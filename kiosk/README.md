@@ -35,6 +35,13 @@ Vitest, ESLint, Prettier or Tailwind config. Tailwind v4 uses `@theme` in
 `src/index.css`. Components were added with shadcn's CLI, use Base UI rather
 than Radix, and use `tw-animate-css`. System fonts only; no remote fonts,
 analytics or CDN assets. Recharts is the dependency supplied by shadcn chart.
+Runtime dependencies are limited to React/React DOM, Base UI, lucide-react,
+Recharts, class-variance-authority, clsx and tailwind-merge. All components use
+the standard local `cn()` helper in `src/lib/utils.ts`. There is no direct `cn`
+dependency or runtime import; shadcn's build-only CLI still depends on `cn`
+transitively. shadcn and tw-animate-css are development dependencies.
+The GPU chart is loaded with React.lazy and a Suspense skeleton only when
+history is available, keeping Recharts out of the initial JavaScript bundle.
 
 ## API and behavior
 
@@ -66,8 +73,12 @@ viewport. Arbitrarily large real fleets/model lists may require page scrolling.
 
 ## Mock and screenshots
 
-Normal fixtures include both model families, an offline node, a failing service,
-pending pricing, estimated pre-history spend and null prompt tps. Outage
+Normal fixtures distinguish local models from reference families: Claude Sonnet
+uses `anthropic/claude-sonnet-5.5`; ChatGPT mid-tier uses `openai/gpt-6.1-sol`.
+The pending Sonnet 5.6 model is synthetic fixture data, not a provider claim.
+Frontier tools are exactly `amp`, `cursor`, `claude-code`, `codex` and `kimi`.
+Fixtures also include an offline node, a failing service, pending pricing,
+estimated pre-history spend and null prompt tps. Outage
 fixtures use contract nulls, empty model/history lists and warnings. Mock SSE
 emits GPU samples every 3s, requests every 5s and keepalive comments every 15s.
 Every response uses only contract fields. Change `MOCK_PORT` to choose another
@@ -105,6 +116,9 @@ cards and WCAG text contrast, then writes these committed captures:
   unknown telemetry/reference values, empty history/usage and warnings.
 - [Loading](screenshots/1728-dark-loading.png): held Fleet response with
   skeletons while other sections load successfully.
+- [Chart loading](screenshots/1728-dark-chart-loading.png): the lazy chart chunk
+  is held to verify the Suspense skeleton while metrics and other sections
+  remain usable; releasing it verifies that the real chart renders.
 - [Error](screenshots/1728-dark-error.png): injected Fleet HTTP 503 without
   hiding other sections.
 - [Reconnecting](screenshots/1728-dark-reconnecting.png): stopped isolated SSE
@@ -169,8 +183,10 @@ was removed for the required system font stack. `lazyPlugins(...) ?? []` makes
 the generated config compatible with exact optional property types. Generated
 chart keys use explicit `String(...)` for clean type-aware linting.
 
-Vite reports a bundle-size warning (approximately 709 kB JS / 221 kB gzip), mostly
-React, Base UI and the shadcn chart stack. No warning is suppressed. Browser
+Initial JavaScript is 382.66 kB / 122.02 kB gzip, down from 708.68 kB /
+221.24 kB gzip (46.0% smaller before compression). The separately loaded chart
+chunk is 328.92 kB / 98.08 kB gzip. No bundle-size warning remains or is suppressed.
+This splits delivery rather than reducing total chart code. Browser
 checks run Chromium on this runner, not real iOS Safari/Blink devices. The real
 factory-api, embedding, production deployment and tailnet access are phase 3b
 and remain unverified. Rust builds/tests/clippy are intentionally not run:

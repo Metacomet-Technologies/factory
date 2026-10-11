@@ -532,7 +532,7 @@ footer {
     padding-block: 4px;
   }
   .agent-list li {
-    padding-block: 10px;
+    padding-block: 6px;
   }
   [role="log"] {
     max-height: 210px;

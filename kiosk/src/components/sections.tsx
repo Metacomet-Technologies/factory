@@ -1,6 +1,5 @@
-import type { ReactNode } from "react";
+import { lazy, Suspense, type ReactNode } from "react";
 import { AlertTriangle, ArrowUpRight, Radio } from "lucide-react";
-import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from "recharts";
 import type { Resource } from "../api/client";
 import type { LiveState } from "../api/stream";
 import type {
@@ -22,7 +21,8 @@ import { Skeleton } from "./ui/skeleton";
 import { Separator } from "./ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./ui/table";
 import { ToggleGroup, ToggleGroupItem } from "./ui/toggle-group";
-import { ChartContainer, ChartTooltip, ChartTooltipContent } from "./ui/chart";
+
+const GpuChart = lazy(() => import("./gpu-chart"));
 
 function Section({
   title,
@@ -217,43 +217,9 @@ export function GpuSection({
             <Metric label="Power" value={number(current?.power_w ?? null, "W")} />
           </div>
           {data && data.history.length > 0 ? (
-            <>
-              <ChartContainer
-                config={{
-                  utilization_percent: { label: "Utilization (%)", color: "var(--primary)" },
-                }}
-                className="gpu-chart"
-                aria-label="GPU utilization history"
-              >
-                <AreaChart
-                  data={data.history}
-                  accessibilityLayer
-                  margin={{ left: 0, right: 4, top: 10, bottom: 0 }}
-                >
-                  <CartesianGrid vertical={false} />
-                  <XAxis dataKey="ts_ms" hide />
-                  <YAxis domain={[0, 100]} hide />
-                  <ChartTooltip
-                    content={<ChartTooltipContent />}
-                    labelFormatter={(value) => time(Number(value))}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="utilization_percent"
-                    stroke="var(--accent-text)"
-                    fill="var(--primary)"
-                    fillOpacity={1}
-                    strokeWidth={2}
-                    isAnimationActive={false}
-                  />
-                </AreaChart>
-              </ChartContainer>
-              <div className="row muted chart-caption">
-                <span>{time(data.history[0]?.ts_ms ?? 0)}</span>
-                <span>Utilization · 0–100%</span>
-                <span>Now</span>
-              </div>
-            </>
+            <Suspense fallback={<Skeleton className="gpu-chart" aria-label="Loading GPU chart" />}>
+              <GpuChart history={data.history} />
+            </Suspense>
           ) : (
             <p className="empty">No GPU history available.</p>
           )}
@@ -470,9 +436,12 @@ export function AgentsSection({ resource, icon }: { resource: Resource<Agents>; 
           <li key={tool.tool}>
             <div className="row">
               <h3>{tool.tool}</h3>
-              <Badge variant="secondary">Not tracked yet</Badge>
+              <div className="row">
+                {tool.note === null && <span className="muted">—</span>}
+                <Badge variant="secondary">Not tracked yet</Badge>
+              </div>
             </div>
-            <p className="muted">{tool.note ?? "—"}</p>
+            {tool.note !== null && <p className="muted">{tool.note}</p>}
           </li>
         ))}
       </ul>

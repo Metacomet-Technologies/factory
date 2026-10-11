@@ -94,15 +94,15 @@ export function fixtures(
     },
     spend_avoided: [
       {
-        family: "factory-assist",
-        model_id: outage ? null : "claude-sonnet-4.6",
+        family: "Claude Sonnet",
+        model_id: outage ? null : "anthropic/claude-sonnet-5.5",
         usd: outage ? 0 : 3.41 * scale,
         estimated_usd: outage ? 0 : 1.12 * scale,
         unpriced_requests: outage ? 0 : 8,
       },
       {
-        family: "factory-code",
-        model_id: outage ? null : "gpt-5.4",
+        family: "ChatGPT mid-tier",
+        model_id: outage ? null : "openai/gpt-6.1-sol",
         usd: outage ? 0 : 6.82 * scale,
         estimated_usd: 0,
         unpriced_requests: outage ? 0 : 3,
@@ -165,10 +165,10 @@ export function fixtures(
   const pricing: Pricing = {
     families: [
       {
-        family: "factory-assist",
+        family: "Claude Sonnet",
         selected: outage
           ? null
-          : { model_id: "claude-sonnet-4.6", effective_from_ms: now - 86_400_000 },
+          : { model_id: "anthropic/claude-sonnet-5.5", effective_from_ms: now - 86_400_000 },
         rates: outage
           ? null
           : {
@@ -177,11 +177,15 @@ export function fixtures(
               source: "OpenRouter",
               fetched_at_ms: now - 300_000,
             },
-        pending: outage ? null : { model_id: "claude-sonnet-4.7", effective_from_ms: now },
+        pending: outage
+          ? null
+          : { model_id: "anthropic/claude-sonnet-5.6", effective_from_ms: now },
       },
       {
-        family: "factory-code",
-        selected: outage ? null : { model_id: "gpt-5.4", effective_from_ms: now - 86_400_000 },
+        family: "ChatGPT mid-tier",
+        selected: outage
+          ? null
+          : { model_id: "openai/gpt-6.1-sol", effective_from_ms: now - 86_400_000 },
         rates: outage
           ? null
           : {
@@ -198,12 +202,14 @@ export function fixtures(
   const agents: Agents = {
     tools: [
       {
-        tool: "Claude Code",
+        tool: "amp",
         status: "not_tracked",
         note: "CLI usage will appear when tracking is connected.",
       },
-      { tool: "Codex", status: "not_tracked", note: null },
-      { tool: "Gemini CLI", status: "not_tracked", note: null },
+      { tool: "cursor", status: "not_tracked", note: null },
+      { tool: "claude-code", status: "not_tracked", note: null },
+      { tool: "codex", status: "not_tracked", note: null },
+      { tool: "kimi", status: "not_tracked", note: null },
     ],
   };
   return { health, fleet, usage, gpu, pricing, agents };

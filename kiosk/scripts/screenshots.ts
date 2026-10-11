@@ -191,11 +191,25 @@ try {
     await gate;
     await route.fulfill({ status: 503, body: "Unavailable" });
   });
+  let releaseChart = () => {};
+  const chartGate = new Promise<void>((resolve) => {
+    releaseChart = resolve;
+  });
+  await states.route("**/assets/gpu-chart-*.js", async (route) => {
+    await chartGate;
+    await route.continue();
+  });
   await states.goto("http://127.0.0.1:4180");
   await expect(
     states.getByRole("region", { name: "Fleet" }).getByLabel("Loading section"),
   ).toBeVisible();
   await expect(states.getByText("$3.41 priced", { exact: true })).toBeVisible();
+  await expect(states.getByLabel("Loading GPU chart")).toBeVisible();
+  await states.screenshot({ path: "screenshots/1728-dark-chart-loading.png" });
+  releaseChart();
+  await expect(
+    states.getByRole("region", { name: "GPU" }).locator(".recharts-area-area"),
+  ).toBeVisible();
   await states.screenshot({ path: "screenshots/1728-dark-loading.png" });
   release();
   await expect(states.getByText("Unable to load this section")).toBeVisible();

@@ -92,14 +92,25 @@ describe("dashboard contract", () => {
     expect(screen.getByText("Failing · —")).toBeInTheDocument();
     expect(screen.getByText("+ $1.12 estimated (pre-history)")).toBeInTheDocument();
     expect(
-      screen.getByText("New reference model available: claude-sonnet-4.7. Confirm via CLI"),
+      screen.getByText(
+        "New reference model available: anthropic/claude-sonnet-5.6. Confirm via CLI",
+      ),
     ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Claude Sonnet" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "ChatGPT mid-tier" })).toBeInTheDocument();
+    expect(screen.getByText("8 unpriced · anthropic/claude-sonnet-5.5")).toBeInTheDocument();
+    expect(screen.getByText("3 unpriced · openai/gpt-6.1-sol")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /confirm/i })).not.toBeInTheDocument();
     expect(
       within(screen.getByRole("region", { name: "GPU" })).getByText("21 GiB"),
     ).toBeInTheDocument();
+    expect(await screen.findByLabelText("GPU utilization history")).toBeInTheDocument();
     expect(within(screen.getByRole("table")).getByText("— / 56.8")).toBeInTheDocument();
-    expect(screen.getAllByText("Not tracked yet")).toHaveLength(3);
+    const tools = within(screen.getByRole("region", { name: "Frontier CLIs" }));
+    expect(
+      tools.getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent),
+    ).toEqual(["amp", "cursor", "claude-code", "codex", "kimi"]);
+    expect(tools.getAllByText("Not tracked yet")).toHaveLength(5);
     const event: StreamEvent = {
       type: "llm.request",
       ts_ms: 1000,
@@ -154,7 +165,7 @@ describe("dashboard contract", () => {
           data: JSON.stringify({
             type: "pricing.changed",
             ts_ms: 2,
-            data: { family: "factory-assist", pending_model_id: null },
+            data: { family: "Claude Sonnet", pending_model_id: null },
           }),
         }),
       ),
@@ -171,7 +182,7 @@ describe("dashboard contract", () => {
     expect(
       screen.getByText("Pricing provider unavailable. Reference rates are unknown."),
     ).toBeInTheDocument();
-    expect(screen.getByText("factory-code reference: — · rates: —")).toBeInTheDocument();
+    expect(screen.getByText("ChatGPT mid-tier reference: — · rates: —")).toBeInTheDocument();
   });
   it("keeps endpoint errors isolated and exposes section empty states", async () => {
     api(false, "/v1/fleet", true);
@@ -213,7 +224,7 @@ describe("dashboard contract", () => {
           ...data.usage,
           spend_avoided: [
             {
-              family: "factory-code",
+              family: "ChatGPT mid-tier",
               model_id: null,
               usd: 17.89,
               estimated_usd: 0,
@@ -263,7 +274,7 @@ it("reduces all SSE types, bounds the ticker and rejects malformed frames", () =
   state = streamReducer(state, {
     type: "pricing.changed",
     ts_ms: 12,
-    data: { family: "factory-code", pending_model_id: null },
+    data: { family: "ChatGPT mid-tier", pending_model_id: null },
   });
   for (let i = 0; i < 9; i++)
     state = streamReducer(state, {

@@ -62,7 +62,7 @@
       "theme": "dark",
       "layout": {
         "width": 1024,
-        "height": 1941,
+        "height": 1989,
         "viewport": 768
       },
       "contrast": {
@@ -90,7 +90,7 @@
       "theme": "dark",
       "layout": {
         "width": 390,
-        "height": 2970,
+        "height": 3037,
         "viewport": 844
       },
       "contrast": {
@@ -118,7 +118,7 @@
       "theme": "light",
       "layout": {
         "width": 390,
-        "height": 2970,
+        "height": 3037,
         "viewport": 844
       },
       "contrast": {
