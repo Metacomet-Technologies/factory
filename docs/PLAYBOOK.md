@@ -112,6 +112,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 ## 8. Gotchas we've already hit
 
 **Process**
+- Tests that pass locally can hang on GitHub runners: every CI job sets `timeout-minutes`, and async tests wrap their waits in an explicit timeout so a hang fails fast with a message.
 - Repo Actions options greyed out means the org setting is off; enable it at org → Settings → Actions first (the default token stays read-only).
 - When a Linear **Decided** section changes a rule, update `AGENTS.md`/docs in the next PR. Agents follow the repo file, not Linear.
 - Amp's **New Worktree** fetches `origin` before creating the worktree; `agent` has GitHub credentials only inside threads, so it fails ("could not read Username"). Start threads in `work` and let the agent create the worktree after auth.
@@ -139,6 +140,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 - GNOME RDP headless: set credentials with `sudo grdctl --system rdp set-credentials` and register a TLS cert; the Windows App hangs at TLS, use `sdl-freerdp`. Remote Login refuses while the same user is logged in locally.
 - Ollama `/api/ps` misreports gemma4's size; use `nvidia-smi`. Exclude non-inference requests (health checks) from usage.
 - A lock held across a network call froze usage/pricing for 60 s+ when TLS failed on a bad clock (MET-90): never hold DB access across I/O.
+- Bundled SQLite 3.51.1 (rusqlite 0.38) can deadlock during concurrent WAL connection closes (fixed in SQLite 3.51.2); use rusqlite ≥ 0.39.
 - iOS Safari doesn't run timers in background tabs; check on `visibilitychange`.
 - **1Password CLI:** with app integration, `op whoami` can say "not signed in" while `op vault list` works; `op account add` refuses unless `OP_BIOMETRIC_UNLOCK_ENABLED=false`; app-integrated `op` only works inside the desktop session.
 - Omarchy (Hyprland 0.56) moved to Lua config and dispatch.
@@ -146,3 +148,5 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 ## 9. Where things are tracked
 
 Linear: project overview, the roadmap issues, and the Linear copy of this playbook (this repo file is the source of truth). Decisions live in each issue's **Decided** section.
+
+Labels: every issue gets one type (Bug / Feature / Improvement) plus one or more `area:*` labels (meter, api, kiosk, data, security, agents, ops). Post a Linear project update after milestone days.
