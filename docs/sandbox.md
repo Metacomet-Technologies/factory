@@ -6,11 +6,15 @@ still useful for UI-only fixtures; this sandbox runs the real meter and API.
 
 ## Usage
 
-Requires Linux, Rust/Cargo, a C compiler, Python 3.11+, Bash, util-linux `flock`,
+Requires Linux, Rust/Cargo, a C compiler, Python 3.10+, Bash, util-linux `flock`,
 and working Bubblewrap (`bwrap`) network/PID namespaces. No sudo is used.
 Install missing host prerequisites through an administrator; startup fails
 closed if namespaces are unavailable. Optional kiosk builds require the pinned
 Vite+ toolchain described in `kiosk/README.md`.
+
+Ubuntu 24.04's AppArmor policy can reject Bubblewrap loopback setup. The sandbox
+never disables that policy or falls back to host networking. The separate CI job
+uses Ubuntu 22.04; the required jobs keep their existing Ubuntu 24.04 runners.
 
 ```sh
 scripts/sandbox up --rows 100k --seed 42 --kiosk
@@ -29,9 +33,10 @@ lives under `.sandbox/`, with owner-only permissions. Build products remain in
 the normal ignored `target/` and `kiosk/dist/` directories.
 
 `down` preserves data. The next `up` with matching seed/rows reuses it; mismatched
-options fail. Use `reset` to change seed/row count. `reset` accepts the same options as `up`, including `--kiosk`; omitted
-options return to defaults. `up` on a running sandbox fails instead of spawning
-duplicates. Row counts accept integers or `k`, with a 1,000,000-row ceiling.
+options fail. Use `reset` to change seed/row count. `reset` accepts the same
+options as `up`, including `--kiosk`; omitted options return to defaults. `up` on
+a running sandbox fails instead of spawning duplicates. Row counts accept
+integers or `k`, with a 1,000,000-row ceiling.
 
 ## Ports and isolation
 
