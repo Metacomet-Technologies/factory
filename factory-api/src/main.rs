@@ -26,6 +26,12 @@ struct Args {
         default_value = "/var/lib/factory-api/pricing.db"
     )]
     pricing_db_path: PathBuf,
+    #[arg(long, env = "FACTORY_API_OPENROUTER_FEED_URL", default_value = pricing::OPENROUTER_URL, value_parser = pricing::feed_url)]
+    openrouter_feed_url: String,
+    #[arg(long, env = "FACTORY_API_LITELLM_FEED_URL", default_value = pricing::LITELLM_URL, value_parser = pricing::feed_url)]
+    litellm_feed_url: String,
+    #[arg(long, env = "FACTORY_API_DISABLE_PRICING_COLLECTOR", value_parser = clap::builder::BoolishValueParser::new(), action = clap::ArgAction::SetTrue)]
+    disable_pricing_collector: bool,
     #[arg(long, env = "FACTORY_API_SERVICES_CONFIG")]
     services_config: Option<PathBuf>,
     #[arg(
@@ -89,9 +95,17 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    tracing::info!(
+        openrouter = %pricing::feed_url_for_log(&args.openrouter_feed_url),
+        litellm = %pricing::feed_url_for_log(&args.litellm_feed_url),
+        collector_disabled = args.disable_pricing_collector,
+        "pricing feeds"
+    );
     let mut state =
         AppState::new(args.meter_url, args.db_path, args.pricing_db_path, config).await?;
     state.static_dir = args.static_dir;
+    state.pricing_sources = [args.openrouter_feed_url, args.litellm_feed_url];
+    state.disable_pricing_collector = args.disable_pricing_collector;
     state.check_clock().await;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     let tasks = state.start_collectors();

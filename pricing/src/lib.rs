@@ -13,6 +13,32 @@ pub const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 pub const DEFAULT_CONFIG: &str = include_str!("../config/references.toml");
 
+/// Public feeds require HTTPS; HTTP is allowed only for loopback fixtures.
+pub fn feed_url(text: &str) -> Result<String> {
+    let url = reqwest::Url::parse(text).context("feed URL must be an absolute http(s) URL")?;
+    let host = url.host_str().context("feed URL must have a host")?;
+    let loopback = host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    ensure!(
+        url.scheme() == "https" || (url.scheme() == "http" && loopback),
+        "feed URL requires https unless the host is loopback (127.0.0.0/8, ::1, localhost)"
+    );
+    Ok(url.into())
+}
+
+/// Startup logs omit query strings, fragments and credentials.
+pub fn feed_url_for_log(text: &str) -> String {
+    let mut url = reqwest::Url::parse(text).expect("validated feed URL");
+    url.set_query(None);
+    url.set_fragment(None);
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.into()
+}
+
 /// Explicit offline migration only. Never adopt or convert legacy pricing data.
 pub fn migrate(path: impl AsRef<Path>) -> Result<factory_db::migrations::Report> {
     let mut db = Connection::open(path)?;
@@ -746,6 +772,17 @@ fn insert_batches<const N: usize>(
 /// Fetch both feeds independently. One failure is a recorded warning; both failing
 /// aborts without changing the database. OpenRouter is authoritative when present.
 pub fn fetch_live(at_ms: i64) -> Result<(Vec<Model>, Vec<Model>, Vec<Item>)> {
+    fetch_from(at_ms, OPENROUTER_URL, LITELLM_URL)
+}
+
+/// Fetch from configured feed URLs, using the same parsers and fallback rules.
+pub fn fetch_from(
+    at_ms: i64,
+    openrouter: &str,
+    litellm: &str,
+) -> Result<(Vec<Model>, Vec<Model>, Vec<Item>)> {
+    let openrouter = feed_url(openrouter)?;
+    let litellm = feed_url(litellm)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
         .user_agent("factory-pricing/0.1")
@@ -771,8 +808,8 @@ pub fn fetch_live(at_ms: i64) -> Result<(Vec<Model>, Vec<Model>, Vec<Item>)> {
             }
         }
     };
-    let primary = fetch(OPENROUTER_URL, parse_openrouter, "openrouter");
-    let secondary = fetch(LITELLM_URL, parse_litellm, "litellm");
+    let primary = fetch(&openrouter, parse_openrouter, "openrouter");
+    let secondary = fetch(&litellm, parse_litellm, "litellm");
     if primary.is_empty() && secondary.is_empty() {
         bail!(
             "both pricing sources unavailable: {}",

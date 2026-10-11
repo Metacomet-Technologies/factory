@@ -139,7 +139,8 @@ jobs:
           for script in "${scripts[@]}"; do bash -n "$script"; done
           shellcheck -x "${scripts[@]}"
       - run: scripts/sandbox up --rows 1k
-      - run: python3 scripts/sandbox-shims/smoke.py
+      - name: Check pricing refresh, confirmation and positive spend avoided
+        run: python3 scripts/sandbox-shims/smoke.py
       - name: Sandbox logs
         if: failure()
         run: |

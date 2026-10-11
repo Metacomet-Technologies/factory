@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 MODE, ROOT = sys.argv[1], Path(sys.argv[2]).resolve()
@@ -167,8 +168,31 @@ def inside():
         start("factory-api", [binary / "factory-api", "--listen", f"127.0.0.1:{BASE+2}",
                               "--meter-url", f"http://127.0.0.1:{BASE+1}", "--db-path", STATE / "requests.db",
                               "--pricing-db-path", STATE / "pricing.db", "--services-config", STATE / "fleet.toml",
+                              "--openrouter-feed-url", f"http://127.0.0.1:{BASE}/feeds/openrouter",
+                              "--litellm-feed-url", f"http://127.0.0.1:{BASE}/feeds/litellm",
+                              "--disable-pricing-collector",
                               "--static-dir", ROOT / "kiosk/dist" if kiosk == "1" else STATE / "no-kiosk"])
         ready(BASE + 2, "/v1/health")
+        started = time.monotonic()
+        pricing = {"refresh": request(BASE + 2, "/v1/pricing/refresh", {})}
+        pricing["confirm"] = {}
+        for family in pricing["refresh"]["families"]:
+            name = family["family"]
+            if family["pending"] is not None:
+                path = "/v1/pricing/confirm/" + urllib.parse.quote(name, safe="")
+                pricing["confirm"][name] = request(BASE + 2, path, {})
+            else:
+                assert family["selected"] is not None, f"No candidate for {name}: {pricing['refresh']}"
+        pricing["snapshot"] = request(BASE + 2, "/v1/pricing")
+        assert len(pricing["snapshot"]["families"]) == 2
+        assert not pricing["snapshot"]["warnings"], pricing["snapshot"]
+        for family in pricing["snapshot"]["families"]:
+            assert family["selected"] is not None and family["pending"] is None
+            assert family["rates"]["input_per_mtok"] == 2
+            assert family["rates"]["output_per_mtok"] == 10
+        pricing["refresh_confirm_ms"] = (time.monotonic() - started) * 1000
+        atomic(STATE / "pricing-check.json", json.dumps(pricing, indent=2))
+        request(BASE + 1, "/api/generate", {"model": "factory-assist", "prompt": "pricing check", "stream": False})
         sockets = listeners(True)
         atomic(STATE / "ready", "ready\n")
         index = 0

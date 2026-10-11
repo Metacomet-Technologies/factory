@@ -310,11 +310,23 @@ Defaults and environment equivalents (CLI flags take precedence):
 - `--meter-url` / `FACTORY_API_METER_URL`: `http://factory-gpu:11434`.
 - `--db-path` / `FACTORY_API_DB_PATH`: `/var/lib/factory-api/requests.db`.
 - `--pricing-db-path` / `FACTORY_API_PRICING_DB_PATH`: `/var/lib/factory-api/pricing.db`.
+- `--openrouter-feed-url` / `FACTORY_API_OPENROUTER_FEED_URL`:
+  `https://openrouter.ai/api/v1/models`.
+- `--litellm-feed-url` / `FACTORY_API_LITELLM_FEED_URL`:
+  `https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json`.
+- `--disable-pricing-collector` / `FACTORY_API_DISABLE_PRICING_COLLECTOR=1`:
+  default off. Skips startup/daily pricing refresh only; manual refresh,
+  confirmation and snapshot reads still work. Environment value `0` keeps it enabled.
 - `--services-config` / `FACTORY_API_SERVICES_CONFIG`: optional TOML file;
   defaults are embedded from `factory-api/config/services.toml`.
 - `--static-dir` / `FACTORY_API_STATIC_DIR`: `/var/lib/factory-api/kiosk`;
   runtime kiosk files, not embedded in the binary.
 - `RUST_LOG`: defaults to `factory_api=info`.
+
+Feed overrides must be absolute HTTP(S) URLs. HTTPS is required except for
+loopback hosts (`127.0.0.0/8`, `::1`, `localhost`); invalid values fail startup.
+Effective URLs are logged once without query strings, fragments or credentials.
+Disabling the collector does not bypass the clock-synchronization write guard.
 
 Database parent directories must exist. Request and pricing paths must differ.
 SQLite uses bundled SQLite, WAL and five-second busy timeouts. Database work and

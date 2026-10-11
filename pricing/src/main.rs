@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use pricing::{DEFAULT_CONFIG, Store, fetch_live, parse_references};
+use pricing::{DEFAULT_CONFIG, Store, fetch_from, parse_references};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -17,6 +17,10 @@ struct Cli {
     /// Use another reference TOML; defaults to the bundled references.toml.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    #[arg(long, env = "PRICING_OPENROUTER_FEED_URL", default_value = pricing::OPENROUTER_URL, value_parser = pricing::feed_url, global = true)]
+    openrouter_feed_url: String,
+    #[arg(long, env = "PRICING_LITELLM_FEED_URL", default_value = pricing::LITELLM_URL, value_parser = pricing::feed_url, global = true)]
+    litellm_feed_url: String,
     #[command(subcommand)]
     command: Command,
 }
@@ -55,6 +59,11 @@ fn timestamp(text: &str) -> Result<i64> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    eprintln!(
+        "pricing feeds: openrouter={} litellm={}",
+        pricing::feed_url_for_log(&cli.openrouter_feed_url),
+        pricing::feed_url_for_log(&cli.litellm_feed_url)
+    );
     let config = cli.config.map(std::fs::read_to_string).transpose()?;
     let references = parse_references(config.as_deref().unwrap_or(DEFAULT_CONFIG))?;
     pricing::verify_path(&cli.db)?;
@@ -68,7 +77,8 @@ fn main() -> Result<()> {
     let now = Utc::now().timestamp_millis();
     match cli.command {
         Command::Refresh => {
-            let (primary, secondary, items) = fetch_live(now)?;
+            let (primary, secondary, items) =
+                fetch_from(now, &cli.openrouter_feed_url, &cli.litellm_feed_url)?;
             let items = pool.write_sync(&scope, move |store| {
                 store.refresh(&references, &primary, &secondary, now, items)
             })?;

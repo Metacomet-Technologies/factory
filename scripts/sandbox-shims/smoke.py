@@ -23,9 +23,10 @@ for service, path in [("meter", "/meter/health"), ("factory-api", "/v1/health")]
 deadline = time.monotonic() + 120
 while True:
     usage = get("factory-api", "/v1/llm/usage?range=30d")
-    if usage["totals"]["requests"] > 0:
+    if (usage["totals"]["requests"] > 0 and len(usage["spend_avoided"]) == 2
+            and all(spend["usd"] > 0 for spend in usage["spend_avoided"])):
         break
-    assert time.monotonic() < deadline, "meter ingestion did not produce usage"
+    assert time.monotonic() < deadline, f"meter ingestion did not produce positive spend avoided: {usage}"
     time.sleep(1)
 timings = []
 for _ in range(20):
@@ -35,6 +36,9 @@ for _ in range(20):
 assert usage["totals"]["prompt_tokens"] > 0
 assert usage["totals"]["output_tokens"] > 0
 evidence.update(totals=usage["totals"], usage_p95_ms=sorted(timings)[18], usage_samples_ms=timings)
+evidence["spend_avoided"] = usage["spend_avoided"]
+assert all(spend["usd"] > 0 for spend in usage["spend_avoided"])
+evidence["pricing"] = json.loads((root / ".sandbox/pricing-check.json").read_text())
 gpu = get("factory-api", "/v1/gpu")
 assert gpu["current"]["memory_used_mib"] == 9255
 assert gpu["current"]["memory_total_mib"] == 12288

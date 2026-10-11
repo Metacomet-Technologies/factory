@@ -118,13 +118,36 @@ so synthetic ingestion can run; it does not assert host clock synchronization.
 Background traffic sends one request every two seconds through meter. API SSE
 and the kiosk ticker advance on the existing 30-second sync cadence.
 
+## Pricing hooks (MET-111)
+
+`up` passes `--openrouter-feed-url` and `--litellm-feed-url` pointing to the
+fake's `/feeds/openrouter` and `/feeds/litellm`, plus `--disable-pricing-collector`.
+It calls the real `POST /v1/pricing/refresh`, then
+`POST /v1/pricing/confirm/{family}` for both pending families. Reused databases
+retain already-confirmed selections. No pricing SQL is seeded. Both families
+use synthetic rates of $2 input / $10 output per million tokens.
+Responses and refresh/confirm timing are saved in `.sandbox/pricing-check.json`.
+
+Run the existing check without kiosk builds:
+
+```sh
+scripts/sandbox up --rows 1k
+python3 scripts/sandbox-shims/smoke.py
+scripts/sandbox down
+```
+
+The check waits at most 120 seconds for ingestion, asserts positive dated `usd`
+spend avoided for **each** family after synthetic requests, and prints pricing
+responses, rates, usage timings, spend and namespace isolation evidence as JSON.
+Pre-history seeded requests may have separate `estimated_usd` spend; the assertion
+requires post-confirmation spend, not only estimates.
+Clock guards remain active. The existing exact-command `timedatectl` shim supplies
+the synthetic clock assertion; a clock warning fails pricing setup, never bypasses it.
+Production feed defaults and automatic collection remain unchanged when hooks
+are unset. No installer/unit change or production deployment is needed for this check.
+
 ## Limits and follow-up hooks
 
-- Factory-api has no CLI/environment feed URL override or pricing collector
-  disable flag. v1 leaves pricing unconfigured/unconfirmed, does not seed its DB,
-  and blocks its attempted public refresh inside the namespace. Pricing warnings
-  and null spend are expected. Add those configuration hooks before connecting
-  the fake feeds through the real refresh path; do not alter production defaults.
 - Factory-api's clock requirement has no synthetic/offline CLI clock hook; the
   exact-command shim is sufficient for v1, but not proof of production NTP.
 - Meter's writer and seven-day GPU pruning own the current legacy schema. This
@@ -140,8 +163,9 @@ and the kiosk ticker advance on the existing 30-second sync cadence.
 NDJSON and SSE, tool calls, faults, feed parsing, seed counts/gaps and nullable
 fields. Run workspace fmt/clippy/tests too. Check Bash scripts with `bash -n`
 and `shellcheck -x`. The separate CI `sandbox` job runs a 1k-row stack and public
-health, usage, GPU and SSE checks, then always stops it. It does not change the
-required `rust`, `kiosk`, or `scripts` checks or branch protection.
+health, pricing, positive spend-avoided, usage, GPU and SSE checks, then always
+stops it. It does not change the required `rust`, `kiosk`, or `scripts` checks
+or branch protection.
 
 v2 may publish sanitized real-data snapshots using consistent SQLite backups,
 explicit approval, a versioned manifest (schema, timestamp, counts, checksums),
