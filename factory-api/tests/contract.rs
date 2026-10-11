@@ -113,6 +113,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
     let record = |id, ts, prompt, duration| RequestRecord {
         id,
         ts,
+        endpoint: "/api/generate".into(),
         model: Some("local:latest".into()),
         prompt_eval_count: prompt,
         eval_count: Some(4),
@@ -458,6 +459,167 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
     );
     drop(stream);
     failed_task.abort();
+    api_task.abort();
+    meter_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mixed_endpoints_only_count_and_stream_inference() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let at = now_ms().div_euclid(1000);
+    let record = |id, endpoint: &str| RequestRecord {
+        id,
+        ts: (at - 30) * 1000,
+        endpoint: endpoint.into(),
+        model: Some("local:latest".into()),
+        prompt_eval_count: Some(3),
+        eval_count: Some(2),
+        prompt_eval_duration: Some(1_000_000_000),
+        eval_duration: Some(2_000_000_000),
+        load_duration: Some(1_000_000),
+        total_duration: Some(100_000_000),
+        client_hostname: id.to_string(),
+        ..Default::default()
+    };
+    let mut rows = vec![
+        RequestRecord {
+            model: None,
+            prompt_eval_count: None,
+            eval_count: None,
+            ..record(1, "/api/version")
+        },
+        RequestRecord {
+            prompt_eval_count: Some(900),
+            eval_count: Some(800),
+            ..record(2, "/api/tags")
+        },
+        RequestRecord {
+            model: Some("excluded-model".into()),
+            ..record(3, "/api/generate/extra")
+        },
+    ];
+    // Keep the expected endpoint contract independent of the production constant.
+    for (index, endpoint) in [
+        "/api/generate",
+        "/api/chat",
+        "/api/embed",
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/embeddings",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut row = record(index as i64 + 4, endpoint);
+        if index < 2 {
+            row.ts = (at - 180) * 1000;
+        }
+        if endpoint == "/api/embed" {
+            row.eval_count = None;
+        }
+        rows.push(row);
+    }
+    rows.reverse(); // Meter returns newest IDs first.
+    let meter = Meter {
+        records: Arc::new(RwLock::new(rows)),
+        down: Default::default(),
+        ts: at * 1000,
+    };
+    let (meter_url, meter_task) = serve(
+        Router::new()
+            .route("/meter/requests", get(requests))
+            .with_state(meter.clone()),
+    )
+    .await;
+    let config = fleet::Config::parse("[[nodes]]\nname='factory-console'\nservices=[]")?;
+    let state = AppState::new(
+        meter_url,
+        temp.path().join("requests.db"),
+        temp.path().join("pricing.db"),
+        config,
+    )
+    .await?;
+    {
+        let mut prices = pricing::Store::open(&state.pricing_db_path)?;
+        offline_refresh(
+            &mut prices,
+            &pricing::parse_references(pricing::DEFAULT_CONFIG)?,
+            at - 120,
+        )?;
+        prices.confirm("Claude Sonnet", at - 60)?;
+    }
+    let (url, api_task) = serve(router(state.clone())).await;
+    let client = reqwest::Client::new();
+    let mut stream = client.get(format!("{url}/v1/stream")).send().await?;
+    state.sync_meter().await?;
+    let events = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut pending = String::new();
+        let mut events = Vec::<Value>::new();
+        loop {
+            let chunk = stream.chunk().await?.expect("open SSE stream");
+            pending.push_str(std::str::from_utf8(&chunk)?);
+            while let Some(end) = pending.find("\n\n") {
+                let frame: String = pending.drain(..end + 2).collect();
+                let json = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .expect("SSE event data");
+                events.push(serde_json::from_str(json)?);
+            }
+            if events
+                .last()
+                .is_some_and(|event| event["data"]["client_hostname"] == "9")
+            {
+                return Ok::<_, anyhow::Error>(events);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(events.len(), 6);
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event["type"], "llm.request");
+        assert_eq!(event["data"]["client_hostname"], (index + 4).to_string());
+        assert_eq!(event["data"]["latency_ms"], 100.0);
+    }
+    let usage = fetch(&client, &format!("{url}/v1/llm/usage")).await;
+    assert_eq!(
+        usage["totals"],
+        json!({"requests":6,"prompt_tokens":18,"output_tokens":10})
+    );
+    assert_eq!(
+        usage["models"],
+        json!([{"model":"local:latest","requests":6,"prompt_tokens":18,"output_tokens":10,"avg_prompt_tps":3.0,"avg_gen_tps":1.0,"p50_latency_ms":100.0,"p95_latency_ms":100.0,"total_load_ms":6.0}])
+    );
+    let spend = usage["spend_avoided"].as_array().unwrap();
+    let sonnet = spend
+        .iter()
+        .find(|s| s["family"] == "Claude Sonnet")
+        .unwrap();
+    assert!((sonnet["usd"].as_f64().unwrap() - 0.000117).abs() < 1e-12);
+    assert!((sonnet["estimated_usd"].as_f64().unwrap() - 0.000078).abs() < 1e-12);
+    assert_eq!(sonnet["unpriced_requests"], 1);
+    let sol = spend
+        .iter()
+        .find(|s| s["family"] == "ChatGPT mid-tier")
+        .unwrap();
+    assert_eq!(sol["unpriced_requests"], 6);
+    assert_eq!(sol["usd"], 0.0);
+    assert_eq!(sol["estimated_usd"], 0.0);
+
+    *meter.records.write().await = vec![record(10, "/api/version")];
+    state.sync_meter().await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.chunk())
+            .await
+            .is_err()
+    );
+    *meter.records.write().await = vec![record(11, "/api/chat")];
+    state.sync_meter().await?;
+    let usage = fetch(&client, &format!("{url}/v1/llm/usage")).await;
+    assert_eq!(usage["totals"]["requests"], 7);
+    assert_eq!(usage["warnings"], json!([])); // Non-inference IDs still advance the watermark.
+    drop(stream);
     api_task.abort();
     meter_task.abort();
     Ok(())

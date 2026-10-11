@@ -157,10 +157,11 @@ pub fn usage(
 ) -> Result<Usage> {
     let db = open(path)?;
     let mut statement = db.prepare("SELECT record FROM requests WHERE ts_ms>=?1 ORDER BY id")?;
-    let records = statement
+    let mut records = statement
         .query_map([since], |r| r.get::<_, String>(0))?
         .map(|r| Ok(serde_json::from_str::<RequestRecord>(&r?)?))
         .collect::<Result<Vec<_>>>()?;
+    records.retain(|r| crate::INFERENCE_ENDPOINTS.contains(&r.endpoint.as_str()));
     warnings.extend(
         db.prepare("SELECT message FROM warnings ORDER BY message")?
             .query_map([], |r| r.get::<_, String>(0))?
