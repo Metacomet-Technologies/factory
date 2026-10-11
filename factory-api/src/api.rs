@@ -23,8 +23,25 @@ pub(crate) fn error(status: StatusCode, code: &str, message: impl Into<String>) 
         .into_response()
 }
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/v1/pricing/confirm/{family}", axum::routing::any(dispatch))
+        .route("/v1", axum::routing::any(dispatch))
+        .route("/v1/{*path}", axum::routing::any(dispatch))
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(axum::error_handling::HandleErrorLayer::new(layer_error))
+                .timeout(Duration::from_secs(4)),
+        )
+        // SSE has no request timeout. Its body observes the shutdown token.
+        .route("/v1/stream", axum::routing::any(dispatch))
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(axum::error_handling::HandleErrorLayer::new(layer_error))
+                .load_shed()
+                .layer(tower::limit::GlobalConcurrencyLimitLayer::new(16)),
+        );
+    Router::new()
+        .merge(api)
         .route("/{*path}", axum::routing::any(dispatch))
         .fallback(dispatch)
         .with_state(state)
@@ -37,6 +54,21 @@ pub fn router(state: AppState) -> Router {
                 response
             },
         ))
+}
+async fn layer_error(error_value: tower::BoxError) -> Response {
+    if error_value.is::<tower::timeout::error::Elapsed>() {
+        error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "request_timeout",
+            "request exceeded four seconds",
+        )
+    } else {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded",
+            "too many in-flight requests",
+        )
+    }
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -64,6 +96,13 @@ fn range(request: &Request<Body>, gpu: bool) -> Result<(String, i64), String> {
     Ok((range, now_ms() - hours * 3_600_000))
 }
 async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Response {
+    if state.shutdown.is_cancelled() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "shutting_down",
+            "server shutting down",
+        );
+    }
     let path = request.uri().path();
     let confirm = path
         .strip_prefix("/v1/pricing/confirm/")
@@ -175,7 +214,12 @@ fn response<T: serde::Serialize>(result: anyhow::Result<T>) -> Response {
 #[utoipa::path(get, path="/v1/health", responses((status=200, body=Health)))]
 fn health(state: &AppState) -> Json<Health> {
     Json(Health {
-        status: "ok".into(),
+        status: if state.require_clock().is_ok() {
+            "ok"
+        } else {
+            "clock_unsynchronized"
+        }
+        .into(),
         version: env!("CARGO_PKG_VERSION").into(),
         uptime_ms: state.started.elapsed().as_millis() as u64,
     })
@@ -210,11 +254,12 @@ fn stream(
         Duration::from_secs(15),
     );
     let events = futures_util::stream::unfold(
-        (receiver, keepalive),
-        |(mut receiver, mut keepalive)| async move {
+        (receiver, keepalive, state.shutdown.clone()),
+        |(mut receiver, mut keepalive, shutdown)| async move {
             loop {
-                tokio::select! {
-                    _ = keepalive.tick() => return Some((Ok(Event::default().comment("keepalive")), (receiver, keepalive))),
+                tokio::select! { biased;
+                    _ = shutdown.cancelled() => return None,
+                    _ = keepalive.tick() => return Some((Ok(Event::default().comment("keepalive")), (receiver, keepalive, shutdown))),
                     result = receiver.recv() => match result {
                     Ok(event) => {
                         return Some((
@@ -222,7 +267,7 @@ fn stream(
                                 .event(&event.r#type)
                                 .json_data(&event)
                                 .expect("JSON event")),
-                            (receiver, keepalive),
+                            (receiver, keepalive, shutdown),
                         ));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {

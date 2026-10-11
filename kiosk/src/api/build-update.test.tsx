@@ -1,6 +1,47 @@
 import { act, renderHook, fireEvent } from "@testing-library/react";
 import { expect, it, vi } from "vite-plus/test";
 import { useBuildUpdate } from "./build-update";
+import { useApi } from "./client";
+
+it("aborts hung requests before reloading after 20s, including across reconnects", async () => {
+  vi.useFakeTimers();
+  const meta = document.createElement("meta");
+  meta.name = "kiosk-build";
+  meta.content = "a".repeat(64);
+  document.head.append(meta);
+  let signal: AbortSignal | undefined;
+  const reload = vi.fn(() => expect(signal?.aborted).toBe(true));
+  vi.stubGlobal("location", { reload });
+  let versionChecks = 0;
+  vi.stubGlobal("fetch", (url: string, options: RequestInit) => {
+    if (url === "/version.json") {
+      if (versionChecks++ === 0)
+        return Promise.resolve(new Response(JSON.stringify({ build: "b".repeat(64) })));
+      return new Promise(() => {});
+    }
+    signal = options.signal as AbortSignal;
+    return new Promise(() => {});
+  });
+  const hook = renderHook(
+    ({ revision }) => {
+      const usage = useApi("/v1/llm/usage");
+      useBuildUpdate(revision, usage.loading);
+    },
+    { initialProps: { revision: 0 } },
+  );
+  try {
+    await act(() => vi.advanceTimersByTimeAsync(10_250));
+    hook.rerender({ revision: 1 });
+    await act(() => vi.advanceTimersByTimeAsync(9_999));
+    expect(reload).not.toHaveBeenCalled();
+    expect(signal?.aborted).toBe(false);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(reload).toHaveBeenCalledTimes(1);
+  } finally {
+    hook.unmount();
+    meta.remove();
+  }
+});
 
 it("checks every 60s and on reconnect, deferring changed builds until interactions are idle", async () => {
   vi.useFakeTimers();

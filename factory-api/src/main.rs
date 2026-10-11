@@ -1,6 +1,6 @@
 use clap::Parser;
 use factory_api::{AppState, fleet, router};
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(Parser)]
 struct Args {
@@ -63,19 +63,35 @@ async fn main() -> anyhow::Result<()> {
     let mut state =
         AppState::new(args.meter_url, args.db_path, args.pricing_db_path, config).await?;
     state.static_dir = args.static_dir;
+    state.check_clock().await;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     let tasks = state.start_collectors();
     tracing::info!(listen=%args.listen, "factory-api listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            let mut terminate =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("SIGTERM handler");
-            tokio::select! { _ = tokio::signal::ctrl_c() => (), _ = terminate.recv() => () }
-        })
-        .await?;
+    let shutdown = state.shutdown.clone();
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let server = axum::serve(listener, router(state.clone()))
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned());
+    let server = std::future::IntoFuture::into_future(server);
+    tokio::pin!(server);
+    let finished = tokio::select! {
+        result = &mut server => { result?; true }
+        _ = tokio::signal::ctrl_c() => false,
+        _ = terminate.recv() => false,
+    };
+    shutdown.cancel();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(4900);
     for task in tasks {
         task.abort();
+        let _ = task.await;
     }
+    if !finished
+        && tokio::time::timeout(Duration::from_secs(4), &mut server)
+            .await
+            .is_err()
+    {
+        tracing::warn!("HTTP drain deadline reached");
+    }
+    tokio::time::timeout_at(deadline, state.db.close()).await??;
+    tracing::info!("database pool closed; shutdown complete");
     Ok(())
 }

@@ -183,9 +183,41 @@ pub struct Store {
     connection: Connection,
 }
 
+/// A range's rates loaded once. Token rows never execute SQL.
+pub struct History {
+    selections: Vec<(i64, String)>,
+    rates: BTreeMap<String, Vec<(i64, f64, f64)>>,
+    pub earliest: Option<(f64, f64)>,
+}
+
+impl History {
+    pub fn rates_at(&self, at: i64) -> Option<(f64, f64)> {
+        let selected = self.selections.partition_point(|(time, _)| *time <= at);
+        let (_, model) = self.selections.get(selected.checked_sub(1)?)?;
+        let rates = self.rates.get(model)?;
+        let index = rates.partition_point(|(time, _, _)| *time <= at);
+        let (_, input, output) = rates.get(index.checked_sub(1)?)?;
+        Some((*input, *output))
+    }
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::from_connection(Connection::open(path)?)
+    }
+
+    /// Use an existing connection without running schema migrations or taking a write lock.
+    pub fn reader(connection: Connection) -> Result<Self> {
+        connection.execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=1000;")?;
+        Ok(Self { connection })
+    }
+
+    /// Keep selections, rates, and warnings on one committed WAL snapshot.
+    pub fn snapshot<T>(&self, read: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let value = read(self)?;
+        transaction.commit()?;
+        Ok(value)
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -193,7 +225,7 @@ impl Store {
     }
 
     fn from_connection(connection: Connection) -> Result<Self> {
-        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.busy_timeout(Duration::from_secs(1))?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS refreshes (fetched_at INTEGER NOT NULL);
@@ -209,9 +241,50 @@ impl Store {
              CREATE INDEX IF NOT EXISTS selection_lookup ON reference_selection(family, effective_from);
              CREATE TABLE IF NOT EXISTS pricing_items (
                fetched_at INTEGER NOT NULL, kind TEXT NOT NULL, family TEXT NOT NULL,
-               message TEXT NOT NULL, refresh_id INTEGER NOT NULL);"
+               message TEXT NOT NULL, refresh_id INTEGER NOT NULL);
+             CREATE INDEX IF NOT EXISTS items_refresh ON pricing_items(refresh_id);
+             CREATE INDEX IF NOT EXISTS selection_confirmed ON reference_selection(family,confirmed,effective_from);"
         )?;
         Ok(Self { connection })
+    }
+
+    /// Three queries per family, regardless of the number of token rows. Includes
+    /// predecessor selections/rates and the original pre-history estimate.
+    pub fn history(&self, family: &str, until: i64) -> Result<History> {
+        let selections = self
+            .connection
+            .prepare(
+                "SELECT effective_from,model_id FROM reference_selection
+             WHERE family=?1 AND confirmed=1 AND effective_from<=?2
+             ORDER BY effective_from,rowid",
+            )?
+            .query_map(params![family, until], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rates = BTreeMap::<String, Vec<(i64, f64, f64)>>::new();
+        let mut statement = self.connection.prepare(
+            "SELECT model_id,fetched_at,input_per_mtok,output_per_mtok FROM price_snapshots
+             WHERE model_id IN (SELECT model_id FROM reference_selection WHERE family=?1 AND confirmed=1)
+               AND fetched_at<=?2
+             ORDER BY model_id,fetched_at,refresh_id,(source='openrouter'),rowid",
+        )?;
+        for row in statement.query_map(params![family, until], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+        })? {
+            let (model, rate) = row?;
+            rates.entry(model).or_default().push(rate);
+        }
+        let earliest = self.connection.query_row(
+            "SELECT input_per_mtok,output_per_mtok FROM price_snapshots
+             WHERE model_id=(SELECT model_id FROM reference_selection WHERE family=?1 AND confirmed=1
+                 ORDER BY effective_from,rowid LIMIT 1)
+             ORDER BY fetched_at,refresh_id,(source='openrouter') DESC,rowid DESC LIMIT 1",
+            [family], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        Ok(History {
+            selections,
+            rates,
+            earliest,
+        })
     }
 
     fn selected(&self, family: &str, at: i64) -> Result<Option<Selection>> {
