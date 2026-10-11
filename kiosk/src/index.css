@@ -487,15 +487,15 @@
     padding-block: 8px;
   }
   .dashboard {
-    padding-top: 16px;
+    padding-top: 8px;
     padding-bottom: 60px;
   }
   .intro {
-    margin-bottom: 8px;
+    margin-bottom: 4px;
   }
   [data-slot="card"] {
-    --card-spacing: 16px;
-    gap: 12px;
+    --card-spacing: 12px;
+    gap: 8px;
   }
   .dashboard-grid {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(300px, 0.8fr);
