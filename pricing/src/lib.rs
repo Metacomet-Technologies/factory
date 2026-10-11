@@ -203,7 +203,9 @@ impl History {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_connection(Connection::open(path)?)
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_millis(5000))?;
+        Self::from_connection(connection)
     }
 
     /// Borrow the owned connection for shared settings, counters and snapshots.
@@ -226,7 +228,9 @@ impl Store {
     }
 
     pub fn in_memory() -> Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
+        let connection = Connection::open_in_memory()?;
+        connection.busy_timeout(Duration::from_millis(5000))?;
+        Self::from_connection(connection)
     }
 
     /// Bootstrap the legacy schema on an owner-supplied writer connection.

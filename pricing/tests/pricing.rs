@@ -349,6 +349,63 @@ fn parser_rejects_invalid_rates_and_config() {
 }
 
 #[test]
+fn standalone_store_waits_for_a_write_lock() {
+    use std::{
+        sync::mpsc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+    let path = std::env::temp_dir().join(format!(
+        "pricing-contention-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut store = Store::open(&path).unwrap();
+    for connection in [store.connection(), Store::in_memory().unwrap().connection()] {
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "busy_timeout", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5000
+        );
+    }
+    let mut blocker = rusqlite::Connection::open(&path).unwrap();
+    let lock = blocker
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let (started, ready) = mpsc::channel();
+    let (finished, result) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        let models = [model("anthropic/claude-sonnet-5.5", 10, 2.0, 10.0)];
+        let outcome = store.refresh(&references(), &models, &[], 100, vec![]);
+        finished.send(outcome).unwrap();
+        store
+    });
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    let early = result.recv_timeout(Duration::from_millis(200));
+    let waited = matches!(early, Err(mpsc::RecvTimeoutError::Timeout));
+    lock.commit().unwrap();
+    let outcome = match early {
+        Err(mpsc::RecvTimeoutError::Timeout) => result.recv_timeout(Duration::from_secs(5)),
+        _ => early,
+    };
+    let store = writer.join().unwrap();
+    let status = store.show(&references(), 100).unwrap();
+    drop(store);
+    drop(blocker);
+    std::fs::remove_file(path).unwrap();
+    assert!(waited, "write completed before the lock was released");
+    outcome.unwrap().unwrap();
+    assert_eq!(
+        status[0].pending.as_ref().unwrap().model_id,
+        "anthropic/claude-sonnet-5.5"
+    );
+}
+
+#[test]
 fn cli_confirms_shows_and_prices_with_db_env_and_historical_timestamp() {
     use std::{
         process::Command,

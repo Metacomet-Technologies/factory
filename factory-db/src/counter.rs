@@ -97,7 +97,11 @@ unsafe extern "C" fn trace(
         if event != ffi::SQLITE_TRACE_STMT {
             return;
         }
-        let original = CStr::from_ptr(ffi::sqlite3_sql(statement.cast()));
+        let original = ffi::sqlite3_sql(statement.cast());
+        if original.is_null() || text.is_null() {
+            return;
+        }
+        let original = CStr::from_ptr(original);
         let event_sql = CStr::from_ptr(text.cast());
         // Trigger subprogram callbacks are not extra application executions.
         if event_sql.to_bytes().starts_with(b"--") && event_sql != original {
