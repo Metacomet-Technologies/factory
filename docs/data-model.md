@@ -703,7 +703,7 @@ backup lock/timer; keep Ollama running. Use SQLite backup API including WAL,
 checksum/compress/integrity verification, and record archive path, code version,
 schema version and per-table row counts. Restore/decompress into a scratch DB
 first. Enough space for old DB, new tables/indexes, WAL and snapshot is a hard
-preflight gate. MET-74 scripts exist, but live installation/peer access is unverified.
+preflight gate. MET-74 is installed and restore-checked on both nodes (2026-10-11).
 
 Current schemas are legacy version 0 **only after validating schema and actual
 user_version**. Proposed versions are per DB, not one shared global version:
@@ -818,7 +818,7 @@ Rollup retention intentionally cannot recover seven-day-expired GPU details or
 - MET-74 is operational on both nodes with restore-checked nightly timers. Each
   migration still requires a fresh snapshot.
 
-Not verified: live counts/data/PRAGMAs/user_version, production performance,
+Not verified at audit time: live counts/data/PRAGMAs/user_version, production performance,
 backup installation/restore permissions, deployment, or any proposed
 migration/rollup implementation. Capture timestamps alone do
 not prove current live schema remains unchanged. No production DB was opened,

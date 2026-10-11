@@ -60,7 +60,8 @@ Every prompt has these sections:
 
 ## 5. Review checklist (before merge)
 
-- Files changed match the isolation rule (`gh pr view N --json files`).
+- **Reviews are done by Claude directly:** Linear `get_diff` for metadata and link types, then Claude in Chrome for the actual diff and full scripts. Only fall back to asking Devon for `gh` output when neither tool is reachable.
+- Files changed match the isolation rule (the diff's file list).
 - Tests pass, the live check has real evidence (timings, row counts), the deviations list has been read.
 - Read install/rollback scripts in full.
 - **PR ↔ Linear link type:** a "closes" link auto-closes the issue on merge. Use **contributes** for research, partial work, or fixes whose install hasn't been verified; reopen issues that auto-closed early.
@@ -95,6 +96,8 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 - **`ssh -t dgarbs51@<host> '…'`** only for interactive prompts.
 - **Full paths with sudo** (`/home/agent/work/factory/...`): admins can't `cd` into `/home/agent`. For agent-owned paths, run as the agent: `sudo -u agent git -C /home/agent/work/factory status -sb`.
 - Agent-thread commands go in a separate prompt block with the handoff header, never mixed with Mac commands.
+
+### Day-to-day operations
 
 - **`factory-status`** (Mac): switches to the Metacomet tailnet, then checks every node, service, GPU, link speed, disk, endpoints and latencies. For about a minute after a reboot, "fleet all green" can be briefly red while services start.
 - **When something looks down:** first run `tailscale switch --list` (the asterisk is the active tailnet; the Mac is signed into several). Then `factory-status`. **Capture evidence before rebooting:** `uptime; free -h; systemctl --failed; journalctl -p warning --since "-30min"`.
