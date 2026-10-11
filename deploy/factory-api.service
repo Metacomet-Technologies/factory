@@ -1,7 +1,9 @@
 [Unit]
 Description=Factory API
-After=network-online.target tailscaled.service amp-runner.service
-Wants=network-online.target
+# The installer enables systemd-time-wait-sync or chrony-wait; time-sync.target
+# alone does not wait for a synchronized clock.
+After=network-online.target time-sync.target tailscaled.service amp-runner.service
+Wants=network-online.target time-sync.target
 
 [Service]
 Type=simple
@@ -14,7 +16,7 @@ ExecStart=/usr/local/bin/factory-api --listen 0.0.0.0:8080 --meter-url http://fa
 Environment=RUST_LOG=factory_api=info
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=120
+TimeoutStopSec=15
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict

@@ -9,6 +9,11 @@ export interface Resource<T> {
   loading: boolean;
 }
 
+const requests = new Set<AbortController>();
+export function abortApiRequests() {
+  for (const controller of requests) controller.abort();
+}
+
 export function useApi<K extends keyof Endpoints>(
   path: K,
   query = "",
@@ -23,6 +28,7 @@ export function useApi<K extends keyof Endpoints>(
   });
   useEffect(() => {
     const controller = new AbortController();
+    requests.add(controller);
     async function refresh() {
       try {
         const response = await fetch(apiUrl(path + query), { signal: controller.signal });
@@ -45,6 +51,7 @@ export function useApi<K extends keyof Endpoints>(
     }, 60_000);
     return () => {
       controller.abort();
+      requests.delete(controller);
       clearInterval(timer);
     };
   }, [path, query, key]);

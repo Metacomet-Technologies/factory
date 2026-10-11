@@ -3,6 +3,7 @@ use axum::{
     Json, Router,
     extract::{Query, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use factory_api::{AppState, fleet, now_ms, router};
@@ -68,12 +69,24 @@ struct Meter {
 async fn requests(
     State(meter): State<Meter>,
     Query(query): Query<BTreeMap<String, String>>,
-) -> Result<Json<Vec<RequestRecord>>, StatusCode> {
+) -> Result<Response, StatusCode> {
     assert_eq!(query.get("limit").map(String::as_str), Some("500"));
     if meter.down.load(Ordering::Relaxed) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    Ok(Json(meter.records.read().await.clone()))
+    let cursor: i64 = query["after_id"].parse().unwrap();
+    let mut rows = meter.records.read().await.clone();
+    rows.retain(|r| r.id > cursor);
+    rows.sort_by_key(|r| r.id);
+    rows.truncate(500);
+    let next = rows.last().map(|r| r.id).unwrap_or(cursor);
+    Ok(([("next_after_id", next.to_string())], Json(rows)).into_response())
+}
+async fn prices() -> Json<Value> {
+    Json(json!({"data":[
+        {"id":"anthropic/claude-sonnet-5.5", "created":1, "pricing":{"prompt":"0.000003","completion":"0.000015"}},
+        {"id":"openai/gpt-5.6-sol", "created":2, "pricing":{"prompt":"0.000002","completion":"0.000010"}}
+    ]}))
 }
 fn gpu_sample(ts: i64, index: u32) -> Value {
     json!({"index":index,"ts":ts,"memory_used_mib":321.0,"memory_total_mib":12288.0,"utilization_percent":27.0,"temperature_c":43.0,"power_w":48.5})
@@ -143,6 +156,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             .route("/meter/requests", get(requests))
             .route("/meter/gpu", get(gpu))
             .route("/meter/gpu/history", get(history))
+            .route("/prices", get(prices))
             .route("/ok", get(|| async { StatusCode::NO_CONTENT }))
             .route("/redirect", get(|| async { StatusCode::FOUND }))
             .with_state(meter.clone()),
@@ -171,7 +185,11 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
         config,
     )
     .await?;
-    state.pricing_refresh = offline_refresh;
+    state.db.clock_synchronized.store(true, Ordering::Release);
+    state.pricing_sources = [
+        format!("{}/prices", state.meter_url),
+        format!("{}/missing", state.meter_url),
+    ];
     state.static_dir = temp.path().join("kiosk");
     let (url, api_task) = serve(router(state.clone())).await;
     let client = reqwest::Client::builder()
@@ -442,7 +460,10 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
     );
     // A feed outage returns the last pricing snapshot and warning, never auto-confirms.
     let mut failed = state.clone();
-    failed.pricing_refresh = |_, _, _| anyhow::bail!("mock pricing outage");
+    failed.pricing_sources = [
+        format!("{}/missing", state.meter_url),
+        format!("{}/missing", state.meter_url),
+    ];
     let (failed_url, failed_task) = serve(router(failed)).await;
     let failed_prices: Value = client
         .post(format!("{failed_url}/v1/pricing/refresh"))
@@ -456,7 +477,10 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             .as_array()
             .unwrap()
             .iter()
-            .any(|w| w.as_str().unwrap().contains("mock pricing outage"))
+            .any(|w| w
+                .as_str()
+                .unwrap()
+                .contains("both pricing sources unavailable"))
     );
     drop(stream);
     failed_task.abort();
@@ -541,6 +565,7 @@ async fn mixed_endpoints_only_count_and_stream_inference() -> Result<()> {
         config,
     )
     .await?;
+    state.db.clock_synchronized.store(true, Ordering::Release);
     {
         let mut prices = pricing::Store::open(&state.pricing_db_path)?;
         offline_refresh(
@@ -651,6 +676,7 @@ async fn runtime_kiosk_serving_and_api_isolation() -> Result<()> {
     )
     .await?;
     state.static_dir = root.clone();
+    state.db.clock_synchronized.store(true, Ordering::Release);
     let (url, task) = serve(router(state)).await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -811,6 +837,429 @@ async fn runtime_kiosk_serving_and_api_isolation() -> Result<()> {
         client.get(format!("{url}/")).send().await?.text().await?,
         "updated kiosk"
     );
+    task.abort();
+    Ok(())
+}
+
+async fn test_state(temp: &tempfile::TempDir, meter_url: String) -> Result<AppState> {
+    let state = AppState::new(
+        meter_url,
+        temp.path().join("requests.db"),
+        temp.path().join("pricing.db"),
+        fleet::Config::parse("[[nodes]]\nname='factory-console'\nservices=[]")?,
+    )
+    .await?;
+    state.db.clock_synchronized.store(true, Ordering::Release);
+    Ok(state)
+}
+
+#[tokio::test]
+async fn sixty_second_pricing_source_and_sqlite_writer_do_not_stall_reads() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let notify = entered.clone();
+    let (feed, feed_task) = serve(Router::new().route(
+        "/",
+        get(move || {
+            let notify = notify.clone();
+            async move {
+                notify.add_permits(1);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        }),
+    ))
+    .await;
+    let mut state = test_state(&temp, feed.clone()).await?;
+    state.pricing_sources = [feed.clone(), feed];
+    let refresh_state = state.clone();
+    let refresh = tokio::spawn(async move { refresh_state.refresh_pricing().await });
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire_many(2))
+        .await??
+        .forget();
+    let (url, api_task) = serve(router(state.clone())).await;
+    let client = reqwest::Client::new();
+    // Hold real SQLite write transactions, not a mocked lock. WAL readers must
+    // still see the previous committed state on a single-thread Tokio runtime.
+    let requests = rusqlite::Connection::open(&state.db_path)?;
+    let prices = rusqlite::Connection::open(&state.pricing_db_path)?;
+    requests.execute_batch("BEGIN IMMEDIATE")?;
+    prices.execute_batch("BEGIN IMMEDIATE")?;
+    let write_state = state.clone();
+    let started = std::time::Instant::now();
+    let write = tokio::spawn(async move {
+        write_state
+            .db
+            .write(|db| {
+                factory_api::data::sync(
+                    &mut db.requests,
+                    vec![RequestRecord {
+                        id: 1,
+                        ts: now_ms(),
+                        endpoint: "/api/chat".into(),
+                        ..Default::default()
+                    }],
+                )
+            })
+            .await
+    });
+    tokio::task::yield_now().await;
+    // An inline SQLite busy wait would block this single Tokio worker for 1s.
+    assert!(started.elapsed() < Duration::from_millis(200));
+    for path in ["/v1/llm/usage?range=30d", "/v1/pricing", "/v1/health"] {
+        let start = std::time::Instant::now();
+        let value = tokio::time::timeout(
+            Duration::from_millis(200),
+            fetch(&client, &format!("{url}{path}")),
+        )
+        .await?;
+        assert!(start.elapsed() < Duration::from_millis(200));
+        assert!(value.is_object());
+        eprintln!("stalled source + WAL writer: {path}: {:?}", start.elapsed());
+    }
+    assert!(
+        !refresh.is_finished(),
+        "the refresh must still be awaiting the source"
+    );
+    requests.execute_batch("ROLLBACK")?;
+    prices.execute_batch("ROLLBACK")?;
+    assert_eq!(write.await??.len(), 1);
+    assert_eq!(state.usage("30d".into(), 0).await?.totals.requests, 1);
+    refresh.abort();
+    let _ = refresh.await;
+    state.db.close().await?;
+    api_task.abort();
+    feed_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn cursor_sync_recovers_multiple_pages_and_restarts_without_false_gaps() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let meter = Meter {
+        records: Arc::new(RwLock::new(
+            (1..=1207)
+                .map(|id| RequestRecord {
+                    id,
+                    ts: now_ms(),
+                    endpoint: "/api/chat".into(),
+                    ..Default::default()
+                })
+                .collect(),
+        )),
+        down: Default::default(),
+        ts: now_ms(),
+    };
+    let (url, task) = serve(
+        Router::new()
+            .route("/meter/requests", get(requests))
+            .with_state(meter.clone()),
+    )
+    .await;
+    let state = test_state(&temp, url.clone()).await?;
+    state.sync_meter().await?;
+    let usage = state.usage("30d".into(), 0).await?;
+    assert_eq!(usage.totals.requests, 1207);
+    assert!(usage.warnings.is_empty());
+    state.db.close().await?;
+    drop(state);
+    let state = test_state(&temp, url).await?;
+    // Only IDs after the durable cursor remain available in this fixture.
+    *meter.records.write().await = (1208..=1210)
+        .map(|id| RequestRecord {
+            id,
+            ts: now_ms(),
+            endpoint: "/api/chat".into(),
+            ..Default::default()
+        })
+        .collect();
+    state.sync_meter().await?;
+    state.sync_meter().await?;
+    let usage = state.usage("30d".into(), 0).await?;
+    assert_eq!(usage.totals.requests, 1210);
+    assert!(usage.warnings.is_empty());
+    // A hole within a page, not just at its start, is a real discontinuity.
+    *meter.records.write().await = [1211, 1214]
+        .map(|id| RequestRecord {
+            id,
+            ts: now_ms(),
+            endpoint: "/api/chat".into(),
+            ..Default::default()
+        })
+        .to_vec();
+    state.sync_meter().await?;
+    let usage = state.usage("30d".into(), 0).await?;
+    assert_eq!(usage.totals.requests, 1212);
+    assert_eq!(usage.warnings.len(), 1);
+    assert!(usage.warnings[0].contains("1212..1213"));
+    state.db.close().await?;
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsynchronized_clock_pauses_feeds_and_all_data_writes_until_recovery() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = calls.clone();
+    let (feed, task) = serve(Router::new().route(
+        "/",
+        get(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            prices()
+        }),
+    ))
+    .await;
+    let mut state = test_state(&temp, feed.clone()).await?;
+    state.pricing_sources = [feed.clone(), feed];
+    state.db.clock_synchronized.store(false, Ordering::Release);
+    assert!(state.sync_meter().await.is_err());
+    assert!(state.confirm_pricing("Claude Sonnet".into()).await.is_err());
+    assert!(
+        state
+            .db
+            .write(|db| {
+                db.requests
+                    .execute("INSERT INTO warnings VALUES ('bad clock')", [])?;
+                Ok(())
+            })
+            .await
+            .is_err()
+    );
+    let snapshot = state.refresh_pricing().await?;
+    assert!(snapshot.warnings.iter().any(|w| w.starts_with("clock:")));
+    assert!(snapshot.families.iter().all(|f| f.pending.is_none()));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    state.db.clock_synchronized.store(true, Ordering::Release);
+    let snapshot = state.refresh_pricing().await?;
+    assert!(snapshot.families.iter().all(|f| f.pending.is_some()));
+    assert!(!snapshot.warnings.iter().any(|w| w.starts_with("clock:")));
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    state.confirm_pricing("Claude Sonnet".into()).await?;
+    state.db.close().await?;
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn overload_sheds_requests_times_out_work_and_keeps_sse_open() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (upstream, upstream_task) = serve(Router::new().fallback(|| async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        StatusCode::SERVICE_UNAVAILABLE
+    }))
+    .await;
+    let state = test_state(&temp, upstream).await?;
+    let (url, task) = serve(router(state.clone())).await;
+    let client = reqwest::Client::new();
+    let mut stream = client.get(format!("{url}/v1/stream")).send().await?;
+    let mut pending = tokio::task::JoinSet::new();
+    for _ in 0..40 {
+        let client = client.clone();
+        let url = url.clone();
+        pending.spawn(async move {
+            client
+                .get(format!("{url}/v1/gpu"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+    }
+    let mut shed = 0;
+    let mut timed_out = 0;
+    while let Some(status) = pending.join_next().await {
+        match status? {
+            503 => shed += 1,
+            504 => timed_out += 1,
+            other => panic!("unexpected HTTP {other}"),
+        }
+    }
+    assert!(shed > 0 && timed_out > 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.chunk())
+            .await
+            .is_err()
+    );
+    state.shutdown.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), stream.chunk())
+            .await??
+            .is_none()
+    );
+    state.db.close().await?;
+    task.abort();
+    upstream_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn sigterm_exits_with_sse_clients_and_closes_pool_within_five_seconds() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir()?;
+    // Exercise the real boot clock probe without changing this machine's clock.
+    let probe = temp.path().join("timedatectl");
+    std::fs::write(&probe, "#!/bin/sh\necho no\n")?;
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755))?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    drop(listener);
+    let config = temp.path().join("services.toml");
+    std::fs::write(&config, "[[nodes]]\nname='factory-console'\nservices=[]")?;
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_factory-api"))
+        .env(
+            "PATH",
+            format!("{}:{}", temp.path().display(), std::env::var("PATH")?),
+        )
+        .args([
+            "--listen",
+            &address.to_string(),
+            "--meter-url",
+            "http://127.0.0.1:1",
+            "--db-path",
+        ])
+        .arg(temp.path().join("requests.db"))
+        .arg("--pricing-db-path")
+        .arg(temp.path().join("pricing.db"))
+        .arg("--services-config")
+        .arg(config)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let client = reqwest::Client::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(response) = client
+                .get(format!("http://{address}/v1/health"))
+                .send()
+                .await
+            {
+                assert_eq!(
+                    response.json::<Value>().await?["status"],
+                    "clock_unsynchronized"
+                );
+                return Ok::<_, anyhow::Error>(());
+            }
+            assert!(child.try_wait()?.is_none(), "child exited during startup");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let mut streams = Vec::new();
+    for _ in 0..3 {
+        streams.push(
+            client
+                .get(format!("http://{address}/v1/stream"))
+                .send()
+                .await?,
+        );
+    }
+    let start = std::time::Instant::now();
+    assert!(
+        tokio::process::Command::new("kill")
+            .args(["-TERM", &child.id().unwrap().to_string()])
+            .status()
+            .await?
+            .success()
+    );
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await??;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("database pool closed; shutdown complete")
+    );
+    assert!(start.elapsed() < Duration::from_secs(5));
+    eprintln!("SIGTERM with three SSE clients: {:?}", start.elapsed());
+    for mut stream in streams {
+        while stream.chunk().await?.is_some() {}
+    }
+    Ok(())
+}
+
+/// Run with: cargo test --release -p factory-api benchmark_100k -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "100k-row HTTP benchmark; run in release mode"]
+async fn benchmark_100k() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let state = test_state(&temp, "http://127.0.0.1:1".into()).await?;
+    let at = now_ms();
+    state
+        .db
+        .write(move |db| {
+            offline_refresh(
+                &mut db.pricing,
+                &pricing::parse_references(pricing::DEFAULT_CONFIG)?,
+                at / 1000 - 31 * 86400,
+            )?;
+            db.pricing
+                .confirm("Claude Sonnet", at / 1000 - 31 * 86400)?;
+            db.pricing
+                .confirm("ChatGPT mid-tier", at / 1000 - 31 * 86400)?;
+            factory_api::data::sync(
+                &mut db.requests,
+                (1..=100_000)
+                    .map(|id| RequestRecord {
+                        id,
+                        ts: at - (id % 29) * 86_400_000,
+                        endpoint: "/api/chat".into(),
+                        model: Some(format!("model-{}", id % 7)),
+                        prompt_eval_count: Some(37),
+                        eval_count: Some(19),
+                        prompt_eval_duration: Some(100_000_000),
+                        eval_duration: Some(1_000_000_000),
+                        total_duration: Some(id as u64 * 100_000),
+                        load_duration: Some(5_000_000),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )?;
+            Ok(())
+        })
+        .await?;
+    let (url, task) = serve(router(state.clone())).await;
+    let client = reqwest::Client::new();
+    for path in ["/v1/llm/usage?range=30d", "/v1/pricing"] {
+        let mut samples = vec![];
+        for _ in 0..40 {
+            let started = std::time::Instant::now();
+            let value = fetch(&client, &format!("{url}{path}")).await;
+            samples.push(started.elapsed());
+            if path.contains("usage") {
+                assert_eq!(
+                    value["totals"],
+                    json!({"requests":100_000,"prompt_tokens":3_700_000,"output_tokens":1_900_000})
+                );
+                let sonnet = value["spend_avoided"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["family"] == "Claude Sonnet")
+                    .unwrap();
+                assert!((sonnet["usd"].as_f64().unwrap() - 39.6).abs() < 1e-6);
+            } else {
+                assert!(
+                    value["families"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|f| f["selected"].is_object())
+                );
+            }
+        }
+        samples.sort();
+        let p95 = samples[37];
+        eprintln!(
+            "100k cached rows, 40 HTTP samples, {path}: p95={p95:?}, max={:?}",
+            samples[39]
+        );
+        assert!(p95 < Duration::from_millis(200), "{path}: p95 {p95:?}");
+    }
+    state.db.close().await?;
     task.abort();
     Ok(())
 }

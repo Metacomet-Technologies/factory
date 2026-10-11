@@ -55,6 +55,16 @@ systemctl is-active --quiet amp-runner.service
 systemctl is-active --quiet tailscaled.service
 curl -fsS --max-time 5 http://factory-gpu:11434/meter/health
 
+# Ordering after time-sync.target only works when a real synchronization waiter
+# is enabled. Keep this boot prerequisite enabled even after API rollback.
+if systemctl is-active --quiet chrony.service || systemctl is-active --quiet chronyd.service; then
+    clock_wait=chrony-wait.service
+else
+    systemctl is-active --quiet systemd-timesyncd.service || fail 'Enable chrony or systemd-timesyncd before installing.'
+    clock_wait=systemd-time-wait-sync.service
+fi
+[[ $(systemctl show "$clock_wait" --property=LoadState --value) == loaded ]] || fail "Install $clock_wait before installing factory-api."
+
 # Each snapshot records missing files too; rollback never touches databases/user.
 install -d -m 0700 /var/backups/factory-api
 snapshot=$(mktemp -d "/var/backups/factory-api/$(date -u +%Y%m%dT%H%M%S.%NZ).XXXXXX")
@@ -74,6 +84,7 @@ if [[ "$active" == active ]]; then systemctl stop factory-api.service; fi
 install -m 0755 "$binary" "$destination"
 install -m 0644 "$unit" "$installed_unit"
 systemctl daemon-reload
+systemctl enable --now "$clock_wait"
 systemctl enable factory-api.service
 systemctl restart factory-api.service
 wait_ready http://127.0.0.1:8080/v1/health

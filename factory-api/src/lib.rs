@@ -2,6 +2,7 @@ mod api;
 pub mod data;
 pub mod fleet;
 mod kiosk;
+pub mod pool;
 
 use anyhow::Result;
 use serde::de::DeserializeOwned;
@@ -9,10 +10,11 @@ use shared::{GpuSample, RequestRecord, factory_api::*};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast};
+use tokio_util::sync::CancellationToken;
 
 pub const INFERENCE_ENDPOINTS: [&str; 6] = [
     "/api/generate",
@@ -31,14 +33,14 @@ pub struct AppState {
     pub static_dir: PathBuf,
     pub config: Arc<fleet::Config>,
     pub client: reqwest::Client,
-    /// Feed ingestion boundary, replaceable for offline integration tests.
-    pub pricing_refresh:
-        fn(&mut pricing::Store, &[pricing::Reference], i64) -> Result<Vec<pricing::Item>>,
+    pub pricing_sources: [String; 2],
+    pricing_client: reqwest::Client,
+    pub db: Arc<pool::Pool>,
+    pub shutdown: CancellationToken,
     started: Instant,
     fleet: Arc<RwLock<Fleet>>,
     warnings: Arc<RwLock<BTreeMap<String, String>>>,
     events: broadcast::Sender<StreamEvent>,
-    pricing_write: Arc<Mutex<()>>,
 }
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -62,13 +64,7 @@ impl AppState {
             matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
             "invalid meter URL"
         );
-        let (requests, prices) = (db_path.clone(), pricing_db_path.clone());
-        data::blocking(move || {
-            data::open(&requests)?;
-            pricing::Store::open(&prices)?;
-            Ok(())
-        })
-        .await?;
+        let db = Arc::new(pool::Pool::open(db_path.clone(), pricing_db_path.clone()).await?);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
@@ -80,13 +76,49 @@ impl AppState {
             static_dir: "/var/lib/factory-api/kiosk".into(),
             config: Arc::new(config),
             client,
-            pricing_refresh: pricing::refresh_live,
+            pricing_sources: [pricing::OPENROUTER_URL.into(), pricing::LITELLM_URL.into()],
+            pricing_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .user_agent("factory-pricing/0.1")
+                .build()?,
+            db,
+            shutdown: CancellationToken::new(),
             started: Instant::now(),
             fleet: Default::default(),
             warnings: Default::default(),
             events: broadcast::channel(1024).0,
-            pricing_write: Default::default(),
         })
+    }
+    pub async fn check_clock(&self) -> bool {
+        let synchronized =
+            fleet::command("timedatectl", &["show", "-p", "NTPSynchronized", "--value"])
+                .await
+                .is_ok_and(|value| value.trim() == "yes");
+        self.db
+            .clock_synchronized
+            .store(synchronized, Ordering::Release);
+        self.warning(
+            "clock",
+            (!synchronized)
+                .then(|| "not synchronized; pricing refreshes and data writes paused".into()),
+        )
+        .await;
+        synchronized
+    }
+    fn require_clock(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.db.clock_synchronized.load(Ordering::Acquire),
+            "clock not synchronized; data writes paused"
+        );
+        Ok(())
+    }
+    async fn read_warnings(&self) -> Vec<String> {
+        let mut warnings: Vec<_> = self.warnings.read().await.values().cloned().collect();
+        if self.require_clock().is_err() && !warnings.iter().any(|w| w.starts_with("clock:")) {
+            warnings
+                .push("clock: not synchronized; pricing refreshes and data writes paused".into());
+        }
+        warnings
     }
     fn emit(&self, kind: &str, data: impl serde::Serialize) {
         let _ = self.events.send(StreamEvent {
@@ -116,23 +148,69 @@ impl AppState {
     }
     pub async fn sync_meter(&self) -> Result<()> {
         let result = async {
-            let records: Vec<RequestRecord> = self.get("/meter/requests?limit=500").await?;
-            let path = self.db_path.clone();
-            let new = data::blocking(move || data::sync(&path, records)).await?;
-            for r in new
-                .into_iter()
-                .filter(|r| INFERENCE_ENDPOINTS.contains(&r.endpoint.as_str()))
-            {
-                self.emit(
-                    "llm.request",
-                    LlmRequest {
-                        model: r.model,
-                        prompt_tokens: r.prompt_eval_count,
-                        output_tokens: r.eval_count,
-                        latency_ms: r.total_duration.map(data::ns_to_ms).unwrap_or(r.latency_ms),
-                        client_hostname: r.client_hostname,
-                    },
+            self.require_clock()?;
+            let mut cursor: i64 = self
+                .db
+                .read(|db| {
+                    Ok(db.requests.query_row(
+                        "SELECT COALESCE(MAX(id),0) FROM requests",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .await?;
+            loop {
+                let response = self
+                    .client
+                    .get(format!(
+                        "{}/meter/requests?after_id={cursor}&limit=500",
+                        self.meter_url
+                    ))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let next: i64 = response
+                    .headers()
+                    .get("next_after_id")
+                    .ok_or_else(|| anyhow::anyhow!("meter missing next_after_id"))?
+                    .to_str()?
+                    .parse()?;
+                let records: Vec<RequestRecord> = response.json().await?;
+                anyhow::ensure!(
+                    records.len() <= 500
+                        && records
+                            .iter()
+                            .map(|r| r.id)
+                            .try_fold(cursor, |previous, id| { (id > previous).then_some(id) })
+                            == Some(next),
+                    "invalid meter cursor page"
                 );
+                if records.is_empty() {
+                    break;
+                }
+                let new = self
+                    .db
+                    .write(move |db| data::sync(&mut db.requests, records))
+                    .await?;
+                cursor = next;
+                for r in new
+                    .into_iter()
+                    .filter(|r| INFERENCE_ENDPOINTS.contains(&r.endpoint.as_str()))
+                {
+                    self.emit(
+                        "llm.request",
+                        LlmRequest {
+                            model: r.model,
+                            prompt_tokens: r.prompt_eval_count,
+                            output_tokens: r.eval_count,
+                            latency_ms: r
+                                .total_duration
+                                .map(data::ns_to_ms)
+                                .unwrap_or(r.latency_ms),
+                            client_hostname: r.client_hostname,
+                        },
+                    );
+                }
             }
             Ok(())
         }
@@ -239,39 +317,87 @@ impl AppState {
         }
     }
     pub async fn pricing(&self) -> Result<Pricing> {
-        let path = self.pricing_db_path.clone();
         let warning = self
-            .warnings
-            .read()
+            .read_warnings()
             .await
-            .get("pricing")
-            .cloned()
             .into_iter()
+            .filter(|w| w.starts_with("pricing:") || w.starts_with("clock:"))
             .collect();
-        data::blocking(move || {
-            data::pricing_view(
-                &pricing::Store::open(path)?,
-                &pricing::parse_references(pricing::DEFAULT_CONFIG)?,
-                warning,
-            )
-        })
-        .await
+        self.db
+            .read(move |db| {
+                data::pricing_view(
+                    &db.pricing,
+                    &pricing::parse_references(pricing::DEFAULT_CONFIG)?,
+                    warning,
+                )
+            })
+            .await
     }
     pub async fn refresh_pricing(&self) -> Result<Pricing> {
-        let _guard = self.pricing_write.lock().await;
+        if self.require_clock().is_err() {
+            return self.pricing().await;
+        }
         let before = self.pricing().await?;
-        let path = self.pricing_db_path.clone();
-        let refresh = self.pricing_refresh;
-        let result = data::blocking(move || {
-            let mut store = pricing::Store::open(path)?;
-            refresh(
-                &mut store,
-                &pricing::parse_references(pricing::DEFAULT_CONFIG)?,
-                data::ms_to_seconds(now_ms()),
-            )?;
-            Ok(())
-        })
-        .await;
+        // No connection, transaction, or mutex is held while either feed is fetched.
+        let fetch = |index: usize| async move {
+            let text = self
+                .pricing_client
+                .get(&self.pricing_sources[index])
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?;
+            data::blocking(move || {
+                let models = if index == 0 {
+                    pricing::parse_openrouter(&text)?
+                } else {
+                    pricing::parse_litellm(&text)?
+                };
+                anyhow::ensure!(!models.is_empty(), "source returned no usable models");
+                Ok(models)
+            })
+            .await
+        };
+        let (primary, secondary) = tokio::join!(fetch(0), fetch(1));
+        let result = self
+            .db
+            .write(move |db| {
+                let at = data::ms_to_seconds(now_ms());
+                let mut items = vec![];
+                let mut source = |result: Result<Vec<pricing::Model>>, name: &str| match result {
+                    Ok(models) => models,
+                    Err(error) => {
+                        items.push(pricing::Item {
+                            fetched_at: at,
+                            kind: "warning".into(),
+                            family: "*".into(),
+                            message: format!("{name} unavailable: {error:#}"),
+                        });
+                        vec![]
+                    }
+                };
+                let primary = source(primary, "openrouter");
+                let secondary = source(secondary, "litellm");
+                anyhow::ensure!(
+                    !primary.is_empty() || !secondary.is_empty(),
+                    "both pricing sources unavailable: {}",
+                    items
+                        .iter()
+                        .map(|i| i.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+                db.pricing.refresh(
+                    &pricing::parse_references(pricing::DEFAULT_CONFIG)?,
+                    &primary,
+                    &secondary,
+                    at,
+                    items,
+                )?;
+                Ok(())
+            })
+            .await;
         self.warning("pricing", result.err().map(|e| e.to_string()))
             .await;
         let after = self.pricing().await?;
@@ -299,51 +425,73 @@ impl AppState {
         }
     }
     pub async fn confirm_pricing(&self, family: String) -> Result<Pricing> {
-        let _guard = self.pricing_write.lock().await;
+        self.require_clock()?;
         let before = self.pricing().await?;
-        let path = self.pricing_db_path.clone();
-        data::blocking(move || {
-            pricing::Store::open(path)?.confirm(&family, data::ms_to_seconds(now_ms()))?;
-            Ok(())
-        })
-        .await?;
+        self.db
+            .write(move |db| {
+                db.pricing.confirm(&family, data::ms_to_seconds(now_ms()))?;
+                Ok(())
+            })
+            .await?;
         let after = self.pricing().await?;
         self.pricing_events(&before, &after);
         Ok(after)
     }
     pub async fn usage(&self, range: String, since: i64) -> Result<Usage> {
-        let path = self.db_path.clone();
-        let prices = self.pricing_db_path.clone();
-        let warnings = self.warnings.read().await.values().cloned().collect();
-        data::blocking(move || data::usage(&path, &prices, range, since, warnings)).await
+        let warnings = self.read_warnings().await;
+        self.db
+            .read(move |db| data::usage(&db.requests, &db.pricing, range, since, warnings))
+            .await
     }
     pub fn start_collectors(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = Vec::new();
-        for kind in ["meter", "fleet", "gpu", "pricing"] {
+        for kind in ["meter", "fleet", "gpu", "pricing", "clock"] {
             let state = self.clone();
             tasks.push(tokio::spawn(async move {
                 let mut timer = tokio::time::interval(Duration::from_secs(match kind {
-                    "pricing" => 86400,
+                    // Retry promptly after clock synchronization; feed attempts stay daily.
+                    "pricing" | "clock" => 2,
                     "gpu" => 15,
                     _ => 30,
                 }));
                 timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut last_pricing = None::<Instant>;
                 loop {
-                    timer.tick().await;
-                    match kind {
-                        "meter" => {
-                            let _ = state.sync_meter().await;
-                        }
-                        "fleet" => state.collect_fleet().await,
-                        "gpu" => {
-                            let (current, _) = state.gpu_current().await;
-                            state.emit("gpu.sample", current);
-                        }
-                        _ => {
-                            if let Err(error) = state.refresh_pricing().await {
-                                tracing::error!(%error, "pricing refresh failed");
+                    tokio::select! { biased;
+                        _ = state.shutdown.cancelled() => break,
+                        _ = timer.tick() => (),
+                    }
+                    let collect = async {
+                        match kind {
+                            "meter" => {
+                                let _ = state.sync_meter().await;
+                            }
+                            "fleet" => state.collect_fleet().await,
+                            "gpu" => {
+                                let (current, _) = state.gpu_current().await;
+                                state.emit("gpu.sample", current);
+                            }
+                            "clock" => {
+                                state.check_clock().await;
+                            }
+                            _ => {
+                                if state.require_clock().is_ok()
+                                    && last_pricing
+                                        .is_none_or(|at| at.elapsed() >= Duration::from_secs(86400))
+                                {
+                                    if let Err(error) = state.refresh_pricing().await {
+                                        tracing::error!(%error, "pricing refresh failed");
+                                    }
+                                    if state.require_clock().is_ok() {
+                                        last_pricing = Some(Instant::now());
+                                    }
+                                }
                             }
                         }
+                    };
+                    tokio::select! { biased;
+                        _ = state.shutdown.cancelled() => break,
+                        _ = collect => (),
                     }
                 }
             }));
