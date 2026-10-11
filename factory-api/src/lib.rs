@@ -364,13 +364,13 @@ impl AppState {
         let result = self
             .db
             .write_pricing(&self.query_scope, move |db| {
-                let at = data::ms_to_seconds(now_ms());
+                let at = now_ms();
                 let mut items = vec![];
                 let mut source = |result: Result<Vec<pricing::Model>>, name: &str| match result {
                     Ok(models) => models,
                     Err(error) => {
                         items.push(pricing::Item {
-                            fetched_at: at,
+                            fetched_at_ms: at,
                             kind: "warning".into(),
                             family: "*".into(),
                             message: format!("{name} unavailable: {error:#}"),
@@ -430,7 +430,7 @@ impl AppState {
         let before = self.pricing().await?;
         self.db
             .write_pricing(&self.query_scope, move |db| {
-                db.confirm(&family, data::ms_to_seconds(now_ms()))?;
+                db.confirm(&family, now_ms())?;
                 Ok(())
             })
             .await?;

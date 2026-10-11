@@ -1000,11 +1000,13 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "factory-db",
  "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "toml",
 ]
 

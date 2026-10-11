@@ -1,14 +1,9 @@
 use anyhow::{Context, Result};
+use factory_db::money::{MicroUsdPerMtok, NanoUsd, request_cost};
 use rusqlite::Connection;
 use shared::{RequestRecord, factory_api::*};
 use std::{collections::BTreeMap, path::Path};
 
-pub fn ms_to_seconds(ms: i64) -> i64 {
-    ms.div_euclid(1000)
-}
-pub fn seconds_to_ms(seconds: i64) -> i64 {
-    seconds * 1000
-}
 pub fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
 }
@@ -85,14 +80,7 @@ pub fn spend(
     model_id: Option<String>,
     records: &[RequestRecord],
 ) -> Result<SpendAvoided> {
-    let history = store.history(
-        family,
-        records
-            .iter()
-            .map(|r| ms_to_seconds(r.ts))
-            .max()
-            .unwrap_or(0),
-    )?;
+    let history = store.history(family, records.iter().map(|r| r.ts).max().unwrap_or(0))?;
     let mut result = SpendAvoided {
         family: family.into(),
         model_id,
@@ -100,25 +88,38 @@ pub fn spend(
         estimated_usd: 0.0,
         unpriced_requests: 0,
     };
+    let mut priced = NanoUsd::default();
+    let mut estimated = NanoUsd::default();
     for record in records {
         let (Some(prompt), Some(output)) = (record.prompt_eval_count, record.eval_count) else {
             result.unpriced_requests += 1;
             continue;
         };
-        match history.rates_at(ms_to_seconds(record.ts)) {
+        match history.rates_at(record.ts) {
             Some((input, output_rate)) => {
-                result.usd += (prompt as f64 * input + output as f64 * output_rate) / 1_000_000.0
+                priced = priced.checked_add(request_cost(
+                    prompt,
+                    output,
+                    MicroUsdPerMtok(input),
+                    MicroUsdPerMtok(output_rate),
+                )?)?;
             }
             None => {
                 if let Some((input, output_rate)) = history.earliest {
-                    result.estimated_usd +=
-                        (prompt as f64 * input + output as f64 * output_rate) / 1_000_000.0;
+                    estimated = estimated.checked_add(request_cost(
+                        prompt,
+                        output,
+                        MicroUsdPerMtok(input),
+                        MicroUsdPerMtok(output_rate),
+                    )?)?;
                 } else {
                     result.unpriced_requests += 1;
                 }
             }
         }
     }
+    result.usd = priced.display_usd();
+    result.estimated_usd = estimated.display_usd();
     Ok(result)
 }
 pub fn pricing_view(
@@ -135,23 +136,23 @@ pub fn pricing_view(
             .map(|i| format!("{}: {}", i.family, i.message)),
     );
     let families = store
-        .show(references, ms_to_seconds(crate::now_ms()))?
+        .show(references, crate::now_ms())?
         .into_iter()
         .map(|s| Family {
             family: s.family,
             selected: s.selected.map(|s| Selection {
                 model_id: s.model_id,
-                effective_from_ms: seconds_to_ms(s.effective_from),
+                effective_from_ms: s.effective_from_ms,
             }),
             pending: s.pending.map(|s| Selection {
                 model_id: s.model_id,
-                effective_from_ms: seconds_to_ms(s.effective_from),
+                effective_from_ms: s.effective_from_ms,
             }),
             rates: s.rates.map(|r| Rates {
-                input_per_mtok: r.model.input_per_mtok,
-                output_per_mtok: r.model.output_per_mtok,
+                input_per_mtok: r.model.input_micro_usd_per_mtok as f64 / 1_000_000.0,
+                output_per_mtok: r.model.output_micro_usd_per_mtok as f64 / 1_000_000.0,
                 source: r.source,
-                fetched_at_ms: seconds_to_ms(r.fetched_at),
+                fetched_at_ms: r.fetched_at_ms,
             }),
         })
         .collect();
@@ -193,7 +194,7 @@ pub fn usage(
     };
     let references = pricing::parse_references(pricing::DEFAULT_CONFIG)?;
     let spend_avoided = store
-        .show(&references, ms_to_seconds(crate::now_ms()))?
+        .show(&references, crate::now_ms())?
         .into_iter()
         .map(|s| spend(store, &s.family, s.selected.map(|s| s.model_id), &records))
         .collect::<Result<_>>()?;
@@ -270,8 +271,6 @@ mod tests {
     use super::*;
     #[test]
     fn units_and_tps() {
-        assert_eq!(ms_to_seconds(1_791_695_440_999), 1_791_695_440);
-        assert_eq!(seconds_to_ms(1_791_695_440), 1_791_695_440_000);
         assert_eq!(ns_to_ms(2_750_000), 2.75);
         assert_eq!(tps(Some(23), Some(2_000_000_000)), Some(11.5));
         assert_eq!(tps(Some(23), Some(0)), None);
@@ -281,15 +280,22 @@ mod tests {
     fn priced_estimated_unpriced_and_missing_tokens() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("pricing.db");
+        pricing::migrate(&path)?;
         let mut store = pricing::Store::open(&path)?;
         let references = pricing::parse_references("[[reference]]\nname='test'\nmatch='^model$'")?;
         let model = pricing::Model {
             model_id: "model".into(),
-            input_per_mtok: 2.0,
-            output_per_mtok: 8.0,
-            released_at: Some(1),
+            input_micro_usd_per_mtok: 2_000_000,
+            output_micro_usd_per_mtok: 8_000_000,
+            released_at_ms: Some(1),
         };
-        store.refresh(&references, std::slice::from_ref(&model), &[], 100, vec![])?;
+        store.refresh(
+            &references,
+            std::slice::from_ref(&model),
+            &[],
+            100_000,
+            vec![],
+        )?;
         let record = |ts, prompt| RequestRecord {
             ts,
             prompt_eval_count: prompt,
@@ -308,18 +314,77 @@ mod tests {
             record(110_000, Some(250_000)),
         ];
         assert_eq!(spend(&store, "test", None, &rows)?.unpriced_requests, 6);
-        store.confirm("test", 110)?;
+        store.confirm("test", 110_000)?;
         // Later rates must not leak into either historical cost or pre-history estimates.
         let later = pricing::Model {
-            input_per_mtok: 9.0,
-            output_per_mtok: 30.0,
+            input_micro_usd_per_mtok: 9_000_000,
+            output_micro_usd_per_mtok: 30_000_000,
             ..model
         };
-        store.refresh(&references, &[later], &[], 130, vec![])?;
+        store.refresh(&references, &[later], &[], 130_000, vec![])?;
         let spend = spend(&store, "test", Some("model".into()), &rows)?;
         assert_eq!(
             (spend.usd, spend.estimated_usd, spend.unpriced_requests),
             (6.5, 5.5, 2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spend_rounds_each_request_once_and_checks_totals() -> Result<()> {
+        let mut store = pricing::Store::in_memory()?;
+        let references = pricing::parse_references("[[reference]]\nname='test'\nmatch='^model$'")?;
+        let mut model = pricing::Model {
+            model_id: "model".into(),
+            input_micro_usd_per_mtok: 1500,
+            output_micro_usd_per_mtok: 0,
+            released_at_ms: Some(1),
+        };
+        store.refresh(&references, std::slice::from_ref(&model), &[], 10, vec![])?;
+        store.confirm("test", 11)?;
+        let row = RequestRecord {
+            ts: 11,
+            prompt_eval_count: Some(1),
+            eval_count: Some(0),
+            ..Default::default()
+        };
+        let rows = [row.clone(), row.clone()];
+        let result = spend(&store, "test", None, &rows)?;
+        assert_eq!(result.usd, 0.000000004);
+        assert_eq!(result.estimated_usd, 0.0);
+        assert_eq!(store.cost("test", 1, 0, 11)?.0, 2);
+        let early = [
+            RequestRecord {
+                ts: 10,
+                ..row.clone()
+            },
+            RequestRecord {
+                ts: 10,
+                ..row.clone()
+            },
+        ];
+        assert_eq!(
+            spend(&store, "test", None, &early)?.estimated_usd,
+            0.000000004
+        );
+        model.input_micro_usd_per_mtok = i64::MAX;
+        store.refresh(&references, &[model], &[], 11, vec![])?;
+        let large = RequestRecord {
+            prompt_eval_count: Some(1000),
+            ..row
+        };
+        assert!(spend(&store, "test", None, &[large.clone(), large.clone()]).is_err());
+        assert!(
+            spend(
+                &store,
+                "test",
+                None,
+                &[RequestRecord {
+                    prompt_eval_count: Some(1001),
+                    ..large
+                }]
+            )
+            .is_err()
         );
         Ok(())
     }
@@ -330,25 +395,26 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let db = open(&temp.path().join("requests.db"))?;
         let pricing_path = temp.path().join("pricing.db");
+        pricing::migrate(&pricing_path)?;
         let mut writer = pricing::Store::open(&pricing_path)?;
         let references = pricing::parse_references(pricing::DEFAULT_CONFIG)?;
         let model = pricing::Model {
             model_id: "anthropic/claude-sonnet-5.5".into(),
-            input_per_mtok: 2.0,
-            output_per_mtok: 7.0,
-            released_at: Some(1),
+            input_micro_usd_per_mtok: 2_000_000,
+            output_micro_usd_per_mtok: 7_000_000,
+            released_at_ms: Some(1),
         };
         writer.refresh(&references, std::slice::from_ref(&model), &[], 10, vec![])?;
         writer.confirm("Claude Sonnet", 20)?;
         let secondary = pricing::Model {
-            input_per_mtok: 90.0,
+            input_micro_usd_per_mtok: 90_000_000,
             ..model.clone()
         };
-        // Same-second refresh and source ties must choose the latest refresh's primary rate.
+        // Same-millisecond refresh and source ties choose the latest refresh's primary rate.
         writer.refresh(
             &references,
             &[pricing::Model {
-                input_per_mtok: 1.0,
+                input_micro_usd_per_mtok: 1_000_000,
                 ..model.clone()
             }],
             &[],
@@ -364,20 +430,20 @@ mod tests {
         )?;
         let newer = pricing::Model {
             model_id: "anthropic/claude-sonnet-6".into(),
-            input_per_mtok: 5.0,
+            input_micro_usd_per_mtok: 5_000_000,
             ..model.clone()
         };
         writer.refresh(&references, &[newer], &[], 40, vec![])?;
         writer.confirm("Claude Sonnet", 50)?;
         writer.connection().execute_batch(
             "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000)
-             INSERT INTO price_snapshots SELECT x,'openrouter','noise-'||(x%101),2,7,1,1 FROM n;
+             INSERT INTO price_snapshots(fetched_at_ms,source,model_id,input_micro_usd_per_mtok,output_micro_usd_per_mtok,released_at_ms,refresh_id) SELECT x,'openrouter','noise-'||(x%101),2,7,1,1 FROM n;
              WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<3000)
-             INSERT INTO reference_selection SELECT 'noise-'||(x%37),'noise-'||(x%101),x,1,1 FROM n;
+             INSERT INTO reference_selection(family,model_id,effective_from_ms,confirmed,refresh_id) SELECT 'noise-'||(x%37),'noise-'||(x%101),x,1,1 FROM n;
              WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000)
-             INSERT INTO refreshes SELECT x FROM n;
+             INSERT INTO refreshes(fetched_at_ms) SELECT x FROM n;
              WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5000)
-             INSERT INTO pricing_items SELECT x,'warning','noise','fixture',x%1000 FROM n;
+             INSERT INTO pricing_items(fetched_at_ms,kind,family,message,refresh_id) SELECT x,'warning','noise','fixture',1+x%1000 FROM n;
              ANALYZE;",
         )?;
         let history = Connection::open(&pricing_path)?;
@@ -386,7 +452,7 @@ mod tests {
         let mut db = Tracked::new(db, |db| db)?;
         let row = |id| RequestRecord {
             id,
-            ts: 30_000,
+            ts: 30,
             endpoint: "/api/chat".into(),
             prompt_eval_count: Some(1_000_000),
             eval_count: Some(2_000_000),
@@ -427,11 +493,10 @@ mod tests {
             store.history("Claude Sonnet", 60)
         })?;
         assert_eq!(history.rates_at(19), None);
-        assert_eq!(history.rates_at(20), Some((2.0, 7.0)));
-        assert_eq!(history.rates_at(49), Some((2.0, 7.0)));
-        assert_eq!(history.rates_at(50), Some((5.0, 7.0)));
+        assert_eq!(history.rates_at(20), Some((2_000_000, 7_000_000)));
+        assert_eq!(history.rates_at(49), Some((2_000_000, 7_000_000)));
+        assert_eq!(history.rates_at(50), Some((5_000_000, 7_000_000)));
         // Replay actual traced templates with bound values, never expanded SQL.
-        // Legacy sort exceptions are tied to the rate tie-breaks, not all queries.
         use factory_db::explain::{self, Exception, ExceptionKind, RequiredSearch};
         db.run(&Scope::default(), Category::Setup, |db| {
             db.execute_batch("ANALYZE")
@@ -473,9 +538,12 @@ mod tests {
             } else if sql.contains("FROM price_snapshots") {
                 required.push(RequiredSearch {
                     table: "price_snapshots",
-                    index: Some("snapshot_lookup"),
+                    index: Some(if sql.contains("ORDER BY fetched_at_ms,refresh_id") {
+                        "snapshot_earliest"
+                    } else {
+                        "snapshot_lookup"
+                    }),
                 });
-                exceptions.push(Exception { kind: ExceptionKind::ReviewedLegacySort, table: "", reason: "legacy refresh/source/rowid tie ordering; owner indexes arrive in step 4" });
             } else if sql.contains("FROM pricing_items") {
                 required.push(RequiredSearch {
                     table: "pricing_items",
@@ -484,7 +552,11 @@ mod tests {
             } else {
                 required.push(RequiredSearch {
                     table: "reference_selection",
-                    index: Some("selection_confirmed"),
+                    index: Some(if sql.contains("confirmed=0") {
+                        "selection_pending"
+                    } else {
+                        "selection_lookup"
+                    }),
                 });
             }
             explain::validate(&plan, &required, &exceptions)

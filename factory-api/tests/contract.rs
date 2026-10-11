@@ -47,15 +47,15 @@ fn offline_refresh(
     let models = [
         pricing::Model {
             model_id: "anthropic/claude-sonnet-5.5".into(),
-            input_per_mtok: 3.0,
-            output_per_mtok: 15.0,
-            released_at: Some(1),
+            input_micro_usd_per_mtok: 3_000_000,
+            output_micro_usd_per_mtok: 15_000_000,
+            released_at_ms: Some(1),
         },
         pricing::Model {
             model_id: "openai/gpt-5.6-sol".into(),
-            input_per_mtok: 2.0,
-            output_per_mtok: 10.0,
-            released_at: Some(2),
+            input_micro_usd_per_mtok: 2_000_000,
+            output_micro_usd_per_mtok: 10_000_000,
+            released_at_ms: Some(2),
         },
     ];
     store.refresh(references, &models, &models, at, vec![])
@@ -183,6 +183,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
     "#,
         meter_url.trim_start_matches("http://")
     ))?;
+    pricing::migrate(temp.path().join("pricing.db"))?;
     let mut state = AppState::new(
         meter_url,
         temp.path().join("requests.db"),
@@ -591,6 +592,7 @@ async fn mixed_endpoints_only_count_and_stream_inference() -> Result<()> {
     )
     .await;
     let config = fleet::Config::parse("[[nodes]]\nname='factory-console'\nservices=[]")?;
+    pricing::migrate(temp.path().join("pricing.db"))?;
     let state = AppState::new(
         meter_url,
         temp.path().join("requests.db"),
@@ -604,9 +606,9 @@ async fn mixed_endpoints_only_count_and_stream_inference() -> Result<()> {
         offline_refresh(
             &mut prices,
             &pricing::parse_references(pricing::DEFAULT_CONFIG)?,
-            at - 120,
+            (at - 120) * 1000,
         )?;
-        prices.confirm("Claude Sonnet", at - 60)?;
+        prices.confirm("Claude Sonnet", (at - 60) * 1000)?;
     }
     let (url, api_task) = serve(router(state.clone())).await;
     let client = reqwest::Client::new();
@@ -701,6 +703,7 @@ async fn runtime_kiosk_serving_and_api_isolation() -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let temp = tempfile::tempdir()?;
     let root = temp.path().join("kiosk");
+    pricing::migrate(temp.path().join("pricing.db"))?;
     let mut state = AppState::new(
         "http://127.0.0.1:1".into(),
         temp.path().join("requests.db"),
@@ -875,6 +878,7 @@ async fn runtime_kiosk_serving_and_api_isolation() -> Result<()> {
 }
 
 async fn test_state(temp: &tempfile::TempDir, meter_url: String) -> Result<AppState> {
+    pricing::migrate(temp.path().join("pricing.db"))?;
     let state = AppState::new(
         meter_url,
         temp.path().join("requests.db"),
@@ -1030,8 +1034,7 @@ async fn cursor_sync_recovers_multiple_pages_and_restarts_without_false_gaps() -
     Ok(())
 }
 
-/// Worst successful views: both families have selected and pending rates. Refresh
-/// itself remains step-4 debt (P6); do not conceal it behind an error-only budget.
+/// Worst successful views: both families have selected and pending rates.
 #[tokio::test]
 async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
     const USAGE: usize = 16;
@@ -1039,7 +1042,7 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
     const CONFIRM: usize = 29;
     const NO_DATABASE: usize = 0;
     const REQUESTS_SETUP: usize = 72;
-    const PRICING_SETUP: usize = 80;
+    const PRICING_SETUP: usize = 74;
     for n in [3usize, 1001] {
         let temp = tempfile::tempdir()?;
         let at = now_ms();
@@ -1074,7 +1077,7 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
         std::fs::write(state.static_dir.join("index.html"), "fixture".repeat(n))?;
         state.db.write_pricing(&factory_db::Scope::default(), move |store| {
             let references = pricing::parse_references(pricing::DEFAULT_CONFIG)?;
-            let start = at / 1000 - 10000;
+            let start = at - 10_000_000;
             offline_refresh(store, &references, start)?;
             store.confirm("Claude Sonnet", start)?;
             store.confirm("ChatGPT mid-tier", start)?;
@@ -1082,13 +1085,13 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
             for i in 1..=if n == 3 { 4 } else { 31 } {
                 offline_refresh(store, &references, start + i)?;
                 if i % 3 == 0 {
-                    store.connection().execute("INSERT INTO reference_selection VALUES ('Claude Sonnet','anthropic/claude-sonnet-5.5',?1,1,1)", [start + i])?;
+                    store.connection().execute("INSERT INTO reference_selection(family,model_id,effective_from_ms,confirmed,refresh_id) VALUES ('Claude Sonnet','anthropic/claude-sonnet-5.5',?1,1,1)", [start + i])?;
                 }
             }
             store.refresh(&references, &[
-                pricing::Model { model_id: "anthropic/claude-sonnet-6".into(), input_per_mtok: 9.0, output_per_mtok: 21.0, released_at: Some(3) },
-                pricing::Model { model_id: "openai/gpt-6-sol".into(), input_per_mtok: 5.0, output_per_mtok: 11.0, released_at: Some(4) },
-            ], &[], at / 1000 - 2, vec![])?;
+                pricing::Model { model_id: "anthropic/claude-sonnet-6".into(), input_micro_usd_per_mtok: 9_000_000, output_micro_usd_per_mtok: 21_000_000, released_at_ms: Some(3) },
+                pricing::Model { model_id: "openai/gpt-6-sol".into(), input_micro_usd_per_mtok: 5_000_000, output_micro_usd_per_mtok: 11_000_000, released_at_ms: Some(4) },
+            ], &[], at - 2000, vec![])?;
             Ok(())
         }).await?;
         let sync = factory_db::Scope::default();
@@ -1207,6 +1210,69 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
             eprintln!("n={n} {path}: {:?}", scope.counts());
             task.abort();
         }
+        let mut primary = Vec::new();
+        let mut secondary = serde_json::Map::new();
+        for i in 0..n {
+            let (id, provider) = match i {
+                0 => ("claude-sonnet-7".to_owned(), "anthropic"),
+                1 => ("gpt-7-sol".to_owned(), "openai"),
+                _ => (format!("gpt-noise-{i}"), "openai"),
+            };
+            primary.push(json!({"id":format!("{provider}/{id}"),"created":10,"pricing":{"prompt":"0.000002","completion":"0.000008"}}));
+            secondary.insert(id, json!({"litellm_provider":provider,"input_cost_per_token":0.000002,"output_cost_per_token":0.000008}));
+        }
+        let primary = json!({"data":primary});
+        let secondary = Value::Object(secondary);
+        let (feed, feed_task) = serve(
+            Router::new()
+                .route(
+                    "/primary",
+                    get(move || {
+                        let body = primary.clone();
+                        async move { Json(body) }
+                    }),
+                )
+                .route(
+                    "/secondary",
+                    get(move || {
+                        let body = secondary.clone();
+                        async move { Json(body) }
+                    }),
+                ),
+        )
+        .await;
+        state.pricing_sources = [format!("{feed}/primary"), format!("{feed}/secondary")];
+        let scope = factory_db::Scope::default();
+        let (url, task) = serve(router(state.clone()).layer(axum::Extension(scope.clone()))).await;
+        let response = client
+            .post(format!("{url}/v1/pricing/refresh"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        assert_eq!(
+            response["families"][0]["pending"]["model_id"],
+            "anthropic/claude-sonnet-7"
+        );
+        assert_eq!(
+            response["families"][1]["pending"]["model_id"],
+            "openai/gpt-7-sol"
+        );
+        let warnings = response["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2);
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.as_str().unwrap().contains("cross-check unavailable"))
+        );
+        // Two views (8 before / 9 after), six fixed job statements, then batches.
+        assert_eq!(scope.counts().data, 17 + 6 + (2 * n).div_ceil(100) + 1 + 1);
+        assert_eq!(scope.counts().transaction, 6);
+        assert_eq!((scope.counts().setup, scope.counts().maintenance), (0, 0));
+        eprintln!("n={n} /v1/pricing/refresh: {:?}", scope.counts());
+        task.abort();
+        feed_task.abort();
         state.query_scope = factory_db::Scope::default();
         assert!(state.gpu_current().await.0.is_some());
         assert_eq!(state.query_scope.counts().data, NO_DATABASE);
@@ -1288,6 +1354,70 @@ async fn unsynchronized_clock_pauses_feeds_and_all_data_writes_until_recovery() 
 }
 
 #[tokio::test]
+async fn explicit_migrate_and_startup_version_gate() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("pricing.db");
+    let binary = env!("CARGO_BIN_EXE_factory-api");
+    let migrate = || {
+        std::process::Command::new(binary)
+            .arg("migrate")
+            .arg("--pricing-db")
+            .arg(&path)
+            .output()
+    };
+    for version in [None, Some(0), Some(2)] {
+        if let Some(version) = version {
+            let db = rusqlite::Connection::open(&path)?;
+            db.pragma_update(None, "user_version", version)?;
+        }
+        let output = tokio::process::Command::new(binary)
+            .arg("--pricing-db-path")
+            .arg(&path)
+            .arg("--db-path")
+            .arg(temp.path().join("requests.db"))
+            .arg("--listen")
+            .arg("127.0.0.1:0")
+            .output()
+            .await?;
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("factory-api migrate --pricing-db")
+        );
+        assert!(!temp.path().join("requests.db").exists());
+    }
+    let db = rusqlite::Connection::open(&path)?;
+    db.pragma_update(None, "user_version", 0)?;
+    db.execute_batch(include_str!("../../pricing/tests/fixtures/v0.sql"))?;
+    drop(db);
+    let before = std::fs::read(&path)?;
+    let output = migrate()?;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("legacy pricing DB found; move it aside first (the installer does this)")
+    );
+    assert_eq!(std::fs::read(&path)?, before);
+    std::fs::rename(&path, temp.path().join("pricing.v0.db"))?;
+    for _ in 0..2 {
+        let output = migrate()?;
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)?,
+            "pricing user_version=1; tables: price_snapshots, pricing_items, reference_selection, refreshes\n"
+        );
+    }
+    let state = AppState::new(
+        "http://127.0.0.1:1".into(),
+        temp.path().join("requests.db"),
+        path,
+        fleet::Config { nodes: vec![] },
+    )
+    .await?;
+    state.db.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn overload_sheds_requests_times_out_work_and_keeps_sse_open() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (upstream, upstream_task) = serve(Router::new().fallback(|| async {
@@ -1344,6 +1474,7 @@ async fn overload_sheds_requests_times_out_work_and_keeps_sse_open() -> Result<(
 async fn sigterm_exits_with_sse_clients_and_closes_pool_within_five_seconds() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir()?;
+    pricing::migrate(temp.path().join("pricing.db"))?;
     // Exercise the real boot clock probe without changing this machine's clock.
     let probe = temp.path().join("timedatectl");
     std::fs::write(&probe, "#!/bin/sh\necho no\n")?;
@@ -1440,10 +1571,10 @@ async fn benchmark_100k() -> Result<()> {
             offline_refresh(
                 db,
                 &pricing::parse_references(pricing::DEFAULT_CONFIG)?,
-                at / 1000 - 31 * 86400,
+                at - 31 * 86_400_000,
             )?;
-            db.confirm("Claude Sonnet", at / 1000 - 31 * 86400)?;
-            db.confirm("ChatGPT mid-tier", at / 1000 - 31 * 86400)?;
+            db.confirm("Claude Sonnet", at - 31 * 86_400_000)?;
+            db.confirm("ChatGPT mid-tier", at - 31 * 86_400_000)?;
             Ok(())
         })
         .await?;

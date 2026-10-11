@@ -387,16 +387,16 @@ physical-GPU history. Remove duplicate sample JSON, keep wire `ts` compatibility
 
 API `sync_state`: `id INTEGER PRIMARY KEY CHECK(id=1)`, `last_after_id INTEGER NOT
 NULL CHECK(last_after_id>=0)`, `synced_at_ms INTEGER NOT NULL CHECK(synced_at_ms>=0)`.
-STRICT singleton, initialized from existing MAX(id), not recalculated after
-pruning. Commit cache rows and cursor in one transaction; emit SSE only afterward.
+STRICT singleton, initialized to zero for migration 3's empty rebuild, not
+recalculated after pruning. Commit cache rows and cursor in one transaction; emit SSE only afterward.
 Use ascending cursor pages and a bounded catch-up loop. Numeric ID discontinuities
 are diagnostic, not conclusive proof of lost committed rows after AUTOINCREMENT;
 meter must expose its oldest retained ID for retention-loss detection. A restored
 meter whose maximum ID is below the API cursor requires explicit reconciliation,
 not automatic cursor advancement or silently treating it as an empty page.
 Before costs/rollups activate, backfill missing retained history using cursor
-pages starting at the relevant earlier IDs; the migrated MAX(id) checkpoint alone
-does not recover old gaps. After activation, reject a newly discovered lower ID
+pages starting at `after_id=0`; a legacy MAX(id) checkpoint alone does not recover
+old gaps. After activation, reject a newly discovered lower ID
 at or below the rollup checkpoint from normal sync and require explicit aggregate
 reconciliation. Higher-ID late timestamps are handled by the normal job. Do not
 silently insert lower-ID backfill that an ID checkpoint would never aggregate.
@@ -408,7 +408,16 @@ NULL resolution; don't invent past dates. Index `(resolved_at_ms,last_seen_ms)`.
 Unresolved coverage gaps stay visible; resolve only after verified backfill or
 operator acknowledgement, never automatically on a successful new poll.
 
-### Pricing: migrate early, preserve all history
+### Pricing v1: rebuild empty, preserve the legacy file
+
+Migration 1 creates this schema only on an empty database via `factory-db`.
+The installer stops factory-api, verifies a SQLite backup, and moves the old
+file and WAL/SHM to `pricing.v0.db`. It never copies legacy rows or deletes the
+old file. It runs `factory-api migrate --pricing-db <path>` as `factory-api`
+before starting the new binary. A rerun on v1 does not rebuild. Both API startup
+and the pricing CLI refuse any version other than v1; runtime opens perform no
+pricing DDL. A populated version-zero file is refused without writes, not
+adopted by fingerprint. After startup, refresh once and confirm both families.
 
 ```sql
 CREATE TABLE refreshes (
@@ -425,6 +434,8 @@ CREATE TABLE price_snapshots (
 ) STRICT;
 CREATE INDEX snapshot_lookup ON price_snapshots(
   model_id,fetched_at_ms DESC,refresh_id DESC,(source='openrouter') DESC,id DESC);
+CREATE INDEX snapshot_earliest ON price_snapshots(
+  model_id,fetched_at_ms,refresh_id,(source='openrouter') DESC,id DESC);
 CREATE INDEX snapshot_release ON price_snapshots(model_id,released_at_ms DESC);
 CREATE INDEX snapshot_refresh ON price_snapshots(refresh_id);
 CREATE TABLE reference_selection (
@@ -449,23 +460,21 @@ CREATE TABLE pricing_items (
 CREATE INDEX items_refresh ON pricing_items(refresh_id,id);
 ```
 
-Copy **each old rowid to its table's explicit ID**. Preserve refresh_id values,
-including same-second refreshes, so ordering and pending withdrawal do not change.
-Do not deduplicate historical rows or add uniqueness not present in the old
-contract. Foreign keys are database-local; model IDs are external feed identifiers.
-Batch `show`/history reads through pricing's public library instead of letting
-factory-api duplicate private SQL. Earliest fallback needs its own correctly
-indexed ascending order variant if the descending lookup index leaves a sort;
-verify its complete order with the bundled EQP helper before choosing that index.
+No legacy identities or rates are converted. New history uses explicit IDs for
+same-millisecond ties and pending withdrawal, preserving the selection semantics.
+Foreign keys are database-local; model IDs are external feed identifiers.
+API history reads use pricing's public library. `snapshot_earliest` covers the
+mixed ascending-time/descending-source earliest fallback; hot rate queries name
+their matching index because bundled SQLite otherwise sometimes chooses the
+opposite time order and adds a temporary sort. EXPLAIN tests require no such sort.
 
 Money rules:
 
-- Legacy REAL USD/Mtok becomes nearest integer micro-USD/Mtok, nonnegative ties
-  rounded half-up. First validate finite/nonnegative values and checked range;
-  record every changed rate and the rounding delta in the migration report.
-  Legacy floating-point input cannot recover an original exact decimal; report
-  that limit. New feed parsing uses decimal strings/JSON numeric lexemes with
-  checked integer decimal scaling, never an intermediate f64 money value.
+- Pricing does not convert legacy REAL money and has no rounding report.
+  Feed parsing uses decimal strings/JSON numeric lexemes with checked integer
+  scaling by 10^12 from USD/token to micro-USD/Mtok, never an intermediate f64.
+  Negative, nonfinite, out-of-range and fractional-micro-unit rates are rejected;
+  trailing decimal zeroes and exponent notation retain their exact values.
 - For each complete-token request and family, compute numerator using checked
   i128: `prompt_tokens * input_micro_usd_per_mtok + output_tokens * output_micro_usd_per_mtok`.
   Cost is `(numerator + 500) / 1000` nano-dollars, half-up **once per request**,
@@ -672,9 +681,9 @@ maintenance statements are counted separately, never hidden in data ceilings.
 | API GPU | Measured ceiling **0** local; target after step 5: **0 local, ≤2 upstream history** (upstream enforcement awaits meter adoption) |
 | API usage | Measured ceiling **16** total reads for 24h/7d/30d with two selected and pending families; target after step 5: **≤8**, regardless of R |
 | API pricing / confirm | Measured ceilings **9 / 29** across all views and confirmation, including HTTP confirmation preflight; target after step 5: **≤3 / ≤12** |
-| API pricing refresh | **No refresh budget test yet**: owner refresh N+1 (audit P6) is step-4 debt. Target after step 5: **≤6 view reads** plus the pricing-refresh job budget below |
+| API pricing refresh | Measured **26 / 46** for 3 / 1,001 models per source, two asymmetric families: 17 before/after view reads + job formula below. Worst view ceiling is 18. Target after step 5: **≤6 view reads** plus job budget |
 | API meter-sync page | Measured job ceiling **1 + ceil(n/100) + ceil(g/100)**, g gap warnings, plus **1 cursor read per sync run**; both inserts batch 100 rows, no per-row SELECT. Target after step 5: **≤10 + 2*ceil(n/100)** including pricing history and separate raw/cost batches; n≤5,000 (current wire pages ≤500) |
-| Pricing refresh | **Unenforced until step 4 (P6)**. Target: ≤6 + ceil(M/100) + ceil(B/100) + ceil(I/100), with bulk release history; no S per-model reads; M is source rows, B pending rows, I items |
+| Pricing refresh | **P6 fixed and enforced:** ≤6 + ceil(M/100) + ceil(B/100) + ceil(I/100) for two configured families. Measured **9 / 29** with 3 / 1,001 fallback source rows, two pending rows and 10 / 1,008 items. One bulk release-history read, no S per-model reads; M is total source rows, B pending rows, I items |
 | Rollup/retention | ≤16 per ≤5,000-row batch per database; pruning chunk ≤5,000; cost families fixed by input configuration |
 | GPU sampling | G+1 data statements, plus one transaction; G physical GPUs |
 
@@ -685,8 +694,9 @@ All-gap sync fixtures measure 4 and 26 statements respectively (page jobs 3 and
 11/11/3, plus the initial cursor read). The inherited single-selected-family
 case remains 13 reads for 1 and 1,000 rows; it is not the worst successful view.
 Usage/pricing/HTTP confirm additionally count 4/2/8 transaction statements.
-Fresh API startup counts 72 requests-DB and 80 pricing-DB setup statements across
-all six connections, plus one startup optimize per writer. Tests reject setup or
+Fresh API startup counts 72 requests-DB and 74 pricing-DB setup statements across
+all six connections, plus one startup optimize per writer and a separate read-only
+pricing version preflight. Tests reject setup or
 maintenance statements inside request scopes. Runtime metrics remain MET-76.
 
 Each budget must be exercised with small and large **successful** workloads,
@@ -697,8 +707,8 @@ Budget constants live next to owning endpoint/job tests; any increase needs a
 reviewed doc change. Setup has its own per-pool-start budget; zero setup statements
 are allowed inside a row loop.
 
-Step 3 adoption: **factory-api uses `factory-db` pool, settings, scoped statement
-counter and EXPLAIN helper, not migrations**. Each file has one writer plus two
+Step 4 adoption: **factory-api and the pricing CLI use `factory-db` pool/settings;
+pricing uses its explicit migration runner**. Each file has one writer plus two
 readers on dedicated OS threads (six total), with 1,024 outstanding jobs per file,
 explicit overload, cancelled-job skipping, persistent 64 MiB reader caches and
 short query-only snapshots. Usage materializes cache rows before opening its
@@ -713,21 +723,18 @@ counts VM instructions. The counter uses exported SQLite `trace_v2` with an owne
 per-connection context and explicit scope handles, including across both files;
 no global reset or thread-local scope. Existing bundled/trace features suffice.
 EXPLAIN tests replay traced SQL templates with bound values on analyzed fixtures.
-Exceptions explicitly retain complete warning reads and legacy pricing sorts
-for refresh/source/rowid ties; pricing's step-4 indexes must remove those sorts.
+Exceptions retain complete warning reads and the incoming model-ID JSON list.
+There are no legacy pricing sort exceptions. Release history searches
+`snapshot_release` once for the incoming set; items search `items_refresh`.
 
-Transitional debt: startup's existing `IF NOT EXISTS` DDL is unchanged, not a
-migration; API cache adopts the runner in numbered migration 3. Pricing adopts
-shared infrastructure and migrations in step 4; meter adopts in its later typed
-schema step, preserving FIFO visibility. Pricing's narrow connection constructor/
-accessor integration removes its 1,000 ms timeout override so the API can apply
-5,000 ms; the standalone pricing CLI remains unadopted. **Audit P6 refresh N+1**
-(one release-history SELECT per secondary model, plus per-row writes) remains
-known step-4 debt, with no refresh budget test in this PR. No schema/unit/pricing
-behavior changes or production migrations occur in step 3. The runner ships
-tested only on disposable sample schemas. Costs, rollups and retention follow.
-Enforcement is `cargo test --workspace`; this PR adds no CI workflow. These
-explicit legacy debts are not permission to introduce new per-row SQL.
+Transitional debt: only the API cache retains startup `IF NOT EXISTS` DDL until
+numbered migration 3. Meter adopts the shared infrastructure in its typed-schema
+step, preserving FIFO visibility. Pricing's P6 N+1 and per-row writes are fixed;
+refresh batches all three write sets in groups of 100. Small and large successful
+refresh/view/confirmation tests use two families and asymmetric release history.
+Integer costs are calculated per request and summed with checked arithmetic;
+persisted frozen costs, lower view budgets, rollups and retention follow later.
+Enforcement is `cargo test --workspace`; no production migration is run by tests.
 
 ## Ordered migrations and rollback
 
@@ -745,14 +752,14 @@ user_version**. Proposed versions are per DB, not one shared global version:
 
 | Order / DB migration | Work and verification | Reversibility |
 | --- | --- | --- |
-| 1. pricing v1: explicit IDs + STRICT + ms/money | Copy refreshes first; then snapshots/selections/items; old rowid→id, seconds×1000 with overflow validation, REAL rates→integer with rounding report; add FKs/order indexes; count every table, compare all IDs/FKs and selection/rate tie results; advance version only on success | **Backup-gated**; rounded REAL money cannot be losslessly down-migrated |
+| 1. pricing v1: empty rebuild + STRICT + ms/money | Preserve verified backup and `pricing.v0.db` with sidecars; copy no data. Explicit runner creates four empty tables, indexes and FKs, then sets user_version=1. Startup refuses any other version. Refresh and confirm each family afterward | **Backup-gated**; move v1 and sidecars aside, restore v0 and its compatible binary/unit; never delete either DB |
 | 2. meter v1: typed facts + attribution | Rebuild requests/GPU, extract/validate all JSON values, preserve IDs and ns durations, rename ts to ts_ms, initialize users, indexes/AUTOINCREMENT sequence above historical maximum; no retention yet; count both tables, compare token sums/null counts/ranges and wire output | **Backup-gated**; normalized JSON/wire reconstruction must not rely on an untested reverse transform |
-| 3. API cache v1: typed replica + durable cursor/warnings | Rebuild requests under same fact contract; move MAX(id) into sync_state before any deletion; add dated warning metadata; count requests/warnings and validate IDs/JSON timestamp equality; adopt cursor sync, reconcile known gaps from retained meter pages | **Backup-gated**; preserve original warning text and checkpoint; restore with compatible binary |
+| 3. API cache v1: empty rebuild + typed replica + durable cursor/warnings | Preserve the old cache, create an empty typed cache and initialize sync_state to 0. Re-sync from meter `after_id=0`, filling the 340–421 gap from retained source history; verify IDs/counts/token sums. No in-place conversion of cache JSON | **Backup-gated**; restore the old cache with its compatible binary; meter remains the authoritative source |
 | 4. API cache v2: frozen costs | Add request_costs, backfill in resumable id batches against pricing v1; no pruning. Count = inference rows × configured families; prove each classification, integer totals, zero vs NULL and selected/snapshot provenance. Publish backfill-complete state only after all rows pass | Schema addition can be reversed by dropping costs/reverting compatible code **before any rollup/pruning**; snapshot still mandatory |
 | 5. meter v2 and API cache v3: rollup tables/state | Add hourly/daily metrics, API spend, GPU hourly and state; build retained history in bounded resumable batches; compare aggregate counts/tokens/costs against raw before enabling reads. Existing missing history is not reconstructed | Additive and reversible by dropping new tables/reverting code **before pruning**; snapshot mandatory |
 | 6. scheduled jobs activated after all backfills | Enable five-minute jobs, then enable 365-day request / seven-day GPU pruning only after checkpoints and comparison gates; count every table before/after each prune and match deleted counts to eligible IDs | **Backup-gated** once rows are deleted; migration runner's version alone must not enable irreversible deletion |
 
-For all table rebuilds, use new temporary-named tables with **explicit column
+Meter remains the one careful data conversion. For its table rebuilds, use new temporary-named tables with **explicit column
 lists**, copy in a migration transaction, validate before dropping/renaming,
 recreate indexes, run FK checks, then commit and set user_version atomically.
 No silent CAST of invalid JSON/types/overflow or dropped "bad rows". Fail with
@@ -763,7 +770,7 @@ necessary but not sufficient; also compare primary keys, sums, time bounds,
 tie cases and representative serialized records. Row counts for additive tables
 are expected formulas/checkpoints, not equality with nonexistent old tables.
 
-Pricing/API are one console service; stop it for pricing conversion, stage a
+Pricing/API are one console service; stop it for the pricing empty rebuild, stage a
 compatible library/API/CLI binary together, migrate pricing, verify and restart
 only after cache compatibility is checked. Meter v1 keeps legacy wire field
 names `ts` and nanosecond duration names while adding optional attribution with
