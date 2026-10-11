@@ -95,7 +95,12 @@ fn range(request: &Request<Body>, gpu: bool) -> Result<(String, i64), String> {
     };
     Ok((range, now_ms() - hours * 3_600_000))
 }
-async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Response {
+async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> Response {
+    state.query_scope = request
+        .extensions()
+        .get::<factory_db::Scope>()
+        .cloned()
+        .unwrap_or_default();
     if state.shutdown.is_cancelled() {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,

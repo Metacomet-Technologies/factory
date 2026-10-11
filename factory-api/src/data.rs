@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use shared::{RequestRecord, factory_api::*};
 use std::{collections::BTreeMap, path::Path};
 
@@ -20,38 +20,61 @@ pub fn tps(tokens: Option<u64>, ns: Option<u64>) -> Option<f64> {
 }
 pub fn open(path: &Path) -> Result<Connection> {
     let db = Connection::open(path)?;
-    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000;
-        CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, record TEXT NOT NULL);
+    factory_db::settings::apply(&db, false, 65_536)?;
+    initialize(&db)?;
+    Ok(db)
+}
+pub fn initialize(db: &Connection) -> Result<()> {
+    db.execute_batch("CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, record TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts_ms);
         CREATE TABLE IF NOT EXISTS warnings(message TEXT PRIMARY KEY);")?;
-    Ok(db)
+    Ok(())
 }
 pub fn sync(db: &mut Connection, records: Vec<RequestRecord>) -> Result<Vec<RequestRecord>> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let watermark: i64 =
         tx.query_row("SELECT COALESCE(MAX(id),0) FROM requests", [], |r| r.get(0))?;
     let mut previous = watermark;
-    let mut new = Vec::new();
-    for record in records {
+    let mut warnings = Vec::new();
+    for record in &records {
         anyhow::ensure!(record.id > 0, "invalid meter id");
-        if record.id > previous + 1 {
-            tx.execute(
-                "INSERT OR IGNORE INTO warnings VALUES (?1)",
-                [format!(
-                    "gap: meter ids {}..{} are absent from cursor history",
-                    previous + 1,
-                    record.id - 1
-                )],
-            )?;
+        if record.id > previous.saturating_add(1) {
+            warnings.push(format!(
+                "gap: meter ids {}..{} are absent from cursor history",
+                previous + 1,
+                record.id - 1
+            ));
         }
         previous = previous.max(record.id);
-        tx.execute("INSERT INTO requests VALUES (?1,?2,?3) ON CONFLICT(id) DO UPDATE SET ts_ms=excluded.ts_ms, record=excluded.record",
-            params![record.id, record.ts, serde_json::to_string(&record)?])?;
-        if record.id > watermark {
-            new.push(record);
+    }
+    for chunk in warnings.chunks(100) {
+        let values = std::iter::repeat_n("(?)", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        tx.execute(
+            &format!("INSERT OR IGNORE INTO warnings VALUES {values}"),
+            rusqlite::params_from_iter(chunk),
+        )?;
+    }
+    for chunk in records.chunks(100) {
+        let values = std::iter::repeat_n("(?,?,?)", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut parameters = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() * 3);
+        for record in chunk {
+            parameters.extend([
+                record.id.into(),
+                record.ts.into(),
+                serde_json::to_string(record)?.into(),
+            ]);
         }
+        tx.execute(&format!("INSERT INTO requests VALUES {values} ON CONFLICT(id) DO UPDATE SET ts_ms=excluded.ts_ms, record=excluded.record"), rusqlite::params_from_iter(parameters))?;
     }
     tx.commit()?;
+    let mut new: Vec<_> = records
+        .into_iter()
+        .filter(|record| record.id > watermark)
+        .collect();
     new.sort_by_key(|r| r.id);
     Ok(new)
 }
@@ -134,13 +157,11 @@ pub fn pricing_view(
         .collect();
     Ok(Pricing { families, warnings })
 }
-pub fn usage(
+pub fn usage_records(
     db: &Connection,
-    store: &pricing::Store,
-    range: String,
     since: i64,
     mut warnings: Vec<String>,
-) -> Result<Usage> {
+) -> Result<(Vec<RequestRecord>, Vec<String>)> {
     let mut statement =
         db.prepare("SELECT record FROM requests WHERE ts_ms>=?1 ORDER BY ts_ms,id")?;
     let mut rows = statement.query([since])?;
@@ -156,6 +177,15 @@ pub fn usage(
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?,
     );
+    Ok((records, warnings))
+}
+
+pub fn usage(
+    store: &pricing::Store,
+    range: String,
+    records: Vec<RequestRecord>,
+    warnings: Vec<String>,
+) -> Result<Usage> {
     let totals = Totals {
         requests: records.len(),
         prompt_tokens: records.iter().filter_map(|r| r.prompt_eval_count).sum(),
@@ -295,19 +325,10 @@ mod tests {
     }
 
     #[test]
-    fn bulk_query_count_is_constant_and_hot_queries_use_indexes() -> Result<()> {
-        use rusqlite::trace::{TraceEvent, TraceEventCodes};
-        use std::cell::RefCell;
-        thread_local! { static QUERIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) }; }
-        fn trace(event: TraceEvent<'_>) {
-            if let TraceEvent::Stmt(statement, sql) = event
-                && sql.trim_start().starts_with("SELECT")
-            {
-                QUERIES.with_borrow_mut(|queries| queries.push(statement.expanded_sql().unwrap()));
-            }
-        }
+    fn bulk_query_count_and_historical_ties() -> Result<()> {
+        use factory_db::{Category, Scope, Tracked};
         let temp = tempfile::tempdir()?;
-        let mut db = open(&temp.path().join("requests.db"))?;
+        let db = open(&temp.path().join("requests.db"))?;
         let pricing_path = temp.path().join("pricing.db");
         let mut writer = pricing::Store::open(&pricing_path)?;
         let references = pricing::parse_references(pricing::DEFAULT_CONFIG)?;
@@ -348,10 +369,21 @@ mod tests {
         };
         writer.refresh(&references, &[newer], &[], 40, vec![])?;
         writer.confirm("Claude Sonnet", 50)?;
+        writer.connection().execute_batch(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000)
+             INSERT INTO price_snapshots SELECT x,'openrouter','noise-'||(x%101),2,7,1,1 FROM n;
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<3000)
+             INSERT INTO reference_selection SELECT 'noise-'||(x%37),'noise-'||(x%101),x,1,1 FROM n;
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000)
+             INSERT INTO refreshes SELECT x FROM n;
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<5000)
+             INSERT INTO pricing_items SELECT x,'warning','noise','fixture',x%1000 FROM n;
+             ANALYZE;",
+        )?;
         let history = Connection::open(&pricing_path)?;
-        history.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace));
-        let reader = pricing::Store::reader(history)?;
-        db.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace));
+        let mut reader =
+            Tracked::new(pricing::Store::reader(history)?, pricing::Store::connection)?;
+        let mut db = Tracked::new(db, |db| db)?;
         let row = |id| RequestRecord {
             id,
             ts: 30_000,
@@ -361,10 +393,17 @@ mod tests {
             ..Default::default()
         };
         let mut counts = vec![];
+        let mut queries = Vec::new();
         for count in [1, 1000] {
-            sync(&mut db, (1..=count).map(row).collect())?;
-            QUERIES.with_borrow_mut(Vec::clear);
-            let result = usage(&db, &reader, "30d".into(), 0, vec![])?;
+            db.run(&Scope::default(), Category::Setup, |db| {
+                sync(db, (1..=count).map(row).collect())
+            })?;
+            let scope = Scope::recording();
+            let (records, warnings) =
+                db.run(&scope, Category::Data, |db| usage_records(db, 0, vec![]))?;
+            let result = reader.run(&scope, Category::Data, |store| {
+                usage(store, "30d".into(), records, warnings)
+            })?;
             assert_eq!(result.totals.requests, count as usize);
             assert_eq!(
                 result
@@ -375,43 +414,92 @@ mod tests {
                     .usd,
                 count as f64 * 16.0
             );
-            let queries = QUERIES.with_borrow(|q| q.clone());
-            counts.push(queries.len());
+            counts.push(scope.counts().data);
+            reader.run(&scope, Category::Data, |store| {
+                pricing_view(store, &references, vec![])
+            })?;
+            queries.extend(scope.statements());
         }
-        assert_eq!(counts[0], counts[1], "per-row SQL returned: {counts:?}");
-        assert!(counts[1] <= 20, "unexpected bulk query count: {counts:?}");
-        pricing_view(&reader, &references, vec![])?;
-        let queries = QUERIES.with_borrow(|q| q.clone());
-        let prices = Connection::open(pricing_path)?;
-        for sql in queries.iter().chain(std::iter::once(
-            &"SELECT COALESCE(MAX(id),0) FROM requests".to_owned(),
-        )) {
-            let connection = if sql.contains("FROM requests") || sql.contains("FROM warnings") {
-                &db
-            } else {
-                &prices
-            };
-            let plan = connection
-                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
-                .query_map([], |r| r.get::<_, String>(3))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            assert!(
-                !plan
-                    .iter()
-                    .any(|line| line.starts_with("SCAN ") && !line.contains("USING")),
-                "full table scan: {sql}\n{plan:?}"
-            );
-        }
+        const ONE_SELECTED_FAMILY_USAGE: usize = 13;
+        assert_eq!(counts, [ONE_SELECTED_FAMILY_USAGE; 2]);
         // The model switch is effective at 50, never at its earlier observation.
-        let history = reader.history("Claude Sonnet", 60)?;
+        let history = reader.run(&Scope::default(), Category::Data, |store| {
+            store.history("Claude Sonnet", 60)
+        })?;
         assert_eq!(history.rates_at(19), None);
         assert_eq!(history.rates_at(20), Some((2.0, 7.0)));
         assert_eq!(history.rates_at(49), Some((2.0, 7.0)));
         assert_eq!(history.rates_at(50), Some((5.0, 7.0)));
-        eprintln!(
-            "usage SELECT count: 1 row={}, 1000 rows={}; all hot query plans indexed",
-            counts[0], counts[1]
-        );
+        // Replay actual traced templates with bound values, never expanded SQL.
+        // Legacy sort exceptions are tied to the rate tie-breaks, not all queries.
+        use factory_db::explain::{self, Exception, ExceptionKind, RequiredSearch};
+        db.run(&Scope::default(), Category::Setup, |db| {
+            db.execute_batch("ANALYZE")
+        })?;
+        queries.push("SELECT COALESCE(MAX(id),0) FROM requests".into());
+        queries.sort();
+        queries.dedup();
+        let check = |connection: &Connection, sql: &str| -> Result<()> {
+            let mut parameters = Vec::<rusqlite::types::Value>::new();
+            let count = connection.prepare(sql)?.parameter_count();
+            let requests = sql.contains("FROM requests");
+            if count > 0 {
+                parameters.push(if requests {
+                    0.into()
+                } else if sql.contains("WHERE model_id=?1") {
+                    "anthropic/claude-sonnet-5.5".to_owned().into()
+                } else {
+                    "Claude Sonnet".to_owned().into()
+                });
+            }
+            if count > 1 {
+                parameters.push(60.into());
+            }
+            let plan =
+                explain::query_plan(connection, sql, rusqlite::params_from_iter(parameters))?;
+            let mut required = Vec::new();
+            let mut exceptions = Vec::new();
+            if requests {
+                required.push(RequiredSearch {
+                    table: "requests",
+                    index: sql.contains("ts_ms>=").then_some("requests_ts"),
+                });
+            } else if sql.contains("FROM warnings") {
+                exceptions.push(Exception {
+                    kind: ExceptionKind::SmallWholeSetRead,
+                    table: "warnings",
+                    reason: "complete warning set is part of the API response",
+                });
+            } else if sql.contains("FROM price_snapshots") {
+                required.push(RequiredSearch {
+                    table: "price_snapshots",
+                    index: Some("snapshot_lookup"),
+                });
+                exceptions.push(Exception { kind: ExceptionKind::ReviewedLegacySort, table: "", reason: "legacy refresh/source/rowid tie ordering; owner indexes arrive in step 4" });
+            } else if sql.contains("FROM pricing_items") {
+                required.push(RequiredSearch {
+                    table: "pricing_items",
+                    index: Some("items_refresh"),
+                });
+            } else {
+                required.push(RequiredSearch {
+                    table: "reference_selection",
+                    index: Some("selection_confirmed"),
+                });
+            }
+            explain::validate(&plan, &required, &exceptions)
+                .with_context(|| format!("{sql}\n{plan:?}"))
+        };
+        for sql in queries {
+            if sql.contains("FROM requests") || sql.contains("FROM warnings") {
+                db.run(&Scope::default(), Category::Setup, |db| check(db, &sql))?;
+            } else {
+                reader.run(&Scope::default(), Category::Setup, |store| {
+                    check(store.connection(), &sql)
+                })?;
+            }
+        }
+        eprintln!("one-selected-family usage: {counts:?}");
         Ok(())
     }
 }

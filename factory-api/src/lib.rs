@@ -36,6 +36,8 @@ pub struct AppState {
     pub pricing_sources: [String; 2],
     pricing_client: reqwest::Client,
     pub db: Arc<pool::Pool>,
+    /// Explicit request/job handle propagated to both database pools.
+    pub query_scope: factory_db::Scope,
     pub shutdown: CancellationToken,
     started: Instant,
     fleet: Arc<RwLock<Fleet>>,
@@ -82,6 +84,7 @@ impl AppState {
                 .user_agent("factory-pricing/0.1")
                 .build()?,
             db,
+            query_scope: factory_db::Scope::default(),
             shutdown: CancellationToken::new(),
             started: Instant::now(),
             fleet: Default::default(),
@@ -151,12 +154,9 @@ impl AppState {
             self.require_clock()?;
             let mut cursor: i64 = self
                 .db
-                .read(|db| {
-                    Ok(db.requests.query_row(
-                        "SELECT COALESCE(MAX(id),0) FROM requests",
-                        [],
-                        |r| r.get(0),
-                    )?)
+                .requests
+                .read(&self.query_scope, |db| {
+                    Ok(db.query_row("SELECT COALESCE(MAX(id),0) FROM requests", [], |r| r.get(0))?)
                 })
                 .await?;
             loop {
@@ -190,7 +190,7 @@ impl AppState {
                 }
                 let new = self
                     .db
-                    .write(move |db| data::sync(&mut db.requests, records))
+                    .write(&self.query_scope, move |db| data::sync(db, records))
                     .await?;
                 cursor = next;
                 for r in new
@@ -324,9 +324,10 @@ impl AppState {
             .filter(|w| w.starts_with("pricing:") || w.starts_with("clock:"))
             .collect();
         self.db
-            .read(move |db| {
+            .pricing
+            .read(&self.query_scope, move |db| {
                 data::pricing_view(
-                    &db.pricing,
+                    db,
                     &pricing::parse_references(pricing::DEFAULT_CONFIG)?,
                     warning,
                 )
@@ -362,7 +363,7 @@ impl AppState {
         let (primary, secondary) = tokio::join!(fetch(0), fetch(1));
         let result = self
             .db
-            .write(move |db| {
+            .write_pricing(&self.query_scope, move |db| {
                 let at = data::ms_to_seconds(now_ms());
                 let mut items = vec![];
                 let mut source = |result: Result<Vec<pricing::Model>>, name: &str| match result {
@@ -388,7 +389,7 @@ impl AppState {
                         .collect::<Vec<_>>()
                         .join("; ")
                 );
-                db.pricing.refresh(
+                db.refresh(
                     &pricing::parse_references(pricing::DEFAULT_CONFIG)?,
                     &primary,
                     &secondary,
@@ -428,8 +429,8 @@ impl AppState {
         self.require_clock()?;
         let before = self.pricing().await?;
         self.db
-            .write(move |db| {
-                db.pricing.confirm(&family, data::ms_to_seconds(now_ms()))?;
+            .write_pricing(&self.query_scope, move |db| {
+                db.confirm(&family, data::ms_to_seconds(now_ms()))?;
                 Ok(())
             })
             .await?;
@@ -439,28 +440,41 @@ impl AppState {
     }
     pub async fn usage(&self, range: String, since: i64) -> Result<Usage> {
         let warnings = self.read_warnings().await;
+        let (records, warnings) = self
+            .db
+            .requests
+            .read(&self.query_scope, move |db| {
+                data::usage_records(db, since, warnings)
+            })
+            .await?;
         self.db
-            .read(move |db| data::usage(&db.requests, &db.pricing, range, since, warnings))
+            .pricing
+            .read(&self.query_scope, move |db| {
+                data::usage(db, range, records, warnings)
+            })
             .await
     }
     pub fn start_collectors(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = Vec::new();
-        for kind in ["meter", "fleet", "gpu", "pricing", "clock"] {
-            let state = self.clone();
+        for kind in ["meter", "fleet", "gpu", "pricing", "clock", "database"] {
+            let mut state = self.clone();
             tasks.push(tokio::spawn(async move {
                 let mut timer = tokio::time::interval(Duration::from_secs(match kind {
                     // Retry promptly after clock synchronization; feed attempts stay daily.
                     "pricing" | "clock" => 2,
                     "gpu" => 15,
+                    "database" => 300,
                     _ => 30,
                 }));
                 timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut last_pricing = None::<Instant>;
+                let mut last_optimize = Instant::now();
                 loop {
                     tokio::select! { biased;
                         _ = state.shutdown.cancelled() => break,
                         _ = timer.tick() => (),
                     }
+                    state.query_scope = factory_db::Scope::default();
                     let collect = async {
                         match kind {
                             "meter" => {
@@ -473,6 +487,38 @@ impl AppState {
                             }
                             "clock" => {
                                 state.check_clock().await;
+                            }
+                            "database" => {
+                                let optimize =
+                                    last_optimize.elapsed() >= Duration::from_secs(86400);
+                                let result = async {
+                                    let requests = state
+                                        .db
+                                        .requests
+                                        .maintain(&state.query_scope, optimize)
+                                        .await?;
+                                    let pricing = state
+                                        .db
+                                        .pricing
+                                        .maintain(&state.query_scope, optimize)
+                                        .await?;
+                                    tracing::debug!(
+                                        ?requests,
+                                        ?pricing,
+                                        "passive database checkpoints"
+                                    );
+                                    anyhow::Ok(())
+                                }
+                                .await;
+                                if result.is_ok() && optimize {
+                                    last_optimize = Instant::now();
+                                }
+                                state
+                                    .warning(
+                                        "database maintenance",
+                                        result.err().map(|e| e.to_string()),
+                                    )
+                                    .await;
                             }
                             _ => {
                                 if state.require_clock().is_ok()

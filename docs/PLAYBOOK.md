@@ -41,13 +41,13 @@ The working agreement and hard-won lessons for building and operating the factor
 
 ## 4. Agent prompt template
 
-**Handoff header (every prompt Claude gives Devon):** the **runner** (factory-gpu / factory-console), the **folder** (`work` = main checkout, or a **new worktree** with its exact name: letters, digits, `-`, `_`, no slashes, including `met-NN`), and the **effort level** (Low only for mechanical tasks like pull/build; Medium by default; High for risky concurrency/security work).
+**Handoff header (every prompt Claude gives Devon):** the **runner** (factory-gpu / factory-console), the **directory** (always Amp's `work`, `~/work`; for code/docs tasks the prompt names a worktree `met-NN-<slug>` that the agent creates after auth, since Amp's own New Worktree fetches without credentials and fails), and the **effort level** (Low only for mechanical tasks like pull/build; Medium by default; High for risky concurrency/security work).
 
 **First line of every prompt:** `**Thread title:** Use the Linear ticket identifier and title: \`MET-123 — Ticket title\`.` (the exact Linear title).
 
 Every prompt has these sections:
 
-1. **Start fresh:** `export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git`, fetch, branch from the latest `main` (or `git rebase origin/main` in a worktree). Read `AGENTS.md`/READMEs first. Reference the MET id in the PR title and body, with the right link type (**closes** only if the PR finishes the issue).
+1. **Start fresh:** `export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git`, `git -C ~/work/factory fetch origin`, then `git -C ~/work/factory worktree add -b <name> ~/work/factory-<name> origin/main` and work only in that directory (never the main checkout); first push `git push -u origin <name>`. Read `AGENTS.md`/READMEs first. Reference the MET id in the PR title and body, with the right link type (**closes** only if the PR finishes the issue).
 2. **Context:** what's deployed, what other agents are doing, what's off-limits.
 3. **Isolation:** the exact directories it may edit.
 4. **Build:** spec and requirements; contracts written out exactly.
@@ -56,7 +56,7 @@ Every prompt has these sections:
 7. **Deploy artifacts:** write, don't run.
 8. **Done means:** push, open the PR, final message with results, deviations, anything unverified, and exact deploy steps.
 
-**Runner hygiene:** one thread per task; archive threads once their work is merged **and deployed/verified**; start fresh threads per phase. Parallel threads on one runner use **Amp worktrees**; remove the worktree when its thread is archived. Don't message a thread mid-run unless it's a correction. Mechanical follow-ups (pull + build) also start with the `GH_TOKEN` setup line.
+**Runner hygiene:** one thread per task; archive threads once their work is merged **and deployed/verified**; start fresh threads per phase. Parallel threads on one runner use **Amp worktrees**; remove the worktree when its thread is archived. Don't message a thread mid-run unless it's a correction. Mechanical follow-ups (pull + build) also start with the `GH_TOKEN` setup line. Cleanup after merge: archive the thread (UI only), then as `agent`: `git -C /home/agent/work/factory worktree remove /home/agent/work/factory-<name>` and `git -C /home/agent/work/factory branch -D <name>`.
 
 ## 5. Review checklist (before merge)
 
@@ -72,7 +72,7 @@ Every prompt has these sections:
 1. Merge (squash, delete branch).
 2. Ask the thread to `export GH_TOKEN=... && gh auth setup-git && git checkout main && git pull --ff-only && build` (the token only exists in threads).
 3. From the Mac: `factory-ssh "sudo bash /home/agent/work/factory/deploy/install-*.sh <prebuilt path>"` (use **full paths**: admins can't `cd` into `/home/agent`).
-4. Verify: `factory-status` (all green; usage/pricing < 2 s), kiosk self-reload, then mark the Linear issue Done.
+4. Verify: `factory-status` (all green; usage/pricing < 2 s), kiosk self-reload, then mark the Linear issue Done. Then update Linear (status, Decided, Next) and, if `docs/PLAYBOOK.md` changed, re-sync the Linear playbook copy.
 
 ## 7. Operating the factory
 
@@ -110,6 +110,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 
 **Process**
 - When a Linear **Decided** section changes a rule, update `AGENTS.md`/docs in the next PR. Agents follow the repo file, not Linear.
+- Amp's **New Worktree** fetches `origin` before creating the worktree; `agent` has GitHub credentials only inside threads, so it fails ("could not read Username"). Start threads in `work` and let the agent create the worktree after auth.
 
 **Networking / Tailscale**
 - Plain `tailscale ping` **ignores the access policy**; test blocks with `tailscale ping --icmp` or a real TCP connection.

@@ -311,6 +311,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "factory-db",
  "futures-util",
  "pricing",
  "reqwest 0.12.28",
@@ -326,6 +327,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "utoipa",
+]
+
+[[package]]
+name = "factory-db"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
