@@ -29,6 +29,19 @@ Migration refuses legacy databases without writes: move the old file and WAL/SHM
 aside first, then migrate, refresh, and confirm. The installer preserves both a
 verified backup and `pricing.v0.db`; no legacy rows are copied.
 
+Feed configuration follows the same CLI > environment > default precedence:
+
+- `--openrouter-feed-url` / `PRICING_OPENROUTER_FEED_URL`:
+  `https://openrouter.ai/api/v1/models`.
+- `--litellm-feed-url` / `PRICING_LITELLM_FEED_URL`:
+  `https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json`.
+
+Both flags work before or after the subcommand. Startup rejects values that are
+not absolute HTTP(S) URLs, or use HTTP outside loopback (`127.0.0.0/8`, `::1`,
+`localhost`). Effective URLs are printed once to stderr without query strings,
+fragments or credentials; JSON stdout stays unchanged. There is no collector
+in this binary, so no collector-disable setting applies.
+
 `config/references.toml` supplies the bundled defaults. To load edits without
 rebuilding, pass `--config config/references.toml` (or another TOML file).
 ChatGPT mid-tier uses `^openai/gpt-[0-9]+(?:\.[0-9]+)?-sol$`, selecting ordinary

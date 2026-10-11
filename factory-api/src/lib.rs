@@ -34,6 +34,7 @@ pub struct AppState {
     pub config: Arc<fleet::Config>,
     pub client: reqwest::Client,
     pub pricing_sources: [String; 2],
+    pub disable_pricing_collector: bool,
     pricing_client: reqwest::Client,
     pub db: Arc<pool::Pool>,
     /// Explicit request/job handle propagated to both database pools.
@@ -79,6 +80,7 @@ impl AppState {
             config: Arc::new(config),
             client,
             pricing_sources: [pricing::OPENROUTER_URL.into(), pricing::LITELLM_URL.into()],
+            disable_pricing_collector: false,
             pricing_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
                 .user_agent("factory-pricing/0.1")
@@ -456,7 +458,15 @@ impl AppState {
     }
     pub fn start_collectors(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = Vec::new();
+        if self.disable_pricing_collector {
+            tracing::info!(
+                "pricing collector disabled; manual refresh and confirmation remain enabled"
+            );
+        }
         for kind in ["meter", "fleet", "gpu", "pricing", "clock", "database"] {
+            if kind == "pricing" && self.disable_pricing_collector {
+                continue;
+            }
             let mut state = self.clone();
             tasks.push(tokio::spawn(async move {
                 let mut timer = tokio::time::interval(Duration::from_secs(match kind {

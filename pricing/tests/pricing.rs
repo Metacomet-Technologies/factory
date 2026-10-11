@@ -3,6 +3,116 @@ use pricing::{
     resolve,
 };
 
+#[test]
+fn feed_urls_validate_loopback_and_redact_startup_logs() {
+    for url in [
+        "https://public.example/feed",
+        "http://127.0.0.1/feed",
+        "http://127.255.255.254:123/feed",
+        "http://[::1]/feed",
+        "http://localhost/feed",
+    ] {
+        assert!(pricing::feed_url(url).is_ok(), "{url}");
+    }
+    for url in [
+        "http://public.example/feed",
+        "http://128.0.0.1/feed",
+        "http://126.255.255.255/feed",
+        "http://[::2]/feed",
+        "http://localhost.example/feed",
+        "/relative",
+        "garbage",
+        "ftp://localhost/feed",
+        "https:///",
+        "https://",
+    ] {
+        assert!(pricing::feed_url(url).is_err(), "{url}");
+    }
+    assert_eq!(
+        pricing::feed_url_for_log("https://user:secret@example.com/feed?private=1#fragment"),
+        "https://example.com/feed"
+    );
+}
+
+#[test]
+fn cli_feed_precedence_defaults_and_startup_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    pricing::migrate(temp.path().join("pricing.db")).unwrap();
+    for (environment, flags, expected) in [
+        (
+            false,
+            false,
+            [
+                "https://openrouter.ai/api/v1/models",
+                "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+            ],
+        ),
+        (
+            true,
+            false,
+            [
+                "https://env.example/primary",
+                "https://env.example/secondary",
+            ],
+        ),
+        (
+            true,
+            true,
+            ["http://localhost/primary", "http://127.1.2.3/secondary"],
+        ),
+    ] {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pricing"));
+        command
+            .env_clear()
+            .arg("--db")
+            .arg(temp.path().join("pricing.db"));
+        if environment {
+            command
+                .env("PRICING_OPENROUTER_FEED_URL", "https://env.example/primary")
+                .env("PRICING_LITELLM_FEED_URL", "https://env.example/secondary");
+        }
+        if flags {
+            command.args(["--openrouter-feed-url", "http://localhost/primary?hidden=1"]);
+        }
+        command.arg("show");
+        // Global feed flags work on both sides of the subcommand.
+        if flags {
+            command.args(["--litellm-feed-url", "http://127.1.2.3/secondary?hidden=2"]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = String::from_utf8(output.stderr).unwrap();
+        for url in expected {
+            assert!(log.contains(url), "{log}");
+        }
+        assert!(!log.contains("hidden"));
+    }
+    for flag in ["--openrouter-feed-url", "--litellm-feed-url"] {
+        for value in [
+            "http://public.example/feed",
+            "/relative",
+            "garbage",
+            "ftp://localhost/feed",
+        ] {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_pricing"))
+                .env_clear()
+                .args(["show", flag, value])
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                error.contains(flag) && error.contains("feed URL"),
+                "{error}"
+            );
+        }
+    }
+}
+
 fn references() -> Vec<Reference> {
     vec![Reference {
         name: "Claude Sonnet".into(),
