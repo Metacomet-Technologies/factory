@@ -46,6 +46,21 @@ pub struct GpuResponse {
 #[derive(Serialize, ToSchema)]
 pub struct Health {
     pub status: String,
+    pub version: String,
+    pub git_sha: String,
+    pub git_dirty: bool,
+    pub built_at_ms: u64,
+}
+
+/// Identity embedded at compilation, shared by the meter and aggregation API.
+pub fn build_info() -> Health {
+    Health {
+        status: "ok".into(),
+        version: env!("FACTORY_VERSION").into(),
+        git_sha: env!("FACTORY_GIT_SHA").into(),
+        git_dirty: env!("FACTORY_GIT_DIRTY") == "true",
+        built_at_ms: env!("FACTORY_BUILT_AT_MS").parse().unwrap(),
+    }
 }
 
 #[derive(Serialize, ToSchema)]

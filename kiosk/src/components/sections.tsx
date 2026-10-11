@@ -137,7 +137,10 @@ export function FleetSection({ resource, icon }: { resource: Resource<Fleet>; ic
                 {node.services.map((service) => (
                   <li key={service.name}>
                     <div className="row">
-                      <span>{service.name}</span>
+                      <span title={service.git_sha ?? undefined}>
+                        {service.name}
+                        {service.version ? ` v${service.version}` : ""}
+                      </span>
                       <span className={service.ok ? "status-ok" : "status-fail"}>
                         {service.ok ? "OK" : "Failing"} · {ms(service.latency_ms)}
                       </span>

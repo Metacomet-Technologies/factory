@@ -7,6 +7,28 @@ server, configuration, test and script sources are TypeScript. Both TypeScript
 projects enable `strict`, `noUncheckedIndexedAccess` and
 `exactOptionalPropertyTypes`.
 
+## Running versions (MET-107 phase 1)
+
+`VERSION` at the repository root controls the kiosk's build-time version.
+`package.json` must match it or the build fails. The fixed footer shows
+`factory v0.2.0 · api <sha> · kiosk <sha> · meter <sha>` even while the page
+scrolls. It distinguishes version/SHA mismatch, any dirty build, and incomplete
+identity; legacy meter health without identity displays `meter unknown` rather
+than inventing a version. Native title text includes each component's version,
+dirty state, and UTC build time. Known versions also appear in Fleet.
+
+Generate types and run the strict check against the updated isolated API using
+`OPENAPI_URL=http://127.0.0.1:18080/openapi.json`, not the still-deployed old schema.
+The source of truth remains the live OpenAPI response. No drift/lint/type gate is
+disabled. Footer tests cover matching builds, independent version/SHA mismatches,
+dirty builds, unknown SHA, and missing health/Fleet data.
+
+Desktop Fleet columns fill available space and pricing notices use two columns
+to reserve footer space at 1728×1117. Phone/tablet retain scrolling cards with
+bottom padding, so the last card can scroll clear of the fixed footer.
+See the root README's phase 1 handoff for per-node builds and explicit installer
+paths. Release workflows and version-downloading installers remain phases 2–3.
+
 ## Toolchain and commands
 
 Install Vite+ in user space with `curl -fsSL https://vite.plus | bash`, then load
@@ -206,7 +228,8 @@ verified, not live-observed**.
 `vp build` hashes the emitted HTML/assets with SHA-256, embeds that identity in
 `index.html` as `<meta name="kiosk-build">`, and emits `/version.json` with the
 same `build` value. Identical outputs produce an identical identity. A change
-to HTML, CSS or either JavaScript chunk changes it.
+to HTML, CSS or either JavaScript chunk changes it. MET-107 embeds build time,
+so rebuilding the same commit also changes the JavaScript and build identity.
 
 The app checks same-origin `/version.json` with `cache: "no-store"` on startup,
 every 60 seconds and after every native SSE reconnect. It also checks when

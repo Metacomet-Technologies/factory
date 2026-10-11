@@ -13,6 +13,7 @@ import {
 } from "./components/sections";
 import { Button } from "./components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
+import { VersionFooter } from "./components/version-footer";
 
 export default function App() {
   const [usageRange, setUsageRange] = useState<UsageRange>("24h");
@@ -122,10 +123,13 @@ export default function App() {
             <TickerSection requests={live.requests} connected={live.connected} />
           </aside>
         </div>
-        <footer className="muted">
-          factory · tailnet dashboard<span>Local inference. Visible impact.</span>
-        </footer>
       </main>
+      <VersionFooter
+        api={health.data}
+        meter={fleet.data?.nodes
+          .flatMap((node) => node.services)
+          .find((service) => service.name === "meter-http")}
+      />
     </TooltipProvider>
   );
 }

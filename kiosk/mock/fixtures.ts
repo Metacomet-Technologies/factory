@@ -9,13 +9,20 @@ import type {
   GpuRange,
 } from "../src/api/types.ts";
 
+const build = {
+  version: "0.2.0",
+  git_sha: "a1b2c3d",
+  git_dirty: false,
+  built_at_ms: 1_790_000_000_000,
+};
+
 export function fixtures(
   outage = false,
   usageRange: UsageRange = "24h",
   gpuRange: GpuRange = "1h",
   now = Date.now(),
 ) {
-  const health: Health = { status: "ok", version: "1.0.0-mock", uptime_ms: 9_840_000 };
+  const health: Health = { status: "ok", ...build, uptime_ms: 9_840_000 };
   const fleet: Fleet = {
     generated_at_ms: now,
     nodes: [
@@ -27,13 +34,14 @@ export function fixtures(
         os: outage ? null : "Linux",
         services: [
           {
-            name: "meter",
+            name: "meter-http",
             kind: "http",
             target: "http://factory-gpu:11434/meter/health",
             ok: !outage,
             latency_ms: outage ? null : 4,
             detail: outage ? "Upstream unavailable" : null,
             checked_at_ms: now,
+            ...build,
           },
           {
             name: "Ollama",
@@ -61,6 +69,7 @@ export function fixtures(
             latency_ms: 7,
             detail: null,
             checked_at_ms: now,
+            ...build,
           },
           {
             name: "backup",

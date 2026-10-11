@@ -6,6 +6,9 @@ use utoipa::ToSchema;
 pub struct Health {
     pub status: String,
     pub version: String,
+    pub git_sha: String,
+    pub git_dirty: bool,
+    pub built_at_ms: u64,
     pub uptime_ms: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -33,6 +36,10 @@ pub struct Service {
     pub latency_ms: Option<f64>,
     pub detail: Option<String>,
     pub checked_at_ms: i64,
+    pub version: Option<String>,
+    pub git_sha: Option<String>,
+    pub git_dirty: Option<bool>,
+    pub built_at_ms: Option<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Node {
