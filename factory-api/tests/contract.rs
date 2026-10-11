@@ -923,9 +923,9 @@ async fn sixty_second_pricing_source_and_sqlite_writer_do_not_stall_reads() -> R
     let write = tokio::spawn(async move {
         write_state
             .db
-            .write(|db| {
+            .write(&write_state.query_scope, |db| {
                 factory_api::data::sync(
-                    &mut db.requests,
+                    db,
                     vec![RequestRecord {
                         id: 1,
                         ts: now_ms(),
@@ -1030,6 +1030,192 @@ async fn cursor_sync_recovers_multiple_pages_and_restarts_without_false_gaps() -
     Ok(())
 }
 
+/// Worst successful views: both families have selected and pending rates. Refresh
+/// itself remains step-4 debt (P6); do not conceal it behind an error-only budget.
+#[tokio::test]
+async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
+    const USAGE: usize = 16;
+    const PRICING: usize = 9;
+    const CONFIRM: usize = 29;
+    const NO_DATABASE: usize = 0;
+    const REQUESTS_SETUP: usize = 72;
+    const PRICING_SETUP: usize = 80;
+    for n in [3usize, 1001] {
+        let temp = tempfile::tempdir()?;
+        let at = now_ms();
+        let meter = Meter {
+            records: Arc::new(RwLock::new(
+                (1..=n)
+                    .map(|i| RequestRecord {
+                        id: (i * 2) as i64,
+                        ts: at - 1000,
+                        endpoint: "/api/chat".into(),
+                        model: (i % 3 != 0).then(|| "local".into()),
+                        prompt_eval_count: Some(3),
+                        eval_count: Some(7),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )),
+            down: Default::default(),
+            ts: at,
+        };
+        let (upstream, upstream_task) = serve(
+            Router::new()
+                .route("/meter/requests", get(requests))
+                .route("/meter/gpu", get(gpu))
+                .route("/meter/gpu/history", get(history))
+                .with_state(meter),
+        )
+        .await;
+        let mut state = test_state(&temp, upstream).await?;
+        state.static_dir = temp.path().join("kiosk");
+        std::fs::create_dir(&state.static_dir)?;
+        std::fs::write(state.static_dir.join("index.html"), "fixture".repeat(n))?;
+        state.db.write_pricing(&factory_db::Scope::default(), move |store| {
+            let references = pricing::parse_references(pricing::DEFAULT_CONFIG)?;
+            let start = at / 1000 - 10000;
+            offline_refresh(store, &references, start)?;
+            store.confirm("Claude Sonnet", start)?;
+            store.confirm("ChatGPT mid-tier", start)?;
+            // Asymmetric histories for the two families, with both source ties.
+            for i in 1..=if n == 3 { 4 } else { 31 } {
+                offline_refresh(store, &references, start + i)?;
+                if i % 3 == 0 {
+                    store.connection().execute("INSERT INTO reference_selection VALUES ('Claude Sonnet','anthropic/claude-sonnet-5.5',?1,1,1)", [start + i])?;
+                }
+            }
+            store.refresh(&references, &[
+                pricing::Model { model_id: "anthropic/claude-sonnet-6".into(), input_per_mtok: 9.0, output_per_mtok: 21.0, released_at: Some(3) },
+                pricing::Model { model_id: "openai/gpt-6-sol".into(), input_per_mtok: 5.0, output_per_mtok: 11.0, released_at: Some(4) },
+            ], &[], at / 1000 - 2, vec![])?;
+            Ok(())
+        }).await?;
+        let sync = factory_db::Scope::default();
+        state.query_scope = sync.clone();
+        state.sync_meter().await?;
+        let page_counts: Vec<_> = (0..n)
+            .step_by(500)
+            .map(|offset| 1 + 2 * (n - offset).min(500).div_ceil(100))
+            .collect();
+        assert_eq!(sync.counts().data, 1 + page_counts.iter().sum::<usize>());
+        assert_eq!(sync.counts().setup, 0);
+        eprintln!(
+            "sync n={n}: data={}, page jobs={page_counts:?}, initial cursor=1",
+            sync.counts().data
+        );
+        for (name, settings) in [
+            (
+                "requests",
+                state
+                    .db
+                    .requests
+                    .settings(&factory_db::Scope::default())
+                    .await?,
+            ),
+            (
+                "pricing",
+                state
+                    .db
+                    .pricing
+                    .settings(&factory_db::Scope::default())
+                    .await?,
+            ),
+        ] {
+            assert_eq!(settings.len(), 3);
+            for (index, actual) in settings.iter().enumerate() {
+                assert_eq!(actual.journal_mode, "wal");
+                assert_eq!(
+                    (
+                        actual.synchronous,
+                        actual.busy_timeout,
+                        actual.foreign_keys,
+                        actual.journal_size_limit
+                    ),
+                    (1, 5000, 1, 67108864)
+                );
+                assert_eq!(actual.query_only, i64::from(index > 0));
+                if index > 0 {
+                    assert_eq!(actual.cache_size, -65536);
+                }
+                assert_eq!(actual.wal_autocheckpoint, 1000);
+            }
+            eprintln!("{name} settings: {settings:?}");
+        }
+        eprintln!(
+            "startup requests={:?}, pricing={:?}",
+            state.db.requests.startup.counts(),
+            state.db.pricing.startup.counts()
+        );
+        assert_eq!(state.db.requests.startup.counts().setup, REQUESTS_SETUP);
+        assert_eq!(state.db.pricing.startup.counts().setup, PRICING_SETUP);
+        assert_eq!(state.db.requests.startup.counts().maintenance, 1);
+        assert_eq!(state.db.pricing.startup.counts().maintenance, 1);
+        let client = reqwest::Client::new();
+        for (path, budget) in [
+            ("/v1/llm/usage?range=24h", USAGE),
+            ("/v1/llm/usage?range=7d", USAGE),
+            ("/v1/llm/usage?range=30d", USAGE),
+            ("/v1/pricing", PRICING),
+            ("/v1/health", NO_DATABASE),
+            ("/v1/fleet", NO_DATABASE),
+            ("/v1/agents", NO_DATABASE),
+            ("/v1/gpu", NO_DATABASE),
+            ("/v1/stream", NO_DATABASE),
+            ("/", NO_DATABASE),
+            ("/openapi.json", NO_DATABASE),
+            ("/v1/pricing/confirm/Claude%20Sonnet", CONFIRM),
+        ] {
+            let scope = factory_db::Scope::default();
+            let (url, task) =
+                serve(router(state.clone()).layer(axum::Extension(scope.clone()))).await;
+            let request = if path.contains("/confirm/") {
+                client.post(format!("{url}{path}"))
+            } else {
+                client.get(format!("{url}{path}"))
+            };
+            let response = request.send().await?;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            if path != "/v1/stream" {
+                let body = response.bytes().await?;
+                assert!(!body.is_empty());
+                if path.contains("usage") {
+                    let value: Value = serde_json::from_slice(&body)?;
+                    assert_eq!(value["totals"]["requests"], n);
+                    assert_eq!(value["totals"]["prompt_tokens"], 3 * n);
+                    assert_eq!(value["models"].as_array().unwrap().len(), 2);
+                    let costs = value["spend_avoided"].as_array().unwrap();
+                    for (family, per_request) in
+                        [("Claude Sonnet", 0.000114), ("ChatGPT mid-tier", 0.000076)]
+                    {
+                        let cost = costs.iter().find(|s| s["family"] == family).unwrap();
+                        assert!(
+                            (cost["usd"].as_f64().unwrap() - per_request * n as f64).abs() < 1e-9
+                        );
+                        assert_eq!(cost["unpriced_requests"], 0);
+                    }
+                } else if path.contains("confirm") {
+                    let value: Value = serde_json::from_slice(&body)?;
+                    assert_eq!(
+                        value["families"][0]["selected"]["model_id"],
+                        "anthropic/claude-sonnet-6"
+                    );
+                }
+            }
+            assert_eq!(scope.counts().data, budget, "n={n} {path}");
+            assert_eq!((scope.counts().setup, scope.counts().maintenance), (0, 0));
+            eprintln!("n={n} {path}: {:?}", scope.counts());
+            task.abort();
+        }
+        state.query_scope = factory_db::Scope::default();
+        assert!(state.gpu_current().await.0.is_some());
+        assert_eq!(state.query_scope.counts().data, NO_DATABASE);
+        state.db.close().await?;
+        upstream_task.abort();
+    }
+    Ok(())
+}
+
 #[test]
 fn repo_versions_match_single_source() -> Result<()> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1079,9 +1265,8 @@ async fn unsynchronized_clock_pauses_feeds_and_all_data_writes_until_recovery() 
     assert!(
         state
             .db
-            .write(|db| {
-                db.requests
-                    .execute("INSERT INTO warnings VALUES ('bad clock')", [])?;
+            .write(&state.query_scope, |db| {
+                db.execute("INSERT INTO warnings VALUES ('bad clock')", [])?;
                 Ok(())
             })
             .await
@@ -1251,18 +1436,22 @@ async fn benchmark_100k() -> Result<()> {
     let at = now_ms();
     state
         .db
-        .write(move |db| {
+        .write_pricing(&state.query_scope, move |db| {
             offline_refresh(
-                &mut db.pricing,
+                db,
                 &pricing::parse_references(pricing::DEFAULT_CONFIG)?,
                 at / 1000 - 31 * 86400,
             )?;
-            db.pricing
-                .confirm("Claude Sonnet", at / 1000 - 31 * 86400)?;
-            db.pricing
-                .confirm("ChatGPT mid-tier", at / 1000 - 31 * 86400)?;
+            db.confirm("Claude Sonnet", at / 1000 - 31 * 86400)?;
+            db.confirm("ChatGPT mid-tier", at / 1000 - 31 * 86400)?;
+            Ok(())
+        })
+        .await?;
+    state
+        .db
+        .write(&state.query_scope, move |db| {
             factory_api::data::sync(
-                &mut db.requests,
+                db,
                 (1..=100_000)
                     .map(|id| RequestRecord {
                         id,

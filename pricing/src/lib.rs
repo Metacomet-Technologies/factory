@@ -206,9 +206,14 @@ impl Store {
         Self::from_connection(Connection::open(path)?)
     }
 
+    /// Borrow the owned connection for shared settings, counters and snapshots.
+    pub fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
     /// Use an existing connection without running schema migrations or taking a write lock.
     pub fn reader(connection: Connection) -> Result<Self> {
-        connection.execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=1000;")?;
+        connection.execute_batch("PRAGMA query_only=ON;")?;
         Ok(Self { connection })
     }
 
@@ -224,8 +229,8 @@ impl Store {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self> {
-        connection.busy_timeout(Duration::from_secs(1))?;
+    /// Bootstrap the legacy schema on an owner-supplied writer connection.
+    pub fn from_connection(connection: Connection) -> Result<Self> {
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS refreshes (fetched_at INTEGER NOT NULL);

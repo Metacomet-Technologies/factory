@@ -661,20 +661,33 @@ and business queries in their owners, not in a universal repository abstraction.
   migration scans. SEARCH alone is insufficient for global MAX on wrong leading
   indexes; add bounded-work benchmarks/row-visit diagnostics for those paths.
 
-Target data-statement budgets (later tests fail on exceeding them):
+Data-statement budgets: API ceilings below are enforced by `cargo test --workspace`.
+Other owners' budgets remain targets until adoption. Transaction, setup and
+maintenance statements are counted separately, never hidden in data ceilings.
 
 | Endpoint/job | Budget, independent of request history unless stated |
 | --- | --- |
 | meter health / requests / stats / GPU history | 1 / 1 per page / ≤4 with rollups+raw quantile / ≤2 with raw+hourly history |
-| API health/fleet/agents/SSE/static/OpenAPI and GPU collector | 0 local DB statements |
-| API GPU | 0 local; ≤2 upstream history statements |
-| API usage | ≤8 total reads across cache/pricing for 24h/7d/30d, regardless of R |
-| API pricing / confirm | ≤3 / ≤12 data statements across all views and confirmation |
-| API pricing refresh | ≤6 view reads plus the pricing-refresh job budget below |
-| API meter-sync page | ≤10 + 2*ceil(n/100) data statements including pricing history, separate raw/cost batches of 100 requests; n≤5,000; no per-request SELECT |
-| Pricing refresh | ≤6 + ceil(M/100) + ceil(B/100) + ceil(I/100), with bulk release history; no S per-model reads; M is source rows, B pending rows, I items |
+| API health/fleet/agents/SSE/static/OpenAPI and GPU collector | Measured ceiling **0** local DB statements; target after step 5: **0** |
+| API GPU | Measured ceiling **0** local; target after step 5: **0 local, ≤2 upstream history** (upstream enforcement awaits meter adoption) |
+| API usage | Measured ceiling **16** total reads for 24h/7d/30d with two selected and pending families; target after step 5: **≤8**, regardless of R |
+| API pricing / confirm | Measured ceilings **9 / 29** across all views and confirmation, including HTTP confirmation preflight; target after step 5: **≤3 / ≤12** |
+| API pricing refresh | **No refresh budget test yet**: owner refresh N+1 (audit P6) is step-4 debt. Target after step 5: **≤6 view reads** plus the pricing-refresh job budget below |
+| API meter-sync page | Measured job ceiling **1 + ceil(n/100) + ceil(g/100)**, g gap warnings, plus **1 cursor read per sync run**; both inserts batch 100 rows, no per-row SELECT. Target after step 5: **≤10 + 2*ceil(n/100)** including pricing history and separate raw/cost batches; n≤5,000 (current wire pages ≤500) |
+| Pricing refresh | **Unenforced until step 4 (P6)**. Target: ≤6 + ceil(M/100) + ceil(B/100) + ceil(I/100), with bulk release history; no S per-model reads; M is source rows, B pending rows, I items |
 | Rollup/retention | ≤16 per ≤5,000-row batch per database; pruning chunk ≤5,000; cost families fixed by input configuration |
 | GPU sampling | G+1 data statements, plus one transaction; G physical GPUs |
+
+API budget fixtures exercise 3 and 1,001 successful request rows, two pricing
+families with asymmetric history, NULL/non-NULL model groups, and both selected
+and pending rates. Usage costs/tokens and confirmation outcomes are asserted.
+All-gap sync fixtures measure 4 and 26 statements respectively (page jobs 3 and
+11/11/3, plus the initial cursor read). The inherited single-selected-family
+case remains 13 reads for 1 and 1,000 rows; it is not the worst successful view.
+Usage/pricing/HTTP confirm additionally count 4/2/8 transaction statements.
+Fresh API startup counts 72 requests-DB and 80 pricing-DB setup statements across
+all six connections, plus one startup optimize per writer. Tests reject setup or
+maintenance statements inside request scopes. Runtime metrics remain MET-76.
 
 Each budget must be exercised with small and large **successful** workloads,
 not only empty/error branches. Endpoints with multiple family views must use
@@ -684,15 +697,37 @@ Budget constants live next to owning endpoint/job tests; any increase needs a
 reviewed doc change. Setup has its own per-pool-start budget; zero setup statements
 are allowed inside a row loop.
 
-Adoption order: add helper/runner/counter/EQP harness first; pricing adopts during
-its immediate unit migration; meter adopts during typed schema migration (preserve
-FIFO visibility); factory-api adopts after both schemas/wire compatibility are
-ready and replaces its private pricing-history connection. Then implement costs,
-rollups and retention. The shared helper cannot change connection types without
-updating all opens, including tests/CLI. Enforcement becomes required as each
-owner adopts; legacy violations listed here are explicit transitional debt, not
-permission to add new ones. Add a workspace CI job running owner budget/EQP and
-migration tests; no GitHub Actions workflow currently exists in this checkout.
+Step 3 adoption: **factory-api uses `factory-db` pool, settings, scoped statement
+counter and EXPLAIN helper, not migrations**. Each file has one writer plus two
+readers on dedicated OS threads (six total), with 1,024 outstanding jobs per file,
+explicit overload, cancelled-job skipping, persistent 64 MiB reader caches and
+short query-only snapshots. Usage materializes cache rows before opening its
+pricing snapshot; neither this nor the prior implementation promises an atomic
+snapshot across independent files. The shared writer barrier provides FIFO
+read-after-write when needed. Shutdown closes admission, drains accepted live
+jobs, then closes connections. PASSIVE checkpoints run every five minutes and
+optimize runs at startup and daily, outside requests. No TRUNCATE or VACUUM.
+
+The rusqlite 0.38 trace/profile APIs accept function pointers, while progress
+counts VM instructions. The counter uses exported SQLite `trace_v2` with an owned
+per-connection context and explicit scope handles, including across both files;
+no global reset or thread-local scope. Existing bundled/trace features suffice.
+EXPLAIN tests replay traced SQL templates with bound values on analyzed fixtures.
+Exceptions explicitly retain complete warning reads and legacy pricing sorts
+for refresh/source/rowid ties; pricing's step-4 indexes must remove those sorts.
+
+Transitional debt: startup's existing `IF NOT EXISTS` DDL is unchanged, not a
+migration; API cache adopts the runner in numbered migration 3. Pricing adopts
+shared infrastructure and migrations in step 4; meter adopts in its later typed
+schema step, preserving FIFO visibility. Pricing's narrow connection constructor/
+accessor integration removes its 1,000 ms timeout override so the API can apply
+5,000 ms; the standalone pricing CLI remains unadopted. **Audit P6 refresh N+1**
+(one release-history SELECT per secondary model, plus per-row writes) remains
+known step-4 debt, with no refresh budget test in this PR. No schema/unit/pricing
+behavior changes or production migrations occur in step 3. The runner ships
+tested only on disposable sample schemas. Costs, rollups and retention follow.
+Enforcement is `cargo test --workspace`; this PR adds no CI workflow. These
+explicit legacy debts are not permission to introduce new per-row SQL.
 
 ## Ordered migrations and rollback
 
