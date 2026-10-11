@@ -101,11 +101,12 @@ not zero, except that an online Fleet node with no last-seen timestamp shows
 `Last seen now`. Section errors do not blank other sections.
 
 The dashboard follows `prefers-color-scheme`, including changes while it is
-open, until the user selects a theme. `?kiosk` is accepted and ignored; it never
-forces dark. The theme control saves `light` or `dark` in localStorage under
-`factory-theme`, not in API data. Remove that key to resume system following
-on the next reload. Invalid preferences and unavailable storage follow the
-system on load. A blocking head script sets the resolved `data-theme` and dark
+open, unless the user selects a theme different from the current system scheme.
+`?kiosk` is accepted and ignored; it never forces dark. The theme control saves
+an override as `light` or `dark` in localStorage under `factory-theme`, not in
+API data. Selecting the system-matching theme clears that key and immediately
+resumes following future system changes. Invalid preferences and unavailable
+storage follow the system on load. A blocking head script sets the resolved `data-theme` and dark
 class before styles or modules load; React initializes from that attribute.
 The head's `light-dark()` tokens color both html and body before React starts,
 including manual and self-update reloads. No remote script or forced default
@@ -126,7 +127,10 @@ plus every delivered PNG screencast frame. Pixel (0, 0) must match the expected
 page token in every captured frame. The first frame and per-case JSON go to
 `screenshots/first-frame/` (override with `FIRST_FRAME_DIRECTORY`). The matrix
 covers both system schemes, both opposite saved preferences, invalid preferences,
-blocked storage, and system changes before/after a user selection.
+blocked storage, override persistence across reload, and returning to system
+following after a system-matching selection. Contrast tokens are resolved through
+a hidden element's computed color and recorded as RGB before ratio calculation;
+rendered-text pass/fail thresholds are unchanged.
 
 From the repository root, start `scripts/sandbox up --rows 1k --kiosk`, then
 use its printed factory-api URL from `kiosk/`:

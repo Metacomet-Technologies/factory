@@ -89,11 +89,14 @@ export default function App() {
             aria-label={dark ? "Use light theme" : "Use dark theme"}
             onClick={() => {
               const preference = dark ? "light" : "dark";
-              document.documentElement.dataset.themePreference = preference;
-              setFollowsSystem(false);
+              const followsSystem = !dark === matchMedia("(prefers-color-scheme: dark)").matches;
+              if (followsSystem) delete document.documentElement.dataset.themePreference;
+              else document.documentElement.dataset.themePreference = preference;
+              setFollowsSystem(followsSystem);
               setDark(!dark);
               try {
-                localStorage.setItem("factory-theme", preference);
+                if (followsSystem) localStorage.removeItem("factory-theme");
+                else localStorage.setItem("factory-theme", preference);
               } catch {}
             }}
           >

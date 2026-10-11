@@ -50,8 +50,11 @@ async function firstFrames(url: string, placeholder = false) {
               throw new DOMException("Storage blocked", "SecurityError");
             },
           });
-        else if (preference) localStorage.setItem("factory-theme", preference);
-        else localStorage.removeItem("factory-theme");
+        else if (!sessionStorage.getItem("theme-check-seeded")) {
+          if (preference) localStorage.setItem("factory-theme", preference);
+          else localStorage.removeItem("factory-theme");
+          sessionStorage.setItem("theme-check-seeded", "true");
+        }
         window.themeProbe = {
           timeOrigin: performance.timeOrigin,
           fcp: 0,
@@ -147,17 +150,27 @@ async function firstFrames(url: string, placeholder = false) {
       expect([...new Set(probe.samples)], `${name}: every animation frame`).toEqual([expected]);
       expect([...new Set(pixels)], `${name}: every captured frame`).toEqual([expected]);
       if (!placeholder) {
-        await page.emulateMedia({ colorScheme: system === "dark" ? "light" : "dark" });
-        await expect(page.locator("html")).toHaveAttribute(
-          "data-theme",
-          explicit ?? (system === "dark" ? "light" : "dark"),
-        );
-        await page.getByRole("button", { name: /Use (light|dark) theme/ }).click();
-        const selected = await page.locator("html").getAttribute("data-theme");
+        const opposite = system === "dark" ? "light" : "dark";
+        await page.emulateMedia({ colorScheme: opposite });
+        await expect(page.locator("html")).toHaveAttribute("data-theme", explicit ?? opposite);
         await page.emulateMedia({ colorScheme: system });
-        await expect(page.locator("html")).toHaveAttribute("data-theme", selected!);
+        await expect(page.locator("html")).toHaveAttribute("data-theme", explicit ?? system);
+        if ((await page.locator("html").getAttribute("data-theme")) === system)
+          await page.getByRole("button", { name: /Use (light|dark) theme/ }).click();
+        await expect(page.locator("html")).toHaveAttribute("data-theme", opposite);
+        if (saved !== "blocked") {
+          expect(await page.evaluate(() => localStorage.getItem("factory-theme"))).toBe(opposite);
+          await page.reload();
+          await expect(page.locator("html")).toHaveAttribute("data-theme", opposite);
+          expect(await page.evaluate(() => localStorage.getItem("factory-theme"))).toBe(opposite);
+        }
+        await page.getByRole("button", { name: /Use (light|dark) theme/ }).click();
+        await expect(page.locator("html")).toHaveAttribute("data-theme", system);
+        await expect(page.locator("html")).not.toHaveAttribute("data-theme-preference");
         if (saved !== "blocked")
-          expect(await page.evaluate(() => localStorage.getItem("factory-theme"))).toBe(selected);
+          expect(await page.evaluate(() => localStorage.getItem("factory-theme"))).toBeNull();
+        await page.emulateMedia({ colorScheme: opposite });
+        await expect(page.locator("html")).toHaveAttribute("data-theme", opposite);
       }
       await page.close();
     }
@@ -239,22 +252,36 @@ try {
             l2 = luminance(b);
           return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
         }
-        const style = getComputedStyle(document.documentElement);
-        const token = (name: string) => style.getPropertyValue(`--${name}`).trim();
+        const probe = document.createElement("span");
+        probe.hidden = true;
+        document.body.append(probe);
+        const token = (name: string) => {
+          probe.style.color = `var(--${name})`;
+          const [r, g, b] = rgb(getComputedStyle(probe).color);
+          return `rgb(${r}, ${g}, ${b})`;
+        };
         const tokens = {
           primary: token("primary"),
           primaryForeground: token("primary-foreground"),
           accentText: token("accent-text"),
+          background: token("background"),
+          card: token("card"),
+          mutedForeground: token("muted-foreground"),
+          muted: token("muted"),
+          ok: token("ok"),
+          warn: token("warn"),
+          fail: token("fail"),
         };
+        probe.remove();
         const pairs = {
           "white / primary": ratio(tokens.primaryForeground, tokens.primary),
-          "accent / background": ratio(tokens.accentText, token("background")),
-          "accent / card": ratio(tokens.accentText, token("card")),
-          "muted / card": ratio(token("muted-foreground"), token("card")),
-          "muted / muted": ratio(token("muted-foreground"), token("muted")),
-          "ok / card": ratio(token("ok"), token("card")),
-          "warn / card": ratio(token("warn"), token("card")),
-          "fail / card": ratio(token("fail"), token("card")),
+          "accent / background": ratio(tokens.accentText, tokens.background),
+          "accent / card": ratio(tokens.accentText, tokens.card),
+          "muted / card": ratio(tokens.mutedForeground, tokens.card),
+          "muted / muted": ratio(tokens.mutedForeground, tokens.muted),
+          "ok / card": ratio(tokens.ok, tokens.card),
+          "warn / card": ratio(tokens.warn, tokens.card),
+          "fail / card": ratio(tokens.fail, tokens.card),
         };
         const failures: { text: string; ratio: number; foreground: string; background: string }[] =
           [];
@@ -272,7 +299,7 @@ try {
           if (!text) continue;
           const foreground = getComputedStyle(element).color;
           let parent: Element | null = element;
-          let background = token("background");
+          let background = tokens.background;
           while (parent) {
             const color = getComputedStyle(parent).backgroundColor;
             if ((rgb(color)[3] ?? 0) === 255) {
