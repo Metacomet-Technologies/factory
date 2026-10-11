@@ -27,7 +27,7 @@ fn close(actual: f64, expected: f64) {
 fn live_fixtures_parse_offline_and_resolve_newest_not_highest_price() {
     let primary = parse_openrouter(include_str!("fixtures/openrouter.json")).unwrap();
     let secondary = parse_litellm(include_str!("fixtures/litellm.json")).unwrap();
-    assert_eq!(primary.len(), 7);
+    assert_eq!(primary.len(), 11);
     assert_eq!(secondary.len(), 5); // Ignore sample_spec, reseller rates and missing rates.
     let sonnet = secondary
         .iter()
@@ -43,8 +43,8 @@ fn live_fixtures_parse_offline_and_resolve_newest_not_highest_price() {
     ); // Same-date :batch must not win.
     assert_eq!(
         resolve(&references[1], &primary).unwrap().unwrap().model_id,
-        "openai/gpt-6.1-sol-pro"
-    ); // The placeholder includes pro, intentionally.
+        "openai/gpt-6.1-sol"
+    );
     let older = primary
         .iter()
         .find(|m| m.model_id == "anthropic/claude-sonnet-4.6")
@@ -52,6 +52,36 @@ fn live_fixtures_parse_offline_and_resolve_newest_not_highest_price() {
     close(older.input_per_mtok, 3.0);
     close(older.output_per_mtok, 15.0);
     assert_eq!(older.released_at, Some(1771342990));
+}
+
+#[test]
+fn chatgpt_mid_tier_selects_sol_and_excludes_other_tiers_and_batch() {
+    let models = parse_openrouter(include_str!("fixtures/openrouter.json")).unwrap();
+    let references = parse_references(DEFAULT_CONFIG).unwrap();
+    let reference = references
+        .iter()
+        .find(|r| r.name == "ChatGPT mid-tier")
+        .unwrap();
+    assert_eq!(
+        resolve(reference, &models).unwrap().unwrap().model_id,
+        "openai/gpt-6.1-sol"
+    );
+    for id in [
+        "openai/gpt-6.1-sol-pro",
+        "openai/gpt-6-luna",
+        "openai/gpt-6-astra",
+        "openai/gpt-6.1-sol:batch",
+        "openai/gpt-6.1-sol-pro:batch",
+    ] {
+        let excluded = models.iter().find(|m| m.model_id == id).unwrap();
+        // Testing each candidate alone proves exclusion, not merely an older release.
+        assert!(
+            resolve(reference, std::slice::from_ref(excluded))
+                .unwrap()
+                .is_none(),
+            "{id}"
+        );
+    }
 }
 
 #[test]

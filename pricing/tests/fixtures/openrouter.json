@@ -113,6 +113,38 @@
         "prompt": "-1",
         "completion": "-1"
       }
+    },
+    {
+      "id": "openai/gpt-6.1-sol-pro:batch",
+      "created": 1790702886,
+      "pricing": {
+        "prompt": "0.000001",
+        "completion": "0.000005"
+      }
+    },
+    {
+      "id": "openai/gpt-6.1-sol:batch",
+      "created": 1790702882,
+      "pricing": {
+        "prompt": "0.000001",
+        "completion": "0.000005"
+      }
+    },
+    {
+      "id": "openai/gpt-6-luna",
+      "created": 1790100786,
+      "pricing": {
+        "prompt": "0.0000001",
+        "completion": "0.0000005"
+      }
+    },
+    {
+      "id": "openai/gpt-6-astra",
+      "created": 1788552838,
+      "pricing": {
+        "prompt": "0.00001",
+        "completion": "0.00005"
+      }
     }
   ]
 }

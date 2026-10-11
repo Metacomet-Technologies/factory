@@ -25,8 +25,9 @@ with an explicit timezone. All stored timestamps are UTC Unix seconds.
 
 `config/references.toml` supplies the bundled defaults. To load edits without
 rebuilding, pass `--config config/references.toml` (or another TOML file).
-The requested `^openai/gpt-` placeholder is unchanged. It currently selects a Pro
-model; see [the live report](LIVE_REPORT.md) for the tighter regex recommendation.
+ChatGPT mid-tier uses `^openai/gpt-[0-9]+(?:\.[0-9]+)?-sol$`, selecting ordinary
+Sol models and excluding Pro, Luna, Astra, and batch variants. See
+[the live report](LIVE_REPORT.md) for the original recommendation and capture.
 
 ## Library
 

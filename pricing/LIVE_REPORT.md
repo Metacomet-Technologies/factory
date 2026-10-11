@@ -1,5 +1,10 @@
 # Live pricing report — 2026-10-11
 
+After approval, `config/references.toml` now uses the recommended Sol-only regex.
+The capture below preserves the original placeholder run; its Pro selection is
+historical, not the current default. A fixture-based resolver regression test
+verifies the new default selects GPT 6.1 Sol and excludes other tiers and batch.
+
 ## Result and recommendation
 
 Both public sources were fetched without API keys. The successful refresh is
@@ -21,7 +26,7 @@ published base rates. It excludes the cheaper Luna tier, the higher-priced Astra
 tier, Pro, batch, image/audio, Codex, OSS, and floating ChatGPT aliases.
 This recommendation is based on the live naming and price tiers, not an
 independently measured capability benchmark. Future naming changes need review.
-**The placeholder in `config/references.toml` has not been changed.**
+**The placeholder was unchanged at capture time; the approved regex is now configured.**
 
 ## Schema adaptations and limits
 
