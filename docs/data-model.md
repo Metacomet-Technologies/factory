@@ -35,13 +35,17 @@ Decisions that later PRs must preserve:
   rollups: indefinite. Freeze each request's reference cost at pricing time;
   never reprice an old rollup using today's rate.
 - GPU: seven days raw, hourly rollups indefinitely.
-- Migrate pricing now: UTC INTEGER milliseconds and INTEGER micro-dollars for
-  rates per million tokens and per-request costs. Floating-point money must not
-  enter stored values or totals.
+- Migrate pricing now: UTC INTEGER milliseconds; INTEGER micro-dollars per Mtok
+  for rates; and INTEGER nano-dollars for per-request costs and totals.
+  Floating-point money must not enter stored values or totals.
 - MET-89 readiness: `user_key` and `actor_kind` (`human`, `agent`, `unattributed`).
   Unknown identity is NULL plus `unattributed`; hostnames are not user identities.
 - MET-90 phase 1 remains independent and precedes implementation. Its phase 2
   snapshots can consume the rollups after MET-92 step 5.
+
+The query inventory and measured plans reflect main after PR #13. PR #15 since
+removed usage's pricing N+1 and added a factory-api pool and indexes. Step 3
+re-baselines budgets against current main.
 
 ## Current databases and ownership
 
@@ -288,17 +292,21 @@ This audit did not run those scripts or access their production databases.
 
 ## Findings ranked by impact
 
-1. **High: request-scale pricing reads and cache full scans.** Indexed individual
+1. **High (audit snapshot): request-scale pricing reads and cache full scans.** Indexed individual
    lookups do not rescue 120,012 statements per 30k-row usage response. C5 also
    scans all cache rows for every supported range. Freeze/batch historical costs,
    remove unnecessary ordering, then serve rollup aggregates. This supports
-   MET-90's diagnosis but does not independently reproduce its live timeout.
+   MET-90's diagnosis but does not independently reproduce its live timeout. PR
+   #15 since removed the usage pricing N+1 and added a factory-api pool and indexes;
+   step 3 re-baselines this budget against current main.
 2. **High: sync loses historical coverage and cannot backfill.** Newest 500 per 30s means
    more than 500 arrivals between successful polls (about 16.7/s sustained), or
-   an outage with more than 500 rows, produces gaps. A fresh cache cannot backfill
-   old history; existing gap warnings report loss but do not recover it. Adopt
-   existing meter cursor before pruning; expose missing
-   history, persist a separate cursor, and do not equate ID gaps with zero usage.
+   an outage with more than 500 rows, produces gaps. Current `factory-api` code
+   does request `after_id` pages with `next_after_id`, but initializes that cursor
+   from `MAX(id)` on each sync rather than persisting separate sync state. A fresh
+   cache cannot backfill old history; existing gap warnings report loss but do not
+   recover it. Persist a separate cursor before pruning; expose missing history,
+   and do not equate ID gaps with zero usage.
 3. **High: migration/retention can break IDs and financial reproducibility.**
    Current ordinary INTEGER PRIMARY KEY may reuse IDs after deletion; MAX(id)
    as cache watermark can regress if emptied. Prices use REAL, seconds, implicit
@@ -460,12 +468,13 @@ Money rules:
   checked integer decimal scaling, never an intermediate f64 money value.
 - For each complete-token request and family, compute numerator using checked
   i128: `prompt_tokens * input_micro_usd_per_mtok + output_tokens * output_micro_usd_per_mtok`.
-  Cost is `(numerator + 500000) / 1000000` micro-dollars, half-up **once per request**,
-  then checked into i64. Sum those stored integers, not rounded aggregate tokens.
+  Cost is `(numerator + 500) / 1000` nano-dollars, half-up **once per request**,
+  then checked into i64. Sum those stored nano-dollars, not rounded aggregate tokens.
   Sum with checked arithmetic; overflow fails visibly, never saturates.
-- Example: rates 2,000,000/8,000,000 micro-USD/Mtok and tokens 3/7 cost 62
-  micro-USD. At 500,000 micro-USD/Mtok, one input token costs 1 micro-USD after
-  rounding; two such requests total 2, not 1. Zero cost is not an unpriced row.
+- Example: rates 2,000,000/8,000,000 micro-USD/Mtok and tokens 3/7 give numerator
+  62,000,000 and cost **62,000 nano-USD**. At 1,500 micro-USD/Mtok, one input
+  token costs **2 nano-USD** after rounding; two such requests total **4**, not 3.
+  Zero cost is not an unpriced row.
 - SQL CHECKs enforce signed ranges/nonnegativity; STRICT alone still permits
   lossless type coercion. Trust-boundary validation rejects wrong units/types.
   Preserve HTTP USD fields as presentation-only conversions of integer totals;
@@ -482,10 +491,10 @@ API `request_costs`, STRICT:
 | --- | --- |
 | `request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE`, `family TEXT NOT NULL` | PRIMARY KEY(request_id,family), one classification per inference request per reference family |
 | `priced_at_ms INTEGER NOT NULL CHECK(priced_at_ms>=0)` | Actual time that classification is frozen, separate from event time |
-| `pricing_kind TEXT NOT NULL CHECK(... IN ('dated','estimated','unpriced'))` | Preserve distinct estimates and missing prices/tokens |
-| `cost_micro_usd INTEGER CHECK(cost_micro_usd>=0)` | NOT NULL for dated/estimated, NULL for unpriced; table CHECK enforces both directions |
-| `selection_id INTEGER`, `snapshot_id INTEGER`, `reference_model_id TEXT` | Cross-DB provenance, not SQLite FKs; present for priced classifications, NULL for unpriced |
-| `input_micro_usd_per_mtok INTEGER`, `output_micro_usd_per_mtok INTEGER` | Freeze nonnegative rates with priced row; NULL only when unpriced |
+| `cost_status TEXT NOT NULL CHECK(cost_status IN ('priced','estimated','unpriced'))` | Preserve distinct estimates and missing prices/tokens |
+| `cost_nano_usd INTEGER CHECK(cost_nano_usd>=0)` | NOT NULL for priced/estimated, NULL for unpriced; table CHECK enforces both directions |
+| `selection_id INTEGER`, `snapshot_id INTEGER`, `reference_model_id TEXT` | Cross-DB provenance, not SQLite FKs; present for priced/estimated classifications, NULL for unpriced |
+| `input_micro_usd_per_mtok INTEGER`, `output_micro_usd_per_mtok INTEGER` | Freeze nonnegative rates with priced/estimated row; NULL only when unpriced |
 
 Index `(family,request_id)` supports backfill/reporting; request PK supports
 batch reads/cascades. Effective selection/rate are evaluated at **request.ts_ms**,
@@ -498,10 +507,12 @@ If initial ingestion cannot read pricing due to a storage failure, do not advanc
 the cursor; a genuine absence of history is an unpriced classification.
 
 Migration backfill freezes legacy classifications using the current history;
-new ingestion freezes once. A later confirmation does not silently revise
-already-unpriced rows. A deliberate restatement is a separate versioned operation,
-not this job. Confirm this product-visible freezing behavior with Devon before
-rollup implementation; it differs from today's recalculation on every GET.
+new ingestion freezes once. Priced and estimated rows are frozen. The only
+allowed transition is `unpriced` to `estimated`, while the raw request remains,
+in a separate fill-in job after a reference price is confirmed, matching today's
+pre-history behavior. That job rewrites affected `spend_hourly`/`spend_daily`
+buckets in the same transaction. After pruning, the row remains unpriced in
+rollups. Any other rewrite requires a separate versioned restatement design.
 
 ### Rollup tables and exact aggregation
 
@@ -529,13 +540,13 @@ against SQLite overflow; REAL telemetry/TPS sums are not money.
 
 API `spend_hourly` and `spend_daily`, STRICT: `bucket_ms INTEGER NOT NULL`,
 `dimension_key TEXT NOT NULL` (same checked dimension columns as request rollups),
-`family TEXT NOT NULL`, `dated_micro_usd INTEGER NOT NULL`,
-`estimated_micro_usd INTEGER NOT NULL`, `dated_requests INTEGER NOT NULL`,
+`family TEXT NOT NULL`, `priced_nano_usd INTEGER NOT NULL`,
+`estimated_nano_usd INTEGER NOT NULL`, `priced_requests INTEGER NOT NULL`,
 `estimated_requests INTEGER NOT NULL`, `unpriced_requests INTEGER NOT NULL`.
 All sums/counts nonnegative; bucket alignment CHECK. PK
 `(bucket_ms,family,dimension_key)`; indexes `(family,bucket_ms)` and
 `(user_key,actor_kind,bucket_ms,family)`. Aggregate frozen request costs only;
-dated+estimated+unpriced counts must equal inference requests per family/dimension.
+priced+estimated+unpriced counts must equal inference requests per family/dimension.
 Reference families are alternatives: never sum them into one total spend figure.
 
 Meter `gpu_hourly`, STRICT: PK `(bucket_ms,gpu_index)` with aligned nonnegative
@@ -554,16 +565,12 @@ CHECK(updated_at_ms>=0)`. Meter has separate request/GPU rows; API one request
 row for metrics and costs together. Initialize only when aggregates are built,
 not merely when schema is created.
 
-**Percentile boundary:** exact nearest-rank p50/p95 is not mergeable from hourly
-p50/p95 or sums. Current 24h/7d/30d endpoints retain their exact percentile
-contract by querying only indexed raw range latency/token-duration fields
-(one query), while counts/costs/rates come from rollups and raw edge fragments.
-Any MET-90 snapshot computes exact supported-range percentiles in the background
-from retained raw data. Indefinite rollups guarantee counts/tokens/costs/rates,
-not exact all-time quantiles. Older-than-365-day quantiles must be unavailable
-until Devon chooses a versioned approximation contract; no silent histogram
-approximation or average of hourly quantiles ships. Current endpoints don't
-offer older-than-365-day ranges, so this does not remove an existing feature.
+**Percentile boundary:** exact nearest-rank p50/p95 comes from raw rows within
+the 365-day window, so current ≤30-day endpoints remain exact. Hourly rollups
+carry a mergeable fixed-bucket latency histogram; daily rollups sum hourly
+histograms. Ranges outside raw retention use approximate percentiles and the
+contract flags them as approximate. Bucket boundaries and storage layout are
+deferred to step 5; they must be fixed, versioned and additive.
 
 ### Retention and job transaction rules
 
@@ -612,21 +619,20 @@ and business queries in their owners, not in a universal repository abstraction.
 
 - **Pool/execution:** one writer plus initially two readers per file DB, each
   owned by a dedicated blocking OS thread. Bound submitted operations (initial
-  capacity 1,024); overload must produce an explicit error/metric, never unbounded
-  growth or a blocked Tokio worker. Async callers await results; pricing CLI can
+  capacity 1,024); overload never slows inference: meter drops rows, counts drops,
+  and surfaces a warning and MET-76 alert rather than unbounded growth or a blocked
+  Tokio worker. Async callers await results; pricing CLI can
   use a synchronous facade to the same queue. No fresh connection per endpoint.
   Reader transactions are short-lived and query-only. Meter read-after-write
   calls use an acknowledged writer barrier **before** opening the read snapshot.
-  Preserve shutdown drain/write-error semantics. If forwarding must survive queue
-  overload without data loss, a durable spool is required; a pool cannot claim
-  it solved durability. That policy is an open question, not a hidden guarantee.
+  Preserve shutdown drain/write-error semantics.
 - **Settings:** writer startup sets/verifies `journal_mode=WAL`; every connection
   sets `synchronous=NORMAL`, `busy_timeout=5000`, `foreign_keys=ON`,
   `journal_size_limit=67108864` (64 MiB); readers also `query_only=ON` after setup.
   MEMORY journal is an explicit in-memory-test exception, never a file fallback.
-  NORMAL preserves consistency but may lose latest commits on power loss; Devon
-  must accept that durability policy before rollout. Journal size limit does not
-  cap an active WAL held by long readers. Configure autocheckpoint (1,000 pages),
+  NORMAL preserves consistency but may lose latest commits on power loss; MET-104's
+  UPS covers power outages. Journal size limit does not cap an active WAL held by
+  long readers. Configure autocheckpoint (1,000 pages),
   attempt PASSIVE checkpoint every five minutes, observe busy/WAL size; TRUNCATE
   only in a reader-free maintenance window. Optimize on startup after migration
   and daily; verify resulting settings on all pool connections in tests.
@@ -644,7 +650,8 @@ and business queries in their owners, not in a universal repository abstraction.
   BEGIN/COMMIT, setup/migration and maintenance are separate named budgets, not
   ignored. Do not rely on a SELECT-only counter or thread-local scope that is
   lost in `spawn_blocking`. Reset isolated scopes, never a shared global counter
-  while concurrent operations are running. Runtime metrics accompany CI failures.
+  while concurrent operations are running. Runtime query-counter metrics wait for
+  MET-76; until then, tests enforce budgets.
 - **EQP helper:** run parameter-bound EXPLAIN QUERY PLAN with bundled SQLite on
   realistic fixture sizes/selectivities and ANALYZE. Match semantic plan features
   (required search/index, forbidden unrestricted hot-table scan/temp sort), not
@@ -696,7 +703,7 @@ backup lock/timer; keep Ollama running. Use SQLite backup API including WAL,
 checksum/compress/integrity verification, and record archive path, code version,
 schema version and per-table row counts. Restore/decompress into a scratch DB
 first. Enough space for old DB, new tables/indexes, WAL and snapshot is a hard
-preflight gate. MET-74 scripts exist, but live installation/peer access is unverified.
+preflight gate. MET-74 is installed and restore-checked on both nodes (2026-10-11).
 
 Current schemas are legacy version 0 **only after validating schema and actual
 user_version**. Proposed versions are per DB, not one shared global version:
@@ -782,8 +789,11 @@ Rollup retention intentionally cannot recover seven-day-expired GPU details or
   windows, DST dates, NULL identities, two real users, humans/agents, unknown
   counts and two families. Validate mean-of-ratios (not ratio-of-sums), zero vs
   unpriced, late rows, crash before/after checkpoint, no duplicate contribution,
-  no hourly/daily edge overlap, exact current-range percentiles from raw. Rates
-  changing after ingest cannot alter frozen costs. Pruning at cutoff-1/cutoff/
+  no hourly/daily edge overlap, exact current-range percentiles from raw, and
+  flagged approximate older-range percentiles from merged fixed-bucket histograms.
+  Verify only retained unpriced rows can become estimated and that each fill-in
+  rewrites affected spend buckets in its transaction. Rates changing after ingest
+  cannot alter frozen costs. Pruning at cutoff-1/cutoff/
   cutoff+1 proves the strict boundary and prevents deletion when rollups lag.
 - **Enforcement:** realistic analyzed fixtures run hot-query EQP checks under
   bundled SQLite; query budgets compare small/large successful requests and
@@ -791,24 +801,24 @@ Rollup retention intentionally cannot recover seven-day-expired GPU details or
   conceal N+1. Test bounded queue overload and writer-barrier visibility; long
   readers/WAL maintenance must not block Tokio workers or claim nonexistent WAL caps.
 
-## Open questions and unverified limits
+## Decided (2026-10-11)
 
-Devon decisions before implementation, with safe defaults above:
+- Rates remain INTEGER micro-dollars per Mtok; request costs and totals are i64
+  nano-dollars, rounded half-up once per request with checked i128 arithmetic.
+  Priced/estimated rows are frozen; retained unpriced rows alone may become
+  estimated through the transactional fill-in job. Other rewrites need a
+  versioned restatement design.
+- Raw rows provide exact nearest-rank percentiles for the 365-day window. Hourly
+  fixed-bucket latency histograms merge into daily histograms; older ranges are
+  approximate and flagged. Buckets/storage are fixed, versioned and additive.
+- WAL plus `synchronous=NORMAL` is accepted. MET-104's UPS covers power outages.
+  Meter's bounded 1,024 write queue drops on overflow without slowing inference,
+  counts drops, and surfaces a warning and MET-76 alert. Runtime query-counter
+  metrics wait for MET-76; tests enforce budgets until then.
+- MET-74 is operational on both nodes with restore-checked nightly timers. Each
+  migration still requires a fresh snapshot.
 
-1. Accept half-up per-request micro-dollar rounding and freezing an initially
-   unpriced classification after later confirmation? Proposed default is yes;
-   deliberate restatement needs a separate audited design.
-2. Is indefinite counts/tokens/costs/rates without exact >365-day percentiles
-   sufficient? Proposed default preserves today's exact ≤30-day API; any older
-   quantile needs an explicitly versioned approximation/unavailability contract.
-3. Accept synchronous=NORMAL power-loss window and explicit meter queue overload
-   reporting, or require FULL/durable spool? Neither backups nor readers solve
-   queued-record loss. Choose before shared-pool adoption.
-4. Confirm MET-74 is installed/verified on both hosts and that fresh snapshots
-   can be taken during a quiesced migration. Production migration stays blocked
-   until this and disk-space/count/data-validity preflights pass.
-
-Not verified: live counts/data/PRAGMAs/user_version, production performance,
+Not verified at audit time: live counts/data/PRAGMAs/user_version, production performance,
 backup installation/restore permissions, deployment, or any proposed
 migration/rollup implementation. Capture timestamps alone do
 not prove current live schema remains unchanged. No production DB was opened,

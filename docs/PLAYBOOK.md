@@ -60,7 +60,8 @@ Every prompt has these sections:
 
 ## 5. Review checklist (before merge)
 
-- Files changed match the isolation rule (`gh pr view N --json files`).
+- **Reviews are done by Claude directly:** Linear `get_diff` for metadata and link types, then Claude in Chrome for the actual diff and full scripts. Only fall back to asking Devon for `gh` output when neither tool is reachable.
+- Files changed match the isolation rule (the diff's file list).
 - Tests pass, the live check has real evidence (timings, row counts), the deviations list has been read.
 - Read install/rollback scripts in full.
 - **PR ↔ Linear link type:** a "closes" link auto-closes the issue on merge. Use **contributes** for research, partial work, or fixes whose install hasn't been verified; reopen issues that auto-closed early.
@@ -75,6 +76,30 @@ Every prompt has these sections:
 
 ## 7. Operating the factory
 
+### Commands for Devon
+
+Every command Claude or an agent gives Devon is written as run **from his Mac**, with the helper that says where it runs:
+
+| Helper | Runs |
+|---|---|
+| `factory-ssh "…"` | factory-gpu, as `dgarbs51` |
+| `console-ssh "…"` | factory-console |
+| `factory-desktop` / `console-desktop` | RDP desktop sessions |
+| `factory-status` | full health check (Mac only) |
+| `opin …` | 1Password CLI on a node |
+
+- **Multi-line remote scripts:** `factory-ssh 'bash -s' <<'EOF'` … `EOF` (or `console-ssh` for factory-console; a heredoc after a plain `ssh host` runs on the Mac).
+- **Same command on both nodes:** one labeled loop, not two copies:
+  `for h in factory-gpu factory-console; do echo "== $h"; ssh dgarbs51@$h '…'; done`
+  (or `ssh dgarbs51@$h 'bash -s' <<'EOF'` … `EOF` inside the loop).
+  Use separate commands instead when order matters (for example factory-gpu first), when one node must be checked before the next, or when a command needs an interactive prompt.
+- **`ssh -t dgarbs51@<host> '…'`** only for interactive prompts.
+- **Full paths with sudo** (`/home/agent/work/factory/...`): admins can't `cd` into `/home/agent`. For agent-owned paths, run as the agent: `sudo -u agent git -C /home/agent/work/factory status -sb`.
+- Agent-thread commands go in a separate prompt block with the handoff header, never mixed with Mac commands.
+- **Every step has its command:** each step given to Devon includes the exact command and where it runs, or says **UI only** and where (for example, archiving an Amp thread). Steps Claude can do with its own tools (reviews, Linear updates) Claude does or offers; irreversible actions (merges, deletes) need Devon's explicit yes first. Claude can merge through Linear's `merge_diff` (squash) only after Devon's explicit yes.
+
+### Day-to-day operations
+
 - **`factory-status`** (Mac): switches to the Metacomet tailnet, then checks every node, service, GPU, link speed, disk, endpoints and latencies. For about a minute after a reboot, "fleet all green" can be briefly red while services start.
 - **When something looks down:** first run `tailscale switch --list` (the asterisk is the active tailnet; the Mac is signed into several). Then `factory-status`. **Capture evidence before rebooting:** `uptime; free -h; systemctl --failed; journalctl -p warning --since "-30min"`.
 - **Phone:** Blink `ssh gpu` / `mosh gpu` (Mosh needs SSH to work first; no daemon to start). Check the Tailscale app is on Metacomet.
@@ -82,6 +107,9 @@ Every prompt has these sections:
 - **UPS:** `upsc cyberpower@localhost` on factory-gpu. Clean shutdown at < 30% charge or < 5 min runtime; it boots itself when power returns.
 
 ## 8. Gotchas we've already hit
+
+**Process**
+- When a Linear **Decided** section changes a rule, update `AGENTS.md`/docs in the next PR. Agents follow the repo file, not Linear.
 
 **Networking / Tailscale**
 - Plain `tailscale ping` **ignores the access policy**; test blocks with `tailscale ping --icmp` or a real TCP connection.
