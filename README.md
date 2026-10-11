@@ -46,8 +46,29 @@ vp test --run
 vp build
 ```
 
-Release automation and version-downloading installers are MET-107 phases 2–3,
-not part of phase 1. No GitHub workflows or deployment scripts change here.
+### Releases
+
+Releases are manual; there is no release bot or CHANGELOG file.
+
+1. In a clean feature branch, run `scripts/bump-version.sh 0.2.1` and open a PR.
+   It updates `VERSION`, both manifests, workspace entries in `Cargo.lock`, and
+   the OpenAPI snapshot's embedded version, then checks version consistency.
+   Use a 0.x version; the script never commits, pushes, or tags.
+2. Merge the bump PR after the `rust`, `kiosk`, and `scripts` CI checks pass.
+3. From your Mac, publish the matching release:
+   `gh release create v0.2.1 --repo Metacomet-Technologies/factory --target main --generate-notes`.
+
+The release workflow checks that the existing tag exactly matches `v$(cat VERSION)`
+at its commit, uses 0.x SemVer, and belongs to `main`'s history. It reruns CI on
+that verified commit and never edits or deletes the release. For a post-merge
+dry run against an existing tag, use
+`gh workflow run release.yml --repo Metacomet-Technologies/factory -f tag=v0.2.0`.
+Artifacts and version-downloading installers remain MET-107 phase 3.
+
+CI uses `factory-api/openapi.json` without a running API. Its drift test checks
+the public OpenAPI endpoint; regenerate intentional schema changes with
+`UPDATE_OPENAPI=1 cargo test -p factory-api --test openapi_snapshot`, then update
+kiosk types against that file. Normal kiosk development retains its live schema gate.
 
 ### Phase 1 deployment after merge (administrator handoff)
 

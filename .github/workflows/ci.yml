@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to check (the release workflow supplies the verified tag commit)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Set up Rust and verify the C compiler
+        run: |
+          cc --version
+          if [[ -f rust-toolchain || -f rust-toolchain.toml ]]; then
+            rustup show active-toolchain
+            rustup component add rustfmt clippy
+          else
+            rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+            rustup default stable
+          fi
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*') }}
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
+
+  kiosk:
+    name: kiosk
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: kiosk
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Read pinned runtime versions
+        id: versions
+        run: |
+          node -e 'const p = require("./package.json"); console.log("node=" + p.devEngines.runtime.version); console.log("pnpm=" + p.devEngines.packageManager.version)' >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: ${{ steps.versions.outputs.node }}
+      - name: Install pinned Vite+ and pnpm via npm
+        env:
+          PNPM_VERSION: ${{ steps.versions.outputs.pnpm }}
+        # https://viteplus.dev/guide/local-cli: npm CLI supports package-manager commands.
+        # Install outside the checkout so bootstrapping cannot change its manifests.
+        run: |
+          npm install --prefix "$RUNNER_TEMP/kiosk-tools" --no-audit --no-fund vite-plus@1.1.0 "pnpm@$PNPM_VERSION"
+          echo "$RUNNER_TEMP/kiosk-tools/node_modules/.bin" >> "$GITHUB_PATH"
+      - run: node --version && pnpm --version && vp --version
+      - name: Install kiosk dependencies and select its local CLI
+        run: |
+          vp install
+          echo "$GITHUB_WORKSPACE/kiosk/node_modules/.bin" >> "$GITHUB_PATH"
+      - run: vp check
+        env:
+          OPENAPI_URL: file://${{ github.workspace }}/factory-api/openapi.json
+      - run: vp test --run
+      - run: vp build
+
+  scripts:
+    name: scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Install script check dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck sqlite3 zstd rsync
+      - name: Check every deployment and version script
+        run: |
+          mapfile -d '' scripts < <(find deploy scripts -type f -name '*.sh' -print0)
+          for script in "${scripts[@]}"; do bash -n "$script"; done
+          shellcheck -x "${scripts[@]}"
+      - run: python3 -B deploy/test_set_ollama_host.py
+      - run: python3 -B deploy/backup/test-backup.py
