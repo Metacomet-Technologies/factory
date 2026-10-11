@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -1037,6 +1037,7 @@ async fn cursor_sync_recovers_multiple_pages_and_restarts_without_false_gaps() -
 /// Worst successful views: both families have selected and pending rates.
 #[tokio::test]
 async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
     const USAGE: usize = 16;
     const PRICING: usize = 9;
     const CONFIRM: usize = 29;
@@ -1107,13 +1108,14 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
             "sync n={n}: data={}, page jobs={page_counts:?}, initial cursor=1",
             sync.counts().data
         );
+        let settings_scope = factory_db::Scope::default();
         for (name, settings) in [
             (
                 "requests",
                 state
                     .db
                     .requests
-                    .settings(&factory_db::Scope::default())
+                    .settings(&settings_scope)
                     .await?,
             ),
             (
@@ -1121,7 +1123,7 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
                 state
                     .db
                     .pricing
-                    .settings(&factory_db::Scope::default())
+                    .settings(&settings_scope)
                     .await?,
             ),
         ] {
@@ -1145,6 +1147,8 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
             }
             eprintln!("{name} settings: {settings:?}");
         }
+        // Eight PRAGMAs on each of six connections; a lost trace hook reduces this total.
+        assert_eq!(settings_scope.counts(), factory_db::counter::Counts { setup: 48, ..Default::default() });
         eprintln!(
             "startup requests={:?}, pricing={:?}",
             state.db.requests.startup.counts(),
@@ -1280,6 +1284,9 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
         upstream_task.abort();
     }
     Ok(())
+    })
+    .await
+    .context("measured_endpoint_budgets_and_all_connection_settings exceeded 30 seconds")?
 }
 
 #[test]
@@ -1419,55 +1426,59 @@ async fn explicit_migrate_and_startup_version_gate() -> Result<()> {
 
 #[tokio::test]
 async fn overload_sheds_requests_times_out_work_and_keeps_sse_open() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let (upstream, upstream_task) = serve(Router::new().fallback(|| async {
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        StatusCode::SERVICE_UNAVAILABLE
-    }))
-    .await;
-    let state = test_state(&temp, upstream).await?;
-    let (url, task) = serve(router(state.clone())).await;
-    let client = reqwest::Client::new();
-    let mut stream = client.get(format!("{url}/v1/stream")).send().await?;
-    let mut pending = tokio::task::JoinSet::new();
-    for _ in 0..40 {
-        let client = client.clone();
-        let url = url.clone();
-        pending.spawn(async move {
-            client
-                .get(format!("{url}/v1/gpu"))
-                .send()
-                .await
-                .unwrap()
-                .status()
-                .as_u16()
-        });
-    }
-    let mut shed = 0;
-    let mut timed_out = 0;
-    while let Some(status) = pending.join_next().await {
-        match status? {
-            503 => shed += 1,
-            504 => timed_out += 1,
-            other => panic!("unexpected HTTP {other}"),
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let temp = tempfile::tempdir()?;
+        let (upstream, upstream_task) = serve(Router::new().fallback(|| async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            StatusCode::SERVICE_UNAVAILABLE
+        }))
+        .await;
+        let state = test_state(&temp, upstream).await?;
+        let (url, task) = serve(router(state.clone())).await;
+        let client = reqwest::Client::new();
+        let mut stream = client.get(format!("{url}/v1/stream")).send().await?;
+        let mut pending = tokio::task::JoinSet::new();
+        for _ in 0..40 {
+            let client = client.clone();
+            let url = url.clone();
+            pending.spawn(async move {
+                client
+                    .get(format!("{url}/v1/gpu"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            });
         }
-    }
-    assert!(shed > 0 && timed_out > 0);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), stream.chunk())
-            .await
-            .is_err()
-    );
-    state.shutdown.cancel();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), stream.chunk())
-            .await??
-            .is_none()
-    );
-    state.db.close().await?;
-    task.abort();
-    upstream_task.abort();
-    Ok(())
+        let mut shed = 0;
+        let mut timed_out = 0;
+        while let Some(status) = pending.join_next().await {
+            match status? {
+                503 => shed += 1,
+                504 => timed_out += 1,
+                other => panic!("unexpected HTTP {other}"),
+            }
+        }
+        assert!(shed > 0 && timed_out > 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.chunk())
+                .await
+                .is_err()
+        );
+        state.shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), stream.chunk())
+                .await??
+                .is_none()
+        );
+        state.db.close().await?;
+        task.abort();
+        upstream_task.abort();
+        Ok(())
+    })
+    .await
+    .context("overload_sheds_requests_times_out_work_and_keeps_sse_open exceeded 30 seconds")?
 }
 
 #[tokio::test]
