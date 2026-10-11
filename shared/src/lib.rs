@@ -71,3 +71,9 @@ pub struct MeterQuery {
     pub model: Option<String>,
     pub limit: Option<usize>,
 }
+
+#[derive(Default, Deserialize, ToSchema)]
+pub struct MeterRequestsQuery {
+    pub limit: Option<usize>,
+    pub after_id: Option<i64>,
+}
