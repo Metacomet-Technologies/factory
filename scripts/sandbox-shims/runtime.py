@@ -159,6 +159,11 @@ def inside():
         for name, path in [("fake-ollama", "/api/version"), ("meter", "/meter/health"), ("factory-api", "/v1/health")]:
             fleet += f'[[nodes.services]]\nname = "{name}"\nkind = "http"\ntarget = "http://127.0.0.1:{SERVICES[name]}{path}"\n'
         (STATE / "fleet.toml").write_text(fleet)
+        with (STATE / "factory-api.log").open("ab") as log:
+            migration = subprocess.run([binary / "factory-api", "migrate", "--pricing-db", STATE / "pricing.db"],
+                                       stdout=log, stderr=log)
+        if migration.returncode != 0:
+            raise RuntimeError(f"Pricing migration failed (exit {migration.returncode}); see factory-api.log")
         start("factory-api", [binary / "factory-api", "--listen", f"127.0.0.1:{BASE+2}",
                               "--meter-url", f"http://127.0.0.1:{BASE+1}", "--db-path", STATE / "requests.db",
                               "--pricing-db-path", STATE / "pricing.db", "--services-config", STATE / "fleet.toml",
