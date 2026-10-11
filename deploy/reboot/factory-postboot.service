@@ -1,0 +1,18 @@
+[Unit]
+Description=Record factory post-boot health
+# Avoid an ordering cycle: this service runs after the target that enables it.
+DefaultDependencies=no
+Wants=time-sync.target
+After=multi-user.target time-sync.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/lib/factory-reboot/postboot-check.sh
+
+[Install]
+WantedBy=multi-user.target

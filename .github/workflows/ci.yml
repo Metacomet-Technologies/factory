@@ -108,6 +108,7 @@ jobs:
           shellcheck -x "${scripts[@]}"
       - run: python3 -B deploy/test_set_ollama_host.py
       - run: python3 -B deploy/backup/test-backup.py
+      - run: python3 -B deploy/reboot/test-reboot.py
 
   sandbox:
     name: sandbox
