@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""No-root contract checks with fake filesystems and commands, never host reboots."""
+
+import concurrent.futures
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import threading
+
+HERE = Path(__file__).resolve().parent
+NOW = 1_791_799_200_000  # 2026-10-12 10:00 UTC (06:00 New York)
+RUNNER = ("/home/agent/.local/bin/amp --no-tui --runner-id factory-gpu --dir /home/agent/work "
+          "--discover-dirs=/home/agent/work --remote-control-terminal --amp-env "
+          "--runner-account-email devon@metacomet.tech")
+PLUGIN = ("/home/agent/.amp/bin/amp run /tmp/amp-plugin-runtime-q517Yo/plugin-runtime.ts "
+          "/home/agent/.cache/amp/global-plugins/ampcode.com/workspace/official-modes@46ba5e96083e1347/index.ts")
+
+SHIM = r'''#!/usr/bin/python3
+import json, os, sys
+from pathlib import Path
+fixture = Path(os.environ['REBOOT_FIXTURE'])
+data = json.loads((fixture / 'commands.json').read_text())
+name = Path(sys.argv[0]).name
+with (fixture / 'calls').open('a') as log:
+    log.write(name + ' ' + ' '.join(sys.argv[1:]) + '\n')
+if name == 'cp':
+    import subprocess
+    # Host-root ancestor ownership is unmapped in this unprivileged namespace.
+    sys.exit(subprocess.run([str(fixture / 'cp-real'), *sys.argv[1:],
+                             '--no-preserve=ownership']).returncode)
+if name == 'ps':
+    print(data['ps'], end='')
+    print(data.get('ps_error', ''), end='', file=sys.stderr)
+    sys.exit(data.get('ps_code', 0))
+if name == 'curl':
+    print(data['meter'])
+    sys.exit(data.get('meter_code', 0))
+if name == 'upsc':
+    print('Init SSL without certificate database', file=sys.stderr)
+    print(data['ups'])
+    sys.exit(data.get('ups_code', 0))
+if name == 'hostname':
+    print(data['node'])
+if name == 'timedatectl':
+    print('NTPSynchronized=' + data.get('clock', 'yes'))
+if name == 'systemctl':
+    if sys.argv[1] == 'reboot':
+        root = Path(os.environ.get('REBOOT_ROOT', '/'))
+        state = json.loads((root / 'var/lib/factory-reboot/status.json').read_text())
+        assert state['last_decision'] == 'rebooting' and state['mode'] == 'enforce'
+    elif sys.argv[1] == 'show':
+        if '--property=Version' in sys.argv:
+            print('259')
+        elif '--property=LoadState' in sys.argv:
+            print('loaded' if Path('/etc/systemd/system', sys.argv[2]).exists() else 'not-found')
+    elif sys.argv[1] == 'is-enabled':
+        print('disabled')
+        sys.exit(1)
+    elif sys.argv[1] == 'is-active':
+        state = data.get('services', {}).get(sys.argv[2], 'active')
+        print(state)
+        sys.exit(0 if state == 'active' else 3)
+'''
+
+
+with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
+    fixture = Path(temporary)
+    root = fixture / "root"
+    bin_dir = fixture / "bin"
+    bin_dir.mkdir()
+    shutil.copy2(shutil.which("cp"), fixture / "cp-real")
+    for name in ("ps", "curl", "upsc", "systemctl", "timedatectl", "hostname", "cp"):
+        path = bin_dir / name
+        path.write_text(SHIM)
+        path.chmod(0o755)
+    for directory in ("var/run", "proc", "etc/factory-reboot"):
+        (root / directory).mkdir(parents=True)
+    config_path = root / "etc/factory-reboot/node.conf"
+    config = json.loads((HERE / "factory-gpu.conf").read_text())
+    config_path.write_text(json.dumps(config))
+    flag = root / "var/run/reboot-required"
+    status = root / "var/lib/factory-reboot/status.json"
+    calls = fixture / "calls"
+    commands = dict(ps=f"2481 1 {RUNNER}\n34170 2481 {PLUGIN}\n31101 1 op daemon\n",
+                    meter=json.dumps([{"ts": NOW - 600_001}]), ups="OL", node="factory-gpu")
+    env = dict(os.environ, REBOOT_ROOT=str(root), REBOOT_CONFIG=str(config_path),
+               REBOOT_NOW_MS=str(NOW), REBOOT_FIXTURE=str(fixture),
+               PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])
+
+    def run(script="reboot-check.sh", *args, updates=None, environment=None, success=True):
+        if updates:
+            commands.update(updates)
+        (fixture / "commands.json").write_text(json.dumps(commands))
+        result = subprocess.run(["bash", str(HERE / script), *args],
+                                env=environment or env, text=True, capture_output=True, timeout=60)
+        assert (result.returncode == 0) == success, result.stdout + result.stderr
+        return json.loads(status.read_text())
+
+    def expect(decision, reason=None, **kwargs):
+        data = run(**kwargs)
+        assert data["last_decision"] == decision, data
+        if reason:
+            assert data["last_reason"].startswith(reason), data
+        assert "systemctl reboot\n" not in calls.read_text() if calls.exists() else True
+        return data
+
+    data = expect("not-needed")
+    assert data["pending_since_ms"] is None and data["consecutive_skips"] == 0
+    assert not calls.exists(), "No busy tools should run when reboot is not needed"
+    flag.touch()
+    data = expect("would-reboot")
+    assert data["pending_since_ms"] == NOW and data["days_pending"] == 0
+    print("PASS: not-needed clears state; exact idle runner, plugin and op daemon allow observe")
+
+    expect("skipped", "agent-busy", updates={"ps": f"2481 1 {RUNNER}\n9 2481 cargo test\n"})
+    expect("skipped", "agent-busy", updates={"ps": f"9 1 {PLUGIN}\n"})
+    expect("skipped", "agent-busy", updates={"ps": f"9 1 {RUNNER} --execute work\n"})
+    expect("skipped", "agent-processes-unknown", updates={"ps": "invalid output\n"})
+    expect("skipped", "agent-processes-unknown", updates={"ps": "", "ps_code": 1, "ps_error": "read error"})
+    expect("would-reboot", updates={"ps_error": ""})
+    expect("would-reboot", updates={"ps": "31101 1 op daemon\n", "ps_code": 0})
+    print("PASS: work, extra runner arguments, orphan plugin and unreadable ps block reboot")
+
+    for ts, decision in ((NOW - 599_999, "skipped"), (NOW - 600_000, "skipped"),
+                         (NOW - 600_001, "would-reboot"), (NOW + 1, "skipped")):
+        expect(decision, updates={"meter": json.dumps([{"ts": ts}])})
+    expect("skipped", "meter-unknown", updates={"meter_code": 7})
+    for invalid in ("invalid JSON", '{"ts": 1}', '[{"ts": true}]', '[{}]'):
+        expect("skipped", "meter-unknown", updates={"meter_code": 0, "meter": invalid})
+    expect("would-reboot", updates={"meter": "[]"})
+    print("PASS: 10-minute boundary, stale/empty/recent/future traffic and unknown meter")
+
+    for ups, code, decision, reason in (("OL", 0, "would-reboot", None),
+                                       ("OB DISCHRG", 0, "skipped", "ups-on-battery"),
+                                       ("OL OB", 0, "skipped", "ups-on-battery"),
+                                       ("", 1, "skipped", "ups-unknown"),
+                                       ("UNKNOWN", 0, "skipped", "ups-unknown")):
+        expect(decision, reason, updates={"ups": ups, "ups_code": code})
+    commands.update(ups="OL", ups_code=0, ps="9 1 cargo test\n")
+    config["mode"] = "enforce"
+    config_path.write_text(json.dumps(config))
+    status.unlink()
+    for day in range(4):
+        env["REBOOT_NOW_MS"] = str(NOW + day * 86_400_000)
+        data = expect("skipped")
+        assert data["consecutive_skips"] == day + 1
+        assert data["days_pending"] == day
+        assert data["alert_due"] == (day >= 2)
+        assert expect("skipped")["consecutive_skips"] == day + 1
+    print("PASS: UPS OL/OB/unreadable; three skipped days alert, repeated checks do not inflate")
+
+    (root / "proc/stat").write_text("cpu 1 2 3\nbtime 1791800000\n")
+    flag.unlink()
+    data = run("postboot-check.sh", updates={"clock": "no", "services": {"meter.service": "failed"}})
+    assert data["pending_since_ms"] is None and data["days_pending"] == 0
+    assert data["consecutive_skips"] == 0 and not data["alert_due"]
+    assert data["last_boot_ms"] == 1_791_800_000_000
+    assert data["postboot"]["services"]["meter.service"] == "failed"
+    assert not data["postboot"]["clock_synced"]
+    flag.touch()
+    data = run("postboot-check.sh", updates={"clock": "yes"})
+    assert data["reboot_required"] and data["pending_since_ms"] == NOW + 3 * 86_400_000
+    assert data["postboot"]["clock_synced"]
+    assert expect("skipped")["consecutive_skips"] == 1
+    print("PASS: postboot boot timestamp, failed services, clock states and pending resolution")
+
+    flag.unlink()
+    expect("not-needed")
+    flag.touch()
+    data = run(updates={"ps": "", "meter": "[]", "ups": "OL", "ups_code": 0})
+    assert data["last_decision"] == "rebooting" and calls.read_text().count("systemctl reboot\n") == 1
+    run("reboot-check.sh", "--mode", "observe")
+    assert calls.read_text().count("systemctl reboot\n") == 1
+    config["mode"] = "observe"
+    config_path.write_text(json.dumps(config))
+    calls.write_text("")
+    print("PASS: enforce calls only fake reboot after status publication; explicit observe never reboots")
+
+    failures = []
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                data = json.loads(status.read_text())
+                assert set(data) == {"mode", "reboot_required", "pending_since_ms", "days_pending",
+                                     "consecutive_skips", "alert_due", "last_check_ms", "last_decision",
+                                     "last_reason", "last_boot_ms", "postboot"}
+            except Exception as error:
+                failures.append(error)
+                break
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    try:
+        # Keep the fake command fixture immutable while concurrent real scripts run.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(subprocess.run, ["bash", str(HERE / "reboot-check.sh")],
+                                   env=env, capture_output=True, timeout=60) for _ in range(12)]
+            assert all(future.result().returncode == 0 for future in futures)
+    finally:
+        stop.set()
+        thread.join()
+    assert not failures, failures
+    assert {p.name for p in status.parent.iterdir()} == {"status.json", "policy.lock"}
+    print("PASS: concurrent checks serialize; readers see complete atomic JSON and no leftover temp files")
+
+    for node, expected in (("factory-gpu", "06:00"), ("factory-console", "06:30")):
+        node_config = json.loads((HERE / f"{node}.conf").read_text())
+        calendar = node_config["calendar"]
+        assert calendar == f"*-*-* {expected} America/New_York"
+        timer = (HERE / "factory-reboot.timer").read_text().replace("@CALENDAR@", calendar)
+        assert f"OnCalendar=*-*-* {expected} America/New_York" in timer
+        assert "Persistent=false" in timer and "RandomizedDelaySec=0" in timer
+        if node == "factory-console":
+            config_path.write_text(json.dumps(node_config))
+            calls.write_text("")
+            data = expect("would-reboot", updates={"meter_code": 7, "ups_code": 1})
+            assert "curl " not in calls.read_text() and "upsc " not in calls.read_text()
+    print("PASS: both node calendars; console does not query GPU meter or UPS")
+
+    # Optional stronger installer check: real scripts in a root user namespace,
+    # with a read-only host and every writable destination/command replaced.
+    bwrap = shutil.which("bwrap")
+    probe = subprocess.run([bwrap, "--ro-bind", "/", "/", "--unshare-user", "--uid", "0",
+                            "--gid", "0", "--", "/bin/true"], capture_output=True) if bwrap else None
+    if probe is None or probe.returncode:
+        print("SKIP: isolated installer execution requires usable bwrap (decision checks all passed)")
+    else:
+        for node, expected in (("factory-gpu", "06:00"), ("factory-console", "06:30")):
+            isolated = fixture / node
+            mounts = [bwrap, "--ro-bind", "/", "/", "--unshare-user", "--uid", "0", "--gid", "0",
+                      "--unshare-uts", "--hostname", node, "--dev", "/dev", "--tmpfs", "/tmp",
+                      "--bind", str(fixture), str(fixture)]
+            for relative in ("etc", "usr/local/lib", "var/lib", "var/backups", "run"):
+                target = isolated / relative
+                target.mkdir(parents=True)
+                if relative == "etc":
+                    (target / "systemd/system").mkdir(parents=True)
+                if relative == "var/backups":
+                    (target / "factory-reboot").mkdir()
+                if relative == "run":
+                    (target / "systemd/system").mkdir(parents=True)
+                    (target / "reboot-required").touch()
+                mounts += ["--bind", str(target), "/" + relative]
+            for name in ("ps", "curl", "upsc", "systemctl", "timedatectl", "cp"):
+                destination = shutil.which(name, path="/usr/sbin:/usr/bin:/sbin:/bin")
+                if destination:
+                    mounts += ["--ro-bind", str(bin_dir / name), destination]
+                elif name == "upsc":
+                    mounts += ["--ro-bind", str(bin_dir), "/usr/sbin"]
+                else:
+                    raise AssertionError(f"Missing namespace command: {name}")
+            commands.update(node=node, ps="", meter="[]", meter_code=0, ups="OL", ups_code=0)
+            (fixture / "commands.json").write_text(json.dumps(commands))
+            calls.write_text("")
+            poisoned = dict(env, REBOOT_ROOT="/must-not-exist", REBOOT_CONFIG="/must-not-exist", REBOOT_NOW_MS="bad")
+
+            def installer(script, *args, success=True):
+                result = subprocess.run(mounts + ["--", "bash", str(HERE / script), *args],
+                                        env=poisoned, text=True, capture_output=True, timeout=60)
+                assert (result.returncode == 0) == success, str(result.returncode) + result.stdout + result.stderr + calls.read_text()
+                return result
+
+            installer("install-reboot-policy.sh", "--node", "wrong", success=False)
+            other = "factory-console" if node == "factory-gpu" else "factory-gpu"
+            installer("install-reboot-policy.sh", "--node", other, success=False)
+            assert not list((isolated / "var/backups/factory-reboot").iterdir())
+            installer("install-reboot-policy.sh", "--node", node)
+            installed_config = isolated / "etc/factory-reboot/node.conf"
+            installed_status = isolated / "var/lib/factory-reboot/status.json"
+            installed_timer = isolated / "etc/systemd/system/factory-reboot.timer"
+            assert f"OnCalendar=*-*-* {expected} America/New_York" in installed_timer.read_text()
+            wants = installed_timer.parent / "multi-user.target.wants"
+            wants.mkdir()
+            (wants / "factory-postboot.service").symlink_to("../factory-postboot.service")
+            verified = subprocess.run(mounts + ["--", "systemd-analyze", "verify", "--man=no",
+                                      "/etc/systemd/system/factory-reboot.service",
+                                      "/etc/systemd/system/factory-reboot.timer",
+                                      "/etc/systemd/system/factory-postboot.service"],
+                                      text=True, capture_output=True, timeout=60)
+            assert verified.returncode == 0, verified.stdout + verified.stderr
+            local = json.loads(installed_config.read_text())
+            local["agent_allowlist"].append({"args": "local idle daemon"})
+            installed_config.write_text(json.dumps(local))
+            before = {p: p.stat().st_mtime_ns for folder in (isolated / "usr/local/lib/factory-reboot",
+                      isolated / "etc/systemd/system") for p in folder.iterdir() if p.is_file()}
+            installer("install-reboot-policy.sh", "--node", node, "--mode", "enforce")
+            assert json.loads(installed_config.read_text())["mode"] == "enforce"
+            assert json.loads(installed_config.read_text())["agent_allowlist"][-1] == {"args": "local idle daemon"}
+            assert json.loads(installed_status.read_text())["mode"] == "observe"
+            assert json.loads(installed_status.read_text())["last_decision"] == "would-reboot"
+            assert all(p.stat().st_mtime_ns == stamp for p, stamp in before.items())
+            assert "systemctl reboot\n" not in calls.read_text()
+            snapshots = list((isolated / "var/backups/factory-reboot").iterdir())
+            assert len(snapshots) == 2
+            assert any((p / "etc/factory-reboot/node.conf").exists() for p in snapshots)
+            installer("rollback-reboot-policy.sh")
+            assert "systemctl disable factory-reboot.timer\n" in calls.read_text()
+            assert "systemctl disable factory-postboot.service\n" in calls.read_text()
+            installer("rollback-reboot-policy.sh")
+            assert installed_status.exists() and not installed_timer.exists() and not installed_config.exists()
+            assert not (isolated / "usr/local/lib/factory-reboot").exists()
+        print("PASS: both real installers in isolated namespaces; snapshots, mode-only reruns, cleared overrides and rollback")

@@ -1,0 +1,12 @@
+[Unit]
+Description=Needs-only factory reboot window
+
+[Timer]
+OnCalendar=@CALENDAR@
+Persistent=false
+RandomizedDelaySec=0
+AccuracySec=1s
+Unit=factory-reboot.service
+
+[Install]
+WantedBy=timers.target

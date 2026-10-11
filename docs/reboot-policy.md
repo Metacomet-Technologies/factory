@@ -1,0 +1,193 @@
+# Factory reboot policy (MET-75 phase 1)
+
+This policy only reboots when `/var/run/reboot-required` exists. It does not
+install updates, change NUT, or enable unattended-upgrades' automatic reboot.
+Keep `Unattended-Upgrade::Automatic-Reboot` disabled: it bypasses these checks.
+
+## Schedule and rollout
+
+- factory-gpu: **06:00 America/New_York**, after its 03:15 backup.
+- factory-console: **06:30 America/New_York**, after its 03:45 backup.
+- `Persistent=false`: a missed window is not replayed at boot. No random delay.
+- Default **observe** mode records decisions but never reboots. Devon explicitly
+  switches each node to **enforce** after reviewing observations and the allowlist.
+- Staggering avoids simultaneous scheduled reboots; it is not a peer-health
+  interlock. A boot lasting over 30 minutes can overlap the other node's window.
+
+On factory-gpu, Ubuntu 26.04 reports `systemd 259 (259.5-0ubuntu3.4)`.
+`systemd-analyze calendar '*-*-* 06:00 America/New_York'` normalizes to
+`06:00:00 America/New_York` and reports 10:00 UTC during EDT; a December
+base-time check reports 11:00 UTC during EST. Named timezones
+handle DST without a fixed-UTC caveat. The installer validates the calendar on
+each node and refuses an unsupported systemd; no UTC fallback is needed on the
+verified version. Console's version could not be inspected from this runner.
+
+## Decision order
+
+1. Without the marker, record `not-needed` and clear pending/skip counters.
+2. With the marker, retain the first `pending_since_ms` and compute elapsed
+   whole 24-hour `days_pending` (timestamps are UTC milliseconds).
+3. Check agent processes, then GPU-only meter traffic, then GPU-only UPS status.
+   The first blocking reason wins. A failed or malformed probe blocks reboot.
+4. Record `skipped`. Count at most once per New York calendar date. Three
+   consecutive skipped dates set `alert_due=true`; keep skipping, never force.
+   A gap in checked dates or a clear decision resets the consecutive count.
+   MET-76 will consume this flag; this phase sends no alerts.
+5. If clear, record `would-reboot` in observe mode. Enforce records `rebooting`,
+   publishes and syncs state, then calls `systemctl reboot` without force flags.
+
+### Agent process allowlist
+
+The root check runs `ps -u agent -ww -o pid=,ppid=,args=`. Each row is a numeric
+PID, parent PID, and the remaining full command line. **Every** agent-owned
+process blocks unless its full command matches an explicit Python regular
+expression in `/etc/factory-reboot/node.conf` (`agent_allowlist`). `parent_args`,
+when present, must also match the direct parent's command. Never allow all
+`amp`, `bash`, `node`, `python`, `cargo`, `ssh`, or all descendants of the runner.
+The verified procps empty-selection result is exit 1 with empty stdout/stderr;
+that is idle. Errors with diagnostics, other exit codes, and malformed rows skip.
+
+Read-only inspection on factory-gpu on 2026-10-11 found:
+
+- PID 2481, parent 1: `/home/agent/.local/bin/amp --no-tui --runner-id
+  factory-gpu --dir /home/agent/work --discover-dirs=/home/agent/work
+  --remote-control-terminal --amp-env --runner-account-email devon@metacomet.tech`.
+  Its exact long-lived runner command is allowed, not arbitrary Amp invocations.
+- PID 34170, parent 2481: Amp's `official-modes` plugin runtime. Its command
+  contains `/tmp/amp-plugin-runtime-q517Yo/plugin-runtime.ts` and
+  `official-modes@46ba5e96083e1347/index.ts`. Only the runtime directory suffix
+  and plugin hash vary in the rule; the parent must match the exact runner.
+- PID 31101, parent 1: `op daemon`, the idle 1Password background process.
+- The inspection shell and `ps` process also appeared. They are work, not allowed.
+
+**Console's allowlist starts empty.** SSH host-key verification and the tailnet
+SSH policy prevented its process inspection. This deliberately blocks a console
+reboot while any agent process exists. Devon must inspect that node when idle
+and add only verified idle daemon commands before enabling enforcement there.
+Do not copy GPU rules blindly: console's runner command can differ.
+
+From the Mac, inspect and edit each node separately:
+
+```sh
+factory-ssh "ps -u agent -ww -o pid=,ppid=,args="
+console-ssh "ps -u agent -ww -o pid=,ppid=,args="
+ssh -t dgarbs51@factory-gpu 'sudoedit /etc/factory-reboot/node.conf'
+ssh -t dgarbs51@factory-console 'sudoedit /etc/factory-reboot/node.conf'
+```
+
+JSON strings require doubled backslashes in regex escapes. Matching uses
+`re.fullmatch`, not substring matching. No daemon reload is needed for allowlist
+edits. Installer reruns preserve these local edits. An invalid configuration
+fails without rebooting; inspect the failed service's journal.
+
+This is the specified process-based busy rule, not a runner activity API.
+Inference or remote agent work entirely inside an allowlisted daemon can be
+invisible between tool processes. Observe mode must precede enforcement; a
+future runner activity signal would be needed to cover that ceiling.
+
+### Meter and UPS
+
+On GPU, `curl -fsS --max-time 5
+http://127.0.0.1:11434/meter/requests?limit=1` returns a JSON array, not an
+envelope. Inspection returned one request with `id: 2194`, `endpoint:
+"/api/version"`, and integer `ts: 1791753470751` (UTC milliseconds).
+Any newest request at or within 600,000 milliseconds blocks, including health
+traffic; stale requests and an empty array permit the next check. Future
+timestamps block too. Unreachable, malformed or incorrectly typed output records
+`meter-unknown` and skips. This intentionally follows the ticket's unfiltered
+newest-request rule, even when periodic health traffic keeps it busy.
+
+`upsc cyberpower@localhost ups.status` returned stdout `OL\n`. Its
+`Init SSL without certificate database` diagnostic is on stderr and is not
+parsed. Status is whitespace-separated tokens; any exact `OB` token blocks,
+including `OB DISCHRG`. Nonzero exit, empty output, or no `OL` token blocks as
+`ups-unknown`. Live on-battery behavior was not induced; fake outputs test it.
+
+## State and post-boot observations
+
+`/var/lib/factory-reboot/status.json` is root-owned and private. Both services
+lock the same state and publish by atomic replacement, with file/directory sync.
+Logs go to the journal. A failed state write prevents a reboot.
+
+- `mode`: effective mode of the last operation. The installer's immediate check
+  **always** uses observe, even when configuration is enforce; the next timer
+  check uses the mode in `/etc/factory-reboot/node.conf`.
+- `reboot_required`, `pending_since_ms`, `days_pending`: current marker and age.
+- `consecutive_skips`, `alert_due`: skipped-date count and the MET-76 handoff.
+- `last_check_ms`, `last_decision`, `last_reason`: most recent reboot decision.
+- `last_boot_ms`: kernel `/proc/stat` `btime` seconds converted to milliseconds.
+- `postboot.services`: configured unit names mapped to `systemctl is-active`
+  states, including failed/inactive/unknown rather than pretending all are healthy.
+- `postboot.clock_synced`: true only for successful
+  `timedatectl show -p NTPSynchronized` output `NTPSynchronized=yes`.
+
+`factory-postboot.service` runs after `multi-user.target` and `time-sync.target`.
+It uses `DefaultDependencies=no` to avoid a cycle with the target enabling it,
+and retains explicit shutdown ordering. It observes rather than repairs
+services. GPU configuration includes meter, Ollama, Amp and operational NUT
+units (not optional/inactive enumerators); console includes API, Amp and GDM.
+If the marker disappears after boot, it clears pending and skip state without
+overwriting the preceding reboot decision. If it remains, pending age survives.
+Time-sync ordering is not itself proof of synchronization; the boolean records
+what timedatectl reports.
+
+## Installation, observation and mode switch
+
+After this PR is merged and both node checkouts have been updated, run **from
+the Mac**, GPU first. No build artifact is required for this host-only tooling.
+
+```sh
+factory-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-gpu --mode observe"
+console-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-console --mode observe"
+```
+
+The installer requires root, checks the actual hostname and tools, rejects
+symlink destinations/drop-ins/masks, and completes read-only preflight before
+changing files. It snapshots existing config, scripts and units under the printed
+`/var/backups/factory-reboot/<timestamp>.<suffix>/`, installs the artifacts,
+enables the timer and next-boot service, runs one immediate observe check, and
+prints JSON. On an unchanged rerun, only configuration is republished; scripts
+and units are not rewritten. Snapshots and the immediate observation still occur.
+Harness overrides and inherited command paths are discarded by installers.
+
+Read status and recent decisions from the Mac:
+
+```sh
+factory-ssh "sudo cat /var/lib/factory-reboot/status.json; sudo journalctl -u factory-reboot.service -u factory-postboot.service -n 30 --no-pager"
+console-ssh "sudo cat /var/lib/factory-reboot/status.json; sudo journalctl -u factory-reboot.service -u factory-postboot.service -n 30 --no-pager"
+```
+
+Only after reviewing observe results and console's allowlist, switch modes:
+
+```sh
+factory-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-gpu --mode enforce"
+console-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-console --mode enforce"
+```
+
+Rerun with `--mode observe` to stop future enforcement. Do not manually start
+`factory-reboot.service` in enforce mode: that bypasses the scheduled window.
+Rollback disables/stops and removes this policy, preserving status, journals and
+snapshots; it does not automatically restore old policy files or enable states:
+
+```sh
+factory-ssh "sudo bash /home/agent/work/factory/deploy/reboot/rollback-reboot-policy.sh"
+console-ssh "sudo bash /home/agent/work/factory/deploy/reboot/rollback-reboot-policy.sh"
+```
+
+## No-root verification
+
+```sh
+python3 -B deploy/reboot/test-reboot.py
+for script in deploy/reboot/*.sh; do bash -n "$script"; done
+shellcheck -x deploy/reboot/*.sh
+```
+
+The harness runs the real check scripts with `REBOOT_ROOT`, `REBOOT_CONFIG`,
+`REBOOT_NOW_MS`, and fake command paths. It covers decision order, both modes,
+busy/allowed processes, meter time boundaries/errors, UPS states/errors,
+consecutive dates, post-boot state, both calendars and concurrent atomic reads.
+Where usable `bwrap` exists, it additionally runs the real installer/rollback
+in root user namespaces with fake commands and temporary destinations; it
+models ownership rather than changing host ownership. Without namespaces that
+additional installer check is explicitly skipped, not reported as passed.
+No real timer installation, service mutation or reboot is part of these tests.
