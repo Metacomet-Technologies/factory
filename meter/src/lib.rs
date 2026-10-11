@@ -20,11 +20,32 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     task::{Context, Poll},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use usage::UsageParser;
+
+fn local_hostname() -> &'static str {
+    static HOSTNAME: OnceLock<String> = OnceLock::new();
+    HOSTNAME.get_or_init(|| {
+        unsafe extern "C" {
+            fn gethostname(name: *mut std::ffi::c_char, len: usize) -> std::ffi::c_int;
+        }
+        // Linux hostnames are at most 64 bytes; leave room for the terminating NUL.
+        let mut buffer = [0_u8; 256];
+        // SAFETY: gethostname writes at most buffer.len() bytes to this valid buffer.
+        let result = unsafe { gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+        assert_eq!(
+            result,
+            0,
+            "gethostname: {}",
+            std::io::Error::last_os_error()
+        );
+        let end = buffer.iter().position(|&byte| byte == 0).unwrap();
+        String::from_utf8_lossy(&buffer[..end]).into_owned()
+    })
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -36,6 +57,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(upstream: String, db: db::Db) -> Self {
+        local_hostname();
         Self {
             db,
             upstream: upstream.trim_end_matches('/').into(),
@@ -71,13 +93,17 @@ async fn dispatch(
     }
     let started = Instant::now();
     let ip = peer.ip().to_string();
-    let hostname = state
-        .hosts
-        .read()
-        .unwrap()
-        .get(&ip)
-        .cloned()
-        .unwrap_or_else(|| ip.clone());
+    let hostname = if peer.ip().is_loopback() {
+        local_hostname().to_owned()
+    } else {
+        state
+            .hosts
+            .read()
+            .unwrap()
+            .get(&ip)
+            .cloned()
+            .unwrap_or_else(|| ip.clone())
+    };
     let record = Arc::new(Mutex::new(RequestRecord {
         ts: now_ms(),
         endpoint: endpoint.clone(),
@@ -253,7 +279,7 @@ impl Drop for Tap {
 mod api {
     use super::*;
     use axum::{Json, extract::Query, http::Method};
-    use shared::{GpuResponse, Health, MeterQuery, ModelStats};
+    use shared::{GpuResponse, Health, MeterQuery, MeterRequestsQuery, ModelStats};
     use utoipa::OpenApi;
 
     fn since(range: Option<&str>) -> Result<i64, String> {
@@ -286,11 +312,29 @@ mod api {
             "/meter/health" => health(state).await,
             "/meter/openapi.json" => return openapi_doc(),
             "/meter/requests" => {
-                let limit = parameters.limit.unwrap_or(100);
-                if !(1..=10_000).contains(&limit) {
-                    return error(StatusCode::BAD_REQUEST, "limit must be 1..=10000".into());
+                let parameters = match Query::<MeterRequestsQuery>::try_from_uri(request.uri()) {
+                    Ok(parameters) => parameters.0,
+                    Err(message) => return error(StatusCode::BAD_REQUEST, message.to_string()),
+                };
+                let (default, max) = if parameters.after_id.is_some() {
+                    (500, 5000)
+                } else {
+                    (100, 10_000)
+                };
+                let limit = parameters.limit.unwrap_or(default);
+                if !(1..=max).contains(&limit) {
+                    return error(StatusCode::BAD_REQUEST, format!("limit must be 1..={max}"));
                 }
-                requests_doc(state, limit).await
+                if parameters.after_id.is_some_and(|id| id < 0) {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "after_id must be nonnegative".into(),
+                    );
+                }
+                return match requests_doc(state, limit, parameters.after_id).await {
+                    Ok(response) => response,
+                    Err(message) => error(StatusCode::SERVICE_UNAVAILABLE, message),
+                };
             }
             "/meter/stats" | "/meter/gpu/history" => {
                 let since = match since(parameters.range.as_deref()) {
@@ -373,14 +417,40 @@ mod api {
             .and_then(serde_json::to_value)
             .map_err(|e| e.to_string())
     }
-    #[utoipa::path(get, path = "/meter/requests", params(("limit" = Option<usize>, Query, description = "1..10000; default 100")), responses((status = 200, body = [RequestRecord]), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
-    async fn requests_doc(state: &AppState, limit: usize) -> Result<serde_json::Value, String> {
-        state
+    #[utoipa::path(get, path = "/meter/requests", params(
+        ("limit" = Option<usize>, Query, description = "Without after_id: 1..10000, default 100. With after_id: 1..5000, default 500."),
+        ("after_id" = Option<i64>, Query, description = "Nonnegative cursor: return id > after_id in ascending order. Omit for legacy newest-first behavior.")
+    ), responses((status = 200, body = [RequestRecord], headers(
+        ("next_after_id" = i64, description = "Present only with after_id: last returned ID, or the supplied cursor for an empty page.")
+    )), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
+    async fn requests_doc(
+        state: &AppState,
+        limit: usize,
+        after_id: Option<i64>,
+    ) -> Result<Response<Body>, String> {
+        let order = match after_id {
+            Some(id) => format!("WHERE id > {id} ORDER BY id ASC"),
+            None => "ORDER BY id DESC".into(),
+        };
+        let rows = state
             .db
             .query(format!(
-                "SELECT id,record FROM requests ORDER BY id DESC LIMIT {limit}"
+                "SELECT id,record FROM requests {order} LIMIT {limit}"
             ))
-            .await
+            .await?;
+        let next = after_id.map(|cursor| {
+            rows.as_array()
+                .and_then(|rows| rows.last())
+                .and_then(|row| row["id"].as_i64())
+                .unwrap_or(cursor)
+        });
+        let mut response = Json(rows).into_response();
+        if let Some(next) = next {
+            response
+                .headers_mut()
+                .insert("next_after_id", next.to_string().parse().unwrap());
+        }
+        Ok(response)
     }
     #[utoipa::path(get, path = "/meter/gpu/history", params(("range" = Option<String>, Query, description = "24h (default), 7d, 30d; retained for 7 days")), responses((status = 200, body = [shared::GpuSample]), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
     async fn history_doc(state: &AppState, since: i64) -> Result<serde_json::Value, String> {
@@ -406,7 +476,8 @@ mod api {
             Health,
             ModelStats,
             ApiError,
-            MeterQuery
+            MeterQuery,
+            MeterRequestsQuery
         ))
     )]
     struct ApiDoc;

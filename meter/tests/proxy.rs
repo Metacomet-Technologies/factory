@@ -19,7 +19,11 @@ use std::{
 use tokio::net::TcpListener;
 
 async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    serve_on(router, "127.0.0.1:0").await
+}
+
+async fn serve_on(router: Router, address: &str) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind(address).await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(async move {
         axum::serve(
@@ -92,7 +96,6 @@ async fn slow_ndjson_is_incremental_and_written_once() {
     assert_eq!(records[0].status, 201);
     assert!(records[0].stream);
     assert_eq!(records[0].client_ip, "127.0.0.1");
-    assert_eq!(records[0].client_hostname, "127.0.0.1");
     assert!(records[0].error.is_none());
     let stats: Value = client
         .get(format!("{proxy}/meter/stats?range=24h&model=demo"))
@@ -108,6 +111,171 @@ async fn slow_ndjson_is_incremental_and_written_once() {
     assert_eq!(stats[0]["p95_total_latency_ms"], 700.0);
     proxy_task.abort();
     upstream_task.abort();
+}
+
+#[tokio::test]
+async fn loopback_clients_use_machine_hostname() {
+    let hostname = std::process::Command::new("hostname").output().unwrap();
+    assert!(hostname.status.success());
+    let hostname = String::from_utf8(hostname.stdout).unwrap();
+    let (upstream, upstream_task) = serve(Router::new().fallback(|| async { "ok" })).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for (address, ip) in [("127.0.0.1:0", "127.0.0.1"), ("[::1]:0", "::1")] {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(&directory.path().join("meter.db")).unwrap();
+        let (proxy, task) =
+            serve_on(meter::router(AppState::new(upstream.clone(), db)), address).await;
+        assert_eq!(
+            client
+                .get(format!("{proxy}/api/version"))
+                .header("x-forwarded-for", "203.0.113.1")
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "ok"
+        );
+        let records: Vec<RequestRecord> = client
+            .get(format!("{proxy}/meter/requests"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].client_ip, ip);
+        assert_eq!(records[0].client_hostname, hostname.trim());
+        task.abort();
+    }
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn request_cursor_pages_without_gaps_and_preserves_legacy_behavior() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Db::open(&directory.path().join("meter.db")).unwrap();
+    for index in 1..=1200 {
+        db.send(Event::Request(Box::new(RequestRecord {
+            ts: 1200 - index,
+            endpoint: format!("/request/{index}"),
+            ..Default::default()
+        })));
+    }
+    let (proxy, task) = serve(meter::router(AppState::new(
+        "http://127.0.0.1:1".into(),
+        db.clone(),
+    )))
+    .await;
+    let client = reqwest::Client::new();
+    for (query, count) in [("", 100), ("?limit=7", 7), ("?limit=10000", 1200)] {
+        let response = client
+            .get(format!("{proxy}/meter/requests{query}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert!(response.headers().get("next_after_id").is_none());
+        let rows: Vec<RequestRecord> = response.json().await.unwrap();
+        assert_eq!(rows.len(), count);
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            (1201 - count as i64..=1200).rev().collect::<Vec<_>>()
+        );
+    }
+    let mut cursor = 0;
+    let mut ids = Vec::new();
+    for count in [500, 500, 200, 0] {
+        let response = client
+            .get(format!("{proxy}/meter/requests?after_id={cursor}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let next: i64 = response.headers()["next_after_id"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let rows: Vec<RequestRecord> = response.json().await.unwrap();
+        assert_eq!(rows.len(), count);
+        assert_eq!(next, cursor + count as i64);
+        for row in rows {
+            assert_eq!(row.endpoint, format!("/request/{}", row.id));
+            ids.push(row.id);
+        }
+        cursor = next;
+    }
+    assert_eq!(ids, (1..=1200).collect::<Vec<_>>());
+    for (after_id, limit, end) in [(498, 137, 635), (0, 5000, 1200)] {
+        let response = client
+            .get(format!(
+                "{proxy}/meter/requests?after_id={after_id}&limit={limit}"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        assert_eq!(response.headers()["next_after_id"], end.to_string());
+        let rows: Vec<RequestRecord> = response.json().await.unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            (after_id + 1..=end).collect::<Vec<_>>()
+        );
+    }
+    for query in [
+        "after_id=0&limit=0",
+        "after_id=0&limit=5001",
+        "limit=10001",
+        "after_id=-1",
+        "after_id=invalid",
+        "after_id=9223372036854775808",
+    ] {
+        assert_eq!(
+            client
+                .get(format!("{proxy}/meter/requests?{query}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // A client at the end must still see rows appended after its last page.
+    db.send(Event::Request(Box::default()));
+    let rows: Vec<RequestRecord> = client
+        .get(format!("{proxy}/meter/requests?after_id={cursor}&limit=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, 1201);
+    let schema: Value = client
+        .get(format!("{proxy}/meter/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let request_schema = &schema["paths"]["/meter/requests"]["get"];
+    assert!(
+        request_schema["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|parameter| parameter["name"] == "after_id")
+    );
+    assert!(request_schema["responses"]["200"]["headers"]["next_after_id"].is_object());
+    task.abort();
 }
 
 #[tokio::test]
