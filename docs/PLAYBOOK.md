@@ -1,0 +1,115 @@
+# Software Factory Playbook
+
+The working agreement and hard-won lessons for building and operating the factory. **Every new Claude conversation and every agent prompt should follow this.** Keep it current: when we learn something the hard way, add it here (via a PR to this file).
+
+## 1. How Devon works (apply in every conversation)
+
+- **Design before implementation.** Talk through decisions first; don't jump to code or commands for a new feature.
+- **Trade-offs with a recommendation and the reason.** Tables are welcome for options.
+- **Separate Decided from Open** at the end of design answers.
+- **Be concise and stay on task.** Don't expand scope; park new ideas as Linear issues.
+- **Agent prompts are pragmatic and tightly scoped** (template in §4).
+- **Verify before asserting:** check current docs or versions when unsure; never guess flags or APIs.
+
+## 2. The system
+
+| Node | Hardware / location | Runs |
+|---|---|---|
+| factory-gpu | Ryzen 7 3700X, 32 GB, RTX 3060 12 GB, 1.8 TB at `/srv/factory`, Ubuntu 26.04. **Wired (1 Gb/s) to the main eero**, on the **CyberPower CP1000PFCLCDa UPS** (battery outlets; USB to the PC) | Ollama (127.0.0.1:11435), **meter** proxy (:11434), NUT (UPS monitor, localhost), Amp runner |
+| factory-console | 2019 16" MBP (T2 kernel), 16 GB, Ubuntu 26.04. Wi-Fi via the office eero satellite | **factory-api** (:8080), Chrome kiosk (`console` user, auto-login), Amp runner |
+
+- **Tailnet:** Metacomet (`bearded-pompano.ts.net`). Both nodes are `tag:factory`. Dashboard: `https://factory-console.bearded-pompano.ts.net` (Tailscale Serve → 127.0.0.1:8080). ufw allows only `tailscale0`.
+- **Access policy:** admins (`group:factory-admins`) reach everything on the factory; factory → factory only on tcp 22/443/3389/8080/11434; **factory nodes can't reach personal devices**; SSH maps each person to their own account (`DGarbs51@github` → `dgarbs51`, `agent`; `metacometdave@github` → `david`, `agent`); `tag:factory` → `tag:factory` as `factory-backup` for backups. All factory SSH rules are `accept` (no re-auth prompts). The policy has `tests` + `sshTests`.
+- **Repo:** `Metacomet-Technologies/factory`: Rust workspace (`shared`, `meter`, `pricing`, `factory-api`) + `kiosk/` + `deploy/` + `evals/` + `docs/`.
+- **Local models:** `factory-assist` (gemma4:12b, 64K; tool calling reliable), `factory-assist-max` (256K), `factory-code` (qwen2.5-coder:14b, 16K; **no native tool calls**). Ollama runs with flash attention + q8 KV cache.
+- **Users:** `dgarbs51` (Devon) and `david` (David): admins with passwordless sudo. `agent`: unprivileged, runs Amp runners (per-person `agent-devon` / `agent-david` planned, MET-78). `console`: kiosk only. Service users: `meter`, `factory-api`, `factory-backup`.
+- **Backups (MET-74):** nightly verified SQLite snapshots (~03:19 gpu, ~03:47 console), pushed to the other node; 7 daily + 4 weekly; `restore-check.sh all`.
+- **Secrets:** 1Password. Devon: desktop integration in RDP, standalone CLI sign-in over SSH via `opin`. Automation secrets: a Factory vault + per-node read-only service accounts (MET-105).
+- **Tracking:** Linear project **Software Factory** (team Metacomet, `MET-*`). The GitHub integration auto-links PRs.
+
+## 3. Hard rules
+
+- **Agents never run as `dgarbs51`/`david`, and never get sudo.** Agents write install scripts; a human reviews and runs them.
+- **Never touch production while testing.** Use the sandbox (MET-93) or a side port (:11500 / :18080) with temp DBs. Leave deployed PIDs untouched.
+- **Installer pattern** (every deploy script): prebuilt binary as an argument (no building as root), root check, read-only preflight, error trap that prints the rollback command, a snapshot before any change, a quiet wait loop then one `curl -fsS`, post-start checks **as the service user**, a matching rollback, idempotent reruns.
+- **Never repurpose distro system accounts** (e.g. Ubuntu's `backup`); create dedicated ones.
+- **Security:** everything tailnet-only; LLM tools are **read-only**; logs and tool output are untrusted data; enforce schemas, allowlists and limits **in code**, never only in prompts. Verify any command a local model suggests (gemma4 invents CLI flags).
+- **Database rules (MET-92, see `AGENTS.md`):** no N+1 (query-count tests), `EXPLAIN` tests on hot queries, versioned migrations, `STRICT` tables, all times `*_ms` UTC, money as integers (rates in micro-dollars per Mtok; per-request costs and totals in nano-dollars; priced costs frozen, `cost_status` priced/estimated/unpriced), the shared PRAGMA/pool helper, retention per table (raw requests 365 days + rollups), no blocking tokio threads, no lock held across network I/O.
+- **API style:** contract-first REST + generated OpenAPI; live data via **SSE named events** with a `{type, ts_ms, data}` envelope; additive changes only within v1; outages return 200 with nulls + warnings. Graceful shutdown within seconds (SSE streams closed).
+- **Kiosk:** React 19, strict TS, Vite+ (`vp`), Tailwind v4 CSS-first, shadcn on Base UI, dark purple accent (one hue, AA contrast). **Theme follows the system**; never force a default. Self-updates on build change; the reload guard gives up on stuck requests after ~20 s.
+- **Versioning (MET-107):** one repo-wide SemVer (0.x) from the root `VERSION` file; every component reports version + git SHA; the kiosk footer shows them and warns on mismatch.
+
+## 4. Agent prompt template
+
+**Handoff header (every prompt Claude gives Devon):** the **runner** (factory-gpu / factory-console), the **folder** (`work` = main checkout, or a **new worktree** with its exact name: letters, digits, `-`, `_`, no slashes, including `met-NN`), and the **effort level** (Low only for mechanical tasks like pull/build; Medium by default; High for risky concurrency/security work).
+
+**First line of every prompt:** `**Thread title:** Use the Linear ticket identifier and title: \`MET-123 — Ticket title\`.` (the exact Linear title).
+
+Every prompt has these sections:
+
+1. **Start fresh:** `export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git`, fetch, branch from the latest `main` (or `git rebase origin/main` in a worktree). Read `AGENTS.md`/READMEs first. Reference the MET id in the PR title and body, with the right link type (**closes** only if the PR finishes the issue).
+2. **Context:** what's deployed, what other agents are doing, what's off-limits.
+3. **Isolation:** the exact directories it may edit.
+4. **Build:** spec and requirements; contracts written out exactly.
+5. **Tests:** what must pass (`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace`; `vp check`/`vp test`/`vp build`).
+6. **Live check (no system changes):** a side port, temp DB, evidence in the final message.
+7. **Deploy artifacts:** write, don't run.
+8. **Done means:** push, open the PR, final message with results, deviations, anything unverified, and exact deploy steps.
+
+**Runner hygiene:** one thread per task; archive threads once their work is merged **and deployed/verified**; start fresh threads per phase. Parallel threads on one runner use **Amp worktrees**; remove the worktree when its thread is archived. Don't message a thread mid-run unless it's a correction. Mechanical follow-ups (pull + build) also start with the `GH_TOKEN` setup line.
+
+## 5. Review checklist (before merge)
+
+- Files changed match the isolation rule (`gh pr view N --json files`).
+- Tests pass, the live check has real evidence (timings, row counts), the deviations list has been read.
+- Read install/rollback scripts in full.
+- **PR ↔ Linear link type:** a "closes" link auto-closes the issue on merge. Use **contributes** for research, partial work, or fixes whose install hasn't been verified; reopen issues that auto-closed early.
+- After rebases, confirm the push actually landed.
+
+## 6. Deploy flow
+
+1. Merge (squash, delete branch).
+2. Ask the thread to `export GH_TOKEN=... && gh auth setup-git && git checkout main && git pull --ff-only && build` (the token only exists in threads).
+3. From the Mac: `factory-ssh "sudo bash /home/agent/work/factory/deploy/install-*.sh <prebuilt path>"` (use **full paths**: admins can't `cd` into `/home/agent`).
+4. Verify: `factory-status` (all green; usage/pricing < 2 s), kiosk self-reload, then mark the Linear issue Done.
+
+## 7. Operating the factory
+
+- **`factory-status`** (Mac): switches to the Metacomet tailnet, then checks every node, service, GPU, link speed, disk, endpoints and latencies. For about a minute after a reboot, "fleet all green" can be briefly red while services start.
+- **When something looks down:** first run `tailscale switch --list` (the asterisk is the active tailnet; the Mac is signed into several). Then `factory-status`. **Capture evidence before rebooting:** `uptime; free -h; systemctl --failed; journalctl -p warning --since "-30min"`.
+- **Phone:** Blink `ssh gpu` / `mosh gpu` (Mosh needs SSH to work first; no daemon to start). Check the Tailscale app is on Metacomet.
+- **1Password over SSH:** `opin <op args>` (asks for the password only when the 30-min session has expired). In RDP terminals, `op` uses the desktop app.
+- **UPS:** `upsc cyberpower@localhost` on factory-gpu. Clean shutdown at < 30% charge or < 5 min runtime; it boots itself when power returns.
+
+## 8. Gotchas we've already hit
+
+**Networking / Tailscale**
+- Plain `tailscale ping` **ignores the access policy**; test blocks with `tailscale ping --icmp` or a real TCP connection.
+- Tailscale SSH default rules use `check` (browser re-auth, ≤ 168 h); automation needs `accept`. A node's port-22 check against itself fails; check `tailscaled` instead.
+- **Ubuntu installed with the Ethernet cable unplugged** creates `netplan-<if>` with `ipv4.method link-local` (169.254 only) and leaves the port declared without a renderer, so **systemd-networkd** also manages it (two DHCP leases). Fix: `nmcli connection modify netplan-<if> ipv4.method auto ipv4.route-metric 100 ipv6.route-metric 100`, set `/etc/netplan/00-installer-config.yaml` to `renderer: NetworkManager`, `netplan apply`, and mask `systemd-networkd`. Wired metric 100, Wi-Fi 600 as fallback.
+
+**Shell / SSH**
+- `sudo` over `ssh host cmd` needs `ssh -t` (or NOPASSWD). Heredocs after `ssh host` run on the Mac; use `ssh host 'bash -s' <<'EOF'`.
+- zsh doesn't expand `~` in `if=`; `curl -d "$big"` hits the arg limit (use `-d @-`).
+- `~/.hushlogin` silences the Ubuntu login banner (per user).
+
+**Ubuntu 26.04**
+- Default coreutils is uutils, but `mv` is GNU (`gnumv`, supports `--exchange`). An apt lock right after boot = unattended-upgrades; wait. `debconf: unable to initialize frontend` lines are harmless.
+- Removing desktop apps can remove `ubuntu-desktop-minimal`; dry-run `purge --autoremove` and protect dependencies with `apt-mark manual`.
+- `hwclock` isn't installed; read clocks from `/sys/class/rtc/rtc*/`.
+
+**Hardware**
+- **T2 MacBook:** Wi-Fi firmware must be supplied (back up `/lib/firmware/brcm`); boot `Option` → EFI Boot. **Its CMOS RTC resets to 1970 at every boot** (the firmware ACPI clock has no time either), so systemd starts the clock at a stale floor date until chrony syncs. factory-api waits for `chrony-wait` (time-sync.target) and refuses refreshes/writes while unsynchronized.
+- **NUT:** write `/etc/nut/*` **before** installing the package (otherwise its postinst deadlocks starting with no config: `systemctl cancel`, stop `nut-driver-enumerator.path`, then `dpkg --configure -a`). A UPS plugged in before NUT's udev rules exist needs `udevadm control --reload-rules && udevadm trigger --subsystem-match=usb --attr-match=idVendor=0764 --action=add`.
+
+**Services / apps**
+- GNOME RDP headless: set credentials with `sudo grdctl --system rdp set-credentials` and register a TLS cert; the Windows App hangs at TLS, use `sdl-freerdp`. Remote Login refuses while the same user is logged in locally.
+- Ollama `/api/ps` misreports gemma4's size; use `nvidia-smi`. Exclude non-inference requests (health checks) from usage.
+- A lock held across a network call froze usage/pricing for 60 s+ when TLS failed on a bad clock (MET-90): never hold DB access across I/O.
+- iOS Safari doesn't run timers in background tabs; check on `visibilitychange`.
+- **1Password CLI:** with app integration, `op whoami` can say "not signed in" while `op vault list` works; `op account add` refuses unless `OP_BIOMETRIC_UNLOCK_ENABLED=false`; app-integrated `op` only works inside the desktop session.
+- Omarchy (Hyprland 0.56) moved to Lua config and dispatch.
+
+## 9. Where things are tracked
+
+Linear: project overview, the roadmap issues, and the Linear copy of this playbook (this repo file is the source of truth). Decisions live in each issue's **Decided** section.

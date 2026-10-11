@@ -1,5 +1,7 @@
 # Repository workflow
 
+Read docs/PLAYBOOK.md first: the working agreement, system facts, hard rules, prompt template and known gotchas.
+
 Before GitHub or Git authentication, run:
 
 ```sh
