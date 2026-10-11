@@ -15,6 +15,11 @@ This repository is a Rust workspace. Run `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace` before pushing.
 Do not run deployment scripts or change the running Ollama without explicit permission.
 
+## Testing
+
+Use `scripts/sandbox` for live checks, never production endpoints. Production
+read-only checks happen only when a prompt explicitly asks. See `docs/sandbox.md`.
+
 ## Database rules
 
 Follow [the data-model plan](docs/data-model.md). These rules govern new DB work;

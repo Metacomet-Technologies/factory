@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+    status)
+        [[ "${2:-}" == --json ]] || exit 1
+        printf '%s\n' '{"Self":{"HostName":"sandbox","DNSName":"sandbox.invalid.","Online":true,"OS":"linux","TailscaleIPs":["127.0.0.1"]},"Peer":{}}' ;;
+    whois)
+        printf '%s\n' '{"Node":{"HostName":"sandbox","Name":"sandbox.invalid.","Addresses":["127.0.0.1/32"]},"UserProfile":{"LoginName":"sandbox","DisplayName":"Synthetic user"}}' ;;
+    *) exit 1 ;;
+esac

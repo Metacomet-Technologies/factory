@@ -1,0 +1,19 @@
+[package]
+name = "sandbox"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+meter = { path = "../meter" }
+serde_json.workspace = true
+shared = { path = "../shared" }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+pricing = { path = "../pricing" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+tempfile = "3"

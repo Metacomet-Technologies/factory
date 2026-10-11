@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == '--query-gpu=index,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw --format=csv,noheader,nounits' ]] || exit 1
+printf '0, 9255, 12288, 65, 62, 135.5\n'

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == 'show -p NTPSynchronized --value' ]] || exit 1
+# A synthetic clock assertion, not a claim about host NTP or production readiness.
+printf 'yes\n'
