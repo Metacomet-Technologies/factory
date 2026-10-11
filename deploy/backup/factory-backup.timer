@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily factory database backup
+
+[Timer]
+# Installer substitutes 03:45:00 on factory-console. Host-local wall clock.
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=10m
+Persistent=true
+Unit=factory-backup.service
+
+[Install]
+WantedBy=timers.target
