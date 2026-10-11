@@ -1,0 +1,145 @@
+{
+  "reports": [
+    {
+      "width": 1728,
+      "height": 1117,
+      "theme": "dark",
+      "layout": {
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117
+      },
+      "contrast": {
+        "tokens": {
+          "primary": "oklch(38% .17 300)",
+          "primaryForeground": "#fff",
+          "accentText": "oklch(72% .15 300)"
+        },
+        "pairs": {
+          "white / primary": 10.891193213984485,
+          "accent / background": 7.119533634238857,
+          "accent / card": 6.592577798745375,
+          "muted / card": 7.4609161082891475,
+          "muted / muted": 6.4537589497648185,
+          "ok / card": 9.769533847270802,
+          "warn / card": 10.124030082756365,
+          "fail / card": 8.167497240341898
+        },
+        "failures": []
+      }
+    },
+    {
+      "width": 1728,
+      "height": 1117,
+      "theme": "light",
+      "layout": {
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117
+      },
+      "contrast": {
+        "tokens": {
+          "primary": "oklch(38% .17 300)",
+          "primaryForeground": "#fff",
+          "accentText": "oklch(38% .17 300)"
+        },
+        "pairs": {
+          "white / primary": 10.891193213984485,
+          "accent / background": 10.084183286498424,
+          "accent / card": 10.891193213984485,
+          "muted / card": 6.0367128204019656,
+          "muted / muted": 5.166516011603871,
+          "ok / card": 6.50567900834632,
+          "warn / card": 6.309291416034444,
+          "fail / card": 6.504336375463541
+        },
+        "failures": []
+      }
+    },
+    {
+      "width": 1024,
+      "height": 768,
+      "theme": "dark",
+      "layout": {
+        "width": 1024,
+        "height": 1941,
+        "viewport": 768
+      },
+      "contrast": {
+        "tokens": {
+          "primary": "oklch(38% .17 300)",
+          "primaryForeground": "#fff",
+          "accentText": "oklch(72% .15 300)"
+        },
+        "pairs": {
+          "white / primary": 10.891193213984485,
+          "accent / background": 7.119533634238857,
+          "accent / card": 6.592577798745375,
+          "muted / card": 7.4609161082891475,
+          "muted / muted": 6.4537589497648185,
+          "ok / card": 9.769533847270802,
+          "warn / card": 10.124030082756365,
+          "fail / card": 8.167497240341898
+        },
+        "failures": []
+      }
+    },
+    {
+      "width": 390,
+      "height": 844,
+      "theme": "dark",
+      "layout": {
+        "width": 390,
+        "height": 2970,
+        "viewport": 844
+      },
+      "contrast": {
+        "tokens": {
+          "primary": "oklch(38% .17 300)",
+          "primaryForeground": "#fff",
+          "accentText": "oklch(72% .15 300)"
+        },
+        "pairs": {
+          "white / primary": 10.891193213984485,
+          "accent / background": 7.119533634238857,
+          "accent / card": 6.592577798745375,
+          "muted / card": 7.4609161082891475,
+          "muted / muted": 6.4537589497648185,
+          "ok / card": 9.769533847270802,
+          "warn / card": 10.124030082756365,
+          "fail / card": 8.167497240341898
+        },
+        "failures": []
+      }
+    },
+    {
+      "width": 390,
+      "height": 844,
+      "theme": "light",
+      "layout": {
+        "width": 390,
+        "height": 2970,
+        "viewport": 844
+      },
+      "contrast": {
+        "tokens": {
+          "primary": "oklch(38% .17 300)",
+          "primaryForeground": "#fff",
+          "accentText": "oklch(38% .17 300)"
+        },
+        "pairs": {
+          "white / primary": 10.891193213984485,
+          "accent / background": 10.084183286498424,
+          "accent / card": 10.891193213984485,
+          "muted / card": 6.0367128204019656,
+          "muted / muted": 5.166516011603871,
+          "ok / card": 6.50567900834632,
+          "warn / card": 6.309291416034444,
+          "fail / card": 6.504336375463541
+        },
+        "failures": []
+      }
+    }
+  ],
+  "errors": []
+}
