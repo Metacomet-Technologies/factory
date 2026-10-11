@@ -1,8 +1,8 @@
 # pricing
 
-A standalone Rust library and CLI for estimating spend avoided by running local
-Ollama tokens instead of reference frontier models. There is no root workspace
-integration, meter integration, scheduler, or dashboard in this package.
+A Rust library and CLI for estimating spend avoided by running local Ollama
+tokens instead of reference frontier models. It is a member of the root Cargo
+workspace; there is no meter integration, scheduler, or dashboard in this package.
 
 ## Run
 
@@ -135,7 +135,7 @@ not a committed database or a production selection.
 
 ## Future
 
-* Add this package to the root workspace and consume it from the dashboard/meter.
+* Consume this package from the dashboard/factory-api.
 * Schedule refreshes and route `pricing.changed` items to an operator inbox.
 * Add independently dated LiteLLM aliases or another authoritative release source
   if first-run outage resolution becomes necessary.

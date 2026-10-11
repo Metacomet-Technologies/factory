@@ -3,8 +3,9 @@
 `meter` is a transparent Ollama metering proxy for factory-gpu. It forwards
 all non-`/meter/*` paths (including NDJSON, OpenAI SSE, embeddings, and unknown
 future Ollama endpoints), records usage in SQLite, and samples NVIDIA GPUs.
-The workspace contains `shared` (serde/utoipa API contract) and `meter`
-(axum/Tokio/Hyper binary). There is no pricing logic or factory-api yet.
+The workspace contains `shared` (serde/utoipa API contract), `meter`
+(axum/Tokio/Hyper binary), and `pricing` (reference rates and spend-avoided
+estimates). Meter contains no pricing logic; factory-api is not built yet.
 
 ## Run without changing Ollama
 
@@ -92,29 +93,60 @@ by the existing host firewall; metering metadata is visible to allowed clients.
 ## Install (administrator action; interrupts Ollama)
 
 Deployment scripts are artifacts, not executed during development. Run from
-the checkout on factory-gpu as an administrator with sudo access. Requires
-Rust tooling, Python 3, curl, systemd, useradd, and the existing Ollama unit.
+the checkout on factory-gpu. Build as `agent`, without sudo:
 
 ```sh
-./deploy/install-meter.sh
+cargo build --release --locked -p meter
 ```
 
-The idempotent installer builds the locked release as the invoking user,
-creates the dedicated `meter` system user and `/srv/factory/meter`, installs
+Then install as an administrator:
+
+```sh
+sudo bash deploy/install-meter.sh
+# Optional alternate prebuilt binary:
+sudo bash deploy/install-meter.sh /path/to/meter
+```
+
+The installer never runs Cargo. Its first argument defaults to
+`/home/agent/work/factory/target/release/meter`; a missing or non-executable
+binary fails before any system changes. Installation requires sudo, Python 3,
+curl, systemd, useradd, `nvidia-smi`, `tailscale`, and the existing Ollama unit
+and drop-in. Rust tooling is needed only for the unprivileged build.
+
+The idempotent installer creates the dedicated `meter` system user and
+`/srv/factory/meter`, installs
 `/usr/local/bin/meter` atomically and `deploy/meter.service`, and changes only
 `OLLAMA_HOST` in `/etc/systemd/system/ollama.service.d/override.conf` to
 `127.0.0.1:11435`. Other lines/variables, including model path, flash attention,
-and KV cache settings, are preserved. If absent, it appends a Service section
-with the host assignment. It then reloads systemd, restarts Ollama, waits for
+and KV cache settings, are preserved. Before editing the drop-in, it copies
+the complete file, with permissions, ownership, and timestamps preserved, to
+`override.conf.bak.<UTC timestamp>` in the same directory and prints the path.
+Each installation creates a new snapshot. It then reloads systemd, restarts Ollama, waits for
 its version endpoint, enables/restarts meter, and verifies `/api/version` and
-`/meter/health` on :11434. Scripts stop on failure; they do not silently apply
+`/meter/health` on :11434. After startup it also requires these checks to pass:
+
+- `sudo -u meter nvidia-smi -L`, showing the GPU as the real service user.
+- `sudo -u meter tailscale status --json`, showing its first byte (`{`). The
+  script captures the complete output before `head -c 1`, avoiding a false
+  SIGPIPE failure under `pipefail` when Tailscale output is large.
+- A `/meter/gpu` curl prints the complete response and rejects an empty GPU
+  list or missing/null memory used/total, utilization, temperature, or power.
+  This exercises telemetry through the actual running systemd service.
+
+**Service-user verification result: not run yet.** Development had no sudo or
+permission to install/restart services. Earlier live checks used the agent's
+test process, not the `meter` user. The :11500 test proxy is now stopped.
+The installer prints `Service-user NVIDIA/Tailscale and live GPU checks passed`
+only after all three checks succeed; any failure exits nonzero with an error.
+
+Scripts stop on failure; they do not silently apply
 automatic rollback. Inspect errors and run rollback if needed.
 
 The unit wants/starts after Ollama, restarts always, and has a read-only system
 with write access only to `/srv/factory/meter`. GPU device access remains
 available. It does not change the firewall, Tailscale, models, or GPU settings.
-Verify `tailscale status --json` and `nvidia-smi` work as the service user after
-install; unavailable telemetry is logged rather than blocking proxy traffic.
+Runtime telemetry failures are logged rather than blocking proxy traffic;
+installation treats failed telemetry verification as an error.
 
 ## Rollback
 
@@ -125,13 +157,18 @@ install; unavailable telemetry is logged rather than blocking proxy traffic.
 Stops/disables meter, restores only `OLLAMA_HOST=0.0.0.0:11434`, restarts Ollama,
 and verifies `/api/version`. Retains the meter binary, unit, user, and database.
 Other Ollama settings are preserved. No model files are touched.
+The rollback script prints the pre-install backup location,
+`/etc/systemd/system/ollama.service.d/override.conf.bak.<timestamp>`, for manual
+recovery. It does not automatically restore a snapshot: a repeated install's
+snapshot may already contain `127.0.0.1:11435`. Inspect the appropriate backup
+before using it for full-file recovery; normal rollback restores only the host.
 
 ## Development checks
 
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test --workspace
 bash -n deploy/install-meter.sh deploy/rollback-meter.sh
 python3 -B deploy/test_set_ollama_host.py
 ```
@@ -143,6 +180,6 @@ assertions and a persisted request row.
 
 ## Future
 
-- factory-api and pricing in phase 2, consuming the shared contract.
+- factory-api consuming the shared contract and pricing library.
 - Request retention and bounded/durable queue policy if sustained load warrants it.
 - Kiosk/UI and access controls if the trusted-tailnet boundary changes.
