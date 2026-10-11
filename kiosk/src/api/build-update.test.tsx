@@ -1,0 +1,85 @@
+import { act, renderHook, fireEvent } from "@testing-library/react";
+import { expect, it, vi } from "vite-plus/test";
+import { useBuildUpdate } from "./build-update";
+
+it("checks every 60s and on reconnect, deferring changed builds until interactions are idle", async () => {
+  vi.useFakeTimers();
+  const original = "a".repeat(64);
+  const meta = document.createElement("meta");
+  meta.name = "kiosk-build";
+  meta.content = original;
+  document.head.append(meta);
+  const reload = vi.fn();
+  vi.stubGlobal("location", { reload });
+  let deployed = original;
+  let failed = false;
+  vi.stubGlobal("fetch", () =>
+    Promise.resolve(
+      new Response(failed ? "not JSON" : JSON.stringify({ build: deployed }), {
+        status: failed ? 503 : 200,
+      }),
+    ),
+  );
+  const hook = renderHook(({ revision, busy }) => useBuildUpdate(revision, busy), {
+    initialProps: { revision: 0, busy: false },
+  });
+  const tick = async (duration: number) => {
+    await act(() => vi.advanceTimersByTimeAsync(duration));
+  };
+  try {
+    await tick(0);
+    expect(reload).not.toHaveBeenCalled();
+    deployed = "b".repeat(64);
+    await tick(59_999);
+    expect(reload).not.toHaveBeenCalled();
+    failed = true;
+    await tick(1);
+    expect(reload).not.toHaveBeenCalled();
+    failed = false;
+    hook.rerender({ revision: 1, busy: true });
+    await tick(0);
+    await tick(1000);
+    expect(reload).not.toHaveBeenCalled();
+    const tooltip = document.createElement("div");
+    tooltip.dataset.slot = "tooltip-content";
+    document.body.append(tooltip);
+    hook.rerender({ revision: 1, busy: false });
+    await tick(1000);
+    expect(reload).not.toHaveBeenCalled();
+    delete tooltip.dataset.slot;
+    tooltip.setAttribute("role", "tooltip");
+    await tick(1000);
+    expect(reload).not.toHaveBeenCalled();
+    tooltip.remove();
+    const group = document.createElement("div");
+    group.dataset.slot = "toggle-group";
+    const toggle = document.createElement("button");
+    group.append(toggle);
+    document.body.append(group);
+    toggle.focus();
+    await tick(1000);
+    expect(reload).not.toHaveBeenCalled();
+    toggle.blur();
+    group.remove();
+    fireEvent.keyDown(document, { key: "Tab" });
+    await tick(999);
+    expect(reload).not.toHaveBeenCalled();
+    await tick(1001);
+    expect(reload).toHaveBeenCalledTimes(1);
+    await tick(60_000);
+    expect(reload).toHaveBeenCalledTimes(1);
+    hook.unmount();
+    deployed = original;
+    const periodic = renderHook(() => useBuildUpdate(0, false));
+    await tick(0);
+    deployed = "c".repeat(64);
+    await tick(59_999);
+    expect(reload).toHaveBeenCalledTimes(1);
+    await tick(1);
+    expect(reload).toHaveBeenCalledTimes(2);
+    periodic.unmount();
+  } finally {
+    hook.unmount();
+    meta.remove();
+  }
+});

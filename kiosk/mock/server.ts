@@ -18,13 +18,14 @@ createServer((request, response) => {
       Connection: "keep-alive",
     });
     response.write(": connected\n\n");
-    const send = (event: StreamEvent) => response.write(`data: ${JSON.stringify(event)}\n\n`);
+    const send = (event: StreamEvent) =>
+      response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
     let index = 0;
     const gpu = setInterval(() => {
       const data = fixtures(outage).gpu.current;
       if (data) {
         data.utilization_percent = 50 + (index++ % 27);
-        data.power_w = 230 + (index % 35);
+        data.power_w = 120 + (index % 35);
       }
       send({ type: "gpu.sample", ts_ms: Date.now(), data });
     }, 3000);
@@ -34,10 +35,10 @@ createServer((request, response) => {
           type: "llm.request",
           ts_ms: Date.now(),
           data: {
-            model: index % 2 ? "factory-assist:latest" : "factory-code:latest",
-            prompt_tokens: 1840 + index * 3,
-            output_tokens: 328 + index,
-            latency_ms: 812 + index * 8,
+            model: index % 3 === 0 ? null : index % 2 ? "factory-assist" : "factory-code",
+            prompt_tokens: index % 3 === 0 ? null : 18 + index,
+            output_tokens: index % 3 === 0 ? null : 32 + index,
+            latency_ms: 6302 + index * 8,
             client_hostname: "factory-console",
           },
         });

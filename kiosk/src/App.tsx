@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Activity, Cpu, Moon, Server, Sun, Terminal, Radio, Info } from "lucide-react";
 import { useApi } from "./api/client";
 import { useStream } from "./api/stream";
+import { useBuildUpdate } from "./api/build-update";
 import type { UsageRange, GpuRange } from "./api/types";
 import {
   FleetSection,
@@ -34,11 +35,16 @@ export default function App() {
   }, [dark]);
   const live = useStream();
   const health = useApi("/v1/health");
-  const fleet = useApi("/v1/fleet", "", live.fleetRevision);
-  const usage = useApi("/v1/llm/usage", `?range=${usageRange}`, live.pricingRevision);
-  const gpu = useApi("/v1/gpu", `?range=${gpuRange}`);
-  const pricing = useApi("/v1/pricing", "", live.pricingRevision);
+  const fleet = useApi("/v1/fleet", "", live.fleetRevision + live.snapshotRevision);
+  const usage = useApi(
+    "/v1/llm/usage",
+    `?range=${usageRange}`,
+    live.pricingRevision + live.snapshotRevision,
+  );
+  const gpu = useApi("/v1/gpu", `?range=${gpuRange}`, live.snapshotRevision);
+  const pricing = useApi("/v1/pricing", "", live.pricingRevision + live.snapshotRevision);
   const agents = useApi("/v1/agents");
+  useBuildUpdate(live.snapshotRevision, usage.loading || gpu.loading);
   return (
     <TooltipProvider>
       <a href="#main" className="skip-link">
