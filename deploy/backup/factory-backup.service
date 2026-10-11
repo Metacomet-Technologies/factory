@@ -1,0 +1,14 @@
+[Unit]
+Description=Verified SQLite snapshots and cross-host replicas
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+Type=oneshot
+User=root
+Environment=BACKUP_CONFIG=/etc/factory-backup/nodes.conf
+ExecStart=/usr/local/lib/factory-backup/factory-backup.sh
+UMask=0027
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle

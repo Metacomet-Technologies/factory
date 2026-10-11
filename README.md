@@ -345,3 +345,193 @@ OpenAPI references, explicit confirmation, a real HTTP SSE event, runtime static
 updates, SPA fallback, API precedence, cache/content headers, traversal rejection,
 symlink escapes, and missing/empty-directory placeholders.
 See [the live check](factory-api/LIVE_CHECK.md) for observed outputs and limits.
+
+## Cross-host SQLite backups (MET-74)
+
+`deploy/backup/` backs up running services without copying live SQLite files.
+Root uses SQLite's `.backup` API (including committed WAL data), requires exactly
+`ok` from `PRAGMA integrity_check`, compresses with zstd, and publishes a SHA-256
+sidecar. Failed snapshots never become successful status entries. The databases are:
+
+- factory-gpu: `meter`, `/srv/factory/meter/meter.db`.
+- factory-console: `requests`, `/var/lib/factory-api/requests.db`, and `pricing`,
+  `/var/lib/factory-api/pricing.db` (factory-api's systemd `StateDirectory`).
+
+Snapshots are `/var/backups/factory-db/<host>/<db>/<UTC-timestamp>.db.zst` with
+adjacent `.sha256` files. Local snapshots are root-owned and read-only to the
+`backup` group. Only the dedicated, password-locked system user `backup` runs
+network operations: `rsync -a --partial -e ssh` over Tailscale SSH, **never
+`--delete`**. Incoming replicas live at `/srv/factory/backups/replica` on
+factory-gpu and `/var/backups/factory-replica` on factory-console, under
+`<source-host>/<db>/`. Each replica root has mode 0700 and is owned by `backup`.
+No sudo permissions or SSH keys are granted. Its home (including `.ssh/known_hosts`)
+is inside the replica root; `/bin/sh` is necessary for rsync remote commands.
+The installer also configures Ubuntu's existing system `backup` account if present,
+rejecting root/non-system accounts and extra groups.
+
+The oneshot service runs as root at 03:15 on factory-gpu and 03:45 on
+factory-console, in each host's local timezone, with `RandomizedDelaySec=10m`
+and `Persistent=true`. Filenames and retention dates use UTC. Each DB retains
+the newest copy on each of the seven newest available daily dates, plus the
+four newest available Sunday copies. Overlap counts once; reruns do not consume
+daily slots. The newest copy is never pruned. Any snapshot or push failure
+skips all pruning for that run. After a successful push, the receiving host
+prunes its own replica as `backup`, then the sender prunes its local tree.
+Receiver pruning requires today's complete, checksummed copies for every DB
+from that source, so missing/failed days do not trigger deletion. This avoids
+depending on whether the peer's staggered timer has already run.
+
+`/var/lib/factory-backup/status.json` is atomically replaced, with a top-level
+entry for each local DB: `last_success_ms`, `last_attempt_ms`, `size_bytes`
+(compressed), `integrity` (`ok`, `failed`, or null before checking),
+`pushed_to_peer` (boolean), and `error` (string or null). A successful run means
+snapshot, push and retention finished; failures preserve `last_success_ms`.
+Every failure exits nonzero for systemd/journald. Inspect with:
+
+```sh
+sudo cat /var/lib/factory-backup/status.json
+systemctl list-timers factory-backup.timer
+journalctl -u factory-backup.service
+```
+
+### Install on both nodes (Devon; requires MET-73)
+
+Do not run the installer during development. No application service is stopped
+or restarted by installation or backups. Both nodes need existing databases,
+systemd, active tailscaled with Tailscale SSH enabled, SQLite CLI, zstd, rsync,
+OpenSSH client, Python 3.11+, and standard Ubuntu coreutils/util-linux/account
+tools. Install missing packages as administrator:
+
+```sh
+sudo apt-get install sqlite3 zstd rsync openssh-client python3
+```
+
+To avoid changing another agent's checkout/branch, fetch and create an isolated
+MET-74 checkout on **each node**, as the checkout owner (not root):
+
+```sh
+export GH_TOKEN="$AGENT_GH_TOKEN"
+gh auth setup-git
+git fetch origin
+git worktree add --detach /home/agent/work/factory-met-74 \
+  origin/devon/met-74-backups-for-meter-factory-api-and-pricing-sqlite-dbs
+cd /home/agent/work/factory-met-74
+```
+
+**Wait for the MET-73 Tailscale SSH rule before completing installation.** Devon
+must tag both nodes `tag:factory`, enable Tailscale SSH on both, permit TCP 22
+between them in the network policy, and add this SSH rule to the existing policy
+(do not replace unrelated rules). Use `accept`, not interactive `check`, for
+unattended backups:
+
+```json
+{
+  "action": "accept",
+  "src": ["tag:factory"],
+  "dst": ["tag:factory"],
+  "users": ["backup"]
+}
+```
+
+First, on **factory-gpu**, from the MET-74 checkout:
+
+```sh
+sudo bash deploy/backup/install-backup.sh --prepare-only
+```
+
+Then, on **factory-console**, from the same checkout:
+
+```sh
+sudo bash deploy/backup/install-backup.sh --prepare-only
+```
+
+Preparation creates the accounts, directories, config and units on both nodes
+but does not enable a new timer or run a backup. Once both nodes are prepared
+and MET-73 is active, run on **factory-gpu**, then **factory-console**:
+
+```sh
+sudo bash deploy/backup/install-backup.sh
+```
+
+Each completion run checks peer access, records the first host key over the
+trusted tailnet (`accept-new`; changed keys fail), runs an immediate backup
+through systemd, verifies local restores, then enables the timer. After both
+completion runs, verify local and received copies on **each node**:
+
+```sh
+sudo /usr/local/lib/factory-backup/restore-check.sh all
+```
+
+The installer is idempotent, preflights dependencies/databases/accounts/paths
+and unit overrides, and stops on errors with no automatic rollback. Fix the
+reported failure and rerun. It installs scripts in `/usr/local/lib/factory-backup`
+and a single root-owned config at `/etc/factory-backup/nodes.conf`; reinstalling
+replaces that config from the checkout. No firewall, Tailscale policy or live DB
+is changed. If a timer is already enabled, preparation leaves it enabled.
+
+### Read-only restore checks and manual recovery
+
+`restore-check.sh [local|replica|all]` (default `all`) verifies the checksum of
+the newest copy of every selected DB, decompresses only into a temporary
+directory, checks integrity, and prints row counts for every table (including
+quoted table names). Missing/corrupt copies fail; it **never replaces live DBs**.
+Use `local` during first-node bootstrap before incoming replicas exist.
+
+Manual restoration is an explicit administrator action. Choose a verified copy
+from either local snapshots or received replicas and retain its sidecar. For
+meter use service/user `meter` and `/srv/factory/meter/meter.db`; for either
+console DB use service/user `factory-api` and its corresponding path above.
+Restore requests and pricing together when recovering the whole console.
+Run the following in a root Bash shell, setting the three paths/names first.
+`set -e` ensures a bad checksum or integrity result stops before replacement:
+
+```sh
+set -euo pipefail
+service=meter
+database=/srv/factory/meter/meter.db
+archive='/var/backups/factory-db/factory-gpu/meter/<UTC-timestamp>.db.zst'
+systemctl stop factory-backup.timer factory-backup.service
+systemctl stop "$service.service"  # meter only; does not stop Ollama
+(cd "$(dirname "$archive")" && sha256sum --strict -c "$(basename "$archive").sha256")
+temporary=$(mktemp -d "$(dirname "$database")/.restore.XXXXXX")
+zstd -d "$archive" -o "$temporary/verified.db"
+test "$(sqlite3 -readonly "$temporary/verified.db" 'PRAGMA integrity_check;')" = ok
+chown "$service:$service" "$temporary/verified.db"
+chmod 0600 "$temporary/verified.db"
+# Keep the old DB and any WAL/SHM together; never replay stale WAL onto a restore.
+recovery=/var/backups/factory-db/pre-restore-$(date -u +%Y%m%dT%H%M%S.%NZ)
+mkdir -m 0700 "$recovery"
+printf 'Pre-restore originals: %s\n' "$recovery"
+for file in "$database" "$database-wal" "$database-shm"; do
+  if test -e "$file"; then mv -- "$file" "$recovery/"; fi
+done
+mv -- "$temporary/verified.db" "$database"
+rmdir "$temporary"
+systemctl start "$service.service"
+systemctl start factory-backup.timer
+```
+
+Do not restart the application between replacing requests and pricing when
+restoring both. Check its health endpoint before declaring recovery complete.
+If any step fails, keep services stopped until the paths/error are reviewed;
+the originals remain at the printed/selected recovery location.
+
+### Backup development checks (no root)
+
+```sh
+python3 -B deploy/backup/test-backup.py
+for script in deploy/backup/*.sh deploy/backup/nodes.conf; do bash -n "$script"; done
+shellcheck -x deploy/backup/*.sh deploy/backup/nodes.conf
+```
+
+The contract check runs the real scripts with local rsync, three sample WAL
+databases and active writers. It verifies transaction consistency, integrity,
+compression, checksums, exact survivors of 40 dated copies on both trees,
+same-day reruns, Sunday retention, status, read-only restore output, and no
+deletion on missing/corrupt DBs, failed pushes, or incomplete incoming copies.
+Development overrides are `BACKUP_HOST`, `METER_DB`, `REQUESTS_DB`, `PRICING_DB`,
+`LOCAL_ROOT`, `REPLICA_ROOT`, `PEER_REPLICA_ROOT`, `STATUS_FILE`, and
+`BACKUP_TRANSPORT=local`. `BACKUP_CONFIG` selects a trusted alternative config.
+The installer clears development overrides and always uses real node defaults.
+These unprivileged checks do not prove production Tailscale SSH/root permissions;
+the administrator's immediate systemd backup and restore checks do that.
