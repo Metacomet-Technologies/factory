@@ -126,7 +126,9 @@ export function FleetSection({ resource, icon }: { resource: Resource<Fleet>; ic
             <p className="muted node-meta">
               {node.tailscale_ip ?? "—"} · {node.os ?? "—"}
             </p>
-            <p className="muted">Last seen {seen(node.last_seen_ms)}</p>
+            <p className="muted">
+              Last seen {node.online && node.last_seen_ms == null ? "now" : seen(node.last_seen_ms)}
+            </p>
             <Separator className="my-3" />
             {node.services.length === 0 ? (
               <p className="muted">No services reported.</p>

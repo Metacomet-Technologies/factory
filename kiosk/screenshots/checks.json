@@ -6,7 +6,7 @@
       "theme": "dark",
       "layout": {
         "width": 1728,
-        "height": 1117,
+        "height": 1147,
         "viewport": 1117
       },
       "contrast": {
@@ -34,7 +34,7 @@
       "theme": "light",
       "layout": {
         "width": 1728,
-        "height": 1117,
+        "height": 1147,
         "viewport": 1117
       },
       "contrast": {
@@ -62,7 +62,7 @@
       "theme": "dark",
       "layout": {
         "width": 1024,
-        "height": 1989,
+        "height": 2057,
         "viewport": 768
       },
       "contrast": {
@@ -90,7 +90,7 @@
       "theme": "dark",
       "layout": {
         "width": 390,
-        "height": 3037,
+        "height": 3460,
         "viewport": 844
       },
       "contrast": {
@@ -118,7 +118,7 @@
       "theme": "light",
       "layout": {
         "width": 390,
-        "height": 3037,
+        "height": 3460,
         "viewport": 844
       },
       "contrast": {
@@ -141,5 +141,9 @@
       }
     }
   ],
-  "errors": []
+  "errors": [],
+  "layoutFailures": [
+    "Kiosk does not fit (dark): 1147 > 1117; original label also 1147",
+    "Kiosk does not fit (light): 1147 > 1117; original label also 1147"
+  ]
 }

@@ -50,7 +50,7 @@ export function fixtures(
         name: "factory-console",
         tailscale_ip: "100.91.20.11",
         online: true,
-        last_seen_ms: now - 1200,
+        last_seen_ms: null,
         os: "Linux",
         services: [
           {

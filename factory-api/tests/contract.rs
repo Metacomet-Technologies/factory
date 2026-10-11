@@ -672,6 +672,9 @@ async fn runtime_kiosk_serving_and_api_isolation() -> Result<()> {
         let page = response.text().await?;
         assert!(page.contains("factory · kiosk not deployed yet"));
         assert!(page.contains("http-equiv=\"refresh\" content=\"30\""));
+        assert!(page.contains("setInterval(() => location.reload(), 30000)"));
+        assert!(page.contains("document.addEventListener(\"visibilitychange\""));
+        assert!(page.contains("if (document.visibilityState === \"visible\") location.reload()"));
         assert_eq!(
             fetch(&client, &format!("{url}/v1/health")).await["status"],
             "ok"
