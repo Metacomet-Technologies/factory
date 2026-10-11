@@ -767,6 +767,21 @@ user_version**. Proposed versions are per DB, not one shared global version:
 | 5. meter v2 and API cache v3: rollup tables/state | Add hourly/daily metrics, API spend, GPU hourly and state; build retained history in bounded resumable batches; compare aggregate counts/tokens/costs against raw before enabling reads. Existing missing history is not reconstructed | Additive and reversible by dropping new tables/reverting code **before pruning**; snapshot mandatory |
 | 6. scheduled jobs activated after all backfills | Enable five-minute jobs, then enable 365-day request / seven-day GPU pruning only after checkpoints and comparison gates; count every table before/after each prune and match deleted counts to eligible IDs | **Backup-gated** once rows are deleted; migration runner's version alone must not enable irreversible deletion |
 
+**Migration 3 normalization notes:** the legacy meter already parses stored JSON
+as `serde_json::Value`, replaces the placeholder JSON ID with the SQL ID, and
+serializes it for cursor pages. Its floating-point parse/serialize can change
+low-order digits in `latency_ms`. The API then deserializes `RequestRecord` and
+serializes that typed record into its cache; raw JSON text is not its contract.
+In the step 5a snapshot differential (1,548 requests), 223 raw latency values
+differed from the legacy cache, but none differed between legacy wire and cache.
+There were no missing/null, type or nested `usage` differences. Legacy and v1
+meters feeding identical current-main APIs produced exactly equal cache JSON
+values and usage totals. Thus these observed changes precede v1, not an API
+normalization introduced by migration 3. Re-sync checks must compare observable
+wire/typed facts, not original JSON spelling; do not silently tolerate new changes.
+`meter/tests/differential.py` gates step 5a with exact A/B cache comparisons and
+separately reports raw-to-legacy-cache and legacy-wire-to-cache differences.
+
 Meter v1 uses a new-file swap: `meter migrate --legacy OLD --db NEW` opens OLD
 read-only and runs the shared migration runner against a new file. `--dry-run`
 deletes the temporary output; omitting `--legacy` initializes an empty v1 DB.

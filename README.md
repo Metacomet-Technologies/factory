@@ -315,6 +315,29 @@ upstream errors, exact body/status/header forwarding, internal routing, GPU
 retention, and a slow NDJSON server proving incremental arrival with timing
 assertions and a persisted request row.
 
+For the offline migration differential, build the legacy meter and current-main
+factory-api from separate archived trees/target directories. Set `LEGACY_METER`,
+`MAIN_API`, and `LEGACY_DB` to their absolute paths, then run from this checkout:
+
+```sh
+mkdir -p .sandbox
+env -i PATH=/usr/bin:/bin HOME="$PWD/.sandbox" bwrap \
+  --unshare-net --unshare-pid --unshare-uts --hostname sandbox --die-with-parent \
+  --ro-bind / / --bind "$PWD/.sandbox" "$PWD/.sandbox" \
+  --proc /proc --dev /dev --tmpfs /run --tmpfs /tmp \
+  --setenv PATH "$PWD/scripts/sandbox-shims:/usr/bin:/bin" \
+  python3 "$PWD/meter/tests/differential.py" "$LEGACY_METER" \
+  "$PWD/target/release/meter" "$MAIN_API" "$PWD/target/release/fake-ollama" \
+  "$LEGACY_DB" "$PWD/.sandbox/differential"
+```
+
+The output compares both fully synced caches as JSON values without tolerances
+or field exclusions. It also reports every raw-to-legacy-cache difference and
+isolates changes between the legacy wire and API cache. Existing legacy float
+normalization is not a v1 regression. The work directory must not exist; remove
+private copies/logs after inspection, and never commit reports containing real
+metadata. Processes shut down in the private namespace even when a check fails.
+
 ## Future
 
 - factory-api consuming the shared contract and pricing library.
