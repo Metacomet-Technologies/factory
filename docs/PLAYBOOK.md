@@ -88,7 +88,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 | `factory-status` | full health check (Mac only) |
 | `opin …` | 1Password CLI on a node |
 
-- **Multi-line remote scripts:** `factory-ssh 'bash -s' <<'EOF'` … `EOF` (a heredoc after a plain `ssh host` runs on the Mac).
+- **Multi-line remote scripts:** `factory-ssh 'bash -s' <<'EOF'` … `EOF` (or `console-ssh` for factory-console; a heredoc after a plain `ssh host` runs on the Mac).
 - **Same command on both nodes:** one labeled loop, not two copies:
   `for h in factory-gpu factory-console; do echo "== $h"; ssh dgarbs51@$h '…'; done`
   (or `ssh dgarbs51@$h 'bash -s' <<'EOF'` … `EOF` inside the loop).
@@ -96,7 +96,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 - **`ssh -t dgarbs51@<host> '…'`** only for interactive prompts.
 - **Full paths with sudo** (`/home/agent/work/factory/...`): admins can't `cd` into `/home/agent`. For agent-owned paths, run as the agent: `sudo -u agent git -C /home/agent/work/factory status -sb`.
 - Agent-thread commands go in a separate prompt block with the handoff header, never mixed with Mac commands.
-- **Every step has its command:** each step given to Devon includes the exact command and where it runs, or says **UI only** and where (for example, archiving an Amp thread). Steps Claude can do with its own tools (reviews, Linear updates) Claude does or offers; irreversible actions (merges, deletes) need Devon's explicit yes first.
+- **Every step has its command:** each step given to Devon includes the exact command and where it runs, or says **UI only** and where (for example, archiving an Amp thread). Steps Claude can do with its own tools (reviews, Linear updates) Claude does or offers; irreversible actions (merges, deletes) need Devon's explicit yes first. Claude can merge through Linear's `merge_diff` (squash) only after Devon's explicit yes.
 
 ### Day-to-day operations
 
