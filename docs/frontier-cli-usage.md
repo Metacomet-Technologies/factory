@@ -1,8 +1,12 @@
-# MET-77: frontier CLI usage, limits, and cost collection
+# MET-77 / MET-89: frontier CLI usage, limits, cost, and user attribution
 
 Research date: **2026-10-11**. All findings and source accesses below are dated
 2026-10-11 unless a source snapshot has a different date. Prices exclude tax
 unless noted. This is research, not a collector implementation.
+
+MET-89 adds attribution to **Devon or David**, with per-user and combined views.
+Use stable internal user IDs, verified vendor-account mappings, and explicit
+shared/unattributed records. An OS user named `agent` does not identify a person.
 
 ## Recommendation in brief
 
@@ -140,6 +144,21 @@ hourly daily-report refresh, daily historical reconciliation, conservative activ
 thread polling with backoff. Personal balance, included agent/orb remaining, and
 exact per-request billing times remain gaps without a supported additional API.
 
+### User attribution (MET-89) — 2026-10-11
+
+The [External API](https://ampcode.com/api/external) daily report's
+`users[].user.id` is the strongest per-user usage/cost dimension. Map vendor IDs
+to `devon` or `david`; optional email needs `workspace.members:view`. The M2M
+credential identifies the workspace application, not the person consuming usage.
+`creatorUserID` from thread listing identifies the creator, not necessarily every
+participant or billing account on a shared thread. Prefer daily per-user rows;
+do not assign an entire parent/subthread usage total to its creator when identity
+can differ. Streaming JSON session IDs need a trusted invocation/account mapping.
+Shared credits and group/default entitlements remain workspace/group scoped;
+do not duplicate their limits under both people. Amp user attribution alone does
+not identify the owner of a linked Claude/ChatGPT subscription or workspace BYOK
+key; preserve a separately confirmed billing-account mapping, otherwise unknown.
+
 **Placement:** server-side on factory-console with a scoped workspace credential.
 Optional stream capture runs beside each existing agent invocation, as that
 runner's agent user or on Devon's Mac. It cannot discover unrelated personal
@@ -272,6 +291,23 @@ Honor 429 and `Retry-After: 60`. Cloud usage has no verified publication SLA;
 overview documents default **20/minute** unless overridden. OTel starts about a
 minute after enable; delivery is streaming without an accounting completeness SLA.
 
+### User attribution (MET-89) — 2026-10-11
+
+[Admin usage events](https://cursor.com/docs/account/teams/admin-api) expose
+`userEmail` for human activity and optional `serviceAccountId`/`serviceAccountName`.
+Daily rows and spend rows also provide user attribution; organization variants
+add `teamId`. Map these identities to Devon/David, not the admin-key creator.
+Organization pooled budget is shared and cannot be split into individual quota.
+For [cloud agents](https://cursor.com/docs/cloud-agent/api/endpoints),
+`GET /v1/me` returns `userId`/`userEmail` for user-scoped keys; these fields are
+absent for service-account/team keys. `GET /v1/agents` lists the authenticated
+user's agents; bind usage to that verified principal, or join `cloudAgentId` to
+Admin usage events. A key name or ability to read an agent does not prove human
+ownership. Shared service-account activity stays unattributed unless a trusted
+per-run launch record identifies the person. CLI JSON session IDs alone lack
+account identity; use invocation/account mapping, not runner hostname. BYOK
+provider account ownership remains separate from Cursor's consuming user.
+
 **Placement:** server-side factory-console for Admin/cloud polling; an approved
 public HTTPS OTel receiver if Enterprise telemetry is chosen (do not expose the
 existing unauthenticated factory API). Capture CLI session IDs locally on runner
@@ -391,6 +427,28 @@ response's `customer_type=subscription` as proof of individual API access.
 Bedrock/Vertex/Foundry billing comes from their provider; Console reporting does
 not cover it. No numeric limit for the Code analytics/rate-limit reporting routes
 was verified; use hourly/daily collection and backoff.
+
+### User attribution (MET-89) — 2026-10-11
+
+[OTel standard attributes](https://code.claude.com/docs/en/monitoring-usage)
+include authenticated `user.account_uuid`, `user.account_id`, `user.email`, and
+`organization.id` when available. Map account IDs to Devon/David; account metrics
+can be disabled via `OTEL_METRICS_INCLUDE_ACCOUNT_UUID`. Ordinary `user.id` is an
+anonymous installation ID, **not a Claude account ID**; gateway-authenticated
+sessions instead use the IdP subject. Direct API-key/cloud-provider sessions lack
+Claude account identity: use a trusted per-user launch mapping or approved custom
+`OTEL_RESOURCE_ATTRIBUTES` (for example `enduser.id`), not shared `agent` home.
+Status-line/transcript session IDs do not independently identify a subscription;
+bind quota to the authenticated account at observation time. Do not infer owners
+of historical sessions from the account currently logged in.
+
+[Code Analytics](https://platform.claude.com/docs/en/manage-claude/claude-code-analytics-api)
+identifies `actor.type=user_actor` through `email_address`, or `api_actor` through
+`api_key_name`. A shared API key does not identify either human. API usage can be
+grouped by dedicated `api_key_id`/workspace; map only exclusive keys/workspaces.
+The org cost report groups by workspace/description, not individual actors: a
+dedicated workspace can support per-user cost; shared workspace cost cannot be
+split authoritatively. Any allocation by token share remains an estimate.
 
 **Placement:** OTel and status-line callback on each used runner as agent and on
 Devon's Mac if he codes there; central authenticated receiver. Org reporting
@@ -538,6 +596,25 @@ freshness/rate limits and cost/remaining coverage are **unverified** here; do no
 invent endpoints. This is a possible later Enterprise reporting path, not the
 personal-plan default.
 
+### User attribution (MET-89) — 2026-10-11
+
+[App-server `account/read`](https://learn.chatgpt.com/codex/app-server), with
+`refreshToken:false`, reports ChatGPT `account.type`, nullable `email`, and
+`planType`; map the verified account to Devon/David and bind quota snapshots to
+it. API-key mode reports `type=apiKey` without a human owner. Exec JSON and rollout
+thread IDs are not proof of account ownership; retain identity at invocation time
+or an exclusive, time-bounded home/account mapping. Current account info cannot
+establish whose subscription paid for historical files after an account switch.
+
+OpenAI [usage reporting](https://developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage/methods/completions)
+supports `user_id`, `api_key_id`, and `project_id` grouping. Map returned IDs to
+people; shared/service keys require trusted launch attribution and must not be
+assigned to the key creator. [Cost reporting](https://developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage/methods/costs)
+has project/line-item dimensions, not a guaranteed per-human cost breakdown.
+Dedicated projects allow per-user billing attribution; shared project costs stay
+shared, or receive an explicitly estimated allocation. ChatGPT workspace Analytics
+per-user schema remains unverified here; do not assume it can split the workspace.
+
 **Placement:** exec/OTel/disk collectors on each runner as agent and Devon's Mac
 where used; local app-server account reads on one existing authenticated node
 per account. API usage/cost or eligible workspace reporting runs server-side.
@@ -681,6 +758,22 @@ No live remaining-inference-quota API or balance publication SLA was verified.
 Search 429 response headers have their own separate limits. Do not reuse them
 as chat-model quota.
 
+### User attribution (MET-89) — 2026-10-11
+
+[Kimi Code local API](https://www.kimi.com/code/docs/en/kimi-code-cli/reference/server-api.html)
+`GET /api/v1/oauth/userinfo` identifies the managed account with `userId`,
+`globalId?`, `region`, and optional email. Use nonsecret IDs plus region to map
+the subscription to Devon/David; check envelope and `data.kind` as with quota.
+Fetch identity alongside quota, rather than assuming the local Bearer token names
+the user. Wire `agentId` is an agent identity, not a human/account ID. Both new
+and legacy files need trusted invocation or time-bounded home/account mapping;
+their documented usage fields do not identify the subscription owner.
+Moonshot PAYG balance is account-wide and has no per-user usage split. Map a
+credential reference to its confirmed billing account without copying the key.
+Dedicated keys plus local launch attribution can distinguish activity, but do
+not create separate balances when keys share one wallet. Shared wallet/subscription
+remaining stays shared; no verified org API splits it by Devon and David.
+
 **Placement:** wire readers on each used runner as agent and on Devon's Mac;
 experimental Code quota reads on one already authenticated local node per
 account. Global PAYG balance polling can run server-side with a dedicated key.
@@ -694,6 +787,7 @@ Proposed minimum shape (synthetic example, not an observed account):
 ```json
 {
   "tool": "codex",
+  "user": "devon",
   "source": "codex.exec.turn.completed",
   "period_start_ms": 1791676800000,
   "period_end_ms": 1791680400000,
@@ -748,6 +842,8 @@ Proposed minimum shape (synthetic example, not an observed account):
    source row ID or file offset, session lineage, cache fields, cost basis, and
    whether amount/remaining is derived. The requested flat fields alone cannot
    safely distinguish multiple accounts, dedupe, or represent corrections.
+   Include `account_owner`, `attribution_basis`, and time-bounded identity mappings
+   so the human using a shared account is not confused with its billing owner.
 9. Upsert stable IDs or replace whole aggregate buckets. Never add successive
    cumulative snapshots. Do not sum local usage plus vendor reporting for the
    same activity; reporting reconciles/replaces it. Keep provider bills from
@@ -759,11 +855,37 @@ Proposed minimum shape (synthetic example, not an observed account):
     events. Keep stale last-good data with its age; failed auth is unknown, not
     zero. Fetch paginated reports with overlap and reconcile late corrections.
 
+### Per-user and combined views (MET-89)
+
+`user` is `"devon"`, `"david"`, or `null`, using stable internal IDs rather than
+display names or vendor emails. It identifies the person to whom this record's
+claim can be attributed. Documented account identity is the default basis;
+trusted per-run launch identity can attribute shared-account activity to David
+while `account_owner` remains Devon. Record that distinction, never infer it.
+Shared or unidentified activity, org bills, and shared quota have `user=null`
+with metadata distinguishing `shared` from `unknown`; they are not zero usage.
+
+- **Devon / David:** filter attributed usage by `user`. Show coverage gaps and
+  shared-account context separately; a person's activity is not necessarily
+  charged to their own subscription. Unknown billed cost remains null even if
+  local tokens are attributable. Include a subscription fee only once per account.
+- **Combined:** sum reconciled additive Devon/David usage and include disjoint
+  shared/unattributed usage once, labeled separately. Org totals that overlap
+  per-user rows are reconciliation totals, not additional usage. Report sessions
+  using account/tool/session identity, not session ID alone.
+- **Limits/remaining:** show snapshots by billing account and quota window, not
+  sums across users. If both people use one pool, link the same snapshot in their
+  views and display it once in combined view. Never split a percentage/budget
+  equally or add snapshots from two nodes. Do not imply missing user coverage is
+  complete merely because an organization total is available.
+
 ## Collector placement
 
 - **Every used runner node, agent user:** Claude/Codex OTel or existing-run output;
   optional version-pinned Claude/Codex/Kimi file readers. That user's home is the
-  visibility boundary. Root is unnecessary. Collect usage metadata locally and
+  visibility boundary, not Devon/David identity. Preserve per-invocation identity
+  when both people share `agent`; otherwise report unattributed activity.
+  Root is unnecessary. Collect usage metadata locally and
   forward only normalized records, never prompts/transcripts/provider secrets.
 - **Devon's Mac, Devon's user:** the same adapters for sessions that actually run
   there; it is not a proxy for sessions on runners. Use local status-line/app-server
@@ -781,7 +903,9 @@ Proposed minimum shape (synthetic example, not an observed account):
 
 ### Phase 0: choose sources, no deployment
 
-Devon supplies the account/tool inventory below. Check installed versions and
+Devon and David supply the account/tool inventory below, including vendor-ID,
+credential-reference, home, and subscription-owner mappings with effective dates.
+Check installed versions and
 read-only eligibility with approved credentials. Do not request all-vendor Admin
 keys or enable telemetry until a used billing model needs them. Save a redacted
 fixture for each selected contract, including missing usage, resumes, subagents,
@@ -823,6 +947,9 @@ unknown; a manually supplied official export can supplement it. No UI scraping.
 1. Which tools actually run: Amp, Cursor CLI/editor/cloud agents, Claude Code,
    Codex CLI/cloud, legacy Kimi CLI or replacement Kimi Code? Which runner nodes
    and which Mac user/home? Which versions and existing ephemeral sessions?
+   For Devon and David, which vendor IDs/emails, keys/projects/workspaces, and
+   subscriptions are exclusive or shared? Can launches identify the initiating
+   person on shared runner accounts? Who owns each billing account?
 2. For **each tool/account**, subscription tier and legacy/new status, personal
    vs workspace/org ownership, billing-cycle start, currency, included pools,
    overage/Extra Usage settings, spend caps, BYOK/provider/region, discounts and
