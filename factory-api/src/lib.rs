@@ -13,6 +13,15 @@ use std::{
 };
 use tokio::sync::{Mutex, RwLock, broadcast};
 
+pub const INFERENCE_ENDPOINTS: [&str; 6] = [
+    "/api/generate",
+    "/api/chat",
+    "/api/embed",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+];
+
 #[derive(Clone)]
 pub struct AppState {
     pub meter_url: String,
@@ -107,7 +116,10 @@ impl AppState {
             let records: Vec<RequestRecord> = self.get("/meter/requests?limit=500").await?;
             let path = self.db_path.clone();
             let new = data::blocking(move || data::sync(&path, records)).await?;
-            for r in new {
+            for r in new
+                .into_iter()
+                .filter(|r| INFERENCE_ENDPOINTS.contains(&r.endpoint.as_str()))
+            {
                 self.emit(
                     "llm.request",
                     LlmRequest {
