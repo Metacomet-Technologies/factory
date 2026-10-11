@@ -27,7 +27,7 @@ it("checks every 60s and on reconnect, deferring changed builds until interactio
     await act(() => vi.advanceTimersByTimeAsync(duration));
   };
   try {
-    await tick(0);
+    await tick(250);
     expect(reload).not.toHaveBeenCalled();
     deployed = "b".repeat(64);
     await tick(59_999);
@@ -71,7 +71,7 @@ it("checks every 60s and on reconnect, deferring changed builds until interactio
     hook.unmount();
     deployed = original;
     const periodic = renderHook(() => useBuildUpdate(0, false));
-    await tick(0);
+    await tick(250);
     deployed = "c".repeat(64);
     await tick(59_999);
     expect(reload).toHaveBeenCalledTimes(1);
@@ -80,6 +80,90 @@ it("checks every 60s and on reconnect, deferring changed builds until interactio
     periodic.unmount();
   } finally {
     hook.unmount();
+    meta.remove();
+  }
+});
+
+it.each(["visibilitychange", "pageshow", "online"])(
+  "checks on %s and preserves the interaction guard",
+  async (trigger) => {
+    vi.useFakeTimers();
+    const meta = document.createElement("meta");
+    meta.name = "kiosk-build";
+    meta.content = "a".repeat(64);
+    document.head.append(meta);
+    const reload = vi.fn();
+    vi.stubGlobal("location", { reload });
+    let deployed = meta.content;
+    const fetch = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ build: deployed }))));
+    vi.stubGlobal("fetch", fetch);
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    const hook = renderHook(() => useBuildUpdate(0, false));
+    try {
+      await act(() => vi.advanceTimersByTimeAsync(250));
+      expect(fetch).toHaveBeenCalledTimes(1);
+      deployed = "b".repeat(64);
+      visibility.mockReturnValue("hidden");
+      fireEvent(document, new Event("visibilitychange"));
+      fireEvent(window, new PageTransitionEvent("pageshow", { persisted: false }));
+      await act(() => vi.advanceTimersByTimeAsync(300));
+      expect(fetch).toHaveBeenCalledTimes(1);
+      fireEvent.pointerDown(document);
+      visibility.mockReturnValue("visible");
+      if (trigger === "visibilitychange") fireEvent(document, new Event(trigger));
+      else if (trigger === "pageshow")
+        fireEvent(window, new PageTransitionEvent(trigger, { persisted: true }));
+      else fireEvent(window, new Event(trigger));
+      await act(() => vi.advanceTimersByTimeAsync(250));
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenLastCalledWith("/version.json", {
+        cache: "no-store",
+        signal: expect.any(AbortSignal),
+      });
+      expect(reload).not.toHaveBeenCalled();
+      await act(() => vi.advanceTimersByTimeAsync(1750));
+      expect(reload).toHaveBeenCalledTimes(1);
+    } finally {
+      hook.unmount();
+      visibility.mockRestore();
+      meta.remove();
+    }
+  },
+);
+
+it("debounces lifecycle event bursts and removes pending checks on unmount", async () => {
+  vi.useFakeTimers();
+  const meta = document.createElement("meta");
+  meta.name = "kiosk-build";
+  meta.content = "a".repeat(64);
+  document.head.append(meta);
+  const fetch = vi.fn(() => Promise.resolve(new Response(JSON.stringify({ build: meta.content }))));
+  vi.stubGlobal("fetch", fetch);
+  const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  const hook = renderHook(({ revision }) => useBuildUpdate(revision, false), {
+    initialProps: { revision: 0 },
+  });
+  try {
+    await act(() => vi.advanceTimersByTimeAsync(250));
+    fireEvent(document, new Event("visibilitychange"));
+    await act(() => vi.advanceTimersByTimeAsync(100));
+    fireEvent(window, new PageTransitionEvent("pageshow", { persisted: true }));
+    await act(() => vi.advanceTimersByTimeAsync(100));
+    hook.rerender({ revision: 1 });
+    fireEvent(window, new Event("online"));
+    await act(() => vi.advanceTimersByTimeAsync(249));
+    expect(fetch).toHaveBeenCalledTimes(1);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(fetch).toHaveBeenCalledTimes(2);
+    fireEvent(window, new Event("online"));
+    hook.unmount();
+    fireEvent(document, new Event("visibilitychange"));
+    fireEvent(window, new PageTransitionEvent("pageshow", { persisted: true }));
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    expect(fetch).toHaveBeenCalledTimes(2);
+  } finally {
+    hook.unmount();
+    visibility.mockRestore();
     meta.remove();
   }
 });

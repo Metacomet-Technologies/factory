@@ -6,6 +6,7 @@ import { streamReducer, initialLiveState, parseEvent } from "./api/stream";
 import type { StreamEvent } from "./api/types";
 import { count, ms, usd, number, seen } from "./lib/format";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
+import { FleetSection } from "./components/sections";
 
 class MockSource extends EventTarget {
   static latest: MockSource;
@@ -81,6 +82,20 @@ describe("human formats", () => {
   });
 });
 describe("dashboard contract", () => {
+  it("shows now only for online nodes without a last-seen timestamp", () => {
+    const data = fixtures().fleet;
+    data.nodes = [
+      { name: "online-unknown", online: true, last_seen_ms: null, services: [] },
+      { name: "offline-unknown", online: false, last_seen_ms: null, services: [] },
+      { name: "online-dated", online: true, last_seen_ms: 0, services: [] },
+    ];
+    render(<FleetSection resource={{ data, error: null, loading: false }} icon={null} />);
+    const nodes = screen.getAllByRole("article");
+    expect(nodes[0]).toHaveTextContent("Last seen now");
+    expect(nodes[1]).toHaveTextContent("Last seen —");
+    expect(nodes[2]).toHaveTextContent(`Last seen ${seen(0)}`);
+    expect(nodes[2]).not.toHaveTextContent("Last seen now");
+  });
   it("renders every section, null tps, pricing estimates and a read-only pending banner", async () => {
     api();
     render(<App />);

@@ -10,7 +10,13 @@ const PLACEHOLDER: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="30"><title>factory · kiosk not deployed yet</title>
 <style>html{background:#111018;color:oklch(0.72 0.15 300);font-family:system-ui,sans-serif}body{margin:0;min-height:100vh;display:grid;place-items:center}h1{font-size:clamp(1rem,3vw,2rem);font-weight:500;text-align:center;padding:1rem}</style>
-</head><body><h1>factory · kiosk not deployed yet</h1></body></html>"#;
+</head><body><h1>factory · kiosk not deployed yet</h1>
+<script>
+setInterval(() => location.reload(), 30000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") location.reload();
+});
+</script></body></html>"#;
 
 pub(crate) fn reserved(path: &str) -> bool {
     path == "/v1" || path.starts_with("/v1/") || path == "/openapi.json"

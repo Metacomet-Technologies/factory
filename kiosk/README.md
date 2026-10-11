@@ -75,7 +75,8 @@ Native EventSource reconnects automatically. Reconnection refetches Fleet,
 GPU/history, usage and pricing snapshots without inventing missed ticker rows.
 A disconnect clears live GPU
 values rather than presenting stale telemetry as live. Nulls render as `—`,
-not zero. Section errors do not blank other sections.
+not zero, except that an online Fleet node with no last-seen timestamp shows
+`Last seen now`. Section errors do not blank other sections.
 
 Open `/?kiosk` to default to dark regardless of system preference. Without that
 flag, the dashboard follows `prefers-color-scheme`, including changes while it
@@ -85,9 +86,9 @@ polite ticker announcements and reduced-motion styles are included.
 
 Phone widths below 640px use stacked cards and per-model cards. 640–1279px uses
 a two-column grid. Desktop uses Fleet/GPU above Local LLM and a tool/ticker
-side column. The default fixture fits the 1728×1117 kiosk without page scrolling
-even after the ticker fills; the ticker has a keyboard-scrollable bounded
-viewport. Arbitrarily large real fleets/model lists may require page scrolling.
+side column. The ticker has a keyboard-scrollable bounded viewport. The current
+mock fixture exceeds the 1728×1117 kiosk height by 30px (see screenshot checks
+below). Arbitrarily large real fleets/model lists may also require page scrolling.
 
 ## Mock and screenshots
 
@@ -121,8 +122,8 @@ vp run screenshots
 Playwright and Chromium install under this user and `kiosk/`; no sudo. The
 script verifies native SSE delivery/reconnection, range selection, keyboard
 tooltip access, absence of horizontal overflow, kiosk height, phone model
-cards and WCAG text contrast. The following committed Phase 3a captures are
-historical fixtures; rerunning the script replaces them with current fixtures:
+cards and WCAG text contrast. The committed captures were regenerated for
+MET-86 with current fixtures, including the Phase 3b GPU and local-model updates:
 
 - [1728 dark](screenshots/1728-dark.png): full default kiosk with the ticker
   filled, all KPIs, pricing, warnings and model table. Older ticker rows scroll
@@ -155,7 +156,13 @@ historical fixtures; rerunning the script replaces them with current fixtures:
 
 `screenshots/checks.json` records viewport/page dimensions and browser-rasterized
 contrast measurements for all five required default captures. Screenshots are
-review artifacts, not production data.
+review artifacts, not production data. MET-86 regeneration exposed an existing
+desktop mock overflow: page height 1,147px at a 1,117px viewport in both themes.
+The old last-seen label produces the same height. The normal screenshot check
+still fails on this; layout was left unchanged. A temporary capture-only copy
+ran the remaining checks and recorded both failures in `checks.json`. All
+captures were refreshed; horizontal overflow, contrast, SSE reconnects, range
+controls and tooltips passed. Desktop viewport captures cut off the footer.
 
 ## Accent and contrast
 
@@ -202,7 +209,11 @@ same `build` value. Identical outputs produce an identical identity. A change
 to HTML, CSS or either JavaScript chunk changes it.
 
 The app checks same-origin `/version.json` with `cache: "no-store"` on startup,
-every 60 seconds and after every native SSE reconnect. The deployed static
+every 60 seconds and after every native SSE reconnect. It also checks when
+`visibilitychange` makes the page visible, on `pageshow` with `persisted: true`,
+and on `online`. These lifecycle events share a 250ms trailing debounce, so a
+wake/reconnect burst performs one check. Listeners and pending checks are removed
+on cleanup. The deployed static
 server already gives this non-asset file `Cache-Control: no-cache`. A changed
 valid identity schedules a full reload. A one-second idle tick defers it while
 range data is loading, a range toggle is hovered/focused, any tooltip (including
@@ -210,10 +221,14 @@ the chart tooltip) is open, or a pointer/key interaction happened within the
 last second. Move focus/pointer away to finish the interaction. Failed, missing
 or malformed version responses leave the running dashboard intact. Development
 without a build meta tag skips these checks. Tests cover unchanged builds,
-60-second checks, reconnects, failures, tooltip/range interaction and idle reload.
+60-second checks, reconnects, failures, tooltip/range interaction, idle reload,
+each lifecycle trigger, ignored hidden/non-persisted events and burst debounce.
 
-The currently deployed placeholder already reloads every 30 seconds, so the
-first install also appears without a manual refresh. Later installs use the
+The placeholder retains its 30-second meta refresh and now has a 30-second
+JavaScript fallback plus an immediate reload when visibility returns. This
+placeholder change requires a factory-api binary redeploy; static kiosk
+installation alone cannot update it. Already-open old placeholders need one
+manual refresh to receive the new fallback. Later dashboard installs use the
 build check. Reload resets session-only theme/range/ticker state.
 
 ## Live build and administrator handoff
@@ -239,9 +254,20 @@ Captures: [1728×1117 dark](screenshots/live-1728-dark.png),
 [390×844 dark](screenshots/live-390-dark.png),
 [tablet full page](screenshots/live-1024-dark-full.png),
 [phone full page](screenshots/live-390-dark-full.png).
-[Live checks](screenshots/live-checks.json) record real traffic, before/after
-usage, native SSE frames and dimensions without prompt/generated text.
-The successful run sends four requests (90 prompt tokens, 96 output tokens),
+[Live checks](screenshots/live-checks.json) now record the MET-86 read-only
+capture run: native SSE, Fleet labels and dimensions, with no inference or API
+mutation requests. Usage and pricing requests exceeded 60 seconds on the
+deployed API, while health, Fleet, GPU and SSE responded. The refreshed live
+captures preserve those sections' actual loading state. The unchanged range
+loading guard therefore prevents a changed build from reloading on the fully
+live page until those requests complete or fail. The lifecycle/reload browser
+check used browser-only timeout failures for those two requests, real Fleet/GPU/
+SSE, and simulated manifest/index replacement. Hidden events performed no
+check; a visible/pageshow/online burst performed one check after 250ms. A changed
+identity stayed loaded during an open tooltip and navigated once after dismissal.
+This is Chromium simulation, not physical iPhone Safari or console Chrome proof.
+
+The earlier Phase 3b successful run sent four requests (90 prompt tokens, 96 output tokens),
 matches all four completions in each browser's real SSE, and sees cached totals
 increase from 68 to 94 requests, 58,908 to 81,519 input tokens and 6,325 to
 11,191 output tokens. Other tailnet clients generate concurrently; these deltas
@@ -263,13 +289,94 @@ Built directory: `/home/agent/work/factory/kiosk/dist`. Devon installs it:
 sudo bash deploy/install-kiosk.sh /home/agent/work/factory/kiosk/dist
 ```
 
-Only kiosk files change. Factory-api needs **no binary redeploy or restart**.
+Kiosk installation changes only static files and does not restart factory-api.
+MET-86 also changes the API's built-in placeholder: **factory-api needs a binary
+redeploy for that fallback**, separately from installing this dist. No deployment
+or production restart was performed during development.
 
-Final build sizes (decimal kB, raw / gzip): initial JavaScript **384.11 / 122.48**,
-lazy chart **328.94 / 98.09**, CSS **54.29 / 10.16**, HTML **0.55 / 0.36**, and
-version manifest **0.07 / 0.08**. Total dist is **767,983 bytes** before compression.
-`vp check`, `vp test --run` (10 tests), `vp build`, Rust fmt, clippy with denied
+`vp check`, `vp test --run` (15 tests), `vp build`, Rust fmt, clippy with denied
 warnings and workspace tests pass. The live preview is stopped after checking.
+
+## MET-86 console investigation and administrator handoff
+
+Read-only observations on factory-console (Ubuntu 26.04.1, GNOME Wayland):
+
+- Console is UID 1001, session 1: `Active=yes`, `State=active`, `IdleHint=no`,
+  `IdleSinceHint=0`, `LockedHint=no`. This does not establish its earlier state.
+- Chrome 155.0.8059.39 runs with `--kiosk --app=http://localhost:8080` and the
+  error/first-run/password-store flags below, but no background flags.
+- Agent cannot read console's autostart files or connect to `/run/user/1001/bus`.
+  `gsettings` as agent reads agent settings, even with that bus address; its
+  `idle-delay=300` is **not** console's value. Console's blanking/lock/suspend
+  policy remains unverified.
+- The server currently returns matching dashboard index/manifest identities.
+  No first-deploy page/timer history is available. An old hidden/suspended
+  placeholder is a hypothesis; the original foreground failure's cause is
+  **not established**. Today's hung usage/pricing requests independently block
+  reload through the existing loading guard; that is not proof of the old cause.
+
+[Chrome's timer documentation](https://developer.chrome.com/blog/timer-throttling-in-chrome-88)
+describes minimal throttling for visible pages and minute-level checks for
+intensively throttled hidden pages. [Frozen pages](https://developer.chrome.com/docs/web-platform/page-lifecycle-api)
+do not execute timers or fetch callbacks. Chromium's kiosk switch enters
+fullscreen, without a timer/freezing exemption. A truly visible top-level page
+should not undergo ordinary background throttling or freezing.
+
+Devon: run this read-only inspection on factory-console. Confirm the current
+console session ID first; session IDs can change:
+
+```sh
+loginctl list-sessions
+loginctl show-session 1 -p Name -p Active -p State -p IdleHint -p IdleSinceHint -p LockedHint -p Type
+sudo -u console env XDG_RUNTIME_DIR=/run/user/1001 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus bash -c '
+  gsettings get org.gnome.desktop.session idle-delay
+  gsettings get org.gnome.desktop.screensaver lock-enabled
+  gsettings get org.gnome.settings-daemon.plugins.power idle-dim
+  gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type
+  gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout
+  gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type
+  gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout
+  gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
+  cat /home/console/.config/autostart/console-kiosk.desktop
+'
+```
+
+Recommended change, not applied: edit only the existing `Exec=` line in
+`/home/console/.config/autostart/console-kiosk.desktop`, preserving other keys:
+
+```ini
+Exec=/usr/bin/google-chrome --kiosk --app=http://localhost:8080 --noerrdialogs --disable-session-crashed-bubble --disable-infobars --no-first-run --no-default-browser-check --password-store=basic --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows
+```
+
+- `--disable-background-timer-throttling`: disables Blink background timer
+  throttling, including on Linux.
+- `--disable-renderer-backgrounding`: retains foreground renderer process
+  priority; it does not override page freezing.
+- `--disable-backgrounding-occluded-windows`: treats reported occluded WebContents
+  as visible; it is not Windows-only, but does not override Wayland compositor
+  suspension or actual hidden/minimized state.
+
+See [Chromium's switch definitions](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/content/public/common/content_switches.cc).
+None guarantees execution during OS sleep or page freezing. Apply at the next
+planned Chrome/session launch; no kiosk was restarted here.
+
+Only for a physically secured, dedicated read-only console session: these commands
+disable automatic blanking, locking, dimming and idle suspend. Disabling locking
+reduces physical-access protection; do not apply to Devon's personal session:
+
+```sh
+sudo -u console env XDG_RUNTIME_DIR=/run/user/1001 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus bash -c '
+  gsettings set org.gnome.desktop.session idle-delay 0
+  gsettings set org.gnome.desktop.screensaver lock-enabled false
+  gsettings set org.gnome.settings-daemon.plugins.power idle-dim false
+  gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type nothing
+  gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type nothing
+'
+```
+
+Lid-close behavior is unchanged; browser flags cannot prevent independent system
+suspend. If refresh still fails while visibly awake, record page visibility,
+console/network errors and `chrome://discards` state rather than assuming throttling.
 
 ## Tooling deviations and limits
 
@@ -289,5 +396,6 @@ The chart remains a separate lazy chunk; no size warning is suppressed.
 Browser checks use Chromium on this runner, not the physical kiosk screen or
 real iOS Safari. Static installation remains Devon's administrator action.
 Rust fmt, clippy and workspace tests run locally under repository guidance;
-they do not stop or modify deployed services. Rust sources and running meter /
-Ollama configuration are untouched.
+they do not stop or modify deployed services. Only the factory-api placeholder
+and its contract test changed in Rust; meter, deploy and running Ollama
+configuration are untouched.

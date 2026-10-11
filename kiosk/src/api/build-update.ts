@@ -52,19 +52,35 @@ export function useBuildUpdate(reconnectRevision: number, rangeLoading: boolean)
         // A failed check leaves the working dashboard in place until the next check.
       }
     };
+    let debounce: ReturnType<typeof setTimeout> | undefined;
+    const scheduleCheck = () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => void check(), 250);
+    };
+    const visible = () => {
+      if (document.visibilityState === "visible") scheduleCheck();
+    };
+    const restored = (event: PageTransitionEvent) => {
+      if (event.persisted) scheduleCheck();
+    };
     document.addEventListener("pointerdown", interact);
     document.addEventListener("keydown", interact);
-    void check();
-    const poll = setInterval(() => {
-      void check();
-    }, 60_000);
+    document.addEventListener("visibilitychange", visible);
+    window.addEventListener("pageshow", restored);
+    window.addEventListener("online", scheduleCheck);
+    scheduleCheck();
+    const poll = setInterval(scheduleCheck, 60_000);
     const idle = setInterval(reloadIfIdle, 1000);
     return () => {
       controller.abort();
       clearInterval(poll);
       clearInterval(idle);
+      clearTimeout(debounce);
       document.removeEventListener("pointerdown", interact);
       document.removeEventListener("keydown", interact);
+      document.removeEventListener("visibilitychange", visible);
+      window.removeEventListener("pageshow", restored);
+      window.removeEventListener("online", scheduleCheck);
     };
   }, [reconnectRevision]);
 }
