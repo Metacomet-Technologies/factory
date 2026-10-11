@@ -359,15 +359,24 @@ sidecar. Failed snapshots never become successful status entries. The databases 
 
 Snapshots are `/var/backups/factory-db/<host>/<db>/<UTC-timestamp>.db.zst` with
 adjacent `.sha256` files. Local snapshots are root-owned and read-only to the
-`backup` group. Only the dedicated, password-locked system user `backup` runs
-network operations: `rsync -a --partial -e ssh` over Tailscale SSH, **never
+`factory-backup` group. Only the dedicated, password-locked system user
+`factory-backup` runs network operations: `rsync -a --partial -e ssh` over
+Tailscale SSH, **never
 `--delete`**. Incoming replicas live at `/srv/factory/backups/replica` on
 factory-gpu and `/var/backups/factory-replica` on factory-console, under
-`<source-host>/<db>/`. Each replica root has mode 0700 and is owned by `backup`.
-No sudo permissions or SSH keys are granted. Its home (including `.ssh/known_hosts`)
-is inside the replica root; `/bin/sh` is necessary for rsync remote commands.
-The installer also configures Ubuntu's existing system `backup` account if present,
-rejecting root/non-system accounts and extra groups.
+`<source-host>/<db>/`. Each replica root has mode 0700 and is owned by
+`factory-backup`. Its home is `/var/lib/factory-backup`, also owned by it with
+mode 0700. The immediate replica parents (`/srv/factory/backups` on factory-gpu,
+`/var/backups` on factory-console) are root-owned 0711: traversal without directory
+listing. Higher shared ancestors are not changed and must permit traversal.
+No sudo permissions or SSH keys are granted; `/bin/sh` supports rsync remote
+commands, unlike a `nologin` shell. Ubuntu's built-in `backup` account is never
+used for these backups.
+
+Every SSH operation explicitly sets
+`-o UserKnownHostsFile=/var/lib/factory-backup/known_hosts`
+and `-o StrictHostKeyChecking=accept-new`. No operation depends on `~/.ssh`.
+First-use keys are recorded over the trusted tailnet; changed keys still fail.
 
 The oneshot service runs as root at 03:15 on factory-gpu and 03:45 on
 factory-console, in each host's local timezone, with `RandomizedDelaySec=10m`
@@ -376,7 +385,7 @@ the newest copy on each of the seven newest available daily dates, plus the
 four newest available Sunday copies. Overlap counts once; reruns do not consume
 daily slots. The newest copy is never pruned. Any snapshot or push failure
 skips all pruning for that run. After a successful push, the receiving host
-prunes its own replica as `backup`, then the sender prunes its local tree.
+prunes its own replica as `factory-backup`, then the sender prunes its local tree.
 Receiver pruning requires today's complete, checksummed copies for every DB
 from that source, so missing/failed days do not trigger deletion. This avoids
 depending on whether the peer's staggered timer has already run.
@@ -386,7 +395,9 @@ entry for each local DB: `last_success_ms`, `last_attempt_ms`, `size_bytes`
 (compressed), `integrity` (`ok`, `failed`, or null before checking),
 `pushed_to_peer` (boolean), and `error` (string or null). A successful run means
 snapshot, push and retention finished; failures preserve `last_success_ms`.
-Every failure exits nonzero for systemd/journald. Inspect with:
+Every failure exits nonzero for systemd/journald. The root lock is
+`/var/backups/factory-db/.backup.lock`, outside the SSH user's writable home.
+Inspect with:
 
 ```sh
 sudo cat /var/lib/factory-backup/status.json
@@ -413,12 +424,15 @@ MET-74 checkout on **each node**, as the checkout owner (not root):
 export GH_TOKEN="$AGENT_GH_TOKEN"
 gh auth setup-git
 git fetch origin
-git worktree add --detach /home/agent/work/factory-met-74 \
-  origin/devon/met-74-backups-for-meter-factory-api-and-pricing-sqlite-dbs
-cd /home/agent/work/factory-met-74
+git worktree add --detach /home/agent/work/factory-backup-fix \
+  origin/devon/met-74-dedicated-backup-account
+cd /home/agent/work/factory-backup-fix
 ```
 
-**Wait for the MET-73 Tailscale SSH rule before completing installation.** Devon
+After the fix PR is merged, use `origin/main` instead of the feature branch.
+Do not run the stale original installer from an older worktree.
+
+**Require the MET-73 Tailscale SSH rule before completing installation.** Devon
 must tag both nodes `tag:factory`, enable Tailscale SSH on both, permit TCP 22
 between them in the network policy, and add this SSH rule to the existing policy
 (do not replace unrelated rules). Use `accept`, not interactive `check`, for
@@ -429,7 +443,7 @@ unattended backups:
   "action": "accept",
   "src": ["tag:factory"],
   "dst": ["tag:factory"],
-  "users": ["backup"]
+  "users": ["factory-backup"]
 }
 ```
 
@@ -445,17 +459,19 @@ Then, on **factory-console**, from the same checkout:
 sudo bash deploy/backup/install-backup.sh --prepare-only
 ```
 
-Preparation creates the accounts, directories, config and units on both nodes
-but does not enable a new timer or run a backup. Once both nodes are prepared
+Preparation migrates the accounts/directories, installs config/units, and checks
+real filesystem access as `factory-backup`. It stops the backup service and
+disables/stops its timer, including an existing timer, until full installation
+passes. No application service is stopped. Once both nodes are prepared
 and MET-73 is active, run on **factory-gpu**, then **factory-console**:
 
 ```sh
 sudo bash deploy/backup/install-backup.sh
 ```
 
-Each completion run checks peer access, records the first host key over the
-trusted tailnet (`accept-new`; changed keys fail), runs an immediate backup
-through systemd, verifies local restores, then enables the timer. After both
+Each completion run checks peer access using the explicit known_hosts path,
+runs an immediate backup through systemd, verifies local restores, then enables
+the timer. After both
 completion runs, verify local and received copies on **each node**:
 
 ```sh
@@ -463,11 +479,41 @@ sudo /usr/local/lib/factory-backup/restore-check.sh all
 ```
 
 The installer is idempotent, preflights dependencies/databases/accounts/paths
-and unit overrides, and stops on errors with no automatic rollback. Fix the
-reported failure and rerun. It installs scripts in `/usr/local/lib/factory-backup`
+and unit overrides, and stops on errors with no automatic rollback. Before any
+peer connection or timer enable, it runs `factory-backup.sh --check-access` as
+`factory-backup`: actual ancestor traversal, replica read/write access (including
+a temporary file), home traversal/write access, and known_hosts read/write.
+Normal backups run the same probe before snapshotting to catch permission drift.
+Fix the reported failure and rerun. It installs scripts in `/usr/local/lib/factory-backup`
 and a single root-owned config at `/etc/factory-backup/nodes.conf`; reinstalling
 replaces that config from the checkout. No firewall, Tailscale policy or live DB
-is changed. If a timer is already enabled, preparation leaves it enabled.
+is changed. A failed completion leaves the timer disabled; rerun to finish.
+
+### Migration from the original MET-74 installer
+
+Run the two preparation steps above even if the old `backup` account has already
+been restored. Both legacy and partially repaired states are supported:
+
+- If Ubuntu's `backup` uid/gid 34 still has this node's replica root as its home
+  and `/bin/sh` as its shell, restore `/var/backups`, `/usr/sbin/nologin`, and its
+  disabled password (`*`). If its home is already `/var/backups`, leave the entire
+  account unchanged. No distro account is repurposed for future backups.
+- Create/configure only the dedicated system account `factory-backup`, with a
+  locked password, its own group only, no sudo grants, and home 0700.
+- Transfer the entire replica tree to `factory-backup:factory-backup`, without
+  following symlinks or deleting snapshots. Change the local archive group to
+  `factory-backup` while retaining root ownership and existing snapshot modes.
+- Merge legacy `<replica-root>/.ssh/known_hosts` with the new explicit known_hosts
+  file, preserving trusted keys. Remove that legacy file, `known_hosts.old`, and
+  the empty `.ssh` directory. Unexpected administrator-added files (such as
+  `authorized_keys`) fail preflight for review; they are not silently deleted.
+- Preserve `status.json`. Remove the obsolete home `backup.lock`; new root locks
+  are outside the account-owned home, preventing symlink-based file truncation.
+
+If an administrator has already restored `backup`, preparation still migrates
+replica ownership and legacy SSH artifacts without changing that account.
+Prepare factory-gpu, prepare factory-console, then complete factory-gpu and
+factory-console in that order, with `users: ["factory-backup"]` in the SSH policy.
 
 ### Read-only restore checks and manual recovery
 
@@ -529,8 +575,13 @@ databases and active writers. It verifies transaction consistency, integrity,
 compression, checksums, exact survivors of 40 dated copies on both trees,
 same-day reruns, Sunday retention, status, read-only restore output, and no
 deletion on missing/corrupt DBs, failed pushes, or incomplete incoming copies.
-Development overrides are `BACKUP_HOST`, `METER_DB`, `REQUESTS_DB`, `PRICING_DB`,
-`LOCAL_ROOT`, `REPLICA_ROOT`, `PEER_REPLICA_ROOT`, `STATUS_FILE`, and
+It also exercises kernel-enforced traversal/write failures, rejects unsafe
+known_hosts links, and checks repeatable migration on both node configurations
+with both legacy and already-restored Ubuntu accounts. Account administration
+and uid/gid changes are modelled without root; directory modes, key migration,
+access probes and data preservation are checked against the real filesystem.
+Development overrides are `BACKUP_HOST`, `BACKUP_HOME`, `METER_DB`, `REQUESTS_DB`,
+`PRICING_DB`, `LOCAL_ROOT`, `REPLICA_ROOT`, `PEER_REPLICA_ROOT`, `STATUS_FILE`, and
 `BACKUP_TRANSPORT=local`. `BACKUP_CONFIG` selects a trusted alternative config.
 The installer clears development overrides and always uses real node defaults.
 These unprivileged checks do not prove production Tailscale SSH/root permissions;

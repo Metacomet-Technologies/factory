@@ -6,8 +6,33 @@ here=$(dirname "$(realpath "$0")")
 source "${BACKUP_CONFIG:-$here/nodes.conf}"
 state=$here/backup-state.py
 
+if [[ ${1:-} == --check-access ]]; then
+    # Installer and runtime call this as factory-backup, not root. Test actual
+    # kernel access (including ancestor traversal), not merely directory modes.
+    [[ -d "$REPLICA_ROOT" && -r "$REPLICA_ROOT" && -x "$REPLICA_ROOT" && -w "$REPLICA_ROOT" ]] || {
+        printf 'Cannot traverse/read/write replica root: %s\n' "$REPLICA_ROOT" >&2; exit 1;
+    }
+    [[ -d "$BACKUP_HOME" && -x "$BACKUP_HOME" && -w "$BACKUP_HOME" ]] || {
+        printf 'Cannot traverse/write backup home: %s\n' "$BACKUP_HOME" >&2; exit 1;
+    }
+    known=$BACKUP_HOME/known_hosts
+    [[ ! -L "$known" && ( ! -e "$known" || -f "$known" ) ]] || {
+        printf 'Unsafe known_hosts file: %s\n' "$known" >&2; exit 1;
+    }
+    umask 0077
+    : >> "$known"
+    [[ -r "$known" && -w "$known" ]] || { echo 'Cannot read/write known_hosts' >&2; exit 1; }
+    probe=$(mktemp "$REPLICA_ROOT/.access.XXXXXX")
+    rm -- "$probe"
+    [[ -r "$LOCAL_ROOT/$BACKUP_HOST" && -x "$LOCAL_ROOT/$BACKUP_HOST" ]] || {
+        echo 'Cannot read local snapshot tree' >&2; exit 1;
+    }
+    echo 'Replica traversal/write and known_hosts read/write checks passed.'
+    exit 0
+fi
+
 if [[ ${1:-} == --prune-replica ]]; then
-    # Runs on the receiving host as backup, never as the sender's root user.
+    # Runs on the receiver as factory-backup, never as the sender's root user.
     exec python3 "$state" prune "$REPLICA_ROOT/$PEER" "${PEER_DBS[@]}"
 fi
 
@@ -27,18 +52,19 @@ if [[ ${1:-} == --snapshot ]]; then
     (cd "$temp" && sha256sum "$STAMP.db.zst" > "$STAMP.db.zst.sha256")
     chmod 0640 "$temp/$STAMP.db.zst" "$temp/$STAMP.db.zst.sha256"
     if [[ ${BACKUP_TRANSPORT:-ssh} == ssh ]]; then
-        chgrp backup "$directory" "$temp/$STAMP.db.zst" "$temp/$STAMP.db.zst.sha256"
+        chgrp "$BACKUP_USER" "$directory" "$temp/$STAMP.db.zst" "$temp/$STAMP.db.zst.sha256"
         chmod 0750 "$LOCAL_ROOT" "$LOCAL_ROOT/$BACKUP_HOST" "$directory"
-        chgrp backup "$LOCAL_ROOT" "$LOCAL_ROOT/$BACKUP_HOST"
+        chgrp "$BACKUP_USER" "$LOCAL_ROOT" "$LOCAL_ROOT/$BACKUP_HOST"
     fi
     mv -- "$temp/$STAMP.db.zst" "$directory/"
     mv -- "$temp/$STAMP.db.zst.sha256" "$directory/"
     exit 0
 fi
 
-[[ $# -eq 0 ]] || { echo 'Usage: factory-backup.sh [--prune-replica]' >&2; exit 1; }
+[[ $# -eq 0 ]] || { echo 'Usage: factory-backup.sh [--prune-replica|--check-access]' >&2; exit 1; }
 mkdir -p "$(dirname "$STATUS_FILE")" "$LOCAL_ROOT/$BACKUP_HOST"
-exec 9>"$(dirname "$STATUS_FILE")/backup.lock"
+# Root's lock must not be under the SSH account's writable home.
+exec 9>"$LOCAL_ROOT/.backup.lock"
 flock -n 9 || { echo 'Backup already running' >&2; exit 1; }
 names=()
 for entry in "${DBS[@]}"; do names+=("${entry%%:*}"); done
@@ -47,6 +73,9 @@ trap 'python3 "$state" fatal "$STATUS_FILE" "Backup failed at line $LINENO"; exi
 for command in sqlite3 zstd sha256sum rsync python3 flock; do
     command -v "$command" >/dev/null
 done
+if [[ ${BACKUP_TRANSPORT:-ssh} == ssh ]]; then
+    runuser -u "$BACKUP_USER" -- bash "$here/factory-backup.sh" --check-access
+fi
 export STAMP
 STAMP=$(date -u +%Y%m%dT%H%M%S.%NZ)
 failed=0
@@ -66,9 +95,9 @@ done
 push() {
     case ${BACKUP_TRANSPORT:-ssh} in
         ssh)
-            runuser -u backup -- rsync -a --partial --exclude='.snapshot.*' \
-                -e 'ssh -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=3' \
-                "$LOCAL_ROOT/$BACKUP_HOST/" "backup@$PEER:$PEER_REPLICA_ROOT/$BACKUP_HOST/"
+            runuser -u "$BACKUP_USER" -- rsync -a --partial --exclude='.snapshot.*' \
+                -e "ssh ${SSH_OPTIONS[*]}" \
+                "$LOCAL_ROOT/$BACKUP_HOST/" "$BACKUP_USER@$PEER:$PEER_REPLICA_ROOT/$BACKUP_HOST/"
             ;;
         local)
             mkdir -p "$PEER_REPLICA_ROOT/$BACKUP_HOST" || return
@@ -92,8 +121,7 @@ else
     exit 1
 fi
 if [[ ${BACKUP_TRANSPORT:-ssh} == ssh ]]; then
-    runuser -u backup -- ssh -o BatchMode=yes -o ConnectTimeout=30 \
-        -o ServerAliveInterval=30 -o ServerAliveCountMax=3 "backup@$PEER" \
+    runuser -u "$BACKUP_USER" -- ssh "${SSH_OPTIONS[@]}" "$BACKUP_USER@$PEER" \
         env BACKUP_CONFIG=/etc/factory-backup/nodes.conf \
         /usr/local/lib/factory-backup/factory-backup.sh --prune-replica
 else

@@ -189,3 +189,207 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
     run("factory-backup.sh", gpu, "--prune-replica")
     assert all(path.exists() for path in before_files)
     print("PASS: receiver skips retention without today's complete backups; checksum corruption fails")
+
+    # Exercise the actual access probe under the current unprivileged identity.
+    assert os.geteuid() != 0, "Run these permission checks without root"
+    home = root / "access-home"
+    home.mkdir(mode=0o700)
+    access = dict(gpu, BACKUP_HOME=str(home), HOME=str(root / "unrelated-home"))
+    known = home / "known_hosts"
+    known.write_text("preserve this host key\n")
+    known.chmod(0o600)
+    parent = Path(gpu["REPLICA_ROOT"]).parent
+    original_mode = parent.stat().st_mode & 0o777
+    parent.chmod(0o600)  # No execute bit: the kernel denies ancestor traversal.
+    try:
+        output = run("factory-backup.sh", access, "--check-access", success=False)
+        assert "Cannot traverse/read/write replica root" in output
+    finally:
+        parent.chmod(original_mode)
+    home.chmod(0o500)
+    try:
+        run("factory-backup.sh", access, "--check-access", success=False)
+    finally:
+        home.chmod(0o700)
+    known.chmod(0o400)
+    try:
+        run("factory-backup.sh", access, "--check-access", success=False)
+    finally:
+        known.chmod(0o600)
+    known.unlink()
+    victim = root / "must-not-truncate"
+    victim.write_text("leave unchanged")
+    known.symlink_to(victim)
+    run("factory-backup.sh", access, "--check-access", success=False)
+    assert victim.read_text() == "leave unchanged"
+    known.unlink()
+    known.write_text("preserve this host key\n")
+    known.chmod(0o600)
+    run("factory-backup.sh", access, "--check-access")
+    assert known.read_text() == "preserve this host key\n"
+    assert not list(Path(access["REPLICA_ROOT"]).glob(".access.*"))
+    # The root lock no longer follows a file in the SSH user's writable home.
+    old_lock = Path(env["STATUS_FILE"]).parent / "backup.lock"
+    old_lock.symlink_to(victim)
+    run("factory-backup.sh", env)
+    assert victim.read_text() == "leave unchanged"
+    print("PASS: kernel traversal/write failures and unsafe known_hosts fail; legacy lock cannot truncate files")
+
+    # No root: account commands and ownership are modelled; all directory modes,
+    # key migration, access probes, file contents and deletions use the real FS.
+    account_harness = r'''
+set -Eeuo pipefail
+fail() { echo "$*" >&2; exit 1; }
+id() {
+    local user=${@: -1}
+    [[ -f "$FIXTURE/$user" ]] || return 1
+    case $1 in
+        -u) cut -d: -f3 "$FIXTURE/$user" ;;
+        -Gn) printf '%s\n' "$user" ;;
+    esac
+}
+getent() {
+    if [[ $1 == passwd ]]; then
+        [[ -f "$FIXTURE/$2" ]] || return 1
+        cat "$FIXTURE/$2"
+    else
+        [[ -f "$FIXTURE/$2" ]] || return 1
+        printf '%s:x:900:\n' "$2"
+    fi
+}
+usermod() {
+    local user=${@: -1} name password uid gid description home shell
+    IFS=: read -r name password uid gid description home shell < "$FIXTURE/$user"
+    while (( $# > 1 )); do
+        case $1 in
+            --home) home=$2; shift 2 ;;
+            --shell) shell=$2; shift 2 ;;
+            --password) password=$2; shift 2 ;;
+            --lock) password="!${password#!}"; shift ;;
+            *) fail "Unexpected usermod option: $1" ;;
+        esac
+    done
+    printf '%s:%s:%s:%s:%s:%s:%s\n' "$name" "$password" "$uid" "$gid" "$description" "$home" "$shell" > "$FIXTURE/$user"
+}
+useradd() {
+    local user=${@: -1} home shell
+    while (( $# > 1 )); do
+        case $1 in
+            --home-dir) home=$2; shift 2 ;;
+            --shell) shell=$2; shift 2 ;;
+            --system|--user-group|--no-create-home) shift ;;
+            *) fail "Unexpected useradd option: $1" ;;
+        esac
+    done
+    printf '%s:!:900:900::%s:%s\n' "$user" "$home" "$shell" > "$FIXTURE/$user"
+}
+install() {
+    local owner group args=() paths=()
+    while (( $# )); do
+        case $1 in
+            -o) owner=$2; shift 2 ;;
+            -g) group=$2; shift 2 ;;
+            -m) args+=("$1" "$2"); shift 2 ;;
+            -d) args+=("$1"); shift ;;
+            *) args+=("$1"); paths+=("$1"); shift ;;
+        esac
+    done
+    command install "${args[@]}"
+    for path in "${paths[@]}"; do
+        printf '%s\t%s\t%s\n' "$owner" "$group" "$path" >> "$FIXTURE/owners"
+    done
+}
+chown() {
+    [[ $1 == -hR ]] || fail 'Recursive chown must not follow links'
+    find "$3" -print | while IFS= read -r path; do
+        printf '%s\t%s\t%s\n' "${2%:*}" "${2#*:}" "$path" >> "$FIXTURE/owners"
+    done
+}
+chgrp() {
+    [[ $1 == -hR ]] || fail 'Recursive chgrp must not follow links'
+    find "$3" -print | while IFS= read -r path; do
+        printf 'root\t%s\t%s\n' "$2" "$path" >> "$FIXTURE/owners"
+    done
+}
+runuser() {
+    [[ $1 == -u && $2 == factory-backup && $3 == -- ]] || fail 'Wrong runtime account'
+    shift 3
+    "$@"
+}
+source "$ACCOUNT_SCRIPT"
+preflight_backup_account
+prepare_backup_account
+'''
+    for host in ("factory-gpu", "factory-console"):
+        for already_restored, has_keys in ((False, True), (True, True), (True, False)):
+            fixture = root / f"migration-{host}-{already_restored}-{has_keys}"
+            fixture.mkdir()
+            replica = fixture / ("srv/factory/backups/replica" if host == "factory-gpu"
+                                 else "var/backups/factory-replica")
+            legacy_ssh = replica / ".ssh"
+            legacy_ssh.mkdir(parents=True)
+            replica.parent.chmod(0o700)
+            legacy_ssh.chmod(0o700)
+            old_key = "factory-peer ssh-ed25519 old-trusted-key\n"
+            if has_keys:
+                (legacy_ssh / "known_hosts").write_text(old_key)
+                (legacy_ssh / "known_hosts.old").write_text("obsolete key\n")
+            archive = replica / host / "test.db.zst"
+            archive.parent.mkdir()
+            archive.write_bytes(b"preserve replica data")
+            local = fixture / "var/backups/factory-db"
+            local_archive = local / host / "test.db.zst"
+            local_archive.parent.mkdir(parents=True)
+            local_archive.write_bytes(b"preserve local data")
+            home = fixture / "var/lib/factory-backup"
+            home.mkdir(mode=0o700, parents=True)
+            status = home / "status.json"
+            status.write_text('{"last_success_ms":123}')
+            (home / "backup.lock").touch()
+            known = home / "known_hosts"
+            new_key = "factory-other ssh-ed25519 new-trusted-key\n"
+            if has_keys:
+                known.write_text(new_key)
+            builtin = fixture / "backup"
+            # An already-restored account retains its password state too.
+            default_account = f"backup:{'!*' if already_restored else '*'}:34:34:backup:/var/backups:/usr/sbin/nologin\n"
+            builtin.write_text(default_account if already_restored else
+                               f"backup:!*:34:34:backup:{replica}:/bin/sh\n")
+            migration_env = dict(os.environ, FIXTURE=str(fixture), ACCOUNT_SCRIPT=str(HERE / "account.sh"),
+                                 BACKUP_CONFIG=str(HERE / "nodes.conf"), BACKUP_HOST=host,
+                                 BACKUP_USER="factory-backup", BACKUP_HOME=str(home),
+                                 REPLICA_ROOT=str(replica), LOCAL_ROOT=str(local))
+            for attempt in range(2):
+                result = subprocess.run(["bash", "-c", account_harness], env=migration_env,
+                                        text=True, capture_output=True, timeout=30)
+                assert result.returncode == 0, result.stdout + result.stderr
+                assert builtin.read_text() == default_account
+                account = (fixture / "factory-backup").read_text().split(":")
+                assert account[1].startswith("!") and account[5] == str(home) and account[6].strip() == "/bin/sh"
+                assert replica.stat().st_mode & 0o777 == 0o700
+                assert replica.parent.stat().st_mode & 0o777 == 0o711
+                assert home.stat().st_mode & 0o777 == 0o700
+                assert known.stat().st_mode & 0o777 == 0o600
+                assert known.read_text() == ("".join(sorted([old_key, new_key])) if has_keys else "")
+                assert not legacy_ssh.exists() and not (home / "backup.lock").exists()
+                assert archive.read_bytes() == b"preserve replica data"
+                assert local_archive.read_bytes() == b"preserve local data"
+                assert status.read_text() == '{"last_success_ms":123}'
+                owners = {}
+                for line in (fixture / "owners").read_text().splitlines():
+                    owner, group, path = line.split("\t")
+                    owners[path] = (owner, group)
+                assert owners[str(replica)] == owners[str(archive)] == ("factory-backup", "factory-backup")
+                assert owners[str(home)] == ("factory-backup", "factory-backup")
+                assert owners[str(local_archive)] == ("root", "factory-backup")
+                assert owners[str(replica.parent)] == ("root", "root")
+                run("factory-backup.sh", migration_env, "--check-access")
+            # Do not silently remove administrator-added SSH keys or trust links.
+            legacy_ssh.mkdir()
+            key = legacy_ssh / "authorized_keys"
+            key.write_text("administrator-added key")
+            result = subprocess.run(["bash", "-c", account_harness], env=migration_env,
+                                    text=True, capture_output=True, timeout=30)
+            assert result.returncode != 0 and "Review unexpected legacy SSH artifact" in result.stderr
+            assert key.read_text() == "administrator-added key"
+    print("PASS: both-node legacy/already-restored migrations are idempotent; accounts, data and host keys preserved")
