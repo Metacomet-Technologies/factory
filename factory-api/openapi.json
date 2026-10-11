@@ -1,0 +1,938 @@
+{
+  "components": {
+    "schemas": {
+      "AgentTool": {
+        "properties": {
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "tool": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool",
+          "status"
+        ],
+        "type": "object"
+      },
+      "Agents": {
+        "properties": {
+          "tools": {
+            "items": {
+              "$ref": "#/components/schemas/AgentTool"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tools"
+        ],
+        "type": "object"
+      },
+      "ApiError": {
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "ErrorDetail": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      "Family": {
+        "properties": {
+          "family": {
+            "type": "string"
+          },
+          "pending": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Selection"
+              }
+            ]
+          },
+          "rates": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Rates"
+              }
+            ]
+          },
+          "selected": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Selection"
+              }
+            ]
+          }
+        },
+        "required": [
+          "family"
+        ],
+        "type": "object"
+      },
+      "Fleet": {
+        "properties": {
+          "generated_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/Node"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "generated_at_ms",
+          "nodes"
+        ],
+        "type": "object"
+      },
+      "FleetChange": {
+        "properties": {
+          "node": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "service": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node",
+          "service",
+          "ok"
+        ],
+        "type": "object"
+      },
+      "Gpu": {
+        "properties": {
+          "current": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GpuCurrent"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/GpuHistory"
+            },
+            "type": "array"
+          },
+          "loaded_models": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "loaded_models",
+          "history"
+        ],
+        "type": "object"
+      },
+      "GpuCurrent": {
+        "properties": {
+          "memory_total_mib": {
+            "format": "double",
+            "type": "number"
+          },
+          "memory_used_mib": {
+            "format": "double",
+            "type": "number"
+          },
+          "power_w": {
+            "format": "double",
+            "type": "number"
+          },
+          "temperature_c": {
+            "format": "double",
+            "type": "number"
+          },
+          "ts_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "utilization_percent": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "memory_used_mib",
+          "memory_total_mib",
+          "utilization_percent",
+          "temperature_c",
+          "power_w",
+          "ts_ms"
+        ],
+        "type": "object"
+      },
+      "GpuHistory": {
+        "properties": {
+          "memory_used_mib": {
+            "format": "double",
+            "type": "number"
+          },
+          "power_w": {
+            "format": "double",
+            "type": "number"
+          },
+          "temperature_c": {
+            "format": "double",
+            "type": "number"
+          },
+          "ts_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "utilization_percent": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "ts_ms",
+          "memory_used_mib",
+          "utilization_percent",
+          "temperature_c",
+          "power_w"
+        ],
+        "type": "object"
+      },
+      "Health": {
+        "properties": {
+          "built_at_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "git_dirty": {
+            "type": "boolean"
+          },
+          "git_sha": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "uptime_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "version",
+          "git_sha",
+          "git_dirty",
+          "built_at_ms",
+          "uptime_ms"
+        ],
+        "type": "object"
+      },
+      "LlmRequest": {
+        "properties": {
+          "client_hostname": {
+            "type": "string"
+          },
+          "latency_ms": {
+            "format": "double",
+            "type": "number"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "prompt_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "latency_ms",
+          "client_hostname"
+        ],
+        "type": "object"
+      },
+      "ModelUsage": {
+        "properties": {
+          "avg_gen_tps": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "avg_prompt_tps": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "p50_latency_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "p95_latency_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "prompt_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "requests": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_load_ms": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "requests",
+          "prompt_tokens",
+          "output_tokens",
+          "total_load_ms"
+        ],
+        "type": "object"
+      },
+      "Node": {
+        "properties": {
+          "last_seen_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "online": {
+            "type": "boolean"
+          },
+          "os": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "services": {
+            "items": {
+              "$ref": "#/components/schemas/Service"
+            },
+            "type": "array"
+          },
+          "tailscale_ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "online",
+          "services"
+        ],
+        "type": "object"
+      },
+      "Pricing": {
+        "properties": {
+          "families": {
+            "items": {
+              "$ref": "#/components/schemas/Family"
+            },
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "families",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "PricingChanged": {
+        "properties": {
+          "family": {
+            "type": "string"
+          },
+          "pending_model_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "family"
+        ],
+        "type": "object"
+      },
+      "Rates": {
+        "properties": {
+          "fetched_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "input_per_mtok": {
+            "format": "double",
+            "type": "number"
+          },
+          "output_per_mtok": {
+            "format": "double",
+            "type": "number"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "input_per_mtok",
+          "output_per_mtok",
+          "source",
+          "fetched_at_ms"
+        ],
+        "type": "object"
+      },
+      "Selection": {
+        "properties": {
+          "effective_from_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "model_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_id",
+          "effective_from_ms"
+        ],
+        "type": "object"
+      },
+      "Service": {
+        "properties": {
+          "built_at_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "checked_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "git_dirty": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "git_sha": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ServiceKind"
+          },
+          "latency_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "target": {
+            "type": "string"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "target",
+          "ok",
+          "checked_at_ms"
+        ],
+        "type": "object"
+      },
+      "ServiceKind": {
+        "enum": [
+          "http",
+          "tcp",
+          "systemd"
+        ],
+        "type": "string"
+      },
+      "SpendAvoided": {
+        "properties": {
+          "estimated_usd": {
+            "format": "double",
+            "type": "number"
+          },
+          "family": {
+            "type": "string"
+          },
+          "model_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unpriced_requests": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "usd": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "family",
+          "usd",
+          "estimated_usd",
+          "unpriced_requests"
+        ],
+        "type": "object"
+      },
+      "StreamEvent": {
+        "properties": {
+          "data": {},
+          "ts_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "ts_ms",
+          "data"
+        ],
+        "type": "object"
+      },
+      "Totals": {
+        "properties": {
+          "output_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "prompt_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "requests": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "requests",
+          "prompt_tokens",
+          "output_tokens"
+        ],
+        "type": "object"
+      },
+      "Usage": {
+        "properties": {
+          "generated_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/ModelUsage"
+            },
+            "type": "array"
+          },
+          "range": {
+            "type": "string"
+          },
+          "spend_avoided": {
+            "items": {
+              "$ref": "#/components/schemas/SpendAvoided"
+            },
+            "type": "array"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/Totals"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "range",
+          "generated_at_ms",
+          "totals",
+          "spend_avoided",
+          "models",
+          "warnings"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "",
+    "license": {
+      "name": ""
+    },
+    "title": "factory-api",
+    "version": "0.2.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v1/agents": {
+      "get": {
+        "operationId": "agents",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Agents"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
+    "/v1/fleet": {
+      "get": {
+        "operationId": "fleet",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Fleet"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
+    "/v1/gpu": {
+      "get": {
+        "operationId": "gpu",
+        "parameters": [
+          {
+            "description": "1h (default), 24h, 7d",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Gpu"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
+    "/v1/llm/usage": {
+      "get": {
+        "operationId": "usage",
+        "parameters": [
+          {
+            "description": "24h (default), 7d, 30d",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Usage"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
+    "/v1/pricing": {
+      "get": {
+        "operationId": "pricing",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Pricing"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
+    "/v1/pricing/confirm/{family}": {
+      "post": {
+        "operationId": "confirm_selection",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "family",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Pricing"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
+    "/v1/pricing/refresh": {
+      "post": {
+        "operationId": "refresh",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Pricing"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
+    "/v1/stream": {
+      "get": {
+        "operationId": "stream",
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamEvent"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    }
+  }
+}
