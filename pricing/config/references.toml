@@ -1,0 +1,7 @@
+[[reference]]
+name = "Claude Sonnet"
+match = "^anthropic/claude-sonnet"
+
+[[reference]]
+name = "ChatGPT mid-tier"
+match = "^openai/gpt-"
