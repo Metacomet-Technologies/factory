@@ -1,0 +1,29 @@
+[Unit]
+Description=Ollama metering proxy
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=meter
+Group=meter
+ExecStart=/usr/local/bin/meter
+WorkingDirectory=/srv/factory/meter
+Environment=RUST_LOG=meter=info
+Restart=always
+RestartSec=3
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/factory/meter
+ReadOnlyPaths=/tmp /var/tmp /dev/shm
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
