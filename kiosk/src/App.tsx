@@ -18,20 +18,19 @@ import { VersionFooter } from "./components/version-footer";
 export default function App() {
   const [usageRange, setUsageRange] = useState<UsageRange>("24h");
   const [gpuRange, setGpuRange] = useState<GpuRange>("1h");
-  const [theme, setTheme] = useState<boolean | null>(() =>
-    new URLSearchParams(location.search).has("kiosk") ? true : null,
+  const [dark, setDark] = useState(() => document.documentElement.dataset.theme === "dark");
+  const [followsSystem, setFollowsSystem] = useState(
+    () => !document.documentElement.dataset.themePreference,
   );
-  const [systemDark, setSystemDark] = useState(
-    () => matchMedia("(prefers-color-scheme: dark)").matches,
-  );
-  const dark = theme ?? systemDark;
   useEffect(() => {
+    if (!followsSystem) return;
     const preference = matchMedia("(prefers-color-scheme: dark)");
-    const update = (event: MediaQueryListEvent) => setSystemDark(event.matches);
+    const update = (event: MediaQueryListEvent) => setDark(event.matches);
     preference.addEventListener("change", update);
     return () => preference.removeEventListener("change", update);
-  }, []);
+  }, [followsSystem]);
   useEffect(() => {
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
     document.documentElement.classList.toggle("dark", dark);
   }, [dark]);
   const live = useStream();
@@ -88,7 +87,18 @@ export default function App() {
             variant="ghost"
             size="icon"
             aria-label={dark ? "Use light theme" : "Use dark theme"}
-            onClick={() => setTheme(!dark)}
+            onClick={() => {
+              const preference = dark ? "light" : "dark";
+              const followsSystem = !dark === matchMedia("(prefers-color-scheme: dark)").matches;
+              if (followsSystem) delete document.documentElement.dataset.themePreference;
+              else document.documentElement.dataset.themePreference = preference;
+              setFollowsSystem(followsSystem);
+              setDark(!dark);
+              try {
+                if (followsSystem) localStorage.removeItem("factory-theme");
+                else localStorage.setItem("factory-theme", preference);
+              } catch {}
+            }}
           >
             {dark ? <Sun /> : <Moon />}
           </Button>

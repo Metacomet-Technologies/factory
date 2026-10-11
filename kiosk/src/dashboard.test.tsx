@@ -21,6 +21,9 @@ class MockSource extends EventTarget {
   close() {}
 }
 beforeEach(() => {
+  document.documentElement.dataset.theme = "dark";
+  delete document.documentElement.dataset.themePreference;
+  localStorage.clear();
   vi.stubGlobal("EventSource", MockSource);
   vi.stubGlobal(
     "matchMedia",
@@ -83,6 +86,63 @@ describe("human formats", () => {
   });
 });
 describe("dashboard contract", () => {
+  it.each([
+    [false, null, "Use dark theme", "dark"],
+    [true, null, "Use light theme", "light"],
+    [false, "dark", "Use light theme", null],
+    [true, "light", "Use dark theme", null],
+  ] as const)(
+    "keeps the pre-paint theme with system dark=%s and preference=%s",
+    (systemDark, saved, label, stored) => {
+      api();
+      vi.stubGlobal("matchMedia", () => ({
+        matches: systemDark,
+        addEventListener() {},
+        removeEventListener() {},
+      }));
+      document.documentElement.dataset.theme = saved ?? (systemDark ? "dark" : "light");
+      if (saved) document.documentElement.dataset.themePreference = saved;
+      render(<App />);
+      fireEvent.click(screen.getByRole("button", { name: label }));
+      expect(
+        screen.getByRole("button", {
+          name: label === "Use dark theme" ? "Use light theme" : "Use dark theme",
+        }),
+      ).toBeVisible();
+      expect(localStorage.getItem("factory-theme")).toBe(stored);
+    },
+  );
+  it("returns from a saved light override to the dark system and follows later changes", () => {
+    api();
+    const media = Object.assign(new EventTarget(), { matches: true });
+    vi.stubGlobal("matchMedia", () => media);
+    localStorage.setItem("factory-theme", "light");
+    document.documentElement.dataset.theme = "light";
+    document.documentElement.dataset.themePreference = "light";
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Use dark theme" }));
+    expect(localStorage.getItem("factory-theme")).toBeNull();
+    expect(document.documentElement).not.toHaveAttribute("data-theme-preference");
+    expect(screen.getByRole("button", { name: "Use light theme" })).toBeVisible();
+    act(() => {
+      media.matches = false;
+      media.dispatchEvent(Object.assign(new Event("change"), { matches: false }));
+    });
+    expect(screen.getByRole("button", { name: "Use dark theme" })).toBeVisible();
+  });
+  it("preserves an explicit light override when remounting from the saved head theme", () => {
+    api();
+    const { unmount } = render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Use light theme" }));
+    expect(localStorage.getItem("factory-theme")).toBe("light");
+    unmount();
+    // The blocking head script supplies these attributes on a full reload.
+    document.documentElement.dataset.theme = localStorage.getItem("factory-theme")!;
+    document.documentElement.dataset.themePreference = localStorage.getItem("factory-theme")!;
+    render(<App />);
+    expect(screen.getByRole("button", { name: "Use dark theme" })).toBeVisible();
+    expect(localStorage.getItem("factory-theme")).toBe("light");
+  });
   it("renders matching, mismatched, dirty and unknown build identities", () => {
     const build = {
       version: "0.2.0",
