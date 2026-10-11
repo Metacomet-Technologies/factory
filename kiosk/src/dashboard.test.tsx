@@ -102,7 +102,7 @@ describe("dashboard contract", () => {
     expect(screen.getByText("3 unpriced · openai/gpt-6.1-sol")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /confirm/i })).not.toBeInTheDocument();
     expect(
-      within(screen.getByRole("region", { name: "GPU" })).getByText("21 GiB"),
+      within(screen.getByRole("region", { name: "GPU" })).getByText("9 GiB"),
     ).toBeInTheDocument();
     expect(await screen.findByLabelText("GPU utilization history")).toBeInTheDocument();
     expect(within(screen.getByRole("table")).getByText("— / 56.8")).toBeInTheDocument();
@@ -138,8 +138,32 @@ describe("dashboard contract", () => {
     expect(screen.getByText("Live")).toBeInTheDocument();
     expect(screen.getByRole("log")).toHaveTextContent("test-client");
     expect(screen.getByText("91 %")).toBeInTheDocument();
+    await act(() =>
+      MockSource.latest.dispatchEvent(
+        new MessageEvent("llm.request", {
+          data: JSON.stringify({
+            type: "llm.request",
+            ts_ms: 1001,
+            data: {
+              model: null,
+              prompt_tokens: null,
+              output_tokens: null,
+              latency_ms: 104,
+              client_hostname: "unknown-usage",
+            },
+          }),
+        }),
+      ),
+    );
+    expect(screen.getByRole("log")).toHaveTextContent("Non-model request");
+    expect(screen.getByRole("log")).toHaveTextContent("— in · — out");
+    api(true);
     act(() => MockSource.latest.onerror?.());
     expect(screen.getByText("Reconnecting")).toBeInTheDocument();
+    act(() => MockSource.latest.onopen?.());
+    await screen.findByText("Meter unavailable. Usage cannot be retrieved.");
+    expect(screen.getByText("Upstream unavailable")).toBeInTheDocument();
+    expect(screen.getByRole("log")).toHaveTextContent("unknown-usage");
   });
   it("refreshes fleet, pricing and usage when their SSE change events arrive", async () => {
     api();
@@ -264,7 +288,7 @@ it("reduces all SSE types, bounds the ticker and rejects malformed frames", () =
   let state = streamReducer(initialLiveState, {
     type: "gpu.sample",
     ts_ms: 10,
-    data: fixtures().gpu.current,
+    data: fixtures().gpu.current ?? null,
   });
   state = streamReducer(state, {
     type: "fleet.change",
@@ -298,7 +322,7 @@ it("reduces all SSE types, bounds the ticker and rejects malformed frames", () =
   ]);
   expect(state.fleetRevision).toBe(1);
   expect(state.pricingRevision).toBe(1);
-  expect(state.gpu?.memory_total_mib).toBe(32768);
+  expect(state.gpu?.memory_total_mib).toBe(12288);
   expect(streamReducer(state, { type: "gpu.sample", ts_ms: 20, data: null }).gpu).toBeNull();
   expect(parseEvent({ type: "llm.request", ts_ms: 1, data: { model: "bad" } })).toBeNull();
   expect(parseEvent({ type: "gpu.sample", ts_ms: 1, data: null })).not.toBeNull();

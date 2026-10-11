@@ -1,0 +1,51 @@
+event: gpu.sample
+data: {"type":"gpu.sample","ts_ms":1791701508946,"data":{"memory_total_mib":12288.0,"memory_used_mib":9265.0,"power_w":167.45,"temperature_c":68.0,"ts_ms":1791701508943,"utilization_percent":94.0}}
+
+: keepalive
+
+event: gpu.sample
+data: {"type":"gpu.sample","ts_ms":1791701524107,"data":{"memory_total_mib":12288.0,"memory_used_mib":9265.0,"power_w":168.47,"temperature_c":69.0,"ts_ms":1791701524102,"utilization_percent":95.0}}
+
+event: llm.request
+data: {"type":"llm.request","ts_ms":1791701524198,"data":{"client_hostname":"127.0.0.1","latency_ms":9569.527146,"model":"factory-assist","output_tokens":595,"prompt_tokens":679}}
+
+event: llm.request
+data: {"type":"llm.request","ts_ms":1791701524198,"data":{"client_hostname":"factory-console","latency_ms":1197.590828,"model":"factory-assist","output_tokens":24,"prompt_tokens":22}}
+
+event: llm.request
+data: {"type":"llm.request","ts_ms":1791701524198,"data":{"client_hostname":"127.0.0.1","latency_ms":2350.859778,"model":"factory-assist","output_tokens":92,"prompt_tokens":679}}
+
+event: llm.request
+data: {"type":"llm.request","ts_ms":1791701524198,"data":{"client_hostname":"factory-console","latency_ms":2225.103179,"model":"factory-assist","output_tokens":24,"prompt_tokens":27}}
+
+event: llm.request
+data: {"type":"llm.request","ts_ms":1791701524198,"data":{"client_hostname":"127.0.0.1","latency_ms":6550.907265,"model":"factory-assist","output_tokens":317,"prompt_tokens":676}}
+
+event: llm.request
+data: {"type":"llm.request","ts_ms":1791701524198,"data":{"client_hostname":"factory-console","latency_ms":6637.924396,"model":"factory-assist","output_tokens":24,"prompt_tokens":21}}
+
+event: llm.request
+data: {"type":"llm.request","ts_ms":1791701524198,"data":{"client_hostname":"127.0.0.1","latency_ms":6527.010763,"model":"factory-assist","output_tokens":362,"prompt_tokens":676}}
+
+event: llm.request
+data: {"type":"llm.request","ts_ms":1791701524198,"data":{"client_hostname":"factory-console","latency_ms":6521.526681,"model":"factory-assist","output_tokens":24,"prompt_tokens":20}}
+
+event: llm.request
+data: {"type":"llm.request","ts_ms":1791701524198,"data":{"client_hostname":"127.0.0.1","latency_ms":5573.50698,"model":"factory-assist","output_tokens":315,"prompt_tokens":676}}
+
+event: llm.request
+data: {"type":"llm.request","ts_ms":1791701524198,"data":{"client_hostname":"127.0.0.1","latency_ms":3506.452786,"model":"factory-assist","output_tokens":219,"prompt_tokens":696}}
+
+event: llm.request
+data: {"type":"llm.request","ts_ms":1791701524198,"data":{"client_hostname":"127.0.0.1","latency_ms":2625.60071,"model":"factory-assist","output_tokens":135,"prompt_tokens":1020}}
+
+: keepalive
+
+event: gpu.sample
+data: {"type":"gpu.sample","ts_ms":1791701538924,"data":{"memory_total_mib":12288.0,"memory_used_mib":9265.0,"power_w":158.65,"temperature_c":69.0,"ts_ms":1791701538922,"utilization_percent":93.0}}
+
+: keepalive
+
+event: gpu.sample
+data: {"type":"gpu.sample","ts_ms":1791701554210,"data":{"memory_total_mib":12288.0,"memory_used_mib":9265.0,"power_w":167.51,"temperature_c":69.0,"ts_ms":1791701554207,"utilization_percent":89.0}}
+

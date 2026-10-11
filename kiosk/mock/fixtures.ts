@@ -112,26 +112,48 @@ export function fixtures(
       ? []
       : [
           {
-            model: "factory-assist:latest",
+            model: "factory-assist",
             requests: 812 * scale,
             prompt_tokens: 760_000 * scale,
             output_tokens: 218_000 * scale,
-            avg_prompt_tps: 1456.2,
-            avg_gen_tps: 81.4,
-            p50_latency_ms: 812,
-            p95_latency_ms: 2460,
+            avg_prompt_tps: 130.2,
+            avg_gen_tps: 61.2,
+            p50_latency_ms: 6302,
+            p95_latency_ms: 6333,
             total_load_ms: 14500 * scale,
           },
           {
-            model: "factory-code:latest",
-            requests: 472 * scale,
-            prompt_tokens: 480_000 * scale,
-            output_tokens: 168_200 * scale,
+            model: "factory-code",
+            requests: 372 * scale,
+            prompt_tokens: 380_000 * scale,
+            output_tokens: 138_200 * scale,
             avg_prompt_tps: null,
             avg_gen_tps: 56.8,
             p50_latency_ms: 1280,
             p95_latency_ms: 4120,
             total_load_ms: 9200 * scale,
+          },
+          {
+            model: "factory-assist-max",
+            requests: 96 * scale,
+            prompt_tokens: 100_000 * scale,
+            output_tokens: 30_000 * scale,
+            avg_prompt_tps: 92.4,
+            avg_gen_tps: 24.7,
+            p50_latency_ms: 3800,
+            p95_latency_ms: 8100,
+            total_load_ms: 18600 * scale,
+          },
+          {
+            model: null,
+            requests: 4 * scale,
+            prompt_tokens: 0,
+            output_tokens: 0,
+            avg_prompt_tps: null,
+            avg_gen_tps: null,
+            p50_latency_ms: 104,
+            p95_latency_ms: 150,
+            total_load_ms: 0,
           },
         ],
     warnings: outage
@@ -141,25 +163,25 @@ export function fixtures(
   const current: Gpu["current"] = outage
     ? null
     : {
-        memory_used_mib: 21480,
-        memory_total_mib: 32768,
+        memory_used_mib: 9255,
+        memory_total_mib: 12288,
         utilization_percent: 64,
         temperature_c: 62,
-        power_w: 248,
+        power_w: 138,
         ts_ms: now,
       };
   const window = gpuRange === "1h" ? 3_600_000 : gpuRange === "24h" ? 86_400_000 : 604_800_000;
   const gpu: Gpu = {
     current,
-    loaded_models: outage ? [] : ["factory-assist:latest", "factory-code:latest"],
+    loaded_models: outage ? [] : ["factory-assist:latest"],
     history: outage
       ? []
       : Array.from({ length: 36 }, (_, index) => ({
           ts_ms: now - ((35 - index) * window) / 35,
-          memory_used_mib: 19000 + Math.round(Math.sin(index / 4) * 2400),
+          memory_used_mib: 9255 + Math.round(Math.sin(index / 4) * 300),
           utilization_percent: 40 + Math.round(Math.sin(index / 3) * 20 + index / 3),
           temperature_c: 58 + (index % 6),
-          power_w: 210 + (index % 40),
+          power_w: 110 + (index % 40),
         })),
   };
   const pricing: Pricing = {

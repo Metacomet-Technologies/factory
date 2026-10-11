@@ -124,7 +124,7 @@ export function FleetSection({ resource, icon }: { resource: Resource<Fleet>; ic
               </Badge>
             </div>
             <p className="muted node-meta">
-              {node.tailscale_ip} · {node.os ?? "—"}
+              {node.tailscale_ip ?? "—"} · {node.os ?? "—"}
             </p>
             <p className="muted">Last seen {seen(node.last_seen_ms)}</p>
             <Separator className="my-3" />
@@ -235,8 +235,8 @@ function ModelCards({ models }: { models: ModelUsage[] }) {
   return (
     <div className="model-cards">
       {models.map((model) => (
-        <article className="model-card" key={model.model}>
-          <h3>{model.model}</h3>
+        <article className="model-card" key={model.model ?? "non-model"}>
+          <h3>{model.model ?? "Non-model requests"}</h3>
           <dl>
             {[
               ["Requests", count(model.requests)],
@@ -354,7 +354,7 @@ export function UsageSection({
                 <AlertDescription>{family.family} · This dashboard is read-only.</AlertDescription>
               </Alert>
             )}
-            {(family.selected === null || family.rates === null) && (
+            {(family.selected == null || family.rates == null) && (
               <p className="muted">
                 {family.family} reference: {family.selected?.model_id ?? "—"} · rates:{" "}
                 {family.rates
@@ -370,7 +370,7 @@ export function UsageSection({
         <>
           <div className="model-heading">
             <h3>Model performance</h3>
-            <p className="muted">Load time is separate from request latency.</p>
+            <p className="muted">Latency includes load; total load is also reported separately.</p>
           </div>
           {data.models.length === 0 ? (
             <p className="empty">No model requests in this range.</p>
@@ -394,8 +394,10 @@ export function UsageSection({
                   </TableHeader>
                   <TableBody>
                     {data.models.map((model) => (
-                      <TableRow key={model.model}>
-                        <TableCell className="font-medium">{model.model}</TableCell>
+                      <TableRow key={model.model ?? "non-model"}>
+                        <TableCell className="font-medium">
+                          {model.model ?? "Non-model requests"}
+                        </TableCell>
                         <TableCell>{count(model.requests)}</TableCell>
                         <TableCell>
                           {count(model.prompt_tokens)} / {count(model.output_tokens)}
@@ -437,11 +439,11 @@ export function AgentsSection({ resource, icon }: { resource: Resource<Agents>; 
             <div className="row">
               <h3>{tool.tool}</h3>
               <div className="row">
-                {tool.note === null && <span className="muted">—</span>}
+                {tool.note == null && <span className="muted">—</span>}
                 <Badge variant="secondary">Not tracked yet</Badge>
               </div>
             </div>
-            {tool.note !== null && <p className="muted">{tool.note}</p>}
+            {tool.note != null && <p className="muted">{tool.note}</p>}
           </li>
         ))}
       </ul>
@@ -480,7 +482,7 @@ export function TickerSection({
             {requests.map((event, index) => (
               <li key={`${event.ts_ms}-${index}`}>
                 <div className="row">
-                  <h3>{event.data.model}</h3>
+                  <h3>{event.data.model ?? "Non-model request"}</h3>
                   <span className="muted">{time(event.ts_ms)}</span>
                 </div>
                 <p>

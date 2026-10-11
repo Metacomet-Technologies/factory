@@ -1,0 +1,903 @@
+{
+  "before": {
+    "range": "24h",
+    "generated_at_ms": 1791701462314,
+    "totals": {
+      "requests": 68,
+      "prompt_tokens": 58908,
+      "output_tokens": 6325
+    },
+    "spend_avoided": [
+      {
+        "family": "Claude Sonnet",
+        "model_id": "anthropic/claude-sonnet-5.5",
+        "usd": 0.18072000000000002,
+        "estimated_usd": 0.000346,
+        "unpriced_requests": 0
+      },
+      {
+        "family": "ChatGPT mid-tier",
+        "model_id": "openai/gpt-6.1-sol",
+        "usd": 0.18072000000000002,
+        "estimated_usd": 0.000346,
+        "unpriced_requests": 0
+      }
+    ],
+    "models": [
+      {
+        "model": "factory-assist",
+        "requests": 68,
+        "prompt_tokens": 58908,
+        "output_tokens": 6325,
+        "avg_prompt_tps": 2039.086604115002,
+        "avg_gen_tps": 68.24172894048839,
+        "p50_latency_ms": 2014.913673,
+        "p95_latency_ms": 6301.823696,
+        "total_load_ms": 55005.53539100001
+      }
+    ],
+    "warnings": []
+  },
+  "after": {
+    "range": "24h",
+    "generated_at_ms": 1791701525303,
+    "totals": {
+      "requests": 94,
+      "prompt_tokens": 81519,
+      "output_tokens": 11191
+    },
+    "spend_avoided": [
+      {
+        "family": "Claude Sonnet",
+        "model_id": "anthropic/claude-sonnet-5.5",
+        "usd": 0.274602,
+        "estimated_usd": 0.000346,
+        "unpriced_requests": 0
+      },
+      {
+        "family": "ChatGPT mid-tier",
+        "model_id": "openai/gpt-6.1-sol",
+        "usd": 0.274602,
+        "estimated_usd": 0.000346,
+        "unpriced_requests": 0
+      }
+    ],
+    "models": [
+      {
+        "model": "factory-assist",
+        "requests": 94,
+        "prompt_tokens": 81519,
+        "output_tokens": 11191,
+        "avg_prompt_tps": 2168.1750575255414,
+        "avg_gen_tps": 68.1053253266535,
+        "p50_latency_ms": 2237.514917,
+        "p95_latency_ms": 6748.522667,
+        "total_load_ms": 55064.632908
+      }
+    ],
+    "warnings": []
+  },
+  "traffic": [
+    {
+      "model": "factory-assist",
+      "prompt_eval_count": 22,
+      "eval_count": 24,
+      "total_duration": 1197590828,
+      "load_duration": 2275957
+    },
+    {
+      "model": "factory-assist",
+      "prompt_eval_count": 27,
+      "eval_count": 24,
+      "total_duration": 2225103179,
+      "load_duration": 1834671
+    },
+    {
+      "model": "factory-assist",
+      "prompt_eval_count": 21,
+      "eval_count": 24,
+      "total_duration": 6637924396,
+      "load_duration": 1823601
+    },
+    {
+      "model": "factory-assist",
+      "prompt_eval_count": 20,
+      "eval_count": 24,
+      "total_duration": 6521526681,
+      "load_duration": 2143358
+    }
+  ],
+  "reports": [
+    {
+      "width": 1728,
+      "height": 1117,
+      "layout": {
+        "width": 1728,
+        "height": 1117
+      },
+      "events": [
+        {
+          "type": "gpu.sample",
+          "ts_ms": 1791701464095,
+          "data": {
+            "memory_total_mib": 12288,
+            "memory_used_mib": 9255,
+            "power_w": 103.79,
+            "temperature_c": 63,
+            "ts_ms": 1791701464093,
+            "utilization_percent": 50
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701464192,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 3560.767334,
+            "model": "factory-assist",
+            "output_tokens": 217,
+            "prompt_tokens": 701
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701464192,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 2540.495126,
+            "model": "factory-assist",
+            "output_tokens": 82,
+            "prompt_tokens": 1839
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701464192,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 4025.951284,
+            "model": "factory-assist",
+            "output_tokens": 193,
+            "prompt_tokens": 717
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701464192,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 2495.094708,
+            "model": "factory-assist",
+            "output_tokens": 114,
+            "prompt_tokens": 1582
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701464192,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 2422.629596,
+            "model": "factory-assist",
+            "output_tokens": 144,
+            "prompt_tokens": 1763
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701464192,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 4070.164433,
+            "model": "factory-assist",
+            "output_tokens": 217,
+            "prompt_tokens": 717
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701464192,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 1913.797306,
+            "model": "factory-assist",
+            "output_tokens": 71,
+            "prompt_tokens": 1606
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701464192,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 1588.46964,
+            "model": "factory-assist",
+            "output_tokens": 83,
+            "prompt_tokens": 1744
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701464192,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 3748.017702,
+            "model": "factory-assist",
+            "output_tokens": 199,
+            "prompt_tokens": 717
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701464192,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 1907.69824,
+            "model": "factory-assist",
+            "output_tokens": 71,
+            "prompt_tokens": 1588
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701464192,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 1889.777487,
+            "model": "factory-assist",
+            "output_tokens": 112,
+            "prompt_tokens": 1726
+          }
+        },
+        {
+          "type": "gpu.sample",
+          "ts_ms": 1791701478945,
+          "data": {
+            "memory_total_mib": 12288,
+            "memory_used_mib": 9265,
+            "power_w": 168.31,
+            "temperature_c": 67,
+            "ts_ms": 1791701478940,
+            "utilization_percent": 92
+          }
+        },
+        {
+          "type": "gpu.sample",
+          "ts_ms": 1791701493994,
+          "data": {
+            "memory_total_mib": 12288,
+            "memory_used_mib": 9265,
+            "power_w": 168.95,
+            "temperature_c": 69,
+            "ts_ms": 1791701493994,
+            "utilization_percent": 96
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701494067,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 8566.279361,
+            "model": "factory-assist",
+            "output_tokens": 451,
+            "prompt_tokens": 680
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701494067,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 3180.580611,
+            "model": "factory-assist",
+            "output_tokens": 177,
+            "prompt_tokens": 680
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701494067,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 8675.174505,
+            "model": "factory-assist",
+            "output_tokens": 515,
+            "prompt_tokens": 680
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701494067,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 1893.660507,
+            "model": "factory-assist",
+            "output_tokens": 89,
+            "prompt_tokens": 679
+          }
+        },
+        {
+          "type": "gpu.sample",
+          "ts_ms": 1791701508946,
+          "data": {
+            "memory_total_mib": 12288,
+            "memory_used_mib": 9265,
+            "power_w": 167.45,
+            "temperature_c": 68,
+            "ts_ms": 1791701508943,
+            "utilization_percent": 94
+          }
+        },
+        {
+          "type": "gpu.sample",
+          "ts_ms": 1791701524107,
+          "data": {
+            "memory_total_mib": 12288,
+            "memory_used_mib": 9265,
+            "power_w": 168.47,
+            "temperature_c": 69,
+            "ts_ms": 1791701524102,
+            "utilization_percent": 95
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 9569.527146,
+            "model": "factory-assist",
+            "output_tokens": 595,
+            "prompt_tokens": 679
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "factory-console",
+            "latency_ms": 1197.590828,
+            "model": "factory-assist",
+            "output_tokens": 24,
+            "prompt_tokens": 22
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 2350.859778,
+            "model": "factory-assist",
+            "output_tokens": 92,
+            "prompt_tokens": 679
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "factory-console",
+            "latency_ms": 2225.103179,
+            "model": "factory-assist",
+            "output_tokens": 24,
+            "prompt_tokens": 27
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 6550.907265,
+            "model": "factory-assist",
+            "output_tokens": 317,
+            "prompt_tokens": 676
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "factory-console",
+            "latency_ms": 6637.924396,
+            "model": "factory-assist",
+            "output_tokens": 24,
+            "prompt_tokens": 21
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 6527.010763,
+            "model": "factory-assist",
+            "output_tokens": 362,
+            "prompt_tokens": 676
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "factory-console",
+            "latency_ms": 6521.526681,
+            "model": "factory-assist",
+            "output_tokens": 24,
+            "prompt_tokens": 20
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 5573.50698,
+            "model": "factory-assist",
+            "output_tokens": 315,
+            "prompt_tokens": 676
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 3506.452786,
+            "model": "factory-assist",
+            "output_tokens": 219,
+            "prompt_tokens": 696
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 2625.60071,
+            "model": "factory-assist",
+            "output_tokens": 135,
+            "prompt_tokens": 1020
+          }
+        }
+      ]
+    },
+    {
+      "width": 1024,
+      "height": 768,
+      "layout": {
+        "width": 1024,
+        "height": 2097
+      },
+      "events": [
+        {
+          "type": "gpu.sample",
+          "ts_ms": 1791701478945,
+          "data": {
+            "memory_total_mib": 12288,
+            "memory_used_mib": 9265,
+            "power_w": 168.31,
+            "temperature_c": 67,
+            "ts_ms": 1791701478940,
+            "utilization_percent": 92
+          }
+        },
+        {
+          "type": "gpu.sample",
+          "ts_ms": 1791701493994,
+          "data": {
+            "memory_total_mib": 12288,
+            "memory_used_mib": 9265,
+            "power_w": 168.95,
+            "temperature_c": 69,
+            "ts_ms": 1791701493994,
+            "utilization_percent": 96
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701494067,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 8566.279361,
+            "model": "factory-assist",
+            "output_tokens": 451,
+            "prompt_tokens": 680
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701494067,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 3180.580611,
+            "model": "factory-assist",
+            "output_tokens": 177,
+            "prompt_tokens": 680
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701494067,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 8675.174505,
+            "model": "factory-assist",
+            "output_tokens": 515,
+            "prompt_tokens": 680
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701494067,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 1893.660507,
+            "model": "factory-assist",
+            "output_tokens": 89,
+            "prompt_tokens": 679
+          }
+        },
+        {
+          "type": "gpu.sample",
+          "ts_ms": 1791701508946,
+          "data": {
+            "memory_total_mib": 12288,
+            "memory_used_mib": 9265,
+            "power_w": 167.45,
+            "temperature_c": 68,
+            "ts_ms": 1791701508943,
+            "utilization_percent": 94
+          }
+        },
+        {
+          "type": "gpu.sample",
+          "ts_ms": 1791701524107,
+          "data": {
+            "memory_total_mib": 12288,
+            "memory_used_mib": 9265,
+            "power_w": 168.47,
+            "temperature_c": 69,
+            "ts_ms": 1791701524102,
+            "utilization_percent": 95
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 9569.527146,
+            "model": "factory-assist",
+            "output_tokens": 595,
+            "prompt_tokens": 679
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "factory-console",
+            "latency_ms": 1197.590828,
+            "model": "factory-assist",
+            "output_tokens": 24,
+            "prompt_tokens": 22
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 2350.859778,
+            "model": "factory-assist",
+            "output_tokens": 92,
+            "prompt_tokens": 679
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "factory-console",
+            "latency_ms": 2225.103179,
+            "model": "factory-assist",
+            "output_tokens": 24,
+            "prompt_tokens": 27
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 6550.907265,
+            "model": "factory-assist",
+            "output_tokens": 317,
+            "prompt_tokens": 676
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "factory-console",
+            "latency_ms": 6637.924396,
+            "model": "factory-assist",
+            "output_tokens": 24,
+            "prompt_tokens": 21
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 6527.010763,
+            "model": "factory-assist",
+            "output_tokens": 362,
+            "prompt_tokens": 676
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "factory-console",
+            "latency_ms": 6521.526681,
+            "model": "factory-assist",
+            "output_tokens": 24,
+            "prompt_tokens": 20
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 5573.50698,
+            "model": "factory-assist",
+            "output_tokens": 315,
+            "prompt_tokens": 676
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 3506.452786,
+            "model": "factory-assist",
+            "output_tokens": 219,
+            "prompt_tokens": 696
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 2625.60071,
+            "model": "factory-assist",
+            "output_tokens": 135,
+            "prompt_tokens": 1020
+          }
+        }
+      ]
+    },
+    {
+      "width": 390,
+      "height": 844,
+      "layout": {
+        "width": 390,
+        "height": 3090
+      },
+      "events": [
+        {
+          "type": "gpu.sample",
+          "ts_ms": 1791701493994,
+          "data": {
+            "memory_total_mib": 12288,
+            "memory_used_mib": 9265,
+            "power_w": 168.95,
+            "temperature_c": 69,
+            "ts_ms": 1791701493994,
+            "utilization_percent": 96
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701494067,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 8566.279361,
+            "model": "factory-assist",
+            "output_tokens": 451,
+            "prompt_tokens": 680
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701494067,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 3180.580611,
+            "model": "factory-assist",
+            "output_tokens": 177,
+            "prompt_tokens": 680
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701494067,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 8675.174505,
+            "model": "factory-assist",
+            "output_tokens": 515,
+            "prompt_tokens": 680
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701494067,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 1893.660507,
+            "model": "factory-assist",
+            "output_tokens": 89,
+            "prompt_tokens": 679
+          }
+        },
+        {
+          "type": "gpu.sample",
+          "ts_ms": 1791701508946,
+          "data": {
+            "memory_total_mib": 12288,
+            "memory_used_mib": 9265,
+            "power_w": 167.45,
+            "temperature_c": 68,
+            "ts_ms": 1791701508943,
+            "utilization_percent": 94
+          }
+        },
+        {
+          "type": "gpu.sample",
+          "ts_ms": 1791701524107,
+          "data": {
+            "memory_total_mib": 12288,
+            "memory_used_mib": 9265,
+            "power_w": 168.47,
+            "temperature_c": 69,
+            "ts_ms": 1791701524102,
+            "utilization_percent": 95
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 9569.527146,
+            "model": "factory-assist",
+            "output_tokens": 595,
+            "prompt_tokens": 679
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "factory-console",
+            "latency_ms": 1197.590828,
+            "model": "factory-assist",
+            "output_tokens": 24,
+            "prompt_tokens": 22
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 2350.859778,
+            "model": "factory-assist",
+            "output_tokens": 92,
+            "prompt_tokens": 679
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "factory-console",
+            "latency_ms": 2225.103179,
+            "model": "factory-assist",
+            "output_tokens": 24,
+            "prompt_tokens": 27
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 6550.907265,
+            "model": "factory-assist",
+            "output_tokens": 317,
+            "prompt_tokens": 676
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "factory-console",
+            "latency_ms": 6637.924396,
+            "model": "factory-assist",
+            "output_tokens": 24,
+            "prompt_tokens": 21
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 6527.010763,
+            "model": "factory-assist",
+            "output_tokens": 362,
+            "prompt_tokens": 676
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "factory-console",
+            "latency_ms": 6521.526681,
+            "model": "factory-assist",
+            "output_tokens": 24,
+            "prompt_tokens": 20
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 5573.50698,
+            "model": "factory-assist",
+            "output_tokens": 315,
+            "prompt_tokens": 676
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 3506.452786,
+            "model": "factory-assist",
+            "output_tokens": 219,
+            "prompt_tokens": 696
+          }
+        },
+        {
+          "type": "llm.request",
+          "ts_ms": 1791701524198,
+          "data": {
+            "client_hostname": "127.0.0.1",
+            "latency_ms": 2625.60071,
+            "model": "factory-assist",
+            "output_tokens": 135,
+            "prompt_tokens": 1020
+          }
+        }
+      ]
+    }
+  ],
+  "errors": []
+}

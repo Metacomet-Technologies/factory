@@ -27,8 +27,8 @@ export function streamReducer(state: LiveState, event: StreamEvent): LiveState {
   }
 }
 
-// The contract leaves SSE event names unspecified. Accept named events and default messages;
-// the JSON envelope is authoritative in either case.
+// Named factory-api events carry the JSON envelope. Default messages remain
+// accepted for older fixture servers; malformed payloads never reach the UI.
 export function parseEvent(value: unknown): StreamEvent | null {
   if (
     !value ||
@@ -36,7 +36,8 @@ export function parseEvent(value: unknown): StreamEvent | null {
     !("type" in value) ||
     !("ts_ms" in value) ||
     !("data" in value) ||
-    typeof value.ts_ms !== "number"
+    typeof value.ts_ms !== "number" ||
+    !Number.isFinite(value.ts_ms)
   )
     return null;
   const data = value.data;
@@ -62,8 +63,16 @@ export function parseEvent(value: unknown): StreamEvent | null {
       break;
     case "llm.request":
       if (
-        strings(["model", "client_hostname"]) &&
-        numbers(["prompt_tokens", "output_tokens", "latency_ms"])
+        strings(["client_hostname"]) &&
+        (fields.model == null || typeof fields.model === "string") &&
+        ["prompt_tokens", "output_tokens"].every(
+          (key) =>
+            fields[key] == null ||
+            (typeof fields[key] === "number" &&
+              Number.isSafeInteger(fields[key]) &&
+              fields[key] >= 0),
+        ) &&
+        numbers(["latency_ms"])
       )
         return value as StreamEvent;
       break;
@@ -74,7 +83,7 @@ export function parseEvent(value: unknown): StreamEvent | null {
     case "pricing.changed":
       if (
         strings(["family"]) &&
-        (fields.pending_model_id === null || typeof fields.pending_model_id === "string")
+        (fields.pending_model_id == null || typeof fields.pending_model_id === "string")
       )
         return value as StreamEvent;
       break;
@@ -85,9 +94,15 @@ export function parseEvent(value: unknown): StreamEvent | null {
 export function useStream() {
   const [state, dispatch] = useReducer(streamReducer, initialLiveState);
   const [connected, setConnected] = useState(false);
+  const [snapshotRevision, setSnapshotRevision] = useState(0);
   useEffect(() => {
     const source = new EventSource(apiUrl("/v1/stream"));
-    source.onopen = () => setConnected(true);
+    let opened = false;
+    source.onopen = () => {
+      setConnected(true);
+      if (opened) setSnapshotRevision((revision) => revision + 1);
+      opened = true;
+    };
     source.onerror = () => {
       setConnected(false);
       dispatch({ type: "gpu.sample", ts_ms: Date.now(), data: null });
@@ -105,5 +120,5 @@ export function useStream() {
       source.addEventListener(type, receive);
     return () => source.close();
   }, []);
-  return { ...state, connected };
+  return { ...state, connected, snapshotRevision };
 }
