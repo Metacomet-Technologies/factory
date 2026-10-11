@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 0077
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/rollback-factory-api.sh <snapshot-directory>.'
 [[ $# -eq 1 ]] || fail 'Supply the exact snapshot directory printed by the installer.'
 snapshot=$1
 trap 'printf "ERROR: rollback failed at line %s; snapshot retained at %s.\n" "$LINENO" "$snapshot" >&2' ERR
-for command in systemctl cp rm cat; do
+for command in systemctl cp rm cat mv mktemp date sudo curl touch sqlite3 jq flock sha256sum; do
     command -v "$command" >/dev/null || fail "Required command missing: $command"
 done
 [[ -f "$snapshot/complete" && -f "$snapshot/enabled" && -f "$snapshot/active" ]] || fail 'Snapshot is incomplete.'
@@ -26,10 +27,56 @@ for path in /usr/local/bin/factory-api /etc/systemd/system/factory-api.service; 
     [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || fail "Unsafe destination: $path"
 done
 
+[[ -f "$snapshot/pricing-mode" ]] || fail 'Use the rollback script matching this snapshot; pricing mode is missing.'
+pricing_mode=$(cat "$snapshot/pricing-mode")
+case "$pricing_mode" in legacy|fresh|v1) ;; *) fail "Invalid pricing mode: $pricing_mode" ;; esac
+pricing_db=/var/lib/factory-api/pricing.db
+legacy_db=/var/lib/factory-api/pricing.v0.db
+for path in "$pricing_db" "$pricing_db-wal" "$pricing_db-shm" "$legacy_db" "$legacy_db-wal" "$legacy_db-shm"; do
+    [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || fail "Unsafe pricing file: $path"
+done
+[[ ! -d /etc/systemd/system/factory-api.service.d ]] || fail 'Review factory-api unit drop-ins before rollback.'
+[[ -z $(systemctl show factory-api.service --property=DropInPaths --value) ]] || fail 'Review factory-api unit drop-ins before rollback.'
+if [[ "$pricing_mode" == legacy && -f "$legacy_db" ]]; then
+    [[ -f "$snapshot/pricing.db.sha256" ]] || fail 'Verified legacy snapshot is missing.'
+    sha256sum -c "$snapshot/pricing.db.sha256"
+    [[ $(sqlite3 -readonly "$snapshot/pricing.db" 'PRAGMA integrity_check;') == ok ]] || fail 'Legacy snapshot integrity failed.'
+fi
+[[ -d /var/backups/factory-db && ! -L /var/backups/factory-db/.backup.lock ]] || fail 'MET-74 backup lock is unavailable.'
+exec 9>>/var/backups/factory-db/.backup.lock
+flock -n 9 || fail 'Backup or deployment is running; retry after it finishes.'
+
 # Installation may have failed before writing/loading the new unit.
 if [[ $(systemctl show factory-api.service --property=LoadState --value) != not-found ]]; then
     systemctl stop factory-api.service
     systemctl disable factory-api.service
+fi
+if [[ "$pricing_mode" != v1 && ! -f "$snapshot/pricing-restored" ]]; then
+    # Unique directory keeps both databases and every displaced sidecar.
+    aside=$(mktemp -d "$snapshot/rollback-$(date -u +%Y%m%dT%H%M%S.%NZ).XXXXXX")
+    if [[ "$pricing_mode" == fresh ]]; then
+        for suffix in -wal -shm ''; do
+            if [[ -e "$pricing_db$suffix" ]]; then mv -- "$pricing_db$suffix" "$aside/pricing.db$suffix"; fi
+        done
+    else
+        moved_main=false
+        [[ ! -f "$legacy_db" ]] || moved_main=true
+        if [[ "$moved_main" == false ]]; then
+            [[ -f "$pricing_db" && $(sqlite3 -readonly "$pricing_db" 'PRAGMA user_version;') == 0 ]] || fail 'Legacy DB is missing; refusing to restore the old binary against v1.'
+        fi
+        # If installation stopped partway through moving legacy files, only
+        # restore the files actually moved. Main file is restored last.
+        for suffix in -wal -shm ''; do
+            if [[ "$moved_main" == true || -e "$legacy_db$suffix" ]]; then
+                if [[ -e "$pricing_db$suffix" ]]; then mv -- "$pricing_db$suffix" "$aside/pricing.db$suffix"; fi
+                if [[ -e "$legacy_db$suffix" ]]; then mv -- "$legacy_db$suffix" "$pricing_db$suffix"; fi
+            fi
+        done
+        [[ $(sqlite3 -readonly "$pricing_db" 'PRAGMA user_version;') == 0 ]] || fail 'Restored pricing DB is not legacy v0.'
+        [[ $(sqlite3 -readonly "$pricing_db" 'PRAGMA integrity_check;') == ok ]] || fail 'Restored pricing DB integrity failed; service remains stopped.'
+    fi
+    touch "$snapshot/pricing-restored"
+    printf 'Displaced pricing files retained at: %s\n' "$aside"
 fi
 if [[ -f "$snapshot/binary.missing" ]]; then
     rm -f -- /usr/local/bin/factory-api
@@ -45,6 +92,14 @@ systemctl daemon-reload
 if [[ "$enabled" == enabled ]]; then systemctl enable factory-api.service; fi
 if [[ "$active" == active ]]; then
     systemctl start factory-api.service
+    deadline=$((SECONDS + 45))
+    while (( SECONDS < deadline )); do
+        remaining=$((deadline - SECONDS))
+        (( remaining > 2 )) && remaining=2
+        if sudo -u factory-api curl -fs --max-time "$remaining" -o /dev/null http://127.0.0.1:8080/v1/health; then break; fi
+        if (( SECONDS < deadline )); then sleep 1; fi
+    done
+    sudo -u factory-api curl -fsS --max-time 2 http://127.0.0.1:8080/v1/health | jq -e '.status == "ok"' >/dev/null
     systemctl is-active --quiet factory-api.service
 fi
-printf '\nFactory API snapshot restored: %s\nPrior enabled state: %s; prior active state: %s (failed/unknown restored as stopped).\nDatabases and factory-api account preserved.\n' "$snapshot" "$enabled" "$active"
+printf '\nFactory API snapshot restored: %s\nPrior enabled state: %s; prior active state: %s (failed/unknown restored as stopped).\nPricing mode: %s; all pricing data and factory-api account preserved.\n' "$snapshot" "$enabled" "$active" "$pricing_mode"

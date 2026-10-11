@@ -21,6 +21,7 @@ The working agreement and hard-won lessons for building and operating the factor
 - **Tailnet:** Metacomet (`bearded-pompano.ts.net`). Both nodes are `tag:factory`. Dashboard: `https://factory-console.bearded-pompano.ts.net` (Tailscale Serve → 127.0.0.1:8080). ufw allows only `tailscale0`.
 - **Access policy:** admins (`group:factory-admins`) reach everything on the factory; factory → factory only on tcp 22/443/3389/8080/11434; **factory nodes can't reach personal devices**; SSH maps each person to their own account (`DGarbs51@github` → `dgarbs51`, `agent`; `metacometdave@github` → `david`, `agent`); `tag:factory` → `tag:factory` as `factory-backup` for backups. All factory SSH rules are `accept` (no re-auth prompts). The policy has `tests` + `sshTests`.
 - **Repo:** `Metacomet-Technologies/factory`: Rust workspace (`shared`, `meter`, `pricing`, `factory-api`) + `kiosk/` + `deploy/` + `evals/` + `docs/`.
+- **GitHub controls (MET-109):** `main` ruleset — PRs only, required checks `rust`/`kiosk`/`scripts`, no force-push or deletion, linear history; squash-only merges using the PR title; Actions limited to GitHub-owned + verified creators, pinned to full SHAs (Dependabot keeps pins current); default `GITHUB_TOKEN` read-only. Releases are manual: `scripts/bump-version.sh`, merge, then `gh release create vX.Y.Z --repo Metacomet-Technologies/factory --target main --generate-notes`.
 - **Local models:** `factory-assist` (gemma4:12b, 64K; tool calling reliable), `factory-assist-max` (256K), `factory-code` (qwen2.5-coder:14b, 16K; **no native tool calls**). Ollama runs with flash attention + q8 KV cache.
 - **Users:** `dgarbs51` (Devon) and `david` (David): admins with passwordless sudo. `agent`: unprivileged, runs Amp runners (per-person `agent-devon` / `agent-david` planned, MET-78). `console`: kiosk only. Service users: `meter`, `factory-api`, `factory-backup`.
 - **Backups (MET-74):** nightly verified SQLite snapshots (~03:19 gpu, ~03:47 console), pushed to the other node; 7 daily + 4 weekly; `restore-check.sh all`.
@@ -58,6 +59,8 @@ Every prompt has these sections:
 
 **Runner hygiene:** one thread per task; archive threads once their work is merged **and deployed/verified**; start fresh threads per phase. Parallel threads on one runner use **Amp worktrees**; remove the worktree when its thread is archived. Don't message a thread mid-run unless it's a correction. Mechanical follow-ups (pull + build) also start with the `GH_TOKEN` setup line. Cleanup after merge: archive the thread (UI only), then as `agent`: `git -C /home/agent/work/factory worktree remove /home/agent/work/factory-<name>` and `git -C /home/agent/work/factory branch -D <name>`.
 
+**Wrap-up prompt (after merge):** the same thread confirms the merge, updates and builds in the main checkout (`~/work/factory`), removes its worktree and local branch, and replies with exact Mac install/verify commands. One deploy per runner at a time. Devon archives the thread (UI only) only after deploy verification; if verification fails, the same thread fixes it from a fresh worktree.
+
 ## 5. Review checklist (before merge)
 
 - **Reviews are done by Claude directly:** Linear `get_diff` for metadata and link types, then Claude in Chrome for the actual diff and full scripts. Only fall back to asking Devon for `gh` output when neither tool is reachable.
@@ -70,7 +73,7 @@ Every prompt has these sections:
 ## 6. Deploy flow
 
 1. Merge (squash, delete branch).
-2. Ask the thread to `export GH_TOKEN=... && gh auth setup-git && git checkout main && git pull --ff-only && build` (the token only exists in threads).
+2. Send the thread the wrap-up prompt (§4); it builds in the main checkout and cleans up its worktree.
 3. From the Mac: `factory-ssh "sudo bash /home/agent/work/factory/deploy/install-*.sh <prebuilt path>"` (use **full paths**: admins can't `cd` into `/home/agent`).
 4. Verify: `factory-status` (all green; usage/pricing < 2 s), kiosk self-reload, then mark the Linear issue Done. Then update Linear (status, Decided, Next) and, if `docs/PLAYBOOK.md` changed, re-sync the Linear playbook copy.
 
@@ -109,6 +112,8 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 ## 8. Gotchas we've already hit
 
 **Process**
+- Tests that pass locally can hang on GitHub runners: every CI job sets `timeout-minutes`, and async tests wrap their waits in an explicit timeout so a hang fails fast with a message.
+- Repo Actions options greyed out means the org setting is off; enable it at org → Settings → Actions first (the default token stays read-only).
 - When a Linear **Decided** section changes a rule, update `AGENTS.md`/docs in the next PR. Agents follow the repo file, not Linear.
 - Amp's **New Worktree** fetches `origin` before creating the worktree; `agent` has GitHub credentials only inside threads, so it fails ("could not read Username"). Start threads in `work` and let the agent create the worktree after auth.
 
@@ -135,6 +140,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 - GNOME RDP headless: set credentials with `sudo grdctl --system rdp set-credentials` and register a TLS cert; the Windows App hangs at TLS, use `sdl-freerdp`. Remote Login refuses while the same user is logged in locally.
 - Ollama `/api/ps` misreports gemma4's size; use `nvidia-smi`. Exclude non-inference requests (health checks) from usage.
 - A lock held across a network call froze usage/pricing for 60 s+ when TLS failed on a bad clock (MET-90): never hold DB access across I/O.
+- Bundled SQLite 3.51.1 (rusqlite 0.38) can deadlock during concurrent WAL connection closes (fixed in SQLite 3.51.2); use rusqlite ≥ 0.39.
 - iOS Safari doesn't run timers in background tabs; check on `visibilitychange`.
 - **1Password CLI:** with app integration, `op whoami` can say "not signed in" while `op vault list` works; `op account add` refuses unless `OP_BIOMETRIC_UNLOCK_ENABLED=false`; app-integrated `op` only works inside the desktop session.
 - Omarchy (Hyprland 0.56) moved to Lua config and dispatch.
@@ -142,3 +148,5 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 ## 9. Where things are tracked
 
 Linear: project overview, the roadmap issues, and the Linear copy of this playbook (this repo file is the source of truth). Decisions live in each issue's **Decided** section.
+
+Labels: every issue gets one type (Bug / Feature / Improvement) plus one or more `area:*` labels (meter, api, kiosk, data, security, agents, ops). Post a Linear project update after milestone days.

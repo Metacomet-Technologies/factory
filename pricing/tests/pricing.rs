@@ -13,13 +13,14 @@ fn references() -> Vec<Reference> {
 fn model(id: &str, released: i64, input: f64, output: f64) -> Model {
     Model {
         model_id: id.into(),
-        released_at: Some(released),
-        input_per_mtok: input,
-        output_per_mtok: output,
+        released_at_ms: Some(released),
+        input_micro_usd_per_mtok: (input * 1_000_000.0).round() as i64,
+        output_micro_usd_per_mtok: (output * 1_000_000.0).round() as i64,
     }
 }
 
-fn close(actual: f64, expected: f64) {
+fn close(actual: factory_db::money::NanoUsd, expected: f64) {
+    let actual = actual.display_usd();
     assert!((actual - expected).abs() < 1e-10, "{actual} != {expected}");
 }
 
@@ -33,9 +34,9 @@ fn live_fixtures_parse_offline_and_resolve_newest_not_highest_price() {
         .iter()
         .find(|m| m.model_id == "anthropic/claude-sonnet-5.5")
         .unwrap();
-    close(sonnet.input_per_mtok, 2.0);
-    close(sonnet.output_per_mtok, 10.0);
-    assert_eq!(sonnet.released_at, None);
+    assert_eq!(sonnet.input_micro_usd_per_mtok, 2_000_000);
+    assert_eq!(sonnet.output_micro_usd_per_mtok, 10_000_000);
+    assert_eq!(sonnet.released_at_ms, None);
     let references = parse_references(DEFAULT_CONFIG).unwrap();
     assert_eq!(
         resolve(&references[0], &primary).unwrap().unwrap().model_id,
@@ -49,9 +50,9 @@ fn live_fixtures_parse_offline_and_resolve_newest_not_highest_price() {
         .iter()
         .find(|m| m.model_id == "anthropic/claude-sonnet-4.6")
         .unwrap();
-    close(older.input_per_mtok, 3.0);
-    close(older.output_per_mtok, 15.0);
-    assert_eq!(older.released_at, Some(1771342990));
+    assert_eq!(older.input_micro_usd_per_mtok, 3_000_000);
+    assert_eq!(older.output_micro_usd_per_mtok, 15_000_000);
+    assert_eq!(older.released_at_ms, Some(1_771_342_990_000));
 }
 
 #[test]
@@ -106,7 +107,10 @@ fn pending_changes_require_confirmation_and_preserve_historical_cost() {
     let status = store.show(&refs, 100).unwrap().remove(0);
     assert!(status.selected.is_none());
     assert_eq!(status.pending.unwrap().model_id, old.model_id);
-    close(status.pending_rates.unwrap().model.input_per_mtok, 2.0);
+    assert_eq!(
+        status.pending_rates.unwrap().model.input_micro_usd_per_mtok,
+        2_000_000
+    );
     assert!(store.confirm(&refs[0].name, 99).is_err());
     store.confirm(&refs[0].name, 110).unwrap();
     assert!(store.confirm(&refs[0].name, 111).is_err());
@@ -201,7 +205,7 @@ fn cross_check_warns_only_above_five_percent_on_either_rate() {
         close(store.cost(&refs[0].name, 500_000, 20_000, at).unwrap(), 1.2);
     }
     let free = model(&primary.model_id, 10, 0.0, 0.0);
-    let paid = model(&primary.model_id, 10, 1e-13, 0.0);
+    let paid = model(&primary.model_id, 10, 0.000001, 0.0);
     store.refresh(&refs, &[free], &[paid], 500, vec![]).unwrap();
     assert!(
         store
@@ -217,7 +221,7 @@ fn fallback_uses_known_dates_and_never_invents_a_new_release_date() {
     let refs = references();
     let primary = model("anthropic/claude-sonnet-5.5", 10, 2.0, 10.0);
     let mut fallback = model(&primary.model_id, 10, 3.0, 20.0);
-    fallback.released_at = None;
+    fallback.released_at_ms = None;
     let mut store = Store::in_memory().unwrap();
     let items = store
         .refresh(&refs, &[], &[fallback.clone()], 100, vec![])
@@ -241,7 +245,7 @@ fn fallback_uses_known_dates_and_never_invents_a_new_release_date() {
     store.refresh(&refs, &[], &[fallback], 300, vec![]).unwrap();
     let rates = store.show(&refs, 300).unwrap().remove(0).rates.unwrap();
     assert_eq!(rates.source, "litellm");
-    assert_eq!(rates.model.released_at, Some(10));
+    assert_eq!(rates.model.released_at_ms, Some(10));
     close(
         store.cost(&refs[0].name, 250_000, 40_000, 299).unwrap(),
         0.9,
@@ -313,7 +317,7 @@ fn invalid_refresh_rolls_back_and_cannot_rewrite_history() {
         )
         .unwrap();
     store.confirm(&refs[0].name, 110).unwrap();
-    let invalid = model("anthropic/claude-sonnet-5.5", 20, f64::NAN, 20.0);
+    let invalid = model("anthropic/claude-sonnet-5.5", 20, -1.0, 20.0);
     assert!(
         store
             .refresh(&refs, &[old.clone(), invalid], &[], 200, vec![])
@@ -362,6 +366,7 @@ fn standalone_store_waits_for_a_write_lock() {
             .unwrap()
             .as_nanos()
     ));
+    pricing::migrate(&path).unwrap();
     let mut store = Store::open(&path).unwrap();
     for connection in [store.connection(), Store::in_memory().unwrap().connection()] {
         assert_eq!(
@@ -421,6 +426,7 @@ fn cli_confirms_shows_and_prices_with_db_env_and_historical_timestamp() {
     ));
     let refs = references();
     let models = [model("anthropic/claude-sonnet-5.5", 10, 2.0, 10.0)];
+    pricing::migrate(&path).unwrap();
     {
         let mut store = Store::open(&path).unwrap();
         store.refresh(&refs, &models, &models, 100, vec![]).unwrap();
@@ -437,7 +443,7 @@ fn cli_confirms_shows_and_prices_with_db_env_and_historical_timestamp() {
         String::from_utf8_lossy(&confirm.stderr)
     );
     let selection: serde_json::Value = serde_json::from_slice(&confirm.stdout).unwrap();
-    let at = selection["effective_from"].as_i64().unwrap();
+    let at = selection["effective_from_ms"].as_i64().unwrap();
     let show = Command::new(binary)
         .env("PRICING_DB", "missing-directory/unused.db")
         .arg("show")
@@ -452,7 +458,7 @@ fn cli_confirms_shows_and_prices_with_db_env_and_historical_timestamp() {
         "anthropic/claude-sonnet-5.5"
     );
     assert!(status["families"][0]["pending"].is_null());
-    let date = chrono::DateTime::from_timestamp(at, 0)
+    let date = chrono::DateTime::from_timestamp_millis(at)
         .unwrap()
         .to_rfc3339();
     let cost = Command::new(binary)
@@ -469,5 +475,337 @@ fn cli_confirms_shows_and_prices_with_db_env_and_historical_timestamp() {
         .unwrap();
     assert!(!early.status.success());
     assert!(String::from_utf8_lossy(&early.stderr).contains("no confirmed selection"));
+    for (flag, value) in [
+        ("--at-ms", at.to_string()),
+        ("--at", (at / 1000 + 1).to_string()),
+    ] {
+        let cost = Command::new(binary)
+            .env("PRICING_DB", &path)
+            .args(["cost", "Claude Sonnet", "250000", "40000", flag, &value])
+            .output()
+            .unwrap();
+        assert!(
+            cost.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cost.stderr)
+        );
+        assert_eq!(cost.stdout, b"0.900000000 USD\n");
+    }
+    for (flag, value) in [
+        ("--at-ms", "100"),
+        ("--at", "9223372036854775807"),
+        ("--at", "2026-10-11T01:10:40"),
+    ] {
+        let result = Command::new(binary)
+            .env("PRICING_DB", &path)
+            .args(["cost", "Claude Sonnet", "1", "0", flag, value])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+    }
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn exact_decimal_rates_from_strings_and_numeric_lexemes() -> anyhow::Result<()> {
+    for (text, expected) in [
+        ("0", 0),
+        ("0.000002", 2_000_000),
+        ("8e-6", 8_000_000),
+        ("0.000000000001", 1),
+        ("0.0000001234560000000000", 123_456),
+        ("1.23456789012e-1", 123_456_789_012),
+        ("1E+2", 100_000_000_000_000),
+        ("9223372.036854775807", i64::MAX),
+    ] {
+        assert_eq!(pricing::parse_rate(text)?, expected, "{text}");
+        let primary = parse_openrouter(&format!(
+            r#"{{"data":[{{"id":"openai/gpt-6-sol","created":17,"pricing":{{"prompt":"{text}","completion":"0"}}}}]}}"#
+        ))?;
+        let secondary = parse_litellm(&format!(
+            r#"{{"gpt-6-sol":{{"litellm_provider":"openai","input_cost_per_token":{text},"output_cost_per_token":0}}}}"#
+        ))?;
+        assert_eq!(primary[0].input_micro_usd_per_mtok, expected);
+        assert_eq!(secondary[0].input_micro_usd_per_mtok, expected);
+        assert_eq!(primary[0].released_at_ms, Some(17_000));
+    }
+    for text in [
+        "-1",
+        "-0",
+        "NaN",
+        "Inf",
+        "Infinity",
+        "1e999",
+        "9223372.036854775808",
+        "0.0000000000001",
+        "0.0000010000001",
+        "",
+        "+1",
+        " 1",
+        "1 ",
+        "01",
+        "1.",
+    ] {
+        assert!(pricing::parse_rate(text).is_err(), "accepted {text:?}");
+    }
+    assert!(parse_openrouter(r#"{"data":[{"id":"x","created":9223372036854775807,"pricing":{"prompt":"0","completion":"0"}}]}"#).is_err());
+    Ok(())
+}
+
+#[test]
+fn migration_and_runtime_version_contract() -> anyhow::Result<()> {
+    use rusqlite::Connection;
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("pricing.db");
+    let cli = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_pricing"))
+            .arg("--db")
+            .arg(&path)
+            .arg("show")
+            .output()
+            .unwrap()
+    };
+    assert!(Store::open(&path).is_err());
+    assert!(!cli().status.success());
+    assert!(!path.exists());
+    let db = Connection::open(&path)?;
+    db.execute_batch(include_str!("fixtures/v0.sql"))?;
+    db.execute("INSERT INTO refreshes VALUES(100)", [])?;
+    drop(db);
+    let before = std::fs::read(&path)?;
+    assert_eq!(
+        pricing::migrate(&path).unwrap_err().to_string(),
+        "legacy pricing DB found; move it aside first (the installer does this)"
+    );
+    assert!(Store::open(&path).is_err());
+    assert!(!cli().status.success());
+    assert_eq!(std::fs::read(&path)?, before);
+    std::fs::rename(&path, temp.path().join("pricing.v0.db"))?;
+    assert_eq!(pricing::migrate(&path)?.applied, [1]);
+    let before = std::fs::read(&path)?;
+    assert!(pricing::migrate(&path)?.applied.is_empty());
+    assert_eq!(std::fs::read(&path)?, before);
+    let db = Connection::open(&path)?;
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM pragma_table_list WHERE schema='main' AND strict=1",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        4
+    );
+    for table in [
+        "refreshes",
+        "price_snapshots",
+        "reference_selection",
+        "pricing_items",
+    ] {
+        assert_eq!(
+            db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            db.query_row(
+                &format!(
+                    "SELECT pk FROM pragma_table_info('{table}') WHERE name='id' AND type='INTEGER'"
+                ),
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            1
+        );
+    }
+    assert!(cli().status.success());
+    db.pragma_update(None, "foreign_keys", true)?;
+    for sql in [
+        "INSERT INTO refreshes(fetched_at_ms) VALUES(-1)",
+        "INSERT INTO price_snapshots(refresh_id,fetched_at_ms,source,model_id,input_micro_usd_per_mtok,output_micro_usd_per_mtok) VALUES(999,0,'openrouter','x',1,2)",
+        "INSERT INTO refreshes(fetched_at_ms) VALUES(0.5)",
+    ] {
+        assert!(db.execute(sql, []).is_err(), "{sql}");
+    }
+    db.execute("INSERT INTO refreshes(fetched_at_ms) VALUES(0)", [])?;
+    for (source, input) in [
+        ("other", "1"),
+        ("openrouter", "-1"),
+        ("openrouter", "1.5"),
+        ("openrouter", "9223372036854775808"),
+    ] {
+        assert!(db.execute(&format!("INSERT INTO price_snapshots(refresh_id,fetched_at_ms,source,model_id,input_micro_usd_per_mtok,output_micro_usd_per_mtok) VALUES(1,0,'{source}','x',{input},2)"), []).is_err());
+    }
+    db.pragma_update(None, "user_version", 2)?;
+    drop(db);
+    let before = std::fs::read(&path)?;
+    assert!(pricing::migrate(&path).is_err());
+    assert!(!cli().status.success());
+    assert!(Store::open(&path).is_err());
+    assert_eq!(std::fs::read(&path)?, before);
+    Ok(())
+}
+
+#[test]
+fn refresh_batches_release_history_and_indexed_hot_reads() -> anyhow::Result<()> {
+    use factory_db::{
+        Category, Scope, Tracked,
+        explain::{self, Exception, ExceptionKind, RequiredSearch},
+    };
+    let refs = parse_references(DEFAULT_CONFIG)?;
+    for n in [3usize, 1001] {
+        let store = Store::in_memory()?;
+        let mut tracked = Tracked::new(store, Store::connection)?;
+        let mut primary = (0..n)
+            .map(|i| model(&format!("noise-{i}"), i as i64, 2.0, 8.0))
+            .collect::<Vec<_>>();
+        primary[0] = model("anthropic/claude-sonnet-5.5", 11, 2.0, 8.0);
+        primary[1] = model("openai/gpt-6-sol", 7, 3.0, 9.0);
+        // Asymmetric history: the first family appears on every refresh, the second only once.
+        tracked.run(
+            &Scope::default(),
+            Category::Setup,
+            |store| -> anyhow::Result<()> {
+                store.refresh(&refs, &primary, &[], 100, vec![])?;
+                for at in 101..if n == 3 { 105 } else { 132 } {
+                    store.refresh(&refs, &primary[..1], &[], at, vec![])?;
+                }
+                store.connection().execute_batch("ANALYZE")?;
+                Ok(())
+            },
+        )?;
+        let secondary = primary
+            .iter()
+            .cloned()
+            .map(|mut m| {
+                m.released_at_ms = None;
+                m
+            })
+            .collect::<Vec<_>>();
+        let scope = Scope::recording();
+        let items = tracked.run(&scope, Category::Data, |store| {
+            let warnings = (0..n + 3)
+                .map(|i| pricing::Item {
+                    fetched_at_ms: 200,
+                    kind: "warning".into(),
+                    family: "*".into(),
+                    message: format!("fixture {i}"),
+                })
+                .collect();
+            store.refresh(&refs, &[], &secondary, 200, warnings)
+        })?;
+        assert_eq!(items.len(), n + 7);
+        let expected = 6 + n.div_ceil(100) + 1 + items.len().div_ceil(100);
+        assert_eq!(scope.counts().data, expected);
+        assert_eq!(scope.counts().transaction, 2);
+        assert_eq!(scope.counts().setup, 0);
+        eprintln!(
+            "refresh n={n}: data={expected}, transaction=2, items={}",
+            items.len()
+        );
+        let view = Scope::recording();
+        tracked.run(&view, Category::Data, |store| -> anyhow::Result<()> {
+            let status = store.show(&refs, 200)?;
+            assert_eq!(
+                status[0].pending.as_ref().unwrap().model_id,
+                primary[0].model_id
+            );
+            assert_eq!(
+                status[1].pending.as_ref().unwrap().model_id,
+                primary[1].model_id
+            );
+            assert_eq!(
+                status[0]
+                    .pending_rates
+                    .as_ref()
+                    .unwrap()
+                    .model
+                    .released_at_ms,
+                Some(11)
+            );
+            assert_eq!(
+                status[1]
+                    .pending_rates
+                    .as_ref()
+                    .unwrap()
+                    .model
+                    .released_at_ms,
+                Some(7)
+            );
+            assert_eq!(store.items()?.len(), n + 7);
+            Ok(())
+        })?;
+        assert_eq!(view.counts().data, 7);
+        let confirm = Scope::recording();
+        tracked.run(&confirm, Category::Data, |store| {
+            store.confirm(&refs[0].name, 201)
+        })?;
+        assert_eq!(confirm.counts().data, 3);
+        assert_eq!(confirm.counts().transaction, 2);
+        tracked.run(
+            &Scope::default(),
+            Category::Data,
+            |store| -> anyhow::Result<()> {
+                assert_eq!(store.cost(&refs[0].name, 3, 7, 201)?.0, 62_000);
+                for sql in scope
+                    .statements()
+                    .into_iter()
+                    .chain(view.statements())
+                    .chain(confirm.statements())
+                    .filter(|s| s.starts_with("SELECT"))
+                {
+                    let count = store.connection().prepare(&sql)?.parameter_count();
+                    let mut values = Vec::<rusqlite::types::Value>::new();
+                    if count > 0 {
+                        values.push(if sql.contains("json_each") {
+                            serde_json::to_string(
+                                &secondary.iter().map(|m| &m.model_id).collect::<Vec<_>>(),
+                            )?
+                            .into()
+                        } else if sql.contains("WHERE model_id=?1") {
+                            primary[0].model_id.clone().into()
+                        } else {
+                            refs[0].name.clone().into()
+                        });
+                    }
+                    if count > 1 {
+                        values.push(200.into());
+                    }
+                    let plan = explain::query_plan(
+                        store.connection(),
+                        &sql,
+                        rusqlite::params_from_iter(values),
+                    )?;
+                    let (table, index) = if sql.contains("json_each") {
+                        ("price_snapshots", "snapshot_release")
+                    } else if sql.contains("FROM price_snapshots") {
+                        ("price_snapshots", "snapshot_lookup")
+                    } else if sql.contains("FROM pricing_items") {
+                        ("pricing_items", "items_refresh")
+                    } else if sql.contains("MAX(effective_from_ms)") {
+                        ("reference_selection", "selection_time")
+                    } else if sql.contains("MAX(fetched_at_ms)") {
+                        ("refreshes", "refreshes_time")
+                    } else if sql.contains("confirmed=0") {
+                        ("reference_selection", "selection_pending")
+                    } else {
+                        ("reference_selection", "selection_lookup")
+                    };
+                    explain::validate(
+                        &plan,
+                        &[RequiredSearch {
+                            table,
+                            index: Some(index),
+                        }],
+                        &[Exception {
+                            kind: ExceptionKind::SmallWholeSetRead,
+                            table: "json_each",
+                            reason: "bounded incoming model IDs, never a persisted history scan",
+                        }],
+                    )
+                    .map_err(|e| anyhow::anyhow!("{sql}\n{e:#}"))?;
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
 }

@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-rusqlite = { version = "0.38", features = ["bundled", "trace"] }
+rusqlite = { version = "0.39", features = ["bundled", "trace"] }
 tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]

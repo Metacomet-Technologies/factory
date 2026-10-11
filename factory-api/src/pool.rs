@@ -18,6 +18,8 @@ pub struct Pool {
 
 impl Pool {
     pub async fn open(requests: PathBuf, prices: PathBuf) -> Result<Self> {
+        let check = prices.clone();
+        crate::data::blocking(move || pricing::verify_path(check)).await?;
         let requests = factory_db::Pool::open(
             requests,
             Config::default(),

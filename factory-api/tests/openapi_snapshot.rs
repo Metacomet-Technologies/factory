@@ -4,6 +4,7 @@ use factory_api::{AppState, fleet, router};
 #[tokio::test]
 async fn openapi_snapshot() -> Result<()> {
     let directory = tempfile::tempdir()?;
+    pricing::migrate(directory.path().join("pricing.db"))?;
     let state = AppState::new(
         "http://127.0.0.1:1".into(),
         directory.path().join("requests.db"),

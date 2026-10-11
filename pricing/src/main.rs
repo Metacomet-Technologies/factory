@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use pricing::{DEFAULT_CONFIG, Store, parse_references, refresh_live};
+use pricing::{DEFAULT_CONFIG, Store, fetch_live, parse_references};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -33,19 +33,22 @@ enum Command {
         prompt_tokens: u64,
         output_tokens: u64,
         /// Unix seconds or RFC3339 with an explicit timezone.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "at_ms")]
         at: Option<String>,
+        /// Unix milliseconds, without magnitude-based unit guessing.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+        at_ms: Option<i64>,
     },
 }
 
 fn timestamp(text: &str) -> Result<i64> {
     if let Ok(value) = text.parse::<i64>() {
         ensure!(value >= 0, "timestamp must be nonnegative");
-        return Ok(value);
+        return value.checked_mul(1000).context("timestamp overflow");
     }
     let value = DateTime::parse_from_rfc3339(text)
         .context("expected Unix seconds or RFC3339 timestamp")?
-        .timestamp();
+        .timestamp_millis();
     ensure!(value >= 0, "timestamp must be nonnegative");
     Ok(value)
 }
@@ -54,20 +57,30 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = cli.config.map(std::fs::read_to_string).transpose()?;
     let references = parse_references(config.as_deref().unwrap_or(DEFAULT_CONFIG))?;
-    let mut store = Store::open(&cli.db)?;
-    let now = Utc::now().timestamp();
+    pricing::verify_path(&cli.db)?;
+    let pool = factory_db::Pool::open_sync(
+        cli.db,
+        factory_db::Config::default(),
+        |db, _| Store::from_connection(db),
+        Store::connection,
+    )?;
+    let scope = factory_db::Scope::default();
+    let now = Utc::now().timestamp_millis();
     match cli.command {
         Command::Refresh => {
-            let items = refresh_live(&mut store, &references, now)?;
+            let (primary, secondary, items) = fetch_live(now)?;
+            let items = pool.write_sync(&scope, move |store| {
+                store.refresh(&references, &primary, &secondary, now, items)
+            })?;
             println!("{}", serde_json::to_string_pretty(&items)?);
         }
         Command::Show => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
+            let view = pool.read_sync(&scope, move |store| {
+                Ok(serde_json::json!({
                     "families": store.show(&references, now)?, "items": store.items()?
-                }))?
-            );
+                }))
+            })?;
+            println!("{}", serde_json::to_string_pretty(&view)?);
         }
         Command::Confirm { family } => {
             ensure!(
@@ -76,7 +89,9 @@ fn main() -> Result<()> {
             );
             println!(
                 "{}",
-                serde_json::to_string_pretty(&store.confirm(&family, now)?)?
+                serde_json::to_string_pretty(
+                    &pool.write_sync(&scope, move |store| store.confirm(&family, now))?
+                )?
             );
         }
         Command::Cost {
@@ -84,13 +99,22 @@ fn main() -> Result<()> {
             prompt_tokens,
             output_tokens,
             at,
+            at_ms,
         } => {
-            let at = at.as_deref().map(timestamp).transpose()?.unwrap_or(now);
+            let at = at_ms
+                .or(at.as_deref().map(timestamp).transpose()?)
+                .unwrap_or(now);
             println!(
                 "{:.9} USD",
-                store.cost(&family, prompt_tokens, output_tokens, at)?
+                pool.read_sync(&scope, move |store| store.cost(
+                    &family,
+                    prompt_tokens,
+                    output_tokens,
+                    at
+                ))?
+                .display_usd()
             );
         }
     }
-    Ok(())
+    pool.close_sync()
 }

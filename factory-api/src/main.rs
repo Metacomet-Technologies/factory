@@ -1,9 +1,11 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use factory_api::{AppState, fleet, router};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(Parser)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     #[arg(long, env = "FACTORY_API_LISTEN", default_value = "0.0.0.0:8080")]
     listen: SocketAddr,
     #[arg(
@@ -33,6 +35,16 @@ struct Args {
     )]
     static_dir: PathBuf,
 }
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create an empty pricing v1 database. Never converts a legacy file.
+    Migrate {
+        #[arg(long)]
+        pricing_db: PathBuf,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -42,6 +54,23 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    if let Some(Command::Migrate { pricing_db }) = args.command {
+        let report = pricing::migrate(&pricing_db)?;
+        let db = rusqlite::Connection::open_with_flags(
+            &pricing_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let tables = db
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        println!(
+            "pricing user_version={}; tables: {}",
+            report.to,
+            tables.join(", ")
+        );
+        return Ok(());
+    }
     let text = args
         .services_config
         .map(std::fs::read_to_string)
