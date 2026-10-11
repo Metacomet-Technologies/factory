@@ -5,6 +5,11 @@ use std::path::PathBuf;
 struct Args {
     #[arg(long)]
     db_path: PathBuf,
+    /// Create the captured v0 fixture for an explicit meter conversion.
+    #[arg(long)]
+    legacy: bool,
+    #[arg(long, requires = "legacy")]
+    bad_row: bool,
     #[arg(long, default_value_t = 42)]
     seed: u64,
     #[arg(long, default_value_t = 100_000)]
@@ -19,13 +24,33 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    // Refuse existing files, including symlinks, rather than risking a live database.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&args.db_path)?;
-    let db = meter::db::Db::open(&args.db_path)?;
-    sandbox::seed::seed(&db, args.seed, args.rows, args.days, args.end_ms).await?;
+    if args.legacy {
+        sandbox::seed::legacy(
+            &args.db_path,
+            args.seed,
+            args.rows,
+            args.days,
+            args.end_ms,
+            args.bad_row,
+        )?;
+    } else {
+        anyhow::ensure!(!args.db_path.try_exists()?, "seed requires a new path");
+        let meter = std::env::current_exe()?.with_file_name("meter");
+        anyhow::ensure!(
+            tokio::process::Command::new(meter)
+                .arg("migrate")
+                .arg("--db")
+                .arg(&args.db_path)
+                .status()
+                .await?
+                .success(),
+            "meter initialization failed"
+        );
+        let path = args.db_path.clone();
+        let db = tokio::task::spawn_blocking(move || meter::db::Db::open(&path)).await??;
+        sandbox::seed::seed(&db, args.seed, args.rows, args.days, args.end_ms).await?;
+        db.close().await?;
+    }
     println!(
         "seeded {} requests; seed={}, days={}, end_ms={}",
         args.rows, args.seed, args.days, args.end_ms

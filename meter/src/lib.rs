@@ -1,4 +1,6 @@
 pub mod db;
+pub mod migrate;
+mod storage;
 mod telemetry;
 mod usage;
 
@@ -66,8 +68,8 @@ impl AppState {
         }
     }
 
-    pub fn start_telemetry(&self, seconds: u64) {
-        telemetry::start(self.clone(), seconds);
+    pub fn start_telemetry(&self, seconds: u64) -> tokio::task::JoinHandle<()> {
+        telemetry::start(self.clone(), seconds)
     }
 }
 
@@ -282,6 +284,14 @@ mod api {
     use shared::{GpuResponse, Health, MeterQuery, MeterRequestsQuery, ModelStats};
     use utoipa::OpenApi;
 
+    #[derive(serde::Serialize, utoipa::ToSchema)]
+    struct MeterHealth {
+        #[serde(flatten)]
+        build: Health,
+        #[serde(flatten)]
+        queue: db::QueueStatus,
+    }
+
     fn since(range: Option<&str>) -> Result<i64, String> {
         let days = match range.unwrap_or("24h") {
             "24h" => 1,
@@ -356,13 +366,14 @@ mod api {
         }
     }
 
-    #[utoipa::path(get, path = "/meter/health", responses((status = 200, body = Health), (status = 503, body = ApiError)))]
+    #[utoipa::path(get, path = "/meter/health", responses((status = 200, body = MeterHealth), (status = 503, body = ApiError)))]
     async fn health(state: &AppState) -> Result<serde_json::Value, String> {
-        state
-            .db
-            .query("SELECT id,record FROM requests LIMIT 0".into())
-            .await?;
-        serde_json::to_value(shared::build_info()).map_err(|e| e.to_string())
+        state.db.health().await.map_err(|e| e.to_string())?;
+        serde_json::to_value(MeterHealth {
+            build: shared::build_info(),
+            queue: state.db.queue_status(),
+        })
+        .map_err(|e| e.to_string())
     }
 
     #[utoipa::path(get, path = "/meter/gpu", responses((status = 200, body = GpuResponse), (status = 503, body = ApiError)))]
@@ -400,19 +411,12 @@ mod api {
         since: i64,
         model: Option<String>,
     ) -> Result<serde_json::Value, String> {
-        let filter = model
-            .map(|m| format!(" AND model = '{}'", m.replace('\'', "''")))
-            .unwrap_or_default();
-        let value = state
+        let stats = state
             .db
-            .query(format!(
-                "SELECT id,record FROM requests WHERE ts >= {since}{filter}"
-            ))
-            .await?;
-        serde_json::from_value(value)
-            .map(db::stats)
-            .and_then(serde_json::to_value)
-            .map_err(|e| e.to_string())
+            .stats(since, model)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(stats).map_err(|e| e.to_string())
     }
     #[utoipa::path(get, path = "/meter/requests", params(
         ("limit" = Option<usize>, Query, description = "Without after_id: 1..10000, default 100. With after_id: 1..5000, default 500."),
@@ -425,22 +429,12 @@ mod api {
         limit: usize,
         after_id: Option<i64>,
     ) -> Result<Response<Body>, String> {
-        let order = match after_id {
-            Some(id) => format!("WHERE id > {id} ORDER BY id ASC"),
-            None => "ORDER BY id DESC".into(),
-        };
         let rows = state
             .db
-            .query(format!(
-                "SELECT id,record FROM requests {order} LIMIT {limit}"
-            ))
-            .await?;
-        let next = after_id.map(|cursor| {
-            rows.as_array()
-                .and_then(|rows| rows.last())
-                .and_then(|row| row["id"].as_i64())
-                .unwrap_or(cursor)
-        });
+            .requests(limit, after_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let next = after_id.map(|cursor| rows.last().map_or(cursor, |row| row.id));
         let mut response = Json(rows).into_response();
         if let Some(next) = next {
             response
@@ -451,12 +445,8 @@ mod api {
     }
     #[utoipa::path(get, path = "/meter/gpu/history", params(("range" = Option<String>, Query, description = "24h (default), 7d, 30d; retained for 7 days")), responses((status = 200, body = [shared::GpuSample]), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
     async fn history_doc(state: &AppState, since: i64) -> Result<serde_json::Value, String> {
-        state
-            .db
-            .query(format!(
-                "SELECT id,sample FROM gpu_samples WHERE ts >= {since} ORDER BY ts,id"
-            ))
-            .await
+        let samples = state.db.history(since).await.map_err(|e| e.to_string())?;
+        serde_json::to_value(samples).map_err(|e| e.to_string())
     }
     #[utoipa::path(get, path = "/meter/openapi.json", responses((status = 200, description = "OpenAPI 3.1 document")))]
     fn openapi_doc() -> Response<Body> {
@@ -471,6 +461,8 @@ mod api {
             shared::GpuSample,
             GpuResponse,
             Health,
+            MeterHealth,
+            db::QueueStatus,
             ModelStats,
             ApiError,
             MeterQuery,

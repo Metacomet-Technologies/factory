@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 shared = { path = "../shared" }
+factory-db = { path = "../factory-db" }
+anyhow = "1"
+tempfile = "3"
 serde.workspace = true
 serde_json.workspace = true
 utoipa.workspace = true
@@ -20,5 +23,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
-tempfile = "3"
 futures-util = "0.3"

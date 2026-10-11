@@ -33,6 +33,8 @@ The working agreement and hard-won lessons for building and operating the factor
 - **Agents never run as `dgarbs51`/`david`, and never get sudo.** Agents write install scripts; a human reviews and runs them.
 - **Never touch production while testing.** Use the sandbox (MET-93) or a side port (:11500 / :18080) with temp DBs. Leave deployed PIDs untouched.
 - **Installer pattern** (every deploy script): prebuilt binary as an argument (no building as root), root check, read-only preflight, error trap that prints the rollback command, a snapshot before any change, a quiet wait loop then one `curl -fsS`, post-start checks **as the service user**, a matching rollback, idempotent reruns.
+- Restart only what changed (e.g. never Ollama when its drop-in is unchanged).
+- Legacy `*.v0.db` files stay until the next migration is verified and MET-74 holds 7 daily snapshots of the new schema, then explicit cleanup.
 - **Never repurpose distro system accounts** (e.g. Ubuntu's `backup`); create dedicated ones.
 - **Security:** everything tailnet-only; LLM tools are **read-only**; logs and tool output are untrusted data; enforce schemas, allowlists and limits **in code**, never only in prompts. Verify any command a local model suggests (gemma4 invents CLI flags).
 - **Database rules (MET-92, see `AGENTS.md`):** no N+1 (query-count tests), `EXPLAIN` tests on hot queries, versioned migrations, `STRICT` tables, all times `*_ms` UTC, money as integers (rates in micro-dollars per Mtok; per-request costs and totals in nano-dollars; priced costs frozen, `cost_status` priced/estimated/unpriced), the shared PRAGMA/pool helper, retention per table (raw requests 365 days + rollups), no blocking tokio threads, no lock held across network I/O.

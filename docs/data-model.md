@@ -385,6 +385,14 @@ REAL NOT NULL `memory_used_mib`, `memory_total_mib`, `power_w`; REAL NOT NULL
 Indexes: `(ts_ms)` for all-GPU retention/history and `(gpu_index,ts_ms,id)` for
 physical-GPU history. Remove duplicate sample JSON, keep wire `ts` compatibility.
 
+Meter v1 also owns STRICT `drop_episodes`: `id INTEGER PRIMARY KEY AUTOINCREMENT`,
+`started_at_ms`, `ended_at_ms`, `dropped_requests`, `dropped_gpu_samples`, all
+INTEGER NOT NULL with nonnegative CHECKs and `ended_at_ms>=started_at_ms`.
+One row records each overflow episode after the bounded 1,024 writer queue drains.
+Health exposes process-lifetime request/GPU drop counters and queue depth while
+status remains `ok`; warnings are rate-limited. Episodes are retained indefinitely.
+factory-api and factory-status warning presentation follows separately.
+
 API `sync_state`: `id INTEGER PRIMARY KEY CHECK(id=1)`, `last_after_id INTEGER NOT
 NULL CHECK(last_after_id>=0)`, `synced_at_ms INTEGER NOT NULL CHECK(synced_at_ms>=0)`.
 STRICT singleton, initialized to zero for migration 3's empty rebuild, not
@@ -753,14 +761,21 @@ user_version**. Proposed versions are per DB, not one shared global version:
 | Order / DB migration | Work and verification | Reversibility |
 | --- | --- | --- |
 | 1. pricing v1: empty rebuild + STRICT + ms/money | Preserve verified backup and `pricing.v0.db` with sidecars; copy no data. Explicit runner creates four empty tables, indexes and FKs, then sets user_version=1. Startup refuses any other version. Refresh and confirm each family afterward | **Backup-gated**; move v1 and sidecars aside, restore v0 and its compatible binary/unit; never delete either DB |
-| 2. meter v1: typed facts + attribution | Rebuild requests/GPU, extract/validate all JSON values, preserve IDs and ns durations, rename ts to ts_ms, initialize users, indexes/AUTOINCREMENT sequence above historical maximum; no retention yet; count both tables, compare token sums/null counts/ranges and wire output | **Backup-gated**; normalized JSON/wire reconstruction must not rely on an untested reverse transform |
+| 2. meter v1: typed facts + attribution | New-file conversion of requests/GPU, extract/validate all JSON values, preserve IDs and ns durations, rename ts to ts_ms, initialize users, indexes/AUTOINCREMENT sequence at least historical maximum; count both tables, compare token sums/null counts/ranges and every row's wire output. Existing seven-day GPU deletion continues; no request retention yet | **Backup-gated**; swap files only after validation, retain v0 and sidecars with the compatible binary |
 | 3. API cache v1: empty rebuild + typed replica + durable cursor/warnings | Preserve the old cache, create an empty typed cache and initialize sync_state to 0. Re-sync from meter `after_id=0`, filling the 340–421 gap from retained source history; verify IDs/counts/token sums. No in-place conversion of cache JSON | **Backup-gated**; restore the old cache with its compatible binary; meter remains the authoritative source |
 | 4. API cache v2: frozen costs | Add request_costs, backfill in resumable id batches against pricing v1; no pruning. Count = inference rows × configured families; prove each classification, integer totals, zero vs NULL and selected/snapshot provenance. Publish backfill-complete state only after all rows pass | Schema addition can be reversed by dropping costs/reverting compatible code **before any rollup/pruning**; snapshot still mandatory |
 | 5. meter v2 and API cache v3: rollup tables/state | Add hourly/daily metrics, API spend, GPU hourly and state; build retained history in bounded resumable batches; compare aggregate counts/tokens/costs against raw before enabling reads. Existing missing history is not reconstructed | Additive and reversible by dropping new tables/reverting code **before pruning**; snapshot mandatory |
 | 6. scheduled jobs activated after all backfills | Enable five-minute jobs, then enable 365-day request / seven-day GPU pruning only after checkpoints and comparison gates; count every table before/after each prune and match deleted counts to eligible IDs | **Backup-gated** once rows are deleted; migration runner's version alone must not enable irreversible deletion |
 
-Meter remains the one careful data conversion. For its table rebuilds, use new temporary-named tables with **explicit column
-lists**, copy in a migration transaction, validate before dropping/renaming,
+Meter v1 uses a new-file swap: `meter migrate --legacy OLD --db NEW` opens OLD
+read-only and runs the shared migration runner against a new file. `--dry-run`
+deletes the temporary output; omitting `--legacy` initializes an empty v1 DB.
+Nonempty destinations are refused. Runtime requires user_version=1 and never
+creates schema. The installer preserves `meter.v0.db` and its sidecars before
+installing the verified new file; rollback restores that generation and binary.
+
+Where a new-file swap is not used, rebuild with new temporary-named tables and
+**explicit column lists**, copy in a migration transaction, validate before dropping/renaming,
 recreate indexes, run FK checks, then commit and set user_version atomically.
 No silent CAST of invalid JSON/types/overflow or dropped "bad rows". Fail with
 offending IDs; the operator repairs a copy or chooses a separate explicit policy.
