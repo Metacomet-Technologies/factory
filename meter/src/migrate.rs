@@ -43,6 +43,34 @@ pub fn readonly(path: &Path) -> Result<Connection> {
     )?)
 }
 
+/// Offline conversion requires a stopped, checkpointed source. Immutable reads
+/// must never hide committed WAL data or create sidecars in the preserved source.
+fn immutable(path: &Path) -> Result<Connection> {
+    let path = path.canonicalize()?;
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    match std::fs::metadata(&wal) {
+        Ok(meta) => ensure!(
+            meta.is_file() && meta.len() == 0,
+            "legacy WAL is non-empty; stop meter and checkpoint before migration"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    // Encode the entire absolute filename, including ?, #, % and non-UTF8 bytes;
+    // none of the filename may become URI parameters.
+    let filename: String = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|byte| format!("%{byte:02X}"))
+        .collect();
+    Ok(Connection::open_with_flags(
+        format!("file:{filename}?mode=ro&immutable=1"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?)
+}
+
 #[derive(Default, Serialize)]
 pub struct TableReport {
     count: u64,
@@ -267,7 +295,15 @@ pub fn migrate(legacy: Option<&Path>, destination: Option<&Path>, dry_run: bool)
     if let Some(path) = destination {
         empty_target(path)?;
     }
-    let mut source = legacy.map(readonly).transpose()?;
+    let mut source = legacy
+        .map(|path| {
+            if dry_run {
+                readonly(path)
+            } else {
+                immutable(path)
+            }
+        })
+        .transpose()?;
     let source = source.as_mut().map(Connection::transaction).transpose()?;
     if let Some(source) = &source {
         check_legacy(source)?;

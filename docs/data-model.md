@@ -783,7 +783,16 @@ wire/typed facts, not original JSON spelling; do not silently tolerate new chang
 separately reports raw-to-legacy-cache and legacy-wire-to-cache differences.
 
 Meter v1 uses a new-file swap: `meter migrate --legacy OLD --db NEW` opens OLD
-read-only and runs the shared migration runner against a new file. `--dry-run`
+immutable after refusing a nonempty WAL, and runs the shared migration runner
+against a new file. The caller must stop the writer and checkpoint first.
+`--dry-run` and `--check-only` instead use WAL-aware read-only connections as the
+DB owner; even read-only SQLite can create WAL/SHM sidecars. The installer runs
+all its DB inspections as `meter`, verifies ownership immediately after the
+installed MET-74 snapshot operation, and requires meter:meter 0600 on the DB and
+any sidecars before starting the service. It captures the preserved generation
+after inspections; immutable conversion leaves those files byte-identical.
+Rollback requires an identical main file; sidecars may match or be absent/empty.
+`--dry-run`
 deletes the temporary output; omitting `--legacy` initializes an empty v1 DB.
 Nonempty destinations are refused. Runtime requires user_version=1 and never
 creates schema. The installer preserves `meter.v0.db` and its sidecars before

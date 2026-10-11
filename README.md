@@ -165,8 +165,11 @@ unwritable disk.
 Runtime refuses any schema version except 1 and never creates tables. Initialize
 an empty DB with `meter migrate --db NEW`. Convert legacy files offline with
 `meter migrate --legacy OLD --db NEW`; `--dry-run` validates into a temporary
-file and removes it. Legacy input stays read-only; nonempty output paths are
-refused. Invalid JSON, unknown fields, overflow, NULL/type violations, timestamp
+file and removes it. Real conversion requires a stopped, checkpointed legacy DB:
+it refuses a nonempty WAL and opens the source immutable, creating no sidecars.
+`--dry-run` and `--check-only` use WAL-aware read-only connections and may create
+WAL/SHM files; run them as the DB owner (`meter` on production), never root.
+Nonempty output paths are refused. Invalid JSON, unknown fields, overflow, NULL/type violations, timestamp
 mismatches and wire differences fail without publishing a new DB. Reports include
 counts, ID summaries/sequences, nulls, token sums, timestamp ranges and elapsed ms.
 
@@ -307,6 +310,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
 bash -n deploy/install-meter.sh deploy/rollback-meter.sh deploy/rollback-meter-v1.sh
+bash meter/tests/installer-db.sh target/debug/meter
 python3 -B deploy/test_set_ollama_host.py
 ```
 

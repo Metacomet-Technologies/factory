@@ -2,13 +2,21 @@
 set -Eeuo pipefail
 umask 0077
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+check_preserved_v0() {
+    local snapshot_db=$1 legacy_db=$2 suffix
+    cmp -s "$snapshot_db" "$legacy_db" || fail "Preserved v0 main file differs from its stopped snapshot: $legacy_db"
+    for suffix in -wal -shm; do
+        [[ ! -s "$legacy_db$suffix" ]] || cmp -s "$snapshot_db$suffix" "$legacy_db$suffix" || fail "Preserved v0 sidecar differs from its stopped snapshot: $legacy_db$suffix"
+    done
+}
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 [[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/rollback-meter-v1.sh <snapshot-directory>.'
 [[ $# -eq 1 ]] || fail 'Supply the exact installer snapshot directory.'
 snapshot=$(realpath "$1")
 db=/srv/factory/meter/meter.db
 legacy=/srv/factory/meter/meter.v0.db
 trap 'printf "ERROR: rollback failed at line %s; snapshot retained at %s. Meter may remain stopped.\n" "$LINENO" "$snapshot" >&2' ERR
-for command in systemctl cp rm cat mv mktemp date sudo curl touch sqlite3 flock realpath chmod chown cmp dirname sleep; do
+for command in systemctl cp rm cat mv mktemp date sudo curl touch sqlite3 flock realpath chmod chown cmp dirname sleep stat; do
     command -v "$command" >/dev/null || fail "Required command missing: $command"
 done
 [[ -f "$snapshot/complete" && -f "$snapshot/enabled" && -f "$snapshot/active" && -f "$snapshot/mode" ]] || fail 'Snapshot is incomplete.'
@@ -42,26 +50,25 @@ if [[ -f "$snapshot/db-changing" ]]; then
         # Use a disposable copy: SQLite must not modify preserved sidecars.
         check=$(mktemp -d)
         trap 'rm -rf -- "$check"' EXIT
+        chown meter:meter "$check"
         for suffix in '' -wal -shm; do
-            if [[ -f "$snapshot/$source_name$suffix" ]]; then cp -p -- "$snapshot/$source_name$suffix" "$check/meter.db$suffix"; fi
+            if [[ -f "$snapshot/$source_name$suffix" ]]; then
+                cp -p -- "$snapshot/$source_name$suffix" "$check/meter.db$suffix"
+                chown meter:meter "$check/meter.db$suffix"
+                chmod 0600 "$check/meter.db$suffix"
+            fi
         done
         expected=1
         [[ "$mode" != legacy ]] || expected=0
-        [[ $(sqlite3 -readonly "$check/meter.db" 'PRAGMA user_version;') == "$expected" ]] || fail 'Snapshot schema version does not match previous binary generation.'
-        [[ $(sqlite3 -readonly "$check/meter.db" 'PRAGMA integrity_check;') == ok ]] || fail 'Snapshot integrity failed.'
+        [[ $(sudo -u meter sqlite3 -readonly "$check/meter.db" 'PRAGMA user_version;') == "$expected" ]] || fail 'Snapshot schema version does not match previous binary generation.'
+        [[ $(sudo -u meter sqlite3 -readonly "$check/meter.db" 'PRAGMA integrity_check;') == ok ]] || fail 'Snapshot integrity failed.'
     fi
 fi
 [[ -d /var/backups/factory-db ]] || fail 'MET-74 backup lock is unavailable.'
 exec 9>>/var/backups/factory-db/.backup.lock
 flock -n 9 || fail 'Backup or deployment is running; retry later.'
 if [[ "$mode" == legacy && -f "$snapshot/legacy-preserved" && ! -f "$snapshot/db-restored" ]]; then
-    for suffix in '' -wal -shm; do
-        if [[ -f "$snapshot/meter.v0.db$suffix" ]]; then
-            cmp -s "$snapshot/meter.v0.db$suffix" "$legacy$suffix" || fail "Preserved v0 differs from its stopped snapshot: $legacy$suffix"
-        else
-            [[ ! -e "$legacy$suffix" ]] || fail "Unexpected preserved v0 sidecar: $legacy$suffix"
-        fi
-    done
+    check_preserved_v0 "$snapshot/meter.v0.db" "$legacy"
 fi
 if [[ $(systemctl show meter.service --property=LoadState --value) != not-found ]]; then
     systemctl stop meter.service
@@ -111,6 +118,12 @@ systemctl daemon-reload
 if [[ "$enabled" == enabled ]]; then systemctl enable meter.service; fi
 if [[ "$active" == active ]]; then
     [[ -f /usr/local/bin/meter && -f /etc/systemd/system/meter.service ]] || fail 'Cannot restart: prior binary/unit missing.'
+    [[ -f "$db" ]] || fail "Cannot restart: meter DB missing: $db"
+    for path in "$db" "$db-wal" "$db-shm"; do
+        if [[ -e "$path" ]]; then
+            [[ ! -L "$path" && -f "$path" && $(stat -c %U:%G:%a "$path") == meter:meter:600 ]] || fail "Expected meter:meter 0600 file: $path"
+        fi
+    done
     systemctl start meter.service
     deadline=$((SECONDS + 45))
     while (( SECONDS < deadline )); do

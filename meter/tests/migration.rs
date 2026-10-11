@@ -53,6 +53,83 @@ fn cli(args: &[&std::ffi::OsStr]) -> std::process::Output {
 }
 
 #[test]
+fn wal_conversion_preserves_source_and_refuses_uncheckpointed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("source");
+    std::fs::create_dir(&source_dir).unwrap();
+    // URI metacharacters must remain part of the filename, not open options.
+    let source = source_dir.join("legacy ?#% 模型.db");
+    let db = legacy(&source);
+    db.pragma_update(None, "journal_mode", "WAL").unwrap();
+    db.execute(
+        "INSERT INTO requests(id,record) VALUES (1,?1)",
+        [serde_json::to_string(&record(1)).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let files = || -> std::collections::BTreeMap<_, _> {
+        std::fs::read_dir(&source_dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    };
+    assert_eq!(files().len(), 1, "clean close must remove sidecars");
+    for iteration in 0..2 {
+        if iteration == 1 {
+            std::fs::write(format!("{}-wal", source.display()), []).unwrap();
+        }
+        let before = files();
+        let target = dir.path().join(format!("new-{iteration}.db"));
+        assert_eq!(
+            migrate(Some(&source), Some(&target), false)
+                .unwrap()
+                .verified_rows,
+            1
+        );
+        assert_eq!(files(), before, "conversion changed source files or bytes");
+    }
+    let writer = Connection::open(&source).unwrap();
+    writer
+        .execute(
+            "INSERT INTO requests(id,record) VALUES (2,?1)",
+            [serde_json::to_string(&record(2)).unwrap()],
+        )
+        .unwrap();
+    assert!(
+        std::fs::metadata(format!("{}-wal", source.display()))
+            .unwrap()
+            .len()
+            > 0
+    );
+    let target = dir.path().join("refused.db");
+    let error = migrate(Some(&source), Some(&target), false).err().unwrap();
+    assert!(error.to_string().contains("WAL is non-empty"), "{error:#}");
+    assert!(!target.exists());
+    // Online checks must see the committed WAL row, not an immutable stale main file.
+    assert_eq!(migrate(Some(&source), None, true).unwrap().verified_rows, 2);
+    let check = cli(&[
+        "migrate".as_ref(),
+        "--legacy".as_ref(),
+        source.as_os_str(),
+        "--check-only".as_ref(),
+    ]);
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    assert_eq!(
+        writer
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn cli_initialization_empty_conversion_dry_run_rerun_and_version_refusal() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("new.db");

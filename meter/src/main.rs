@@ -22,15 +22,16 @@ struct Config {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialize an empty database or strictly convert a legacy file offline.
+    /// Initialize a database or convert a stopped, checkpointed legacy file offline.
     Migrate {
         #[arg(long)]
         legacy: Option<PathBuf>,
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Validate with WAL-aware reads as the DB owner; discard temporary output.
         #[arg(long, conflicts_with = "check_only")]
         dry_run: bool,
-        /// Read-only schema/version preflight for the installer. Copies no rows.
+        /// WAL-aware schema/version preflight as the DB owner. Copies no rows.
         #[arg(long, requires = "legacy", conflicts_with = "db")]
         check_only: bool,
     },
