@@ -96,6 +96,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 - **`ssh -t dgarbs51@<host> '…'`** only for interactive prompts.
 - **Full paths with sudo** (`/home/agent/work/factory/...`): admins can't `cd` into `/home/agent`. For agent-owned paths, run as the agent: `sudo -u agent git -C /home/agent/work/factory status -sb`.
 - Agent-thread commands go in a separate prompt block with the handoff header, never mixed with Mac commands.
+- **Every step has its command:** each step given to Devon includes the exact command and where it runs, or says **UI only** and where (for example, archiving an Amp thread). Steps Claude can do with its own tools (reviews, Linear updates) Claude does or offers; irreversible actions (merges, deletes) need Devon's explicit yes first.
 
 ### Day-to-day operations
 
