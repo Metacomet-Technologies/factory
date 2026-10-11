@@ -105,3 +105,40 @@ jobs:
           shellcheck -x "${scripts[@]}"
       - run: python3 -B deploy/test_set_ollama_host.py
       - run: python3 -B deploy/backup/test-backup.py
+
+  sandbox:
+    name: sandbox
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Install sandbox prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bubblewrap shellcheck
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: sandbox-${{ runner.os }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*') }}
+      - name: Check sandbox scripts
+        run: |
+          scripts=(scripts/sandbox scripts/sandbox-shims/nvidia-smi scripts/sandbox-shims/tailscale scripts/sandbox-shims/timedatectl)
+          for script in "${scripts[@]}"; do bash -n "$script"; done
+          shellcheck -x "${scripts[@]}"
+      - run: scripts/sandbox up --rows 1k
+      - run: python3 scripts/sandbox-shims/smoke.py
+      - name: Sandbox logs
+        if: failure()
+        run: |
+          for service in runtime seed meter factory-api; do scripts/sandbox logs "$service" || true; done
+      - name: Stop sandbox
+        if: always()
+        run: scripts/sandbox down

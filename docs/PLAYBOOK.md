@@ -52,7 +52,7 @@ Every prompt has these sections:
 3. **Isolation:** the exact directories it may edit.
 4. **Build:** spec and requirements; contracts written out exactly.
 5. **Tests:** what must pass (`cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace`; `vp check`/`vp test`/`vp build`).
-6. **Live check (no system changes):** a side port, temp DB, evidence in the final message.
+6. **Sandbox check:** `scripts/sandbox up` (synthetic data, fake Ollama), run the checks, include evidence (URLs, counts, timings) in the final message, then `scripts/sandbox down`. Production read-only checks only when the prompt explicitly asks.
 7. **Deploy artifacts:** write, don't run.
 8. **Done means:** push, open the PR, final message with results, deviations, anything unverified, and exact deploy steps.
 
