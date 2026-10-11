@@ -5,6 +5,7 @@ import concurrent.futures
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -85,7 +86,8 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
     status = root / "var/lib/factory-reboot/status.json"
     calls = fixture / "calls"
     commands = dict(ps=f"2481 1 {RUNNER}\n34170 2481 {PLUGIN}\n31101 1 op daemon\n",
-                    meter=json.dumps([{"ts": NOW - 600_001}]), ups="OL", node="factory-gpu")
+                    meter=json.dumps([{"ts": NOW - 600_001, "endpoint": "/api/chat"}]),
+                    ups="OL", node="factory-gpu")
     env = dict(os.environ, REBOOT_ROOT=str(root), REBOOT_CONFIG=str(config_path),
                REBOOT_NOW_MS=str(NOW), REBOOT_FIXTURE=str(fixture),
                PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])
@@ -126,12 +128,28 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
 
     for ts, decision in ((NOW - 599_999, "skipped"), (NOW - 600_000, "skipped"),
                          (NOW - 600_001, "would-reboot"), (NOW + 1, "skipped")):
-        expect(decision, updates={"meter": json.dumps([{"ts": ts}])})
+        expect(decision, updates={"meter": json.dumps([{"ts": ts, "endpoint": "/api/chat"}])})
+    health = {"ts": NOW - 1, "endpoint": "/api/version"}
+    expect("would-reboot", updates={"meter": json.dumps([health])})
+    expect("would-reboot", updates={"meter": json.dumps([
+        health, {"ts": NOW - 600_001, "endpoint": "/api/chat"}])})
+    expect("skipped", "meter-recent", updates={"meter": json.dumps([
+        health, {"ts": NOW - 599_999, "endpoint": "/api/chat"}])})
+    # Use the API's public usage contract as inputs, not the reboot implementation.
+    api = (HERE.parents[1] / "factory-api/src/lib.rs").read_text()
+    endpoints = re.findall(r'"([^"]+)"', re.search(
+        r'pub const INFERENCE_ENDPOINTS:.*?= \[(.*?)\];', api, re.S).group(1))
+    for endpoint in endpoints:
+        expect("skipped", "meter-recent", updates={"meter": json.dumps([
+            {"ts": NOW - 1, "endpoint": endpoint}])})
+    expect("would-reboot", updates={"meter": json.dumps([
+        {"ts": NOW - 1, "endpoint": "/api/embeddings"}])})
     expect("skipped", "meter-unknown", updates={"meter_code": 7})
-    for invalid in ("invalid JSON", '{"ts": 1}', '[{"ts": true}]', '[{}]'):
+    for invalid in ("invalid JSON", '{"ts": 1}', '[{"ts": true,"endpoint":"/api/version"}]',
+                    '[{}]', '[{"ts":1}]', '[{"ts":1,"endpoint":null}]'):
         expect("skipped", "meter-unknown", updates={"meter_code": 0, "meter": invalid})
     expect("would-reboot", updates={"meter": "[]"})
-    print("PASS: 10-minute boundary, stale/empty/recent/future traffic and unknown meter")
+    print("PASS: inference-only meter checks, health rows, all usage endpoints, time boundaries and failures")
 
     for ups, code, decision, reason in (("OL", 0, "would-reboot", None),
                                        ("OB DISCHRG", 0, "skipped", "ups-on-battery"),
@@ -215,12 +233,23 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
         timer = (HERE / "factory-reboot.timer").read_text().replace("@CALENDAR@", calendar)
         assert f"OnCalendar=*-*-* {expected} America/New_York" in timer
         assert "Persistent=false" in timer and "RandomizedDelaySec=0" in timer
+        config_path.write_text(json.dumps(node_config))
+        runner = RUNNER.replace("factory-gpu", node)
+        plugin = PLUGIN.replace("q517Yo", "OuJYUh" if node == "factory-console" else "q517Yo")
+        expect("would-reboot", updates={"ps": f"4909 1 {runner}\n138429 4909 {plugin}\n"})
+        updated_plugin = plugin.replace("OuJYUh", "NewSuffix99").replace(
+            "q517Yo", "NewSuffix99").replace("46ba5e96083e1347", "012345abcdef")
+        expect("would-reboot", updates={"ps": f"4909 1 {runner}\n138429 4909 {updated_plugin}\n"})
+        expect("skipped", "agent-busy", updates={"ps": f"4909 1 {runner}\n"
+               "138429 4909 /home/agent/.amp/bin/amp run /home/agent/work/task.ts\n"})
+        expect("skipped", "agent-busy", updates={"ps": f"4909 1 {runner}\n138429 1 {updated_plugin}\n"})
         if node == "factory-console":
-            config_path.write_text(json.dumps(node_config))
+            expect("skipped", "agent-busy", updates={"ps": "31101 1 op daemon\n"})
             calls.write_text("")
-            data = expect("would-reboot", updates={"meter_code": 7, "ups_code": 1})
+            data = expect("would-reboot", updates={"ps": f"4909 1 {runner}\n138429 4909 {updated_plugin}\n",
+                          "meter_code": 7, "ups_code": 1})
             assert "curl " not in calls.read_text() and "upsc " not in calls.read_text()
-    print("PASS: both node calendars; console does not query GPU meter or UPS")
+    print("PASS: both node calendars and update-safe idle allowlists; other Amp work blocks; console excludes op/meter/UPS")
 
     # Optional stronger installer check: real scripts in a root user namespace,
     # with a read-only host and every writable destination/command replaced.
@@ -298,10 +327,19 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             snapshots = list((isolated / "var/backups/factory-reboot").iterdir())
             assert len(snapshots) == 2
             assert any((p / "etc/factory-reboot/node.conf").exists() for p in snapshots)
+            installer("install-reboot-policy.sh", "--node", node, "--mode", "enforce", "--replace-config")
+            expected_config = json.loads((HERE / f"{node}.conf").read_text())
+            expected_config["mode"] = "enforce"
+            assert json.loads(installed_config.read_text()) == expected_config
+            replacement = set((isolated / "var/backups/factory-reboot").iterdir()) - set(snapshots)
+            assert len(replacement) == 1
+            saved_config = replacement.pop() / "etc/factory-reboot/node.conf"
+            assert json.loads(saved_config.read_text()) == dict(local, mode="enforce")
+            assert all(p.stat().st_mtime_ns == stamp for p, stamp in before.items())
             installer("rollback-reboot-policy.sh")
             assert "systemctl disable factory-reboot.timer\n" in calls.read_text()
             assert "systemctl disable factory-postboot.service\n" in calls.read_text()
             installer("rollback-reboot-policy.sh")
             assert installed_status.exists() and not installed_timer.exists() and not installed_config.exists()
             assert not (isolated / "usr/local/lib/factory-reboot").exists()
-        print("PASS: both real installers in isolated namespaces; snapshots, mode-only reruns, cleared overrides and rollback")
+        print("PASS: both isolated installers; preserved/replaced config, snapshots, mode-only reruns, overrides and rollback")

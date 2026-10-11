@@ -14,6 +14,13 @@ import time
 from zoneinfo import ZoneInfo
 
 
+# factory-api/src/data.rs usage_records uses factory-api/src/lib.rs INFERENCE_ENDPOINTS.
+INFERENCE_ENDPOINTS = (
+    "/api/generate", "/api/chat", "/api/embed",
+    "/v1/chat/completions", "/v1/completions", "/v1/embeddings",
+)
+
+
 def command(*args):
     return subprocess.run(args, text=True, capture_output=True, timeout=15)
 
@@ -41,18 +48,18 @@ def busy_reason(config, now):
     if config["node"] == "factory-gpu":
         try:
             result = command("curl", "-fsS", "--max-time", "5",
-                             "http://127.0.0.1:11434/meter/requests?limit=1")
+                             "http://127.0.0.1:11434/meter/requests?limit=1000")
             if result.returncode:
                 return "meter-unknown"
             requests = json.loads(result.stdout)
-            if not isinstance(requests, list) or len(requests) > 1:
+            if not isinstance(requests, list) or len(requests) > 1000:
                 return "meter-unknown"
-            if requests:
-                ts = requests[0]["ts"]
-                if type(ts) is not int or ts < 0:
+            for request in requests:
+                ts, endpoint = request["ts"], request["endpoint"]
+                if type(ts) is not int or ts < 0 or not isinstance(endpoint, str):
                     return "meter-unknown"
                 # Future timestamps also block: an uncertain clock is not idle.
-                if now - ts <= 600_000:
+                if endpoint in INFERENCE_ENDPOINTS and now - ts <= 600_000:
                     return "meter-recent"
         except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
             return "meter-unknown"

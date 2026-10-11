@@ -4,17 +4,19 @@ umask 0077
 here=$(dirname "$(realpath "$0")")
 snapshot=
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-[[ $EUID -eq 0 ]] || fail 'Run as root: sudo bash deploy/reboot/install-reboot-policy.sh [--mode observe|enforce] [--node factory-gpu|factory-console]'
+[[ $EUID -eq 0 ]] || fail 'Run as root: sudo bash deploy/reboot/install-reboot-policy.sh [--mode observe|enforce] [--node factory-gpu|factory-console] [--replace-config]'
 trap 'printf "ERROR: reboot-policy installation failed at line %s. Snapshot: %s. Disable/remove policy with: sudo bash %s/rollback-reboot-policy.sh\n" "$LINENO" "${snapshot:-not created}" "$here" >&2' ERR
 # Never inherit harness roots, clocks, configuration or fake commands as root.
 unset REBOOT_ROOT REBOOT_CONFIG REBOOT_NOW_MS PYTHONPATH PYTHONHOME
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 mode=observe
+replace_config=false
 node=$(hostname -s)
 while (( $# )); do
     case "$1" in
         --mode) [[ $# -ge 2 ]] || fail 'Missing --mode value'; mode=$2; shift 2 ;;
         --node) [[ $# -ge 2 ]] || fail 'Missing --node value'; node=$2; shift 2 ;;
+        --replace-config) replace_config=true; shift ;;
         *) fail "Unknown argument: $1" ;;
     esac
 done
@@ -56,9 +58,9 @@ for unit in factory-reboot.service factory-reboot.timer factory-postboot.service
     enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
     case "$enabled" in enabled|disabled|static|indirect|not-found) ;; *) fail "Unsupported state: $unit $enabled" ;; esac
 done
-# Preserve local allowlist edits on reruns and mode switches.
+# Preserve local edits unless the operator explicitly requests repository defaults.
 source_config=$here/$node.conf
-if [[ -f $config ]]; then source_config=$config; fi
+if [[ -f $config && $replace_config == false ]]; then source_config=$config; fi
 calendar=$(python3 - "$source_config" "$node" <<'PY'
 import json, re, sys
 data = json.load(open(sys.argv[1]))

@@ -20,7 +20,8 @@ On factory-gpu, Ubuntu 26.04 reports `systemd 259 (259.5-0ubuntu3.4)`.
 base-time check reports 11:00 UTC during EST. Named timezones
 handle DST without a fixed-UTC caveat. The installer validates the calendar on
 each node and refuses an unsupported systemd; no UTC fallback is needed on the
-verified version. Console's version could not be inspected from this runner.
+verified version. Devon's idle console capture also reports
+`systemd 259 (259.5-0ubuntu3.4)`: timezone calendars are supported on that version.
 
 ## Decision order
 
@@ -60,11 +61,13 @@ Read-only inspection on factory-gpu on 2026-10-11 found:
 - PID 31101, parent 1: `op daemon`, the idle 1Password background process.
 - The inspection shell and `ps` process also appeared. They are work, not allowed.
 
-**Console's allowlist starts empty.** SSH host-key verification and the tailnet
-SSH policy prevented its process inspection. This deliberately blocks a console
-reboot while any agent process exists. Devon must inspect that node when idle
-and add only verified idle daemon commands before enabling enforcement there.
-Do not copy GPU rules blindly: console's runner command can differ.
+Devon's read-only idle console capture found PID 4909 (parent 1), with the same
+runner flags but `--runner-id factory-console`, and its direct plugin child PID
+138429 with suffix `OuJYUh` and plugin hash `46ba5e96083e1347`. Console allows
+only that exact runner command and its direct plugin child; no `op` daemon.
+Both nodes pattern the alphanumeric runtime suffix and hexadecimal plugin hash,
+so plugin updates stay idle. Everything else remains exact and fully matched;
+a different `amp run` script under either runner still blocks reboot.
 
 From the Mac, inspect and edit each node separately:
 
@@ -77,7 +80,8 @@ ssh -t dgarbs51@factory-console 'sudoedit /etc/factory-reboot/node.conf'
 
 JSON strings require doubled backslashes in regex escapes. Matching uses
 `re.fullmatch`, not substring matching. No daemon reload is needed for allowlist
-edits. Installer reruns preserve these local edits. An invalid configuration
+edits. Installer reruns preserve these local edits unless `--replace-config` is
+specified. An invalid configuration
 fails without rebooting; inspect the failed service's journal.
 
 This is the specified process-based busy rule, not a runner activity API.
@@ -88,14 +92,20 @@ future runner activity signal would be needed to cover that ceiling.
 ### Meter and UPS
 
 On GPU, `curl -fsS --max-time 5
-http://127.0.0.1:11434/meter/requests?limit=1` returns a JSON array, not an
-envelope. Inspection returned one request with `id: 2194`, `endpoint:
-"/api/version"`, and integer `ts: 1791753470751` (UTC milliseconds).
-Any newest request at or within 600,000 milliseconds blocks, including health
-traffic; stale requests and an empty array permit the next check. Future
-timestamps block too. Unreachable, malformed or incorrectly typed output records
-`meter-unknown` and skips. This intentionally follows the ticket's unfiltered
-newest-request rule, even when periodic health traffic keeps it busy.
+http://127.0.0.1:11434/meter/requests?limit=1000` returns a newest-first JSON
+array, not an envelope. Original format inspection returned a request with
+`id: 2194`, `endpoint: "/api/version"`, and integer `ts: 1791753470751`
+(UTC milliseconds). Health traffic does not block reboot.
+
+Only the endpoints counted by factory-api's `usage_records` in `src/data.rs`
+(the `INFERENCE_ENDPOINTS` list in `src/lib.rs`) count as inference:
+`/api/generate`, `/api/chat`, `/api/embed`, `/v1/chat/completions`,
+`/v1/completions`, and `/v1/embeddings`. Any inference row at or within 600,000
+milliseconds blocks, including one behind newer health rows. Stale inference
+and an empty array permit the next check. Future inference timestamps block too.
+Unreachable, malformed or incorrectly typed output records `meter-unknown` and
+skips. The page covers the newest 1,000 requests; pagination would be needed if
+that volume could hide the 10-minute window behind newer non-inference traffic.
 
 `upsc cyberpower@localhost ups.status` returned stdout `OL\n`. Its
 `Init SSL without certificate database` diagnostic is on stderr and is not
@@ -150,6 +160,16 @@ prints JSON. On an unchanged rerun, only configuration is republished; scripts
 and units are not rewritten. Snapshots and the immediate observation still occur.
 Harness overrides and inherited command paths are discarded by installers.
 
+Reruns preserve the installed node configuration by default. To apply updated
+repository allowlists, add `--replace-config`; this replaces the entire node
+configuration, including local edits, after snapshotting the old config. Mode
+still comes from `--mode` (observe by default), not the repository file:
+
+```sh
+factory-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-gpu --mode observe --replace-config"
+console-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-console --mode observe --replace-config"
+```
+
 Read status and recent decisions from the Mac:
 
 ```sh
@@ -157,7 +177,7 @@ factory-ssh "sudo cat /var/lib/factory-reboot/status.json; sudo journalctl -u fa
 console-ssh "sudo cat /var/lib/factory-reboot/status.json; sudo journalctl -u factory-reboot.service -u factory-postboot.service -n 30 --no-pager"
 ```
 
-Only after reviewing observe results and console's allowlist, switch modes:
+Only after reviewing observe results and both allowlists, switch modes:
 
 ```sh
 factory-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-gpu --mode enforce"
