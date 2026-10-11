@@ -8,6 +8,16 @@ installed_unit=/etc/systemd/system/factory-api.service
 snapshot=
 
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+wait_ready() {
+    local url=$1 deadline=$((SECONDS + 45)) remaining
+    while (( SECONDS < deadline )); do
+        remaining=$((deadline - SECONDS))
+        (( remaining > 2 )) && remaining=2
+        if curl -fs --max-time "$remaining" -o /dev/null "$url"; then break; fi
+        if (( SECONDS < deadline )); then sleep 1; fi
+    done
+    curl -fsS --max-time 2 "$url" || fail "Service did not become ready within 45s: $url"
+}
 [[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-factory-api.sh [prebuilt-binary].'
 [[ $# -le 1 ]] || fail 'Expected at most one prebuilt binary path.'
 trap 'printf "ERROR: factory-api install failed at line %s. Snapshot: %s. Recover with: bash deploy/rollback-factory-api.sh <snapshot>\n" "$LINENO" "${snapshot:-not created (no deployment files changed)}" >&2' ERR
@@ -66,7 +76,7 @@ install -m 0644 "$unit" "$installed_unit"
 systemctl daemon-reload
 systemctl enable factory-api.service
 systemctl restart factory-api.service
-curl -fsS --max-time 2 --retry 30 --retry-connrefused --retry-delay 1 --retry-max-time 45 http://127.0.0.1:8080/v1/health
+wait_ready http://127.0.0.1:8080/v1/health
 curl -fsS --max-time 10 http://127.0.0.1:8080/v1/fleet
 tailscale_status=$(sudo -u factory-api tailscale status --json)
 [[ -n "$tailscale_status" ]] || fail 'Tailscale returned empty status for factory-api.'

@@ -26,6 +26,12 @@ struct Args {
     pricing_db_path: PathBuf,
     #[arg(long, env = "FACTORY_API_SERVICES_CONFIG")]
     services_config: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "FACTORY_API_STATIC_DIR",
+        default_value = "/var/lib/factory-api/kiosk"
+    )]
+    static_dir: PathBuf,
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -54,7 +60,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    let state = AppState::new(args.meter_url, args.db_path, args.pricing_db_path, config).await?;
+    let mut state =
+        AppState::new(args.meter_url, args.db_path, args.pricing_db_path, config).await?;
+    state.static_dir = args.static_dir;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     let tasks = state.start_collectors();
     tracing::info!(listen=%args.listen, "factory-api listening");

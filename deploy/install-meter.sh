@@ -4,6 +4,20 @@ root=$(dirname "$(dirname "$(realpath "$0")")")
 binary=${1:-/home/agent/work/factory/target/release/meter}
 drop_in=/etc/systemd/system/ollama.service.d/override.conf
 
+wait_ready() {
+    local url=$1 deadline=$((SECONDS + 45)) remaining
+    while (( SECONDS < deadline )); do
+        remaining=$((deadline - SECONDS))
+        (( remaining > 2 )) && remaining=2
+        if curl -fs --max-time "$remaining" -o /dev/null "$url"; then break; fi
+        if (( SECONDS < deadline )); then sleep 1; fi
+    done
+    if ! curl -fsS --max-time 2 "$url"; then
+        printf 'ERROR: service did not become ready within 45s: %s\n' "$url" >&2
+        exit 1
+    fi
+}
+
 if [[ ! -f "$binary" || ! -x "$binary" ]]; then
     printf 'ERROR: meter binary missing or not executable: %s\nBuild as agent first: cargo build --release --locked -p meter\n' "$binary" >&2
     exit 1
@@ -36,11 +50,11 @@ python3 "$root/deploy/set_ollama_host.py" "$drop_in" 127.0.0.1:11435
 systemctl daemon-reload
 systemctl stop meter.service
 systemctl restart ollama.service
-curl -fsS --max-time 2 --retry 30 --retry-connrefused --retry-delay 1 --retry-max-time 45 http://127.0.0.1:11435/api/version
+wait_ready http://127.0.0.1:11435/api/version
 systemctl enable meter.service
 systemctl restart meter.service
-curl -fsS --max-time 2 --retry 30 --retry-connrefused --retry-delay 1 --retry-max-time 45 http://127.0.0.1:11434/api/version
-curl -fsS --max-time 2 --retry 30 --retry-connrefused --retry-delay 1 --retry-max-time 45 http://127.0.0.1:11434/meter/health
+wait_ready http://127.0.0.1:11434/api/version
+wait_ready http://127.0.0.1:11434/meter/health
 sudo -u meter nvidia-smi -L
 # Capture first, then show one byte: piping directly to head can cause SIGPIPE.
 tailscale_status=$(sudo -u meter tailscale status --json)
