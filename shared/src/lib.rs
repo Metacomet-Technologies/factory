@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+pub mod factory_api;
+
 /// Durations reported by Ollama are nanoseconds. Timestamps are Unix milliseconds.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RequestRecord {
