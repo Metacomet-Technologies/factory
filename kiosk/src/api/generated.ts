@@ -210,6 +210,10 @@ export interface components {
       utilization_percent: number;
     };
     Health: {
+      /** Format: int64 */
+      built_at_ms: number;
+      git_dirty: boolean;
+      git_sha: string;
       status: string;
       /** Format: int64 */
       uptime_ms: number;
@@ -276,14 +280,19 @@ export interface components {
     };
     Service: {
       /** Format: int64 */
+      built_at_ms?: number | null;
+      /** Format: int64 */
       checked_at_ms: number;
       detail?: string | null;
+      git_dirty?: boolean | null;
+      git_sha?: string | null;
       kind: components["schemas"]["ServiceKind"];
       /** Format: double */
       latency_ms?: number | null;
       name: string;
       ok: boolean;
       target: string;
+      version?: string | null;
     };
     /** @enum {string} */
     ServiceKind: "http" | "tcp" | "systemd";

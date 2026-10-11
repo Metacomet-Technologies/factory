@@ -258,6 +258,19 @@ async fn request_cursor_pages_without_gaps_and_preserves_legacy_behavior() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, 1201);
+    let health: Value = client
+        .get(format!("{proxy}/meter/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["version"], include_str!("../../VERSION").trim());
+    assert!(!health["git_sha"].as_str().unwrap().is_empty());
+    assert!(health["git_dirty"].is_boolean());
+    assert!(health["built_at_ms"].as_u64().unwrap() > 1_700_000_000_000);
     let schema: Value = client
         .get(format!("{proxy}/meter/openapi.json"))
         .send()

@@ -112,11 +112,16 @@ pub fn node(config: &NodeConfig, status: &Value) -> Node {
 }
 async fn check(state: &AppState, config: &ServiceConfig) -> Service {
     let started = Instant::now();
+    let mut identity = Value::Null;
     let result: Result<()> = async {
         match config.kind {
             ServiceKind::Http => {
                 let response = state.client.get(&config.target).send().await?;
                 ensure!(response.status().is_success(), "HTTP {}", response.status());
+                if matches!(config.name.as_str(), "meter-http" | "factory-api") {
+                    // Legacy meters and non-JSON 2xx responses remain healthy but unidentified.
+                    identity = response.json().await.unwrap_or(Value::Null);
+                }
             }
             ServiceKind::Tcp => {
                 TcpStream::connect(&config.target).await?;
@@ -136,6 +141,10 @@ async fn check(state: &AppState, config: &ServiceConfig) -> Service {
         latency_ms: Some(started.elapsed().as_secs_f64() * 1000.0),
         detail: result.err().map(|e| e.to_string()),
         checked_at_ms: now_ms(),
+        version: identity["version"].as_str().map(str::to_owned),
+        git_sha: identity["git_sha"].as_str().map(str::to_owned),
+        git_dirty: identity["git_dirty"].as_bool(),
+        built_at_ms: identity["built_at_ms"].as_u64(),
     }
 }
 pub async fn collect(state: &AppState) -> Fleet {
@@ -163,6 +172,10 @@ pub async fn collect(state: &AppState) -> Fleet {
                         latency_ms: Some(5000.0),
                         detail: Some(error.to_string()),
                         checked_at_ms: now_ms(),
+                        version: None,
+                        git_sha: None,
+                        git_dirty: None,
+                        built_at_ms: None,
                     },
                 }
             }))

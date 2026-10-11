@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { defineConfig, lazyPlugins } from "vite-plus";
 import { apiTypes } from "./scripts/api-types.ts";
+import { buildInfo } from "./scripts/build-info.ts";
 
 // Keep the normal check gate tied to the deployed contract, not just a stale snapshot.
 if (process.argv.includes("check")) await apiTypes(true);
@@ -17,6 +18,7 @@ const proxy = proxyTarget
 
 // https://vite.dev/config/
 export default defineConfig({
+  define: { __BUILD_INFO__: JSON.stringify(buildInfo()) },
   test: {
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],

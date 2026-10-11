@@ -213,6 +213,7 @@ fn response<T: serde::Serialize>(result: anyhow::Result<T>) -> Response {
 }
 #[utoipa::path(get, path="/v1/health", responses((status=200, body=Health)))]
 fn health(state: &AppState) -> Json<Health> {
+    let build = shared::build_info();
     Json(Health {
         status: if state.require_clock().is_ok() {
             "ok"
@@ -220,7 +221,10 @@ fn health(state: &AppState) -> Json<Health> {
             "clock_unsynchronized"
         }
         .into(),
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: build.version,
+        git_sha: build.git_sha,
+        git_dirty: build.git_dirty,
+        built_at_ms: build.built_at_ms,
         uptime_ms: state.started.elapsed().as_millis() as u64,
     })
 }

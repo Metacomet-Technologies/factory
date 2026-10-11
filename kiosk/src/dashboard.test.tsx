@@ -7,6 +7,7 @@ import type { StreamEvent } from "./api/types";
 import { count, ms, usd, number, seen } from "./lib/format";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { FleetSection } from "./components/sections";
+import { VersionFooter } from "./components/version-footer";
 
 class MockSource extends EventTarget {
   static latest: MockSource;
@@ -82,6 +83,34 @@ describe("human formats", () => {
   });
 });
 describe("dashboard contract", () => {
+  it("renders matching, mismatched, dirty and unknown build identities", () => {
+    const build = {
+      version: "0.2.0",
+      git_sha: "a1b2c3d",
+      git_dirty: false,
+      built_at_ms: 1_790_000_000_000,
+    };
+    const health = { ...build, status: "ok", uptime_ms: 123 };
+    const meter = { ...fixtures().fleet.nodes[0]!.services[0]!, ...build };
+    const { rerender } = render(<VersionFooter api={health} meter={meter} kiosk={build} />);
+    const footer = screen.getByRole("contentinfo", { name: "Running versions" });
+    expect(footer).toHaveTextContent("factory v0.2.0api a1b2c3dkiosk a1b2c3dmeter a1b2c3d");
+    expect(within(footer).queryByRole("status")).not.toBeInTheDocument();
+    rerender(<VersionFooter api={health} meter={{ ...meter, version: "0.1.0" }} kiosk={build} />);
+    expect(within(footer).getByRole("status")).toHaveTextContent("Build mismatch");
+    rerender(<VersionFooter api={{ ...health, git_sha: "7654321" }} meter={meter} kiosk={build} />);
+    expect(within(footer).getByRole("status")).toHaveTextContent("Build mismatch");
+    rerender(<VersionFooter api={health} meter={{ ...meter, git_dirty: true }} kiosk={build} />);
+    expect(within(footer).getByRole("status")).toHaveTextContent("Dirty build");
+    rerender(<VersionFooter api={health} meter={{ ...meter, git_sha: "unknown" }} kiosk={build} />);
+    expect(footer).toHaveTextContent("meter unknown");
+    expect(within(footer).getByRole("status")).toHaveTextContent("Build identity incomplete");
+    expect(footer).not.toHaveTextContent("Build mismatch");
+    rerender(<VersionFooter api={null} meter={undefined} kiosk={build} />);
+    expect(footer).toHaveTextContent("api unknown");
+    expect(footer).toHaveTextContent("meter unknown");
+    expect(footer).not.toHaveTextContent("Build mismatch");
+  });
   it("shows now only for online nodes without a last-seen timestamp", () => {
     const data = fixtures().fleet;
     data.nodes = [

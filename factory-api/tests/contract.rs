@@ -157,6 +157,9 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             .route("/meter/gpu", get(gpu))
             .route("/meter/gpu/history", get(history))
             .route("/prices", get(prices))
+            .route("/meter/health", get(|| async { Json(json!({"status":"ok", "version":"0.2.0", "git_sha":"a1b2c3d", "git_dirty":false, "built_at_ms":1_790_000_000_000_u64})) }))
+            .route("/legacy-health", get(|| async { Json(json!({"status":"ok"})) }))
+            .route("/v1/health", get(|| async { Json(shared::build_info()) }))
             .route("/ok", get(|| async { StatusCode::NO_CONTENT }))
             .route("/redirect", get(|| async { StatusCode::FOUND }))
             .with_state(meter.clone()),
@@ -167,6 +170,8 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
         [[nodes]]
         name="factory-console"
         services=[
+          {{name="meter-http",kind="http",target="{meter_url}/meter/health"}},
+          {{name="factory-api",kind="http",target="{meter_url}/v1/health"}},
           {{name="healthy",kind="http",target="{meter_url}/ok"}},
           {{name="redirect",kind="http",target="{meter_url}/redirect"}},
           {{name="tcp",kind="tcp",target="{}"}},
@@ -174,7 +179,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
         ]
         [[nodes]]
         name="absent-test-node"
-        services=[]
+        services=[{{name="meter-http",kind="http",target="{meter_url}/legacy-health"}}]
     "#,
         meter_url.trim_start_matches("http://")
     ))?;
@@ -196,9 +201,23 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
         .timeout(Duration::from_secs(20))
         .build()?;
     let health = fetch(&client, &format!("{url}/v1/health")).await;
-    keys(&health, &["status", "version", "uptime_ms"]);
+    keys(
+        &health,
+        &[
+            "status",
+            "version",
+            "git_sha",
+            "git_dirty",
+            "built_at_ms",
+            "uptime_ms",
+        ],
+    );
     assert_eq!(health["status"], "ok");
     assert!(health["uptime_ms"].is_u64());
+    assert_eq!(health["version"], include_str!("../../VERSION").trim());
+    assert!(!health["git_sha"].as_str().unwrap().is_empty());
+    assert!(health["git_dirty"].is_boolean());
+    assert!(health["built_at_ms"].as_u64().unwrap() > 1_700_000_000_000);
 
     let mut stream = client.get(format!("{url}/v1/stream")).send().await?;
     assert!(
@@ -289,6 +308,10 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
                 "latency_ms",
                 "detail",
                 "checked_at_ms",
+                "version",
+                "git_sha",
+                "git_dirty",
+                "built_at_ms",
             ],
         );
     }
@@ -297,8 +320,18 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             .iter()
             .map(|s| s["ok"].as_bool().unwrap())
             .collect::<Vec<_>>(),
-        vec![true, false, true, false]
+        vec![true, true, true, false, true, false]
     );
+    assert_eq!(services[0]["version"], "0.2.0");
+    assert_eq!(services[0]["git_sha"], "a1b2c3d");
+    assert_eq!(services[0]["git_dirty"], false);
+    assert_eq!(services[0]["built_at_ms"], 1_790_000_000_000_u64);
+    for key in ["version", "git_sha", "git_dirty", "built_at_ms"] {
+        assert_eq!(services[1][key], health[key]);
+        assert_eq!(services[2][key], Value::Null);
+        assert_eq!(nodes[1]["services"][0][key], Value::Null);
+    }
+    assert_eq!(nodes[1]["services"][0]["ok"], true);
     let gpu = fetch(&client, &format!("{url}/v1/gpu")).await;
     keys(&gpu, &["current", "loaded_models", "history"]);
     assert_eq!(
@@ -994,6 +1027,34 @@ async fn cursor_sync_recovers_multiple_pages_and_restarts_without_false_gaps() -
     assert!(usage.warnings[0].contains("1212..1213"));
     state.db.close().await?;
     task.abort();
+    Ok(())
+}
+
+#[test]
+fn repo_versions_match_single_source() -> Result<()> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let version = std::fs::read_to_string(root.join("VERSION"))?;
+    let version = version.trim();
+    let workspace: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml"))?)?;
+    assert_eq!(
+        workspace["workspace"]["package"]["version"].as_str(),
+        Some(version)
+    );
+    for member in workspace["workspace"]["members"].as_array().unwrap() {
+        let manifest: toml::Value = toml::from_str(&std::fs::read_to_string(
+            root.join(member.as_str().unwrap()).join("Cargo.toml"),
+        )?)?;
+        assert_eq!(
+            manifest["package"]["version"]["workspace"].as_bool(),
+            Some(true)
+        );
+    }
+    let kiosk: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("kiosk/package.json"))?)?;
+    assert_eq!(kiosk["version"], version);
     Ok(())
 }
 

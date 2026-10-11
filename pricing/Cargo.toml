@@ -1,6 +1,6 @@
 [package]
 name = "pricing"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 description = "Dated reference model rates for local-token spend avoided"
 license = "MIT"

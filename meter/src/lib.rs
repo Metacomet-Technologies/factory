@@ -362,10 +362,7 @@ mod api {
             .db
             .query("SELECT id,record FROM requests LIMIT 0".into())
             .await?;
-        serde_json::to_value(Health {
-            status: "ok".into(),
-        })
-        .map_err(|e| e.to_string())
+        serde_json::to_value(shared::build_info()).map_err(|e| e.to_string())
     }
 
     #[utoipa::path(get, path = "/meter/gpu", responses((status = 200, body = GpuResponse), (status = 503, body = ApiError)))]
