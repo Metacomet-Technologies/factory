@@ -183,3 +183,114 @@ assertions and a persisted request row.
 - factory-api consuming the shared contract and pricing library.
 - Request retention and bounded/durable queue policy if sustained load warrants it.
 - Kiosk/UI and access controls if the trusted-tailnet boundary changes.
+
+## factory-api: aggregation API v1
+
+`factory-api` is now implemented. It runs on factory-console, consumes the
+deployed meter on `http://factory-gpu:11434`, and leaves meter and Ollama unchanged.
+The additive serde/utoipa contract is in `shared::factory_api`; OpenAPI is at
+`GET /openapi.json`. The trusted tailnet and existing host firewall are the
+security boundary. There is no application authentication: never expose this
+listener to an untrusted network. Pricing confirmation is an operator-only
+POST, not a kiosk action.
+
+Build and run without installing anything:
+
+```sh
+cargo build --release --locked -p factory-api
+db_dir=$(mktemp -d)
+target/release/factory-api --listen 0.0.0.0:18080 \
+  --meter-url http://factory-gpu:11434 \
+  --db-path "$db_dir/requests.db" --pricing-db-path "$db_dir/pricing.db"
+```
+
+Defaults and environment equivalents (CLI flags take precedence):
+
+- `--listen` / `FACTORY_API_LISTEN`: `0.0.0.0:8080`.
+- `--meter-url` / `FACTORY_API_METER_URL`: `http://factory-gpu:11434`.
+- `--db-path` / `FACTORY_API_DB_PATH`: `/var/lib/factory-api/requests.db`.
+- `--pricing-db-path` / `FACTORY_API_PRICING_DB_PATH`: `/var/lib/factory-api/pricing.db`.
+- `--services-config` / `FACTORY_API_SERVICES_CONFIG`: optional TOML file;
+  defaults are embedded from `factory-api/config/services.toml`.
+- `RUST_LOG`: defaults to `factory_api=info`.
+
+Database parent directories must exist. Request and pricing paths must differ.
+SQLite uses bundled SQLite, WAL and five-second busy timeouts. Database work and
+the synchronous pricing crate run through `spawn_blocking`. Meter sync and fleet
+checks start immediately and repeat every 30 seconds. Live GPU SSE samples repeat
+every 15 seconds. Pricing refresh runs at startup and daily; it never confirms.
+Collectors retry on the next interval without blocking health or SSE.
+
+Endpoints:
+
+- `GET /v1/health`: status, package version, process uptime in milliseconds.
+- `GET /v1/fleet`: configured Tailscale nodes and HTTP/TCP/local systemd checks.
+  HTTP requires 2xx; redirects fail. Checks time out after five seconds.
+  `systemd` targets are allowed only on factory-console. Missing discovery data
+  gives offline nodes and null metadata; failed service checks retain details.
+  The embedded self-check follows `--listen`'s port, including the :18080 check.
+- `GET /v1/llm/usage?range=24h|7d|30d`: totals, reference-family spend avoided,
+  per-model tokens/rates/nearest-rank latency percentiles, load time and warnings.
+  Default range is 24h. All meter rows count, including non-model requests;
+  missing models remain null. Missing token counts do not invent tokens.
+- `GET /v1/gpu?range=1h|24h|7d`: live physical GPU 0, loaded model names and
+  history. Default range is 1h, filtered from meter's 24h history. NVIDIA data
+  supplies memory; Ollama model sizes never do. Failed upstream calls return
+  null current/empty lists with HTTP 200, log diagnostics, and surface warnings
+  in usage (the GPU contract has no warnings field).
+- `GET /v1/pricing` and `POST /v1/pricing/refresh`: selected/pending families,
+  confirmed-model rates and warnings. A source outage preserves the last snapshot
+  with HTTP 200 and warnings. Rates remain null until a selection is confirmed.
+- `POST /v1/pricing/confirm/{family}`: explicitly confirms the current pending
+  selection. Percent-encode spaces. Unknown families return 404; no pending
+  selection returns 409. Never called automatically.
+- `GET /v1/agents`: amp, cursor, claude-code, codex and kimi are `not_tracked`.
+- `GET /v1/stream`: SSE events named `gpu.sample`, `llm.request`, `fleet.change`,
+  and `pricing.changed`, with JSON `{type, ts_ms, data}`. Independent
+  `: keepalive` comments run every 15 seconds, even during event traffic.
+  Events are live notifications, not replayable history; reconnecting clients
+  should fetch snapshots. Lagged subscribers skip missed events with a log warning.
+
+Errors use `{error:{code,message}}`; malformed ranges return 400, unknown paths
+404, wrong methods 405. Local storage failures return 500, unlike upstream outages.
+Timestamps are Unix milliseconds (`*_ms`); pricing seconds are converted at the
+boundary. Ollama nanoseconds become milliseconds for latency/load and seconds
+for tokens per second. Prompt/generation rates average valid per-request ratios,
+exclude load time and remain null when no positive duration exists.
+
+Spend avoided is calculated independently for each reference family, not added
+across families. Dated requests use `pricing::Store::cost`. Pre-history requests
+use the earliest confirmed selection's earliest observed rate and accumulate
+only in `estimated_usd`. Factory-api reads that append-only history without
+modifying pricing's tables. Without any confirmed selection, or when either
+token count is null, a request increments `unpriced_requests`.
+
+The request cache upserts meter IDs and persists its max-ID watermark across
+restarts. Only the newest 500 rows are available per sync. If the oldest fetched
+ID exceeds watermark + 1, a persistent `gap` warning identifies lost IDs.
+There is no automatic request retention or gap backfill. Upstream failures retain
+cached usage with warnings. A fresh cache cannot reconstruct older meter history.
+
+Deployment artifacts are **not executed during development**:
+
+```sh
+# Administrator action only, after the unprivileged build:
+sudo bash deploy/install-factory-api.sh /path/to/prebuilt/factory-api
+# Use the exact timestamped snapshot printed by installation:
+sudo bash deploy/rollback-factory-api.sh /var/backups/factory-api/<snapshot>
+```
+
+The dedicated `factory-api` user gets `/var/lib/factory-api` through systemd
+`StateDirectory`. The unit uses `ProtectSystem=strict` and `NoNewPrivileges`.
+The installer never runs Cargo, performs preflight checks, snapshots existing
+binary/unit files and prior service state, starts port 8080, curls health/fleet,
+and verifies Tailscale and amp-runner as the service user. Rollback restores those
+files and service state; databases and user remain. Neither script changes meter,
+Ollama, firewall rules, or Tailscale configuration.
+
+Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test --workspace`, and `bash -n` for both deployment scripts. Factory-api
+tests cover every unit conversion, dated/estimated/unpriced spend, null tokens,
+TPS math, mock-meter endpoint JSON, upserts/gaps/outages, fleet check kinds,
+OpenAPI references, explicit confirmation and a real HTTP SSE event.
+See [the live check](factory-api/LIVE_CHECK.md) for observed outputs and limits.

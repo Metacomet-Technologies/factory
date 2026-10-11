@@ -1,0 +1,29 @@
+[Unit]
+Description=Factory API
+After=network-online.target tailscaled.service amp-runner.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=factory-api
+Group=factory-api
+StateDirectory=factory-api
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/factory-api
+ExecStart=/usr/local/bin/factory-api --listen 0.0.0.0:8080 --meter-url http://factory-gpu:11434 --db-path /var/lib/factory-api/requests.db --pricing-db-path /var/lib/factory-api/pricing.db
+Environment=RUST_LOG=factory_api=info
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

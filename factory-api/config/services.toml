@@ -1,0 +1,17 @@
+[[nodes]]
+name = "factory-gpu"
+services = [
+  { name = "meter-http", kind = "http", target = "http://factory-gpu:11434/meter/health" },
+  { name = "ollama-http", kind = "http", target = "http://factory-gpu:11434/api/version" },
+  { name = "ssh-tcp", kind = "tcp", target = "factory-gpu:22" },
+  { name = "rdp-tcp", kind = "tcp", target = "factory-gpu:3389" },
+]
+[[nodes]]
+name = "factory-console"
+services = [
+  { name = "rdp-tcp", kind = "tcp", target = "factory-console:3389" },
+  # Tailscale SSH does not answer this node's own port-22 connections; check its daemon instead.
+  { name = "tailscaled", kind = "systemd", target = "tailscaled" },
+  { name = "amp-runner", kind = "systemd", target = "amp-runner" },
+  { name = "factory-api", kind = "http", target = "http://127.0.0.1:8080/v1/health" },
+]

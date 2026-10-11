@@ -1,0 +1,476 @@
+use anyhow::Result;
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    http::StatusCode,
+    routing::get,
+};
+use factory_api::{AppState, fleet, now_ms, router};
+use serde_json::{Value, json};
+use shared::RequestRecord;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+use tokio::sync::RwLock;
+
+async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    (
+        url,
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+    )
+}
+fn keys(value: &Value, expected: &[&str]) {
+    let mut actual: Vec<_> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let mut expected = expected.to_vec();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+fn offline_refresh(
+    store: &mut pricing::Store,
+    references: &[pricing::Reference],
+    at: i64,
+) -> Result<Vec<pricing::Item>> {
+    let models = [
+        pricing::Model {
+            model_id: "anthropic/claude-sonnet-5.5".into(),
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+            released_at: Some(1),
+        },
+        pricing::Model {
+            model_id: "openai/gpt-5.6-sol".into(),
+            input_per_mtok: 2.0,
+            output_per_mtok: 10.0,
+            released_at: Some(2),
+        },
+    ];
+    store.refresh(references, &models, &models, at, vec![])
+}
+#[derive(Clone)]
+struct Meter {
+    records: Arc<RwLock<Vec<RequestRecord>>>,
+    down: Arc<AtomicBool>,
+    ts: i64,
+}
+async fn requests(
+    State(meter): State<Meter>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Result<Json<Vec<RequestRecord>>, StatusCode> {
+    assert_eq!(query.get("limit").map(String::as_str), Some("500"));
+    if meter.down.load(Ordering::Relaxed) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(Json(meter.records.read().await.clone()))
+}
+fn gpu_sample(ts: i64, index: u32) -> Value {
+    json!({"index":index,"ts":ts,"memory_used_mib":321.0,"memory_total_mib":12288.0,"utilization_percent":27.0,"temperature_c":43.0,"power_w":48.5})
+}
+async fn gpu(State(meter): State<Meter>) -> Result<Json<Value>, StatusCode> {
+    if meter.down.load(Ordering::Relaxed) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(Json(
+        json!({"gpus":[gpu_sample(meter.ts,0)], "ollama_ps":{"models":[{"name":"local:latest", "size":999999999999_u64}]}}),
+    ))
+}
+async fn history(
+    State(meter): State<Meter>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Result<Json<Value>, StatusCode> {
+    assert!(matches!(query["range"].as_str(), "24h" | "7d"));
+    if meter.down.load(Ordering::Relaxed) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(Json(json!([
+        gpu_sample(meter.ts - 7_200_000, 0),
+        gpu_sample(meter.ts - 1_000, 0),
+        gpu_sample(meter.ts, 1)
+    ])))
+}
+async fn fetch(client: &reqwest::Client, url: &str) -> Value {
+    let response = client.get(url).send().await.unwrap();
+    assert_eq!(response.status(), 200, "{url}");
+    response.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let ts = now_ms();
+    let record = |id, ts, prompt, duration| RequestRecord {
+        id,
+        ts,
+        model: Some("local:latest".into()),
+        prompt_eval_count: prompt,
+        eval_count: Some(4),
+        prompt_eval_duration: duration,
+        eval_duration: Some(if id == 2 {
+            4_000_000_000
+        } else {
+            2_000_000_000
+        }),
+        load_duration: Some(3_000_000),
+        total_duration: (id != 2).then_some(5_000_000_000),
+        latency_ms: 9000.0,
+        client_hostname: "client".into(),
+        ..Default::default()
+    };
+    let meter = Meter {
+        records: Arc::new(RwLock::new(vec![
+            record(3, ts - 2 * 86_400_000, Some(100), Some(1_000_000_000)),
+            record(2, ts - 100, None, None),
+            record(1, ts - 1000, Some(23), Some(2_000_000_000)),
+        ])),
+        down: Default::default(),
+        ts,
+    };
+    let (meter_url, meter_task) = serve(
+        Router::new()
+            .route("/meter/requests", get(requests))
+            .route("/meter/gpu", get(gpu))
+            .route("/meter/gpu/history", get(history))
+            .route("/ok", get(|| async { StatusCode::NO_CONTENT }))
+            .route("/redirect", get(|| async { StatusCode::FOUND }))
+            .with_state(meter.clone()),
+    )
+    .await;
+    let config = fleet::Config::parse(&format!(
+        r#"
+        [[nodes]]
+        name="factory-console"
+        services=[
+          {{name="healthy",kind="http",target="{meter_url}/ok"}},
+          {{name="redirect",kind="http",target="{meter_url}/redirect"}},
+          {{name="tcp",kind="tcp",target="{}"}},
+          {{name="missing-unit",kind="systemd",target="factory-api-test-does-not-exist.service"}}
+        ]
+        [[nodes]]
+        name="absent-test-node"
+        services=[]
+    "#,
+        meter_url.trim_start_matches("http://")
+    ))?;
+    let mut state = AppState::new(
+        meter_url,
+        temp.path().join("requests.db"),
+        temp.path().join("pricing.db"),
+        config,
+    )
+    .await?;
+    state.pricing_refresh = offline_refresh;
+    let (url, api_task) = serve(router(state.clone())).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let health = fetch(&client, &format!("{url}/v1/health")).await;
+    keys(&health, &["status", "version", "uptime_ms"]);
+    assert_eq!(health["status"], "ok");
+    assert!(health["uptime_ms"].is_u64());
+
+    let mut stream = client.get(format!("{url}/v1/stream")).send().await?;
+    assert!(
+        stream.headers()["content-type"]
+            .to_str()?
+            .starts_with("text/event-stream")
+    );
+    state.sync_meter().await?;
+    let chunk = tokio::time::timeout(Duration::from_secs(2), stream.chunk())
+        .await??
+        .unwrap();
+    let text = String::from_utf8(chunk.to_vec())?;
+    assert!(text.contains("event: llm.request"));
+    let event: Value =
+        serde_json::from_str(text.lines().find_map(|l| l.strip_prefix("data: ")).unwrap())?;
+    keys(&event, &["type", "ts_ms", "data"]);
+    assert_eq!(event["type"], "llm.request");
+    assert_eq!(
+        event["data"],
+        json!({"model":"local:latest","prompt_tokens":23,"output_tokens":4,"latency_ms":5000.0,"client_hostname":"client"})
+    );
+    state.sync_meter().await?; // Re-fetches upsert, never double-count.
+    let usage = fetch(&client, &format!("{url}/v1/llm/usage?range=24h")).await;
+    keys(
+        &usage,
+        &[
+            "range",
+            "generated_at_ms",
+            "totals",
+            "spend_avoided",
+            "models",
+            "warnings",
+        ],
+    );
+    assert_eq!(
+        usage["totals"],
+        json!({"requests":2,"prompt_tokens":23,"output_tokens":8})
+    );
+    assert_eq!(
+        usage["models"],
+        json!([{"model":"local:latest","requests":2,"prompt_tokens":23,"output_tokens":8,"avg_prompt_tps":11.5,"avg_gen_tps":1.5,"p50_latency_ms":5000.0,"p95_latency_ms":9000.0,"total_load_ms":6.0}])
+    );
+    for spend in usage["spend_avoided"].as_array().unwrap() {
+        keys(
+            spend,
+            &[
+                "family",
+                "model_id",
+                "usd",
+                "estimated_usd",
+                "unpriced_requests",
+            ],
+        );
+        assert_eq!(spend["unpriced_requests"], 2);
+    }
+    for range in ["7d", "30d"] {
+        let usage = fetch(&client, &format!("{url}/v1/llm/usage?range={range}")).await;
+        assert_eq!(usage["totals"]["requests"], 3);
+    }
+    let fleet = fetch(&client, &format!("{url}/v1/fleet")).await;
+    keys(&fleet, &["generated_at_ms", "nodes"]);
+    let nodes = fleet["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2);
+    for node in nodes {
+        keys(
+            node,
+            &[
+                "name",
+                "tailscale_ip",
+                "online",
+                "last_seen_ms",
+                "os",
+                "services",
+            ],
+        );
+    }
+    assert_eq!(nodes[1]["online"], false);
+    assert_eq!(nodes[1]["last_seen_ms"], Value::Null);
+    let services = nodes[0]["services"].as_array().unwrap();
+    for service in services {
+        keys(
+            service,
+            &[
+                "name",
+                "kind",
+                "target",
+                "ok",
+                "latency_ms",
+                "detail",
+                "checked_at_ms",
+            ],
+        );
+    }
+    assert_eq!(
+        services
+            .iter()
+            .map(|s| s["ok"].as_bool().unwrap())
+            .collect::<Vec<_>>(),
+        vec![true, false, true, false]
+    );
+    let gpu = fetch(&client, &format!("{url}/v1/gpu")).await;
+    keys(&gpu, &["current", "loaded_models", "history"]);
+    assert_eq!(
+        gpu["current"],
+        json!({"ts_ms":ts,"memory_used_mib":321.0,"memory_total_mib":12288.0,"utilization_percent":27.0,"temperature_c":43.0,"power_w":48.5})
+    );
+    assert_eq!(gpu["loaded_models"], json!(["local:latest"]));
+    assert_eq!(
+        gpu["history"],
+        json!([{"ts_ms":ts-1000,"memory_used_mib":321.0,"utilization_percent":27.0,"temperature_c":43.0,"power_w":48.5}])
+    );
+    for range in ["24h", "7d"] {
+        assert_eq!(
+            fetch(&client, &format!("{url}/v1/gpu?range={range}")).await["history"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+    let prices = fetch(&client, &format!("{url}/v1/pricing")).await;
+    keys(&prices, &["families", "warnings"]);
+    for family in prices["families"].as_array().unwrap() {
+        keys(family, &["family", "selected", "rates", "pending"]);
+        assert!(family["selected"].is_null() && family["pending"].is_null());
+    }
+    let prices: Value = client
+        .post(format!("{url}/v1/pricing/refresh"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    for family in prices["families"].as_array().unwrap() {
+        assert!(family["selected"].is_null());
+        keys(&family["pending"], &["model_id", "effective_from_ms"]);
+        assert!(family["pending"]["effective_from_ms"].as_i64().unwrap() >= ts - 1000);
+    }
+    let confirmed: Value = client
+        .post(format!("{url}/v1/pricing/confirm/Claude%20Sonnet"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let sonnet = confirmed["families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["family"] == "Claude Sonnet")
+        .unwrap();
+    assert!(sonnet["pending"].is_null());
+    keys(&sonnet["selected"], &["model_id", "effective_from_ms"]);
+    keys(
+        &sonnet["rates"],
+        &[
+            "input_per_mtok",
+            "output_per_mtok",
+            "source",
+            "fetched_at_ms",
+        ],
+    );
+    assert_eq!(sonnet["rates"]["input_per_mtok"], 3.0);
+    let agents = fetch(&client, &format!("{url}/v1/agents")).await;
+    keys(&agents, &["tools"]);
+    assert_eq!(
+        agents["tools"],
+        json!(
+            ["amp", "cursor", "claude-code", "codex", "kimi"]
+                .map(|tool| json!({"tool":tool,"status":"not_tracked","note":null}))
+        )
+    );
+    let openapi = fetch(&client, &format!("{url}/openapi.json")).await;
+    for path in [
+        "/v1/health",
+        "/v1/fleet",
+        "/v1/llm/usage",
+        "/v1/gpu",
+        "/v1/pricing",
+        "/v1/pricing/refresh",
+        "/v1/pricing/confirm/{family}",
+        "/v1/agents",
+        "/v1/stream",
+    ] {
+        assert!(openapi["paths"][path].is_object(), "missing OpenAPI {path}");
+    }
+    // Resolve every schema reference: shared meter and API names must not collide.
+    fn references(value: &Value, doc: &Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    if key == "$ref" {
+                        assert!(
+                            doc.pointer(value.as_str().unwrap().strip_prefix('#').unwrap())
+                                .is_some(),
+                            "unresolved {value}"
+                        );
+                    } else {
+                        references(value, doc);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for value in items {
+                    references(value, doc);
+                }
+            }
+            _ => (),
+        }
+    }
+    references(&openapi, &openapi);
+    for (path, method, status) in [
+        ("/v1/gpu?range=30d", "GET", 400),
+        ("/v1/llm/usage?range=1h", "GET", 400),
+        ("/v1/gpu?range=1h&range=7d", "GET", 400),
+        ("/missing", "GET", 404),
+        ("/v1/health", "POST", 405),
+        ("/v1/pricing/confirm/unknown", "POST", 404),
+        (
+            "/v1/pricing/confirm/Claude%20Sonnet&unexpected",
+            "POST",
+            404,
+        ),
+        ("/v1/pricing/confirm/Claude%20Sonnet/extra", "POST", 404),
+        ("/v1/pricing/confirm/Claude%20Sonnet", "POST", 409),
+    ] {
+        let response = client
+            .request(method.parse()?, format!("{url}{path}"))
+            .send()
+            .await?;
+        assert_eq!(response.status().as_u16(), status);
+        let value: Value = response.json().await?;
+        keys(&value, &["error"]);
+        keys(&value["error"], &["code", "message"]);
+    }
+    *meter.records.write().await = vec![record(8, ts, Some(31), Some(1_000_000_000))];
+    state.sync_meter().await?;
+    let usage = fetch(&client, &format!("{url}/v1/llm/usage")).await;
+    assert_eq!(usage["totals"]["requests"], 3);
+    assert!(
+        usage["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("gap: meter ids 4..7"))
+    );
+    meter.down.store(true, Ordering::Relaxed);
+    assert!(state.sync_meter().await.is_err());
+    let gpu = fetch(&client, &format!("{url}/v1/gpu")).await;
+    assert_eq!(gpu, json!({"current":null,"loaded_models":[],"history":[]}));
+    let usage = fetch(&client, &format!("{url}/v1/llm/usage")).await;
+    assert_eq!(usage["totals"]["requests"], 3);
+    assert!(
+        usage["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().starts_with("meter:"))
+    );
+    // A feed outage returns the last pricing snapshot and warning, never auto-confirms.
+    let mut failed = state.clone();
+    failed.pricing_refresh = |_, _, _| anyhow::bail!("mock pricing outage");
+    let (failed_url, failed_task) = serve(router(failed)).await;
+    let failed_prices: Value = client
+        .post(format!("{failed_url}/v1/pricing/refresh"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        failed_prices["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("mock pricing outage"))
+    );
+    drop(stream);
+    failed_task.abort();
+    api_task.abort();
+    meter_task.abort();
+    Ok(())
+}
+
+#[test]
+fn tailscale_units_and_local_only_config() -> Result<()> {
+    let config = fleet::Config::parse(fleet::DEFAULT_CONFIG)?;
+    let status = json!({"Self":{"HostName":"factory-console","TailscaleIPs":["100.1.2.3"],"Online":true,"OS":"linux","LastSeen":"2026-10-11T01:10:40.123-04:00"},"Peer":{}});
+    let node = fleet::node(&config.nodes[1], &status);
+    assert_eq!(node.last_seen_ms, Some(1_791_695_440_123));
+    assert_eq!(node.tailscale_ip.as_deref(), Some("100.1.2.3"));
+    assert!(node.online);
+    assert!(fleet::Config::parse("[[nodes]]\nname='factory-gpu'\nservices=[{name='remote',kind='systemd',target='amp-runner'}]").is_err());
+    Ok(())
+}
