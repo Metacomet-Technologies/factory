@@ -3,7 +3,38 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#131315" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      let preference;
+      try {
+        preference = localStorage.getItem("factory-theme");
+      } catch {}
+      const root = document.documentElement;
+      if (preference === "light" || preference === "dark")
+        root.dataset.themePreference = preference;
+      root.dataset.theme =
+        root.dataset.themePreference ??
+        (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      root.classList.toggle("dark", root.dataset.theme === "dark");
+    </script>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --background: light-dark(#f6f6f7, #131315);
+        --foreground: light-dark(#202024, #f1f1f3);
+      }
+      :root[data-theme="light"] {
+        color-scheme: light;
+      }
+      :root[data-theme="dark"] {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        background: var(--background);
+        color: var(--foreground);
+      }
+    </style>
     <title>factory / kiosk</title>
   </head>
   <body>

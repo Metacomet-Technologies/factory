@@ -419,8 +419,9 @@ use `Cache-Control: no-cache`; `assets/*` uses
 Other files use `no-cache`.
 
 A missing or empty static directory serves a built-in HTTP 200 placeholder at
-`/`: dark background, centered “factory · kiosk not deployed yet”, system font,
-and a 30-second auto-reload. API endpoints work independently of kiosk files.
+`/`: system-matched Light/Dark background from the first paint, centered
+“factory · kiosk not deployed yet”, system font, and a 30-second auto-reload.
+API endpoints work independently of kiosk files.
 
 After deploying the static-capable API binary, install an already-built kiosk
 dist as an administrator. These scripts are artifacts, not run in development:

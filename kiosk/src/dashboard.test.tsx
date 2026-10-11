@@ -21,6 +21,9 @@ class MockSource extends EventTarget {
   close() {}
 }
 beforeEach(() => {
+  document.documentElement.dataset.theme = "dark";
+  delete document.documentElement.dataset.themePreference;
+  localStorage.clear();
   vi.stubGlobal("EventSource", MockSource);
   vi.stubGlobal(
     "matchMedia",
@@ -83,6 +86,34 @@ describe("human formats", () => {
   });
 });
 describe("dashboard contract", () => {
+  it.each([
+    [false, null, "Use dark theme"],
+    [true, null, "Use light theme"],
+    [false, "dark", "Use light theme"],
+    [true, "light", "Use dark theme"],
+  ] as const)(
+    "keeps the pre-paint theme with system dark=%s and preference=%s",
+    (systemDark, saved, label) => {
+      api();
+      vi.stubGlobal("matchMedia", () => ({
+        matches: systemDark,
+        addEventListener() {},
+        removeEventListener() {},
+      }));
+      document.documentElement.dataset.theme = saved ?? (systemDark ? "dark" : "light");
+      if (saved) document.documentElement.dataset.themePreference = saved;
+      render(<App />);
+      fireEvent.click(screen.getByRole("button", { name: label }));
+      expect(
+        screen.getByRole("button", {
+          name: label === "Use dark theme" ? "Use light theme" : "Use dark theme",
+        }),
+      ).toBeVisible();
+      expect(localStorage.getItem("factory-theme")).toBe(
+        label === "Use dark theme" ? "dark" : "light",
+      );
+    },
+  );
   it("renders matching, mismatched, dirty and unknown build identities", () => {
     const build = {
       version: "0.2.0",

@@ -733,6 +733,9 @@ async fn runtime_kiosk_serving_and_api_isolation() -> Result<()> {
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
         let page = response.text().await?;
         assert!(page.contains("factory · kiosk not deployed yet"));
+        assert!(page.contains("name=\"color-scheme\" content=\"light dark\""));
+        assert!(page.contains("--background:light-dark(#f6f6f7,#131315)"));
+        assert!(page.contains("html,body{background:var(--background)"));
         assert!(page.contains("http-equiv=\"refresh\" content=\"30\""));
         assert!(page.contains("setInterval(() => location.reload(), 30000)"));
         assert!(page.contains("document.addEventListener(\"visibilitychange\""));

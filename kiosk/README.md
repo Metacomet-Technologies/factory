@@ -100,17 +100,61 @@ values rather than presenting stale telemetry as live. Nulls render as `—`,
 not zero, except that an online Fleet node with no last-seen timestamp shows
 `Last seen now`. Section errors do not blank other sections.
 
-Open `/?kiosk` to default to dark regardless of system preference. Without that
-flag, the dashboard follows `prefers-color-scheme`, including changes while it
-is open, until the user selects a theme. The theme control is local UI state,
-not a mutation of API data. Keyboard focus, a skip link, semantic sections,
+The dashboard follows `prefers-color-scheme`, including changes while it is
+open, until the user selects a theme. `?kiosk` is accepted and ignored; it never
+forces dark. The theme control saves `light` or `dark` in localStorage under
+`factory-theme`, not in API data. Remove that key to resume system following
+on the next reload. Invalid preferences and unavailable storage follow the
+system on load. A blocking head script sets the resolved `data-theme` and dark
+class before styles or modules load; React initializes from that attribute.
+The head's `light-dark()` tokens color both html and body before React starts,
+including manual and self-update reloads. No remote script or forced default
+is used. Keyboard focus, a skip link, semantic sections,
 polite ticker announcements and reduced-motion styles are included.
 
 Phone widths below 640px use stacked cards and per-model cards. 640–1279px uses
 a two-column grid. Desktop uses Fleet/GPU above Local LLM and a tool/ticker
 side column. The ticker has a keyboard-scrollable bounded viewport. The current
-mock fixture exceeds the 1728×1117 kiosk height by 30px (see screenshot checks
-below). Arbitrarily large real fleets/model lists may also require page scrolling.
+mock fixture fits the 1728×1117 kiosk in both themes (MET-87 verification).
+Arbitrarily large real fleets/model lists may still require page scrolling.
+
+## First-paint verification (MET-87)
+
+`vp run screenshots` first reloads with CDP cache disabled and 6× CPU throttling.
+It records body background at first contentful paint and every animation frame,
+plus every delivered PNG screencast frame. Pixel (0, 0) must match the expected
+page token in every captured frame. The first frame and per-case JSON go to
+`screenshots/first-frame/` (override with `FIRST_FRAME_DIRECTORY`). The matrix
+covers both system schemes, both opposite saved preferences, invalid preferences,
+blocked storage, and system changes before/after a user selection.
+
+From the repository root, start `scripts/sandbox up --rows 1k --kiosk`, then
+use its printed factory-api URL from `kiosk/`:
+
+```sh
+FIRST_FRAME_URL="http://127.0.0.1:<sandbox-api-port>/?kiosk" FIRST_FRAME_ONLY=1 vp run screenshots
+# Exercise the actual self-update hook with a browser-only changed manifest:
+FIRST_FRAME_URL="http://127.0.0.1:<sandbox-api-port>/?kiosk" FIRST_FRAME_ONLY=1 FIRST_FRAME_RELOAD=self-update vp run screenshots
+```
+
+Stop the stack with `scripts/sandbox down`. Start it again without `--kiosk`
+to check the real built-in placeholder: set `PLACEHOLDER_URL` to that API URL
+while the normal mock preview remains available at 4180, then run
+`FIRST_FRAME_ONLY=1 vp run screenshots`. Stop the sandbox again afterward.
+The placeholder deliberately follows the system rather than saved kiosk state;
+its existing 30-second meta refresh and JavaScript fallback are unchanged.
+
+The isolated Chromium run reproduces light frames before dark on the original
+build. After the fix, system dark and light produce only `rgb(19, 19, 21)` and
+`rgb(246, 246, 247)`, respectively. Opposite saved preferences produce only their
+selected token. The same eight kiosk cases pass through self-update reload;
+both placeholder schemes pass too. Existing five viewport checks, contrast,
+height, overflow, SSE reconnects, range controls and tooltips pass. The tooltip
+check now reads the fixture version rather than the obsolete `1.0.0-mock`.
+No screenshot baselines or production settings were changed. Mac, physical
+iPhone and console session checks remain deployment gates; this PR contributes
+to MET-87 and does not close it. Install factory-api and kiosk from the same
+combined MET-92 release commit; a static-only install cannot update the placeholder.
 
 ## Mock and screenshots
 
@@ -252,7 +296,7 @@ JavaScript fallback plus an immediate reload when visibility returns. This
 placeholder change requires a factory-api binary redeploy; static kiosk
 installation alone cannot update it. Already-open old placeholders need one
 manual refresh to receive the new fallback. Later dashboard installs use the
-build check. Reload resets session-only theme/range/ticker state.
+build check. Reload preserves the saved theme; range/ticker state resets.
 
 ## Live build and administrator handoff
 
