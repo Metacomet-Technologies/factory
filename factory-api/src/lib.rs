@@ -1,6 +1,7 @@
 mod api;
 pub mod data;
 pub mod fleet;
+mod kiosk;
 
 use anyhow::Result;
 use serde::de::DeserializeOwned;
@@ -27,6 +28,7 @@ pub struct AppState {
     pub meter_url: String,
     pub db_path: PathBuf,
     pub pricing_db_path: PathBuf,
+    pub static_dir: PathBuf,
     pub config: Arc<fleet::Config>,
     pub client: reqwest::Client,
     /// Feed ingestion boundary, replaceable for offline integration tests.
@@ -75,6 +77,7 @@ impl AppState {
             meter_url: meter_url.trim_end_matches('/').into(),
             db_path,
             pricing_db_path,
+            static_dir: "/var/lib/factory-api/kiosk".into(),
             config: Arc::new(config),
             client,
             pricing_refresh: pricing::refresh_live,

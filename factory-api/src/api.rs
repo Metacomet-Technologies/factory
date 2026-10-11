@@ -10,7 +10,7 @@ use shared::factory_api::*;
 use std::{convert::Infallible, time::Duration};
 use utoipa::OpenApi;
 
-fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+pub(crate) fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
     (
         status,
         Json(ApiError {
@@ -25,8 +25,18 @@ fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/pricing/confirm/{family}", axum::routing::any(dispatch))
+        .route("/{*path}", axum::routing::any(dispatch))
         .fallback(dispatch)
         .with_state(state)
+        .layer(axum::middleware::map_response(
+            |mut response: Response| async move {
+                response.headers_mut().insert(
+                    "x-content-type-options",
+                    axum::http::HeaderValue::from_static("nosniff"),
+                );
+                response
+            },
+        ))
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -72,6 +82,9 @@ async fn dispatch(State(state): State<AppState>, request: Request<Body>) -> Resp
             | "/openapi.json"
     ) && confirm.is_none()
     {
+        if !crate::kiosk::reserved(path) {
+            return crate::kiosk::serve(&state.static_dir, request).await;
+        }
         return error(StatusCode::NOT_FOUND, "not_found", "unknown endpoint");
     }
     if request.method() != if post { Method::POST } else { Method::GET } {

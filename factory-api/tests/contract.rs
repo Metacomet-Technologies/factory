@@ -172,6 +172,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
     )
     .await?;
     state.pricing_refresh = offline_refresh;
+    state.static_dir = temp.path().join("kiosk");
     let (url, api_task) = serve(router(state.clone())).await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -634,5 +635,179 @@ fn tailscale_units_and_local_only_config() -> Result<()> {
     assert_eq!(node.tailscale_ip.as_deref(), Some("100.1.2.3"));
     assert!(node.online);
     assert!(fleet::Config::parse("[[nodes]]\nname='factory-gpu'\nservices=[{name='remote',kind='systemd',target='amp-runner'}]").is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_kiosk_serving_and_api_isolation() -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("kiosk");
+    let mut state = AppState::new(
+        "http://127.0.0.1:1".into(),
+        temp.path().join("requests.db"),
+        temp.path().join("pricing.db"),
+        fleet::Config::parse(fleet::DEFAULT_CONFIG)?,
+    )
+    .await?;
+    state.static_dir = root.clone();
+    let (url, task) = serve(router(state)).await;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    // Absence and an empty directory both keep the browser on a 200 HTML page.
+    for empty_directory in [false, true] {
+        if empty_directory {
+            std::fs::create_dir(&root)?;
+        }
+        let response = client.get(format!("{url}/")).send().await?;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(response.headers()["cache-control"], "no-cache");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let page = response.text().await?;
+        assert!(page.contains("factory · kiosk not deployed yet"));
+        assert!(page.contains("http-equiv=\"refresh\" content=\"30\""));
+        assert_eq!(
+            fetch(&client, &format!("{url}/v1/health")).await["status"],
+            "ok"
+        );
+    }
+
+    let index = "<!doctype html><html><title>test kiosk</title><body>deployed</body></html>";
+    std::fs::write(root.join("index.html"), index)?;
+    std::fs::create_dir(root.join("assets"))?;
+    std::fs::write(root.join("assets/x-a1b2c3d4.js"), "console.log('kiosk');")?;
+    std::fs::write(root.join("assets/theme-a1b2c3d4.css"), "body{color:red}")?;
+    std::fs::create_dir(root.join("v1"))?;
+    for path in ["v1/health", "v1/stream", "v1/unknown", "openapi.json"] {
+        std::fs::write(root.join(path), "must never be served")?;
+    }
+    for path in ["/", "/index.html", "/some/deep/route"] {
+        let response = client
+            .get(format!("{url}{path}"))
+            .header("accept", "application/json, text/html;q=0.8")
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200, "{path}");
+        assert_eq!(response.headers()["cache-control"], "no-cache");
+        assert_eq!(response.text().await?, index);
+    }
+    for (path, mime, body) in [
+        (
+            "/assets/x-a1b2c3d4.js",
+            "text/javascript; charset=utf-8",
+            "console.log('kiosk');",
+        ),
+        (
+            "/assets/theme-a1b2c3d4.css",
+            "text/css; charset=utf-8",
+            "body{color:red}",
+        ),
+    ] {
+        let response = client.get(format!("{url}{path}")).send().await?;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], mime);
+        assert_eq!(
+            response.headers()["cache-control"],
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.text().await?, body);
+    }
+    for (path, accept) in [
+        ("/some/deep/route", "application/json"),
+        ("/some/deep/route", "text/html;q=0"),
+        ("/assets/", "*/*"),
+    ] {
+        assert_eq!(
+            client
+                .get(format!("{url}{path}"))
+                .header("accept", accept)
+                .send()
+                .await?
+                .status(),
+            404
+        );
+    }
+    let head = client.head(format!("{url}/")).send().await?;
+    assert_eq!(head.status(), 200);
+    assert_eq!(head.headers()["content-length"], index.len().to_string());
+    assert!(head.bytes().await?.is_empty());
+    assert_eq!(
+        client
+            .post(format!("{url}/some/deep/route"))
+            .header("accept", "text/html")
+            .send()
+            .await?
+            .status(),
+        405
+    );
+    assert_eq!(
+        fetch(&client, &format!("{url}/v1/health")).await["status"],
+        "ok"
+    );
+    assert_eq!(
+        fetch(&client, &format!("{url}/openapi.json")).await["openapi"],
+        "3.1.0"
+    );
+    for path in ["/v1", "/v1/unknown", "/%76%31/unknown", "/%6fpenapi.json"] {
+        let unknown = client
+            .get(format!("{url}{path}"))
+            .header("accept", "text/html")
+            .send()
+            .await?;
+        assert_eq!(unknown.status(), 404, "{path}");
+        assert_eq!(unknown.json::<Value>().await?["error"]["code"], "not_found");
+    }
+    let stream = client
+        .get(format!("{url}/v1/stream"))
+        .header("accept", "text/html")
+        .send()
+        .await?;
+    assert_eq!(stream.status(), 200);
+    assert_eq!(stream.headers()["content-type"], "text/event-stream");
+    drop(stream);
+
+    std::fs::write(temp.path().join("secret.txt"), "outside kiosk")?;
+    std::os::unix::fs::symlink(temp.path().join("secret.txt"), root.join("leak.txt"))?;
+    assert_eq!(
+        client
+            .get(format!("{url}/leak.txt"))
+            .header("accept", "text/html")
+            .send()
+            .await?
+            .status(),
+        403
+    );
+    // Raw HTTP avoids client URL normalization hiding literal or encoded traversal.
+    for path in [
+        "/../secret.txt",
+        "/%2e%2e/secret.txt",
+        "/assets/%2E%2E/%2e%2e/secret.txt",
+        "/%2e%2e%2fsecret.txt",
+        "/..%5csecret.txt",
+        "/%2fetc/passwd",
+        "/%00secret.txt",
+    ] {
+        let mut socket =
+            tokio::net::TcpStream::connect(url.strip_prefix("http://").unwrap()).await?;
+        socket.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept: text/html\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+        let mut response = String::new();
+        socket.read_to_string(&mut response).await?;
+        assert!(response.starts_with("HTTP/1.1 400"), "{path}: {response}");
+        assert!(!response.contains("outside kiosk"));
+    }
+    // Files are read at request time, not captured when the router is built.
+    std::fs::write(root.join("index.html"), "updated kiosk")?;
+    assert_eq!(
+        client.get(format!("{url}/")).send().await?.text().await?,
+        "updated kiosk"
+    );
+    task.abort();
     Ok(())
 }

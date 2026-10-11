@@ -123,7 +123,9 @@ the complete file, with permissions, ownership, and timestamps preserved, to
 `override.conf.bak.<UTC timestamp>` in the same directory and prints the path.
 Each installation creates a new snapshot. It then reloads systemd, restarts Ollama, waits for
 its version endpoint, enables/restarts meter, and verifies `/api/version` and
-`/meter/health` on :11434. After startup it also requires these checks to pass:
+`/meter/health` on :11434. Startup checks poll silently for up to 45 seconds,
+then perform one visible curl with an explicit error on failure.
+After startup it also requires these checks to pass:
 
 - `sudo -u meter nvidia-smi -L`, showing the GPU as the real service user.
 - `sudo -u meter tailscale status --json`, showing its first byte (`{`). The
@@ -212,6 +214,8 @@ Defaults and environment equivalents (CLI flags take precedence):
 - `--pricing-db-path` / `FACTORY_API_PRICING_DB_PATH`: `/var/lib/factory-api/pricing.db`.
 - `--services-config` / `FACTORY_API_SERVICES_CONFIG`: optional TOML file;
   defaults are embedded from `factory-api/config/services.toml`.
+- `--static-dir` / `FACTORY_API_STATIC_DIR`: `/var/lib/factory-api/kiosk`;
+  runtime kiosk files, not embedded in the binary.
 - `RUST_LOG`: defaults to `factory_api=info`.
 
 Database parent directories must exist. Request and pricing paths must differ.
@@ -252,7 +256,8 @@ Endpoints:
   should fetch snapshots. Lagged subscribers skip missed events with a log warning.
 
 Errors use `{error:{code,message}}`; malformed ranges return 400, unknown paths
-404, wrong methods 405. Local storage failures return 500, unlike upstream outages.
+under `/v1/` return 404, wrong API methods return 405. Local storage failures
+return 500, unlike upstream outages.
 Timestamps are Unix milliseconds (`*_ms`); pricing seconds are converted at the
 boundary. Ollama nanoseconds become milliseconds for latency/load and seconds
 for tokens per second. Prompt/generation rates average valid per-request ratios,
@@ -284,13 +289,59 @@ The dedicated `factory-api` user gets `/var/lib/factory-api` through systemd
 `StateDirectory`. The unit uses `ProtectSystem=strict` and `NoNewPrivileges`.
 The installer never runs Cargo, performs preflight checks, snapshots existing
 binary/unit files and prior service state, starts port 8080, curls health/fleet,
-and verifies Tailscale and amp-runner as the service user. Rollback restores those
+and verifies Tailscale and amp-runner as the service user. The health startup
+check polls silently for up to 45 seconds, followed by one visible curl with an
+explicit error on failure. Rollback restores those
 files and service state; databases and user remain. Neither script changes meter,
 Ollama, firewall rules, or Tailscale configuration.
 
+### Runtime kiosk and installation
+
+`GET /` serves `index.html` from the static directory. Existing files use their
+content types; unknown non-API GET paths accepting `text/html` use the same
+index for SPA routes. HEAD is also supported. `/v1`, `/v1/*` (including SSE),
+and `/openapi.json` always remain API paths, even if matching files exist.
+There are no directory listings. Decoded traversal, absolute paths and
+backslashes are rejected; symlinks cannot escape the static directory.
+Responses include `X-Content-Type-Options: nosniff`. Index and SPA responses
+use `Cache-Control: no-cache`; `assets/*` uses
+`public, max-age=31536000, immutable`, so builds must use hashed asset filenames.
+Other files use `no-cache`.
+
+A missing or empty static directory serves a built-in HTTP 200 placeholder at
+`/`: dark background, centered “factory · kiosk not deployed yet”, system font,
+and a 30-second auto-reload. API endpoints work independently of kiosk files.
+
+After deploying the static-capable API binary, install an already-built kiosk
+dist as an administrator. These scripts are artifacts, not run in development:
+
+```sh
+sudo bash deploy/install-kiosk.sh /path/to/kiosk/dist
+# Default dist: /home/agent/work/factory/kiosk/dist
+sudo bash deploy/install-kiosk.sh
+# Restore latest complete pre-install snapshot, or specify one:
+sudo bash deploy/rollback-kiosk.sh
+sudo bash deploy/rollback-kiosk.sh /var/backups/factory-kiosk/<snapshot>
+```
+
+Both scripts require root, the existing factory-api account/group and state
+directory, curl, GNU coreutils with `mv --exchange --no-copy`, and `flock`.
+The filesystem must support atomic directory exchange. Preflight rejects unsafe
+paths and non-regular entries (including symlinks). Install requires `index.html`,
+snapshots the current tree or its absence under `/var/backups/factory-kiosk`,
+copies the dist to a sibling temporary directory, sets `root:factory-api`
+ownership and read-only modes (0550 directories, 0440 files), then atomically
+exchanges directories (or renames on first installation). Install and rollback
+share a lock. Snapshots remain available after failures; neither script silently
+rolls back. Rollback restores the selected snapshot, including a missing/empty
+tree. Both verify `GET /` against the installed/restored index or placeholder.
+Neither script builds anything, restarts services, or changes meter/Ollama.
+
 Validation: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test --workspace`, and `bash -n` for both deployment scripts. Factory-api
+`cargo test --workspace`, and `bash -n` for the API and kiosk deployment scripts. Factory-api
 tests cover every unit conversion, dated/estimated/unpriced spend, null tokens,
 TPS math, mock-meter endpoint JSON, upserts/gaps/outages, fleet check kinds,
-OpenAPI references, explicit confirmation and a real HTTP SSE event.
+OpenAPI references, explicit confirmation, a real HTTP SSE event, runtime static
+updates, SPA fallback, API precedence, cache/content headers, traversal rejection,
+symlink escapes, and missing/empty-directory placeholders.
 See [the live check](factory-api/LIVE_CHECK.md) for observed outputs and limits.
