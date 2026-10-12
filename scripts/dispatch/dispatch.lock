@@ -1,0 +1,1 @@
+Dedicated flock inode. Do not replace or delete while a dispatcher pass is running.

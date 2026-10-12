@@ -1,0 +1,304 @@
+import { readFileSync, openSync, closeSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+export const NODE_VERSION = '24.21.0';
+export const modes = {
+  amp: { low: 'low', medium: 'medium', high: 'high' },
+  claude: { low: 'external-agent:claude-code', medium: 'external-agent:claude-code', high: 'external-agent:claude-code' },
+  chatgpt: { low: 'gpt56l', medium: 'gpt61s', high: 'gpt61s' },
+};
+const marker = (name: string) => `<!-- factory-dispatch:${name} -->`;
+const threadPattern = /<!-- factory-dispatch:thread (T-[a-f0-9-]{36})(?: runner:(gpu|console))? -->/;
+const headings = ['Goal', 'Link type', 'Context', 'Isolation', 'Build', 'Tests', 'Sandbox check', 'Deploy artifacts', 'Done means'];
+const required = ['Goal', 'Context', 'Isolation', 'Build', 'Sandbox check', 'Done means'];
+type Label = { id: string; name: string; parent?: { name: string } | null };
+type Issue = {
+  id: string; identifier: string; title: string; description: string | null;
+  priority: number; createdAt: string; team: { id: string; key: string };
+  labels: Label[]; comments: { body: string; createdAt?: string }[];
+  inverseRelations: { type: string; issue: { identifier: string; state: { type: string } } }[];
+  attachments: { url: string; metadata: Record<string, unknown>; createdAt: string }[];
+};
+
+export function sections(description: string | null) {
+  const result: Record<string, string> = {};
+  let current = '';
+  let fence = '';
+  for (const line of (description ?? '').split(/\r?\n/)) {
+    if (/^\s*>/.test(line)) continue;
+    const delimiter = line.match(/^\s*(`{3,}|~{3,})/);
+    if (delimiter) fence = fence ? (delimiter[1][0] === fence[0] && delimiter[1].length >= fence.length ? '' : fence) : delimiter[1];
+    const heading = !fence && line.match(/^#{1,6}\s+(?:\d+\.\s*)?(.*?)\s*$/);
+    const name = heading && heading[1].replace(/^\*\*|\*\*$/g, '').replace(/:$/, '');
+    if (name && headings.includes(name)) {
+      current = name;
+      result[current] ??= '';
+    } else if (current) result[current] += `${line}\n`;
+  }
+  return Object.fromEntries(Object.entries(result).map(([name, value]) => [name, value.trim()]));
+}
+
+export function slug(identifier: string, title: string) {
+  const words = title.trim().split(/\s+/).slice(0, 4).join('-').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return `${identifier.toLowerCase()}-${words}`.slice(0, 40).replace(/-+$/, '');
+}
+
+export function validate(issue: Issue) {
+  const content = sections(issue.description);
+  const errors = required.filter(name => !content[name]).map(name => `Empty required section: ${name}`);
+  const names = issue.labels.map(label => label.name);
+  if (names.filter(name => ['Bug', 'Feature', 'Improvement'].includes(name)).length !== 1) errors.push('Needs exactly one of Bug/Feature/Improvement');
+  if (!names.some(name => /^area:.+/.test(name))) errors.push('Needs at least one area:* label');
+  function choice(group: string, fallback: string, allowed: string[]) {
+    const values = issue.labels.filter(label => label.parent?.name === group || label.name.startsWith(`${group}/`))
+      .map(label => label.name.replace(new RegExp(`^${group}/`), ''));
+    if (values.length > 1 || values.some(value => !allowed.includes(value))) errors.push(`Invalid ${group} label`);
+    return values[0] ?? fallback;
+  }
+  const runner = choice('runner', 'gpu', ['gpu', 'console', 'orb']);
+  const engine = choice('engine', 'amp', Object.keys(modes));
+  const effort = choice('agent-effort', 'medium', ['low', 'medium', 'high']);
+  if (runner === 'orb') errors.push('orb overflow not set up yet');
+  const link = content['Link type']?.toLowerCase() || 'contributes';
+  if (!['contributes', 'closes'].includes(link)) errors.push('Link type must be contributes or closes');
+  return { content, errors, runner, engine, effort, link };
+}
+
+export function prompt(issue: Issue) {
+  const { content, runner, effort, link } = validate(issue);
+  const branch = slug(issue.identifier, issue.title);
+  const tests = 'Run cargo fmt --check, cargo clippy --all-targets -- -D warnings, and cargo test --workspace. For kiosk changes also run vp check, vp test --run, and vp build.';
+  return `**Thread title:** Use the Linear ticket identifier and title: \`${issue.identifier} — ${issue.title}\`.
+
+Runner: factory-${runner}. Directory: ~/work. Effort: ${effort}.
+
+## 1. Start fresh
+Stop and report if branch ${branch} or directory ~/work/factory-${branch} already exists. Never reuse or overwrite either.
+export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git
+git -C ~/work/factory fetch origin
+git -C ~/work/factory worktree add -b ${branch} ~/work/factory-${branch} origin/main
+Work only in that worktree, never the main checkout. Read AGENTS.md and READMEs first.
+First push: git push -u origin ${branch}.
+PR title starts with ${issue.identifier}; body says "${link === 'closes' ? 'Closes' : 'Contributes'} ${issue.identifier}".
+Use closes only if the PR finishes the issue; otherwise use contributes.
+
+${headings.map(name => `## ${name}\n${content[name] || (name === 'Tests' ? tests : name === 'Link type' ? 'contributes' : name === 'Deploy artifacts' ? "Write them, don't run them." : '')}`).join('\n\n')}
+
+Push, open the PR, and reply with test results, deviations, anything unverified, and exact Mac deploy/rollback commands using factory-ssh or console-ssh and full /home/agent/work/factory paths. Never deploy. Merge and deploy remain Devon's gates.`;
+}
+
+export function wrapupPrompt(issue: Issue) {
+  const branch = issue.comments.map(comment => comment.body.match(/<!-- factory-dispatch:worktree ([a-z0-9-]+) -->/)).find(Boolean)?.[1] ?? slug(issue.identifier, issue.title);
+  return `export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git
+Confirm the linked PR for ${issue.identifier} is merged. Stop and report if it is not.
+Update and build in the main checkout /home/agent/work/factory, as agent, without sudo.
+git -C /home/agent/work/factory fetch origin
+git -C /home/agent/work/factory merge --ff-only origin/main
+Build the merged artifacts required by this task. Stop on dirty files or any failure.
+Remove this thread's worktree and local branch only after checking for unpushed work:
+git -C /home/agent/work/factory worktree remove /home/agent/work/factory-${branch}
+git -C /home/agent/work/factory branch -D ${branch}
+Reply with exact Mac install/verify commands using factory-ssh or console-ssh and full /home/agent/work/factory paths.
+Never deploy. One deploy per runner at a time. Devon archives this thread only after deploy verification; if verification fails, fix it in this thread from a fresh worktree.`;
+}
+
+// ponytail: Linear documents metadata as arbitrary JSON, not GitHub's keys.
+// Verify this predicate against a real merged PR attachment before deployment.
+export function isMergedGitHubPR(attachment: Issue['attachments'][number]) {
+  return /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+\/?$/.test(attachment.url)
+    && attachment.metadata?.status === 'merged';
+}
+
+const page = 'pageInfo { hasNextPage endCursor }';
+const fields = {
+  labels: 'id name parent { name }', comments: 'body createdAt',
+  inverseRelations: 'type issue { identifier state { type } }',
+  attachments: 'url metadata createdAt',
+};
+const issueFields = `id identifier title description priority createdAt team { id key }
+  ${Object.entries(fields).map(([name, selection]) => `${name}(first: 20) { nodes { ${selection} } ${page} }`).join('\n')}`;
+
+async function amp(args: string[]) {
+  return new Promise<string>((resolve, reject) => {
+    const child = spawn('amp', args, { stdio: ['ignore', 'pipe', 'ignore'], timeout: 120_000 });
+    let stdout = '';
+    child.stdout.setEncoding('utf8').on('data', chunk => { stdout = (stdout + chunk).slice(-1_000_000); });
+    child.on('error', () => reject(new Error('Amp could not start')));
+    child.on('close', (code, signal) => code === 0 ? resolve(stdout) : reject(new Error(`Amp failed (exit ${code}, signal ${signal ?? 'none'}); inspect the thread before recovery`)));
+  });
+}
+
+export async function run(command: string, identifier: string | undefined, dryRun: boolean) {
+  if (process.versions.node !== NODE_VERSION) throw new Error(`Use Node ${NODE_VERSION}`);
+  const team = process.env.DISPATCH_TEAM ?? 'MET';
+  const cap = Number(process.env.DISPATCH_MAX_ACTIVE_PER_RUNNER ?? 2);
+  if (!Number.isSafeInteger(cap) || cap < 1) throw new Error('DISPATCH_MAX_ACTIVE_PER_RUNNER must be a positive integer');
+  const runners = Object.fromEntries((process.env.DISPATCH_RUNNERS ?? 'gpu=factory-gpu,console=factory-console').split(',').map(item => item.split('=')));
+  if (Object.keys(runners).length !== 2 || !['gpu', 'console'].every(name => /^[\w-]+$/.test(runners[name] ?? ''))) throw new Error('DISPATCH_RUNNERS must be gpu=<id>,console=<id>');
+  // Test-only endpoint override cannot send credentials to another remote host.
+  const endpoint = process.env.DISPATCH_LINEAR_URL ?? 'https://api.linear.app/graphql';
+  if (endpoint !== 'https://api.linear.app/graphql' && !/^http:\/\/127\.0\.0\.1:\d+\/graphql$/.test(endpoint)) throw new Error('Test endpoint must be loopback /graphql');
+  const key = readFileSync(process.env.LINEAR_API_KEY_FILE ?? '/etc/factory-dispatch/linear-api-key', 'utf8').trim();
+  if (!key) throw new Error('Linear key file is empty');
+  const log = (decision: string, details: object = {}) => console.log(JSON.stringify({ decision, ...details }).replaceAll(key, '[redacted]'));
+  async function query(document: string, variables: object = {}) {
+    let response;
+    try {
+      response = await fetch(endpoint, { method: 'POST', headers: { Authorization: key, 'Content-Type': 'application/json' }, body: JSON.stringify({ query: document, variables }), signal: AbortSignal.timeout(30_000) });
+    } catch { throw new Error('Linear request failed; outcome may be unknown'); }
+    if (!response.ok) throw new Error(`Linear HTTP ${response.status}; outcome may be unknown`);
+    let result;
+    try { result = await response.json(); }
+    catch { throw new Error('Linear returned invalid JSON; outcome may be unknown'); }
+    if (result.errors?.length || !result.data) throw new Error('Linear GraphQL error; outcome may be unknown');
+    return result.data;
+  }
+  async function pages(document: string, variables: object, select: (data: any) => any) {
+    const nodes: any[] = [];
+    let after: string | null = null;
+    do {
+      const connection = select(await query(document, { ...variables, after }));
+      nodes.push(...connection.nodes);
+      if (!connection.pageInfo.hasNextPage) return nodes;
+      if (!connection.pageInfo.endCursor || connection.pageInfo.endCursor === after) throw new Error('Linear pagination did not advance');
+      after = connection.pageInfo.endCursor;
+    } while (true);
+  }
+  async function hydrate(raw: any): Promise<Issue> {
+    for (const [name, selection] of Object.entries(fields)) {
+      raw[name] = raw[name].pageInfo.hasNextPage
+        ? await pages(`query IssuePage($id: String!, $after: String) { issue(id: $id) { ${name}(first: 100, after: $after) { nodes { ${selection} } ${page} } } }`, { id: raw.id }, data => data.issue[name])
+        : raw[name].nodes;
+    }
+    return raw;
+  }
+  async function mutate(issue: Issue, document: string, variables: any) {
+    if (dryRun) { log('would-mutate', { issue: issue.identifier, query: document, variables }); return; }
+    const result = await query(document, variables);
+    if (!Object.values(result).every((value: any) => value?.success === true)) throw new Error('Linear mutation unsuccessful; stopping pass');
+  }
+  async function comment(issue: Issue, body: string) {
+    await mutate(issue, 'mutation Comment($input: CommentCreateInput!) { commentCreate(input: $input) { success } }', { input: { issueId: issue.id, body } });
+    issue.comments.push({ body });
+  }
+  async function removeLabel(issue: Issue) {
+    const label = issue.labels.find(label => label.name === 'dispatch');
+    if (!label) return;
+    await mutate(issue, 'mutation RemoveLabel($id: String!, $labelId: String!) { issueRemoveLabel(id: $id, labelId: $labelId) { success } }', { id: issue.id, labelId: label.id });
+    issue.labels = issue.labels.filter(value => value.id !== label.id);
+  }
+  const has = (issue: Issue, name: string) => issue.comments.some(comment => comment.body.includes(marker(name)));
+  const thread = (issue: Issue) => issue.comments.map(comment => comment.body.match(threadPattern)).find(Boolean);
+  function showAmp(issue: Issue, args: string[]) {
+    // Exact argv except prompt text: printing full prompts would leak issue content.
+    log('would-run', { issue: issue.identifier, command: args.map(value => `'${value.replaceAll("'", "'\\''")}'`).join(' ') });
+  }
+
+  const raw = await pages(`query Queue($filter: IssueFilter!, $after: String) { issues(filter: $filter, first: 20, after: $after, includeArchived: true) { nodes { ${issueFields} } ${page} } }`, {
+    filter: { team: { key: { eq: team } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }] },
+  }, data => data.issues);
+  const issues = await Promise.all(raw.map(hydrate));
+  if (identifier && !issues.some(issue => issue.identifier === identifier)) {
+    issues.push(await hydrate((await query(`query OneIssue($id: String!) { issue(id: $id) { ${issueFields} } }`, { id: identifier })).issue));
+  }
+  if (identifier && !issues.some(issue => issue.identifier === identifier && issue.team.key === team)) throw new Error('Issue does not belong to DISPATCH_TEAM');
+  const states = await pages(`query States($filter: WorkflowStateFilter!, $after: String) { workflowStates(filter: $filter, first: 100, after: $after) { nodes { id name type } ${page} } }`, { filter: { team: { key: { eq: team } }, name: { eq: 'In Progress' } } }, data => data.workflowStates);
+  if (states.length !== 1 || states[0].type !== 'started') throw new Error('Team must have one In Progress state of type started');
+
+  const active: Record<string, number> = { gpu: 0, console: 0 };
+  for (const issue of issues) {
+    if (has(issue, 'wrapup')) continue;
+    const match = thread(issue);
+    const claim = issue.comments.map(comment => comment.body.match(/<!-- factory-dispatch:claim runner:(gpu|console) -->/)).find(Boolean);
+    const runner = match?.[2] ?? claim?.[1];
+    if (runner) active[runner]++;
+    else if (match) { active.gpu++; active.console++; }
+  }
+  const candidates = issues.filter(issue => command === 'issue' ? issue.identifier === identifier : issue.labels.some(label => label.name === 'dispatch'));
+  candidates.sort((a, b) => (a.priority || 5) - (b.priority || 5) || a.createdAt.localeCompare(b.createdAt) || a.identifier.localeCompare(b.identifier));
+  for (const issue of candidates) {
+    const blockers = issue.inverseRelations.filter(relation => relation.type === 'blocks' && !['completed', 'canceled'].includes(relation.issue.state.type)).map(relation => relation.issue.identifier);
+    if (blockers.length) {
+      log('blocked', { issue: issue.identifier, blockers });
+      if (!has(issue, 'waiting')) await comment(issue, `Waiting on ${blockers.join(', ')}\n\n${marker('waiting')}`);
+      continue;
+    }
+    const { errors, runner, engine, effort } = validate(issue);
+    if (errors.length) {
+      log('invalid', { issue: issue.identifier, reasons: errors });
+      if (!has(issue, 'invalid')) await comment(issue, `Cannot dispatch:\n${errors.map(error => `- ${error}`).join('\n')}\n\n${marker('invalid')}`);
+      await removeLabel(issue);
+      continue;
+    }
+    if (active[runner] >= cap) { log('capacity', { issue: issue.identifier, runner }); continue; }
+    if (thread(issue) || issue.comments.some(comment => /<!-- factory-dispatch:claim runner:/.test(comment.body))) {
+      log('already-claimed', { issue: issue.identifier });
+      await removeLabel(issue);
+      continue;
+    }
+    await removeLabel(issue);
+    await comment(issue, `Dispatch claimed on ${runner}. If submission is interrupted, inspect Amp before manual recovery; do not delete this claim to retry blindly.\n\n${marker(`claim runner:${runner}`)}\n${marker(`worktree ${slug(issue.identifier, issue.title)}`)}`);
+    active[runner]++;
+    const args = ['-x', prompt(issue), '--mode', modes[engine][effort], '--executor', `runner:${runners[runner]}`, '--runner-dir', '/home/agent/work', '--title', `${issue.identifier} — ${issue.title}`, '--visibility', 'private', '--no-archive-after-execute'];
+    let id = 'T-00000000-0000-0000-0000-000000000000';
+    if (dryRun) showAmp(issue, ['amp', '-x', '$PROMPT', ...args.slice(2)]);
+    else {
+      try {
+        const output = await amp(args);
+        const ids = [...new Set(output.match(/\bT-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\b/g))];
+        if (ids.length !== 1) throw new Error('Amp returned no unique thread ID; inspect Amp before recovery');
+        id = ids[0];
+      } catch (error) {
+        await comment(issue, `${(error as Error).message}. Label remains off; automatic retry is disabled.`);
+        log('amp-failed', { issue: issue.identifier });
+        continue;
+      }
+    }
+    await comment(issue, `https://ampcode.com/threads/${id}\n\n${marker(`thread ${id} runner:${runner}`)}`);
+    await mutate(issue, 'mutation Move($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }', { id: issue.id, input: { stateId: states[0].id } });
+    log('dispatched', { issue: issue.identifier, thread: dryRun ? '<new-thread-id>' : id, runner });
+  }
+  for (const issue of issues) {
+    const match = thread(issue);
+    if (!match || has(issue, 'wrapup')) continue;
+    if (has(issue, 'wrapup-claim')) { log('wrapup-claimed', { issue: issue.identifier }); continue; }
+    const claim = issue.comments.find(comment => /<!-- factory-dispatch:claim runner:(gpu|console) -->/.test(comment.body));
+    if (!issue.attachments.some(attachment => isMergedGitHubPR(attachment)
+      && Date.parse(attachment.createdAt) > Date.parse(claim?.createdAt ?? ''))) {
+      log('awaiting-merge', { issue: issue.identifier }); continue;
+    }
+    await comment(issue, `Wrap-up claimed; an interrupted submission requires manual inspection.\n\n${marker('wrapup-claim')}`);
+    if (dryRun) showAmp(issue, ['amp', 'threads', 'continue', match[1], '-ox', '$WRAPUP_PROMPT']);
+    else {
+      try { await amp(['threads', 'continue', match[1], '-ox', wrapupPrompt(issue)]); }
+      catch (error) {
+        await comment(issue, `Wrap-up submission failed: ${(error as Error).message}. Automatic retry is disabled.`);
+        log('wrapup-failed', { issue: issue.identifier });
+        continue;
+      }
+    }
+    await comment(issue, `Wrap-up submitted to https://ampcode.com/threads/${match[1]}. Devon still owns deployment and verification.\n\n${marker('wrapup')}`);
+    log('wrapup', { issue: issue.identifier });
+  }
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  let fd: number | undefined;
+  try {
+    const args = process.argv.slice(2);
+    const dryRun = args.includes('--dry-run');
+    const positional = args.filter(arg => arg !== '--dry-run');
+    if (!((positional.length === 1 && positional[0] === 'poll') || (positional.length === 2 && positional[0] === 'issue' && /^[A-Z][A-Z0-9]*-\d+$/.test(positional[1])))) throw new Error('Usage: dispatch.ts poll|issue MET-123 [--dry-run]');
+    // Existing, dedicated inode: even dry-run acquires the lock without writes.
+    fd = openSync(process.env.DISPATCH_LOCK_FILE ?? '/home/agent/work/factory/scripts/dispatch/dispatch.lock', 'r');
+    const lock = spawnSync('flock', ['--exclusive', '3'], { stdio: ['ignore', 'ignore', 'ignore', fd] });
+    if (lock.status !== 0) throw new Error('Could not acquire dispatch lock');
+    await run(positional[0], positional[1], dryRun);
+  } catch (error) {
+    // Only our fixed diagnostics; do not echo system errors containing key paths or bodies.
+    const message = (error as NodeJS.ErrnoException).code ? 'Dispatcher local configuration failed' : (error as Error).message;
+    console.log(JSON.stringify({ decision: 'error', message }));
+    process.exitCode = 1;
+  } finally { if (fd !== undefined) closeSync(fd); }
+}
