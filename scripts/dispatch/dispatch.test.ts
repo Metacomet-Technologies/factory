@@ -39,7 +39,8 @@ function issue(n = 123, overrides: any = {}) {
     comments: [], inverseRelations: [], attachments: [], ...overrides };
 }
 const threadComment = (runner = 'gpu') => ({ body: `https://ampcode.com/threads/${threadId}\n<!-- factory-dispatch:thread ${threadId} runner:${runner} -->` });
-const attachment = (status: string) => ({ url: 'https://github.com/Metacomet-Technologies/factory/pull/90', metadata: { status } });
+const claimComment = () => ({ body: '<!-- factory-dispatch:claim runner:gpu -->', createdAt: '2026-10-10T12:00:00.000Z' });
+const attachment = (status: string) => ({ url: 'https://github.com/Metacomet-Technologies/factory/pull/90', metadata: { status }, createdAt: '2026-10-10T12:00:00.001Z' });
 const labeled = (i: any) => i.labels.some((label: any) => label.name === 'dispatch');
 
 async function fixture(t: any, issues = [issue()], options: any = {}) {
@@ -83,7 +84,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
         const crashHere = crash && crash(operation, v);
         if (crashHere === 'before') { crash = null; current.kill('SIGKILL'); response.destroy(); return; }
         if (options.rejectMutation === operation) { response.end(JSON.stringify({ data: { refused: { success: false } } })); return; }
-        if (operation === 'Comment') { i.comments.push({ body: v.input.body }); data = { commentCreate: { success: true } }; }
+        if (operation === 'Comment') { i.comments.push({ body: v.input.body, createdAt: new Date().toISOString() }); data = { commentCreate: { success: true } }; }
         else if (operation === 'RemoveLabel') { i.labels = i.labels.filter((label: any) => label.id !== v.labelId); data = { issueRemoveLabel: { success: true } }; }
         else if (operation === 'Move') { i.stateId = v.input.stateId; data = { issueUpdate: { success: true } }; }
         else throw new Error(`Unexpected mutation ${operation}`);
@@ -261,7 +262,7 @@ for (const environment of [{ FAKE_FAIL: '1' }, { FAKE_NO_ID: '1' }]) {
 }
 
 test('wrap-up only after merged GitHub attachment, sent once to existing thread', { timeout: 10_000 }, async t => {
-  const i = issue(123, { labels: [], comments: [threadComment(), { body: '<!-- factory-dispatch:worktree met-123-build-the-useful-widget -->' }], attachments: [attachment('open')] });
+  const i = issue(123, { labels: [], comments: [claimComment(), threadComment(), { body: '<!-- factory-dispatch:worktree met-123-build-the-useful-widget -->' }], attachments: [attachment('open')] });
   const f = await fixture(t, [i]);
   await f.run(); i.attachments[0].metadata.status = 'closed'; await f.run();
   assert.equal(f.calls().length, 0);
@@ -278,8 +279,33 @@ test('wrap-up only after merged GitHub attachment, sent once to existing thread'
   assert.equal(i.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:wrapup -->')).length, 1);
 });
 
+test('old merged PR cannot wrap up new work; the post-claim PR merging sends exactly once', { timeout: 10_000 }, async t => {
+  const oldPR = { ...attachment('merged'), url: 'https://github.com/Metacomet-Technologies/factory/pull/89', createdAt: '2026-10-10T11:59:59.999Z' };
+  const newPR = attachment('open');
+  const i = issue(123, { labels: [], comments: [claimComment(), { ...threadComment(), createdAt: '2026-10-10T12:00:01.000Z' }], attachments: [oldPR, newPR] });
+  const f = await fixture(t, [i]);
+  await f.run(); await f.run();
+  assert.equal(f.calls().length, 0);
+  assert.equal(f.mutations.length, 0);
+  newPR.metadata.status = 'merged';
+  await f.run(); await f.run();
+  assert.equal(f.calls().length, 1);
+  assert.deepEqual(f.calls()[0].slice(0, 4), ['threads', 'continue', threadId, '-ox']);
+  assert.equal(i.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:wrapup -->')).length, 1);
+});
+
+test('wrap-up requires a known claim timestamp and an attachment strictly later than it', { timeout: 10_000 }, async t => {
+  for (const comments of [[claimComment(), threadComment()], [threadComment()], [{ ...claimComment(), createdAt: undefined }, threadComment()]]) {
+    const i = issue(123, { labels: [], comments, attachments: [{ ...attachment('merged'), createdAt: '2026-10-10T08:00:00-04:00' }] });
+    const f = await fixture(t, [i]);
+    assert.equal((await f.run()).code, 0);
+    assert.equal(f.calls().length, 0);
+    assert.equal(f.mutations.length, 0);
+  }
+});
+
 test('wrap-up crash after Amp success does not send twice', { timeout: 10_000 }, async t => {
-  const i = issue(123, { labels: [], comments: [threadComment()], attachments: [attachment('merged')] });
+  const i = issue(123, { labels: [], comments: [claimComment(), threadComment()], attachments: [attachment('merged')] });
   const f = await fixture(t, [i], { crash: (op: string, v: any) => op === 'Comment' && v.input.body.includes('<!-- factory-dispatch:wrapup -->') ? 'before' : false });
   assert.equal((await f.run()).signal, 'SIGKILL');
   await f.run();
@@ -288,7 +314,7 @@ test('wrap-up crash after Amp success does not send twice', { timeout: 10_000 },
 });
 
 test('failed wrap-up is claimed, reported, and never automatically retried', { timeout: 10_000 }, async t => {
-  const i = issue(123, { labels: [], comments: [threadComment()], attachments: [attachment('merged')] });
+  const i = issue(123, { labels: [], comments: [claimComment(), threadComment()], attachments: [attachment('merged')] });
   const f = await fixture(t, [i]);
   await f.run(['poll'], { FAKE_FAIL: '1' });
   await f.run();
@@ -336,7 +362,7 @@ test('flock serializes simultaneous poll and manual issue through Amp and final 
 
 test('pagination preserves later blockers, labels, thread markers and merged attachments', { timeout: 10_000 }, async t => {
   const blocked = issue(123, { inverseRelations: [{ type: 'related', issue: { identifier: 'MET-1', state: { type: 'completed' } } }, { type: 'blocks', issue: { identifier: 'MET-2', state: { type: 'started' } } }] });
-  const wrapping = issue(124, { labels: [], comments: [{ body: 'ordinary comment' }, threadComment()], attachments: [attachment('closed'), attachment('merged')] });
+  const wrapping = issue(124, { labels: [], comments: [{ body: 'ordinary comment' }, claimComment(), threadComment()], attachments: [attachment('closed'), attachment('merged')] });
   const f = await fixture(t, [blocked, wrapping], { pageSize: 1 });
   assert.equal((await f.run()).code, 0);
   assert.equal(labeled(blocked), true);
@@ -370,5 +396,5 @@ test('slug boundaries, hint stripping, required sections and strict merge predic
   assert.match(prompt(issue()), /## Link type\ncontributes/);
   assert.match(prompt(issue(123, { description: body.replace('> Defaults to contributes.', 'closes') })), /Closes MET-123/);
   assert.equal(isMergedGitHubPR(attachment('merged')), true);
-  for (const value of [attachment('closed'), { ...attachment('merged'), url: 'https://github.com/a/b/issues/1' }, { ...attachment('merged'), url: 'https://github.com.evil/a/b/pull/1' }, { url: attachment('merged').url, metadata: { merged: true } }]) assert.equal(isMergedGitHubPR(value), false);
+  for (const value of [attachment('closed'), { ...attachment('merged'), url: 'https://github.com/a/b/issues/1' }, { ...attachment('merged'), url: 'https://github.com.evil/a/b/pull/1' }, { ...attachment('merged'), metadata: { merged: true } }]) assert.equal(isMergedGitHubPR(value), false);
 });

@@ -97,7 +97,7 @@ on 2026-10-12. No authenticated Linear API request was made by the dispatcher.
 - `issues(filter: IssueFilter, first, after, includeArchived)` and `issue(id)`;
   `id`, `identifier`, `title`, `description`, `priority`, `createdAt`, `team.id/key`.
   Filters: `team.key.eq`, `labels.some.name.eq`, `comments.some.body.contains`, `or`.
-- `labels.nodes.{id,name,parent.name}` and `comments.nodes.body`.
+- `labels.nodes.{id,name,parent.name}` and `comments.nodes.{body,createdAt}`.
 - `inverseRelations.nodes.{type,issue.identifier,issue.state.type}`. A relation's
   `issue` is its source, `relatedIssue` its target, and type `blocks` means the
   source blocks the target. Incoming `blocks` therefore supplies blockers.
@@ -108,10 +108,16 @@ on 2026-10-12. No authenticated Linear API request was made by the dispatcher.
   `commentCreate(input: CommentCreateInput!)` with `issueId/body`,
   `issueUpdate(id: String!, input: IssueUpdateInput!)` with `stateId`;
   all mutation payloads must report `success: true`.
-- `attachments.nodes.{url,metadata}`. Connections use `nodes` and
+- `attachments.nodes.{url,metadata,createdAt}`. Connections use `nodes` and
   `pageInfo.{hasNextPage,endCursor}`. Queue pages and initial nested pages have
   20 entries; overflow connections paginate separately, never silently truncate.
   Archived marked issues remain visible for deduplication and capacity.
+
+Wrap-up considers only attachments whose `createdAt` is strictly later than the
+dispatch claim comment's `createdAt`. Both fields are `DateTime!` in the cited
+schema. Older or equal-time attachments cannot trigger wrap-up; a missing claim
+or unknown timestamp also leaves it pending. Newly posted claims acquire their
+server timestamp from the next poll, not the dispatcher's clock.
 
 [Attachment docs](https://linear.app/developers/attachments) and the schema
 describe `metadata: JSONObject!` as integration-specific. **They do not specify

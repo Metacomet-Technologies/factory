@@ -16,9 +16,9 @@ type Label = { id: string; name: string; parent?: { name: string } | null };
 type Issue = {
   id: string; identifier: string; title: string; description: string | null;
   priority: number; createdAt: string; team: { id: string; key: string };
-  labels: Label[]; comments: { body: string }[];
+  labels: Label[]; comments: { body: string; createdAt?: string }[];
   inverseRelations: { type: string; issue: { identifier: string; state: { type: string } } }[];
-  attachments: { url: string; metadata: Record<string, unknown> }[];
+  attachments: { url: string; metadata: Record<string, unknown>; createdAt: string }[];
 };
 
 export function sections(description: string | null) {
@@ -112,9 +112,9 @@ export function isMergedGitHubPR(attachment: Issue['attachments'][number]) {
 
 const page = 'pageInfo { hasNextPage endCursor }';
 const fields = {
-  labels: 'id name parent { name }', comments: 'body',
+  labels: 'id name parent { name }', comments: 'body createdAt',
   inverseRelations: 'type issue { identifier state { type } }',
-  attachments: 'url metadata',
+  attachments: 'url metadata createdAt',
 };
 const issueFields = `id identifier title description priority createdAt team { id key }
   ${Object.entries(fields).map(([name, selection]) => `${name}(first: 20) { nodes { ${selection} } ${page} }`).join('\n')}`;
@@ -263,7 +263,11 @@ export async function run(command: string, identifier: string | undefined, dryRu
     const match = thread(issue);
     if (!match || has(issue, 'wrapup')) continue;
     if (has(issue, 'wrapup-claim')) { log('wrapup-claimed', { issue: issue.identifier }); continue; }
-    if (!issue.attachments.some(isMergedGitHubPR)) { log('awaiting-merge', { issue: issue.identifier }); continue; }
+    const claim = issue.comments.find(comment => /<!-- factory-dispatch:claim runner:(gpu|console) -->/.test(comment.body));
+    if (!issue.attachments.some(attachment => isMergedGitHubPR(attachment)
+      && Date.parse(attachment.createdAt) > Date.parse(claim?.createdAt ?? ''))) {
+      log('awaiting-merge', { issue: issue.identifier }); continue;
+    }
     await comment(issue, `Wrap-up claimed; an interrupted submission requires manual inspection.\n\n${marker('wrapup-claim')}`);
     if (dryRun) showAmp(issue, ['amp', 'threads', 'continue', match[1], '-ox', '$WRAPUP_PROMPT']);
     else {
