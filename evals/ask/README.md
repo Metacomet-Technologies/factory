@@ -21,7 +21,7 @@ needed. If needed elsewhere, use `vp env` to select a compatible Node version.
 No npm install, compiler, loader, or test framework is required.
 
 The defaults are the deployed meter at `http://127.0.0.1:11434` and the live
-read-only factory API at `http://factory-console:8080`. Override using
+read-only factory API at `https://factory-gpu.bearded-pompano.ts.net`. Override using
 `OLLAMA_URL` and `FACTORY_API_URL` only for another evaluation environment.
 `MODELS=factory-code` runs a single model for diagnosis; the reported full run
 uses both defaults. Use a new output filename to preserve the committed run.

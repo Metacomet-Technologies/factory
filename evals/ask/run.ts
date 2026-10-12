@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 
 const directory = fileURLToPath(new URL('.', import.meta.url));
 const ollama = process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434';
-const api = process.env.FACTORY_API_URL ?? 'http://factory-console:8080';
+const api = process.env.FACTORY_API_URL ?? 'https://factory-gpu.bearded-pompano.ts.net';
 const units = ['ollama', 'meter', 'factory-api', 'tailscaled', 'gnome-remote-desktop', 'amp-runner'];
 const nodes = ['factory-gpu', 'factory-console'];
 const object = (properties: any, required: string[]) => ({ type: 'object', properties, required, additionalProperties: false });

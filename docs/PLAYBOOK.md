@@ -70,6 +70,7 @@ Every prompt has these sections:
 - Tests pass, the live check has real evidence (timings, row counts), the deviations list has been read.
 - Read install/rollback scripts in full.
 - **PR ↔ Linear link type:** a "closes" link auto-closes the issue on merge. Use **contributes** for research, partial work, or fixes whose install hasn't been verified; reopen issues that auto-closed early.
+- Claude fixes wrong or missing link types itself with Linear `update_diff`.
 - After rebases, confirm the push actually landed.
 
 ## 6. Deploy flow
@@ -126,6 +127,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 
 **Shell / SSH**
 - `sudo` over `ssh host cmd` needs `ssh -t` (or NOPASSWD). Heredocs after `ssh host` run on the Mac; use `ssh host 'bash -s' <<'EOF'`.
+- The `factory-ssh`/`console-ssh` helpers run `_factory_ready` first, which can print or fail. For byte streams (tar transfers) use plain `ssh "$FACTORY_USER@$FACTORY_GPU"` (or `$FACTORY_CONSOLE`).
 - zsh doesn't expand `~` in `if=`; `curl -d "$big"` hits the arg limit (use `-d @-`).
 - `~/.hushlogin` silences the Ubuntu login banner (per user).
 
@@ -140,6 +142,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 
 **Services / apps**
 - GNOME RDP headless: set credentials with `sudo grdctl --system rdp set-credentials` and register a TLS cert; the Windows App hangs at TLS, use `sdl-freerdp`. Remote Login refuses while the same user is logged in locally.
+- After changing the kiosk's autostart `Exec=`, relaunch the console session (reboot) and verify the live process with `pgrep -u console -af -- '--app='`; the dashboard working in another browser doesn't prove the kiosk switched.
 - Ollama `/api/ps` misreports gemma4's size; use `nvidia-smi`. Exclude non-inference requests (health checks) from usage.
 - A lock held across a network call froze usage/pricing for 60 s+ when TLS failed on a bad clock (MET-90): never hold DB access across I/O.
 - Bundled SQLite 3.51.1 (rusqlite 0.38) can deadlock during concurrent WAL connection closes (fixed in SQLite 3.51.2); use rusqlite ≥ 0.39.
