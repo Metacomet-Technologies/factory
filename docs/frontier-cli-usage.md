@@ -980,7 +980,10 @@ already exist or that Devon's accounts expose every documented interface.
 Contributes MET-77. These observations supplement, rather than rewrite, the
 2026-10-11 research above. Checks ran as `agent` on **factory-console**, around
 2026-10-12 02:31–02:33 UTC (2026-10-11 evening America/New_York). They do not
-establish factory-gpu's installation, login, or environment.
+by themselves establish factory-gpu's installation, login, or environment.
+The follow-up incorporates Devon's verified Mac/GPU results and his 2026-10-12
+collector decision from [MET-121's comments](https://linear.app/metacomet/issue/MET-121/verify-amp-and-claude-code-usage-and-quota-sources-on-the-runners).
+Devon's checks are attributed below; this thread did not repeat them remotely.
 
 Installed versions: Amp `0.0.1791763306-ged595a`, released
 `2026-10-12T00:01:46.000Z`; Claude Code `2.1.296`.
@@ -997,16 +1000,18 @@ Freshness is observation granularity, not a vendor latency guarantee.
 | Source | Verified yes/no/partial | Evidence | Freshness | Works headless? | Recommended for the collector? |
 | --- | --- | --- | --- | --- | --- |
 | Amp account / plan | Yes, console | `account list --json`; `usage` | Command-time snapshot | Yes | Identity inventory only |
-| Amp workspace / M2M eligibility | No workspace membership on console | `secrets list --workspace --json` returns explicit membership error | Command-time check | CLI check yes; creation UI only | API blocked until Devon chooses a workspace |
-| Amp balance CLI | Yes, text only | Exact `amp usage` output below; help has no JSON flag | Current tier period | Yes | No terminal-text parser; automated balance remains unknown |
-| Amp archived thread CLI | Partial | B's plain report unavailable; detailed report returns tokens/cost | Lifetime snapshot | Yes, text only | Human diagnostics, not collection |
-| Amp External API | Partial | Official reference and OpenAPI fetched; no M2M credential/request | Daily buckets / lifetime thread totals; lag unspecified | Documented yes | Yes, after workspace and scopes are provisioned |
+| Amp workspace / M2M eligibility | No workspace membership on console | CLI membership error; Devon decides no workspace | Command-time check | CLI check yes; creation UI only | No; not pursued |
+| Amp balance CLI | Yes, text only | Exact `amp usage` output below; Devon's Mac result agrees | Poll every 15 min; current tier period | Yes | Yes; strict versioned parser, explicit exception |
+| Amp account detail CLI | Yes, text only | `amp usage --details` here and in Devon's comments | Hourly; range totals | Yes | Yes; strict patterns, unknown on format mismatch |
+| Amp thread detail CLI | Yes, text only | B's detailed report; Devon confirms real-thread reports | Hourly, at most 10 dispatched threads; lifetime totals | Yes | Yes; `--details`, strict patterns, transient unavailability stays unknown |
+| Amp External API | Partial, docs only | Official reference/OpenAPI; Devon declines workspace/API | Daily buckets / lifetime totals | Documented yes | No; not pursued |
 | Claude `/usage` structured report | Yes, console; experimental schema | Third invocation emits `assistant.usage_report` | Server quota snapshot on command | **Yes**, `-p --output-format stream-json --verbose` | **Yes for Max quota**, version-pin and validate nullable fields |
 | Claude status-line JSON | Partial | Official 5h/7d schema; callback absent in both print probes | After response / UI update | **Not observed in `-p`** | No for Amp's headless launches |
 | Claude result / stream usage | Yes, console | `usage`, `modelUsage`; stream also has rate-limit event | Per response / run totals | Yes | Existing-launch capture if available; never send inference to poll usage |
 | Claude OTel | Partial | Official schema/config; console-export attempts produced no telemetry records | Default metrics 60s, logs 5s | Documented programmatic support; export unverified here | Preferred supported source for future usage, after approval and delivery test |
 | Claude local transcripts | Partial | Metadata-only inspection of existing MET-116 SDK sessions | Appended messages; cumulative cost-state checkpoints | Reader yes | Not primary: disk accounting format is not a stable public contract |
-| Claude installation/login on factory-gpu | No check | This executor is factory-console | Unknown | Unknown | Devon must verify as GPU's `agent` user |
+| Claude installation/login on factory-gpu | Yes, Devon verified | MET-121 comment: agent, 2.1.296, claude.ai, Max | 2026-10-12 check | Auth status yes; Amp launch unprobed | GPU local sources available; launch/export coverage still needs verification |
+| ChatGPT quota via Codex app-server | Yes, Devon verified on GPU; same account on both nodes | codex-cli 0.162.1; `account/rateLimits/read` | Poll every 15 min; live account snapshot | Yes; keep stdin open until id 2 response | Yes on GPU; whether Amp uses this same limit remains unverified |
 
 ### Official sources and modified dates
 
@@ -1069,7 +1074,8 @@ Thus this console CLI account currently has **no workspace in which to create
 an External API application**. No conclusion about GPU's saved account follows.
 Gigawatt is an individual tier, not proof of workspace membership or Enterprise.
 The official External API is workspace-scoped M2M, not a personal `AMP_API_KEY`
-reporting API. A workspace admin must provision access; see Devon's UI steps.
+reporting API. **Devon's decision, 2026-10-12: no workspace and no External API.**
+The historical provisioning steps below are not next steps for this collector.
 
 ### 2. Amp balance and archived thread usage
 
@@ -1092,7 +1098,9 @@ The detailed account report was also read. It distinguishes net current balance
 from gross range costs before restored credits, and normalizes included orb hours
 to the tier's default size. It includes a terminal comment saying account/thread
 usage lookups share **60 requests/hour**. That observed limit is not a verified
-External API limit. Do not turn this text/layout into a collector contract.
+External API limit. Devon deliberately approves strict parsing of these CLI
+outputs for MET-77; see the versioned exception and shared polling budget below.
+This does not make the terminal layout a supported vendor schema.
 
 Actually run on existing archived [MET-116 probe B](https://ampcode.com/threads/T-01a12dac-9d56-736b-b4c1-a3e5d1a4da79), without resuming or waking an executor:
 
@@ -1306,49 +1314,120 @@ approved end-to-end test; this investigation changed no launch environment.
 
 ### 5. factory-gpu installation and login
 
-**Not checked.** This thread cannot establish GPU's local `claude`, its PATH,
-saved account or subscription using console's installation. The user's earlier
-installation report is not independent verification.
+**Verified by Devon, 2026-10-12**, in MET-121's 02:29:50 UTC comment: as GPU's
+`agent`, Claude is installed at `/home/agent/.local/bin/claude`, version
+`2.1.296`, logged in via `claude.ai`, `apiProvider: "firstParty"`,
+`subscriptionType: "max"`, with projects at `/home/agent/.claude/projects`.
+His 02:34:23 UTC comment confirms the same Claude account on Mac, console and
+GPU. The collector can read GPU's local Claude sources beside factory-api.
+**Amp-launched Claude execution on factory-gpu remains unprobed**, including
+the running Amp service's environment and telemetry propagation.
 
-For Devon, from his Mac (proposed verification command, **not run**; execute as
-GPU's `agent`, not Devon's own Claude account):
+### 6. ChatGPT quota via Codex app-server
 
-```sh
-factory-ssh 'sudo -u agent -H /home/agent/.local/bin/claude --version; sudo -u agent -H /home/agent/.local/bin/claude auth status'
+Devon verified `codex-cli 0.162.1`, **Logged in using ChatGPT**, as `agent` on
+both factory-gpu and factory-console (MET-121 comments at 02:42:14 and
+02:42:49 UTC, 2026-10-12). Both nodes use the same ChatGPT account. He installed
+Codex for read-only quota collection, **not coding or inference**. His earlier
+02:35:05 comment saying Codex was absent on runners is superseded by these checks.
+
+On his Mac, an initial app-server attempt returned initialization metadata but
+closed stdin before the quota response arrived. Keeping stdin open fixed it
+(02:36:17 UTC comment). On GPU as `agent`, the live read returned the same
+values as his Mac. Session-file `token_count.rate_limits` snapshots were stale
+(0–1%); use the live read, not rollout files or new inference.
+
+Exact method sequence: start `codex app-server` with piped stdin/stdout; send
+`initialize` with id 1; wait for its successful id 1 response; send the
+`initialized` notification; send `account/rateLimits/read` with id 2; keep stdin
+open and read through notifications until the **id 2 response** arrives. Only
+then close stdin and stop the disposable app-server. Do not substitute a fixed
+sleep or let a short input pipe reach EOF before the response.
+
+Reproduction messages, based on the [official app-server protocol](https://learn.chatgpt.com/codex/app-server)
+and Devon's method sequence; **not run by this thread**. The `clientInfo` label
+below is for reproduction, not a claimed capture of Devon's original bytes.
+The wire format is newline-delimited JSON-RPC with the `jsonrpc` header omitted:
+
+```jsonl
+{"id":1,"method":"initialize","params":{"clientInfo":{"name":"factory_usage_collector","title":"Factory Usage Collector","version":"0.1.0"}}}
+{"method":"initialized","params":{}}
+{"id":2,"method":"account/rateLimits/read"}
 ```
 
-This tests the fallback binary path, not the running Amp service's PATH or
-successful Amp launch. Do not install, log in, or restart anything in response
-to a failed check without a separate decision.
+Observed response fields reported by Devon, not a complete raw response:
+
+* `ordinaryUsageAllowed: true`, `planType: "pro"`, limit ID `codex`.
+* `primary.usedPercent: 17`, `primary.windowDurationMins: 10080` (seven days),
+  `primary.resetsAt: 1792299781` (**Unix epoch seconds**).
+* `secondary: null`: this Pro snapshot has no secondary/five-hour window.
+  Do not invent a 5h limit or treat null as zero usage.
+* `credits: {"hasCredits":true,"unlimited":false,"balance":"62500"}`.
+  Balance is a credit quantity, **not USD**; preserve its units and string value.
+* Three available **rate-limit reset credits**, distinct from spend credits.
+  The documented response field is `rateLimitResetCredits.availableCount`;
+  detailed credit rows can be null or capped, so use the count, not array length.
+
+Preserve `rateLimits` and, when supplied, `rateLimitsByLimitId` bucket identity;
+do not add overlapping single-bucket and multi-bucket snapshots. Record account,
+CLI version, host and observation time. Collector methods are read-only:
+**never call `account/rateLimitResetCredit/consume`, login, or logout methods**.
+Do not send a thread/turn request or generate inference to measure quota.
+
+**Unverified:** whether Amp's ChatGPT mode draws on this same `codex` limit.
+Show it as the ChatGPT/Codex account quota, not a proven Amp-specific remaining
+allowance. The shared `agent` login is Devon's accepted single-user arrangement;
+MET-120 addresses access when David joins.
 
 ### Recommended collector sources
 
 Collector placement for MET-77 is **factory-gpu beside factory-api**, superseding
-the earlier console-placement proposal for these two tools. Sources remain
+the earlier console-placement proposal for these sources. Sources remain
 server-side; no credentials reach the kiosk.
 
-**Amp:** after Devon provisions a workspace M2M application, use OAuth
-client-credentials at `https://auth.ampcode.com/oauth2/token`, then documented
-GET endpoints below (from docs, **not run authenticated**):
+**Amp — Devon's decision, 2026-10-12:** no workspace, M2M credential, or External
+API. Use the following CLI sources on factory-gpu with one shared account poller:
 
-```text
-https://ampcode.com/api/v2/workspace/analytics/daily-usage?lookbackDays=1
-https://ampcode.com/api/v2/threads?limit=50
-https://ampcode.com/api/v2/threads/<threadID>/usage
-https://ampcode.com/api/v2/workspace/entitlements
-```
+* `amp usage` every **15 minutes**: 4 requests/hour for plan and remaining pools.
+* `amp usage --details` **hourly**: 1 request/hour for account usage breakdowns.
+* `amp threads usage <id> --details` **hourly for at most 10 dispatched threads**:
+  at most 10 requests/hour. Substitute recorded dispatcher thread IDs only.
 
-Use the workspace's required custom-domain API base if configured. Daily usage
-is workspace-attributed, not guaranteed retroactive personal account history.
-Thread snapshots include specified subthreads; reconcile rather than double-count.
-Suggested initial refresh: hourly reports, daily historical reconciliation,
-bounded thread drilldowns with backoff. These intervals are proposals, not SLAs.
-No verified supported machine-readable source supplies this individual's Amp
-agent-pool remaining dollars or included orb hours. Set automated balance/remaining
-to unknown; leave `amp usage` for human verification. Entitlements are caps only.
+These commands ran here for the account and probe B; Devon also verified them
+on his Mac. The scheduling is a collector decision, not a deployed job. Budget
+is **at most 15 scheduled requests/hour**, below the shared **60 requests/hour**
+account/thread lookup limit. Coordinate all readers and count retries/manual
+drilldowns against that same budget; stagger polls and back off on failure.
+
+**Deliberate exception to the no-terminal-parsing rule:** strict patterns built
+only from the exact outputs captured above and Devon's MET-121 evidence, with
+the CLI version recorded (`0.0.1791763306-ged595a` for these captures). Recognize
+the supported summary and table shapes, their units and billing scope; do not
+guess new labels, column positions, missing rows, or values after an update.
+On **any mismatch**, emit **“unknown, format changed”**, never a guessed value.
+Keep stale last-good data with its age, but do not present it as a current sample.
+An unavailable thread report or failed lookup remains unknown, not zero.
+
+Devon's 02:31:13 UTC comment reports summary agent balance $171.27 of $200
+remaining (86%) and orb balance 998.1h of 1,000h in `a1.xxlarge` hours. His
+02:32:41 UTC comment confirms the detailed markdown tables, recorded cost $28.75
+including Web Search $0.06, and ChatGPT $0 for about 259.8M tokens. Its MET-80
+thread example reports cost $0.007, 1,367,739 tokens and 26 requests; the $3.79
+list-price estimate is not billed by Amp. These comment extracts supplement,
+not replace, the exact console stdout above; changing numbers and decimal
+precision are not themselves format changes. The comment also confirms earlier
+probe unavailability was transient.
+
+Preserve net balance versus gross recorded usage, included orb-hour normalization,
+cache-inclusive CLI input and billed versus estimated cost. Account totals and
+thread drilldowns overlap; do not add them together. Parent thread details include
+subthreads, so reconcile lineage rather than summing parent and child snapshots.
+This parser is a consciously versioned fallback, **not a supported vendor JSON
+schema**, and the exception applies only to these Amp usage commands.
 
 **Claude quota:** use the exact successful third command above as GPU's already
-authenticated `agent` after its login is verified. Keep slash commands enabled;
+authenticated `agent` (login verified by Devon in section 5; quota probe ran on
+console). Keep slash commands enabled;
 `--disable-slash-commands` would defeat `/usage`. Project/user setting sources
 are excluded per invocation; OAuth is still available, unlike `--bare`.
 Consume only the assistant's `usage_report.rate_limits`, not the text report or
@@ -1378,9 +1457,19 @@ stream capture is an alternative supported interface if the launcher exposes it.
 Local `~/.claude/projects/<project>/<session-id>.jsonl` and subagent files are
 version-pinned historical fallback evidence, not the supported primary collector.
 
-### Devon's UI steps
+**ChatGPT quota:** every **15 minutes on factory-gpu**, as its authenticated
+`agent`, use `codex app-server` and the section 6 handshake/read sequence. Keep
+stdin open until id 2 completes. This reads account quota without inference;
+do not poll stale session files, redeem resets, or change authentication. Both
+nodes share the account, so use one GPU poller rather than duplicate collection.
+Display the source as ChatGPT/Codex quota until its relationship to Amp usage is
+verified. Preserve weekly window/reset units and keep spend/reset credits distinct.
 
-**UI only; nothing below was performed.** No app or credential was created.
+### Not pursued (Devon decided against a workspace)
+
+**Historical UI steps only; not next steps.** Devon decided on 2026-10-12 not to
+create/join a workspace or use the External API. Nothing below was performed;
+no app or credential was created. Retained for reference if that decision changes.
 
 1. Open [Workspace Settings](https://ampcode.com/workspace) as the same Amp account,
    `devon@metacomet.tech`. If it shows **Create a Workspace**, there is currently
@@ -1414,13 +1503,17 @@ version-pinned historical fallback evidence, not the supported primary collector
 
 ### Unverified / risks
 
-* No Amp workspace exists for this console account at check time. M2M creation,
-  authenticated API results, personal-history coverage after joining, publication
-  lag, and automated personal balance remain unverified. UI button caption is
-  explicitly unresolved; page, application type and scopes are documented.
-* GPU's Claude installation/login and actual Amp-launched environment are unknown.
-  Max tier multiplier, per-node account equality and long-lived OAuth refresh
-  were not tested. No credentials/settings were read or modified.
+* No Amp workspace/API is pursued. Automated CLI parsing is not implemented here;
+  strict versioned patterns must fail closed as “unknown, format changed”. The
+  historical M2M UI button caption and authenticated API remain unverified, not
+  pending collector setup steps.
+* GPU's Claude installation/login and same-account mapping are verified by Devon;
+  its Amp-launched execution/environment, Max tier multiplier and long-lived
+  OAuth refresh remain untested. No credentials/settings were read or modified
+  by this investigation.
+* Codex's live ChatGPT quota is verified by Devon on GPU, with 0.162.1 installed
+  and logged in as agent on both nodes. Whether Amp's ChatGPT mode uses that same
+  `codex` limit is unverified; do not label it as Amp-specific quota.
 * `/usage` works headless in 2.1.296 with this saved Max login. Its experimental
   schema and credential requirements can change. The test used a new session,
   not a continuation of a running Amp Claude session; account quota is the useful
@@ -1438,7 +1531,8 @@ version-pinned historical fallback evidence, not the supported primary collector
 
 Validation: Markdown rendered with the existing `markdown-it-py` workflow;
 JSON fences parsed, shell fences checked with `bash -n`, and the diff remained
-append-only in this file. `cargo fmt --check`,
+confined to this MET-121 section (the initial addition was append-only).
+The follow-up also parses each JSONL protocol message. `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace` passed
 (one existing ignored test).
 Sandbox: none (docs-only). Deploy artifacts/steps: none. Disposable help/docs/
