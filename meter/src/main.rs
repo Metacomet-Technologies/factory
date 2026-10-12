@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
     {
         anyhow::bail!("upstream must be an http:// origin without path or query");
     }
+    let shutdown_path = config.db_path.clone();
     let db = tokio::task::spawn_blocking(move || meter::db::Db::open(&config.db_path)).await??;
     let state = meter::AppState::new(config.upstream, db.clone());
     let telemetry = state.start_telemetry(config.gpu_sample_interval);
@@ -94,5 +95,24 @@ async fn main() -> anyhow::Result<()> {
     telemetry.abort();
     let _ = telemetry.await;
     db.close().await?;
+    // Pool closes can finish with a read-only connection, which cannot perform
+    // SQLite's last-connection checkpoint. All admitted writes are drained now.
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let db = rusqlite::Connection::open_with_flags(
+            shutdown_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        let (busy, frames, checkpointed): (i64, i64, i64) =
+            db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        anyhow::ensure!(
+            busy == 0 && frames == checkpointed,
+            "shutdown checkpoint incomplete: {busy}|{frames}|{checkpointed}"
+        );
+        Ok(())
+    })
+    .await??;
     Ok(())
 }

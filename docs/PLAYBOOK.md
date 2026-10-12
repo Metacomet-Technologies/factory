@@ -143,6 +143,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 - Ollama `/api/ps` misreports gemma4's size; use `nvidia-smi`. Exclude non-inference requests (health checks) from usage.
 - A lock held across a network call froze usage/pricing for 60 s+ when TLS failed on a bad clock (MET-90): never hold DB access across I/O.
 - Bundled SQLite 3.51.1 (rusqlite 0.38) can deadlock during concurrent WAL connection closes (fixed in SQLite 3.51.2); use rusqlite ≥ 0.39.
+- Test migrations against the real service's stopped state (run the old binary, stop it as systemd does), not only cleanly closed fixtures: a process that exits without closing SQLite leaves committed rows in the WAL, and a WAL's file size alone doesn't show whether frames are uncheckpointed.
 - iOS Safari doesn't run timers in background tabs; check on `visibilitychange`.
 - **1Password CLI:** with app integration, `op whoami` can say "not signed in" while `op vault list` works; `op account add` refuses unless `OP_BIOMETRIC_UNLOCK_ENABLED=false`; app-integrated `op` only works inside the desktop session.
 - Omarchy (Hyprland 0.56) moved to Lua config and dispatch.

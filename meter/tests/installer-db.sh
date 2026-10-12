@@ -60,4 +60,50 @@ for path in "$legacy_db-wal" "$legacy_db-shm" "$legacy_db"; do
     fi
     cp "$temp/saved" "$path"
 done
-printf 'Installer DB reads, sidecar modes, immutable conversion, swap, and rollback comparison passed (UID %s).\n' "$EUID"
+# A committed writer can exit without sqlite3_close(), just like the detached
+# legacy writer at process exit. Reading only the main file must miss its row.
+crashed=$temp/crashed.db
+sqlite3 "$crashed" < "$repo/meter/tests/fixtures/legacy.sql"
+python3 - "$crashed" <<'PY'
+import json, os, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("PRAGMA journal_mode=WAL")
+db.execute("INSERT INTO requests(id,record) VALUES (?,?)", (7, json.dumps(dict(
+    id=0, ts=1791676800000, endpoint="/api/chat", model="synthetic", latency_ms=1.5,
+    status=502, stream=False, client_ip="127.0.0.1", client_hostname="fixture",
+    prompt_eval_count=13, eval_count=7))))
+db.commit()
+os._exit(0)
+PY
+[[ -s "$crashed-wal" ]]
+[[ $(sqlite3 -readonly "file:$crashed?immutable=1" 'SELECT COUNT(*) FROM requests;') == 0 ]]
+[[ $(counts "$crashed") == $'1\n0' ]]
+python3 - "$repo/deploy/install-meter.sh" "$crashed" <<'PY'
+import sqlite3, subprocess, sys
+reader = sqlite3.connect(f"file:{sys.argv[2]}?mode=ro", uri=True)
+reader.execute("BEGIN")
+reader.execute("SELECT COUNT(*) FROM requests").fetchone()
+for probe in ("", "fuser() { return 1; }"):
+    # The second case deliberately bypasses the process probe to exercise
+    # SQLite's busy result, including busy=1 when all frames were copied.
+    result = subprocess.run(["bash", "-c", '''
+source "$1"
+sudo() { [[ $1 == -u && $2 == meter ]] || return 1; shift 2; "$@"; }
+''' + probe + '\ncheckpoint_meter_db "$2"', "test", *sys.argv[1:]],
+        text=True, capture_output=True, timeout=10)
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    assert result.returncode != 0, "Checkpoint accepted an active reader"
+    assert "still open" in result.stderr or "checkpoint incomplete" in result.stderr
+reader.close()
+PY
+checkpoint_meter_db "$crashed"
+[[ ! -s "$crashed-wal" ]]
+[[ $(sqlite3 -readonly "file:$crashed?immutable=1" 'SELECT COUNT(*) FROM requests;') == 1 ]]
+[[ $(counts "$crashed") == $'1\n0' ]]
+sudo -u meter "$meter_binary" migrate --legacy "$crashed" --db "$temp/recovered.db" >/dev/null
+[[ $(counts "$temp/recovered.db") == $'1\n0' ]]
+[[ $(meter_sqlite "$temp/recovered.db" 'SELECT id,prompt_eval_count,eval_count,status FROM requests;') == '7|13|7|502' ]]
+# v1 reruns also checkpoint; never infer pending frames from WAL size alone.
+checkpoint_meter_db "$temp/recovered.db"
+printf 'Installer DB reads, sidecar modes, checkpoint recovery, immutable conversion, swap, and rollback comparison passed (UID %s).\n' "$EUID"
