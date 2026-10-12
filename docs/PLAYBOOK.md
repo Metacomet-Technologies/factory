@@ -63,6 +63,8 @@ Every prompt has these sections:
 
 **Wrap-up prompt (after merge):** the same thread confirms the merge, updates and builds in the main checkout (`~/work/factory`), removes its worktree and local branch, and replies with exact Mac install/verify commands. One deploy per runner at a time. Devon archives the thread (UI only) only after deploy verification; if verification fails, the same thread fixes it from a fresh worktree.
 
+**Linear dispatch (MET-80):** fill the Agent task template, give it exactly one Bug/Feature/Improvement label and at least one `area:*`, then add `dispatch`. The GPU's 60-second poll skips unresolved blockers (one waiting comment), validates required sections after stripping `>` hints, and caps active work at two per runner. Defaults are runner/gpu, engine/amp, agent-effort/medium; orb is refused. It removes the label, records a durable claim, starts a private Amp thread with this prompt contract, comments its URL and moves the issue to In Progress. A merged GitHub PR attachment triggers the same-thread wrap-up once; merge detection's metadata convention still needs live verification. Claims prevent duplicate dispatch/continuation after crashes, including manual retries; interrupted claims require inspection, never blind re-labeling. Human merge/deploy gates remain. See [dispatcher operations and limitations](../scripts/dispatch/README.md).
+
 ## 5. Review checklist (before merge)
 
 - **Reviews are done by Claude directly:** Linear `get_diff` for metadata and link types, then Claude in Chrome for the actual diff and full scripts. Only fall back to asking Devon for `gh` output when neither tool is reachable.
@@ -111,6 +113,21 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 - **Phone:** Blink `ssh gpu` / `mosh gpu` (Mosh needs SSH to work first; no daemon to start). Check the Tailscale app is on Metacomet.
 - **1Password over SSH:** `opin <op args>` (asks for the password only when the 30-min session has expired). In RDP terminals, `op` uses the desktop app.
 - **UPS:** `upsc cyberpower@localhost` on factory-gpu. Clean shutdown at < 30% charge or < 5 min runtime; it boots itself when power returns.
+
+### Dispatcher commands (from Mac)
+
+After [key setup and installer preflight](../scripts/dispatch/README.md#administrator-deployment-from-mac-after-merge), preview one issue or a complete pass. Remove `--dry-run` only to authorize real submissions and Linear mutations; manual `issue` ignores the label, not validation, blockers, capacity or claims.
+
+```sh
+factory-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts issue MET-123 --dry-run'
+factory-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts poll --dry-run'
+factory-ssh 'systemctl list-timers factory-dispatch.timer'
+factory-ssh 'sudo journalctl -u factory-dispatch -f'
+# Pause automatic dispatch before investigating an interrupted claim:
+factory-ssh 'sudo systemctl stop factory-dispatch.timer'
+# Remove dispatcher units; keep the key and existing threads:
+factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
+```
 
 ## 8. Gotchas we've already hit
 

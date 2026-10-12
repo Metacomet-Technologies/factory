@@ -7,6 +7,17 @@ The workspace contains `shared` (serde/utoipa API contract), `meter`
 (axum/Tokio/Hyper binary), and `pricing` (reference rates and spend-avoided
 estimates). Meter contains no pricing logic; factory-api is not built yet.
 
+## Dispatcher
+
+`scripts/dispatch/dispatch.ts` turns Linear's `dispatch` label into a private
+Amp runner thread, with task validation, blocker checks, per-runner caps and
+crash-safe claims. After a linked PR merges, it submits the playbook wrap-up once;
+Devon still owns merge and deploy. Node 24.21.0, no npm dependencies. Start with
+`node scripts/dispatch/dispatch.ts issue MET-123 --dry-run`. Installation is an
+administrator action, not part of development; see the
+[dispatcher README](scripts/dispatch/README.md) for verification gaps, key setup,
+timer installation, recovery and rollback.
+
 ## Build identity (MET-107 phase 1)
 
 The root `VERSION` file is the single source of truth, initially `0.2.0`.

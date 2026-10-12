@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll the Linear factory queue every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+Unit=factory-dispatch.service
+
+[Install]
+WantedBy=timers.target
