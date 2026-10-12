@@ -70,6 +70,12 @@ names=()
 for entry in "${DBS[@]}"; do names+=("${entry%%:*}"); done
 python3 "$state" attempt "$STATUS_FILE" "${names[@]}"
 trap 'python3 "$state" fatal "$STATUS_FILE" "Backup failed at line $LINENO"; exit 1' ERR
+# Receiver-only nodes retain their old originals for rollback. Do not push or
+# prune that tree; replica retention is requested separately by the sender.
+if (( ${#names[@]} == 0 )); then
+    echo 'No originating databases; local archives preserved.'
+    exit 0
+fi
 for command in sqlite3 zstd sha256sum rsync python3 flock; do
     command -v "$command" >/dev/null
 done

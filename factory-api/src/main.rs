@@ -6,12 +6,12 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
-    #[arg(long, env = "FACTORY_API_LISTEN", default_value = "0.0.0.0:8080")]
+    #[arg(long, env = "FACTORY_API_LISTEN", default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
     #[arg(
         long,
         env = "FACTORY_API_METER_URL",
-        default_value = "http://factory-gpu:11434"
+        default_value = "http://127.0.0.1:11434"
     )]
     meter_url: String,
     #[arg(
@@ -85,11 +85,18 @@ async fn main() -> anyhow::Result<()> {
     if text.is_none() {
         // Keep the embedded self-check correct when using a temporary listen port.
         for node in &mut config.nodes {
-            if node.name == "factory-console" {
+            if node.name == "factory-gpu" {
                 for service in &mut node.services {
-                    if service.name == "factory-api" {
-                        service.target =
-                            format!("http://127.0.0.1:{}/v1/health", args.listen.port());
+                    match service.name.as_str() {
+                        "factory-api" => {
+                            service.target =
+                                format!("http://127.0.0.1:{}/v1/health", args.listen.port());
+                        }
+                        "kiosk-static" => {
+                            service.target =
+                                format!("http://127.0.0.1:{}/version.json", args.listen.port());
+                        }
+                        _ => {}
                     }
                 }
             }

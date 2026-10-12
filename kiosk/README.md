@@ -1,7 +1,8 @@
 # factory / kiosk
 
-A read-only React 19 dashboard for factory-api's v1 contract, verified against
-the deployed API on factory-console. The app contacts only factory-api; the
+A read-only React 19 dashboard for factory-api's v1 contract. MET-114 targets
+the API/static origin on factory-gpu; Chrome remains on factory-console.
+The app contacts only factory-api; the
 optional live verification script sends four small Ollama requests. All authored app,
 server, configuration, test and script sources are TypeScript. Both TypeScript
 projects enable `strict`, `noUncheckedIndexedAccess` and
@@ -42,7 +43,33 @@ vp run mock-dev     # Native Node TypeScript mock :4179 + vp dev :4181
 
 Development and preview bind to loopback. Access remotely through an SSH tunnel
 to factory-gpu; no host firewall, production service or Tailscale changes are
-needed. Deployment is tailnet-only, served by factory-api on factory-console.
+needed. Deployment is tailnet-only, served by factory-api on factory-gpu.
+
+## MET-114 origin switch
+
+Follow the root README's **MET-114 move** runbook; no watchdog or new console
+web server is needed. Build with `VITE_API_BASE=`. Relative `/v1/*`, SSE and
+`/version.json` then use `https://factory-gpu.bearded-pompano.ts.net`, served
+through GPU Tailscale Serve to `127.0.0.1:8080`. The existing no-cache manifest
+and reload guard work at that origin without a code change or CORS setting.
+Browser theme storage is origin-specific; an old console-origin preference
+does not transfer automatically.
+
+Only the existing `Exec=` URL changes; preserve every other Chrome flag and
+desktop key. From Mac after GPU health and Serve pass:
+
+```sh
+console-ssh "sudo -u console cp -p /home/console/.config/autostart/console-kiosk.desktop /home/console/.config/autostart/console-kiosk.desktop.met-114"
+console-ssh "sudo -u console sed -i '/^Exec=/s|--app=http://localhost:8080|--app=https://factory-gpu.bearded-pompano.ts.net|' /home/console/.config/autostart/console-kiosk.desktop"
+console-ssh "sudo -u console grep '^Exec=' /home/console/.config/autostart/console-kiosk.desktop"
+```
+
+Make the backup once, before the first edit. Check exactly one `Exec=` line
+has the new URL. UI only: close and relaunch Chrome in the console desktop
+session (or log out/in). Changing autostart does not change an already-running
+Chrome process. Permissions and the physical session remain an administrator
+verification; do not restart the Amp runner. Rollback replaces only the new
+URL with `http://localhost:8080`, as printed by the rollback script.
 
 ```sh
 vp fmt

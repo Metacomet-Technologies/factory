@@ -29,7 +29,7 @@ wait_ready() {
     sudo -u factory-api curl -fsS --max-time 2 "$url" | jq -e '.status == "ok"' >/dev/null || fail "Service health is not OK: $url"
 }
 [[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-factory-api.sh <prebuilt-binary>.'
-[[ $# -eq 1 ]] || fail 'Supply exactly one prebuilt binary path.'
+[[ $# -eq 1 || ( $# -eq 2 && ( $2 == --prepare-only || $2 == --check-only ) ) ]] || fail 'Supply a prebuilt binary path and optional --prepare-only or --check-only.'
 trap 'printf "ERROR: factory-api install failed at line %s.\n" "$LINENO" >&2; rollback_hint' ERR
 
 # Complete preflight before creating the account or changing deployment files.
@@ -63,7 +63,7 @@ else
 fi
 systemctl is-active --quiet amp-runner.service
 systemctl is-active --quiet tailscaled.service
-curl -fsS --max-time 5 http://factory-gpu:11434/meter/health
+curl -fsS --max-time 5 http://127.0.0.1:11434/meter/health
 
 # Ordering after time-sync.target only works when a real synchronization waiter
 # is enabled. Keep this boot prerequisite enabled even after API rollback.
@@ -115,6 +115,10 @@ for path in /var/backups /var/lib /usr/local/bin; do
     (( available * 1024 >= required )) || fail "Insufficient space at $path; need $required bytes for preservation and rebuild."
 done
 
+if [[ ${2:-} == --check-only ]]; then
+    echo 'Read-only factory-api installer preflight passed; no changes made.'
+    exit 0
+fi
 # Serialize with MET-74 and other deployments without stopping its timer.
 exec 9>>/var/backups/factory-db/.backup.lock
 flock -n 9 || fail 'Backup or deployment is running; retry after it finishes.'
@@ -152,6 +156,12 @@ fi
 install -m 0755 "$binary" "$destination"
 install -m 0644 "$unit" "$installed_unit"
 install -d -o factory-api -g factory-api -m 0750 /var/lib/factory-api
+if [[ ${2:-} == --prepare-only ]]; then
+    systemctl daemon-reload
+    systemctl disable factory-api.service
+    echo 'Prepared binary, unit, account and StateDirectory. API remains stopped; restore both databases before starting.'
+    exit 0
+fi
 if [[ "$pricing_mode" != v1 ]]; then
     sudo -u factory-api sh -c 'umask 077; exec "$1" migrate --pricing-db "$2"' sh "$destination" "$pricing_db"
 fi
