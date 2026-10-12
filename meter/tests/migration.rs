@@ -52,6 +52,42 @@ fn cli(args: &[&std::ffi::OsStr]) -> std::process::Output {
         .unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn dry_run_without_destination_works_from_read_only_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("legacy.db");
+    let db = legacy(&source);
+    db.execute(
+        "INSERT INTO requests(id,record) VALUES (1,?1)",
+        [serde_json::to_string(&record(1)).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let cwd = dir.path().join("readonly");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o555)).unwrap();
+    assert!(std::fs::write(cwd.join("probe"), []).is_err());
+    let output = Command::new(env!("CARGO_BIN_EXE_meter"))
+        .current_dir(&cwd)
+        .args(["migrate", "--dry-run", "--legacy"])
+        .arg(&source)
+        .output();
+    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = output.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["verified_rows"], 1);
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0);
+}
+
 #[test]
 fn wal_conversion_preserves_source_and_refuses_uncheckpointed_rows() {
     let dir = tempfile::tempdir().unwrap();

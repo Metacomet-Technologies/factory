@@ -308,11 +308,14 @@ pub fn migrate(legacy: Option<&Path>, destination: Option<&Path>, dry_run: bool)
     if let Some(source) = &source {
         check_legacy(source)?;
     }
-    let parent = destination
-        .and_then(Path::parent)
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let temporary = match destination {
+        Some(path) => tempfile::NamedTempFile::new_in(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?,
+        None => tempfile::NamedTempFile::new_in(std::env::temp_dir())?,
+    };
     let mut db = Tracked::new(Connection::open(temporary.path())?, |c| c)?;
     let scope = Scope::default();
     let mut report = Report {
