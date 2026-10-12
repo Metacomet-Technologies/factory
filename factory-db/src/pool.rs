@@ -13,7 +13,9 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 #[derive(Clone, Copy)]
 pub struct Config {
     pub readers: usize,
-    /// Maximum outstanding jobs across all workers, including running jobs.
+    /// Maximum outstanding awaited jobs across all workers, including running jobs.
+    /// Non-blocking writes have an independent allowance of the same size so
+    /// reader pressure cannot consume the ingestion allowance.
     pub capacity: usize,
     pub reader_cache_kib: u32,
 }
@@ -43,6 +45,7 @@ pub struct Pool<T = Connection> {
     workers: Mutex<Option<Vec<mpsc::Sender<Job<T>>>>>,
     stopped: Vec<watch::Receiver<bool>>,
     capacity: Arc<Semaphore>,
+    detached_capacity: Arc<Semaphore>,
     next: AtomicUsize,
     readers: usize,
     connection: fn(&T) -> &Connection,
@@ -136,6 +139,7 @@ impl<T: Send + 'static> Pool<T> {
             workers: Mutex::new(Some(workers)),
             stopped,
             capacity: Arc::new(Semaphore::new(config.capacity)),
+            detached_capacity: Arc::new(Semaphore::new(config.capacity)),
             next: AtomicUsize::new(0),
             readers: config.readers,
             connection,
@@ -176,6 +180,31 @@ impl<T: Send + 'static> Pool<T> {
             .try_send(job)
             .map_err(|_| anyhow!("database worker stopped"))?;
         Ok(receive)
+    }
+
+    /// Non-blocking, durable admission: accepted work runs even after the caller
+    /// returns. The owner handles write errors in `work`; close drains these jobs.
+    pub fn try_write(
+        &self,
+        scope: &Scope,
+        work: impl FnOnce(&mut T) + Send + 'static,
+    ) -> Result<()> {
+        let permit = self
+            .detached_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Overloaded)?;
+        let scope = scope.clone();
+        let job = Box::new(move |db: &mut Tracked<T>| {
+            let _permit = permit;
+            db.run(&scope, Category::Data, work);
+        });
+        let workers = self.workers.lock().unwrap();
+        let workers = workers.as_ref().context("database pool closed")?;
+        workers[0].try_send(job).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => Overloaded.into(),
+            mpsc::error::TrySendError::Closed(_) => anyhow!("database worker stopped"),
+        })
     }
 
     pub async fn write<R: Send + 'static>(

@@ -7,6 +7,7 @@ from pathlib import Path
 import select
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -147,11 +148,45 @@ def inside():
         ready(BASE, "/api/version")
         if not (STATE / "seed.json").exists():
             end_ms = int(time.time() // 86400) * 86400000
-            child = start("seed", [binary / "sandbox-seed", "--db-path", STATE / "meter.db",
+            child = start("seed", [binary / "sandbox-seed", "--legacy", "--db-path", STATE / "meter.v0.db",
                                   "--rows", rows, "--seed", seed, "--days", "30", "--end-ms", str(end_ms)])
             if child.wait() != 0:
                 raise RuntimeError("Seeding failed; see seed.log; reset before retrying")
+            with (STATE / "meter-bad-row.log").open("ab") as log:
+                subprocess.run([binary / "sandbox-seed", "--legacy", "--bad-row", "--db-path", STATE / "meter.bad.v0.db",
+                                "--rows", "1", "--end-ms", str(end_ms)], stdout=log, stderr=log, check=True, timeout=60)
+                bad = subprocess.run([binary / "meter", "migrate", "--legacy", STATE / "meter.bad.v0.db",
+                                      "--db", STATE / "meter.bad.v1.db"], stdout=log, stderr=log, timeout=60)
+            if bad.returncode == 0 or (STATE / "meter.bad.v1.db").exists():
+                raise RuntimeError("Invalid legacy row was not refused cleanly; see meter-bad-row.log")
             atomic(STATE / "seed.json", json.dumps(dict(rows=int(rows), seed=int(seed), end_ms=end_ms)))
+        meter_db = STATE / "meter.db"
+        legacy_db = STATE / "meter.v0.db"
+        version = None
+        if meter_db.exists():
+            with sqlite3.connect(meter_db.as_uri() + "?mode=ro", uri=True) as db:
+                version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version != 1:
+            if version not in (None, 0):
+                raise RuntimeError(f"Unsupported meter user_version={version}")
+            source = meter_db if version == 0 else legacy_db
+            target = STATE / "meter.v1.db" if version == 0 else meter_db
+            if version == 0 and legacy_db.exists():
+                raise RuntimeError("Legacy preservation collision: meter.v0.db")
+            for dry_run, filename in [(True, "meter-dry-run.json"), (False, "meter-migration.json")]:
+                args = [binary / "meter", "migrate", "--legacy", source, "--db", target]
+                if dry_run:
+                    args.append("--dry-run")
+                with (STATE / filename).open("wb") as log:
+                    result = subprocess.run(args, stdout=log, stderr=subprocess.STDOUT, timeout=60)
+                if result.returncode != 0:
+                    raise RuntimeError(f"Meter migration failed; see {filename}; startup stopped")
+            if version == 0:
+                for suffix in ("", "-wal", "-shm"):
+                    old = Path(str(meter_db) + suffix)
+                    if old.exists():
+                        old.rename(Path(str(legacy_db) + suffix))
+                target.rename(meter_db)
         start("meter", [binary / "meter", "--listen", f"127.0.0.1:{BASE+1}",
                         "--upstream", f"http://127.0.0.1:{BASE}", "--db-path", STATE / "meter.db",
                         "--gpu-sample-interval", "2"])

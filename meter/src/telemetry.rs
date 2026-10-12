@@ -68,10 +68,12 @@ pub async fn refresh_hosts(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
-pub fn start(state: AppState, seconds: u64) {
+pub fn start(state: AppState, seconds: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut samples = tokio::time::interval(std::time::Duration::from_secs(seconds));
         let mut hosts = tokio::time::interval(std::time::Duration::from_secs(300));
+        let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(300));
+        let mut optimized = std::time::Instant::now();
         loop {
             tokio::select! {
                 _ = samples.tick() => match gpu().await {
@@ -81,8 +83,16 @@ pub fn start(state: AppState, seconds: u64) {
                         state.db.send(Event::Gpu(Vec::new()));
                     },
                 },
-                _ = hosts.tick() => if let Err(error) = refresh_hosts(&state).await { tracing::warn!(%error, "Tailscale refresh failed"); }
+                _ = hosts.tick() => if let Err(error) = refresh_hosts(&state).await { tracing::warn!(%error, "Tailscale refresh failed"); },
+                _ = maintenance.tick() => {
+                    let optimize = optimized.elapsed().as_secs() >= 86_400;
+                    match state.db.maintain(optimize).await {
+                        Ok(()) if optimize => optimized = std::time::Instant::now(),
+                        Ok(()) => (),
+                        Err(error) => tracing::warn!(%error, "SQLite maintenance failed"),
+                    }
+                }
             }
         }
-    });
+    })
 }

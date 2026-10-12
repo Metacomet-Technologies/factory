@@ -1,4 +1,4 @@
-use meter::db::{Db, Event};
+use meter::db::Db;
 use shared::{GpuSample, RequestRecord};
 
 pub fn record(seed: u64, index: usize, rows: usize, days: u32, end_ms: i64) -> RequestRecord {
@@ -51,30 +51,27 @@ pub async fn seed(db: &Db, seed: u64, rows: usize, days: u32, end_ms: i64) -> an
         (31_536_000_000..=4_102_444_800_000).contains(&end_ms),
         "end-ms out of range"
     );
-    let query = |sql: &str| db.query(sql.into());
     anyhow::ensure!(
-        query("SELECT id,record FROM requests LIMIT 1")
-            .await
-            .map_err(anyhow::Error::msg)?
-            .as_array()
-            .unwrap()
-            .is_empty(),
+        db.requests(1, None).await?.is_empty(),
         "seed requires an empty request database"
     );
-    query("BEGIN IMMEDIATE").await.map_err(anyhow::Error::msg)?;
     let gaps = [7, 31, 97].into_iter().filter(|id| *id < rows).count();
+    let mut requests = Vec::new();
+    let mut samples = Vec::new();
     for index in 0..rows + gaps {
-        db.send(Event::Request(Box::new(record(
-            seed,
-            index,
-            rows + gaps,
-            days,
-            end_ms,
-        ))));
+        let mut row = record(seed, index, rows + gaps, days, end_ms);
+        row.id = index as i64 + 1;
+        if ![7, 31, 97]
+            .into_iter()
+            .filter(|id| *id < rows)
+            .any(|id| id as i64 == row.id)
+        {
+            requests.push(row);
+        }
         if index.is_multiple_of(100) {
             // Meter owns GPU retention; use the same write path, including its pruning.
             let ts = record(seed, index, rows + gaps, days, end_ms).ts;
-            db.send(Event::Gpu(vec![GpuSample {
+            samples.push(GpuSample {
                 ts,
                 index: 0,
                 memory_used_mib: 9255.0,
@@ -82,23 +79,67 @@ pub async fn seed(db: &Db, seed: u64, rows: usize, days: u32, end_ms: i64) -> an
                 utilization_percent: 65.0,
                 temperature_c: 62.0,
                 power_w: 135.5,
-            }]));
-        }
-        // Bound the writer queue, and surface write failures before adding more rows.
-        if index.is_multiple_of(1000) {
-            query("SELECT id,record FROM requests LIMIT 0")
-                .await
-                .map_err(anyhow::Error::msg)?;
+            });
         }
     }
-    // Fixture-only deletions create holes; all inserts and schema belong to meter.
-    for id in [7, 31, 97].into_iter().filter(|id| *id < rows) {
-        db.query(format!(
-            "DELETE FROM requests WHERE id = {id} RETURNING id,record"
-        ))
-        .await
-        .map_err(anyhow::Error::msg)?;
+    db.import(requests, samples).await?;
+    Ok(())
+}
+
+/// Fixture-only v0 creation from the audited DDL, never a meter runtime path.
+pub fn legacy(
+    path: &std::path::Path,
+    seed: u64,
+    rows: usize,
+    days: u32,
+    end_ms: i64,
+    bad: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=1_000_000).contains(&rows) && (1..=365).contains(&days),
+        "invalid fixture size"
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let mut db = meter::db::Connection::open(path)?;
+    db.execute_batch(include_str!("../../meter/tests/fixtures/legacy.sql"))?;
+    let tx = db.transaction()?;
+    let gaps = [7, 31, 97].into_iter().filter(|id| *id < rows).count();
+    for index in 0..rows + gaps {
+        let id = index as i64 + 1;
+        let r = record(seed, index, rows + gaps, days, end_ms);
+        if ![7, 31, 97]
+            .into_iter()
+            .filter(|gap| *gap < rows)
+            .any(|gap| gap as i64 == id)
+        {
+            let mut value = serde_json::to_value(&r)?;
+            if bad && index == 0 {
+                value["unknown_field"] = true.into();
+            }
+            tx.execute(
+                "INSERT INTO requests(id,record) VALUES (?1,?2)",
+                (id, value.to_string()),
+            )?;
+        }
+        if index.is_multiple_of(100) && r.ts >= meter::now_ms() - 7 * 86_400_000 {
+            let sample = GpuSample {
+                ts: r.ts,
+                index: 0,
+                memory_used_mib: 9255.0,
+                memory_total_mib: 12288.0,
+                utilization_percent: 65.0,
+                temperature_c: 62.0,
+                power_w: 135.5,
+            };
+            tx.execute(
+                "INSERT INTO gpu_samples(id,ts,sample) VALUES (?1,?2,?3)",
+                (id, r.ts, serde_json::to_string(&sample)?),
+            )?;
+        }
     }
-    query("COMMIT").await.map_err(anyhow::Error::msg)?;
+    tx.commit()?;
     Ok(())
 }

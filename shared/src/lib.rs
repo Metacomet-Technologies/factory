@@ -24,6 +24,10 @@ pub struct RequestRecord {
     pub error: Option<String>,
     pub client_ip: String,
     pub client_hostname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

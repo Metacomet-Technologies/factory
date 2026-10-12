@@ -18,6 +18,11 @@ use std::{
 };
 use tokio::net::TcpListener;
 
+fn open(path: &std::path::Path) -> Db {
+    meter::migrate::migrate(None, Some(path), false).unwrap();
+    Db::open(path).unwrap()
+}
+
 async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
     serve_on(router, "127.0.0.1:0").await
 }
@@ -38,6 +43,7 @@ async fn serve_on(router: Router, address: &str) -> (String, tokio::task::JoinHa
 
 #[tokio::test]
 async fn slow_ndjson_is_incremental_and_written_once() {
+    tokio::time::timeout(Duration::from_secs(30), async {
     let upstream = Router::new().route("/api/generate", post(|| async {
         let chunks = stream::unfold(0, |index| async move {
             let line = match index {
@@ -53,7 +59,7 @@ async fn slow_ndjson_is_incremental_and_written_once() {
     }));
     let (upstream, upstream_task) = serve(upstream).await;
     let directory = tempfile::tempdir().unwrap();
-    let db = Db::open(&directory.path().join("meter.db")).unwrap();
+    let db = open(&directory.path().join("meter.db"));
     let (proxy, proxy_task) = serve(meter::router(AppState::new(upstream, db))).await;
     let client = reqwest::Client::new();
     let started = Instant::now();
@@ -111,188 +117,204 @@ async fn slow_ndjson_is_incremental_and_written_once() {
     assert_eq!(stats[0]["p95_total_latency_ms"], 700.0);
     proxy_task.abort();
     upstream_task.abort();
+    }).await.expect("slow NDJSON test timed out");
 }
 
 #[tokio::test]
 async fn loopback_clients_use_machine_hostname() {
-    let hostname = std::process::Command::new("hostname").output().unwrap();
-    assert!(hostname.status.success());
-    let hostname = String::from_utf8(hostname.stdout).unwrap();
-    let (upstream, upstream_task) = serve(Router::new().fallback(|| async { "ok" })).await;
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    for (address, ip) in [("127.0.0.1:0", "127.0.0.1"), ("[::1]:0", "::1")] {
-        let directory = tempfile::tempdir().unwrap();
-        let db = Db::open(&directory.path().join("meter.db")).unwrap();
-        let (proxy, task) =
-            serve_on(meter::router(AppState::new(upstream.clone(), db)), address).await;
-        assert_eq!(
-            client
-                .get(format!("{proxy}/api/version"))
-                .header("x-forwarded-for", "203.0.113.1")
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let hostname = std::process::Command::new("hostname").output().unwrap();
+        assert!(hostname.status.success());
+        let hostname = String::from_utf8(hostname.stdout).unwrap();
+        let (upstream, upstream_task) = serve(Router::new().fallback(|| async { "ok" })).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (address, ip) in [("127.0.0.1:0", "127.0.0.1"), ("[::1]:0", "::1")] {
+            let directory = tempfile::tempdir().unwrap();
+            let db = open(&directory.path().join("meter.db"));
+            let (proxy, task) =
+                serve_on(meter::router(AppState::new(upstream.clone(), db)), address).await;
+            assert_eq!(
+                client
+                    .get(format!("{proxy}/api/version"))
+                    .header("x-forwarded-for", "203.0.113.1")
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap(),
+                "ok"
+            );
+            let records: Vec<RequestRecord> = client
+                .get(format!("{proxy}/meter/requests"))
                 .send()
                 .await
                 .unwrap()
-                .text()
+                .json()
                 .await
-                .unwrap(),
-            "ok"
-        );
-        let records: Vec<RequestRecord> = client
-            .get(format!("{proxy}/meter/requests"))
+                .unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].client_ip, ip);
+            assert_eq!(records[0].client_hostname, hostname.trim());
+            task.abort();
+        }
+        upstream_task.abort();
+    })
+    .await
+    .expect("loopback test timed out");
+}
+
+#[tokio::test]
+async fn request_cursor_pages_without_gaps_and_preserves_legacy_behavior() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let db = open(&directory.path().join("meter.db"));
+        let records = (1..=1200)
+            .map(|index| RequestRecord {
+                id: index,
+                ts: 1200 - index,
+                endpoint: format!("/request/{index}"),
+                status: 200,
+                ..Default::default()
+            })
+            .collect();
+        db.import(records, vec![]).await.unwrap();
+        let (proxy, task) = serve(meter::router(AppState::new(
+            "http://127.0.0.1:1".into(),
+            db.clone(),
+        )))
+        .await;
+        let client = reqwest::Client::new();
+        for (query, count) in [("", 100), ("?limit=7", 7), ("?limit=10000", 1200)] {
+            let response = client
+                .get(format!("{proxy}/meter/requests{query}"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            assert!(response.headers().get("next_after_id").is_none());
+            let rows: Vec<RequestRecord> = response.json().await.unwrap();
+            assert_eq!(rows.len(), count);
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                (1201 - count as i64..=1200).rev().collect::<Vec<_>>()
+            );
+        }
+        let mut cursor = 0;
+        let mut ids = Vec::new();
+        for count in [500, 500, 200, 0] {
+            let response = client
+                .get(format!("{proxy}/meter/requests?after_id={cursor}"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let next: i64 = response.headers()["next_after_id"]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let rows: Vec<RequestRecord> = response.json().await.unwrap();
+            assert_eq!(rows.len(), count);
+            assert_eq!(next, cursor + count as i64);
+            for row in rows {
+                assert_eq!(row.endpoint, format!("/request/{}", row.id));
+                ids.push(row.id);
+            }
+            cursor = next;
+        }
+        assert_eq!(ids, (1..=1200).collect::<Vec<_>>());
+        for (after_id, limit, end) in [(498, 137, 635), (0, 5000, 1200)] {
+            let response = client
+                .get(format!(
+                    "{proxy}/meter/requests?after_id={after_id}&limit={limit}"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            assert_eq!(response.headers()["next_after_id"], end.to_string());
+            let rows: Vec<RequestRecord> = response.json().await.unwrap();
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                (after_id + 1..=end).collect::<Vec<_>>()
+            );
+        }
+        for query in [
+            "after_id=0&limit=0",
+            "after_id=0&limit=5001",
+            "limit=10001",
+            "after_id=-1",
+            "after_id=invalid",
+            "after_id=9223372036854775808",
+        ] {
+            assert_eq!(
+                client
+                    .get(format!("{proxy}/meter/requests?{query}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        // A client at the end must still see rows appended after its last page.
+        db.send(Event::Request(Box::new(RequestRecord {
+            status: 200,
+            ..Default::default()
+        })));
+        let rows: Vec<RequestRecord> = client
+            .get(format!("{proxy}/meter/requests?after_id={cursor}&limit=1"))
             .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].client_ip, ip);
-        assert_eq!(records[0].client_hostname, hostname.trim());
-        task.abort();
-    }
-    upstream_task.abort();
-}
-
-#[tokio::test]
-async fn request_cursor_pages_without_gaps_and_preserves_legacy_behavior() {
-    let directory = tempfile::tempdir().unwrap();
-    let db = Db::open(&directory.path().join("meter.db")).unwrap();
-    for index in 1..=1200 {
-        db.send(Event::Request(Box::new(RequestRecord {
-            ts: 1200 - index,
-            endpoint: format!("/request/{index}"),
-            ..Default::default()
-        })));
-    }
-    let (proxy, task) = serve(meter::router(AppState::new(
-        "http://127.0.0.1:1".into(),
-        db.clone(),
-    )))
-    .await;
-    let client = reqwest::Client::new();
-    for (query, count) in [("", 100), ("?limit=7", 7), ("?limit=10000", 1200)] {
-        let response = client
-            .get(format!("{proxy}/meter/requests{query}"))
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 1201);
+        let health: Value = client
+            .get(format!("{proxy}/meter/health"))
             .send()
             .await
             .unwrap()
-            .error_for_status()
+            .json()
+            .await
             .unwrap();
-        assert!(response.headers().get("next_after_id").is_none());
-        let rows: Vec<RequestRecord> = response.json().await.unwrap();
-        assert_eq!(rows.len(), count);
-        assert_eq!(
-            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-            (1201 - count as i64..=1200).rev().collect::<Vec<_>>()
-        );
-    }
-    let mut cursor = 0;
-    let mut ids = Vec::new();
-    for count in [500, 500, 200, 0] {
-        let response = client
-            .get(format!("{proxy}/meter/requests?after_id={cursor}"))
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["version"], include_str!("../../VERSION").trim());
+        assert!(!health["git_sha"].as_str().unwrap().is_empty());
+        assert!(health["git_dirty"].is_boolean());
+        assert!(health["built_at_ms"].as_u64().unwrap() > 1_700_000_000_000);
+        let schema: Value = client
+            .get(format!("{proxy}/meter/openapi.json"))
             .send()
             .await
             .unwrap()
-            .error_for_status()
-            .unwrap();
-        let next: i64 = response.headers()["next_after_id"]
-            .to_str()
-            .unwrap()
-            .parse()
-            .unwrap();
-        let rows: Vec<RequestRecord> = response.json().await.unwrap();
-        assert_eq!(rows.len(), count);
-        assert_eq!(next, cursor + count as i64);
-        for row in rows {
-            assert_eq!(row.endpoint, format!("/request/{}", row.id));
-            ids.push(row.id);
-        }
-        cursor = next;
-    }
-    assert_eq!(ids, (1..=1200).collect::<Vec<_>>());
-    for (after_id, limit, end) in [(498, 137, 635), (0, 5000, 1200)] {
-        let response = client
-            .get(format!(
-                "{proxy}/meter/requests?after_id={after_id}&limit={limit}"
-            ))
-            .send()
+            .json()
             .await
-            .unwrap()
-            .error_for_status()
             .unwrap();
-        assert_eq!(response.headers()["next_after_id"], end.to_string());
-        let rows: Vec<RequestRecord> = response.json().await.unwrap();
-        assert_eq!(
-            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
-            (after_id + 1..=end).collect::<Vec<_>>()
-        );
-    }
-    for query in [
-        "after_id=0&limit=0",
-        "after_id=0&limit=5001",
-        "limit=10001",
-        "after_id=-1",
-        "after_id=invalid",
-        "after_id=9223372036854775808",
-    ] {
-        assert_eq!(
-            client
-                .get(format!("{proxy}/meter/requests?{query}"))
-                .send()
-                .await
+        let request_schema = &schema["paths"]["/meter/requests"]["get"];
+        assert!(
+            request_schema["parameters"]
+                .as_array()
                 .unwrap()
-                .status(),
-            StatusCode::BAD_REQUEST
+                .iter()
+                .any(|parameter| parameter["name"] == "after_id")
         );
-    }
-    // A client at the end must still see rows appended after its last page.
-    db.send(Event::Request(Box::default()));
-    let rows: Vec<RequestRecord> = client
-        .get(format!("{proxy}/meter/requests?after_id={cursor}&limit=1"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].id, 1201);
-    let health: Value = client
-        .get(format!("{proxy}/meter/health"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(health["status"], "ok");
-    assert_eq!(health["version"], include_str!("../../VERSION").trim());
-    assert!(!health["git_sha"].as_str().unwrap().is_empty());
-    assert!(health["git_dirty"].is_boolean());
-    assert!(health["built_at_ms"].as_u64().unwrap() > 1_700_000_000_000);
-    let schema: Value = client
-        .get(format!("{proxy}/meter/openapi.json"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let request_schema = &schema["paths"]["/meter/requests"]["get"];
-    assert!(
-        request_schema["parameters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|parameter| parameter["name"] == "after_id")
-    );
-    assert!(request_schema["responses"]["200"]["headers"]["next_after_id"].is_object());
-    task.abort();
+        assert!(request_schema["responses"]["200"]["headers"]["next_after_id"].is_object());
+        task.abort();
+    })
+    .await
+    .expect("cursor test timed out");
 }
 
 #[tokio::test]
 async fn arbitrary_endpoints_errors_openai_and_internal_contract() {
+    tokio::time::timeout(Duration::from_secs(30), async {
     let upstream = Router::new().fallback(|request: Request<Body>| async move {
         let path = request.uri().path().to_owned();
         if path.starts_with("/meter") { panic!("internal endpoint forwarded"); }
@@ -307,7 +329,7 @@ async fn arbitrary_endpoints_errors_openai_and_internal_contract() {
     });
     let (upstream, upstream_task) = serve(upstream).await;
     let directory = tempfile::tempdir().unwrap();
-    let db = Db::open(&directory.path().join("meter.db")).unwrap();
+    let db = open(&directory.path().join("meter.db"));
     let (proxy, proxy_task) = serve(meter::router(AppState::new(upstream, db.clone()))).await;
     let client = reqwest::Client::new();
     for endpoint in ["/api/embed", "/api/unknown"] {
@@ -429,10 +451,12 @@ async fn arbitrary_endpoints_errors_openai_and_internal_contract() {
     );
     proxy_task.abort();
     upstream_task.abort();
+    }).await.expect("proxy contract test timed out");
 }
 
 #[tokio::test]
 async fn stats_quantiles_rates_and_model_filter() {
+    tokio::time::timeout(Duration::from_secs(30), async {
     let upstream = Router::new().route("/api/chat", post(|request: Request<Body>| async {
         let input: Value = serde_json::from_slice(&axum::body::to_bytes(request.into_body(), usize::MAX).await.unwrap()).unwrap();
         let index = input["case"].as_u64().unwrap() as usize;
@@ -446,7 +470,7 @@ async fn stats_quantiles_rates_and_model_filter() {
     let directory = tempfile::tempdir().unwrap();
     let (proxy, proxy_task) = serve(meter::router(AppState::new(
         upstream,
-        Db::open(&directory.path().join("meter.db")).unwrap(),
+        open(&directory.path().join("meter.db")),
     )))
     .await;
     let client = reqwest::Client::new();
@@ -490,4 +514,249 @@ async fn stats_quantiles_rates_and_model_filter() {
     assert_eq!(empty, json!([]));
     proxy_task.abort();
     upstream_task.abort();
+    }).await.expect("stats test timed out");
+}
+
+#[tokio::test]
+async fn overflow_never_waits_for_sqlite_counts_rows_and_drains_one_episode() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("meter.db");
+        let db = open(&path);
+        let (upstream, upstream_task) = serve(Router::new().fallback(|| async { "unblocked" })).await;
+        let (proxy, proxy_task) = serve(meter::router(AppState::new(upstream, db.clone()))).await;
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let pool = db.pool.clone();
+        let blocker = tokio::spawn(async move {
+            pool.write(&Default::default(), move |_| {
+                started.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(5))?;
+                Ok(())
+            }).await.unwrap();
+        });
+        ready.await.unwrap();
+        let row = RequestRecord { status: 200, ..Default::default() };
+        for _ in 0..1024 { db.send(Event::Request(Box::new(row.clone()))); }
+        assert_eq!(db.queue_status().queue_depth, 1024);
+        for _ in 0..7 { db.send(Event::Request(Box::new(row.clone()))); }
+        let sample = GpuSample { ts: meter::now_ms(), index: 0, memory_used_mib: 1.0, memory_total_mib: 2.0, utilization_percent: 3.0, temperature_c: 4.0, power_w: 5.0 };
+        db.send(Event::Gpu(vec![sample.clone(); 3]));
+        db.send(Event::Gpu(vec![sample; 2]));
+        // The writer remains blocked until AFTER the complete proxy response.
+        let text = tokio::time::timeout(Duration::from_millis(500), async {
+            reqwest::get(format!("{proxy}/api/version")).await.unwrap().text().await.unwrap()
+        }).await.expect("proxy waited for the blocked writer");
+        assert_eq!(text, "unblocked");
+        assert_eq!(db.queue_status().dropped_requests, 8);
+        assert_eq!(db.queue_status().dropped_gpu_samples, 5);
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        while db.queue_status().queue_depth != 0 { tokio::time::sleep(Duration::from_millis(5)).await; }
+        let health: Value = reqwest::get(format!("{proxy}/meter/health")).await.unwrap().json().await.unwrap();
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["dropped_requests"], 8);
+        assert_eq!(health["dropped_gpu_samples"], 5);
+        assert_eq!(health["queue_depth"], 0);
+        db.close().await.unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM requests", [], |r| r.get::<_,i64>(0)).unwrap(), 1024);
+        let episodes: Vec<(i64,i64,i64,i64)> = conn.prepare("SELECT started_at_ms,ended_at_ms,dropped_requests,dropped_gpu_samples FROM drop_episodes").unwrap()
+            .query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert!(episodes[0].1 >= episodes[0].0);
+        assert_eq!((episodes[0].2,episodes[0].3), (8,5));
+        proxy_task.abort();
+        upstream_task.abort();
+    }).await.expect("overflow test timed out");
+}
+
+#[tokio::test]
+async fn endpoint_budgets_plans_settings_and_openapi() {
+    use factory_db::{
+        Scope,
+        explain::{self, Exception, ExceptionKind, RequiredSearch},
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for size in [3, 10_001] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("meter.db");
+            let db = open(&path);
+            let now = meter::now_ms();
+            let rows = (1..=size)
+                .map(|id| RequestRecord {
+                    id,
+                    ts: now - ((id - 1) % 365) * 86_400_000,
+                    status: 200,
+                    endpoint: "/api/chat".into(),
+                    model: (id % 3 != 0).then(|| "model".into()),
+                    prompt_eval_count: Some(13),
+                    eval_count: (id % 2 != 0).then_some(7),
+                    ..Default::default()
+                })
+                .collect();
+            let gpu = (0..size)
+                .map(|id| GpuSample {
+                    ts: now - (id % 7) * 86_400_000,
+                    index: (id % 2) as u32,
+                    memory_used_mib: 10.0,
+                    memory_total_mib: 100.0,
+                    utilization_percent: 37.0,
+                    temperature_c: 45.0,
+                    power_w: 80.0,
+                })
+                .collect();
+            db.import(rows, gpu).await.unwrap();
+            db.pool
+                .write(&Scope::default(), |c| {
+                    c.execute_batch("ANALYZE")?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let settings = db.pool.settings(&Scope::default()).await.unwrap();
+            assert_eq!(settings.len(), 3);
+            for (index, settings) in settings.into_iter().enumerate() {
+                assert_eq!(settings.journal_mode, "wal");
+                assert_eq!(settings.synchronous, 1);
+                assert_eq!(settings.busy_timeout, 5000);
+                assert_eq!(settings.foreign_keys, 1);
+                assert_eq!(settings.journal_size_limit, 67_108_864);
+                assert_eq!(settings.wal_autocheckpoint, 1000);
+                assert_eq!(settings.query_only, i64::from(index > 0));
+            }
+            for (endpoint, index, exception, params) in [
+                (
+                    "/meter/health",
+                    None,
+                    Some(ExceptionKind::LimitZero),
+                    vec![],
+                ),
+                (
+                    "/meter/requests?limit=3",
+                    None,
+                    Some(ExceptionKind::BoundedRowidWalk),
+                    vec![rusqlite::types::Value::Integer(3)],
+                ),
+                (
+                    "/meter/requests?after_id=1&limit=3",
+                    None,
+                    None,
+                    vec![3.into(), 1.into()],
+                ),
+                (
+                    "/meter/stats?range=24h",
+                    Some("requests_ts"),
+                    None,
+                    vec![(now - 86_400_000).into()],
+                ),
+                (
+                    "/meter/stats?range=7d&model=model",
+                    Some("requests_model_ts"),
+                    None,
+                    vec![(now - 7 * 86_400_000).into(), "model".to_string().into()],
+                ),
+                (
+                    "/meter/stats?range=30d",
+                    Some("requests_ts"),
+                    None,
+                    vec![(now - 30 * 86_400_000).into()],
+                ),
+                (
+                    "/meter/gpu/history?range=7d",
+                    Some("gpu_ts"),
+                    None,
+                    vec![(now - 7 * 86_400_000).into()],
+                ),
+                ("/meter/openapi.json", None, None, vec![]),
+            ] {
+                let scope = Scope::recording();
+                let mut scoped = db.clone();
+                scoped.scope = Some(scope.clone());
+                let (url, task) = serve(meter::router(AppState::new(
+                    "http://127.0.0.1:1".into(),
+                    scoped,
+                )))
+                .await;
+                let value: Value = reqwest::get(format!("{url}{endpoint}"))
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let counts = scope.counts();
+                let schema = endpoint == "/meter/openapi.json";
+                assert_eq!(counts.data, usize::from(!schema), "{endpoint}: {counts:?}");
+                assert_eq!((counts.setup, counts.maintenance), (0, 0));
+                assert_eq!(counts.transaction, if schema { 0 } else { 2 });
+                if schema {
+                    let path =
+                        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi.json");
+                    if std::env::var_os("UPDATE_METER_OPENAPI").is_some() {
+                        std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap() + "\n")
+                            .unwrap();
+                    }
+                    let golden: Value =
+                        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                    assert_eq!(value, golden);
+                } else if endpoint.contains("stats") {
+                    let total: u64 = value
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|r| r["requests"].as_u64().unwrap())
+                        .sum();
+                    assert!(total > 0);
+                    assert_eq!(
+                        value
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|r| r["input_tokens"].as_u64().unwrap())
+                            .sum::<u64>(),
+                        total * 13
+                    );
+                } else if endpoint != "/meter/health" {
+                    assert!(!value.as_array().unwrap().is_empty());
+                }
+                // Small fixtures can rationally scan. Require indexed plans on
+                // the analyzed large fixture using the actual traced endpoint SQL.
+                if size > 3 && !schema {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    let sql = scope
+                        .statements()
+                        .into_iter()
+                        .find(|sql| sql.starts_with("SELECT"))
+                        .unwrap();
+                    let table = if endpoint.contains("gpu/history") {
+                        "gpu_samples"
+                    } else {
+                        "requests"
+                    };
+                    let plan = explain::query_plan(&conn, &sql, rusqlite::params_from_iter(params))
+                        .unwrap();
+                    let required = if exception.is_none() {
+                        vec![RequiredSearch { table, index }]
+                    } else {
+                        vec![]
+                    };
+                    let exceptions = exception
+                        .map(|kind| Exception {
+                            kind,
+                            table,
+                            reason: "metadata-only LIMIT 0 or bounded newest-ID walk",
+                        })
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    explain::validate(&plan, &required, &exceptions).unwrap();
+                }
+                task.abort();
+            }
+            db.close().await.unwrap();
+        }
+    })
+    .await
+    .expect("budget test timed out");
 }
