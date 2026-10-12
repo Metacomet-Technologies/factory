@@ -87,7 +87,7 @@ cargo build --release --locked -p meter
 sudo bash /home/agent/work/factory/deploy/install-meter.sh /home/agent/work/factory/target/release/meter
 ```
 
-On **factory-console**, as `agent`, build/install the API before the kiosk so
+On **factory-gpu**, as `agent`, build/install the API before the kiosk so
 the strict schema check uses the updated contract:
 
 ```sh
@@ -102,8 +102,9 @@ VITE_API_BASE= vp build
 sudo bash /home/agent/work/factory/deploy/install-kiosk.sh /home/agent/work/factory/kiosk/dist
 ```
 
-Verify `/meter/health` on factory-gpu:11434, `/v1/health` and `/v1/fleet` on
-factory-console:8080, and the visible kiosk footer. All three should show the
+For the first console-to-GPU move, use **MET-114 move** below instead of the
+ordinary API install above. Verify `/meter/health` on factory-gpu:11434,
+`/v1/health` and `/v1/fleet` behind GPU Serve, and the visible kiosk footer. All three should show the
 same version/SHA and clean builds; build times need not match.
 
 ## Run without changing Ollama
@@ -360,8 +361,9 @@ metadata. Processes shut down in the private namespace even when a check fails.
 
 ## factory-api: aggregation API v1
 
-`factory-api` is now implemented. It runs on factory-console, consumes the
-deployed meter on `http://factory-gpu:11434`, and leaves meter and Ollama unchanged.
+`factory-api` targets factory-gpu, consumes meter on `http://127.0.0.1:11434`,
+and leaves meter and Ollama unchanged. MET-114 deployment remains an explicit
+administrator action; these defaults do not establish that the move is live.
 The additive serde/utoipa contract is in `shared::factory_api`; OpenAPI is at
 `GET /openapi.json`. The trusted tailnet and existing host firewall are the
 security boundary. There is no application authentication: never expose this
@@ -373,15 +375,15 @@ Build and run without installing anything:
 ```sh
 cargo build --release --locked -p factory-api
 db_dir=$(mktemp -d)
-target/release/factory-api --listen 0.0.0.0:18080 \
-  --meter-url http://factory-gpu:11434 \
+target/release/factory-api --listen 127.0.0.1:18080 \
+  --meter-url http://127.0.0.1:11434 \
   --db-path "$db_dir/requests.db" --pricing-db-path "$db_dir/pricing.db"
 ```
 
 Defaults and environment equivalents (CLI flags take precedence):
 
-- `--listen` / `FACTORY_API_LISTEN`: `0.0.0.0:8080`.
-- `--meter-url` / `FACTORY_API_METER_URL`: `http://factory-gpu:11434`.
+- `--listen` / `FACTORY_API_LISTEN`: `127.0.0.1:8080` (MET-84; Serve is the tailnet entry point).
+- `--meter-url` / `FACTORY_API_METER_URL`: `http://127.0.0.1:11434`.
 - `--db-path` / `FACTORY_API_DB_PATH`: `/var/lib/factory-api/requests.db`.
 - `--pricing-db-path` / `FACTORY_API_PRICING_DB_PATH`: `/var/lib/factory-api/pricing.db`.
 - `--openrouter-feed-url` / `FACTORY_API_OPENROUTER_FEED_URL`:
@@ -414,9 +416,12 @@ Endpoints:
 - `GET /v1/health`: status, build identity, process uptime in milliseconds.
 - `GET /v1/fleet`: configured Tailscale nodes and HTTP/TCP/local systemd checks.
   HTTP requires 2xx; redirects fail. Checks time out after five seconds.
-  `systemd` targets are allowed only on factory-console. Missing discovery data
+  `systemd` targets are allowed only on factory-gpu. Missing discovery data
   gives offline nodes and null metadata; failed service checks retain details.
   The embedded self-check follows `--listen`'s port, including the :18080 check.
+  GPU hosts API/static/meter/Ollama and the backup timer. Console's
+  `backup-replica-ssh` checks transport reachability only, not replica freshness,
+  Chrome, or its Amp runner; no remote systemd execution or watchdog is added.
 - `GET /v1/llm/usage?range=24h|7d|30d`: totals, reference-family spend avoided,
   per-model tokens/rates/nearest-rank latency percentiles, load time and warnings.
   Default range is 24h. All meter rows count, including non-model requests;
@@ -538,9 +543,14 @@ Root uses SQLite's `.backup` API (including committed WAL data), requires exactl
 `ok` from `PRAGMA integrity_check`, compresses with zstd, and publishes a SHA-256
 sidecar. Failed snapshots never become successful status entries. The databases are:
 
-- factory-gpu: `meter`, `/srv/factory/meter/meter.db`.
-- factory-console: `requests`, `/var/lib/factory-api/requests.db`, and `pricing`,
+- factory-gpu: `meter`, `/srv/factory/meter/meter.db`; `requests`,
+  `/var/lib/factory-api/requests.db`; and `pricing`,
   `/var/lib/factory-api/pricing.db` (factory-api's systemd `StateDirectory`).
+- factory-console: no originating DBs; receives all three GPU replicas.
+  Its retained API DBs and old snapshots are rollback data, never pushed/pruned
+  by the receiver-only timer. Its local status becomes `{}`. GPU requests
+  replica pruning after successful pushes; all three verified current copies
+  are required before retention can delete anything.
 
 Snapshots are `/var/backups/factory-db/<host>/<db>/<UTC-timestamp>.db.zst` with
 adjacent `.sha256` files. Local snapshots are root-owned and read-only to the
@@ -593,7 +603,8 @@ journalctl -u factory-backup.service
 ### Install on both nodes (Devon; requires MET-73)
 
 Do not run the installer during development. No application service is stopped
-or restarted by installation or backups. Both nodes need existing databases,
+or restarted by installation or backups. Origin nodes need their configured databases;
+the receiver-only console needs none. Both nodes need
 systemd, active tailscaled with Tailscale SSH enabled, SQLite CLI, zstd, rsync,
 OpenSSH client, Python 3.11+, and standard Ubuntu coreutils/util-linux/account
 tools. Install missing packages as administrator:
@@ -711,8 +722,8 @@ Use `local` during first-node bootstrap before incoming replicas exist.
 Manual restoration is an explicit administrator action. Choose a verified copy
 from either local snapshots or received replicas and retain its sidecar. For
 meter use service/user `meter` and `/srv/factory/meter/meter.db`; for either
-console DB use service/user `factory-api` and its corresponding path above.
-Restore requests and pricing together when recovering the whole console.
+API DB use service/user `factory-api` on factory-gpu and its corresponding path above.
+Restore requests and pricing together when recovering the API.
 Run the following in a root Bash shell, setting the three paths/names first.
 `set -e` ensures a bad checksum or integrity result stops before replacement:
 
@@ -771,3 +782,149 @@ Development overrides are `BACKUP_HOST`, `BACKUP_HOME`, `METER_DB`, `REQUESTS_DB
 The installer clears development overrides and always uses real node defaults.
 These unprivileged checks do not prove production Tailscale SSH/root permissions;
 the administrator's immediate systemd backup and restore checks do that.
+
+## MET-114 move
+
+**Deployment artifacts only.** Merge and complete the PLAYBOOK unprivileged
+main-checkout build handoff first. Both nodes must have the merged scripts at
+`/home/agent/work/factory`; GPU must have a clean release API binary and a
+same-origin kiosk dist from that same commit. Do not run the ordinary API
+installer on console. Do not change meter, Ollama, or either Amp runner.
+
+Plan **5–15 minutes of dashboard/API downtime**, plus archive transfer time.
+This is an operator budget, not a measured production duration. Meter continues
+recording. API cursor sync catches up after startup. Freeze operator pricing
+changes during cutover. No database schema changes or pricing refresh/confirm
+commands are part of the move.
+
+The move is deliberately split: the existing MET-73 node-to-node identity is
+`factory-backup`, without sudo. Giving it administrative SSH would expand
+privilege. Instead the administrator uses existing Mac `factory-ssh` and
+`console-ssh` helpers, authenticated over Tailscale SSH as their admin account.
+The Mac relays the private verified bundle; no credentials/keys are created,
+copied, or delegated. Helpers must support byte-clean stdin/stdout without a
+PTY for tar transfer. A failed transfer/checksum stops before DB replacement.
+
+Run these **from Mac, in order**, stopping on every failure. Before stopping
+console, inspect current Serve configuration and the kiosk file; require the
+existing background HTTPS 443 root proxy with no unrelated path mounts. If
+Serve was configured with different flags, stop and adapt the off command to
+those original flags rather than using `serve reset`.
+
+```sh
+factory-ssh 'sudo tailscale serve status --json'
+console-ssh 'sudo tailscale serve status --json'
+console-ssh "sudo -u console grep '^Exec=' /home/console/.config/autostart/console-kiosk.desktop"
+factory-ssh 'sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api --check-only'
+SHA=$(factory-ssh 'sudo -u agent git -C /home/agent/work/factory rev-parse --short=7 HEAD')
+
+# Downtime starts. This disables/stops API and backup timer/service, takes
+# fresh MET-74 snapshots, and leaves console DBs/binary/unit/static files intact.
+console-ssh 'sudo bash /home/agent/work/factory/deploy/prepare-factory-api-move.sh'
+console-ssh 'systemctl is-active factory-api.service; systemctl is-enabled factory-api.service'
+# Both outputs must be inactive/disabled; their nonzero exit statuses are expected.
+
+# Private Mac transfer. Keep this bundle until the move is verified.
+umask 077
+BUNDLE=$(mktemp -t factory-met-114)
+console-ssh 'sudo tar -C /var/backups/factory-api-move/console/bundle -cf - requests.db.zst requests.db.zst.sha256 pricing.db.zst pricing.db.zst.sha256 counts.json' > "$BUNDLE"
+tar -tf "$BUNDLE"
+factory-ssh 'sudo install -d -m 0700 /var/backups/factory-api-move/incoming && sudo tar --no-same-owner -xf - -C /var/backups/factory-api-move/incoming requests.db.zst requests.db.zst.sha256 pricing.db.zst pricing.db.zst.sha256 counts.json' < "$BUNDLE"
+factory-ssh "sudo bash /home/agent/work/factory/deploy/move-factory-api-to-gpu.sh --dry-run /home/agent/work/factory/target/release/factory-api /home/agent/work/factory/kiosk/dist /var/backups/factory-api-move/incoming $SHA"
+factory-ssh "sudo bash /home/agent/work/factory/deploy/move-factory-api-to-gpu.sh /home/agent/work/factory/target/release/factory-api /home/agent/work/factory/kiosk/dist /var/backups/factory-api-move/incoming $SHA"
+
+# Prepare both backup nodes BEFORE the first push with the new layout.
+# GPU's original backup config was saved by the move; console's by preparation.
+console-ssh 'sudo bash /home/agent/work/factory/deploy/backup/install-backup.sh --prepare-only'
+factory-ssh 'sudo bash /home/agent/work/factory/deploy/backup/install-backup.sh --prepare-only'
+factory-ssh 'sudo bash /home/agent/work/factory/deploy/backup/install-backup.sh'
+console-ssh 'sudo bash /home/agent/work/factory/deploy/backup/install-backup.sh'
+factory-ssh 'sudo /usr/local/lib/factory-backup/restore-check.sh all'
+console-ssh 'sudo /usr/local/lib/factory-backup/restore-check.sh all'
+
+# Scripts print these Serve commands but never execute them.
+factory-ssh 'sudo tailscale serve --bg --https=443 http://127.0.0.1:8080'
+curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/health
+curl -fsS https://factory-gpu.bearded-pompano.ts.net/version.json
+console-ssh 'sudo tailscale serve --bg --https=443 off'
+
+# Back up once. Change only Exec= URL; all other flags/keys remain unchanged.
+console-ssh "sudo -u console cp -p /home/console/.config/autostart/console-kiosk.desktop /home/console/.config/autostart/console-kiosk.desktop.met-114"
+console-ssh "sudo -u console sed -i '/^Exec=/s|--app=http://localhost:8080|--app=https://factory-gpu.bearded-pompano.ts.net|' /home/console/.config/autostart/console-kiosk.desktop"
+console-ssh "sudo -u console grep '^Exec=' /home/console/.config/autostart/console-kiosk.desktop"
+```
+
+UI only: relaunch Chrome in the console desktop session; check the new URL,
+Fleet, usage, pricing and version footer. Autostart permissions and physical
+Chrome are not proven by script checks. Same-origin API/SSE and `/version.json`
+need no application change. The old and new origins have separate theme storage.
+
+The GPU script verifies archive SHA-256, `integrity_check=ok`, pricing v1,
+and **every table count before collectors resume**, as `factory-api`. Counts
+are retained at `/var/backups/factory-api-move/gpu/restored-counts.json`.
+Checking equality after normal startup would race new meter ingestion/pricing
+refresh, so post-start checks verify health version/SHA/clean build, loopback
+binding, fleet, usage, pricing and static manifest instead. DBs have owner
+`factory-api:factory-api` and mode 0600. A partial restore is preserved together
+with its WAL/SHM before retry; no stale sidecar is replayed.
+
+Repeat the GPU command with the **same bundle** to resume an interrupted move.
+Once its `started` marker exists, reruns never import the old snapshot over
+new API writes. Complete the backup steps again after a rerun. Console
+preparation reuses its completed bundle while its API remains stopped.
+After rollback, scripts refuse a new move until the administrator archives
+the old journal and reviews retained GPU DBs; do not erase them to force a retry.
+
+After both backup timers resume, wait 30 seconds for Fleet's next collection,
+then verify from Mac:
+
+```sh
+factory-ssh "sudo -u factory-api curl -fsS http://127.0.0.1:8080/v1/fleet"
+curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/llm/usage
+curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/pricing
+factory-ssh "ss -H -ltn 'sport = :8080'"
+factory-ssh 'systemctl is-active factory-api.service factory-backup.timer'
+console-ssh 'systemctl is-active factory-backup.timer'
+```
+
+Expect only `127.0.0.1:8080`, GPU API/timer active, console timer active, console
+API inactive and disabled. Fleet's console SSH check is only backup transport
+reachability, not evidence of current replicas or Chrome/runner health. No
+console watchdog is introduced. Old `factory-status` clients targeting console
+port 8080 must be updated separately; this PR does not edit Mac helpers.
+
+Serve syntax was checked against the current
+[Tailscale CLI documentation](https://tailscale.com/kb/1242/tailscale-serve).
+`--bg --https=443 <target>` persists the proxy; the same flags plus `off`
+remove it. No Serve commands, TLS certificate provisioning, cross-node SSH
+transfer, root ownership, or kiosk session changes are exercised by no-root tests.
+
+### MET-114 rollback
+
+Stop GPU first to prevent two API writers. Rollback keeps **all** DBs. It
+restores saved MET-74 configs, stops/disables GPU API, and re-enables console
+API and both backup timers. The console binary/unit/static tree was never
+replaced. Post-cutover pricing changes and API-only history are **not merged
+back**; preserve GPU files for reconciliation before accepting rollback.
+
+```sh
+factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh --dry-run gpu'
+console-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh --dry-run console'
+factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh gpu'
+console-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh console'
+console-ssh 'sudo tailscale serve --bg --https=443 http://127.0.0.1:8080'
+factory-ssh 'sudo tailscale serve --bg --https=443 off'
+console-ssh "sudo -u console sed -i '/^Exec=/s|--app=https://factory-gpu.bearded-pompano.ts.net|--app=http://localhost:8080|' /home/console/.config/autostart/console-kiosk.desktop"
+curl -fsS https://factory-console.bearded-pompano.ts.net/v1/health
+```
+
+UI only: relaunch Chrome in its console session. If the GPU step never created
+its journal, there was no GPU deployment to undo: confirm no GPU API is running
+and run console rollback only. The old console unit may bind 0.0.0.0 again;
+MET-84 is not deployed while rolled back. A rollback error prints its retry
+command and leaves DBs intact; keep clients off until checks pass.
+
+No-root development checks additionally include `python3 -B deploy/test-move.py`,
+the move artifact preflight/`--dry-run`, both rollback `--dry-run` modes, and
+the sandbox snapshot/restore response comparison. Dry-run checks artifacts
+only; it never claims production service/account/access preflight succeeded.

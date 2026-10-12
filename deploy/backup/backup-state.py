@@ -15,6 +15,8 @@ def status(path, operation, args):
     data = json.loads(path.read_text()) if path.exists() else {}
     now = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
     if operation == "attempt":
+        # Status describes current origins, not retired rollback archives.
+        data = {name: data[name] for name in args if name in data}
         for name in args:
             previous = data.get(name, {})
             data[name] = dict(last_success_ms=previous.get("last_success_ms"),

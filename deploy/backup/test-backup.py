@@ -55,8 +55,7 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
     threads = []
     environments = {}
     try:
-        for host, names in (("factory-gpu", ["meter"]),
-                            ("factory-console", ["requests", "pricing"])):
+        for host, names in (("factory-gpu", ["meter", "requests", "pricing"]),):
             peer = "factory-console" if host == "factory-gpu" else "factory-gpu"
             env = dict(os.environ, BACKUP_HOST=host, BACKUP_TRANSPORT="local",
                        LOCAL_ROOT=str(root / "local"),
@@ -130,6 +129,35 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
             thread.join(5)
             assert not thread.is_alive()
 
+    gpu = environments["factory-gpu"]
+    console = dict(gpu, BACKUP_HOST="factory-console",
+                   REPLICA_ROOT=str(root / "factory-console" / "replica"),
+                   PEER_REPLICA_ROOT=str(root / "factory-gpu" / "replica"),
+                   STATUS_FILE=str(root / "factory-console" / "status" / "status.json"))
+    environments["factory-console"] = console
+    # Old console originals and GPU-held console replicas remain rollback data.
+    for tree in (root / "local" / "factory-console",
+                 root / "factory-gpu" / "replica" / "factory-console"):
+        for name in ("requests", "pricing"):
+            seed(tree / name)
+    retired = {path: path.read_bytes() for tree in
+               (root / "local" / "factory-console",
+                root / "factory-gpu" / "replica" / "factory-console")
+               for path in tree.rglob("*") if path.is_file()}
+    status_path = Path(console["STATUS_FILE"])
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(json.dumps({"requests": {"error": "old failure"}}))
+    for transport in ("local", "ssh"):
+        output = run("factory-backup.sh", dict(console, BACKUP_TRANSPORT=transport,
+                     PEER_REPLICA_ROOT=str(root / "must-not-create")))
+        assert "No originating databases" in output
+        assert json.loads(status_path.read_text()) == {}
+        assert not (root / "must-not-create").exists()
+        assert all(path.read_bytes() == data for path, data in retired.items())
+    run("factory-backup.sh", gpu, "--prune-replica")
+    assert all(path.read_bytes() == data for path, data in retired.items())
+    print("PASS: empty-origin console succeeds without SSH/push/prune; retired archives preserved")
+
     live_files = {path: hashlib.sha256(path.read_bytes()).digest() for path in root.glob("*.db*")}
     for env in environments.values():
         output = run("restore-check.sh", env, "all")
@@ -138,17 +166,17 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
     assert all(hashlib.sha256(path.read_bytes()).digest() == digest for path, digest in live_files.items())
     print("PASS: restore-check reports every table and never changes live databases")
 
-    env = environments["factory-console"]
-    trees = [root / "local" / "factory-console", root / "factory-gpu" / "replica" / "factory-console"]
+    env = environments["factory-gpu"]
+    trees = [root / "local" / "factory-gpu", root / "factory-console" / "replica" / "factory-gpu"]
     for tree in trees:
-        for name in ("requests", "pricing"):
+        for name in ("meter", "requests", "pricing"):
             seed(tree / name)
     prior_files = {path for tree in trees for path in tree.rglob("*.db.zst*")}
     previous = json.loads(Path(env["STATUS_FILE"]).read_text())
     run("factory-backup.sh", dict(env, PRICING_DB=str(root / "missing.db")), success=False)
     assert all(path.exists() for path in prior_files)
     status = json.loads(Path(env["STATUS_FILE"]).read_text())
-    for name in ("requests", "pricing"):
+    for name in ("meter", "requests", "pricing"):
         assert status[name]["last_success_ms"] == previous[name]["last_success_ms"]
         assert not status[name]["pushed_to_peer"] and status[name]["error"]
     bad = root / "invalid.db"
@@ -170,23 +198,29 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
                for name, value in status.items())
     print("PASS: retry after failures clears errors and resumes retention")
 
-    gpu = environments["factory-gpu"]
-    replica = root / "factory-gpu" / "replica" / "factory-console"
+    replica = root / "factory-console" / "replica" / "factory-gpu"
+    for name in ("meter", "requests", "pricing"):
+        seed(replica / name)
+    run("factory-backup.sh", console, "--prune-replica")
+    for name in ("meter", "requests", "pricing"):
+        assert len(list((replica / name).glob("*.db.zst"))) == len(expected_days)
+        # Reintroduce expired copies so a broken gate would actually delete data.
+        seed(replica / name)
     current = sorted((replica / "pricing").glob("*.db.zst"))[-1]
     checksum = Path(str(current) + ".sha256")
     checksum.unlink()
     before_files = {path for path in replica.rglob("*") if path.is_file()}
-    run("factory-backup.sh", gpu, "--prune-replica")
+    run("factory-backup.sh", console, "--prune-replica")
     assert all(path.exists() for path in before_files)
-    run("restore-check.sh", gpu, "replica", success=False)
+    run("restore-check.sh", console, "replica", success=False)
     checksum.write_text(f"{'0' * 64}  {current.name}\n")
-    run("factory-backup.sh", gpu, "--prune-replica", success=False)
+    run("factory-backup.sh", console, "--prune-replica", success=False)
     assert all(path.exists() for path in before_files)
-    run("restore-check.sh", gpu, "replica", success=False)
+    run("restore-check.sh", console, "replica", success=False)
     for path in (replica / "pricing").glob(today.strftime("%Y%m%d") + "*"):
         path.unlink()
     before_files = {path for path in replica.rglob("*") if path.is_file()}
-    run("factory-backup.sh", gpu, "--prune-replica")
+    run("factory-backup.sh", console, "--prune-replica")
     assert all(path.exists() for path in before_files)
     print("PASS: receiver skips retention without today's complete backups; checksum corruption fails")
 

@@ -56,8 +56,13 @@ is another instance of the **same pricing schema**, not a fourth schema.
 | Database | Owner/location | Current persistence |
 | --- | --- | --- |
 | meter | meter, factory-gpu, `/srv/factory/meter/meter.db` | Raw request facts, GPU samples |
-| API cache | factory-api, factory-console, `/var/lib/factory-api/requests.db` | Synced meter rows and permanent gap-warning strings |
-| pricing | pricing library/CLI, factory-console, `/var/lib/factory-api/pricing.db` | Append-only observed prices, selections and refresh events |
+| API cache | factory-api, factory-gpu after MET-114, `/var/lib/factory-api/requests.db` | Synced meter rows and permanent gap-warning strings |
+| pricing | pricing library/CLI, factory-gpu after MET-114, `/var/lib/factory-api/pricing.db` | Append-only observed prices, selections and refresh events |
+
+MET-114 moves both files intact using verified MET-74 snapshots. The console
+originals remain at the same paths for rollback; console receives GPU replicas
+under `/var/backups/factory-replica/factory-gpu/`. Historical schema capture
+filenames below retain their original node names.
 
 Fleet, live GPU state, collector warnings and SSE fan-out are in memory in
 `AppState`, not fleet/state tables. Fleet config is TOML. No schema should be

@@ -40,10 +40,10 @@ impl Config {
                 );
                 match service.kind {
                     ServiceKind::Systemd => ensure!(
-                        node.name == "factory-console"
+                        node.name == "factory-gpu"
                             && !service.target.starts_with('-')
                             && !service.target.is_empty(),
-                        "systemd checks are local-only on factory-console"
+                        "systemd checks are local-only on factory-gpu"
                     ),
                     ServiceKind::Http => {
                         let url = reqwest::Url::parse(&service.target)?;

@@ -168,7 +168,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
     let config = fleet::Config::parse(&format!(
         r#"
         [[nodes]]
-        name="factory-console"
+        name="factory-gpu"
         services=[
           {{name="meter-http",kind="http",target="{meter_url}/meter/health"}},
           {{name="factory-api",kind="http",target="{meter_url}/v1/health"}},
@@ -694,7 +694,8 @@ fn tailscale_units_and_local_only_config() -> Result<()> {
     assert_eq!(node.last_seen_ms, Some(1_791_695_440_123));
     assert_eq!(node.tailscale_ip.as_deref(), Some("100.1.2.3"));
     assert!(node.online);
-    assert!(fleet::Config::parse("[[nodes]]\nname='factory-gpu'\nservices=[{name='remote',kind='systemd',target='amp-runner'}]").is_err());
+    assert!(fleet::Config::parse("[[nodes]]\nname='factory-console'\nservices=[{name='remote',kind='systemd',target='amp-runner'}]").is_err());
+    assert!(fleet::Config::parse("[[nodes]]\nname='factory-gpu'\nservices=[{name='local',kind='systemd',target='amp-runner'}]").is_ok());
     Ok(())
 }
 

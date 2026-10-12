@@ -12,7 +12,7 @@ Group=factory-api
 StateDirectory=factory-api
 StateDirectoryMode=0750
 WorkingDirectory=/var/lib/factory-api
-ExecStart=/usr/local/bin/factory-api --listen 0.0.0.0:8080 --meter-url http://factory-gpu:11434 --db-path /var/lib/factory-api/requests.db --pricing-db-path /var/lib/factory-api/pricing.db
+ExecStart=/usr/local/bin/factory-api --listen 127.0.0.1:8080 --meter-url http://127.0.0.1:11434 --db-path /var/lib/factory-api/requests.db --pricing-db-path /var/lib/factory-api/pricing.db
 Environment=RUST_LOG=factory_api=info
 Restart=on-failure
 RestartSec=3
