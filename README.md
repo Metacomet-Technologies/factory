@@ -240,10 +240,19 @@ the complete file, with permissions, ownership, and timestamps preserved, to
 Each installation creates a snapshot under `/var/backups/meter` with the previous
 binary/unit and DB generation. Read-only preflight checks the binary version,
 legacy fingerprint/schema version and at least 3× DB disk space. The installer
-holds `/var/backups/factory-db/.backup.lock`, stops only meter, takes and verifies
-a fresh MET-74 snapshot, and converts as `meter` before swapping files. It retains
+holds `/var/backups/factory-db/.backup.lock`, stops only meter, verifies its PID
+is gone and checks DB/sidecar holders with `fuser` when available. For both legacy
+and v1 databases, it runs `PRAGMA wal_checkpoint(TRUNCATE)` read-write as `meter`,
+prints busy/log/checkpointed counts, and requires busy=0, equal frame counts and
+an absent or empty WAL. This moves committed frames into the main file without
+changing logical contents. An incomplete checkpoint fails with the rollback hint
+and leaves meter stopped for administrator recovery. Then it rechecks the schema
+version, takes and verifies a fresh MET-74 snapshot, captures the stopped generation,
+and converts as `meter` before swapping files. It retains
 `meter.v0.db` with WAL/SHM and installs v1 as 0600 meter:meter. First installs use
 the real empty-DB migration; v1 reruns skip conversion. Migration elapsed ms prints.
+V1 SIGTERM drains writes, closes every pool connection, and finishes with a
+writable truncate checkpoint; the installer still checkpoints independently.
 It reloads systemd and restarts Ollama only when the drop-in changes; otherwise
 it prints `Ollama unchanged, not restarted`. It starts meter and verifies `/api/version` and
 `/meter/health` on :11434. Startup checks poll silently for up to 45 seconds,

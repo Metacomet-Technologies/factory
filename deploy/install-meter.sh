@@ -34,6 +34,23 @@ meter_sqlite() {
 counts() {
     meter_sqlite "$1" 'SELECT COUNT(*) FROM requests; SELECT COUNT(*) FROM gpu_samples;'
 }
+checkpoint_meter_db() {
+    local path=$1 result sidecar
+    local files=("$path")
+    [[ -f "$path" ]] || fail "Meter DB missing: $path"
+    for sidecar in "$path-wal" "$path-shm"; do
+        if [[ -e "$sidecar" ]]; then files+=("$sidecar"); fi
+    done
+    if command -v fuser >/dev/null; then
+        if fuser "${files[@]}"; then fail 'Meter DB is still open; leave meter stopped and investigate.'; fi
+    else
+        printf 'fuser unavailable; relying on stopped service and SQLite checkpoint locks.\n' >&2
+    fi
+    result=$(sudo -u meter sqlite3 -batch -noheader -separator '|' -cmd '.timeout 5000' "$path" 'PRAGMA wal_checkpoint(TRUNCATE);') || fail 'Meter checkpoint failed; leave meter stopped and investigate.'
+    printf 'Meter WAL checkpoint (busy|log|checkpointed): %s\n' "$result"
+    [[ "$result" =~ ^0\|(-?[0-9]+)\|(-?[0-9]+)$ && ${BASH_REMATCH[1]} == "${BASH_REMATCH[2]}" ]] || fail 'Meter checkpoint incomplete; leave meter stopped and investigate.'
+    [[ ! -s "$path-wal" ]] || fail 'Meter WAL remains non-empty after checkpoint.'
+}
 assert_meter_owner() {
     local path
     for path; do
@@ -146,12 +163,15 @@ done
 cp -p -- "$drop_in" "$snapshot/ollama-drop-in"
 touch "$snapshot/complete"
 printf 'Rollback snapshot: %s\n' "$snapshot"
-if [[ $(systemctl show meter.service --property=LoadState --value) != not-found ]]; then systemctl stop meter.service; fi
+if [[ $(systemctl show meter.service --property=LoadState --value) != not-found ]]; then
+    systemctl stop meter.service
+    [[ $(systemctl show meter.service --property=MainPID --value) == 0 ]] || fail 'Meter PID remains after stop.'
+fi
 if [[ "$mode" == fresh ]]; then
     [[ ! -e "$db" && ! -e "$db-wal" && ! -e "$db-shm" ]] || fail 'DB appeared since preflight; review before retrying.'
 fi
 if [[ "$mode" != fresh ]]; then
-    [[ ! -s "$db-wal" ]] || fail 'Meter WAL is non-empty after stop; checkpoint before migration.'
+    checkpoint_meter_db "$db"
     [[ $(meter_sqlite "$db" 'PRAGMA user_version;') == "$version" ]] || fail 'DB version changed since preflight.'
     STAMP=$(date -u +%Y%m%dT%H%M%S.%NZ)
     archive=/var/backups/factory-db/factory-gpu/meter/$STAMP.db.zst

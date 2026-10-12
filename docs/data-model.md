@@ -785,6 +785,16 @@ separately reports raw-to-legacy-cache and legacy-wire-to-cache differences.
 Meter v1 uses a new-file swap: `meter migrate --legacy OLD --db NEW` opens OLD
 immutable after refusing a nonempty WAL, and runs the shared migration runner
 against a new file. The caller must stop the writer and checkpoint first.
+For legacy and v1 installs, after stopping meter the installer checks MainPID=0
+and DB/sidecar holders with `fuser` when available, then runs a read-write
+`PRAGMA wal_checkpoint(TRUNCATE)` as `meter`. It prints and requires busy=0,
+log frames=checkpointed frames, and an absent/empty WAL. Failure leaves meter
+stopped and prints the rollback hint. Only then does it recheck the version,
+take and verify the fresh MET-74 snapshot, capture the stopped generation and
+convert immutable. The snapshot and preserved v0 therefore include committed WAL
+rows; file size alone never determines whether frames need checkpointing.
+V1 shutdown drains and closes all pool connections before a final writable
+truncate checkpoint, including when a read-only pool connection closes last.
 `--dry-run` and `--check-only` instead use WAL-aware read-only connections as the
 DB owner; even read-only SQLite can create WAL/SHM sidecars. The installer runs
 all its DB inspections as `meter`, verifies ownership immediately after the

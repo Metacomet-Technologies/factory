@@ -42,6 +42,123 @@ async fn serve_on(router: Router, address: &str) -> (String, tokio::task::JoinHa
 }
 
 #[tokio::test]
+async fn sigterm_drains_writes_and_closes_wal() {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("meter.db");
+        meter::migrate::migrate(None, Some(&path), false).unwrap();
+        for (name, output) in [
+            ("nvidia-smi", "0, 100, 12000, 5, 40, 20"),
+            ("tailscale", "{}"),
+        ] {
+            let script = directory.path().join(name);
+            std::fs::write(&script, format!("#!/bin/sh\necho '{output}'\n")).unwrap();
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (upstream, task) = serve(Router::new().fallback(|| async {
+            axum::Json(
+                json!({"model":"shutdown", "done":true, "prompt_eval_count":13, "eval_count":7}),
+            )
+        }))
+        .await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_meter"))
+            .env("PATH", directory.path())
+            .args([
+                "--listen",
+                &address.to_string(),
+                "--upstream",
+                &upstream,
+                "--gpu-sample-interval",
+                "3600",
+                "--db-path",
+            ])
+            .arg(&path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        loop {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "meter exited during startup"
+            );
+            if let Ok(response) = client
+                .get(format!("http://{address}/meter/gpu/history"))
+                .send()
+                .await
+            {
+                let rows: Vec<Value> = response.json().await.unwrap();
+                if !rows.is_empty() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for _ in 0..32 {
+            let response = client
+                .post(format!("http://{address}/api/generate"))
+                .json(&json!({"model":"shutdown", "stream":false}))
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            assert_eq!(response.json::<Value>().await.unwrap()["eval_count"], 7);
+        }
+        let wal = path.with_extension("db-wal");
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        assert!(
+            tokio::process::Command::new("kill")
+                .args(["-TERM", &child.id().unwrap().to_string()])
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0,
+            "WAL remains after SIGTERM"
+        );
+        let db = rusqlite::Connection::open_with_flags(
+            format!("file:{}?mode=ro&immutable=1", path.display()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        let counts: (i64, i64, i64) = db
+            .query_row(
+                "SELECT COUNT(*), SUM(prompt_eval_count), SUM(eval_count) FROM requests",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (32, 416, 224));
+        assert!(
+            db.query_row("SELECT COUNT(*) FROM gpu_samples", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap()
+                >= 1
+        );
+        task.abort();
+    })
+    .await
+    .expect("SIGTERM test timed out");
+}
+
+#[tokio::test]
 async fn slow_ndjson_is_incremental_and_written_once() {
     tokio::time::timeout(Duration::from_secs(30), async {
     let upstream = Router::new().route("/api/generate", post(|| async {
