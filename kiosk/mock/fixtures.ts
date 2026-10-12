@@ -52,6 +52,16 @@ export function fixtures(
             detail: null,
             checked_at_ms: now,
           },
+          {
+            name: "factory-api",
+            kind: "http",
+            target: "http://127.0.0.1:8080/v1/health",
+            ok: true,
+            latency_ms: 7,
+            detail: null,
+            checked_at_ms: now,
+            ...build,
+          },
         ],
       },
       {
@@ -61,16 +71,6 @@ export function fixtures(
         last_seen_ms: null,
         os: "Linux",
         services: [
-          {
-            name: "factory-api",
-            kind: "http",
-            target: "http://factory-console:8080/v1/health",
-            ok: true,
-            latency_ms: 7,
-            detail: null,
-            checked_at_ms: now,
-            ...build,
-          },
           {
             name: "backup",
             kind: "systemd",
