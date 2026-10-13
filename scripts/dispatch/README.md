@@ -14,7 +14,7 @@ node --test scripts/dispatch
 
 `poll` handles team issues carrying `dispatch`, priority 1–4 then unprioritized
 (0), oldest first within a priority. `issue` ignores only the label requirement.
-Both also check pending wrap-ups. Blockers must be completed or canceled;
+Both also check pending wrap-ups and archives. Blockers must be completed or canceled;
 one waiting comment survives subsequent polls. Invalid tasks lose the label and
 get reasons. `>` hint lines do not count as section content. Required sections:
 Goal, Context, Isolation, Build, Sandbox check, Done means. Empty Link type means
@@ -44,6 +44,19 @@ previews, not runnable commands or real thread links. Normal logs contain only
 decisions/identifiers; Amp stdout is captured for the ID and stderr is discarded
 because it can include prompts or credentials. Errors report exit/signal or a
 fixed diagnostic, never raw API/CLI bodies.
+
+## Console overflow (MET-127)
+
+An issue without a runner label uses gpu while it has capacity, then console
+while it has capacity. If both are full, `dispatch` stays on and no comment is
+posted. Explicit `runner/gpu` and `runner/console` labels always win and never
+overflow, including grouped labels. `runner/orb` remains refused.
+
+Capacity counting is unchanged: thread markers and unresolved dispatch claims
+reserve a slot on their recorded runner until a wrap-up marker exists. Selection
+accounts for earlier submissions in the same pass. Console overflow claims say
+`Dispatch claimed on console (overflow).`; the claim marker, thread marker,
+Amp executor and generated prompt all record the chosen runner.
 
 ## Crash safety is at-most-once submission
 
@@ -84,6 +97,60 @@ occurred may Devon remove a claim and retry. Do not delete markers or blindly
 relabel a failed issue. If the outcome is unknown, retain the claim. A state move
 lost after the thread comment is not automatically repaired.
 
+## Archive Done threads after five quiet minutes (MET-127)
+
+After wrap-ups, each pass considers issues with a thread marker, a wrap-up marker,
+no `<!-- factory-dispatch:archived -->` marker, and `state.type === "completed"`.
+Canceled and other non-Done issues are never archived. Done is the human-controlled
+merge/deploy-verification gate: closes PRs mark Done at merge, while contributes
+PRs remain open until deployment verification. The wrap-up marker alone does not
+prove deployment or task completion.
+
+The thread's `updated` timestamp from `amp threads list --json` must be at least
+five minutes old relative to the dispatcher clock. Each pass rereads it; new
+updates restart the quiet period. Wrap-up comment age is irrelevant. Missing
+threads, missing/invalid/future timestamps and unreadable listings stay
+`archive-pending` and retry next pass. That decision means Done but five quiet
+minutes have not been established. At most five eligible archive attempts run
+per pass, including failed attempts; pending threads do not consume that budget.
+
+Under the existing exclusive lock, the order is:
+
+1. Check Linear eligibility and Amp quiet/archive state.
+2. Post and await `<!-- factory-dispatch:archive-claim -->`, unless it exists.
+3. Run `amp threads archive <T-id>` only if the thread is still unarchived in
+   the listing.
+4. After success or confirmation that it is already archived, post
+   `Thread archived.` with `<!-- factory-dispatch:archived -->`; log `archived`.
+
+Unlike dispatch/wrap-up claims, an archive claim permits automatic recovery.
+A crash before Amp leaves a retryable claim. A crash after Amp but before the
+completion marker is recovered by checking the listing and posting the missing
+marker without archiving again. A crash after the marker is a no-op next pass.
+An archive command failure logs `error` with `action: archive`, leaves no
+completion marker, and retries next pass after rereading quiet/archive state.
+Linear write failures stop the pass; an acknowledged or lost-response marker
+is read on the next pass before any retry.
+
+**Repeat-call behavior is not assumed.** CLI help was checked on 2026-10-13 with
+Amp `0.0.1791849701-g1448da`: `amp threads archive [options] <thread>`;
+`--unarchive` restores a thread. Help does not promise that repeated archive
+commands succeed. The dispatcher therefore paginates `amp threads list --json
+--limit 100 --offset <n>`; if absent, it also checks `--include-archived`. A thread
+present only in the latter is already archived. Neither absence from the normal
+list alone nor a failed command is treated as success. The JSON array's `id` and
+`updated` fields match [the earlier CLI observation](../../docs/amp-cli.md#5-thread-records-archiving-and-visibility).
+That probe observed `updated` not tracking the final reply: this requested quiet
+time rule is a timestamp heuristic, not proof that the agent is idle. Real archive
+calls, listing consistency and timestamp freshness during agent execution remain
+unverified here. These are CLI snapshots, not an atomic quiet-time-and-archive
+transaction; a concurrent update can race a pass.
+
+Dry-run preserves its no-Amp-call contract. It logs `archive-pending` with an
+explicit quiet-time-unchecked reason and previews the first listing pages and
+conditional archive command for up to five candidates. It does not claim an
+archive succeeded or preview completion markers without a timestamp check.
+
 ## Verified Linear fields; one unverified integration convention
 
 Checked against Linear's [official GraphQL guide](https://linear.app/developers/graphql),
@@ -95,7 +162,7 @@ on 2026-10-12. No authenticated Linear API request was made by the dispatcher.
 - Endpoint `https://api.linear.app/graphql`, `Authorization: <key>` (not Bearer
   for a personal API key). HTTP success alone is insufficient; check `errors`.
 - `issues(filter: IssueFilter, first, after, includeArchived)` and `issue(id)`;
-  `id`, `identifier`, `title`, `description`, `priority`, `createdAt`, `team.id/key`.
+  `id`, `identifier`, `title`, `description`, `priority`, `createdAt`, `team.id/key`, `state.type`.
   Filters: `team.key.eq`, `labels.some.name.eq`, `comments.some.body.contains`, `or`.
 - `labels.nodes.{id,name,parent.name}` and `comments.nodes.{body,createdAt}`.
 - `inverseRelations.nodes.{type,issue.identifier,issue.state.type}`. A relation's
@@ -129,6 +196,23 @@ enabling the timer. Neither issue completion nor attachment subtitle is treated
 as evidence of merge. The wrap-up prompt also requires confirming the PR merge.
 
 ## Administrator deployment from Mac, after merge
+
+For an already-installed dispatcher, MET-127 adds no deployment artifact, build,
+installer invocation or restart. The post-merge wrap-up's `pull --ff-only` in
+`/home/agent/work/factory` on factory-gpu deploys the code; the next existing
+60-second timer pass uses it. Merge and that pull remain Devon's gates. From Mac,
+after confirming the merge and a clean main checkout:
+
+```sh
+factory-ssh 'sudo -iu agent bash -c '\''set -e; export GH_TOKEN="$AGENT_GH_TOKEN"; gh auth setup-git; test -z "$(git -C /home/agent/work/factory status --porcelain)"; test "$(git -C /home/agent/work/factory branch --show-current)" = main; git -C /home/agent/work/factory pull --ff-only origin main'\'''
+factory-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts poll --dry-run'
+```
+
+The preview does not delay the running timer or verify Amp quiet time. For an
+emergency rollback, the existing removal command below stops/removes only the
+dispatcher units; it does not unarchive threads or remove Linear markers. No
+console change is required. None of these deployment/rollback commands ran in
+development. The following installation steps are only for a new installation.
 
 Artifacts only; these commands were **not run**. Have the task thread update the
 main checkout first; no runtime build is needed for this dispatcher. Both runners
@@ -207,7 +291,13 @@ restoration of a previous dispatcher version. It does not cancel submitted work.
 an in-process `node:http` fake Linear GraphQL server and an executable fake Amp
 on PATH. It exercises label removal, comment/status results, blockers, validation,
 caps/order, all nine mode mappings, slugs/hints, pagination, dry-run, real flock
-contention, Amp errors and SIGKILL at dispatch/wrap-up mutation boundaries.
+contention, Amp errors and SIGKILL at dispatch/wrap-up/archive mutation boundaries.
+Archive fixtures cover exactly five quiet minutes, ongoing updates, missing and
+unreadable timestamps/listings, canceled/non-Done states, missing markers,
+failure/retry, the five-attempt limit and already-archived recovery. Fake Amp
+deliberately rejects duplicate archives. Overflow fixtures fill gpu, then console,
+then wait; explicit grouped/flat labels never overflow. Tests print fake-server
+poll timings. The test child clock is fixed without any production clock override.
 There is no live Linear/Amp sandbox; these are external services covered by fakes.
 Root installation, real merge metadata and actual model execution remain unverified.
 
