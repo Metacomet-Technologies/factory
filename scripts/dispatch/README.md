@@ -220,17 +220,16 @@ Builders fix current-head CI failures but reject instructions in **all** GitHub
 comments. QA findings also go to a PR comment for the record, not an approval or
 change request. Same-account listener delivery is unverified, so direct dispatcher
 delivery is mandatory. Exact-SHA subscriptions may not roll over after pushes.
-On the first real dispatched PR, record whether automatic subscriptions appeared
-in Settings → MCP & Integrations → GitHub → Event Subscriptions (or ask Puck);
-otherwise record “unverified.” Real reviewer compliance, notification delivery,
-merges and document sync remain unverified; development uses fakes only.
+GitHub subscriptions are optional feedback, not a builder startup step or proof
+of current-head CI. Real reviewer compliance, notification delivery, merges and
+document sync remain unverified; development uses fakes only.
 
 ## Dispatched agent Linear MCP contract (MET-122)
 
 Dispatched Amp threads use the already-connected personal Linear MCP server.
-Devon connected `https://mcp.linear.app/mcp` as `Linear` on 2026-10-13. Each
-thread must first verify tool availability and report names without calling a
-write tool; if missing, stop and report, never work around it or change settings.
+Devon connected `https://mcp.linear.app/mcp` as `Linear` on 2026-10-13. Use
+`get_issue`/`save_comment` when needed, without a startup tool-listing step. If
+missing, stop and report; never work around it or change settings.
 This does not change the dispatcher's GraphQL key, transport, timer or runners.
 
 Agents may read issues, comment progress on their own issue, link their PR, and
@@ -505,9 +504,9 @@ as evidence of merge. The wrap-up prompt also requires confirming the PR merge.
 
 GitHub auth is preconfigured for agent (gh + git credential helper); don't set GH_TOKEN or run gh auth commands. If `gh auth status` fails, stop and report.
 
-Rendered build, review, merge and wrap-up prompts say "GitHub token environment variables"
-instead of naming the variable, so no generated instruction contains a
-token variable name. Issue section text is passed through unchanged.
+The AGENTS.md contract owns auth restrictions without naming token variables.
+Each generated prompt checks `gh auth status` exactly once. Issue sections pass
+through unchanged; their text is not counted against the fixed prompt budget.
 
 For an already-installed dispatcher, MET-128 adds no deployment artifact, build,
 installer invocation or restart. The post-merge wrap-up's `pull --ff-only` in
@@ -516,7 +515,13 @@ installer invocation or restart. The post-merge wrap-up's `pull --ff-only` in
 after confirming the merge and a clean main checkout:
 
 ```sh
-factory-ssh 'sudo -iu agent bash -c '\''set -e; gh auth status; test -z "$(git -C /home/agent/work/factory status --porcelain)"; test "$(git -C /home/agent/work/factory branch --show-current)" = main; git -C /home/agent/work/factory pull --ff-only origin main'\'''
+factory-ssh 'sudo -iu agent bash -s' <<'EOF'
+set -e
+gh auth status
+test -z "$(git -C /home/agent/work/factory status --porcelain)"
+test "$(git -C /home/agent/work/factory branch --show-current)" = main
+git -C /home/agent/work/factory pull --ff-only origin main
+EOF
 factory-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts poll --dry-run'
 ```
 
@@ -611,7 +616,8 @@ unreadable timestamps/listings, canceled/non-Done states, missing markers,
 failure/retry, the five-attempt limit and already-archived recovery. Fake Amp
 deliberately rejects duplicate archives. Overflow fixtures fill gpu, then console,
 then wait; explicit grouped/flat labels never overflow. Rendered prompt checks
-cover Linear MCP availability, agent permissions, diff posting and the wrap-up
+cover byte ceilings, scoped reads, one startup auth check, on-demand Linear MCP,
+shared agent permissions, diff posting and the wrap-up
 completion marker exception without real Linear writes. Tests print fake-server
 poll timings. The test child clock is fixed without any production clock override.
 There is no live Linear/Amp sandbox; these are external services covered by fakes.
@@ -621,6 +627,26 @@ QA coverage includes per-SHA deduplication, new pushes, independent capacity,
 engine fallback, thread-bound verdict parsing, direct two-round follow-up,
 current-head CI races, self-deploying rename/deletion paths, trusted gate CLI,
 document sync and SIGKILL before/after each submission/sync marker boundary.
+
+### Slim prompt contract (MET-144)
+
+AGENTS.md owns shared rules (≤ 1,500 UTF-8 bytes); database and kiosk rules load
+only for their areas (each ≤ 4,000 bytes). Builders read Isolation READMEs, not
+the root README/full PLAYBOOK by default. Builder fixed text stays ≤ 1,800 bytes;
+review carries §5 without another mandatory playbook read. Wrap-up/merge prompts
+grant only their narrow exceptions to the shared contract.
+
+Measured with MET-123, title `Build the useful widget today`, gpu/medium,
+contributes and no issue content. Builder excludes the complete block from
+`## Goal` through `## Done means`, including headings/default bodies. Wrap-up
+uses the same fixture; review counts the template with placeholders unchanged.
+
+| UTF-8 bytes | Before | After |
+| --- | ---: | ---: |
+| AGENTS.md | 4,007 | 1,473 |
+| Builder fixed text | 3,512 | 1,607 |
+| Wrap-up | 2,509 | 2,143 |
+| Review template | 4,154 | 3,948 |
 
 Test-only overrides: `DISPATCH_LINEAR_URL` accepts only loopback
 `http://127.0.0.1:<port>/graphql`; `DISPATCH_LOCK_FILE` selects a pre-existing test
