@@ -51,7 +51,11 @@ sudo -u agent test -x /home/agent/work
 path=/usr/local/bin:/usr/bin:/bin
 declare -A executables
 for command in node amp claude codex; do
-    executable=$(sudo -iu agent sh -c 'cd /home/agent/work && command -v "$1"' sh "$command")
+    # Keep script text out of sudo -i's login-shell command string.
+    executable=$(sudo -iu agent bash -s -- "$command" <<'LOOKUP'
+cd /home/agent/work && command -v "$1"
+LOOKUP
+    )
     [[ "$executable" =~ ^/[a-zA-Z0-9_./-]+$ && -x "$executable" ]] || fail "Require absolute executable path for $command."
     executables[$command]=$executable
     path="$(dirname "$executable"):$path"

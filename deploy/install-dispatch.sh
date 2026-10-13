@@ -47,8 +47,17 @@ for unit in factory-dispatch.service factory-dispatch.timer; do
     [[ ! -L "/etc/systemd/system/$unit" ]] || fail "Refusing symlink unit: $unit"
     [[ -z $(systemctl show "$unit" --property=DropInPaths --value) ]] || fail "Review/remove $unit drop-ins before installing."
 done
-node=$(sudo -iu agent sh -c 'command -v node')
-amp=$(sudo -iu agent sh -c 'command -v amp')
+# A readable cwd is essential for the agent's Vite+ Node shim.
+cd /home/agent/work
+# Heredocs avoid sudo -i script quoting and preserve the runner JSON on stdin.
+node=$(sudo -iu agent bash -s <<'LOOKUP'
+cd /home/agent/work && command -v node
+LOOKUP
+)
+amp=$(sudo -iu agent bash -s <<'LOOKUP'
+cd /home/agent/work && command -v amp
+LOOKUP
+)
 [[ "$node" =~ ^/[a-zA-Z0-9_./-]+$ && "$amp" =~ ^/[a-zA-Z0-9_./-]+$ ]] || fail 'Node and Amp must resolve to absolute executable paths without spaces.'
 path="$(dirname "$node"):$(dirname "$amp"):/usr/local/bin:/usr/bin:/bin"
 as_agent() { sudo -u agent env -i HOME=/home/agent USER=agent PATH="$path" "$@"; }
