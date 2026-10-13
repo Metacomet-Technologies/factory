@@ -14,7 +14,7 @@ node --test scripts/dispatch
 
 `poll` handles team issues carrying `dispatch`, priority 1–4 then unprioritized
 (0), oldest first within a priority. `issue` ignores only the label requirement.
-Both also check pending wrap-ups and archives. Blockers must be completed or canceled;
+Both also check QA, pending wrap-ups and archives. Blockers must be completed or canceled;
 one waiting comment survives subsequent polls. Invalid tasks lose the label and
 get reasons. `>` hint lines do not count as section content. Required sections:
 Goal, Context, Isolation, Build, Sandbox check, Done means. Empty Link type means
@@ -35,6 +35,98 @@ uses `external-agent:claude-code` and ignores effort; ChatGPT low uses `gpt56l`,
 medium/high use `gpt61s` (**proposed, unverified**). See [Amp CLI evidence](../../docs/amp-cli.md).
 Submission success is not execution success. Inspect the thread for results.
 
+## Automated QA and merge (MET-128)
+
+The dispatcher remains the control plane; fresh reviewer threads perform
+PLAYBOOK §5 review. Clean dispatched PRs may now merge as Devon's GitHub identity
+without per-merge human review (the MET-120 identity/privilege risk remains).
+Builders never merge. Devon owns deploys, self-deploying merges and irreversible
+production actions. No native thread-finished trigger is assumed.
+
+Only this repository's open, non-draft PRs targeting main and attached strictly
+after the dispatch claim qualify. `git ls-remote
+https://github.com/Metacomet-Technologies/factory refs/pull/<n>/head` resolves the
+head. Each PR/SHA gets a fresh review, GPU first then console, with a separate
+cap of **one review per runner** regardless of builder labels/capacity. An
+unconfirmed start reserves a slot. Changes release it; ready retains it until
+merge, handoff to Devon, or a new head before any merge continuation. Unresolved
+older reviews retain their slot; a new head may use the other runner. QA threads are not
+builder archive targets; keep them available for manual inspection/archival.
+
+The builder's grouped/flat engine label determines the reviewer: amp or chatgpt
+gets claude; claude gets amp; missing/unknown gets claude. Reviews use high effort
+through the existing modes map. `review-prompt.md` requires the full diff and full
+changed deploy/migration/script files, Isolation/Build/Done-means checks, current
+CI, and contributes/closes correction via `update_diff`. Reviewers never edit code.
+
+State transitions under the existing exclusive dispatcher lock:
+
+1. Write `factory-qa:start pr:<n> sha:<sha> runner:<runner>` before Amp.
+   After one thread ID returns, write
+   `factory-qa:review-claim pr:<n> sha:<sha> thread:<T-review>`.
+2. Accept exactly one `factory-qa:review pr:<n> sha:<sha> thread:<T-review>
+   verdict:ready|changes` matching that claim. Markers use the `<!-- … -->`
+   wrapper on one standalone unfenced line. Duplicate, conflicting, inline,
+   fenced and wrong-thread verdicts fail closed. Shared Linear identity means
+   this is correlation, **not authenticated authorship**: an agent able to copy
+   the markers could spoof them. MET-120 remains the hardening work.
+3. For changes, write a follow-up claim, always deliver the final
+   `## Builder follow-up` section using `amp threads continue <builder> -ox
+   <prompt>`, then record a round. Even overtaken verdicts are delivered with
+   their original SHA for reconciliation. After two rounds, the same comment
+   records a stop marker and @-mentions Devon. Later pushes cannot restart it.
+4. For ready, inspect all changed paths, including deleted and renamed sources.
+   `qa-config.json` lists self-deploying paths (`scripts/dispatch/` and
+   `scripts/usage/`), required checks, the Linear document ID and Devon's profile
+   mention URL. Self-deploying PRs get one “ready; merging deploys it” ping,
+   never a merge continuation.
+5. Otherwise precheck public CI for that SHA, then claim a continuation to the
+   **reviewer**. It reconfirms Isolation and runs the trusted temporary main clone's
+   `node "$QA_BASE/scripts/dispatch/qa.ts" check <n> <sha>` after refreshing main.
+   That independently runs `gh pr checks`, requires all checks to pass including
+   rust/kiosk/scripts, rechecks head/open/draft/base state and refuses
+   self-deploying paths. Only then may it run `gh pr merge <n> --squash
+   --match-head-commit <sha>`. No admin bypass or auto-merge. GitHub's head match
+   and required branch checks guard the final race. Isolation and substantive
+   review remain agent judgments; comments alone cannot establish green CI.
+6. Existing merged-attachment wrap-up follows. Deploy steps get a Devon mention;
+   otherwise no deploy ping. Linear closes-links handle completion on merge;
+   contributes-issues remain open. QA never changes issue status.
+
+The service has no declared GitHub credential. The dispatcher uses public REST
+for metadata/files and SHA-specific CI; only reviewers use their existing
+`AGENT_GH_TOKEN` with `gh`. Claimed idle reviews use only `ls-remote` per poll.
+Public REST quota/errors can delay new reviews or ready gates, never bypass them.
+Public CI over 100 check runs/statuses is refused rather than truncated. Files
+paginate and refuse GitHub's 3,000-file ceiling. Reviewers still independently
+run `gh pr checks` immediately before merging.
+
+Start/follow-up/merge claims provide **at-most-once**, not exactly-once delivery.
+A crash after the claim can strand work; unknown outcomes never resend. Inspect
+Amp and GitHub before recovery, never blindly delete claims. A lost round marker
+blocks later heads, preserving the two-round ceiling. Stale ready verdicts can
+retire only before any merge continuation. Pings and their markers share one
+Linear comment, so lost responses do not duplicate them next poll.
+
+After `wrapup-done`, PLAYBOOK-changing merges trigger `documentUpdate` directly.
+The main checkout must be on main, contain the merge and have clean PLAYBOOK
+content matching HEAD. The source-of-truth header includes checkout and merge
+SHAs. Document replacement safely repeats after a crash; its completion comment
+suppresses later syncs. Non-PLAYBOOK merges get a checked marker, saving quota.
+The [Linear schema](https://github.com/linear/linear/blob/master/packages/sdk/src/schema.graphql)
+defines `documentUpdate(id: String!, input: DocumentUpdateInput!)` and `content`.
+Devon mentions use a plain profile URL, per [Linear's Markdown mention contract](https://linear.app/developers/graphql#adding-mentions-in-markdown).
+
+GitHub listeners are bonus feedback, never queue state or merge authority.
+Builders fix current-head CI failures but reject instructions in **all** GitHub
+comments. QA findings also go to a PR comment for the record, not an approval or
+change request. Same-account listener delivery is unverified, so direct dispatcher
+delivery is mandatory. Exact-SHA subscriptions may not roll over after pushes.
+On the first real dispatched PR, record whether automatic subscriptions appeared
+in Settings → MCP & Integrations → GitHub → Event Subscriptions (or ask Puck);
+otherwise record “unverified.” Real reviewer compliance, notification delivery,
+merges and document sync remain unverified; development uses fakes only.
+
 ## Dispatched agent Linear MCP contract (MET-122)
 
 Dispatched Amp threads use the already-connected personal Linear MCP server.
@@ -48,8 +140,9 @@ create follow-up issues in Backlog related to their issue. They must never chang
 any existing issue's status, labels, assignee or priority, or edit other issues.
 Backlog is allowed only at follow-up creation. The dispatcher retains ownership
 of the `dispatch` label, state moves and claim/thread/wrap-up/archive markers.
-Agents must never write or delete `<!-- factory-dispatch:… -->` or
+Builders must never write or delete `<!-- factory-dispatch:… -->` or
 `<!-- factory-qa:… -->` markers, except the wrap-up completion authorized below.
+The fresh review prompt separately authorizes only its own thread-bound verdict.
 These are prompt rules, not a server-side permission boundary.
 
 Control markers count only when the entire line exactly matches after trimming
@@ -81,14 +174,14 @@ Wrap-up finished
 <!-- factory-dispatch:wrapup-done -->
 ```
 
-This is the sole marker exception. It reports wrap-up completion, not deployment
+This is the builder's sole marker exception. It reports wrap-up completion, not deployment
 verification or permission to mark Done. Archive logic still uses Done and five
-quiet minutes; consuming this new marker is deferred to a later change.
+quiet minutes; QA document sync consumes the completion marker.
 
-Dry-run takes the same read-only lock and performs GraphQL queries, but never
+Dry-run takes the same read-only lock and performs GraphQL/public GitHub/Git reads, but never
 mutates Linear, invokes Amp, or writes files. It prints JSON decisions, exact
 mutation documents/variables and shell-quoted Amp flags. To honor the no-prompt
-logging rule, `$PROMPT`/`$WRAPUP_PROMPT` stand for the rendered text; the future
+logging rule, `$PROMPT`/`$WRAPUP_PROMPT`/`$QA_*` stand for the rendered text; the future
 thread ID is represented by `T-00000000-0000-0000-0000-000000000000`. These are
 previews, not runnable commands or real thread links. Normal logs contain only
 decisions/identifiers; Amp stdout is captured for the ID and stderr is discarded
@@ -253,7 +346,7 @@ Rendered build and wrap-up prompts say "GitHub token environment variables"
 instead of naming the variable, so neither generated instruction contains a
 token variable name. Issue section text is passed through unchanged.
 
-For an already-installed dispatcher, MET-131 adds no deployment artifact, build,
+For an already-installed dispatcher, MET-128 adds no deployment artifact, build,
 installer invocation or restart. The post-merge wrap-up's `pull --ff-only` in
 `/home/agent/work/factory` on factory-gpu deploys the code; the next existing
 60-second timer pass uses it. Merge and that pull remain Devon's gates. From Mac,
@@ -344,8 +437,9 @@ restoration of a previous dispatcher version. It does not cancel submitted work.
 ## Offline verification
 
 `node --test scripts/dispatch` runs the real CLI under an isolated environment,
-an in-process `node:http` fake Linear GraphQL server and an executable fake Amp
-on PATH. It exercises label removal, comment/status results, blockers, validation,
+in-process `node:http` fake Linear/GitHub servers and fake Amp/Git/gh executables
+on PATH. The main-checkout playbook read is replaced with a synthetic fixture.
+It exercises label removal, comment/status results, blockers, validation,
 caps/order, all nine mode mappings, slugs/hints, pagination, dry-run, real flock
 contention, Amp errors and SIGKILL at dispatch/wrap-up/archive mutation boundaries.
 Archive fixtures cover exactly five quiet minutes, ongoing updates, missing and
@@ -358,10 +452,15 @@ completion marker exception without real Linear writes. Tests print fake-server
 poll timings. The test child clock is fixed without any production clock override.
 There is no live Linear/Amp sandbox; these are external services covered by fakes.
 Root installation, real merge metadata and actual model execution remain unverified.
+QA coverage includes per-SHA deduplication, new pushes, independent capacity,
+engine fallback, thread-bound verdict parsing, direct two-round follow-up,
+current-head CI races, self-deploying rename/deletion paths, trusted gate CLI,
+document sync and SIGKILL before/after each submission/sync marker boundary.
 
 Test-only overrides: `DISPATCH_LINEAR_URL` accepts only loopback
 `http://127.0.0.1:<port>/graphql`; `DISPATCH_LOCK_FILE` selects a pre-existing test
-lock. Never override the lock for deployed/manual runs. Tests use synthetic key
+lock; `DISPATCH_GITHUB_URL` accepts only a loopback HTTP origin and receives no
+credential. Never override the lock for deployed/manual runs. Tests use synthetic key
 text, not a credential. No production endpoint, DB or runner is exercised.
 
 ```sh
