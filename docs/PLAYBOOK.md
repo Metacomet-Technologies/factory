@@ -44,13 +44,15 @@ The working agreement and hard-won lessons for building and operating the factor
 
 ## 4. Agent prompt template
 
-**Handoff header (every prompt Claude gives Devon):** the **runner** (factory-gpu / factory-console), the **directory** (always Amp's `work`, `~/work`; for code/docs tasks the prompt names a worktree `met-NN-<slug>` that the agent creates after auth, since Amp's own New Worktree fetches without credentials and fails), and the **effort level** (Low only for mechanical tasks like pull/build; Medium by default; High for risky concurrency/security work).
+**Handoff header (every prompt Claude gives Devon):** the **runner** (factory-gpu / factory-console), the **directory** (always Amp's `work`, `~/work`; for code/docs tasks the prompt names a worktree `met-NN-<slug>` that the agent creates using preconfigured GitHub auth), and the **effort level** (Low only for mechanical tasks like pull/build; Medium by default; High for risky concurrency/security work).
 
 **First line of every prompt:** `**Thread title:** Use the Linear ticket identifier and title: \`MET-123 — Ticket title\`.` (the exact Linear title).
 
+GitHub auth is preconfigured for agent (gh + git credential helper); don't set GH_TOKEN or run gh auth commands. If `gh auth status` fails, stop and report.
+
 Every prompt has these sections:
 
-1. **Start fresh:** `export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git`, `git -C ~/work/factory fetch origin`, then `git -C ~/work/factory worktree add -b <name> ~/work/factory-<name> origin/main` and work only in that directory (never the main checkout); first push `git push -u origin <name>`. Read `AGENTS.md`/READMEs first. Reference the MET id in the PR title and body, with the right link type (**closes** only if the PR finishes the issue).
+1. **Start fresh:** use preconfigured GitHub auth, `git -C ~/work/factory fetch origin`, then `git -C ~/work/factory worktree add -b <name> ~/work/factory-<name> origin/main` and work only in that directory (never the main checkout); first push `git push -u origin <name>`. Read `AGENTS.md`/READMEs first. Reference the MET id in the PR title and body, with the right link type (**closes** only if the PR finishes the issue).
 2. **Context:** what's deployed, what other agents are doing, what's off-limits.
 3. **Isolation:** the exact directories it may edit.
 4. **Build:** spec and requirements; contracts written out exactly.
@@ -63,7 +65,7 @@ Every prompt has these sections:
 
 **Linear diff comment:** after opening the PR and after each later push, post one comment on the agent's issue with the PR URL, head SHA and complete changed-file list from `git diff --name-only origin/main...HEAD`. If `git diff origin/main...HEAD` is under 400 lines, include that full diff. At 400 lines or more, include the file list plus the full contents of every changed file under `deploy/`, every changed migration, and every changed script. Identify deleted files explicitly; do not omit them silently. Use fenced code blocks for diffs and file contents. Never include secrets or production data; redact them and identify any omissions.
 
-**Runner hygiene:** one thread per task; archive threads once their work is merged **and deployed/verified**; start fresh threads per phase. Parallel threads on one runner use **Amp worktrees**; remove the worktree when its thread is archived. Don't message a thread mid-run unless it's a correction. Mechanical follow-ups (pull + build) also start with the `GH_TOKEN` setup line. Cleanup after merge: archive the thread (UI only), then as `agent`: `git -C /home/agent/work/factory worktree remove /home/agent/work/factory-<name>` and `git -C /home/agent/work/factory branch -D <name>`.
+**Runner hygiene:** one thread per task; archive threads once their work is merged **and deployed/verified**; start fresh threads per phase. Parallel threads on one runner use **Amp worktrees**; remove the worktree when its thread is archived. Don't message a thread mid-run unless it's a correction. Mechanical follow-ups (pull + build) also use preconfigured GitHub auth. Cleanup after merge: archive the thread (UI only), then as `agent`: `git -C /home/agent/work/factory worktree remove /home/agent/work/factory-<name>` and `git -C /home/agent/work/factory branch -D <name>`.
 
 **Wrap-up prompt (after merge):** the same thread confirms the merge, updates and builds in the main checkout (`~/work/factory`), removes its worktree and local branch, and replies with exact Mac install/verify commands. One deploy per runner at a time. Devon archives the thread (UI only) only after deploy verification; if verification fails, the same thread fixes it from a fresh worktree.
 
@@ -142,7 +144,7 @@ factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
 - Tests that pass locally can hang on GitHub runners: every CI job sets `timeout-minutes`, and async tests wrap their waits in an explicit timeout so a hang fails fast with a message.
 - Repo Actions options greyed out means the org setting is off; enable it at org → Settings → Actions first (the default token stays read-only).
 - When a Linear **Decided** section changes a rule, update `AGENTS.md`/docs in the next PR. Agents follow the repo file, not Linear.
-- Amp's **New Worktree** fetches `origin` before creating the worktree; `agent` has GitHub credentials only inside threads, so it fails ("could not read Username"). Start threads in `work` and let the agent create the worktree after auth.
+- Resolved (MET-120, 2026-10-13): Amp's **New Worktree** pre-thread `origin` fetch previously failed ("could not read Username") because credentials existed only inside threads; `agent` now has a persistent `gh` login and Git credential helper on both nodes.
 
 **Networking / Tailscale**
 - Plain `tailscale ping` **ignores the access policy**; test blocks with `tailscale ping --icmp` or a real TCP connection.
