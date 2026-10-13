@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, chown, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, chown, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -130,7 +130,7 @@ test('atomic replacement inherits the setgid directory group and preserves owner
       assert.equal(file.mode & 0o7777, 0o640);
     };
     await checkPermissions();
-    const before = (await stat(path)).ino;
+    const original = await open(path, 'r');
     let reading = true;
     const reads = (async () => { while (reading) assert.equal(JSON.parse(await readFile(path, 'utf8')).schema_version, 1); })();
     try {
@@ -138,8 +138,13 @@ test('atomic replacement inherits the setgid directory group and preserves owner
         await writeSnapshot(path, { ...snapshot, generated_at_ms: now + i });
         await checkPermissions();
       }
-    } finally { reading = false; await reads; }
-    assert.notEqual((await stat(path)).ino, before);
+      // An open reader keeps the old contents; inode numbers may be reused after unlink.
+      assert.deepEqual(JSON.parse(await original.readFile('utf8')), snapshot);
+      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), { ...snapshot, generated_at_ms: now + 9 });
+    } finally {
+      reading = false;
+      try { await reads; } finally { await original.close(); }
+    }
     assert.deepEqual(await readdir(dir), ['usage.json']);
     assert.equal((await readPrevious(path, now + 100))?.tools[0].observed_at_ms, now);
     await writeFile(path, '{"tools":"private-secret"}'); assert.equal(await readPrevious(path), null);

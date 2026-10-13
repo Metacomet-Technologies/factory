@@ -29,9 +29,13 @@ with (fixture / 'calls').open('a') as log:
     log.write(name + ' ' + ' '.join(sys.argv[1:]) + '\n')
 if name == 'cp':
     import subprocess
+    args = sys.argv[1:]
+    if '--parents' in args:
+        # Relative sources avoid GNU cp's absolute ancestor handling in the mapped root.
+        args = [arg.lstrip('/') if not arg.startswith('-') else arg for arg in args[:-1]] + args[-1:]
     # Host-root ancestor ownership is unmapped in this unprivileged namespace.
-    sys.exit(subprocess.run([str(fixture / 'cp-real'), *sys.argv[1:],
-                             '--no-preserve=ownership']).returncode)
+    sys.exit(subprocess.run([str(fixture / 'cp-real'), *args,
+                             '--no-preserve=ownership'], cwd='/').returncode)
 if name == 'ps':
     print(data['ps'], end='')
     print(data.get('ps_error', ''), end='', file=sys.stderr)
