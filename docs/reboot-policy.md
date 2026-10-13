@@ -25,10 +25,15 @@ verified version. Devon's idle console capture also reports
 
 ## Decision order
 
+Every check runs the busy checks below and stores the first blocking reason in
+`last_busy_reason` (null when idle), so observe mode shows what enforce would
+see even when no reboot is pending. Only the marker drives decisions:
+
 1. Without the marker, record `not-needed` and clear pending/skip counters.
 2. With the marker, retain the first `pending_since_ms` and compute elapsed
    whole 24-hour `days_pending` (timestamps are UTC milliseconds).
-3. Check agent processes, then GPU-only meter traffic, then GPU-only UPS status.
+3. Check agent processes, then agent worktrees, then GPU-only meter traffic,
+   then GPU-only UPS status.
    The first blocking reason wins. A failed or malformed probe blocks reboot.
 4. Record `skipped`. Count at most once per New York calendar date. Three
    consecutive skipped dates set `alert_due=true`; keep skipping, never force.
@@ -86,8 +91,21 @@ fails without rebooting; inspect the failed service's journal.
 
 This is the specified process-based busy rule, not a runner activity API.
 Inference or remote agent work entirely inside an allowlisted daemon can be
-invisible between tool processes. Observe mode must precede enforcement; a
-future runner activity signal would be needed to cover that ceiling.
+invisible between tool processes. The worktree signal below covers
+dispatched work; observe mode must still precede enforcement.
+
+### Agent worktrees
+
+A dispatched thread thinking inside the allowlisted runner has no tool process.
+Dispatched builder and QA worktrees are the directories
+`/home/agent/work/factory-*`; the main checkout `/home/agent/work/factory` and
+other directories are ignored. Any file in one of them, excluding `.git/`
+contents and a linked worktree's `.git` pointer file, modified within the last
+30 minutes (1,800,000 ms, inclusive) records
+`agent-worktree-active: /home/agent/work/factory-<name>`. Future modification
+times block too. Symlinks are not followed. An unreadable worktree records
+`agent-worktree-unknown`. A finished worktree blocks for up to 30 minutes after
+its last write.
 
 ### Meter and UPS
 
@@ -125,17 +143,30 @@ Logs go to the journal. A failed state write prevents a reboot.
 - `reboot_required`, `pending_since_ms`, `days_pending`: current marker and age.
 - `consecutive_skips`, `alert_due`: skipped-date count and the MET-76 handoff.
 - `last_check_ms`, `last_decision`, `last_reason`: most recent reboot decision.
+- `last_busy_reason`: the first blocking busy reason from the most recent check,
+  or null when idle. It is recorded with or without the marker; postboot leaves
+  it unchanged. Older status files gain it as null.
 - `last_boot_ms`: kernel `/proc/stat` `btime` seconds converted to milliseconds.
 - `postboot.services`: configured unit names mapped to `systemctl is-active`
   states, including failed/inactive/unknown rather than pretending all are healthy.
 - `postboot.clock_synced`: true only for successful
   `timedatectl show -p NTPSynchronized` output `NTPSynchronized=yes`.
 
-`factory-postboot.service` runs after `multi-user.target` and `time-sync.target`.
+`factory-postboot.service` runs after `multi-user.target` and `time-sync.target`,
+then polls the clock and every configured unit concurrently, every 2 seconds.
+Each one gets its own 180-second allowance: the clock until timedatectl reports
+synchronization, each unit until it leaves `activating`. A clock that never syncs
+or a stuck unit therefore cannot shorten another unit's observation. The final
+states are recorded as reported, including `activating`, failed, inactive or
+`unknown` (empty output). The total wait is about 180 seconds plus at most one
+15-second probe timeout, within `TimeoutStartSec=240`. Waiting happens before
+the state lock is taken, so checks are not delayed.
 It uses `DefaultDependencies=no` to avoid a cycle with the target enabling it,
 and retains explicit shutdown ordering. It observes rather than repairs
 services. GPU configuration includes meter, Ollama, Amp and operational NUT
-units (not optional/inactive enumerators); console includes API, Amp and GDM.
+units (not optional/inactive enumerators), plus `factory-api.service` and the
+`factory-dispatch`, `factory-usage` and `factory-backup` timers. After MET-114,
+console includes `amp-runner.service`, `gdm.service` and `factory-backup.timer`.
 If the marker disappears after boot, it clears pending and skip state without
 overwriting the preceding reboot decision. If it remains, pending age survives.
 Time-sync ordering is not itself proof of synchronization; the boolean records
@@ -161,7 +192,7 @@ and units are not rewritten. Snapshots and the immediate observation still occur
 Harness overrides and inherited command paths are discarded by installers.
 
 Reruns preserve the installed node configuration by default. To apply updated
-repository allowlists, add `--replace-config`; this replaces the entire node
+repository allowlists or service lists, add `--replace-config`; this replaces the entire node
 configuration, including local edits, after snapshotting the old config. Mode
 still comes from `--mode` (observe by default), not the repository file:
 
@@ -169,6 +200,11 @@ still comes from `--mode` (observe by default), not the repository file:
 factory-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-gpu --mode observe --replace-config"
 console-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-console --mode observe --replace-config"
 ```
+
+MET-147 changed both service lists, so installed configurations from before it
+(console still listing `factory-api.service`) need this `--replace-config` rerun.
+Re-add any local allowlist edits afterwards; the printed snapshot keeps the old
+configuration.
 
 Read status and recent decisions from the Mac:
 
@@ -204,8 +240,9 @@ shellcheck -x deploy/reboot/*.sh
 
 The harness runs the real check scripts with `REBOOT_ROOT`, `REBOOT_CONFIG`,
 `REBOOT_NOW_MS`, and fake command paths. It covers decision order, both modes,
-busy/allowed processes, meter time boundaries/errors, UPS states/errors,
-consecutive dates, post-boot state, both calendars and concurrent atomic reads.
+busy/allowed processes, worktree activity, `last_busy_reason` without the
+marker, meter time boundaries/errors, UPS states/errors,
+consecutive dates, post-boot state and its independent bounded clock/service waits, both calendars and concurrent atomic reads.
 Where usable `bwrap` exists, it additionally runs the real installer/rollback
 in root user namespaces with fake commands and temporary destinations; it
 models ownership rather than changing host ownership. Without namespaces that

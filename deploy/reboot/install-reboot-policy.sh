@@ -7,7 +7,7 @@ fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || fail 'Run as root: sudo bash deploy/reboot/install-reboot-policy.sh [--mode observe|enforce] [--node factory-gpu|factory-console] [--replace-config]'
 trap 'printf "ERROR: reboot-policy installation failed at line %s. Snapshot: %s. Disable/remove policy with: sudo bash %s/rollback-reboot-policy.sh\n" "$LINENO" "${snapshot:-not created}" "$here" >&2' ERR
 # Never inherit harness roots, clocks, configuration or fake commands as root.
-unset REBOOT_ROOT REBOOT_CONFIG REBOOT_NOW_MS PYTHONPATH PYTHONHOME
+unset REBOOT_ROOT REBOOT_CONFIG REBOOT_NOW_MS REBOOT_POSTBOOT_WAIT_S PYTHONPATH PYTHONHOME
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 mode=observe
 replace_config=false

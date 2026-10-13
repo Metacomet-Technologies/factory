@@ -2,6 +2,7 @@
 """Needs-only reboot decisions and post-boot observations; no forced reboots."""
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import fcntl
 import json
@@ -25,7 +26,39 @@ def command(*args):
     return subprocess.run(args, text=True, capture_output=True, timeout=15)
 
 
-def busy_reason(config, now):
+def worktree_reason(root, now):
+    # Dispatched builder/QA worktrees; the main checkout is /home/agent/work/factory.
+    try:
+        worktrees = sorted(path for path in (root / "home/agent/work").glob("factory-*")
+                           if path.is_dir() and not path.is_symlink())
+    except OSError:
+        return "agent-worktree-unknown"
+
+    def failed(error):
+        raise error
+
+    for worktree in worktrees:
+        try:
+            for directory, folders, files in os.walk(worktree, onerror=failed):
+                folders[:] = [name for name in folders if name != ".git"]
+                for name in files:
+                    if name == ".git":  # A linked worktree's .git is a pointer file.
+                        continue
+                    try:
+                        modified = os.lstat(os.path.join(directory, name)).st_mtime_ns // 1_000_000
+                    except FileNotFoundError:
+                        continue
+                    # Future timestamps also block: an uncertain clock is not idle.
+                    if now - modified <= 1_800_000:
+                        return f"agent-worktree-active: /{worktree.relative_to(root)}"
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return "agent-worktree-unknown"
+    return None
+
+
+def busy_reason(config, root, now):
     try:
         result = command("ps", "-u", "agent", "-ww", "-o", "pid=,ppid=,args=")
         # procps returns 1 with no output when the selection has no processes.
@@ -44,6 +77,10 @@ def busy_reason(config, now):
                 return f"agent-busy: pid={pid}"
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return "agent-processes-unknown"
+
+    reason = worktree_reason(root, now)
+    if reason:
+        return reason
 
     if config["node"] == "factory-gpu":
         try:
@@ -75,6 +112,35 @@ def busy_reason(config, now):
         except (OSError, subprocess.TimeoutExpired):
             return "ups-unknown"
     return None
+
+
+def postboot_observations(config):
+    # Overrides are for the no-root harness only; the installer removes them.
+    allowance = float(os.environ.get("REBOOT_POSTBOOT_WAIT_S", 180))
+
+    def wait(probe, ready):
+        # Each probe gets its own allowance, so one slow probe cannot starve another.
+        deadline = time.monotonic() + allowance
+        while True:
+            value = probe()
+            remaining = deadline - time.monotonic()
+            if ready(value) or remaining <= 0:
+                return value
+            time.sleep(min(2, remaining))
+
+    def clock():
+        result = command("timedatectl", "show", "-p", "NTPSynchronized")
+        return result.returncode == 0 and result.stdout.strip() == "NTPSynchronized=yes"
+
+    def service_state(service):
+        return wait(lambda: command("systemctl", "is-active", service).stdout.strip() or "unknown",
+                    lambda state: state != "activating")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(config["services"]) + 1) as pool:
+        synced = pool.submit(wait, clock, bool)
+        services = {service: pool.submit(service_state, service) for service in config["services"]}
+        return dict(services={service: future.result() for service, future in services.items()},
+                    clock_synced=synced.result())
 
 
 def write_status(path, state):
@@ -117,12 +183,15 @@ def main():
     now = int(os.environ.get("REBOOT_NOW_MS", time.time_ns() // 1_000_000))
     path = root / "var/lib/factory-reboot/status.json"
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Wait for the clock and services before locking so checks are not held up.
+    observed = postboot_observations(config) if args.operation == "postboot" else None
     with (path.parent / "policy.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = json.loads(path.read_text()) if path.exists() else dict(
             pending_since_ms=None, days_pending=0, consecutive_skips=0,
             alert_due=False, last_check_ms=None, last_decision=None,
             last_reason=None, last_boot_ms=None, postboot={})
+        state.setdefault("last_busy_reason", None)
         required = (root / "var/run/reboot-required").exists()
         state.update(mode=mode, reboot_required=required)
         if not required:
@@ -138,15 +207,12 @@ def main():
             boot = next(line.split()[1] for line in (root / "proc/stat").read_text().splitlines()
                         if line.startswith("btime "))
             state["last_boot_ms"] = int(boot) * 1000
-            services = {}
-            for service in config["services"]:
-                result = command("systemctl", "is-active", service)
-                services[service] = result.stdout.strip() or "unknown"
-            result = command("timedatectl", "show", "-p", "NTPSynchronized")
-            state["postboot"] = dict(services=services, clock_synced=(
-                result.returncode == 0 and result.stdout.strip() == "NTPSynchronized=yes"))
+            state["postboot"] = observed
         else:
-            reason = busy_reason(config, now) if required else "reboot-required absent"
+            # Record the busy check even without the marker so observe shows what enforce would see.
+            busy = busy_reason(config, root, now)
+            state["last_busy_reason"] = busy
+            reason = busy if required else "reboot-required absent"
             if required and reason:
                 zone = ZoneInfo("America/New_York")
                 today = dt.datetime.fromtimestamp(now / 1000, zone).date()
