@@ -3,11 +3,12 @@ pub mod data;
 pub mod fleet;
 mod kiosk;
 pub mod pool;
+pub mod types;
 mod usage;
 
 use anyhow::Result;
 use serde::de::DeserializeOwned;
-use shared::{GpuSample, RequestRecord, factory_api::*};
+use shared::{GpuSample, RequestRecord};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -16,6 +17,7 @@ use std::{
 };
 use tokio::sync::{RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
+use types::*;
 
 pub const INFERENCE_ENDPOINTS: [&str; 6] = [
     "/api/generate",

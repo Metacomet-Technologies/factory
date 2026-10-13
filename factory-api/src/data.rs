@@ -1,7 +1,8 @@
+use crate::types::*;
 use anyhow::{Context, Result};
 use factory_db::money::{MicroUsdPerMtok, NanoUsd, request_cost};
 use rusqlite::Connection;
-use shared::{RequestRecord, factory_api::*};
+use shared::RequestRecord;
 use std::{collections::BTreeMap, path::Path};
 
 pub fn ns_to_ms(ns: u64) -> f64 {

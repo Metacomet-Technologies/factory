@@ -370,7 +370,7 @@ mod api {
     async fn health(state: &AppState) -> Result<serde_json::Value, String> {
         state.db.health().await.map_err(|e| e.to_string())?;
         serde_json::to_value(MeterHealth {
-            build: shared::build_info(),
+            build: shared::build_info(env!("FACTORY_INPUTS_FINGERPRINT")),
             queue: state.db.queue_status(),
         })
         .map_err(|e| e.to_string())

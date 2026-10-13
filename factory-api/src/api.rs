@@ -1,3 +1,4 @@
+use crate::types::*;
 use crate::{AppState, now_ms};
 use axum::{
     Json, Router,
@@ -6,7 +7,6 @@ use axum::{
     http::{Method, Request, StatusCode},
     response::{IntoResponse, Response, Sse, sse::Event},
 };
-use shared::factory_api::*;
 use std::{convert::Infallible, time::Duration};
 use utoipa::OpenApi;
 
@@ -220,7 +220,7 @@ fn response<T: serde::Serialize>(result: anyhow::Result<T>) -> Response {
 }
 #[utoipa::path(get, path="/v1/health", responses((status=200, body=Health)))]
 fn health(state: &AppState) -> Json<Health> {
-    let build = shared::build_info();
+    let build = shared::build_info(env!("FACTORY_INPUTS_FINGERPRINT"));
     Json(Health {
         status: if state.require_clock().is_ok() {
             "ok"
@@ -232,6 +232,7 @@ fn health(state: &AppState) -> Json<Health> {
         git_sha: build.git_sha,
         git_dirty: build.git_dirty,
         built_at_ms: build.built_at_ms,
+        inputs_fingerprint: build.inputs_fingerprint,
         uptime_ms: state.started.elapsed().as_millis() as u64,
     })
 }

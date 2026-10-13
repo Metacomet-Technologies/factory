@@ -14,6 +14,7 @@ const build = {
   git_sha: "a1b2c3d",
   git_dirty: false,
   built_at_ms: 1_790_000_000_000,
+  inputs_fingerprint: "012345abcdef",
 };
 
 export function agentFixtures(

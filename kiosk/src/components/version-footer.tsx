@@ -11,17 +11,21 @@ export function VersionFooter({
   kiosk?: typeof BUILD_INFO;
 }) {
   const components = [
-    { name: "api", build: api },
-    { name: "kiosk", build: kiosk },
-    { name: "meter", build: meter },
+    { name: "api", build: api, expected: kiosk.expected_inputs.api },
+    { name: "kiosk", build: kiosk, expected: kiosk.inputs_fingerprint },
+    { name: "meter", build: meter, expected: kiosk.expected_inputs.meter },
   ];
   const versions = components
     .map(({ build }) => build?.version)
     .filter((value) => value && value !== "unknown");
-  const shas = components
-    .map(({ build }) => build?.git_sha)
-    .filter((value) => value && value !== "unknown");
-  const mismatch = new Set(versions).size > 1 || new Set(shas).size > 1;
+  const mismatch =
+    new Set(versions).size > 1 ||
+    components.some(
+      ({ build, expected }) =>
+        build?.inputs_fingerprint &&
+        build.inputs_fingerprint !== "unknown" &&
+        build.inputs_fingerprint !== expected,
+    );
   const dirty = components.some(({ build }) => build?.git_dirty);
   const unknown = components.some(
     ({ build }) =>
@@ -29,6 +33,8 @@ export function VersionFooter({
       build.version === "unknown" ||
       !build.git_sha ||
       build.git_sha === "unknown" ||
+      !build.inputs_fingerprint ||
+      build.inputs_fingerprint === "unknown" ||
       build.git_dirty == null,
   );
   const warning = [
@@ -45,9 +51,10 @@ export function VersionFooter({
         {components.map(({ name, build }) => (
           <span
             key={name}
-            title={`${name} v${build?.version ?? "unknown"} · ${build?.git_sha ?? "unknown"} · ${build?.git_dirty == null ? "dirty status unknown" : build.git_dirty ? "dirty" : "clean"} · built ${build?.built_at_ms ? new Date(build.built_at_ms).toISOString() : "unknown"}`}
+            title={`${name} v${build?.version ?? "unknown"} · ${build?.git_sha ?? "unknown"} · inputs ${build?.inputs_fingerprint || "unknown"} · ${build?.git_dirty == null ? "dirty status unknown" : build.git_dirty ? "dirty" : "clean"} · built ${build?.built_at_ms ? new Date(build.built_at_ms).toISOString() : "unknown"}`}
           >
             {name} {build?.git_sha || "unknown"}
+            {!build?.inputs_fingerprint && " (inputs unknown)"}
           </span>
         ))}
       </div>

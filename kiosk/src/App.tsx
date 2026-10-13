@@ -146,7 +146,13 @@ export default function App() {
         api={health.data}
         meter={fleet.data?.nodes
           .flatMap((node) => node.services)
-          .find((service) => service.name === "meter-http")}
+          .find(
+            (service) =>
+              service.name === "meter-http" ||
+              (service.kind === "http" &&
+                URL.canParse(service.target) &&
+                new URL(service.target).pathname === "/meter/health"),
+          )}
       />
     </TooltipProvider>
   );

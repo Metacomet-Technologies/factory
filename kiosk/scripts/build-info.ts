@@ -16,10 +16,21 @@ export function buildInfo() {
       return undefined;
     }
   };
+  const fingerprint = (component: string) =>
+    execFileSync("bash", [new URL("scripts/build-fingerprint.sh", root).pathname, component], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: "pipe",
+    }).trim();
   return {
     version,
     git_sha: git(["rev-parse", "--short=7", "HEAD"]) ?? "unknown",
     git_dirty: Boolean(git(["status", "--porcelain"])),
     built_at_ms: Date.now(),
+    inputs_fingerprint: fingerprint("kiosk"),
+    expected_inputs: {
+      api: fingerprint("factory-api"),
+      meter: fingerprint("meter"),
+    },
   };
 }

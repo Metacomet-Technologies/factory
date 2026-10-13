@@ -157,9 +157,9 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             .route("/meter/gpu", get(gpu))
             .route("/meter/gpu/history", get(history))
             .route("/prices", get(prices))
-            .route("/meter/health", get(|| async { Json(json!({"status":"ok", "version":"0.2.0", "git_sha":"a1b2c3d", "git_dirty":false, "built_at_ms":1_790_000_000_000_u64})) }))
+            .route("/meter/health", get(|| async { Json(json!({"status":"ok", "version":"0.2.0", "git_sha":"a1b2c3d", "git_dirty":false, "built_at_ms":1_790_000_000_000_u64, "inputs_fingerprint":"012345abcdef"})) }))
             .route("/legacy-health", get(|| async { Json(json!({"status":"ok"})) }))
-            .route("/v1/health", get(|| async { Json(shared::build_info()) }))
+            .route("/v1/health", get(|| async { Json(shared::build_info(env!("FACTORY_INPUTS_FINGERPRINT"))) }))
             .route("/ok", get(|| async { StatusCode::NO_CONTENT }))
             .route("/redirect", get(|| async { StatusCode::FOUND }))
             .with_state(meter.clone()),
@@ -170,7 +170,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
         [[nodes]]
         name="factory-gpu"
         services=[
-          {{name="meter-http",kind="http",target="{meter_url}/meter/health"}},
+          {{name="renamed-meter",kind="http",target="{meter_url}/meter/health"}},
           {{name="factory-api",kind="http",target="{meter_url}/v1/health"}},
           {{name="healthy",kind="http",target="{meter_url}/ok"}},
           {{name="redirect",kind="http",target="{meter_url}/redirect"}},
@@ -211,6 +211,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             "git_sha",
             "git_dirty",
             "built_at_ms",
+            "inputs_fingerprint",
             "uptime_ms",
         ],
     );
@@ -220,6 +221,10 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
     assert!(!health["git_sha"].as_str().unwrap().is_empty());
     assert!(health["git_dirty"].is_boolean());
     assert!(health["built_at_ms"].as_u64().unwrap() > 1_700_000_000_000);
+    assert_eq!(
+        health["inputs_fingerprint"],
+        env!("FACTORY_INPUTS_FINGERPRINT")
+    );
 
     let mut stream = client.get(format!("{url}/v1/stream")).send().await?;
     assert!(
@@ -314,6 +319,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
                 "git_sha",
                 "git_dirty",
                 "built_at_ms",
+                "inputs_fingerprint",
             ],
         );
     }
@@ -328,7 +334,14 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
     assert_eq!(services[0]["git_sha"], "a1b2c3d");
     assert_eq!(services[0]["git_dirty"], false);
     assert_eq!(services[0]["built_at_ms"], 1_790_000_000_000_u64);
-    for key in ["version", "git_sha", "git_dirty", "built_at_ms"] {
+    assert_eq!(services[0]["inputs_fingerprint"], "012345abcdef");
+    for key in [
+        "version",
+        "git_sha",
+        "git_dirty",
+        "built_at_ms",
+        "inputs_fingerprint",
+    ] {
         assert_eq!(services[1][key], health[key]);
         assert_eq!(services[2][key], Value::Null);
         assert_eq!(nodes[1]["services"][0][key], Value::Null);
