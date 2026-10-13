@@ -1037,14 +1037,28 @@ test('same-SHA newer diff evidence starts exactly one fresh review, then stops a
   i.comments.at(-1).createdAt = '2026-10-13T11:00:00Z';
   const f = await fixture(t, [i], { github: { 90: githubPR() } });
   assert.equal((await f.run()).code, 0);
+  const round = i.comments.find((c: any) => commentMarkers(c.body).includes(`<!-- factory-qa:round pr:90 sha:${sha} -->`));
+  round.createdAt = '2026-10-13T11:02:00Z';
   const evidence = `PR: ${attachment('open').url}\nHead SHA: ${sha}\nComplete changed-file list:\n\`\`\`text\nwidgets/widget.rs\n\`\`\`\n\`\`\`diff\nEvidence fix, no push.\n\`\`\``;
   i.comments.push({ body: evidence, createdAt: '2026-10-13T10:59:59Z' });
   await f.run();
   assert.equal(f.calls().filter(a => a[0] === '-x').length, 0);
-  i.comments.push({ body: evidence.replace(sha, nextSha), createdAt: '2026-10-13T11:01:00Z' });
+  i.comments.push({ body: evidence.replace(sha, nextSha), createdAt: '2026-10-13T11:03:00Z' });
   await f.run();
   assert.equal(f.calls().filter(a => a[0] === '-x').length, 0);
   i.comments.push({ body: evidence, createdAt: '2026-10-13T11:01:00Z' });
+  await f.run();
+  assert.equal(f.calls().filter(a => a[0] === '-x').length, 0, 'evidence predates delivery');
+  i.comments.push({ body: evidence, createdAt: '2026-10-13T11:02:00Z' });
+  await f.run();
+  assert.equal(f.calls().filter(a => a[0] === '-x').length, 0, 'evidence equals delivery time');
+  i.comments.push({ body: evidence, createdAt: '2026-10-13T11:02:00.001Z' });
+  for (const timestamp of [undefined, 'invalid']) {
+    round.createdAt = timestamp;
+    await f.run();
+    assert.equal(f.calls().filter(a => a[0] === '-x').length, 0, 'delivery timestamp is unknown');
+  }
+  round.createdAt = '2026-10-13T11:02:00Z';
   const rereview = await f.run();
   await f.run();
   const launches = f.calls().filter(a => a[0] === '-x');

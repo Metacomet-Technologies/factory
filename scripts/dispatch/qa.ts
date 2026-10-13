@@ -218,9 +218,9 @@ export async function reviewPRs(ctx: Context) {
       if (has(issue, `stopped pr:${pr}`) || starts(issue).some(start => start.pr === pr
         && verdict(issue, start.key)?.value === 'changes' && !has(issue, `round ${start.key}`))) continue;
       if (verdict(issue, key)?.value === 'changes') {
-        const reviewedAt = verdict(issue, key)?.createdAt;
+        const deliveredAt = issue.comments.find(c => commentMarkers(c.body).includes(qa(`round ${key}`)))?.createdAt;
         // Evidence is data for a fresh reviewer, never instructions for the dispatcher.
-        const newerDiff = issue.comments.some(c => Date.parse(c.createdAt ?? '') > Date.parse(reviewedAt ?? '')
+        const newerDiff = issue.comments.some(c => Date.parse(c.createdAt ?? '') > Date.parse(deliveredAt ?? '')
           && new RegExp(`https://github.com/${config.repository}/pull/${pr}(?:\\s|[)/]|$)`).test(c.body)
           && new RegExp(`\\b${sha}\\b`).test(c.body) && /(?:`{3,}|~{3,})(?:diff|text|rust|typescript|ts|sh)\b/.test(c.body)
           && commentMarkers(c.body).length === 0);
