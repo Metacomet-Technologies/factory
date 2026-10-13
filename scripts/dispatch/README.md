@@ -46,14 +46,16 @@ CLI evidence, 2026-10-13: `amp --help` confirms `--features <value>` accepts
 comma-separated features. A tiny runner probe with the exact Claude features
 returned `OK`; its exported metadata records `model:claude-opus-5-5` and
 `effort:low`. Usage metadata was unavailable, so the serving model/provider
-remains unverified. The ultra probe records mode `ultra`, but failed before a
-reply with server error subtype `permission-denied`; successful execution,
-serving model/provider and billing remain unverified. Devon's thread-page
-screenshot identifies the cause: Claude Usage is set to Subscription Only,
-which blocks Claude outside Claude Code. Ultra's Claude routing requires
+remains unverified. The ultra probe initially failed with `permission-denied`;
+Devon's thread-page screenshot identified Claude Usage: Subscription Only,
+which blocks Claude outside Claude Code. After Devon changed that setting,
+the same thread returned `OK`. Usage metadata shows `anthropic/claude-fable-5-1`
+(Fable 5.1), Via Amp, $0.92 in covered Amp paid-tier cost across two requests
+(Devon's retry and our confirmation). Ultra's Claude routing requires
 Allow Paid-Per-Token Usage in Settings → Model Routing; enabling paid usage
 is an operator decision, not a dispatcher action. Both attached to the
-factory project from a disposable detached worktree, which was removed.
+factory project from a disposable detached worktree, which was removed after
+the check.
 
 - [Ultra probe](https://ampcode.com/threads/T-01a133dc-100b-72c8-bce7-b77d3d2d4998)
 - [Claude low probe](https://ampcode.com/threads/T-01a133dc-1b2d-744f-9db0-1d2e62b9119c)
