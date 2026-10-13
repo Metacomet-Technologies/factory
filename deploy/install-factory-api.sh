@@ -44,6 +44,10 @@ for path in "$destination" "$installed_unit"; do
     [[ ! -L "$path" ]] || fail "Refusing symlink destination: $path"
     [[ ! -e "$path" || -f "$path" ]] || fail "Destination is not a regular file: $path"
 done
+for path in /var /var/lib /var/lib/factory-usage-trigger; do
+    [[ ! -L "$path" ]] || fail "Refusing symlink: $path"
+    [[ ! -e "$path" || -d "$path" ]] || fail "Not a directory: $path"
+done
 [[ ! -d /etc/systemd/system/factory-api.service.d ]] || fail 'Remove/review existing factory-api unit drop-ins before installing.'
 [[ -d /run/systemd/system ]] || fail 'systemd is not running.'
 systemctl show --property=Version --value >/dev/null
@@ -130,12 +134,23 @@ printf '%s\n' "$active" > "$snapshot/active"
 printf '%s\n' "$pricing_mode" > "$snapshot/pricing-mode"
 if [[ -e "$destination" ]]; then cp -p -- "$destination" "$snapshot/binary"; else touch "$snapshot/binary.missing"; fi
 if [[ -e "$installed_unit" ]]; then cp -p -- "$installed_unit" "$snapshot/unit"; else touch "$snapshot/unit.missing"; fi
+if [[ -d /var/lib/factory-usage-trigger ]]; then
+    stat -c '%u:%g %a' /var/lib/factory-usage-trigger > "$snapshot/trigger-directory.mode"
+else
+    touch "$snapshot/trigger-directory.missing"
+fi
 touch "$snapshot/complete"
 printf '\nRollback snapshot: %s\n' "$snapshot"
 
 if ! id factory-api >/dev/null 2>&1; then
     useradd --system --user-group --no-create-home --home-dir /var/lib/factory-api --shell /usr/sbin/nologin factory-api
 fi
+# API is installed before usage. The required ReadWritePaths entry must exist
+# before startup, or systemd fails with 226/NAMESPACE.
+# Create it now and preserve its inode on reruns and usage installation.
+install -d -o factory-api -g factory-api -m 0700 /var/lib/factory-usage-trigger
+sudo -u factory-api test -w /var/lib/factory-usage-trigger
+[[ $(stat -c '%U:%G %a' /var/lib/factory-usage-trigger) == 'factory-api:factory-api 700' ]]
 install -d -m 0755 /usr/local/bin
 # Stop before replacing files, including on systems running the old binary.
 if [[ $(systemctl show factory-api.service --property=LoadState --value) != not-found ]]; then

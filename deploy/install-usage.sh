@@ -25,22 +25,26 @@ safe_path() {
         path=$(dirname "$path")
     done
 }
-for file in scripts/usage/collect.ts scripts/usage/parsers.ts scripts/usage/.node-version scripts/usage/collect.lock deploy/install-usage.sh deploy/rollback-usage.sh deploy/factory-usage.service deploy/factory-usage.timer; do
+for file in scripts/usage/collect.ts scripts/usage/parsers.ts scripts/usage/.node-version scripts/usage/collect.lock deploy/install-usage.sh deploy/rollback-usage.sh deploy/factory-usage.service deploy/factory-usage.timer deploy/factory-usage-refresh.path; do
     safe_path "$root/$file"
     [[ -f "$root/$file" ]] || fail "Missing artifact: $file"
     sudo -u agent test -r "$root/$file"
 done
-for path in /var/backups/factory-usage /var/lib/factory-usage /var/lib/factory-usage/usage.json /etc/systemd/system; do
+for path in /var/backups/factory-usage /var/lib/factory-usage /var/lib/factory-usage/usage.json /var/lib/factory-usage-trigger /var/lib/factory-usage-trigger/request /etc/systemd/system; do
     safe_path "$path"
 done
-for directory in /var/backups/factory-usage /var/lib/factory-usage; do
+for directory in /var/backups/factory-usage /var/lib/factory-usage /var/lib/factory-usage-trigger; do
     [[ ! -e "$directory" || -d "$directory" ]] || fail "Not a directory: $directory"
 done
 [[ ! -e /var/lib/factory-usage/usage.json || -f /var/lib/factory-usage/usage.json ]] || fail 'usage.json must be a regular file.'
 if [[ -f /var/lib/factory-usage/usage.json ]]; then
     [[ $(stat -c '%h' /var/lib/factory-usage/usage.json) == 1 ]] || fail 'Refusing hard-linked usage.json.'
 fi
-for unit in factory-usage.service factory-usage.timer; do
+[[ ! -e /var/lib/factory-usage-trigger/request || -f /var/lib/factory-usage-trigger/request ]] || fail 'Trigger request must be a regular file.'
+if [[ -f /var/lib/factory-usage-trigger/request ]]; then
+    [[ $(stat -c '%h' /var/lib/factory-usage-trigger/request) == 1 ]] || fail 'Refusing hard-linked trigger request.'
+fi
+for unit in factory-usage.service factory-usage.timer factory-usage-refresh.path; do
     safe_path "/etc/systemd/system/$unit"
     [[ ! -e "/etc/systemd/system/$unit" || -f "/etc/systemd/system/$unit" ]] || fail "Unsafe unit: $unit"
     [[ -z $(systemctl show "$unit" --property=DropInPaths --value) ]] || fail "Review/remove $unit drop-ins before installing."
@@ -81,16 +85,24 @@ check_snapshot "$preview"
 # Snapshot units and state before any deployment mutation.
 install -d -o root -g root -m 0700 /var/backups/factory-usage
 snapshot=$(mktemp -d "/var/backups/factory-usage/$(date -u +%Y%m%dT%H%M%S).XXXXXX")
-for unit in factory-usage.service factory-usage.timer; do
+if [[ -d /var/lib/factory-usage-trigger ]]; then
+    stat -c '%u:%g %a' /var/lib/factory-usage-trigger > "$snapshot/trigger-directory.mode"
+else
+    : > "$snapshot/trigger-directory.missing"
+fi
+for unit in factory-usage.service factory-usage.timer factory-usage-refresh.path; do
     if [[ -f "/etc/systemd/system/$unit" ]]; then cp -p "/etc/systemd/system/$unit" "$snapshot/$unit"; else : > "$snapshot/$unit.missing"; fi
     systemctl is-enabled "$unit" > "$snapshot/$unit.enabled" 2>/dev/null || true
     systemctl is-active "$unit" > "$snapshot/$unit.active" 2>/dev/null || true
 done
 printf 'Snapshot: %s\n' "$snapshot"
 if [[ $(systemctl show factory-usage.timer --property=LoadState --value) != not-found ]]; then systemctl stop factory-usage.timer; fi
+if [[ $(systemctl show factory-usage-refresh.path --property=LoadState --value) != not-found ]]; then systemctl stop factory-usage-refresh.path; fi
 # Wait for any full collector run, using the committed shared lock inode.
 exec 9<"$root/scripts/usage/collect.lock"
 flock --exclusive --timeout 330 9
+# Keep the directory inode: the already-running API has it mounted writable.
+install -d -o factory-api -g factory-api -m 0700 /var/lib/factory-usage-trigger
 install -d -o agent -g factory-api -m 2750 /var/lib/factory-usage
 if [[ -f /var/lib/factory-usage/usage.json ]]; then
     chown agent:factory-api /var/lib/factory-usage/usage.json
@@ -99,6 +111,7 @@ fi
 sed -e "s|@NODE@|$node|g" -e "s|@PATH@|$path|g" "$root/deploy/factory-usage.service" > "$snapshot/new.service"
 install -o root -g root -m 0644 "$snapshot/new.service" /etc/systemd/system/factory-usage.service
 install -o root -g root -m 0644 "$root/deploy/factory-usage.timer" /etc/systemd/system/factory-usage.timer
+install -o root -g root -m 0644 "$root/deploy/factory-usage-refresh.path" /etc/systemd/system/factory-usage-refresh.path
 systemctl daemon-reload
 flock --unlock 9
 exec 9<&-
@@ -118,4 +131,11 @@ check_snapshot "$api"
 systemctl enable --now factory-usage.timer
 systemctl is-active --quiet factory-usage.timer
 systemctl is-enabled --quiet factory-usage.timer
-printf '%s\n' 'Usage timer enabled. API, databases, runners and login/settings unchanged.'
+sudo -u factory-api test -w /var/lib/factory-usage-trigger
+sudo -u factory-api test -x /var/lib/factory-usage-trigger
+[[ $(stat -c '%U:%G %a' /var/lib/factory-usage-trigger) == 'factory-api:factory-api 700' ]]
+systemctl enable --now factory-usage-refresh.path
+systemctl is-active --quiet factory-usage-refresh.path
+systemctl is-enabled --quiet factory-usage-refresh.path
+[[ $(systemctl show factory-usage-refresh.path --property=Triggers --value) == factory-usage.service ]]
+printf '%s\n' 'Usage timer and refresh path enabled. API, databases, runners and login/settings unchanged.'

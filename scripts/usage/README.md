@@ -4,6 +4,30 @@ Run on factory-gpu as its already authenticated `agent`. Node **24.21.0**, like
 `scripts/dispatch`; no npm dependencies. No inference, login/logout, reset-credit
 consumption, runner changes, settings changes, transcript reads or DB writes.
 
+## Kiosk-triggered refresh (MET-139)
+
+`POST /v1/agents/refresh` atomically replaces
+`/var/lib/factory-usage-trigger/request` with the accepted UTC millisecond timestamp.
+The API serializes requests and enforces 180 seconds after the later of that
+timestamp (preserved across restarts) and a valid snapshot's `generated_at_ms`.
+It returns 202 with `status: "accepted"` and `next_allowed_at_ms`, or 429 with
+`error.code: "cooldown"`, that deadline and rounded-up `Retry-After` seconds.
+Nonempty bodies return 400, bodies over 1024 bytes return 413, cross-site browser
+submissions return 403, and trigger failures return 500 `trigger_write_failed`.
+`--usage-trigger` / `FACTORY_API_USAGE_TRIGGER` overrides the path for isolated tests.
+
+Root's `factory-usage-refresh.path` watches `PathChanged=` and starts the existing
+agent-owned collector service; API never invokes CLIs or sudo. Systemd coalesces
+starts while that service is running. SSE still observes snapshots every 30 seconds;
+202 means requested, not completed. The API installer creates the private
+`factory-api:factory-api 0700` trigger directory before restarting its hardened unit;
+the usage installer preserves its inode and enables/verifies the path unit.
+After the clean merged build, install API, run
+`factory-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/install-usage.sh'`,
+then build/install kiosk. Usage rollback disables/removes the path and timer/service
+but retains snapshots and the trigger directory. Restore kiosk and API using their
+printed installer snapshots; no database migration or Ollama restart is required.
+
 ```sh
 node scripts/usage/collect.ts --dry-run
 node --test scripts/usage

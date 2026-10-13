@@ -392,6 +392,117 @@ describe("dashboard contract", () => {
   });
 });
 describe("frontier capacity", () => {
+  it("labels workspace balances without changing unlabeled pools", () => {
+    const data = agentFixtures();
+    data.tools[0]!.balances.push({
+      label: "workspace metacomet",
+      unit: "usd",
+      amount: "0",
+      remaining: "0",
+      total: null,
+    });
+    render(<AgentsSection resource={{ data, error: null, loading: false }} icon={null} />);
+    expect(
+      screen.getByText("$171.27 of $200 · 998.1 of 1,000 orb hours · workspace metacomet: $0"),
+    ).toBeInTheDocument();
+  });
+  it("waits for a usage event, not reconnect, and honors the server cooldown", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    const fetch = api();
+    render(<App />);
+    await screen.findByText("62,500 Codex credits");
+    const now = Date.now();
+    fetch.mockImplementationOnce(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            status: "accepted",
+            next_allowed_at_ms: now + 180_000,
+          }),
+          { status: 202 },
+        ),
+      ),
+    );
+    const button = screen.getByRole("button", { name: "Refresh usage" });
+    button.focus();
+    expect(button).toHaveFocus();
+    expect(button.tagName).toBe("BUTTON");
+    await act(async () => fireEvent.click(button));
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("title", "Next refresh in 180 s");
+    expect(screen.getByText("Refreshing…")).toBeInTheDocument();
+    await act(async () => {
+      MockSource.latest.onopen?.();
+      MockSource.latest.onopen?.();
+    });
+    expect(screen.getByText("Refreshing…")).toBeInTheDocument();
+    await act(async () =>
+      MockSource.latest.dispatchEvent(
+        new MessageEvent("agents.usage", {
+          data: JSON.stringify({ type: "agents.usage", ts_ms: now, data: agentFixtures() }),
+        }),
+      ),
+    );
+    expect(screen.getByText("Updated")).toBeInTheDocument();
+    await act(async () => {
+      vi.advanceTimersByTime(179_000);
+    });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("title", "Next refresh in 1 s");
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(button).toBeEnabled();
+  });
+  it.each([202, 429, 500])("handles refresh HTTP %s and a missing completion", async (status) => {
+    vi.useFakeTimers();
+    const fetch = vi.fn(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            next_allowed_at_ms: Date.now() + 180_000,
+          }),
+          { status },
+        ),
+      ),
+    );
+    vi.stubGlobal("fetch", fetch);
+    render(
+      <AgentsSection
+        resource={{ data: agentFixtures(), error: null, loading: false }}
+        icon={null}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "Refresh usage" });
+    expect(button).toBeEnabled();
+    await act(async () => {
+      fireEvent.click(button);
+      fireEvent.click(button);
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith(
+      "/v1/agents/refresh",
+      expect.objectContaining({ method: "POST" }),
+    );
+    if (status === 500) {
+      expect(screen.getByText("Refresh failed")).toBeInTheDocument();
+      expect(button).toBeEnabled();
+    } else {
+      expect(button).toBeDisabled();
+      expect(button).toHaveAttribute("title", "Next refresh in 180 s");
+      if (status === 202) {
+        await act(async () => {
+          vi.advanceTimersByTime(89_000);
+        });
+        expect(screen.getByText("Refreshing…")).toBeInTheDocument();
+        await act(async () => {
+          vi.advanceTimersByTime(1000);
+        });
+        expect(screen.getByText("Refresh didn't complete")).toBeInTheDocument();
+        expect(button).toBeDisabled();
+      } else expect(screen.queryByText("Refreshing…")).not.toBeInTheDocument();
+    }
+  });
   it("shows independent balances, every window, UTC resets and observation age", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-10-13T00:00:00Z"));

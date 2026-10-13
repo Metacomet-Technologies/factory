@@ -42,6 +42,12 @@ struct Args {
     usage_snapshot: PathBuf,
     #[arg(
         long,
+        env = "FACTORY_API_USAGE_TRIGGER",
+        default_value = "/var/lib/factory-usage-trigger/request"
+    )]
+    usage_trigger: PathBuf,
+    #[arg(
+        long,
         env = "FACTORY_API_STATIC_DIR",
         default_value = "/var/lib/factory-api/kiosk"
     )]
@@ -118,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
         AppState::new(args.meter_url, args.db_path, args.pricing_db_path, config).await?;
     state.static_dir = args.static_dir;
     state.usage_snapshot = args.usage_snapshot;
+    state.usage_trigger = args.usage_trigger;
     state.pricing_sources = [args.openrouter_feed_url, args.litellm_feed_url];
     state.disable_pricing_collector = args.disable_pricing_collector;
     state.check_clock().await;

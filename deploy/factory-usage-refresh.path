@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh factory usage on API request
+
+[Path]
+PathChanged=/var/lib/factory-usage-trigger/request
+Unit=factory-usage.service
+
+[Install]
+WantedBy=multi-user.target

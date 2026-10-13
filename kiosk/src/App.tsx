@@ -110,7 +110,7 @@ export default function App() {
             <p className="eyebrow">OPERATIONS OVERVIEW</p>
             <h2>Your local compute. In focus.</h2>
           </div>
-          <p className="muted">Read-only · refreshes every 60s</p>
+          <p className="muted">Auto-refreshes every 60s</p>
         </div>
         <div className="dashboard-grid">
           <FleetSection resource={fleet} icon={<Server />} />
@@ -129,7 +129,7 @@ export default function App() {
             icon={<Activity />}
           />
           <aside className="sidebar" aria-label="Frontier tools and live requests">
-            <AgentsSection resource={agents} icon={<Terminal />} />
+            <AgentsSection resource={agents} icon={<Terminal />} revision={live.agentsRevision} />
             <TickerSection requests={live.requests} connected={live.connected} />
           </aside>
         </div>

@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useState, type ReactNode } from "react";
-import { AlertTriangle, ArrowUpRight, Radio } from "lucide-react";
+import { AlertTriangle, ArrowUpRight, Radio, RefreshCw } from "lucide-react";
 import type { Resource } from "../api/client";
+import { useAgentsRefresh } from "../api/agents-refresh";
 import type { LiveState } from "../api/stream";
 import type {
   Agents,
@@ -21,6 +22,7 @@ import { Skeleton } from "./ui/skeleton";
 import { Separator } from "./ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./ui/table";
 import { ToggleGroup, ToggleGroupItem } from "./ui/toggle-group";
+import { Button } from "./ui/button";
 
 const GpuChart = lazy(() => import("./gpu-chart"));
 
@@ -448,10 +450,19 @@ function balanceText(balance: Agents["tools"][number]["balances"][number]) {
         : balance.unit === "codex_credits"
           ? " Codex credits"
           : ` ${balance.unit}`;
-  return `${format(balance.remaining)}${balance.total == null ? "" : ` of ${format(balance.total)}`}${unit}`;
+  return `${balance.label ? `${balance.label}: ` : ""}${format(balance.remaining)}${balance.total == null ? "" : ` of ${format(balance.total)}`}${unit}`;
 }
-export function AgentsSection({ resource, icon }: { resource: Resource<Agents>; icon: ReactNode }) {
+export function AgentsSection({
+  resource,
+  icon,
+  revision = 0,
+}: {
+  resource: Resource<Agents>;
+  icon: ReactNode;
+  revision?: number;
+}) {
   const [now, setNow] = useState(Date.now);
+  const refresh = useAgentsRefresh(revision, now);
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
@@ -461,6 +472,31 @@ export function AgentsSection({ resource, icon }: { resource: Resource<Agents>; 
       title="Frontier CLIs"
       subtitle="Account capacity · separate from local usage"
       icon={icon}
+      action={
+        <div className="agent-refresh">
+          <span
+            role="status"
+            className={
+              refresh.message?.includes("fail") || refresh.message?.includes("didn't")
+                ? "status-warn"
+                : "muted"
+            }
+          >
+            {refresh.message}
+          </span>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="accent-text disabled:opacity-100 disabled:pointer-events-auto"
+            aria-label="Refresh usage"
+            title={refresh.seconds > 0 ? `Next refresh in ${refresh.seconds} s` : "Refresh usage"}
+            disabled={refresh.refreshing || refresh.seconds > 0}
+            onClick={() => void refresh.refresh()}
+          >
+            <RefreshCw aria-hidden="true" />
+          </Button>
+        </div>
+      }
     >
       <ResourceState
         resource={resource}
