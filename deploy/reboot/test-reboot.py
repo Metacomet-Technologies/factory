@@ -14,9 +14,8 @@ import time
 
 HERE = Path(__file__).resolve().parent
 NOW = 1_791_799_200_000  # 2026-10-12 10:00 UTC (06:00 New York)
-RUNNER = ("/home/agent/.local/bin/amp --no-tui --runner-id factory-gpu --dir /home/agent/work "
-          "--discover-dirs=/home/agent/work --remote-control-terminal --amp-env "
-          "--runner-account-email devon@metacomet.tech")
+RUNNER = ("amp --no-tui --runner-id factory-gpu --dir /home/agent/work "
+          "--discover-dirs=/home/agent/work --remote-control-terminal --amp-env")
 PLUGIN = ("/home/agent/.amp/bin/amp run /tmp/amp-plugin-runtime-q517Yo/plugin-runtime.ts "
           "/home/agent/.cache/amp/global-plugins/ampcode.com/workspace/official-modes@46ba5e96083e1347/index.ts")
 
@@ -70,7 +69,10 @@ if name == 'systemctl':
         state = json.loads((root / 'var/lib/factory-reboot/status.json').read_text())
         assert state['last_decision'] == 'rebooting' and state['mode'] == 'enforce'
     elif sys.argv[1] == 'show':
-        if '--property=Version' in sys.argv:
+        if '-p' in sys.argv and 'MainPID' in sys.argv:
+            print(data.get('runner_pid', '2481'))
+            sys.exit(data.get('runner_pid_code', 0))
+        elif '--property=Version' in sys.argv:
             print('259')
         elif '--property=LoadState' in sys.argv:
             print('loaded' if Path('/etc/systemd/system', sys.argv[2]).exists() else 'not-found')
@@ -186,16 +188,26 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
     flag.touch()
     data = expect("would-reboot")
     assert data["pending_since_ms"] == NOW and data["days_pending"] == 0
-    print("PASS: not-needed clears state; exact idle runner, plugin and op daemon allow observe")
+    print("PASS: not-needed clears state; today's idle runner, plugin and op daemon allow observe")
 
     expect("skipped", "agent-busy", updates={"ps": f"2481 1 {RUNNER}\n9 2481 cargo test\n"})
     expect("skipped", "agent-busy", updates={"ps": f"9 1 {PLUGIN}\n"})
     expect("skipped", "agent-busy", updates={"ps": f"9 1 {RUNNER} --execute work\n"})
+    expect("skipped", "agent-busy", updates={"ps": f"2481 1 {RUNNER}\n9 2481 plugin-runtime.ts\n"})
+    expect("skipped", "agent-busy", updates={"ps": f"2481 1 {RUNNER}\n9 2481 official-modes@abc\n"})
+    expect("skipped", "agent-busy", updates={"ps": f"2481 1 {RUNNER}\n"
+           f"10 2481 {PLUGIN}\n9 10 {PLUGIN}\n"})
+    for runner_pid, code in (("0", 0), ("", 0), ("invalid", 0), ("2481", 1)):
+        data = expect("skipped", "runner-pid-unknown", updates={"runner_pid": runner_pid,
+                      "runner_pid_code": code, "ps": f"2481 1 {RUNNER}\n34170 2481 {PLUGIN}\n"})
+        assert data["last_busy_reason"] == "runner-pid-unknown: pid=2481", data
+        assert expect("would-reboot", updates={"ps": "31101 1 op daemon\n"})["last_busy_reason"] is None
+    commands.update(runner_pid="2481", runner_pid_code=0)
     expect("skipped", "agent-processes-unknown", updates={"ps": "invalid output\n"})
     expect("skipped", "agent-processes-unknown", updates={"ps": "", "ps_code": 1, "ps_error": "read error"})
     expect("would-reboot", updates={"ps_error": ""})
     expect("would-reboot", updates={"ps": "31101 1 op daemon\n", "ps_code": 0})
-    print("PASS: work, extra runner arguments, orphan plugin and unreadable ps block reboot")
+    print("PASS: work, other Amp processes, non-direct plugins and unreadable ps block; unknown MainPID uses allowlist only")
 
     for ts, decision in ((NOW - 599_999, "skipped"), (NOW - 600_000, "skipped"),
                          (NOW - 600_001, "would-reboot"), (NOW + 1, "skipped")):
@@ -346,7 +358,8 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
         config_path.write_text(json.dumps(node_config))
         runner = RUNNER.replace("factory-gpu", node)
         plugin = PLUGIN.replace("q517Yo", "OuJYUh" if node == "factory-console" else "q517Yo")
-        expect("would-reboot", updates={"ps": f"4909 1 {runner}\n138429 4909 {plugin}\n"})
+        expect("would-reboot", updates={"runner_pid": "4909", "ps": f"4909 1 {runner}\n138429 4909 {plugin}\n"})
+        expect("would-reboot", updates={"ps": f"4909 1 {runner} --new-flag\n138429 4909 {plugin}\n"})
         updated_plugin = plugin.replace("OuJYUh", "NewSuffix99").replace(
             "q517Yo", "NewSuffix99").replace("46ba5e96083e1347", "012345abcdef")
         expect("would-reboot", updates={"ps": f"4909 1 {runner}\n138429 4909 {updated_plugin}\n"})
@@ -359,7 +372,7 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             data = expect("would-reboot", updates={"ps": f"4909 1 {runner}\n138429 4909 {updated_plugin}\n",
                           "meter_code": 7, "ups_code": 1})
             assert "curl " not in calls.read_text() and "upsc " not in calls.read_text()
-    print("PASS: both node calendars and update-safe idle allowlists; other Amp work blocks; console excludes op/meter/UPS")
+    print("PASS: both node calendars and argv-independent idle runner; other Amp work blocks; console excludes op/meter/UPS")
 
     # Optional stronger installer check: real scripts in a root user namespace,
     # with a read-only host and every writable destination/command replaced.

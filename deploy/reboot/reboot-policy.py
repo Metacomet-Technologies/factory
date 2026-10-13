@@ -59,6 +59,14 @@ def worktree_reason(root, now):
 
 
 def busy_reason(config, root, now):
+    runner_pid = None
+    try:
+        result = command("systemctl", "show", "-p", "MainPID", "--value", "amp-runner.service")
+        if result.returncode == 0 and int(result.stdout.strip()) > 0:
+            runner_pid = int(result.stdout.strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass  # Unknown runner identity falls back to the explicit allowlist.
+
     try:
         result = command("ps", "-u", "agent", "-ww", "-o", "pid=,ppid=,args=")
         # procps returns 1 with no output when the selection has no processes.
@@ -70,11 +78,15 @@ def busy_reason(config, root, now):
             pid, parent, args = line.split(None, 2)
             processes[int(pid)] = (int(parent), args)
         for pid, (parent, args) in processes.items():
+            if runner_pid is not None and (pid == runner_pid or (
+                    parent == runner_pid and "plugin-runtime.ts" in args and "official-modes@" in args)):
+                continue
             if not any(re.fullmatch(rule["args"], args) and
                        ("parent_args" not in rule or re.fullmatch(
                            rule["parent_args"], processes.get(parent, (0, ""))[1]))
                        for rule in config["agent_allowlist"]):
-                return f"agent-busy: pid={pid}"
+                reason = "agent-busy" if runner_pid is not None else "runner-pid-unknown"
+                return f"{reason}: pid={pid}"
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return "agent-processes-unknown"
 
