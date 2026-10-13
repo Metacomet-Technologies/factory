@@ -118,6 +118,15 @@ so synthetic ingestion can run; it does not assert host clock synchronization.
 Background traffic sends one request every two seconds through meter. API SSE
 and the kiosk ticker advance on the existing 30-second sync cadence.
 
+## Alert hooks (MET-150)
+
+factory-api gets a synthetic Slack token through `CREDENTIALS_DIRECTORY` and
+`FACTORY_ALERTS_SLACK_URL`, which points at `scripts/sandbox-shims/fake-slack.py`.
+That fake listens only inside the namespace (base+3 in the namespace, no host
+port) and appends payloads to `.sandbox/slack-posts.jsonl`. Alert state lives in
+`.sandbox/alerts.json`. The backup status path points at a missing file, so that
+source logs as unavailable. See [alerts](alerts.md) for forcing an alert.
+
 ## Pricing hooks (MET-111)
 
 `up` passes `--openrouter-feed-url` and `--litellm-feed-url` pointing to the

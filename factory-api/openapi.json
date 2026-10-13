@@ -1,6 +1,30 @@
 {
   "components": {
     "schemas": {
+      "ActiveAlert": {
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "opened_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/AlertSeverity"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "severity",
+          "summary",
+          "opened_at_ms"
+        ],
+        "type": "object"
+      },
       "AgentBalance": {
         "properties": {
           "amount": {
@@ -198,6 +222,36 @@
         ],
         "type": "object"
       },
+      "AlertSeverity": {
+        "enum": [
+          "critical",
+          "warning",
+          "info"
+        ],
+        "type": "string"
+      },
+      "Alerts": {
+        "properties": {
+          "active": {
+            "items": {
+              "$ref": "#/components/schemas/ActiveAlert"
+            },
+            "type": "array"
+          },
+          "recent": {
+            "description": "Last 20 cleared alerts, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/ClearedAlert"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "active",
+          "recent"
+        ],
+        "type": "object"
+      },
       "ApiError": {
         "properties": {
           "error": {
@@ -206,6 +260,35 @@
         },
         "required": [
           "error"
+        ],
+        "type": "object"
+      },
+      "ClearedAlert": {
+        "properties": {
+          "cleared_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          },
+          "opened_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/AlertSeverity"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "severity",
+          "summary",
+          "opened_at_ms",
+          "cleared_at_ms"
         ],
         "type": "object"
       },
@@ -965,6 +1048,25 @@
             "description": ""
           }
         },
+        "tags": []
+      }
+    },
+    "/v1/alerts": {
+      "get": {
+        "operationId": "alerts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Alerts"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "Active alerts and the last 20 cleared ones, as posted to Slack `#factory-alerts`.",
         "tags": []
       }
     },

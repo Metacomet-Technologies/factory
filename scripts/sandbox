@@ -55,7 +55,7 @@ case "$command" in
         (($# == 0)) || { echo 'Unexpected arguments' >&2; exit 1; }
         python3 "$helper" "$command" "$root" ;;
     logs)
-        [[ $# == 1 && "$1" =~ ^(fake-ollama|meter|factory-api|seed|traffic|runtime)$ ]] || { echo 'Usage: scripts/sandbox logs <fake-ollama|meter|factory-api|seed|traffic|runtime>' >&2; exit 1; }
+        [[ $# == 1 && "$1" =~ ^(fake-ollama|fake-slack|meter|factory-api|seed|traffic|runtime)$ ]] || { echo 'Usage: scripts/sandbox logs <fake-ollama|fake-slack|meter|factory-api|seed|traffic|runtime>' >&2; exit 1; }
         tail -n 100 "$state/$1.log" ;;
     *) echo 'Usage: scripts/sandbox {up [--rows 100k] [--seed 42] [--kiosk]|status|reset [up options]|down|logs <svc>}' >&2; exit 1 ;;
 esac

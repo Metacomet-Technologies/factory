@@ -1,0 +1,11 @@
+[Unit]
+Description=Check factory-gpu health every minute (MET-150)
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=factory-watchdog.service
+
+[Install]
+WantedBy=timers.target

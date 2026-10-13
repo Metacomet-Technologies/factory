@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{os::unix::fs::MetadataExt, path::Path, time::Duration};
 use tokio::io::AsyncReadExt;
 
-const STALE_MS: i64 = 45 * 60 * 1000;
+pub(crate) const STALE_MS: i64 = 45 * 60 * 1000;
 const TOOLS: [&str; 5] = ["amp", "cursor", "claude-code", "codex", "kimi"];
 fn source(tool: &str) -> Option<&'static str> {
     match tool {
@@ -179,22 +179,38 @@ fn parse(bytes: &[u8], now: i64) -> Option<Snapshot> {
     }
     Some(snapshot)
 }
-pub(crate) async fn read(path: &Path) -> Agents {
+async fn snapshot(path: &Path, now: i64) -> Result<Snapshot, &'static str> {
     if !tokio::fs::metadata(path).await.is_ok_and(|m| m.is_file()) {
-        return unavailable("usage snapshot unavailable");
+        return Err("usage snapshot unavailable");
     }
     let Ok(file) = tokio::fs::File::open(path).await else {
-        return unavailable("usage snapshot unavailable");
+        return Err("usage snapshot unavailable");
     };
     let mut bytes = Vec::new();
     if file.take(100_001).read_to_end(&mut bytes).await.is_err() || bytes.len() > 100_000 {
-        return unavailable("usage snapshot invalid");
+        return Err("usage snapshot invalid");
     }
-    parse(&bytes, now_ms())
-        .map(|snapshot| Agents {
+    parse(&bytes, now).ok_or("usage snapshot invalid")
+}
+pub(crate) async fn read(path: &Path) -> Agents {
+    match snapshot(path, now_ms()).await {
+        Ok(snapshot) => Agents {
             tools: snapshot.tools,
-        })
-        .unwrap_or_else(|| unavailable("usage snapshot invalid"))
+        },
+        Err(reason) => unavailable(reason),
+    }
+}
+/// Last good reading per collected tool; None when the snapshot is unreadable or invalid.
+pub(crate) async fn observations(path: &Path, now: i64) -> Option<Vec<(String, Option<i64>)>> {
+    let snapshot = snapshot(path, now).await.ok()?;
+    Some(
+        snapshot
+            .tools
+            .into_iter()
+            .filter(|tool| source(&tool.tool).is_some())
+            .map(|tool| (tool.tool, tool.observed_at_ms))
+            .collect(),
+    )
 }
 impl AppState {
     /// The trigger itself records the accepted timestamp, including across restarts.

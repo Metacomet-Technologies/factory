@@ -161,6 +161,10 @@ pub async fn collect(state: &AppState) -> Fleet {
             Value::Null
         }
     };
+    // Without discovery every node reads offline; alerts must not trust that.
+    state
+        .fleet_discovered
+        .store(status.is_object(), std::sync::atomic::Ordering::Release);
     let nodes = futures_util::future::join_all(state.config.nodes.iter().map(|config| async {
         let mut node = node(config, &status);
         node.services =

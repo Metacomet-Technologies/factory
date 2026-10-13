@@ -427,6 +427,8 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             (&json!("kimi"), &json!("not_tracked"))
         ]
     );
+    let alerts = fetch(&client, &format!("{url}/v1/alerts")).await;
+    assert_eq!(alerts, json!({"active": [], "recent": []}));
     let openapi = fetch(&client, &format!("{url}/openapi.json")).await;
     for path in [
         "/v1/health",
@@ -437,6 +439,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
         "/v1/pricing/refresh",
         "/v1/pricing/confirm/{family}",
         "/v1/agents",
+        "/v1/alerts",
         "/v1/stream",
     ] {
         assert!(openapi["paths"][path].is_object(), "missing OpenAPI {path}");
@@ -472,6 +475,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
         ("/v1/gpu?range=1h&range=7d", "GET", 400),
         ("/missing", "GET", 404),
         ("/v1/health", "POST", 405),
+        ("/v1/alerts", "POST", 405),
         ("/v1/pricing/confirm/unknown", "POST", 404),
         (
             "/v1/pricing/confirm/Claude%20Sonnet&unexpected",
@@ -1193,6 +1197,7 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
             ("/v1/health", NO_DATABASE),
             ("/v1/fleet", NO_DATABASE),
             ("/v1/agents", NO_DATABASE),
+            ("/v1/alerts", NO_DATABASE),
             ("/v1/gpu", NO_DATABASE),
             ("/v1/stream", NO_DATABASE),
             ("/", NO_DATABASE),
