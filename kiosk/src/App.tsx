@@ -129,7 +129,15 @@ export default function App() {
             icon={<Activity />}
           />
           <aside className="sidebar" aria-label="Frontier tools and live requests">
-            <AgentsSection resource={agents} icon={<Terminal />} revision={live.agentsRevision} />
+            <AgentsSection
+              resource={
+                live.agents && !agents.data
+                  ? { data: live.agents, loading: false, error: null }
+                  : agents
+              }
+              icon={<Terminal />}
+              revision={live.agentsRevision}
+            />
             <TickerSection requests={live.requests} connected={live.connected} />
           </aside>
         </div>

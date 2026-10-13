@@ -8,6 +8,8 @@ import { count, ms, usd, number, seen } from "./lib/format";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { AgentsSection, FleetSection } from "./components/sections";
 import { VersionFooter } from "./components/version-footer";
+// Captured from the real sandbox API; synthetic quotas include the reported label and percentages.
+import capturedUsage from "./agents-usage.sse?raw";
 
 class MockSource extends EventTarget {
   static latest: MockSource;
@@ -24,6 +26,7 @@ beforeEach(() => {
   document.documentElement.dataset.theme = "dark";
   delete document.documentElement.dataset.themePreference;
   localStorage.clear();
+  sessionStorage.clear();
   vi.stubGlobal("EventSource", MockSource);
   vi.stubGlobal(
     "matchMedia",
@@ -406,11 +409,12 @@ describe("frontier capacity", () => {
       screen.getByText("$171.27 of $200 · 998.1 of 1,000 orb hours · workspace metacomet: $0"),
     ).toBeInTheDocument();
   });
-  it("waits for a usage event, not reconnect, and honors the server cooldown", async () => {
+  it("waits for a usage event, not a stale reconnect snapshot, and honors the cooldown", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
     const fetch = api();
     render(<App />);
     await screen.findByText("62,500 Codex credits");
+    await act(async () => vi.advanceTimersByTime(60_000));
     const now = Date.now();
     fetch.mockImplementationOnce(() =>
       Promise.resolve(
@@ -443,10 +447,13 @@ describe("frontier capacity", () => {
         }),
       ),
     );
-    expect(screen.getByText("Updated")).toBeInTheDocument();
+    expect(screen.getByText("Updated just now")).toBeInTheDocument();
+    expect(screen.getByText("Next refresh in 3:00")).toBeInTheDocument();
     await act(async () => {
       vi.advanceTimersByTime(179_000);
     });
+    expect(screen.getByText("Updated 2 min ago")).toBeInTheDocument();
+    expect(screen.getByText("Next refresh in 0:01")).toBeInTheDocument();
     expect(button).toBeDisabled();
     expect(button).toHaveAttribute("title", "Next refresh in 1 s");
     await act(async () => {
@@ -467,12 +474,9 @@ describe("frontier capacity", () => {
       ),
     );
     vi.stubGlobal("fetch", fetch);
-    render(
-      <AgentsSection
-        resource={{ data: agentFixtures(), error: null, loading: false }}
-        icon={null}
-      />,
-    );
+    const data = agentFixtures();
+    for (const tool of data.tools) tool.observed_at_ms = null;
+    render(<AgentsSection resource={{ data, error: null, loading: false }} icon={null} />);
     const button = screen.getByRole("button", { name: "Refresh usage" });
     expect(button).toBeEnabled();
     await act(async () => {
@@ -485,7 +489,7 @@ describe("frontier capacity", () => {
       expect.objectContaining({ method: "POST" }),
     );
     if (status === 500) {
-      expect(screen.getByText("Refresh failed")).toBeInTheDocument();
+      expect(screen.getByText("Refresh didn't complete")).toBeInTheDocument();
       expect(button).toBeEnabled();
     } else {
       expect(button).toBeDisabled();
@@ -499,10 +503,198 @@ describe("frontier capacity", () => {
           vi.advanceTimersByTime(1000);
         });
         expect(screen.getByText("Refresh didn't complete")).toBeInTheDocument();
+        expect(screen.getByText("Next refresh in 1:30")).toBeVisible();
         expect(button).toBeDisabled();
-      } else expect(screen.queryByText("Refreshing…")).not.toBeInTheDocument();
+      } else {
+        expect(screen.queryByText("Refreshing…")).not.toBeInTheDocument();
+        expect(screen.getByText("Next refresh in 3:00")).toBeVisible();
+        expect(screen.getByRole("status")).toHaveAttribute("aria-live", "polite");
+        await act(async () => vi.advanceTimersByTime(1000));
+        expect(screen.getByText("Next refresh in 2:59")).toBeVisible();
+      }
+      await act(async () => vi.advanceTimersByTime(status === 202 ? 90_000 : 179_000));
+      expect(screen.queryByText(/Next refresh in/)).not.toBeInTheDocument();
+      expect(button).toBeEnabled();
     }
   });
+  it("derives the initial cooldown from the newest snapshot observation without fetching", async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    const data = agentFixtures();
+    data.tools[0]!.observed_at_ms = Date.now() - 179_000;
+    data.tools[2]!.observed_at_ms = Date.now() - 117_000;
+    data.tools[3]!.observed_at_ms = null;
+    const { rerender } = render(
+      <AgentsSection resource={{ data: null, error: null, loading: true }} icon={null} />,
+    );
+    rerender(<AgentsSection resource={{ data, error: null, loading: false }} icon={null} />);
+    const button = screen.getByRole("button", { name: "Refresh usage" });
+    expect(screen.getByText("Next refresh in 1:03")).toBeVisible();
+    expect(button).toBeDisabled();
+    // Snapshot invalidation must not temporarily clear a known cooldown.
+    rerender(<AgentsSection resource={{ data: null, error: null, loading: true }} icon={null} />);
+    await act(async () => vi.advanceTimersByTime(62_000));
+    expect(screen.getByText("Next refresh in 0:01")).toBeVisible();
+    expect(button).toBeDisabled();
+    await act(async () => vi.advanceTimersByTime(1000));
+    expect(button).toBeEnabled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it.each([202, 429])("retains the HTTP %s deadline across a session reload", async (status) => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ next_allowed_at_ms: Date.now() + 180_000 }), { status }),
+        ),
+      ),
+    );
+    const data = agentFixtures();
+    for (const tool of data.tools) tool.observed_at_ms = null;
+    const { unmount } = render(
+      <AgentsSection resource={{ data, error: null, loading: false }} icon={null} />,
+    );
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Refresh usage" })));
+    unmount();
+    await act(async () => vi.advanceTimersByTime(61_000));
+    data.tools[0]!.observed_at_ms = Date.now();
+    render(<AgentsSection resource={{ data, error: null, loading: false }} icon={null} />);
+    expect(screen.getByText("Next refresh in 1:59")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Refresh usage" })).toBeDisabled();
+    expect(screen.queryByText("Refreshing…")).not.toBeInTheDocument();
+  });
+  it("applies a captured named usage event even while its snapshot GET is stuck", async () => {
+    vi.useFakeTimers();
+    const fetch = api();
+    render(<App />);
+    await act(async () => {});
+    await act(async () => vi.advanceTimersByTime(60_000));
+    fetch.mockImplementationOnce(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ next_allowed_at_ms: Date.now() + 180_000 }), { status: 202 }),
+      ),
+    );
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Refresh usage" })));
+    expect(screen.getByText("Refreshing…")).toBeVisible();
+    fetch.mockImplementation(() => new Promise<Response>(() => {}));
+    const [name, payload] = capturedUsage.trim().split("\n");
+    await act(async () =>
+      MockSource.latest.dispatchEvent(
+        new MessageEvent(name!.slice("event: ".length), { data: payload!.slice("data: ".length) }),
+      ),
+    );
+    expect(screen.getByText(/workspace metacomet: \$0/)).toBeVisible();
+    const card = within(screen.getByRole("region", { name: "Frontier CLIs" }));
+    expect(card.getAllByRole("progressbar").map((bar) => bar.getAttribute("value"))).toEqual([
+      "15",
+      "0",
+      "7",
+      "18",
+      "0",
+      "6",
+    ]);
+    expect(card.getByText("Updated just now")).toBeVisible();
+    await act(async () => vi.advanceTimersByTime(90_000));
+    expect(card.queryByText("Refresh didn't complete")).not.toBeInTheDocument();
+    expect(card.getByText("Updated 1 min ago")).toBeVisible();
+  });
+  it("completes from a newer reconnect snapshot without replaying the missed event", async () => {
+    vi.useFakeTimers();
+    const fetch = api();
+    const defaults = fetch.getMockImplementation()!;
+    render(<App />);
+    await act(async () => MockSource.latest.onopen?.());
+    await act(async () => vi.advanceTimersByTime(60_000));
+    fetch.mockImplementationOnce(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ next_allowed_at_ms: Date.now() + 180_000 }), { status: 202 }),
+      ),
+    );
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Refresh usage" })));
+    await act(async () => vi.advanceTimersByTime(22_000));
+    await act(async () => {
+      MockSource.latest.onerror?.();
+      MockSource.latest.onopen?.();
+    });
+    expect(screen.getByText("Refreshing…")).toBeVisible();
+    const captured = parseEvent(JSON.parse(capturedUsage.trim().split("\n")[1]!.slice(6)));
+    if (captured?.type !== "agents.usage") throw new Error("Invalid captured usage event");
+    for (const tool of captured.data.tools)
+      if (tool.observed_at_ms !== null) tool.observed_at_ms = Date.now();
+    fetch.mockImplementation((path) =>
+      path === "/v1/agents"
+        ? Promise.resolve(new Response(JSON.stringify(captured.data)))
+        : defaults(path),
+    );
+    await act(async () => {
+      MockSource.latest.onerror?.();
+      MockSource.latest.onopen?.();
+    });
+    expect(screen.getByText("Updated just now")).toBeVisible();
+    expect(screen.getByText(/workspace metacomet: \$0/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Refresh usage" })).toBeDisabled();
+    await act(async () => vi.advanceTimersByTime(90_000));
+    expect(screen.queryByText("Refresh didn't complete")).not.toBeInTheDocument();
+  });
+  it.each(["timer", "visibilitychange", "pageshow"])(
+    "ends an accepted refresh without interval ticks on %s",
+    async (trigger) => {
+      vi.useFakeTimers();
+      vi.stubGlobal("setInterval", () => 0);
+      const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+      try {
+        vi.stubGlobal(
+          "fetch",
+          vi.fn(() =>
+            Promise.resolve(
+              new Response(JSON.stringify({ next_allowed_at_ms: Date.now() + 180_000 }), {
+                status: 202,
+              }),
+            ),
+          ),
+        );
+        const captured = parseEvent(JSON.parse(capturedUsage.trim().split("\n")[1]!.slice(6)));
+        if (captured?.type !== "agents.usage") throw new Error("Invalid captured usage event");
+        vi.setSystemTime(captured.ts_ms + 180_000);
+        render(
+          <AgentsSection
+            resource={{ data: captured.data, error: null, loading: false }}
+            icon={null}
+          />,
+        );
+        await act(async () =>
+          fireEvent.click(screen.getByRole("button", { name: "Refresh usage" })),
+        );
+        await act(async () => {
+          if (trigger !== "timer") document.dispatchEvent(new Event("visibilitychange"));
+        });
+        await act(async () => vi.advanceTimersByTime(89_999));
+        expect(screen.getByText("Refreshing…")).toBeVisible();
+        await act(async () => {
+          if (trigger === "timer") vi.advanceTimersByTime(1);
+          else {
+            vi.setSystemTime(Date.now() + 1);
+            visibility.mockReturnValue("visible");
+            (trigger === "pageshow" ? window : document).dispatchEvent(new Event(trigger));
+          }
+        });
+        expect(screen.queryByText("Refreshing…")).not.toBeInTheDocument();
+        expect(screen.getByText("Refresh didn't complete")).toBeVisible();
+        if (trigger !== "timer") {
+          await act(async () => {
+            vi.setSystemTime(Date.now() + 90_000);
+            document.dispatchEvent(new Event("visibilitychange"));
+          });
+          expect(screen.getByRole("button", { name: "Refresh usage" })).toBeEnabled();
+          expect(screen.queryByText(/Next refresh in/)).not.toBeInTheDocument();
+        }
+      } finally {
+        visibility.mockRestore();
+      }
+    },
+  );
   it("shows independent balances, every window, UTC resets and observation age", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-10-13T00:00:00Z"));
@@ -673,4 +865,11 @@ it("reduces all SSE types, bounds the ticker and rejects malformed frames", () =
   expect(parseEvent({ type: "llm.request", ts_ms: 1, data: { model: "bad" } })).toBeNull();
   expect(parseEvent({ type: "gpu.sample", ts_ms: 1, data: null })).not.toBeNull();
   expect(parseEvent({ type: "invented", ts_ms: 1, data: {} })).toBeNull();
+  expect(
+    parseEvent({
+      type: "agents.usage",
+      ts_ms: 1,
+      data: { tools: [{ tool: "amp", windows: null }] },
+    }),
+  ).toBeNull();
 });
