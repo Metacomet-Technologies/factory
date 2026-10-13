@@ -27,8 +27,33 @@ Configuration:
 
 - `LINEAR_API_KEY_FILE`: `/etc/factory-dispatch/linear-api-key`; read, never logged.
 - `DISPATCH_TEAM`: `MET`.
-- `DISPATCH_MAX_ACTIVE_PER_RUNNER`: `2`, positive integer.
+- `DISPATCH_MAX_ACTIVE_PER_RUNNER`: fallback for runners without an override;
+  positive integer, default `2`. Existing deployments using only this variable
+  keep the same cap on both runners.
+- `DISPATCH_RUNNER_CAPS`: optional comma-separated overrides, e.g.
+  `gpu=4,console=2`. Keys are `gpu` and `console`, not Amp runner IDs. Each value
+  must be a positive safe integer written with decimal digits only. Unknown or
+  duplicate keys, whitespace, empty entries and malformed values fail startup
+  before API calls. Omit this variable rather than setting it to an empty string.
 - `DISPATCH_RUNNERS`: `gpu=factory-gpu,console=factory-console`.
+
+For each runner, precedence is `DISPATCH_RUNNER_CAPS`, then
+`DISPATCH_MAX_ACTIVE_PER_RUNNER`, then `2`. A partial override such as `gpu=4`
+leaves console on the fallback. Overflow starts only when gpu reaches its own
+effective cap, and stops when console reaches its own cap. Every pass logs one
+JSON `caps` decision with both effective values, including idle passes.
+
+After merge and the wrap-up pull, Devon replaces the old global-cap entry in
+`/etc/systemd/system/factory-dispatch.service.d/cap.conf` with:
+
+```ini
+[Service]
+Environment=DISPATCH_RUNNER_CAPS=gpu=4,console=2
+```
+
+Run `sudo systemctl daemon-reload` and confirm with
+`systemctl show factory-dispatch.service -p Environment`. No timer or runner
+restart is required; the next service pass uses the new caps.
 
 The committed `modes` map sends Amp low/medium/high unchanged; Claude always
 uses `external-agent:claude-code` with `--features model:claude-opus-5-5,effort:<low|medium|high>`

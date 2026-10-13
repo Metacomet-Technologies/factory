@@ -845,25 +845,70 @@ test('slug boundaries, hint stripping, required sections and strict merge predic
   for (const value of [attachment('closed'), { ...attachment('merged'), url: 'https://github.com/a/b/issues/1' }, { ...attachment('merged'), url: 'https://github.com.evil/a/b/pull/1' }, { ...attachment('merged'), metadata: { merged: true } }]) assert.equal(isMergedGitHubPR(value), false);
 });
 
-test('unlabeled queue fills gpu then console, records overflow, then waits without comments', { timeout: 10_000 }, async t => {
-  const issues = Array.from({ length: 5 }, (_, n) => issue(100 + n));
-  const f = await fixture(t, issues);
-  const result = await f.run();
-  assert.equal(result.code, 0, result.stdout);
-  assert.deepEqual(f.calls().map(args => args[args.indexOf('--executor') + 1]), ['runner:factory-gpu', 'runner:factory-gpu', 'runner:factory-console', 'runner:factory-console']);
-  for (const [n, args] of f.calls().entries()) {
-    const runner = n < 2 ? 'gpu' : 'console';
-    assert.ok(args[1].includes(`Runner: factory-${runner}.`));
-    assert.ok(issues[n].comments.some((c: any) => c.body.includes(`<!-- factory-dispatch:claim runner:${runner} -->`)));
-    assert.ok(issues[n].comments.some((c: any) => c.body.includes(`<!-- factory-dispatch:thread ${threadId} runner:${runner} -->`)));
-    assert.equal(issues[n].comments[0].body.includes('(overflow)'), n >= 2);
+test('runner cap parsing, precedence and idle logging', { timeout: 10_000 }, async t => {
+  for (const [environment, caps] of [
+    [{}, { gpu: 2, console: 2 }],
+    [{ DISPATCH_MAX_ACTIVE_PER_RUNNER: '4' }, { gpu: 4, console: 4 }],
+    [{ DISPATCH_RUNNER_CAPS: 'gpu=4,console=2', DISPATCH_MAX_ACTIVE_PER_RUNNER: '3' }, { gpu: 4, console: 2 }],
+    [{ DISPATCH_RUNNER_CAPS: 'gpu=4' }, { gpu: 4, console: 2 }],
+    [{ DISPATCH_RUNNER_CAPS: 'console=1', DISPATCH_MAX_ACTIVE_PER_RUNNER: '3' }, { gpu: 3, console: 1 }],
+    [{ DISPATCH_RUNNER_CAPS: 'console=2,gpu=4', DISPATCH_RUNNERS: 'gpu=gpu-id,console=console-id' }, { gpu: 4, console: 2 }],
+  ] as const) {
+    const f = await fixture(t, []);
+    const result = await f.run(['poll'], environment);
+    assert.equal(result.code, 0, result.stdout);
+    assert.deepEqual(result.stdout.trim().split('\n').map(line => JSON.parse(line)), [{ decision: 'caps', caps }]);
+    assert.equal(f.calls().length, 0);
+    assert.equal(f.mutations.length, 0);
   }
-  assert.equal(labeled(issues[4]), true);
-  assert.equal(issues[4].comments.length, 0);
-  assert.equal((await f.run()).code, 0);
-  assert.equal(f.calls().length, 4);
-  assert.equal(issues[4].comments.length, 0);
-  t.diagnostic(`overflow poll: ${result.durationMs.toFixed(1)} ms`);
+});
+
+test('invalid runner caps fail startup before API or Amp calls', { timeout: 10_000 }, async t => {
+  for (const value of ['', 'gpu', 'gpu=', 'gpu=0', 'console=-1', 'gpu=1.5', 'gpu=1e2', 'gpu=0x4',
+    'gpu=NaN', 'gpu=Infinity', 'gpu=9007199254740992', 'orb=2', 'factory-gpu=4', 'GPU=4',
+    'gpu=4,', ',gpu=4', 'gpu=4=2', 'gpu=4,console=2,gpu=3', 'gpu=4, console=2', 'gpu=4\n']) {
+    const f = await fixture(t, []);
+    const result = await f.run(['poll'], { DISPATCH_RUNNER_CAPS: value });
+    assert.equal(result.code, 1, value);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      decision: 'error',
+      message: 'DISPATCH_RUNNER_CAPS must contain unique gpu=<positive integer> or console=<positive integer> entries separated by commas',
+    });
+    assert.equal(f.queries.length, 0);
+    assert.equal(f.mutations.length, 0);
+    assert.equal(f.calls().length, 0);
+  }
+});
+
+test('unlabeled queue fills each runner to its own cap, then waits without comments', { timeout: 30_000 }, async t => {
+  for (const [name, environment, gpu, console] of [
+    ['default', {}, 2, 2],
+    ['legacy', { DISPATCH_MAX_ACTIVE_PER_RUNNER: '3' }, 3, 3],
+    ['per-runner', { DISPATCH_RUNNER_CAPS: 'gpu=4,console=2', DISPATCH_MAX_ACTIVE_PER_RUNNER: '3' }, 4, 2],
+    ['reverse', { DISPATCH_RUNNER_CAPS: 'gpu=1,console=3' }, 1, 3],
+  ] as const) {
+    const total = gpu + console;
+    const issues = Array.from({ length: total + 1 }, (_, n) => issue(100 + n));
+    const f = await fixture(t, issues);
+    const result = await f.run(['poll'], environment);
+    assert.equal(result.code, 0, result.stdout);
+    assert.deepEqual(f.calls().map(args => args[args.indexOf('--executor') + 1]), [
+      ...Array(gpu).fill('runner:factory-gpu'), ...Array(console).fill('runner:factory-console'),
+    ]);
+    for (const [n, args] of f.calls().entries()) {
+      const runner = n < gpu ? 'gpu' : 'console';
+      assert.ok(args[1].includes(`Runner: factory-${runner}.`));
+      assert.ok(issues[n].comments.some((c: any) => c.body.includes(`<!-- factory-dispatch:claim runner:${runner} -->`)));
+      assert.ok(issues[n].comments.some((c: any) => c.body.includes(`<!-- factory-dispatch:thread ${threadId} runner:${runner} -->`)));
+      assert.equal(issues[n].comments[0].body.includes('(overflow)'), n >= gpu);
+    }
+    assert.equal(labeled(issues[total]), true);
+    assert.equal(issues[total].comments.length, 0);
+    assert.equal((await f.run(['poll'], environment)).code, 0);
+    assert.equal(f.calls().length, total);
+    assert.equal(issues[total].comments.length, 0);
+    t.diagnostic(`${name} overflow poll: ${result.durationMs.toFixed(1)} ms`);
+  }
 });
 
 test('explicit grouped and flat runner labels never overflow even with spare peer capacity', { timeout: 10_000 }, async t => {
