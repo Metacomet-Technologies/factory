@@ -133,8 +133,18 @@ head. Each PR/SHA gets a fresh review, GPU first then console, with a separate
 cap of **one review per runner** regardless of builder labels/capacity. An
 unconfirmed start reserves a slot. Changes release it; ready retains it until
 merge, handoff to Devon, or a new head before any merge continuation. Unresolved
-older reviews retain their slot; a new head may use the other runner. QA threads are not
-builder archive targets; keep them available for manual inspection/archival.
+older reviews retain their slot; a new head may use the other runner. Finished QA
+threads use the shared archive path described below, including legacy claims.
+
+After a delivered changes round, a Linear diff comment newer than the verdict
+can trigger one fresh review without a push. It must contain the same PR URL,
+head SHA and fenced evidence, with no standalone control markers. The dispatcher
+does not execute this evidence; the reviewer checks it. The new key appends
+`round:2` after the SHA in start, claim, verdict and completion markers. Its
+worktree appends `-round-2`, so a retained first checkout is never reused.
+Repeated polls or comments cannot start another review for that key. Both new
+heads and evidence-only reviews count toward the existing two-changes-round stop;
+missing verdict timestamps or interrupted follow-ups defer the re-review.
 
 The builder's grouped/flat engine label determines the reviewer: amp, chatgpt or ultra
 gets claude; claude gets amp; missing/unknown gets claude. Reviews use high effort
@@ -384,6 +394,22 @@ Dry-run preserves its no-Amp-call contract. It logs `archive-pending` with an
 explicit quiet-time-unchecked reason and previews the first listing pages and
 conditional archive command for up to five candidates. It does not claim an
 archive succeeded or preview completion markers without a timestamp check.
+
+### Archive finished QA threads (MET-136)
+
+Every standalone `review-claim` identifies a reviewer, including existing claims
+from before this change. A review finishes on delivered changes (matching verdict
+and round), human handoff, retirement, observed PR merge, or a Done/Canceled
+issue. Active reviews and ready reviews awaiting merge stay open. Canceled
+builders still stay open; only their QA threads qualify.
+
+QA uses the same quiet-time check, retry/recovery logic and **shared five-attempt
+budget** as builders. Its durable markers are `factory-qa:archive-claim pr:<n>
+sha:<sha>` and `factory-qa:archived pr:<n> sha:<sha>`, with `round:2` appended for
+evidence-only reviewers. A crash after archive repairs the missing marker from
+the archived listing without a second archive command. Existing finished reviews
+qualify on the first deployed pass, subject to quiet time and the shared cap.
+The queue includes QA-only marked issues, not just builder-marked issues.
 
 ## Verified Linear fields; one unverified integration convention
 

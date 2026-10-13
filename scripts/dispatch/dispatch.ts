@@ -1,7 +1,7 @@
 import { readFileSync, openSync, closeSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { reviewPRs, cleanupQAWorktrees, syncPlaybook, devonMention } from './qa.ts';
+import { reviewPRs, cleanupQAWorktrees, syncPlaybook, qaArchives, devonMention } from './qa.ts';
 
 export const mainCheckout = '/home/agent/work/factory';
 export function runnerCommand(runner: string, args: string[]) {
@@ -158,6 +158,7 @@ Update and build in the main checkout /home/agent/work/factory, as agent, withou
 git -C /home/agent/work/factory fetch origin
 git -C /home/agent/work/factory merge --ff-only origin/main
 Build the merged artifacts required by this task. Stop on dirty files or any failure.
+Verify dispatcher and collector scripts with node --test, never node --check: node --check does not strip TypeScript types and fails on .ts files with Unexpected token ':'.
 Remove this thread's worktree and local branch only after checking for unpushed work:
 git -C /home/agent/work/factory worktree remove /home/agent/work/factory-${branch}
 git -C /home/agent/work/factory branch -D ${branch}
@@ -289,7 +290,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
   }
 
   const raw = await pages(`query Queue($filter: IssueFilter!, $after: String) { issues(filter: $filter, first: 20, after: $after, includeArchived: true) { nodes { ${issueFields} } ${page} } }`, {
-    filter: { team: { key: { eq: team } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }] },
+    filter: { team: { key: { eq: team } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }, { comments: { some: { body: { contains: '<!-- factory-qa:' } } } }] },
   }, data => data.issues);
   const issues = await Promise.all(raw.map(hydrate));
   if (identifier && !issues.some(issue => issue.identifier === identifier)) {
@@ -389,22 +390,26 @@ export async function run(command: string, identifier: string | undefined, dryRu
   }
   await syncPlaybook(qaContext);
   let archives = 0;
-  for (const issue of issues) {
+  const archiveCandidates = issues.flatMap(issue => {
     const match = thread(issue);
-    if (!match || !has(issue, 'wrapup') || has(issue, 'archived') || issue.state.type !== 'completed') continue;
+    const builder = match && has(issue, 'wrapup') && !has(issue, 'archived') && issue.state.type === 'completed'
+      ? [{ id: match[1], claim: marker('archive-claim'), done: marker('archived') }] : [];
+    return [...builder, ...qaArchives(issue)].map(candidate => ({ issue, ...candidate }));
+  });
+  for (const { issue, id, claim, done } of archiveCandidates) {
     if (archives >= 5) break;
     if (dryRun) {
       archives++;
       log('archive-pending', { issue: issue.identifier, reason: 'dry-run: quiet time not checked; archive command is conditional on five quiet minutes' });
       showAmp(issue, ['amp', 'threads', 'list', '--json', '--limit', '100', '--offset', '0']);
       showAmp(issue, ['amp', 'threads', 'list', '--json', '--limit', '100', '--offset', '0', '--include-archived']);
-      showAmp(issue, ['amp', 'threads', 'archive', match[1]]);
+      showAmp(issue, ['amp', 'threads', 'archive', id]);
       continue;
     }
     let open, entry;
     try {
-      open = await listedThread(match[1], false);
-      entry = open ?? await listedThread(match[1], true);
+      open = await listedThread(id, false);
+      entry = open ?? await listedThread(id, true);
     } catch {
       log('archive-pending', { issue: issue.identifier, reason: 'Amp thread listing unreadable' });
       continue;
@@ -415,15 +420,15 @@ export async function run(command: string, identifier: string | undefined, dryRu
       continue;
     }
     archives++;
-    if (!has(issue, 'archive-claim')) await comment(issue, `Archive claimed; interrupted attempts retry after checking Amp's archive state and quiet time.\n\n${marker('archive-claim')}`);
+    if (!issue.comments.some(c => commentMarkers(c.body).includes(claim))) await comment(issue, `Archive claimed; interrupted attempts retry after checking Amp's archive state and quiet time.\n\n${claim}`);
     try {
-      if (open) await amp(['threads', 'archive', match[1]]);
+      if (open) await amp(['threads', 'archive', id]);
     } catch (error) {
       log('error', { issue: issue.identifier, action: 'archive', message: (error as Error).message });
       continue;
     }
-    await comment(issue, `Thread archived.\n\n${marker('archived')}`);
-    log('archived', { issue: issue.identifier, thread: match[1] });
+    await comment(issue, `Thread archived.\n\n${done}`);
+    log('archived', { issue: issue.identifier, thread: id });
   }
 }
 

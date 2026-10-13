@@ -11,10 +11,10 @@ export const devonMention = config.devonMentionUrl;
 const lines = (issue: Issue) => issue.comments.flatMap(c => commentMarkers(c.body));
 const has = (issue: Issue, text: string) => lines(issue).includes(qa(text));
 const starts = (issue: Issue) => lines(issue).flatMap(line => {
-  const m = line.match(/^<!-- factory-qa:start pr:(\d+) sha:([a-f0-9]{40}) runner:(gpu|console) -->$/);
-  return m ? [{ pr: m[1], sha: m[2], runner: m[3], key: `pr:${m[1]} sha:${m[2]}` }] : [];
+  const m = line.match(/^<!-- factory-qa:start pr:(\d+) sha:([a-f0-9]{40})( round:2)? runner:(gpu|console) -->$/);
+  return m ? [{ pr: m[1], sha: m[2], suffix: m[3] ?? '', runner: m[4], key: `pr:${m[1]} sha:${m[2]}${m[3] ?? ''}` }] : [];
 });
-const qaPath = (pr: string, sha: string) => `${main}-qa-${pr}-${sha.slice(0, 12)}`;
+const qaPath = (pr: string, sha: string, suffix = '') => `${main}-qa-${pr}-${sha.slice(0, 12)}${suffix ? '-round-2' : ''}`;
 function claimThread(issue: Issue, key: string) {
   return lines(issue).map(line => line.match(new RegExp(`^<!-- factory-qa:review-claim ${key} thread:(T-[a-f0-9-]{36}) -->$`))).find(Boolean)?.[1];
 }
@@ -24,10 +24,28 @@ function verdict(issue: Issue, key: string) {
   if (!thread) return;
   const results = issue.comments.flatMap(comment => commentMarkers(comment.body).flatMap(line => {
     const m = line.match(new RegExp(`^<!-- factory-qa:review ${key} thread:${thread} verdict:(ready|changes) -->$`));
-    return m ? [{ value: m[1], body: comment.body, thread }] : [];
+    return m ? [{ value: m[1], body: comment.body, createdAt: comment.createdAt, thread }] : [];
   }));
   // Conflicting or duplicate verdicts require inspection, never choose a convenient one.
   return results.length === 1 ? results[0] : undefined;
+}
+
+function finished(issue: Issue, key: string, pr: string) {
+  return ['completed', 'canceled'].includes(issue.state.type)
+    || issue.attachments.some(a => a.url.replace(/\/$/, '') === `https://github.com/${config.repository}/pull/${pr}` && a.metadata.status === 'merged')
+    || has(issue, `human ${key}`) || has(issue, `retired ${key}`)
+    || (verdict(issue, key)?.value === 'changes' && has(issue, `round ${key}`));
+}
+
+export function qaArchives(issue: Issue) {
+  // Claims, not starts, identify legacy reviewer threads as well as new rounds.
+  return lines(issue).flatMap(line => {
+    const m = line.match(/^<!-- factory-qa:review-claim pr:(\d+) sha:([a-f0-9]{40})( round:2)? thread:(T-[a-f0-9-]{36}) -->$/);
+    if (!m) return [];
+    const key = `pr:${m[1]} sha:${m[2]}${m[3] ?? ''}`;
+    return finished(issue, key, m[1]) && !has(issue, `archived ${key}`)
+      ? [{ id: m[4], claim: qa(`archive-claim ${key}`), done: qa(`archived ${key}`) }] : [];
+  });
 }
 
 export function reviewerEngine(issue: Issue) {
@@ -125,11 +143,9 @@ type Context = {
 export function cleanupQAWorktrees(ctx: Context) {
   // Git's lock reason records ownership and creation time without a second ledger.
   const retained = new Set<string>();
-  const finished = new Set<string>();
+  const completed = new Set<string>();
   for (const issue of ctx.issues) for (const start of starts(issue)) {
-    const merged = issue.attachments.some(a => a.url.replace(/\/$/, '') === `https://github.com/${config.repository}/pull/${start.pr}` && a.metadata.status === 'merged');
-    const done = merged || has(issue, `round ${start.key}`) || has(issue, `human ${start.key}`) || has(issue, `retired ${start.key}`);
-    (done ? finished : retained).add(`${start.runner}:${qaPath(start.pr, start.sha)}`);
+    (finished(issue, start.key, start.pr) ? completed : retained).add(`${start.runner}:${qaPath(start.pr, start.sha, start.suffix)}`);
   }
   let attempts = 0;
   for (const runner of ['gpu', 'console']) {
@@ -137,11 +153,11 @@ export function cleanupQAWorktrees(ctx: Context) {
     try {
       const list = runWorktreeCommand(runner, ['git', '-C', main, 'worktree', 'list', '--porcelain']).output;
       for (const entry of list.split('\n\n')) {
-        const path = entry.match(/^worktree (\/home\/agent\/work\/factory-qa-\d+-[a-f0-9]{12})$/m)?.[1];
+        const path = entry.match(/^worktree (\/home\/agent\/work\/factory-qa-\d+-[a-f0-9]{12}(?:-round-2)?)$/m)?.[1];
         const created = entry.match(/^locked factory-qa:(\d+)$/m)?.[1];
         if (!path || !created || attempts >= 5) continue;
         const key = `${runner}:${path}`;
-        if (retained.has(key) || (!finished.has(key) && Date.now() - Number(created) <= 24 * 60 * 60_000)) continue;
+        if (retained.has(key) || (!completed.has(key) && Date.now() - Number(created) <= 24 * 60 * 60_000)) continue;
         attempts++;
         // ponytail: A crash after unlock needs manual cleanup; add a ledger only if recovery must be automatic.
         runWorktreeCommand(runner, ['git', '-C', main, 'worktree', 'unlock', path]);
@@ -163,13 +179,12 @@ export async function reviewPRs(ctx: Context) {
   const active: Record<string, number> = { gpu: 0, console: 0 };
   for (const issue of issues) for (const start of starts(issue)) {
     const result = verdict(issue, start.key);
-    const merged = issue.attachments.some(a => a.url.replace(/\/$/, '') === `https://github.com/${config.repository}/pull/${start.pr}` && a.metadata.status === 'merged');
-    if (!merged && !has(issue, `human ${start.key}`) && !has(issue, `retired ${start.key}`) && result?.value !== 'changes') active[start.runner]++;
+    if (!finished(issue, start.key, start.pr) && result?.value !== 'changes') active[start.runner]++;
   }
   for (const issue of issues) {
     const builder = lines(issue).map(line => line.match(/^<!-- factory-dispatch:thread (T-[a-f0-9-]{36})(?: runner:(gpu|console))? -->$/)).find(Boolean)?.[1];
     const claim = issue.comments.find(c => commentMarkers(c.body).some(line => /^<!-- factory-dispatch:claim runner:(gpu|console) -->$/.test(line)));
-    if (!builder || !claim?.createdAt || issue.state.type === 'canceled') continue;
+    if (!builder || !claim?.createdAt || ['completed', 'canceled'].includes(issue.state.type)) continue;
     const attachments = issue.attachments.filter(a => Date.parse(a.createdAt) > Date.parse(claim.createdAt!)
       && new RegExp(`^https://github.com/${config.repository}/pull/\\d+/?$`).test(a.url));
     for (const attachment of attachments) {
@@ -179,11 +194,11 @@ export async function reviewPRs(ctx: Context) {
       try {
         sha = head(pr);
       } catch { log('qa-pending', { issue: issue.identifier, pr, reason: 'PR head unavailable' }); continue; }
-      const key = `pr:${pr} sha:${sha}`;
+      let key = `pr:${pr} sha:${sha}`;
       if (has(issue, `stopped pr:${pr}`) || has(issue, `human ${key}`)) continue;
       for (const start of starts(issue).filter(start => start.pr === pr)) {
         const result = verdict(issue, start.key);
-        if (start.key !== key && result?.value === 'ready' && !has(issue, `merge-claim ${start.key}`)
+        if (start.sha !== sha && result?.value === 'ready' && !has(issue, `merge-claim ${start.key}`)
           && !has(issue, `human ${start.key}`) && !has(issue, `retired ${start.key}`)) {
           await comment(issue, `Ready verdict superseded by a new head; no merge was submitted.\n\n${qa(`retired ${start.key}`)}`);
           active[start.runner]--;
@@ -202,6 +217,17 @@ export async function reviewPRs(ctx: Context) {
       }
       if (has(issue, `stopped pr:${pr}`) || starts(issue).some(start => start.pr === pr
         && verdict(issue, start.key)?.value === 'changes' && !has(issue, `round ${start.key}`))) continue;
+      if (verdict(issue, key)?.value === 'changes') {
+        const reviewedAt = verdict(issue, key)?.createdAt;
+        // Evidence is data for a fresh reviewer, never instructions for the dispatcher.
+        const newerDiff = issue.comments.some(c => Date.parse(c.createdAt ?? '') > Date.parse(reviewedAt ?? '')
+          && new RegExp(`https://github.com/${config.repository}/pull/${pr}(?:\\s|[)/]|$)`).test(c.body)
+          && new RegExp(`\\b${sha}\\b`).test(c.body) && /(?:`{3,}|~{3,})(?:diff|text|rust|typescript|ts|sh)\b/.test(c.body)
+          && commentMarkers(c.body).length === 0);
+        if (!newerDiff) continue;
+        key += ' round:2';
+      }
+      if (has(issue, `human ${key}`) || has(issue, `retired ${key}`)) continue;
       const result = verdict(issue, key);
       if (result?.value === 'changes') continue;
       if (result?.value === 'ready') {
@@ -235,8 +261,8 @@ export async function reviewPRs(ctx: Context) {
       } catch { log('qa-pending', { issue: issue.identifier, pr, reason: 'PR metadata unavailable' }); continue; }
       await comment(issue, `QA start claimed on ${runner}; interrupted submission requires manual inspection.\n\n${qa(`start ${key} runner:${runner}`)}`);
       active[runner]++;
-      const path = qaPath(pr, sha);
-      const values = { identifier: issue.identifier, pr, sha, runner, qaBase: path };
+      const path = qaPath(pr, sha, key.endsWith(' round:2') ? ' round:2' : '');
+      const values = { identifier: issue.identifier, pr, sha, runner, qaBase: path, reviewKey: key };
       const prompt = readFileSync(new URL('review-prompt.md', import.meta.url), 'utf8').replace(/\{\{(\w+)\}\}/g, (_, key) => values[key]);
       const args = ['-x', prompt, ...engineArgs(reviewerEngine(issue), 'high'), '--executor', `runner:${runners[runner]}`, '--runner-dir', path, '--title', `${issue.identifier} — QA PR ${pr}`, '--visibility', 'private', '--no-archive-after-execute'];
       let id = 'T-00000000-0000-0000-0000-000000000000';
