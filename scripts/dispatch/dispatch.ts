@@ -131,6 +131,8 @@ First push: git push -u origin ${branch}.
 PR title starts with ${issue.identifier}; body says "${link === 'closes' ? 'Closes' : 'Contributes'} ${issue.identifier}".
 Use closes only if the PR finishes the issue; otherwise use contributes.
 
+Label any scratch, probe or test threads you start with ${issue.identifier.toLowerCase()} (\`amp threads label <T-id> ${issue.identifier.toLowerCase()}\`) and archive them before your final reply; list them in your reply.
+
 ${headings.map(name => `## ${name}\n${content[name] || (name === 'Tests' ? tests : name === 'Link type' ? 'contributes' : name === 'Deploy artifacts' ? "Write them, don't run them." : '')}`).join('\n\n')}
 
 ## Linear MCP rules
@@ -288,6 +290,18 @@ export async function run(command: string, identifier: string | undefined, dryRu
     // Exact argv except prompt text: printing full prompts would leak issue content.
     log('would-run', { issue: issue.identifier, command: args.map(value => `'${value.replaceAll("'", "'\\''")}'`).join(' ') });
   }
+  const labelAttempts = new Set<string>();
+  async function labelThread(issue: Issue, id: string) {
+    if (has(issue, `labeled ${id}`) || labelAttempts.has(`${issue.id}:${id}`)) return;
+    labelAttempts.add(`${issue.id}:${id}`);
+    if (dryRun) { showAmp(issue, ['amp', 'threads', 'label', id, issue.identifier.toLowerCase()]); return; }
+    try { await amp(['threads', 'label', id, issue.identifier.toLowerCase()]); }
+    catch (error) {
+      log('error', { issue: issue.identifier, thread: id, action: 'label', message: (error as Error).message });
+      return;
+    }
+    await comment(issue, `Thread labeled ${issue.identifier.toLowerCase()}.\n\n${marker(`labeled ${id}`)}`);
+  }
 
   const raw = await pages(`query Queue($filter: IssueFilter!, $after: String) { issues(filter: $filter, first: 20, after: $after, includeArchived: true) { nodes { ${issueFields} } ${page} } }`, {
     filter: { team: { key: { eq: team } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }, { comments: { some: { body: { contains: '<!-- factory-qa:' } } } }] },
@@ -360,12 +374,25 @@ export async function run(command: string, identifier: string | undefined, dryRu
       }
     }
     await comment(issue, `https://ampcode.com/threads/${id}\n\n${marker(`thread ${id} runner:${runner}`)}`);
+    await labelThread(issue, id);
     await mutate(issue, 'mutation Move($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }', { id: issue.id, input: { stateId: states[0].id } });
     log('dispatched', { issue: issue.identifier, thread: dryRun ? '<new-thread-id>' : id, runner });
   }
-  const qaContext = { issues, dryRun, runners, runnerAvailable, comment, mutate, amp, showAmp, log };
+  const qaContext = { issues, dryRun, runners, runnerAvailable, comment, mutate, amp, showAmp, log, labelThread };
   try { await reviewPRs(qaContext); }
   finally { cleanupQAWorktrees(qaContext); }
+  // Recorded IDs backfill old launches and retry failed labels without relaunching.
+  for (const issue of issues) {
+    const ids = issue.comments.flatMap(c => commentMarkers(c.body)).flatMap(line => {
+      const reviewer = line.match(/^<!-- factory-qa:review-claim (pr:\d+ sha:[a-f0-9]{40}(?: round:2)?) thread:(T-[a-f0-9-]{36}) -->$/);
+      const id = line.match(threadPattern)?.[1] ?? reviewer?.[2];
+      const archived = reviewer
+        ? issue.comments.some(c => commentMarkers(c.body).includes(`<!-- factory-qa:archived ${reviewer[1]} -->`))
+        : has(issue, 'archived');
+      return id && !archived && !has(issue, `archived thread:${id}`) ? [id] : [];
+    });
+    for (const id of new Set(ids)) await labelThread(issue, id);
+  }
   for (const issue of issues) {
     const match = thread(issue);
     if (!match || has(issue, 'wrapup')) continue;
@@ -390,12 +417,45 @@ export async function run(command: string, identifier: string | undefined, dryRu
   }
   await syncPlaybook(qaContext);
   let archives = 0;
-  const archiveCandidates = issues.flatMap(issue => {
+  const archiveCandidates = [];
+  for (const issue of issues) {
     const match = thread(issue);
-    const builder = match && has(issue, 'wrapup') && !has(issue, 'archived') && issue.state.type === 'completed'
-      ? [{ id: match[1], claim: marker('archive-claim'), done: marker('archived') }] : [];
-    return [...builder, ...qaArchives(issue)].map(candidate => ({ issue, ...candidate }));
-  });
+    const builder = match && !has(issue, 'archived') && issue.state.type === 'completed'
+      ? [{ id: match[1] }] : [];
+    const candidates = [...builder, ...qaArchives(issue)];
+    if (['completed', 'canceled'].includes(issue.state.type)) {
+      // Pending claims recover threads that disappeared from the open search after archive.
+      for (const line of issue.comments.flatMap(c => commentMarkers(c.body))) {
+        const id = line.match(/^<!-- factory-dispatch:archive-claim thread:(T-[a-f0-9-]{36}) -->$/)?.[1];
+        if (id && !(issue.state.type === 'canceled' && id === match?.[1])) candidates.push({ id });
+      }
+      // ponytail: Amp caps search at 500 without pagination. Drain open results across passes;
+      // more than 500 active threads can defer older ones until Amp adds a paging API.
+      const args = ['threads', 'search', `label:${issue.identifier.toLowerCase()} archived:false`, '--json', '--limit', '500'];
+      if (dryRun) showAmp(issue, ['amp', ...args]);
+      else {
+        try {
+          const entries = JSON.parse(await amp(args));
+          if (!Array.isArray(entries) || entries.some(entry => !/^T-[a-f0-9-]{36}$/.test(entry?.id))) {
+            throw new Error('Amp label search invalid');
+          }
+          for (const { id } of entries) {
+            // Legacy builder/QA markers remain authoritative for their recorded IDs.
+            if (id === match?.[1] || candidates.some(candidate => candidate.id === id)
+              || has(issue, `archived thread:${id}`)) continue;
+            const reviewer = issue.comments.some(c => commentMarkers(c.body).some(line => line.endsWith(` thread:${id} -->`) && line.startsWith('<!-- factory-qa:review-claim ')));
+            if (reviewer) continue;
+            candidates.push({ id });
+          }
+        } catch { log('archive-pending', { issue: issue.identifier, reason: 'Amp label search unreadable' }); }
+      }
+    }
+    // New markers key every role by thread ID; legacy completion markers still suppress retries.
+    for (const id of new Set(candidates.map(candidate => candidate.id))) {
+      if (!has(issue, `archived thread:${id}`)) archiveCandidates.push({ issue, id,
+        claim: marker(`archive-claim thread:${id}`), done: marker(`archived thread:${id}`) });
+    }
+  }
   for (const { issue, id, claim, done } of archiveCandidates) {
     if (archives >= 5) break;
     if (dryRun) {

@@ -44,7 +44,7 @@ export function qaArchives(issue: Issue) {
     if (!m) return [];
     const key = `pr:${m[1]} sha:${m[2]}${m[3] ?? ''}`;
     return finished(issue, key, m[1]) && !has(issue, `archived ${key}`)
-      ? [{ id: m[4], claim: qa(`archive-claim ${key}`), done: qa(`archived ${key}`) }] : [];
+      ? [{ id: m[4] }] : [];
   });
 }
 
@@ -138,6 +138,7 @@ type Context = {
   amp: (args: string[]) => Promise<string>;
   showAmp: (issue: Issue, args: string[]) => void;
   log: (decision: string, details?: object) => void;
+  labelThread: (issue: Issue, id: string) => Promise<void>;
 };
 
 export function cleanupQAWorktrees(ctx: Context) {
@@ -262,7 +263,7 @@ export async function reviewPRs(ctx: Context) {
       await comment(issue, `QA start claimed on ${runner}; interrupted submission requires manual inspection.\n\n${qa(`start ${key} runner:${runner}`)}`);
       active[runner]++;
       const path = qaPath(pr, sha, key.endsWith(' round:2') ? ' round:2' : '');
-      const values = { identifier: issue.identifier, pr, sha, runner, qaBase: path, reviewKey: key };
+      const values = { identifier: issue.identifier, issueLabel: issue.identifier.toLowerCase(), pr, sha, runner, qaBase: path, reviewKey: key };
       const prompt = readFileSync(new URL('review-prompt.md', import.meta.url), 'utf8').replace(/\{\{(\w+)\}\}/g, (_, key) => values[key]);
       const args = ['-x', prompt, ...engineArgs(reviewerEngine(issue), 'high'), '--executor', `runner:${runners[runner]}`, '--runner-dir', path, '--title', `${issue.identifier} — QA PR ${pr}`, '--visibility', 'private', '--no-archive-after-execute'];
       let id = 'T-00000000-0000-0000-0000-000000000000';
@@ -283,6 +284,7 @@ export async function reviewPRs(ctx: Context) {
         id = ids[0];
       }
       await comment(issue, `https://ampcode.com/threads/${id}\n\n${qa(`review-claim ${key} thread:${id}`)}`);
+      await ctx.labelThread(issue, id);
       log('qa-review', { issue: issue.identifier, pr, sha, runner });
     }
   }

@@ -49,7 +49,7 @@ const attachment = (status: string) => ({ url: 'https://github.com/Metacomet-Tec
 const labeled = (i: any) => i.labels.some((label: any) => label.name === 'dispatch');
 const now = Date.parse('2026-10-13T12:00:00.000Z');
 const quietUpdated = '2026-10-13T11:55:00.000Z';
-const archived = (i: any) => i.comments.some((c: any) => c.body.includes('<!-- factory-dispatch:archived -->'));
+const archived = (i: any) => i.comments.some((c: any) => commentMarkers(c.body).some(line => line.startsWith('<!-- factory-dispatch:archived thread:')));
 const archivable = (n = 123) => issue(n, { labels: [], state: { type: 'completed' }, comments: [
   { body: `<!-- factory-dispatch:thread T-01234567-89ab-4cde-8fab-${String(n).padStart(12, '0')} runner:gpu -->` }, { body: '<!-- factory-dispatch:wrapup -->' },
 ] });
@@ -186,6 +186,22 @@ if (args[0] === '-x') {
 }
 if (process.env.FAKE_DELAY) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
 if (process.env.FAKE_FAIL) { console.error('${key} full prompt must not leak'); process.exit(7); }
+if (args[0] === 'threads' && args[1] === 'label') {
+  if (process.env.FAKE_LABEL_FAIL) process.exit(7);
+  const threads = JSON.parse(fs.readFileSync(process.env.FAKE_THREADS, 'utf8'));
+  const thread = threads.find(t => t.id === args[2]);
+  if (!thread || thread.archived) process.exit(9);
+  thread.labels = [...new Set([...(thread.labels ?? []), ...args.slice(3)])];
+  fs.writeFileSync(process.env.FAKE_THREADS, JSON.stringify(threads));
+  process.exit(0);
+}
+if (args[0] === 'threads' && args[1] === 'search') {
+  if (process.env.FAKE_BAD_SEARCH) { console.log(process.env.FAKE_BAD_SEARCH); process.exit(0); }
+  const threads = JSON.parse(fs.readFileSync(process.env.FAKE_THREADS, 'utf8'));
+  if (Number(args.at(-1)) > 500) process.exit(99);
+  console.log(JSON.stringify(threads.filter(t => t.labels?.includes(args[2].split(' ')[0].slice(6)) && !t.archived).slice(0, Number(args.at(-1))).map(t => ({ id: t.id, updatedAt: t.updated }))));
+  process.exit(0);
+}
 if (args[0] === 'threads' && args[1] === 'list') {
   if (process.env.FAKE_BAD_LIST) { console.log(process.env.FAKE_BAD_LIST); process.exit(0); }
   const threads = JSON.parse(fs.readFileSync(process.env.FAKE_THREADS, 'utf8'));
@@ -205,6 +221,11 @@ if (args[0] === 'threads' && args[1] === 'archive') {
   process.exit(0);
 }
 const id = args[0] === '-x' && args[1].includes('— QA PR') ? '${reviewId}' : '${threadId}';
+if (args[0] === '-x' && !process.env.FAKE_NO_ID) {
+  const threads = JSON.parse(fs.readFileSync(process.env.FAKE_THREADS, 'utf8'));
+  if (!threads.some(t => t.id === id)) threads.push({ id, archived: false, updated: new Date(Number(process.env.FAKE_NOW)).toISOString() });
+  fs.writeFileSync(process.env.FAKE_THREADS, JSON.stringify(threads));
+}
 console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.com/threads/' + id);
 `, { mode: 0o755 });
   const mutations: any[] = [];
@@ -319,7 +340,11 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
       child.on('close', (code, signal) => { children.delete(child); resolve({ code, signal, stdout, stderr, durationMs: performance.now() - started }); });
     });
   }
-  return { issues, mutations, queries, run, directory,
+  const allCalls = () => existsSync(callsFile) ? readFileSync(callsFile, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
+  // Existing lifecycle assertions exclude the independent label bookkeeping.
+  // Label/group tests use allCalls and inspect the persisted threads.
+  return { issues, get mutations() { return mutations.filter(m => !m.input?.body?.includes('<!-- factory-dispatch:labeled ')); },
+    allCalls, queries, run, directory,
     check: (pr = '90', head = sha, env = {}) => run(['check', pr, head], env, fileURLToPath(new URL('qa.ts', import.meta.url))),
     setGitHub: (github: any) => writeFileSync(githubFile, JSON.stringify(github)),
     githubCalls: () => existsSync(githubFile + '-calls') ? readFileSync(githubFile + '-calls', 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [],
@@ -327,8 +352,8 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
     events: () => readFileSync(eventsFile, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)),
     threads: () => JSON.parse(readFileSync(threadsFile, 'utf8')),
     setThreads: (threads: any[]) => writeFileSync(threadsFile, JSON.stringify(threads)),
-    calls: () => existsSync(callsFile) ? readFileSync(callsFile, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-      .filter(args => !options.submissionsOnly || args[0] === '-x' || args[1] === 'continue') : [] };
+    calls: () => allCalls().filter(args => !['label', 'search'].includes(args[1]))
+      .filter(args => !options.submissionsOnly || args[0] === '-x' || args[1] === 'continue') };
 }
 
 test('full fake-server poll: dispatch, prompt contract, Linear state, and manual/poll idempotency', { timeout: 10_000 }, async t => {
@@ -510,7 +535,7 @@ test('quoted diff markers cannot suppress wrap-up or archive or replace their cl
     assert.deepEqual(f.calls().at(-1), ['threads', 'archive', threadId]);
     assert.deepEqual(f.mutations.map(m => m.input.body.split('\n').at(-1)), [
       '<!-- factory-dispatch:wrapup-claim -->', '<!-- factory-dispatch:wrapup -->',
-      '<!-- factory-dispatch:archive-claim -->', '<!-- factory-dispatch:archived -->',
+      `<!-- factory-dispatch:archive-claim thread:${threadId} -->`, `<!-- factory-dispatch:archived thread:${threadId} -->`,
     ]);
     for (const mutation of f.mutations) assert.equal(commentMarkers(mutation.input.body).length, 1);
     await f.run();
@@ -691,7 +716,7 @@ test('failed wrap-up is claimed, reported, and never automatically retried', { t
   await f.run(['poll'], { FAKE_FAIL: '1' });
   await f.run();
   assert.equal(f.calls().length, 1);
-  assert.match(i.comments.at(-1).body, /Wrap-up submission failed/);
+  assert.ok(i.comments.some((c: any) => /Wrap-up submission failed/.test(c.body)));
   assert.equal(i.comments.some((c: any) => c.body.includes('<!-- factory-dispatch:wrapup -->')), false);
 });
 
@@ -837,15 +862,15 @@ test('Done archive waits until exactly five quiet minutes from Amp updated, then
   assert.match(eligible.stdout, /"decision":"archived"/);
   assert.equal(f.threads()[0].archived, true);
   assert.equal(archived(i), true);
-  assert.equal(i.comments.at(-1).body, 'Thread archived.\n\n<!-- factory-dispatch:archived -->');
+  assert.equal(i.comments.at(-1).body, 'Thread archived.\n\n<!-- factory-dispatch:archived thread:T-01234567-89ab-4cde-8fab-000000000123 -->');
   const again = await f.run(['poll'], { FAKE_NOW: String(now + 1) });
   assert.equal(again.code, 0);
   assert.deepEqual(f.calls().filter(args => args[1] === 'archive'), [['threads', 'archive', 'T-01234567-89ab-4cde-8fab-000000000123']]);
-  assert.equal(i.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:archived -->')).length, 1);
+  assert.equal(i.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:archived thread:')).length, 1);
   t.diagnostic(`archive polls: 4:59.999=${early.durationMs.toFixed(1)} ms; 5:00.000=${eligible.durationMs.toFixed(1)} ms; repeat=${again.durationMs.toFixed(1)} ms`);
 });
 
-test('archive skips canceled, non-Done, missing wrap-up or thread', { timeout: 10_000 }, async t => {
+test('archive skips canceled/non-Done builders and missing threads; Done no longer requires wrap-up', { timeout: 10_000 }, async t => {
   const issues = Array.from({ length: 4 }, (_, n) => archivable(100 + n));
   issues[0].state = { type: 'canceled', name: 'Done' };
   issues[1].state = { type: 'started', name: 'Done' };
@@ -853,8 +878,8 @@ test('archive skips canceled, non-Done, missing wrap-up or thread', { timeout: 1
   issues[3].comments.shift();
   const f = await fixture(t, issues);
   assert.equal((await f.run()).code, 0);
-  assert.equal(f.calls().length, 0);
-  assert.equal(f.mutations.length, 0);
+  assert.deepEqual(f.calls().filter(args => args[1] === 'archive'), [['threads', 'archive', 'T-01234567-89ab-4cde-8fab-000000000102']]);
+  assert.deepEqual(issues.map(archived), [false, false, true, false]);
 });
 
 test('updating threads stay pending regardless of wrap-up age; unreadable timestamps never archive', { timeout: 10_000 }, async t => {
@@ -891,7 +916,7 @@ test('archive failure logs error, keeps claim without completion marker, and ret
   assert.equal((await f.run()).code, 0);
   assert.equal(archived(i), true);
   assert.equal(f.threads()[0].archived, true);
-  assert.equal(i.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:archive-claim -->')).length, 1);
+  assert.equal(i.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:archive-claim thread:')).length, 1);
   assert.equal(f.calls().filter(args => args[1] === 'archive').length, 2);
 });
 
@@ -917,7 +942,7 @@ for (const [name, marker, boundary] of [
 ]) {
   test(`archive crash ${name} recovers without a second archive command`, { timeout: 10_000 }, async t => {
     const i = archivable();
-    const f = await fixture(t, [i], { crash: (op: string, v: any) => op === 'Comment' && v.input.body.includes(`<!-- factory-dispatch:${marker} -->`) ? boundary : false });
+    const f = await fixture(t, [i], { crash: (op: string, v: any) => op === 'Comment' && v.input.body.includes(`<!-- factory-dispatch:${marker} thread:`) ? boundary : false });
     assert.equal((await f.run()).signal, 'SIGKILL');
     assert.equal(f.threads()[0].archived, marker === 'archived');
     assert.equal((await f.run()).code, 0);
@@ -925,8 +950,8 @@ for (const [name, marker, boundary] of [
     assert.equal(archived(i), true);
     assert.equal(f.threads()[0].archived, true);
     assert.equal(f.calls().filter(args => args[1] === 'archive').length, 1);
-    assert.equal(i.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:archive-claim -->')).length, 1);
-    assert.equal(i.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:archived -->')).length, 1);
+    assert.equal(i.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:archive-claim thread:')).length, 1);
+    assert.equal(i.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:archived thread:')).length, 1);
   });
 }
 
@@ -996,7 +1021,7 @@ test('finished QA reviews archive once; active and undelivered reviews remain op
     await f.run();
     const eligible = !['active', 'ready', 'undelivered'].includes(end);
     assert.equal(f.calls().filter(a => a[1] === 'archive').length, eligible ? 1 : 0, end);
-    assert.equal(i.comments.filter((c: any) => c.body.includes(`factory-qa:archived pr:90 sha:${sha}`)).length, eligible ? 1 : 0, end);
+    assert.equal(i.comments.filter((c: any) => c.body.includes(`factory-dispatch:archived thread:${reviewId}`)).length, eligible ? 1 : 0, end);
     t.diagnostic(`QA archive ${end}: ${first.durationMs.toFixed(1)} ms`);
   }
 });
@@ -1017,19 +1042,19 @@ test('QA archiving shares the five-attempt budget with builders and enforces qui
   f.setThreads(f.threads().map((entry: any) => ({ ...entry, updated: quietUpdated })));
   await f.run();
   assert.equal(f.calls().filter(a => a[1] === 'archive').length, 6);
-  assert.ok(i.comments.some((c: any) => c.body.includes(`factory-qa:archived pr:90 sha:${sha} round:2`)));
+  assert.ok(i.comments.some((c: any) => c.body.includes(`factory-dispatch:archived thread:${secondId}`)));
 });
 
 test('QA archive crash after Amp before marker repairs without a second archive', { timeout: 10_000 }, async t => {
   const i = reviewed(); i.comments.splice(0, 2); i.state.type = 'canceled';
   const f = await fixture(t, [i], { threads: [{ id: reviewId, updated: quietUpdated, archived: false }],
-    crash: (operation: string, v: any) => operation === 'Comment' && v.input.body.includes('factory-qa:archived ') ? 'before' : null });
+    crash: (operation: string, v: any) => operation === 'Comment' && v.input.body.includes(`factory-dispatch:archived thread:${reviewId}`) ? 'before' : null });
   assert.equal((await f.run()).signal, 'SIGKILL');
   assert.equal(f.threads()[0].archived, true);
   assert.equal((await f.run()).code, 0);
   assert.equal(f.calls().filter(a => a[1] === 'archive').length, 1);
-  assert.equal(i.comments.filter((c: any) => c.body.includes('factory-qa:archive-claim ')).length, 1);
-  assert.equal(i.comments.filter((c: any) => c.body.includes('factory-qa:archived ')).length, 1);
+  assert.equal(i.comments.filter((c: any) => c.body.includes(`factory-dispatch:archive-claim thread:${reviewId}`)).length, 1);
+  assert.equal(i.comments.filter((c: any) => c.body.includes(`factory-dispatch:archived thread:${reviewId}`)).length, 1);
 });
 
 test('same-SHA newer diff evidence starts exactly one fresh review, then stops after round two', { timeout: 10_000 }, async t => {
@@ -1128,7 +1153,7 @@ test('QA refuses an existing worktree and reports preparation failure without re
     const f = await fixture(t, [i], { github: { 90: githubPR() } });
     const result = await f.run(['poll'], { [failure]: '1' });
     assert.equal(result.code, 0, result.stdout);
-    assert.match(i.comments.at(-1).body, /Worktree .*QA start claim retained; automatic retry is disabled/);
+    assert.ok(i.comments.some((c: any) => /Worktree .*QA start claim retained; automatic retry is disabled/.test(c.body)));
     await f.run();
     assert.equal(f.calls().length, 0);
     assert.deepEqual(f.worktrees(), { gpu: [], console: [] });
@@ -1179,7 +1204,7 @@ test('QA has one slot per runner independent of full builder capacity, and never
   assert.deepEqual(f.calls().map(a => a[a.indexOf('--executor') + 1]), ['runner:factory-gpu', 'runner:factory-console']);
   await f.run();
   assert.equal(f.calls().length, 2);
-  assert.equal(pending[2].comments.length, 2);
+  assert.ok(!pending[2].comments.some((c: any) => c.body.includes('factory-qa:start ')));
   // Free builder slots but retain the two QA claims. New builders must still start.
   for (const i of pending) i.comments.push({ body: '<!-- factory-dispatch:wrapup -->' });
   pending.push(issue(4), issue(5));
@@ -1198,7 +1223,7 @@ test('unreachable console leaves QA unclaimed and retries on a later reachable p
   assert.doesNotMatch(failed.stdout, /qa-cleanup-pending/);
   assert.equal(f.mutations.length, 0);
   assert.equal(f.calls().length, 0);
-  assert.equal(pending.comments.length, 2);
+  assert.ok(!pending.comments.some((c: any) => c.body.includes('factory-qa:start ')));
   assert.deepEqual(f.events().filter(e => e[0] === 'ssh').map(e => e.at(-1)), ["'true'"]);
   const recovered = await f.run();
   assert.equal(recovered.code, 0, recovered.stdout);
@@ -1461,4 +1486,94 @@ test('non-playbook merge records one checked marker without updating the documen
   assert.equal(f.mutations.length, 1);
   assert.equal(f.mutations[0].operation, 'Comment');
   assert.match(f.mutations[0].input.body, /factory-qa:playbook-checked pr:90/);
+});
+
+test('builder and QA launches label their threads; label failure retries without relaunching', { timeout: 15_000 }, async t => {
+  for (const reviewer of [false, true]) {
+    const i = reviewer ? reviewable() : issue();
+    const f = await fixture(t, [i], { github: reviewer ? { 90: githubPR() } : {} });
+    const id = reviewer ? reviewId : threadId;
+    const failed = await f.run(['poll'], { FAKE_LABEL_FAIL: '1' });
+    assert.equal(failed.code, 0, failed.stdout);
+    assert.match(failed.stdout, /"action":"label"/);
+    assert.match(failed.stdout, reviewer ? /qa-review/ : /dispatched/);
+    assert.equal(reviewer || i.stateId === 'started-id', true);
+    assert.ok(!f.threads().find((entry: any) => entry.id === id).labels);
+    const text = f.allCalls().find(args => args[0] === '-x')[1];
+    assert.match(text, /Label any scratch, probe or test threads you start with met-123/);
+    assert.match(text, /amp threads label <T-id> met-123/);
+    assert.match(text, /archive them before your final\s+reply; list them in your reply/);
+    assert.equal((await f.run()).code, 0);
+    assert.deepEqual(f.threads().find((entry: any) => entry.id === id).labels, ['met-123']);
+    await f.run();
+    assert.equal(f.allCalls().filter(args => args[0] === '-x').length, 1);
+    assert.equal(f.allCalls().filter(args => args[1] === 'label' && args[2] === id).length, 2);
+  }
+});
+
+test('backfill labels recorded open builders and legacy reviewers once, ignoring quoted markers', { timeout: 10_000 }, async t => {
+  const i = issue(123, { labels: [], comments: [threadComment(), qaMarker(`review-claim pr:90 sha:${sha} thread:${reviewId}`),
+    { body: `\`\`\`text\n<!-- factory-dispatch:thread T-22345678-89ab-4cde-8fab-0123456789ab -->\n\`\`\`` }] });
+  const f = await fixture(t, [i], { threads: [threadId, reviewId].map(id => ({ id, updated: quietUpdated, archived: false })) });
+  assert.equal((await f.run()).code, 0);
+  assert.equal((await f.run()).code, 0);
+  assert.ok(f.threads().every((entry: any) => entry.labels.includes('met-123')));
+  assert.equal(f.allCalls().filter(args => args[1] === 'label').length, 2);
+  assert.equal(f.allCalls().filter(args => args[0] === '-x').length, 0);
+  const old = issue(124, { labels: [], state: { type: 'completed' }, comments: [threadComment(),
+    { body: '<!-- factory-dispatch:archived -->' }, qaMarker(`review-claim pr:90 sha:${sha} thread:${reviewId}`), qaMarker(`archived pr:90 sha:${sha}`)] });
+  const legacy = await fixture(t, [old], { threads: [threadId, reviewId].map(id => ({ id, updated: quietUpdated, archived: true, labels: ['met-124'] })) });
+  assert.equal((await legacy.run()).code, 0);
+  assert.equal(legacy.allCalls().filter(args => args[1] === 'label' || args[1] === 'archive').length, 0);
+});
+
+test('Done and Canceled groups archive probes and QA, retaining canceled builders and unrelated labels', { timeout: 15_000 }, async t => {
+  const probeId = 'T-22345678-89ab-4cde-8fab-0123456789ab';
+  const unrelatedId = 'T-32345678-89ab-4cde-8fab-0123456789ab';
+  for (const state of ['completed', 'canceled']) {
+    const i = reviewed(); i.state.type = state;
+    const f = await fixture(t, [i], { threads: [threadId, reviewId, probeId, unrelatedId].map(id => ({ id,
+      labels: [id === unrelatedId ? 'met-124' : 'met-123'], updated: quietUpdated, archived: false })) });
+    const result = await f.run();
+    assert.equal(result.code, 0, result.stdout);
+    assert.deepEqual(f.threads().map((entry: any) => entry.archived), [state === 'completed', true, true, false]);
+    await f.run();
+    assert.equal(f.calls().filter(args => args[1] === 'archive').length, state === 'completed' ? 3 : 2);
+  }
+});
+
+test('probe groups share archive cap, quiet boundary, failure retry and crash repair', { timeout: 15_000 }, async t => {
+  const i = issue(123, { labels: [], state: { type: 'completed' }, comments: [claimComment()] });
+  const threads = Array.from({ length: 7 }, (_, n) => ({ id: `T-22345678-89ab-4cde-8fab-${String(n).padStart(12, '0')}`,
+    labels: ['met-123'], updated: n === 0 ? '2026-10-13T11:55:00.001Z' : quietUpdated, archived: false }));
+  const f = await fixture(t, [i], { threads });
+  assert.equal((await f.run(['poll'], { FAKE_ARCHIVE_FAIL: '1' })).code, 0);
+  assert.equal(f.calls().filter(args => args[1] === 'archive').length, 5);
+  assert.ok(f.threads().every((entry: any) => !entry.archived));
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.threads().filter((entry: any) => entry.archived).length, 5);
+  assert.equal(f.threads()[0].archived, false);
+  assert.equal((await f.run(['poll'], { FAKE_NOW: String(now + 1) })).code, 0);
+  assert.ok(f.threads().every((entry: any) => entry.archived));
+
+  const crashIssue = issue(124, { labels: [], state: { type: 'canceled' }, comments: [claimComment()] });
+  const crashThread = { ...threads[0], labels: ['met-124'], updated: quietUpdated };
+  const crash = await fixture(t, [crashIssue], { threads: [crashThread],
+    crash: (operation: string, v: any) => operation === 'Comment' && v.input.body.includes('factory-dispatch:archived thread:') ? 'before' : null });
+  assert.equal((await crash.run()).signal, 'SIGKILL');
+  assert.equal(crash.threads()[0].archived, true);
+  assert.equal((await crash.run()).code, 0);
+  assert.equal(crash.calls().filter(args => args[1] === 'archive').length, 1);
+  assert.equal(crashIssue.comments.filter((c: any) => c.body.includes('factory-dispatch:archived thread:')).length, 1);
+});
+
+test('invalid label search fails closed for probes', { timeout: 10_000 }, async t => {
+  const i = issue(123, { labels: [], state: { type: 'completed' }, comments: [claimComment()] });
+  const f = await fixture(t, [i]);
+  for (const output of ['not json', '{}', '[{"id":"invalid"}]']) {
+    const result = await f.run(['poll'], { FAKE_BAD_SEARCH: output });
+    assert.equal(result.code, 0);
+    assert.match(result.stdout, /Amp label search unreadable/);
+    assert.equal(f.calls().filter(args => args[1] === 'archive').length, 0);
+  }
 });
