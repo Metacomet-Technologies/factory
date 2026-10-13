@@ -220,8 +220,12 @@ impl AppState {
                 Err(e) => return Err(e.into()),
             };
             let mut bytes = Vec::new();
-            let generated = std::fs::File::open(&state.usage_snapshot)
+            let generated = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&state.usage_snapshot)
                 .ok()
+                .filter(|file| file.metadata().is_ok_and(|m| m.is_file()))
                 .and_then(|file| file.take(100_001).read_to_end(&mut bytes).ok())
                 .filter(|_| bytes.len() <= 100_000)
                 .and_then(|_| parse(&bytes, now))
@@ -369,6 +373,24 @@ mod tests {
             assert_eq!(repeat["error"]["code"], "cooldown");
             assert_eq!(repeat["next_allowed_at_ms"], next);
             assert_eq!(std::fs::read_to_string(&state.usage_trigger)?, contents);
+
+            // An agent-owned snapshot may be replaced by a FIFO with no writer.
+            // Both requests must finish promptly, without wedging the refresh lock.
+            std::fs::remove_file(&state.usage_trigger)?;
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&state.usage_snapshot)
+                    .status()?
+                    .success()
+            );
+            for status in [202, 429] {
+                let response =
+                    tokio::time::timeout(Duration::from_secs(1), client.post(&url).send())
+                        .await
+                        .expect("FIFO snapshot must not block refresh")?;
+                assert_eq!(response.status(), status);
+            }
+            std::fs::remove_file(&state.usage_snapshot)?;
 
             // A later timer snapshot wins over the persisted trigger. Fractional
             // seconds round up rather than letting clients retry too early.

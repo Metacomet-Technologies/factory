@@ -313,6 +313,7 @@ dependencies = [
  "clap",
  "factory-db",
  "futures-util",
+ "libc",
  "pricing",
  "reqwest 0.12.28",
  "rusqlite",

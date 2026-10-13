@@ -145,8 +145,8 @@ printf '\nRollback snapshot: %s\n' "$snapshot"
 if ! id factory-api >/dev/null 2>&1; then
     useradd --system --user-group --no-create-home --home-dir /var/lib/factory-api --shell /usr/sbin/nologin factory-api
 fi
-# API is installed before usage. A missing optional ReadWritePaths entry would
-# be skipped at start, leaving a later-created directory read-only until restart.
+# API is installed before usage. The required ReadWritePaths entry must exist
+# before startup, or systemd fails with 226/NAMESPACE.
 # Create it now and preserve its inode on reruns and usage installation.
 install -d -o factory-api -g factory-api -m 0700 /var/lib/factory-usage-trigger
 sudo -u factory-api test -w /var/lib/factory-usage-trigger
