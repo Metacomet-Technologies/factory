@@ -197,6 +197,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
         format!("{}/missing", state.meter_url),
     ];
     state.static_dir = temp.path().join("kiosk");
+    state.usage_snapshot = temp.path().join("usage.json");
     let (url, api_task) = serve(router(state.clone())).await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -399,11 +400,19 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
     let agents = fetch(&client, &format!("{url}/v1/agents")).await;
     keys(&agents, &["tools"]);
     assert_eq!(
-        agents["tools"],
-        json!(
-            ["amp", "cursor", "claude-code", "codex", "kimi"]
-                .map(|tool| json!({"tool":tool,"status":"not_tracked","note":null}))
-        )
+        agents["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| (&tool["tool"], &tool["status"]))
+            .collect::<Vec<_>>(),
+        vec![
+            (&json!("amp"), &json!("unknown")),
+            (&json!("cursor"), &json!("not_tracked")),
+            (&json!("claude-code"), &json!("unknown")),
+            (&json!("codex"), &json!("unknown")),
+            (&json!("kimi"), &json!("not_tracked"))
+        ]
     );
     let openapi = fetch(&client, &format!("{url}/openapi.json")).await;
     for path in [

@@ -18,6 +18,17 @@ administrator action, not part of development; see the
 [dispatcher README](scripts/dispatch/README.md) for verification gaps, key setup,
 timer installation, recovery and rollback.
 
+## Collector
+
+`scripts/usage/collect.ts` reads Amp usage, Claude's zero-inference `/usage`, and
+ChatGPT/Codex account quota on factory-gpu every 15 minutes. It atomically writes
+a sanitized snapshot for `/v1/agents`; source failures remain independent and
+last-good readings age stale after 45 minutes. Node 24.21.0, no npm dependencies.
+Use `node scripts/usage/collect.ts --dry-run` for a read-only preview. See the
+[collector README](scripts/usage/README.md) for balance units, strict parser
+limits, privacy, fixtures and ordered Mac deployment/rollback commands.
+Deployment is a separate administrator action; no services are installed by tests.
+
 ## Build identity (MET-107 phase 1)
 
 The root `VERSION` file is the single source of truth, initially `0.2.0`.
@@ -448,9 +459,12 @@ Endpoints:
 - `POST /v1/pricing/confirm/{family}`: explicitly confirms the current pending
   selection. Percent-encode spaces. Unknown families return 404; no pending
   selection returns 409. Never called automatically.
-- `GET /v1/agents`: amp, cursor, claude-code, codex and kimi are `not_tracked`.
+- `GET /v1/agents`: Amp, Claude Code and Codex usage from `--usage-snapshot` /
+  `FACTORY_API_USAGE_SNAPSHOT` (default `/var/lib/factory-usage/usage.json`).
+  Missing/invalid snapshots return 200 with unknown tracked tools and a reason.
+  Cursor and Kimi stay `not_tracked`.
 - `GET /v1/stream`: SSE events named `gpu.sample`, `llm.request`, `fleet.change`,
-  and `pricing.changed`, with JSON `{type, ts_ms, data}`. Independent
+  `pricing.changed`, and `agents.usage`, with JSON `{type, ts_ms, data}`. Independent
   `: keepalive` comments run every 15 seconds, even during event traffic.
   Events are live notifications, not replayable history; reconnecting clients
   should fetch snapshots. Lagged subscribers skip missed events with a log warning.

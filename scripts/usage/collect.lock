@@ -1,0 +1,1 @@
+This inode serializes collector runs, including dry-runs. Do not replace it while collecting.

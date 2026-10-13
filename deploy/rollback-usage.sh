@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 0077
+[[ $EUID -eq 0 ]] || { echo 'Run rollback-usage.sh as root on factory-gpu.' >&2; exit 1; }
+trap 'echo "Rollback stopped. Retry: factory-ssh '\''sudo bash /home/agent/work/factory/deploy/rollback-usage.sh'\''" >&2' ERR
+[[ $# -eq 0 ]] || { echo 'Usage: rollback-usage.sh' >&2; exit 1; }
+[[ $(hostname) == factory-gpu ]]
+for command in systemctl install mktemp cp date rm dirname; do command -v "$command" >/dev/null; done
+for path in /var/backups/factory-usage /etc/systemd/system/factory-usage.service /etc/systemd/system/factory-usage.timer; do
+    while [[ "$path" != / ]]; do
+        [[ ! -L "$path" ]]
+        path=$(dirname "$path")
+    done
+done
+[[ ! -e /var/backups/factory-usage || -d /var/backups/factory-usage ]]
+for unit in factory-usage.service factory-usage.timer; do
+    [[ ! -e "/etc/systemd/system/$unit" || -f "/etc/systemd/system/$unit" ]]
+    [[ -z $(systemctl show "$unit" --property=DropInPaths --value) ]]
+done
+install -d -o root -g root -m 0700 /var/backups/factory-usage
+snapshot=$(mktemp -d "/var/backups/factory-usage/rollback-$(date -u +%Y%m%dT%H%M%S).XXXXXX")
+for unit in factory-usage.service factory-usage.timer; do
+    if [[ -f "/etc/systemd/system/$unit" ]]; then cp -p "/etc/systemd/system/$unit" "$snapshot/$unit"; else : > "$snapshot/$unit.missing"; fi
+    systemctl is-enabled "$unit" > "$snapshot/$unit.enabled" 2>/dev/null || true
+    systemctl is-active "$unit" > "$snapshot/$unit.active" 2>/dev/null || true
+done
+if [[ $(systemctl show factory-usage.timer --property=LoadState --value) != not-found ]]; then systemctl disable --now factory-usage.timer; fi
+if [[ $(systemctl show factory-usage.service --property=LoadState --value) != not-found ]]; then systemctl disable --now factory-usage.service; fi
+rm -f /etc/systemd/system/factory-usage.service /etc/systemd/system/factory-usage.timer
+systemctl daemon-reload
+printf 'Usage units removed; usage.json and snapshots retained. Snapshot: %s\n' "$snapshot"

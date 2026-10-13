@@ -149,7 +149,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
     match path {
         "/v1/health" => health(&state).into_response(),
         "/v1/fleet" => fleet(&state).await.into_response(),
-        "/v1/agents" => agents().into_response(),
+        "/v1/agents" => agents(&state).await.into_response(),
         "/openapi.json" => Json(ApiDoc::openapi()).into_response(),
         "/v1/stream" => stream(&state).into_response(),
         "/v1/gpu" => match range(&request, true) {
@@ -241,17 +241,8 @@ async fn fleet(state: &AppState) -> Json<Fleet> {
     Json(state.fleet.read().await.clone())
 }
 #[utoipa::path(get, path="/v1/agents", responses((status=200, body=Agents)))]
-fn agents() -> Json<Agents> {
-    Json(Agents {
-        tools: ["amp", "cursor", "claude-code", "codex", "kimi"]
-            .into_iter()
-            .map(|tool| AgentTool {
-                tool: tool.into(),
-                status: "not_tracked".into(),
-                note: None,
-            })
-            .collect(),
-    })
+async fn agents(state: &AppState) -> Json<Agents> {
+    Json(crate::usage::read(&state.usage_snapshot).await)
 }
 #[utoipa::path(get, path="/v1/stream", responses((status=200, content_type="text/event-stream", body=StreamEvent)))]
 fn stream(

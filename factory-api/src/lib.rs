@@ -3,6 +3,7 @@ pub mod data;
 pub mod fleet;
 mod kiosk;
 pub mod pool;
+mod usage;
 
 use anyhow::Result;
 use serde::de::DeserializeOwned;
@@ -31,6 +32,7 @@ pub struct AppState {
     pub db_path: PathBuf,
     pub pricing_db_path: PathBuf,
     pub static_dir: PathBuf,
+    pub usage_snapshot: PathBuf,
     pub config: Arc<fleet::Config>,
     pub client: reqwest::Client,
     pub pricing_sources: [String; 2],
@@ -77,6 +79,7 @@ impl AppState {
             db_path,
             pricing_db_path,
             static_dir: "/var/lib/factory-api/kiosk".into(),
+            usage_snapshot: "/var/lib/factory-usage/usage.json".into(),
             config: Arc::new(config),
             client,
             pricing_sources: [pricing::OPENROUTER_URL.into(), pricing::LITELLM_URL.into()],
@@ -457,7 +460,7 @@ impl AppState {
             .await
     }
     pub fn start_collectors(&self) -> Vec<tokio::task::JoinHandle<()>> {
-        let mut tasks = Vec::new();
+        let mut tasks = vec![self.start_usage_collector()];
         if self.disable_pricing_collector {
             tracing::info!(
                 "pricing collector disabled; manual refresh and confirmation remain enabled"

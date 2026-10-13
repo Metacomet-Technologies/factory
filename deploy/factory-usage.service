@@ -1,0 +1,18 @@
+[Unit]
+Description=Collect Amp, Claude and Codex usage
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=agent
+Group=factory-api
+WorkingDirectory=/home/agent/work
+Environment=HOME=/home/agent
+Environment="PATH=@PATH@"
+ExecStart=@NODE@ /home/agent/work/factory/scripts/usage/collect.ts
+NoNewPrivileges=true
+TimeoutStartSec=5min
+UMask=0027
+StandardOutput=journal
+StandardError=journal

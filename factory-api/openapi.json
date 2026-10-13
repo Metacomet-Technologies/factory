@@ -1,9 +1,92 @@
 {
   "components": {
     "schemas": {
+      "AgentBalance": {
+        "properties": {
+          "amount": {
+            "description": "Decimal strings preserve provider precision; amount equals remaining.",
+            "type": "string"
+          },
+          "remaining": {
+            "type": "string"
+          },
+          "total": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unit": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "amount",
+          "unit",
+          "remaining"
+        ],
+        "type": "object"
+      },
       "AgentTool": {
         "properties": {
+          "balance": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AgentBalance",
+                "description": "Primary balance; the first item in balances, not an additional pool."
+              }
+            ]
+          },
+          "balances": {
+            "description": "Amp has independent USD and normalized orb-hour pools. Never sum units.",
+            "items": {
+              "$ref": "#/components/schemas/AgentBalance"
+            },
+            "type": "array"
+          },
+          "cli_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "observed_at_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "plan": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reset_credits_available": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source": {
             "type": [
               "string",
               "null"
@@ -14,11 +97,50 @@
           },
           "tool": {
             "type": "string"
+          },
+          "windows": {
+            "items": {
+              "$ref": "#/components/schemas/AgentWindow"
+            },
+            "type": "array"
           }
         },
         "required": [
           "tool",
-          "status"
+          "status",
+          "windows",
+          "balances"
+        ],
+        "type": "object"
+      },
+      "AgentWindow": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "resets_at_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "used_percent": {
+            "format": "double",
+            "type": "number"
+          },
+          "window_minutes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "used_percent"
         ],
         "type": "object"
       },
