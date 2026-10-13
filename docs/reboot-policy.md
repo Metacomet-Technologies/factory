@@ -66,9 +66,11 @@ The verified procps empty-selection result is exit 1 with empty stdout/stderr;
 that is idle. Errors with diagnostics, other exit codes, and malformed rows skip.
 
 Both repository configs remove the old full-argv runner and plugin regexes.
-GPU retains `op daemon`, the idle 1Password background process, as an additional
-allowlist rule. Console has no additional allowlist rules. Inspection shells
-and `ps` processes remain work, not idle.
+GPU retains `op daemon`, the idle 1Password background process, and the idle
+Codex `app-server --managed-daemon` helper started by usage collection, as
+additional allowlist rules. Its versioned release path is matched as a pattern;
+`codex exec` remains work. Console has no additional allowlist rules. Inspection
+shells and `ps` processes remain work, not idle.
 
 From the Mac, inspect and edit each node separately:
 
