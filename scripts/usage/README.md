@@ -39,7 +39,9 @@ ceiling. Stderr is discarded. Failures expose fixed diagnostics, never raw CLI
 output or exception text. The collector kills only its own probe process group.
 
 * **Amp:** `amp usage` each pass. `amp usage --details` attempts at most hourly,
-  including failed attempts, tracked in `amp_details.attempted_at_ms`. The summary
+  except that a CLI version change triggers immediate validation. Every attempt,
+  including a forced or failed one, restarts the hourly backoff tracked in
+  `amp_details.attempted_at_ms`. The summary
   and two pool tables have strict label/unit/row patterns. No token, model-cost,
   daily-cost or thread tables are collected: these overlap and contain identities.
   Pool details are validated, not substituted for the net summary balances.
@@ -74,7 +76,10 @@ New versions with unchanged output remain supported; output-format changes
 produce status `unknown` with reason `format changed`.
 
 Normal scheduled Amp usage is five account requests/hour. No thread lookups or
-automatic retries. All readers share Amp's 60/hour limit. Manual dry-runs count
+automatic retries. A CLI update adds a details request to that pass (at most
+eight account requests/hour with an update on every scheduled pass), counted
+within the shared 60/hour budget, not exempt from it. All readers share Amp's
+60/hour limit. Manual dry-runs count
 against that budget: they read existing scheduling metadata but **never persist
 it**, so repeated dry-runs without an existing snapshot can each read details.
 Do not run repeated manual probes hourly. The existing lock serializes full
@@ -87,6 +92,12 @@ committed `collect.lock`; before deployment they use their local inode.
 `generated_at_ms`, private scheduling metadata `amp_details`, and `tools`.
 The API returns only `{tools}`. Entries stay ordered amp, cursor, claude-code,
 codex, kimi. Existing `tool`, `status`, `note` fields remain; note is null.
+
+`FACTORY_USAGE_SNAPSHOT` overrides the collector's snapshot path for both reads
+and writes, including scheduling reads during `--dry-run`. The production default
+is unchanged. Tests always use temporary paths; no test reads or writes `/var/lib`.
+The parent directory must already exist. CI runs both Node suites with the pinned
+Node 24.21.0 runtime: `node --test scripts/dispatch scripts/usage`.
 
 Each tracked entry adds `reason`, `observed_at_ms`, `source`, `cli_version`,
 nullable `plan`, `windows`, nullable `balance`, `balances`, and nullable
@@ -205,6 +216,21 @@ factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh /
 
 The prior collector cannot parse this CLI format, so rollback restores the
 previous stale/unknown behavior rather than making Amp live.
+
+## MET-142 upgrade and rollback (from Mac)
+
+Devon merges this self-deploying change. The wrap-up pull updates the collector
+in `/home/agent/work/factory`; CI uses the new Node test step on merge. No unit
+reinstall, service restart, console change, migration or deploy artifact is needed.
+After the wrap-up handoff, verify once:
+
+```sh
+factory-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && node scripts/usage/collect.ts --dry-run"'
+```
+
+Rollback requires a reviewed revert PR and its wrap-up pull, not a reset of main.
+After that handoff, run the same command above. This restores the old hourly
+CLI-version mismatch behavior; snapshots and units remain unchanged.
 
 ## Checks
 

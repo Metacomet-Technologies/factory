@@ -129,6 +129,39 @@ test('Amp details attempts are at most hourly, including failures', async () => 
   assert.equal(snapshot.amp_details.attempted_at_ms, now + 3_600_000);
 });
 
+test('Amp CLI updates refresh details immediately and restart hourly backoff, including failures', async () => {
+  const previous = await collect(null, fixtureRun, now);
+  const cliVersion = '0.0.1791864325-g52e626';
+  for (const output of [detailsNew, 'unexpected details format']) {
+    let calls = 0;
+    const run = async (program, args) => {
+      if (program !== 'amp') return fixtureRun(program, args);
+      if (args[0] === '--version') return `${cliVersion} (released 2026-10-13T04:05:25.000Z, 2h ago)`;
+      if (args.includes('--details')) { calls++; return output; }
+      return ampNew;
+    };
+    const refreshedAt = now + 15 * 60_000;
+    let snapshot = await collect(previous, run, refreshedAt);
+    assert.equal(calls, 1);
+    assert.equal(snapshot.amp_details.cli_version, cliVersion);
+    assert.equal(snapshot.amp_details.attempted_at_ms, refreshedAt);
+    const a = snapshot.tools[0];
+    assert.equal(a.status, output === detailsNew ? 'ok' : 'unknown');
+    assert.equal(a.reason, output === detailsNew ? null : FORMAT_CHANGED);
+    assert.deepEqual(a.balances, output === detailsNew ? [
+      { amount: '170.30', remaining: '170.30', total: '200', unit: 'usd' },
+      { amount: '997.4', remaining: '997.4', total: '1000', unit: 'orb_hours' },
+      { amount: '0', remaining: '0', total: null, unit: 'usd', label: 'workspace metacomet' },
+    ] : []);
+    // The forced attempt counts against scheduling, not an extra hourly allowance.
+    for (const minutes of [15, 45, 59]) snapshot = await collect(snapshot, run, refreshedAt + minutes * 60_000);
+    assert.equal(calls, 1);
+    snapshot = await collect(snapshot, run, refreshedAt + 60 * 60_000);
+    assert.equal(calls, 2);
+    assert.equal(snapshot.amp_details.attempted_at_ms, refreshedAt + 3_600_000);
+  }
+});
+
 test('process timeout and output cap return fixed diagnostics', async () => {
   await assert.rejects(command(process.execPath, ['-e', 'setInterval(()=>{},1000)'], 100), { message: 'timeout' });
   await assert.rejects(command('/missing-private-cli', []), { message: 'CLI missing' });
@@ -214,11 +247,28 @@ test('CLI dry-run writes nothing and logs only sanitized snapshot using fake bin
       const script = program === 'codex' ? `if(process.argv[2]==='--version') console.log('codex-cli 0.162.1'); else {require('node:readline').createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l); if(m.id===1) console.log(JSON.stringify({id:1,result:{}})); if(m.id===2) console.log(${JSON.stringify(JSON.stringify(codex))});});}` : `const o=${JSON.stringify(output)}; console.error('private-secret'); console.log(process.argv[2]==='--version'?o.version:process.argv.includes('--details')?o.details:o.summary);`;
       await writeFile(join(dir, program), `#!${process.execPath}\n${script}\n`, { mode: 0o700 });
     }
-    const result = spawnSync(process.execPath, ['scripts/usage/collect.ts', '--dry-run'], { cwd: fileURLToPath(new URL('../..', import.meta.url)), env: { HOME: dir, PATH: `${dir}:/usr/bin:/bin` }, encoding: 'utf8', timeout: 5000 });
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stderr, ''); assert.doesNotMatch(result.stdout, /private-|redacted@|tokens|prompt/);
-    assert.deepEqual(JSON.parse(result.stdout).tools.map(t => t.status), ['ok', 'not_tracked', 'ok', 'ok', 'not_tracked']);
-    assert.deepEqual((await readdir(dir)).sort(), ['amp', 'claude', 'codex']);
+    const path = join(dir, 'usage.json');
+    const env = { HOME: dir, PATH: `${dir}:/usr/bin:/bin`, FACTORY_USAGE_SNAPSHOT: path };
+    const invoke = (args: string[]) => spawnSync(process.execPath, ['scripts/usage/collect.ts', ...args], { cwd: fileURLToPath(new URL('../..', import.meta.url)), env, encoding: 'utf8', timeout: 5000 });
+    for (const cachedVersion of [null, '0.0.1791763306-ged595a', '0.0.1791849701-g1448da']) {
+      if (cachedVersion) await writeFile(path, JSON.stringify({
+        schema_version: 1, tools: [],
+        amp_details: { attempted_at_ms: Date.now(), reason: null, cli_version: cachedVersion },
+      }));
+      const before = cachedVersion ? await readFile(path, 'utf8') : null;
+      const result = invoke(['--dry-run']);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stderr, ''); assert.doesNotMatch(result.stdout, /private-|redacted@|tokens|prompt/);
+      assert.deepEqual(JSON.parse(result.stdout).tools.map(t => t.status), ['ok', 'not_tracked', 'ok', 'ok', 'not_tracked']);
+      if (before === null) assert.deepEqual((await readdir(dir)).sort(), ['amp', 'claude', 'codex']);
+      else assert.equal(await readFile(path, 'utf8'), before);
+    }
+    const written = invoke([]);
+    assert.equal(written.status, 0, written.stderr);
+    assert.equal(written.stdout, '');
+    assert.equal(written.stderr, '');
+    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')).tools.map(t => t.status), ['ok', 'not_tracked', 'ok', 'ok', 'not_tracked']);
+    assert.deepEqual((await readdir(dir)).sort(), ['amp', 'claude', 'codex', 'usage.json']);
     assert.deepEqual(CLAUDE_ARGS, ['-p', '/usage', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '', '--no-session-persistence', '--output-format', 'stream-json', '--verbose', '--prompt-suggestions', 'false']);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

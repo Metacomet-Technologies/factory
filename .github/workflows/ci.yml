@@ -97,6 +97,11 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: scripts/dispatch/.node-version
+      - name: Test dispatcher and usage collector
+        run: node --test scripts/dispatch scripts/usage
       - name: Install script check dependencies
         run: |
           sudo apt-get update
