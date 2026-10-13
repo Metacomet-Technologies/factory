@@ -277,6 +277,7 @@ test('full fake-server poll: dispatch, prompt contract, Linear state, and manual
   assert.equal(args[1].split('\n')[0], '**Thread title:** Use the Linear ticket identifier and title: `MET-123 — Build the useful widget today`.');
   assert.doesNotMatch(args[1], /GH_TOKEN/);
   assert.ok(args[1].includes("GitHub auth is preconfigured for agent (gh + git credential helper); don't set GitHub token environment variables or run gh auth commands. If `gh auth status` fails, stop and report."));
+  assert.ok(args[1].includes("Push, open the PR. Then subscribe this thread to your PR's comments and reviews, and to CI for its exact head commit; after every later push, subscribe to CI for the new head commit. If subscribing fails, note the error in your final reply and continue; subscriptions are optional feedback."));
   for (const text of ['git -C ~/work/factory fetch origin', 'git -C ~/work/factory worktree add -b met-123-build-the-useful-widget ~/work/factory-met-123-build-the-useful-widget origin/main', 'Never reuse or overwrite', 'Contributes MET-123', 'cargo fmt --check', 'cargo clippy --all-targets -- -D warnings', 'cargo test --workspace', 'vp check', 'factory-ssh', 'console-ssh', 'Never deploy']) assert.ok(args[1].includes(text), text);
   for (const text of [
     'Use the already-connected Linear MCP server', 'report their names without calling a write tool',
