@@ -4,3 +4,5 @@
 *.db-wal
 __pycache__/
 .sandbox/
+.amp/portals/
+.amp/in/artifacts/

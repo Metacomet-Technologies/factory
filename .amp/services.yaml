@@ -1,0 +1,9 @@
+services:
+  kiosk:
+    cwd: kiosk
+    command: vp run mock-dev
+    port: 4181
+    health: /v1/health
+    portal:
+      title: Factory kiosk (synthetic)
+      description: Mock data only; no production services or credentials.
