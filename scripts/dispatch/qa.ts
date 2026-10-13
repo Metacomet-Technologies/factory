@@ -221,11 +221,11 @@ export async function reviewPRs(ctx: Context) {
       if (verdict(issue, key)?.value === 'changes') {
         const deliveredAt = issue.comments.find(c => commentMarkers(c.body).includes(qa(`round ${key}`)))?.createdAt;
         // Evidence is data for a fresh reviewer, never instructions for the dispatcher.
-        const newerDiff = issue.comments.some(c => Date.parse(c.createdAt ?? '') > Date.parse(deliveredAt ?? '')
+        const newerEvidence = issue.comments.some(c => Date.parse(c.createdAt ?? '') > Date.parse(deliveredAt ?? '')
           && new RegExp(`https://github.com/${config.repository}/pull/${pr}(?:\\s|[)/]|$)`).test(c.body)
-          && new RegExp(`\\b${sha}\\b`).test(c.body) && /(?:`{3,}|~{3,})(?:diff|text|rust|typescript|ts|sh)\b/.test(c.body)
+          && new RegExp(`\\b${sha}\\b`).test(c.body) && /(?:`{3,}|~{3,})(?:diff|text|rust|typescript|ts|sh)\b|^\s*[-*]\s+\S+/m.test(c.body)
           && commentMarkers(c.body).length === 0);
-        if (!newerDiff) continue;
+        if (!newerEvidence) continue;
         key += ' round:2';
       }
       if (has(issue, `human ${key}`) || has(issue, `retired ${key}`)) continue;

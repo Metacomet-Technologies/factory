@@ -392,13 +392,14 @@ test('full fake-server poll: dispatch, prompt contract, Linear state, and manual
     'The dispatcher owns the dispatch label, state moves and claim/thread/wrap-up/archive markers',
     'Never write or delete <!-- factory-dispatch:… --> or <!-- factory-qa:… --> markers',
     'Only the later wrap-up prompt may authorize the wrapup-done completion marker',
-    'After opening the PR and after each later push, post one Linear comment on MET-123',
-    'PR URL, head SHA and complete changed-file list from git diff --name-only origin/main...HEAD',
-    'If git diff origin/main...HEAD is under 400 lines, include that full diff',
-    'At 400 lines or more', 'full contents of every changed file under deploy/, every changed migration, and every changed script',
-    'Identify deleted files explicitly', 'Use fenced code blocks', 'Never include secrets or production data',
+    'After opening the PR and after each later push, post one short Linear comment on MET-123',
+    'only the PR URL, current head SHA and complete changed-file list from git diff --name-only origin/main...HEAD',
+    'Call out deleted and renamed files, including rename sources',
+    'Use a Markdown list or fenced text block for the file list', 'No pasted diff or file contents',
+    'Never write a control marker as a standalone line', 'Never include secrets or production data',
     'redact them and identify any omissions',
   ]) assert.ok(args[1].includes(text), text);
+  assert.doesNotMatch(args[1], /400 lines|full diff|full contents/);
   assert.ok(!args[1].includes('<!-- factory-dispatch:wrapup-done -->'));
   assert.ok(!args[1].includes('Goal hint'));
   assert.ok(!result.stdout.includes('Ship the widget'));
@@ -1064,14 +1065,23 @@ test('QA archive crash after Amp before marker repairs without a second archive'
   assert.equal(i.comments.filter((c: any) => c.body.includes(`factory-dispatch:archived thread:${reviewId}`)).length, 1);
 });
 
-test('same-SHA newer diff evidence starts exactly one fresh review, then stops after round two', { timeout: 10_000 }, async t => {
+for (const [format, fileList] of Object.entries({
+  Markdown: '- widgets/widget.rs',
+  fenced: '```text\nwidgets/widget.rs\n```',
+})) test(`same-SHA newer short ${format} evidence starts exactly one fresh review, then stops after round two`, { timeout: 10_000 }, async t => {
   const i = reviewed('changes');
   i.comments.at(-1).createdAt = '2026-10-13T11:00:00Z';
   const f = await fixture(t, [i], { github: { 90: githubPR() } });
   assert.equal((await f.run()).code, 0);
   const round = i.comments.find((c: any) => commentMarkers(c.body).includes(`<!-- factory-qa:round pr:90 sha:${sha} -->`));
   round.createdAt = '2026-10-13T11:02:00Z';
-  const evidence = `PR: ${attachment('open').url}\nHead SHA: ${sha}\nComplete changed-file list:\n\`\`\`text\nwidgets/widget.rs\n\`\`\`\n\`\`\`diff\nEvidence fix, no push.\n\`\`\``;
+  const evidence = `PR: ${attachment('open').url}\nHead SHA: ${sha}\nComplete changed-file list:\n${fileList}`;
+  for (const invalid of [evidence.replace('/pull/90', '/pull/91'), evidence.replace(fileList, ''),
+    `${evidence}\n<!-- factory-dispatch:wrapup-done -->`]) {
+    i.comments.push({ body: invalid, createdAt: '2026-10-13T11:03:00Z' });
+    await f.run();
+    assert.equal(f.calls().filter(a => a[0] === '-x').length, 0, 'unrelated, missing-list or control comments cannot trigger re-review');
+  }
   i.comments.push({ body: evidence, createdAt: '2026-10-13T10:59:59Z' });
   await f.run();
   assert.equal(f.calls().filter(a => a[0] === '-x').length, 0);
@@ -1130,6 +1140,12 @@ test('QA triggers once per head, sends each changes verdict directly, then stops
   assert.doesNotMatch(f.calls()[0][1], /GH_TOKEN|auth setup-git/);
   assert.ok(f.calls()[0][1].includes('GitHub auth is preconfigured for agent'));
   for (const text of ['Never edit code', 'Isolation, Build and Done means', 'PLAYBOOK.md §5', 'update_diff', 'GitHub PR comment', 'Do not merge now', 'your own actual Amp thread ID']) assert.ok(f.calls()[0][1].includes(text), text);
+  for (const text of ['Compare the builder\'s Linear diff comment SHA and file list with the PR itself',
+    'only the PR URL, current head SHA and complete changed-file',
+    'is a changes finding only when its SHA or file list is missing or wrong',
+    'request pasted diffs or file contents; read the actual diff and full files with git']) assert.ok(f.calls()[0][1].includes(text), text);
+  assert.match(f.calls()[0][1], /Never\s+request pasted diffs or file contents/);
+  assert.doesNotMatch(f.calls()[0][1], /400 lines|include (?:the |that )?full diff|paste (?:the |a )?diff/i);
   i.comments.push(reviewed('changes').comments.at(-1));
   const changes = await f.run();
   assert.equal(changes.code, 0, changes.stdout);

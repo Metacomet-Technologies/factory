@@ -138,9 +138,11 @@ threads use the shared archive path described below, including legacy claims.
 
 After a delivered changes round, a Linear diff comment newer than the round's
 delivery comment can trigger one fresh review without a push. It must contain
-the same PR URL, head SHA and fenced evidence (diff/text/rust/typescript/ts/sh),
-with no standalone control markers. The dispatcher
-does not execute this evidence; the reviewer checks it. The new key appends
+the same PR URL, head SHA and file list (Markdown list or fenced text block),
+with no standalone control markers. Legacy fenced evidence is still accepted.
+The dispatcher does not execute this evidence; the reviewer checks the SHA and
+complete file list against the PR, then reads the actual diff and files with git.
+The new key appends
 `round:2` after the SHA in start, claim, verdict and completion markers. Its
 worktree appends `-round-2`, so a retained first checkout is never reused.
 Repeated polls or comments cannot start another review for that key. Both new
@@ -252,14 +254,15 @@ markers count. All dispatcher-written markers already occupy standalone unfenced
 lines; their output format is unchanged. Future QA consumers must use the shared
 `commentMarkers` parser, not raw comment substring or regex searches.
 
-After opening the PR and after each later push, post one Linear comment on the
-task issue with the PR URL, head SHA and complete file list from
-`git diff --name-only origin/main...HEAD`. If `git diff origin/main...HEAD` is
-under 400 lines, include the full diff. At 400 lines or more, include the file
-list plus the full contents of every changed file under `deploy/`, every changed
-migration, and every changed script. Identify deleted files explicitly. Use
-fenced code blocks; never include secrets or production data. Redact them and
-identify any omissions. Reviewers must match the comment's SHA to the PR head.
+After opening the PR and after each later push, post one short Linear comment
+on the task issue with only the PR URL, current head SHA and complete file list
+from `git diff --name-only origin/main...HEAD`. Call out deleted and renamed
+files, including rename sources. Use a Markdown list or fenced text block for
+the file list. No pasted diff or file contents. Never write a control marker as
+a standalone line; never include secrets or production data. Redact them and
+identify any omissions. Reviewers must match the comment's SHA and file list to
+the PR. A missing or stale evidence comment is a `changes` finding only when its
+SHA or file list is missing or wrong, never a reason to request pasted diffs.
 
 Only after all wrap-up steps succeed, the wrap-up prompt authorizes one comment
 on the task issue with exactly this body:
