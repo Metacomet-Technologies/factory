@@ -9,7 +9,8 @@ export const modes = {
   chatgpt: { low: 'gpt56l', medium: 'gpt61s', high: 'gpt61s' },
 };
 const marker = (name: string) => `<!-- factory-dispatch:${name} -->`;
-const threadPattern = /<!-- factory-dispatch:thread (T-[a-f0-9-]{36})(?: runner:(gpu|console))? -->/;
+const threadPattern = /^<!-- factory-dispatch:thread (T-[a-f0-9-]{36})(?: runner:(gpu|console))? -->$/;
+const claimPattern = /^<!-- factory-dispatch:claim runner:(gpu|console) -->$/;
 const headings = ['Goal', 'Link type', 'Context', 'Isolation', 'Build', 'Tests', 'Sandbox check', 'Deploy artifacts', 'Done means'];
 const required = ['Goal', 'Context', 'Isolation', 'Build', 'Sandbox check', 'Done means'];
 type Label = { id: string; name: string; parent?: { name: string } | null };
@@ -21,6 +22,23 @@ type Issue = {
   inverseRelations: { type: string; issue: { identifier: string; state: { type: string } } }[];
   attachments: { url: string; metadata: Record<string, unknown>; createdAt: string }[];
 };
+
+export function commentMarkers(body: string) {
+  const markers: string[] = [];
+  let fence = '';
+  for (const raw of body.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (fence) {
+      const closing = line.match(/^(`{3,}|~{3,})$/)?.[1];
+      if (closing && closing[0] === fence[0] && closing.length >= fence.length) fence = '';
+      continue;
+    }
+    const opening = line.match(/^(`{3,}|~{3,})/)?.[1];
+    if (opening) fence = opening;
+    else if (/^<!-- factory-(?:dispatch|qa):[^<>]+ -->$/.test(line)) markers.push(line);
+  }
+  return markers;
+}
 
 export function sections(description: string | null) {
   const result: Record<string, string> = {};
@@ -86,11 +104,21 @@ Use closes only if the PR finishes the issue; otherwise use contributes.
 
 ${headings.map(name => `## ${name}\n${content[name] || (name === 'Tests' ? tests : name === 'Link type' ? 'contributes' : name === 'Deploy artifacts' ? "Write them, don't run them." : '')}`).join('\n\n')}
 
+## Linear MCP rules
+Use the already-connected Linear MCP server. First verify Linear tools are available and report their names without calling a write tool. If unavailable, stop and report; do not work around it or change MCP settings.
+You may read issues, comment progress on your own issue ${issue.identifier}, link your PR, and create follow-up issues in Backlog related to ${issue.identifier}.
+Never change any existing issue's status, labels, assignee or priority; never edit other issues. Backlog is allowed only when creating a follow-up.
+The dispatcher owns the dispatch label, state moves and claim/thread/wrap-up/archive markers. Never write or delete <!-- factory-dispatch:… --> or <!-- factory-qa:… --> markers. Only the later wrap-up prompt may authorize the wrapup-done completion marker.
+After opening the PR and after each later push, post one Linear comment on ${issue.identifier} with the PR URL, head SHA and complete changed-file list from git diff --name-only origin/main...HEAD.
+If git diff origin/main...HEAD is under 400 lines, include that full diff. At 400 lines or more, include the file list plus the full contents of every changed file under deploy/, every changed migration, and every changed script. Identify deleted files explicitly; do not omit them silently.
+Use fenced code blocks for diffs and file contents. Never include secrets or production data; redact them and identify any omissions.
+
 Push, open the PR, and reply with test results, deviations, anything unverified, and exact Mac deploy/rollback commands using factory-ssh or console-ssh and full /home/agent/work/factory paths. Never deploy. Merge and deploy remain Devon's gates.`;
 }
 
 export function wrapupPrompt(issue: Issue) {
-  const branch = issue.comments.map(comment => comment.body.match(/<!-- factory-dispatch:worktree ([a-z0-9-]+) -->/)).find(Boolean)?.[1] ?? slug(issue.identifier, issue.title);
+  const branch = issue.comments.flatMap(comment => commentMarkers(comment.body))
+    .map(line => line.match(/^<!-- factory-dispatch:worktree ([a-z0-9-]+) -->$/)).find(Boolean)?.[1] ?? slug(issue.identifier, issue.title);
   return `export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git
 Confirm the linked PR for ${issue.identifier} is merged. Stop and report if it is not.
 Update and build in the main checkout /home/agent/work/factory, as agent, without sudo.
@@ -101,7 +129,15 @@ Remove this thread's worktree and local branch only after checking for unpushed 
 git -C /home/agent/work/factory worktree remove /home/agent/work/factory-${branch}
 git -C /home/agent/work/factory branch -D ${branch}
 Reply with exact Mac install/verify commands using factory-ssh or console-ssh and full /home/agent/work/factory paths.
-Never deploy. One deploy per runner at a time. Devon owns deployment verification and marking the issue Done. The dispatcher archives this thread after Done and five quiet minutes; if verification fails, fix it in this thread from a fresh worktree.`;
+Never deploy. One deploy per runner at a time. Devon owns deployment verification and marking the issue Done. The dispatcher archives this thread after Done and five quiet minutes; if verification fails, fix it in this thread from a fresh worktree.
+Use the already-connected Linear MCP server; verify tools are available and report their names without calling a write tool first. If unavailable, stop and report; do not work around it or change MCP settings.
+You may read issues, comment progress on your own issue ${issue.identifier}, link your PR, and create follow-up issues in Backlog related to ${issue.identifier}.
+Never change any existing issue's status, labels, assignee or priority; never edit other issues. Backlog is allowed only when creating a follow-up.
+Never write or delete <!-- factory-dispatch:… --> or <!-- factory-qa:… --> markers except the completion marker explicitly authorized below. Never include secrets or production data.
+Only after all wrap-up steps succeed, post a Linear comment on ${issue.identifier} with exactly this body (the sole marker exception; not deployment verification):
+Wrap-up finished
+
+<!-- factory-dispatch:wrapup-done -->`;
 }
 
 // ponytail: Linear documents metadata as arbitrary JSON, not GitHub's keys.
@@ -202,8 +238,8 @@ export async function run(command: string, identifier: string | undefined, dryRu
     await mutate(issue, 'mutation RemoveLabel($id: String!, $labelId: String!) { issueRemoveLabel(id: $id, labelId: $labelId) { success } }', { id: issue.id, labelId: label.id });
     issue.labels = issue.labels.filter(value => value.id !== label.id);
   }
-  const has = (issue: Issue, name: string) => issue.comments.some(comment => comment.body.includes(marker(name)));
-  const thread = (issue: Issue) => issue.comments.map(comment => comment.body.match(threadPattern)).find(Boolean);
+  const has = (issue: Issue, name: string) => issue.comments.some(comment => commentMarkers(comment.body).includes(marker(name)));
+  const thread = (issue: Issue) => issue.comments.flatMap(comment => commentMarkers(comment.body)).map(line => line.match(threadPattern)).find(Boolean);
   function showAmp(issue: Issue, args: string[]) {
     // Exact argv except prompt text: printing full prompts would leak issue content.
     log('would-run', { issue: issue.identifier, command: args.map(value => `'${value.replaceAll("'", "'\\''")}'`).join(' ') });
@@ -224,7 +260,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
   for (const issue of issues) {
     if (has(issue, 'wrapup')) continue;
     const match = thread(issue);
-    const claim = issue.comments.map(comment => comment.body.match(/<!-- factory-dispatch:claim runner:(gpu|console) -->/)).find(Boolean);
+    const claim = issue.comments.flatMap(comment => commentMarkers(comment.body)).map(line => line.match(claimPattern)).find(Boolean);
     const runner = match?.[2] ?? claim?.[1];
     if (runner) active[runner]++;
     else if (match) { active.gpu++; active.console++; }
@@ -248,7 +284,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
     const overflow = !issue.labels.some(label => label.parent?.name === 'runner' || label.name.startsWith('runner/')) && active.gpu >= cap;
     const runner = overflow ? 'console' : requestedRunner;
     if (active[runner] >= cap) { log('capacity', { issue: issue.identifier, runner }); continue; }
-    if (thread(issue) || issue.comments.some(comment => /<!-- factory-dispatch:claim runner:/.test(comment.body))) {
+    if (thread(issue) || issue.comments.some(comment => commentMarkers(comment.body).some(line => line.startsWith('<!-- factory-dispatch:claim runner:')))) {
       log('already-claimed', { issue: issue.identifier });
       await removeLabel(issue);
       continue;
@@ -279,7 +315,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
     const match = thread(issue);
     if (!match || has(issue, 'wrapup')) continue;
     if (has(issue, 'wrapup-claim')) { log('wrapup-claimed', { issue: issue.identifier }); continue; }
-    const claim = issue.comments.find(comment => /<!-- factory-dispatch:claim runner:(gpu|console) -->/.test(comment.body));
+    const claim = issue.comments.find(comment => commentMarkers(comment.body).some(line => claimPattern.test(line)));
     if (!issue.attachments.some(attachment => isMergedGitHubPR(attachment)
       && Date.parse(attachment.createdAt) > Date.parse(claim?.createdAt ?? ''))) {
       log('awaiting-merge', { issue: issue.identifier }); continue;

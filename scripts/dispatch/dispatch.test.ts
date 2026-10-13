@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { sections, slug, prompt, validate, isMergedGitHubPR } from './dispatch.ts';
+import { sections, slug, prompt, validate, isMergedGitHubPR, commentMarkers } from './dispatch.ts';
 
 const executable = fileURLToPath(new URL('dispatch.ts', import.meta.url));
 const threadId = 'T-01234567-89ab-4cde-8fab-0123456789ab';
@@ -184,6 +184,24 @@ test('full fake-server poll: dispatch, prompt contract, Linear state, and manual
   assert.deepEqual(args.slice(2), ['--mode', 'medium', '--executor', 'runner:factory-gpu', '--runner-dir', '/home/agent/work', '--title', 'MET-123 — Build the useful widget today', '--visibility', 'private', '--no-archive-after-execute']);
   assert.equal(args[1].split('\n')[0], '**Thread title:** Use the Linear ticket identifier and title: `MET-123 — Build the useful widget today`.');
   for (const text of ['export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git', 'git -C ~/work/factory fetch origin', 'git -C ~/work/factory worktree add -b met-123-build-the-useful-widget ~/work/factory-met-123-build-the-useful-widget origin/main', 'Never reuse or overwrite', 'Contributes MET-123', 'cargo fmt --check', 'cargo clippy --all-targets -- -D warnings', 'cargo test --workspace', 'vp check', 'factory-ssh', 'console-ssh', 'Never deploy']) assert.ok(args[1].includes(text), text);
+  for (const text of [
+    'Use the already-connected Linear MCP server', 'report their names without calling a write tool',
+    'If unavailable, stop and report', 'do not work around it or change MCP settings',
+    'read issues, comment progress on your own issue MET-123, link your PR',
+    'create follow-up issues in Backlog related to MET-123',
+    "Never change any existing issue's status, labels, assignee or priority; never edit other issues",
+    'Backlog is allowed only when creating a follow-up',
+    'The dispatcher owns the dispatch label, state moves and claim/thread/wrap-up/archive markers',
+    'Never write or delete <!-- factory-dispatch:… --> or <!-- factory-qa:… --> markers',
+    'Only the later wrap-up prompt may authorize the wrapup-done completion marker',
+    'After opening the PR and after each later push, post one Linear comment on MET-123',
+    'PR URL, head SHA and complete changed-file list from git diff --name-only origin/main...HEAD',
+    'If git diff origin/main...HEAD is under 400 lines, include that full diff',
+    'At 400 lines or more', 'full contents of every changed file under deploy/, every changed migration, and every changed script',
+    'Identify deleted files explicitly', 'Use fenced code blocks', 'Never include secrets or production data',
+    'redact them and identify any omissions',
+  ]) assert.ok(args[1].includes(text), text);
+  assert.ok(!args[1].includes('<!-- factory-dispatch:wrapup-done -->'));
   assert.ok(!args[1].includes('Goal hint'));
   assert.ok(!result.stdout.includes('Ship the widget'));
   assert.deepEqual(f.mutations.map(m => m.operation), ['RemoveLabel', 'Comment', 'Comment', 'Move']);
@@ -196,6 +214,88 @@ test('full fake-server poll: dispatch, prompt contract, Linear state, and manual
   await f.run();
   assert.equal(labeled(f.issues[0]), false);
   assert.equal(f.calls().length, 1);
+});
+
+test('only standalone unfenced marker lines count, including future QA markers', () => {
+  const markers = [
+    '<!-- factory-dispatch:claim runner:gpu -->',
+    `<!-- factory-dispatch:thread ${threadId} runner:gpu -->`,
+    '<!-- factory-dispatch:worktree met-123-quoted-worktree -->',
+    ...['waiting', 'invalid', 'wrapup-claim', 'wrapup', 'wrapup-done', 'archive-claim', 'archived']
+      .map(name => `<!-- factory-dispatch:${name} -->`),
+    '<!-- factory-qa:passed -->', '<!-- factory-qa:failed -->',
+  ];
+  const lines = markers.join('\n');
+  for (const fence of ['```', '````', '~~~']) {
+    assert.deepEqual(commentMarkers(`${fence}diff\n${lines}\n${fence}`), []);
+    assert.deepEqual(commentMarkers(`${fence}diff\n${lines}`), []);
+  }
+  assert.deepEqual(commentMarkers(markers.map(marker => `quoted ${marker} text`).join('\n')), []);
+  assert.deepEqual(commentMarkers(markers.map(marker => `+${marker}`).join('\n')), []);
+  assert.deepEqual(commentMarkers(markers.map(marker => `> ${marker}`).join('\n')), []);
+  assert.deepEqual(commentMarkers(markers.join(' ')), []);
+  assert.deepEqual(commentMarkers('````diff\n```\n' + lines + '\n```\n````'), []);
+  assert.deepEqual(commentMarkers('```diff\n```text\n' + lines + '\n```'), []);
+  assert.deepEqual(commentMarkers('```diff\n~~~\n' + lines + '\n```'), []);
+  assert.deepEqual(commentMarkers('```diff\n' + lines + '\n```\n' + markers.map(marker => ` \t${marker} \t`).join('\r\n')), markers);
+});
+
+test('quoted markers cannot claim work, reserve capacity or suppress waiting and invalid comments', { timeout: 10_000 }, async t => {
+  for (const quote of [(text: string) => `\`\`\`\`diff\n${text}\n\`\`\`\``, (text: string) => text.split('\n').map(line => `quoted ${line} text`).join('\n')]) {
+    const quoted = { body: quote([
+      '<!-- factory-dispatch:claim runner:gpu -->',
+      `<!-- factory-dispatch:thread ${threadId} runner:gpu -->`,
+      '<!-- factory-dispatch:waiting -->', '<!-- factory-dispatch:invalid -->',
+    ].join('\n')), createdAt: '2026-10-10T12:00:00.000Z' };
+    const ghost = issue(100, { labels: [], comments: [quoted] });
+    const blocked = issue(101, { comments: [quoted], inverseRelations: [
+      { type: 'blocks', issue: { identifier: 'MET-10', state: { type: 'started' } } },
+    ] });
+    const invalid = issue(102, { comments: [quoted], description: body.replace('Ship the widget.', '> hint') });
+    const ready = issue(123, { comments: [quoted] });
+    const f = await fixture(t, [ghost, blocked, invalid, ready]);
+    const result = await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '1' });
+    assert.equal(result.code, 0, result.stdout);
+    assert.equal(f.calls().length, 1);
+    assert.equal(f.calls()[0][f.calls()[0].indexOf('--executor') + 1], 'runner:factory-gpu');
+    assert.equal(ready.stateId, 'started-id');
+    assert.match(blocked.comments.at(-1).body, /^Waiting on MET-10\n\n<!-- factory-dispatch:waiting -->$/);
+    assert.match(invalid.comments.at(-1).body, /^Cannot dispatch:/);
+    assert.equal(ghost.comments.length, 1);
+    for (const mutation of f.mutations.filter(m => m.operation === 'Comment')) {
+      assert.ok(commentMarkers(mutation.input.body).length > 0, mutation.input.body);
+    }
+  }
+});
+
+test('quoted diff markers cannot suppress wrap-up or archive or replace their claim, thread and worktree', { timeout: 10_000 }, async t => {
+  const quotedMarkers = [
+    '<!-- factory-dispatch:claim runner:console -->',
+    '<!-- factory-dispatch:thread T-01234567-89ab-4cde-8fab-999999999999 runner:console -->',
+    '<!-- factory-dispatch:worktree met-123-quoted-worktree -->',
+    ...['waiting', 'invalid', 'wrapup-claim', 'wrapup', 'wrapup-done', 'archive-claim', 'archived']
+      .map(name => `<!-- factory-dispatch:${name} -->`),
+    '<!-- factory-qa:passed -->', '<!-- factory-qa:failed -->',
+  ];
+  for (const quote of [(text: string) => `\`\`\`diff\n${text}\n\`\`\``, (text: string) => `\`\`\`\`diff\n\`\`\`\n${text}\n\`\`\`\n\`\`\`\``, (text: string) => text.split('\n').map(line => `quoted ${line} text`).join('\n')]) {
+    const i = issue(123, { labels: [], state: { type: 'completed' }, attachments: [attachment('merged')], comments: [
+      { body: quote(quotedMarkers.join('\n')), createdAt: '2026-10-11T12:00:00.000Z' },
+      claimComment(), threadComment(), { body: ' \t<!-- factory-dispatch:worktree met-123-real-worktree --> \t' },
+    ] });
+    const f = await fixture(t, [i], { threads: [{ id: threadId, updated: quietUpdated, archived: false }] });
+    const result = await f.run();
+    assert.equal(result.code, 0, result.stdout);
+    assert.deepEqual(f.calls()[0].slice(0, 4), ['threads', 'continue', threadId, '-ox']);
+    assert.match(f.calls()[0][4], /worktree remove \/home\/agent\/work\/factory-met-123-real-worktree/);
+    assert.deepEqual(f.calls().at(-1), ['threads', 'archive', threadId]);
+    assert.deepEqual(f.mutations.map(m => m.input.body.split('\n').at(-1)), [
+      '<!-- factory-dispatch:wrapup-claim -->', '<!-- factory-dispatch:wrapup -->',
+      '<!-- factory-dispatch:archive-claim -->', '<!-- factory-dispatch:archived -->',
+    ]);
+    for (const mutation of f.mutations) assert.equal(commentMarkers(mutation.input.body).length, 1);
+    await f.run();
+    assert.equal(f.calls().length, 3);
+  }
 });
 
 test('blocked: one waiting comment; all blockers must complete or cancel before next-pass dispatch', { timeout: 10_000 }, async t => {
@@ -313,6 +413,20 @@ test('wrap-up only after merged GitHub attachment, sent once to existing thread'
   assert.match(args[4], /Confirm the linked PR.*is merged/);
   assert.match(args[4], /Never deploy/);
   assert.match(args[4], /worktree remove \/home\/agent\/work\/factory-met-123-build-the-useful-widget/);
+  for (const text of [
+    'Use the already-connected Linear MCP server', 'report their names without calling a write tool first',
+    'If unavailable, stop and report', 'do not work around it or change MCP settings',
+    'read issues, comment progress on your own issue MET-123, link your PR',
+    'create follow-up issues in Backlog related to MET-123',
+    "Never change any existing issue's status, labels, assignee or priority; never edit other issues",
+    'Backlog is allowed only when creating a follow-up',
+    'Never write or delete <!-- factory-dispatch:… --> or <!-- factory-qa:… --> markers except the completion marker explicitly authorized below',
+    'Never include secrets or production data',
+    'Only after all wrap-up steps succeed, post a Linear comment on MET-123',
+    'the sole marker exception; not deployment verification',
+  ]) assert.ok(args[4].includes(text), text);
+  assert.match(args[4], /Wrap-up finished\n\n<!-- factory-dispatch:wrapup-done -->$/);
+  assert.equal(i.comments.some((c: any) => c.body.includes('<!-- factory-dispatch:wrapup-done -->')), false);
   assert.equal(i.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:wrapup -->')).length, 1);
 });
 

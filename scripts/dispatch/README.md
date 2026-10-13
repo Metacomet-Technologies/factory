@@ -35,6 +35,56 @@ uses `external-agent:claude-code` and ignores effort; ChatGPT low uses `gpt56l`,
 medium/high use `gpt61s` (**proposed, unverified**). See [Amp CLI evidence](../../docs/amp-cli.md).
 Submission success is not execution success. Inspect the thread for results.
 
+## Dispatched agent Linear MCP contract (MET-122)
+
+Dispatched Amp threads use the already-connected personal Linear MCP server.
+Devon connected `https://mcp.linear.app/mcp` as `Linear` on 2026-10-13. Each
+thread must first verify tool availability and report names without calling a
+write tool; if missing, stop and report, never work around it or change settings.
+This does not change the dispatcher's GraphQL key, transport, timer or runners.
+
+Agents may read issues, comment progress on their own issue, link their PR, and
+create follow-up issues in Backlog related to their issue. They must never change
+any existing issue's status, labels, assignee or priority, or edit other issues.
+Backlog is allowed only at follow-up creation. The dispatcher retains ownership
+of the `dispatch` label, state moves and claim/thread/wrap-up/archive markers.
+Agents must never write or delete `<!-- factory-dispatch:… -->` or
+`<!-- factory-qa:… -->` markers, except the wrap-up completion authorized below.
+These are prompt rules, not a server-side permission boundary.
+
+Control markers count only when the entire line exactly matches after trimming
+whitespace and is outside any fenced code block (three or more backticks or
+tildes). This applies to every dispatcher marker and future `factory-qa` markers.
+Inline text and quoted diff/code markers never count. A closing fence must use
+the same character, be at least as long as the opening fence, and have no trailing
+text; an unclosed fence hides markers through the end of that comment. The queue's
+GraphQL substring filter only selects candidates; local parsing determines which
+markers count. All dispatcher-written markers already occupy standalone unfenced
+lines; their output format is unchanged. Future QA consumers must use the shared
+`commentMarkers` parser, not raw comment substring or regex searches.
+
+After opening the PR and after each later push, post one Linear comment on the
+task issue with the PR URL, head SHA and complete file list from
+`git diff --name-only origin/main...HEAD`. If `git diff origin/main...HEAD` is
+under 400 lines, include the full diff. At 400 lines or more, include the file
+list plus the full contents of every changed file under `deploy/`, every changed
+migration, and every changed script. Identify deleted files explicitly. Use
+fenced code blocks; never include secrets or production data. Redact them and
+identify any omissions. Reviewers must match the comment's SHA to the PR head.
+
+Only after all wrap-up steps succeed, the wrap-up prompt authorizes one comment
+on the task issue with exactly this body:
+
+```text
+Wrap-up finished
+
+<!-- factory-dispatch:wrapup-done -->
+```
+
+This is the sole marker exception. It reports wrap-up completion, not deployment
+verification or permission to mark Done. Archive logic still uses Done and five
+quiet minutes; consuming this new marker is deferred to a later change.
+
 Dry-run takes the same read-only lock and performs GraphQL queries, but never
 mutates Linear, invokes Amp, or writes files. It prints JSON decisions, exact
 mutation documents/variables and shell-quoted Amp flags. To honor the no-prompt
@@ -197,7 +247,7 @@ as evidence of merge. The wrap-up prompt also requires confirming the PR merge.
 
 ## Administrator deployment from Mac, after merge
 
-For an already-installed dispatcher, MET-127 adds no deployment artifact, build,
+For an already-installed dispatcher, MET-122 adds no deployment artifact, build,
 installer invocation or restart. The post-merge wrap-up's `pull --ff-only` in
 `/home/agent/work/factory` on factory-gpu deploys the code; the next existing
 60-second timer pass uses it. Merge and that pull remain Devon's gates. From Mac,
@@ -296,7 +346,9 @@ Archive fixtures cover exactly five quiet minutes, ongoing updates, missing and
 unreadable timestamps/listings, canceled/non-Done states, missing markers,
 failure/retry, the five-attempt limit and already-archived recovery. Fake Amp
 deliberately rejects duplicate archives. Overflow fixtures fill gpu, then console,
-then wait; explicit grouped/flat labels never overflow. Tests print fake-server
+then wait; explicit grouped/flat labels never overflow. Rendered prompt checks
+cover Linear MCP availability, agent permissions, diff posting and the wrap-up
+completion marker exception without real Linear writes. Tests print fake-server
 poll timings. The test child clock is fixed without any production clock override.
 There is no live Linear/Amp sandbox; these are external services covered by fakes.
 Root installation, real merge metadata and actual model execution remain unverified.
