@@ -344,9 +344,12 @@ lost after the thread comment is not automatically repaired.
 
 ## Archive Done threads after five quiet minutes (MET-127)
 
-After wrap-ups, each pass considers issues with a thread marker, a wrap-up marker,
-no `<!-- factory-dispatch:archived -->` marker, and `state.type === "completed"`.
-Canceled and other non-Done issues are never archived. Done is the human-controlled
+After wrap-ups, each pass considers recorded builders and labeled threads on
+issues with `state.type === "completed"`. A builder with a GitHub PR attachment
+newer than its dispatch claim requires the wrap-up marker before archiving;
+unknown attachment/claim chronology also waits. Done builders without such a PR
+need no wrap-up marker. Pending archive claims cannot bypass this gate.
+Canceled issues archive QA/probe threads but never their recorded builder. Done is the human-controlled
 merge/deploy-verification gate: closes PRs mark Done at merge, while contributes
 PRs remain open until deployment verification. The wrap-up marker alone does not
 prove deployment or task completion.
@@ -362,11 +365,11 @@ per pass, including failed attempts; pending threads do not consume that budget.
 Under the existing exclusive lock, the order is:
 
 1. Check Linear eligibility and Amp quiet/archive state.
-2. Post and await `<!-- factory-dispatch:archive-claim -->`, unless it exists.
+2. Post and await `<!-- factory-dispatch:archive-claim thread:<T-id> -->`, unless it exists.
 3. Run `amp threads archive <T-id>` only if the thread is still unarchived in
    the listing.
 4. After success or confirmation that it is already archived, post
-   `Thread archived.` with `<!-- factory-dispatch:archived -->`; log `archived`.
+   `Thread archived.` with `<!-- factory-dispatch:archived thread:<T-id> -->`; log `archived`.
 
 Unlike dispatch/wrap-up claims, an archive claim permits automatic recovery.
 A crash before Amp leaves a retryable claim. A crash after Amp but before the
@@ -402,15 +405,54 @@ Every standalone `review-claim` identifies a reviewer, including existing claims
 from before this change. A review finishes on delivered changes (matching verdict
 and round), human handoff, retirement, observed PR merge, or a Done/Canceled
 issue. Active reviews and ready reviews awaiting merge stay open. Canceled
-builders still stay open; only their QA threads qualify.
+builders still stay open; their QA and labeled probe threads qualify.
 
 QA uses the same quiet-time check, retry/recovery logic and **shared five-attempt
-budget** as builders. Its durable markers are `factory-qa:archive-claim pr:<n>
-sha:<sha>` and `factory-qa:archived pr:<n> sha:<sha>`, with `round:2` appended for
-evidence-only reviewers. A crash after archive repairs the missing marker from
+budget** as builders. All roles now use the thread-ID archive markers above;
+legacy builder and per-PR/SHA QA completion markers still suppress retries.
+A crash after archive repairs the missing marker from
 the archived listing without a second archive command. Existing finished reviews
 qualify on the first deployed pass, subject to quiet time and the shared cap.
 The queue includes QA-only marked issues, not just builder-marked issues.
+
+### Issue labels and probe groups (MET-138)
+
+After recording each successful builder/reviewer launch, the dispatcher adds
+the lowercase issue ID with `amp threads label <T-id> met-<n>`. Failures log
+`error` with `action: label` and retry next pass without blocking dispatch/QA.
+Builders move to In Progress and log `dispatched` before any label attempt.
+A per-thread `factory-dispatch:labeled <T-id>` marker records success; existing
+builder/review-claim IDs backfill once on open issues only (not Done/Canceled). A crash
+between labeling and its marker safely repeats the additive label command.
+Known archive completions skip backfill: the CLI refuses labels on archived threads.
+After a label failure, presence only in the `--include-archived` listing records
+`factory-dispatch:label-skipped-archived <T-id>` and stops later attempts/logs.
+Missing or unreadable listings do not prove archive state; those failures retry.
+Prompts require scratch/probe/test threads to carry the same label, archive
+before the final reply, and appear in that reply's thread list.
+
+For seven days after `completedAt`/`canceledAt`, `amp threads search
+'label:met-<n> author:me archived:false' --json --limit 500` discovers probes.
+Historical issues and missing/invalid/future close timestamps make no search
+call. Archived threads leave the search window; pending archive claims remain
+candidates for crash repair even after that window. Every candidate uses
+the existing listing-based quiet check and shared five-attempt cap. CLI search
+has no offset and a maximum limit of 500: more than 500 recently active threads
+can defer discovery of older ones until that window drains. Dry-run previews
+search/label commands but never invokes Amp or discovers probes live.
+
+Live CLI check, 2026-10-13: add-only label syntax is verified; no remove/list
+subcommand is exposed. Listings omit labels; search returns `id`, `title` and
+`updatedAt`, including archived threads unless filtered. The disposable
+[probe](https://ampcode.com/threads/T-01a1343c-ec9f-756d-a50b-fef6fda1d4aa)
+was found with `label:met-138-label-check`, then returned
+`✓ Thread archived successfully`; its detached scratch worktree was removed.
+An empty preliminary thread was not searchable and was also archived. Search
+index consistency and timestamp freshness during active execution remain unverified.
+Read-only author-filter check from `/tmp`: the same test label with
+`author:me archived:false` returned `[]`; `author:me archived:true` returned the
+owned probe above; a nonexistent-author control returned `[]`. Probe searches
+now use `author:me`; no cross-author live fixture was available.
 
 ## Verified Linear fields; one unverified integration convention
 

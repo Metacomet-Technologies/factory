@@ -11,6 +11,10 @@ write call. If unavailable, stop; never change settings or use another transport
 Read issue {{identifier}}, especially Isolation, Build and Done means, and the
 trusted main branch's AGENTS.md and docs/PLAYBOOK.md §5 before reviewing.
 
+Label any scratch, probe or test threads you start with {{issueLabel}}
+(`amp threads label <T-id> {{issueLabel}}`) and archive them before your final
+reply; list them in your reply.
+
 GitHub auth is preconfigured for agent (gh + git credential helper); don't set
 GitHub token environment variables or run gh auth commands. If `gh auth status`
 fails, stop and report.
