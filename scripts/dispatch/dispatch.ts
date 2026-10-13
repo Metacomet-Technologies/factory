@@ -86,6 +86,15 @@ Use closes only if the PR finishes the issue; otherwise use contributes.
 
 ${headings.map(name => `## ${name}\n${content[name] || (name === 'Tests' ? tests : name === 'Link type' ? 'contributes' : name === 'Deploy artifacts' ? "Write them, don't run them." : '')}`).join('\n\n')}
 
+## Linear MCP rules
+Use the already-connected Linear MCP server. First verify Linear tools are available and report their names without calling a write tool. If unavailable, stop and report; do not work around it or change MCP settings.
+You may read issues, comment progress on your own issue ${issue.identifier}, link your PR, and create follow-up issues in Backlog related to ${issue.identifier}.
+Never change any existing issue's status, labels, assignee or priority; never edit other issues. Backlog is allowed only when creating a follow-up.
+The dispatcher owns the dispatch label, state moves and claim/thread/wrap-up/archive markers. Never write or delete <!-- factory-dispatch:… --> or <!-- factory-qa:… --> markers. Only the later wrap-up prompt may authorize the wrapup-done completion marker.
+After opening the PR and after each later push, post one Linear comment on ${issue.identifier} with the PR URL, head SHA and complete changed-file list from git diff --name-only origin/main...HEAD.
+If git diff origin/main...HEAD is under 400 lines, include that full diff. At 400 lines or more, include the file list plus the full contents of every changed file under deploy/, every changed migration, and every changed script. Identify deleted files explicitly; do not omit them silently.
+Use fenced code blocks for diffs and file contents. Never include secrets or production data; redact them and identify any omissions.
+
 Push, open the PR, and reply with test results, deviations, anything unverified, and exact Mac deploy/rollback commands using factory-ssh or console-ssh and full /home/agent/work/factory paths. Never deploy. Merge and deploy remain Devon's gates.`;
 }
 
@@ -101,7 +110,15 @@ Remove this thread's worktree and local branch only after checking for unpushed 
 git -C /home/agent/work/factory worktree remove /home/agent/work/factory-${branch}
 git -C /home/agent/work/factory branch -D ${branch}
 Reply with exact Mac install/verify commands using factory-ssh or console-ssh and full /home/agent/work/factory paths.
-Never deploy. One deploy per runner at a time. Devon owns deployment verification and marking the issue Done. The dispatcher archives this thread after Done and five quiet minutes; if verification fails, fix it in this thread from a fresh worktree.`;
+Never deploy. One deploy per runner at a time. Devon owns deployment verification and marking the issue Done. The dispatcher archives this thread after Done and five quiet minutes; if verification fails, fix it in this thread from a fresh worktree.
+Use the already-connected Linear MCP server; verify tools are available and report their names without calling a write tool first. If unavailable, stop and report; do not work around it or change MCP settings.
+You may read issues, comment progress on your own issue ${issue.identifier}, link your PR, and create follow-up issues in Backlog related to ${issue.identifier}.
+Never change any existing issue's status, labels, assignee or priority; never edit other issues. Backlog is allowed only when creating a follow-up.
+Never write or delete <!-- factory-dispatch:… --> or <!-- factory-qa:… --> markers except the completion marker explicitly authorized below. Never include secrets or production data.
+Only after all wrap-up steps succeed, post a Linear comment on ${issue.identifier} with exactly this body (the sole marker exception; not deployment verification):
+Wrap-up finished
+
+<!-- factory-dispatch:wrapup-done -->`;
 }
 
 // ponytail: Linear documents metadata as arbitrary JSON, not GitHub's keys.

@@ -184,6 +184,24 @@ test('full fake-server poll: dispatch, prompt contract, Linear state, and manual
   assert.deepEqual(args.slice(2), ['--mode', 'medium', '--executor', 'runner:factory-gpu', '--runner-dir', '/home/agent/work', '--title', 'MET-123 — Build the useful widget today', '--visibility', 'private', '--no-archive-after-execute']);
   assert.equal(args[1].split('\n')[0], '**Thread title:** Use the Linear ticket identifier and title: `MET-123 — Build the useful widget today`.');
   for (const text of ['export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git', 'git -C ~/work/factory fetch origin', 'git -C ~/work/factory worktree add -b met-123-build-the-useful-widget ~/work/factory-met-123-build-the-useful-widget origin/main', 'Never reuse or overwrite', 'Contributes MET-123', 'cargo fmt --check', 'cargo clippy --all-targets -- -D warnings', 'cargo test --workspace', 'vp check', 'factory-ssh', 'console-ssh', 'Never deploy']) assert.ok(args[1].includes(text), text);
+  for (const text of [
+    'Use the already-connected Linear MCP server', 'report their names without calling a write tool',
+    'If unavailable, stop and report', 'do not work around it or change MCP settings',
+    'read issues, comment progress on your own issue MET-123, link your PR',
+    'create follow-up issues in Backlog related to MET-123',
+    "Never change any existing issue's status, labels, assignee or priority; never edit other issues",
+    'Backlog is allowed only when creating a follow-up',
+    'The dispatcher owns the dispatch label, state moves and claim/thread/wrap-up/archive markers',
+    'Never write or delete <!-- factory-dispatch:… --> or <!-- factory-qa:… --> markers',
+    'Only the later wrap-up prompt may authorize the wrapup-done completion marker',
+    'After opening the PR and after each later push, post one Linear comment on MET-123',
+    'PR URL, head SHA and complete changed-file list from git diff --name-only origin/main...HEAD',
+    'If git diff origin/main...HEAD is under 400 lines, include that full diff',
+    'At 400 lines or more', 'full contents of every changed file under deploy/, every changed migration, and every changed script',
+    'Identify deleted files explicitly', 'Use fenced code blocks', 'Never include secrets or production data',
+    'redact them and identify any omissions',
+  ]) assert.ok(args[1].includes(text), text);
+  assert.ok(!args[1].includes('<!-- factory-dispatch:wrapup-done -->'));
   assert.ok(!args[1].includes('Goal hint'));
   assert.ok(!result.stdout.includes('Ship the widget'));
   assert.deepEqual(f.mutations.map(m => m.operation), ['RemoveLabel', 'Comment', 'Comment', 'Move']);
@@ -313,6 +331,20 @@ test('wrap-up only after merged GitHub attachment, sent once to existing thread'
   assert.match(args[4], /Confirm the linked PR.*is merged/);
   assert.match(args[4], /Never deploy/);
   assert.match(args[4], /worktree remove \/home\/agent\/work\/factory-met-123-build-the-useful-widget/);
+  for (const text of [
+    'Use the already-connected Linear MCP server', 'report their names without calling a write tool first',
+    'If unavailable, stop and report', 'do not work around it or change MCP settings',
+    'read issues, comment progress on your own issue MET-123, link your PR',
+    'create follow-up issues in Backlog related to MET-123',
+    "Never change any existing issue's status, labels, assignee or priority; never edit other issues",
+    'Backlog is allowed only when creating a follow-up',
+    'Never write or delete <!-- factory-dispatch:… --> or <!-- factory-qa:… --> markers except the completion marker explicitly authorized below',
+    'Never include secrets or production data',
+    'Only after all wrap-up steps succeed, post a Linear comment on MET-123',
+    'the sole marker exception; not deployment verification',
+  ]) assert.ok(args[4].includes(text), text);
+  assert.match(args[4], /Wrap-up finished\n\n<!-- factory-dispatch:wrapup-done -->$/);
+  assert.equal(i.comments.some((c: any) => c.body.includes('<!-- factory-dispatch:wrapup-done -->')), false);
   assert.equal(i.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:wrapup -->')).length, 1);
 });
 
