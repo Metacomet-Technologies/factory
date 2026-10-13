@@ -18,7 +18,7 @@ Both also check QA, pending wrap-ups and archives. Blockers must be completed or
 one waiting comment survives subsequent polls. Invalid tasks lose the label and
 get reasons. `>` hint lines do not count as section content. Required sections:
 Goal, Context, Isolation, Build, Sandbox check, Done means. Empty Link type means
-contributes; accepted values are `contributes` and `closes`. Tests get the playbook
+contributes. Link type section must contain only `closes` or `contributes`; put notes in Context. Tests get the playbook
 defaults when empty. Exactly one Bug/Feature/Improvement and at least one
 `area:*` label are required. Group labels use `parent.name` plus the child name;
 flattened `runner/gpu`-style labels also work. Orb is refused explicitly.
@@ -368,6 +368,7 @@ marker/state or finish wrap-up by hand. Only after establishing no submission
 occurred may Devon remove a claim and retry. Do not delete markers or blindly
 relabel a failed issue. If the outcome is unknown, retain the claim. A state move
 lost after the thread comment is not automatically repaired.
+After finishing failed-wrap-up recovery by hand, archive the builder thread: `amp threads archive <T-id>`.
 
 ## Archive Done threads after five quiet minutes (MET-127)
 
@@ -442,24 +443,33 @@ the archived listing without a second archive command. Existing finished reviews
 qualify on the first deployed pass, subject to quiet time and the shared cap.
 The queue includes QA-only marked issues, not just builder-marked issues.
 
-### Issue labels and probe groups (MET-138)
+### Shared label and probe groups (MET-138, MET-146)
 
 After recording each successful builder/reviewer launch, the dispatcher adds
-the lowercase issue ID with `amp threads label <T-id> met-<n>`. Failures log
+the single label with `amp threads label <T-id> factory`. Failures log
 `error` with `action: label` and retry next pass without blocking dispatch/QA.
 Builders move to In Progress and log `dispatched` before any label attempt.
-A per-thread `factory-dispatch:labeled <T-id>` marker records success; existing
-builder/review-claim IDs backfill once on open issues only (not Done/Canceled). A crash
+A per-thread `factory-dispatch:labeled <T-id> factory` marker records success; existing
+builder/review-claim IDs backfill once on open issues only (not Done/Canceled),
+including threads with the old issue-label success marker. A crash
 between labeling and its marker safely repeats the additive label command.
 Known archive completions skip backfill: the CLI refuses labels on archived threads.
 After a label failure, presence only in the `--include-archived` listing records
 `factory-dispatch:label-skipped-archived <T-id>` and stops later attempts/logs.
 Missing or unreadable listings do not prove archive state; those failures retry.
-Prompts require scratch/probe/test threads to carry the same label, archive
-before the final reply, and appear in that reply's thread list.
+Prompts require: "Title scratch/probe/test threads `MET-<n> probe: …` and label
+them `factory`." Archive before the final reply and list them.
+Builder and wrap-up also say: "Commands that read `/home/agent` paths run as
+agent (`sudo -u agent …`); admins can't read `/home/agent`." This tells admins
+how to read agent-owned artifacts, not permission for builders to use sudo.
 
 For seven days after `completedAt`/`canceledAt`, `amp threads search
-'label:met-<n> author:me archived:false' --json --limit 500` discovers probes.
+'label:factory author:me archived:false' --json --limit 500` discovers probes,
+keeping only full titles starting with the exact identifier plus a space:
+`MET-14 ` never matches `MET-141 —`. The same window also searches
+`label:met-<n> author:me archived:false` for threads from before this deploy;
+legacy discovery stops after seven days from each issue's closure. No new
+issue labels are created, and existing add-only labels are not removed.
 Historical issues and missing/invalid/future close timestamps make no search
 call. Archived threads leave the search window; pending archive claims remain
 candidates for crash repair even after that window. Every candidate uses
@@ -467,6 +477,12 @@ the existing listing-based quiet check and shared five-attempt cap. CLI search
 has no offset and a maximum limit of 500: more than 500 recently active threads
 can defer discovery of older ones until that window drains. Dry-run previews
 search/label commands but never invokes Amp or discovers probes live.
+
+MET-146 live CLI probe, 2026-10-13: after adding `factory` to
+[the builder](https://ampcode.com/threads/T-01a13598-be1b-727a-a349-21292ef6c1f7),
+`amp threads search 'label:factory' --json --limit 500` returned its full title:
+`MET-146 — Use one Amp label and fix small dispatcher prompt gaps`.
+No extra probe thread was created; the builder remains open for QA/wrap-up.
 
 Live CLI check, 2026-10-13: add-only label syntax is verified; no remove/list
 subcommand is exposed. Listings omit labels; search returns `id`, `title` and

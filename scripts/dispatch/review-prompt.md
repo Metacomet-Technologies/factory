@@ -51,6 +51,6 @@ Never run the PR's gate, use --admin/--auto or bypass changed-head/non-green CI.
 Self-deploying paths in trusted scripts/dispatch/qa-config.json require Devon's merge.
 Never deploy. Dispatcher owns QA_BASE cleanup; never remove/unlock it or write
 artifacts there. No console main-checkout update is needed.
-Label scratch/probe/test threads: `amp threads label <T-id> {{issueLabel}}`;
+Title scratch/probe/test threads `{{identifier}} probe: …` and label them `factory`;
 archive before replying. Reply with tests, deviations, unverified items, blockers
 and thread list.
