@@ -7,9 +7,13 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { sections, slug, prompt, validate, isMergedGitHubPR, commentMarkers } from './dispatch.ts';
+import { reviewerEngine } from './qa.ts';
 
 const executable = fileURLToPath(new URL('dispatch.ts', import.meta.url));
 const threadId = 'T-01234567-89ab-4cde-8fab-0123456789ab';
+const reviewId = 'T-12345678-89ab-4cde-8fab-0123456789ab';
+const sha = 'a'.repeat(40), nextSha = 'b'.repeat(40), mergeSha = 'c'.repeat(40);
+const playbook = '# Synthetic playbook\n\nNo production data.\n';
 const key = 'synthetic-test-secret-not-a-credential';
 const dispatchLabel = { id: 'dispatch-id', name: 'dispatch' };
 const group = (name: string, value: string) => ({ id: `${name}-${value}`, name: value, parent: { name } });
@@ -54,13 +58,72 @@ async function fixture(t: any, issues = [issue()], options: any = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'factory-dispatch-test-'));
   const callsFile = join(directory, 'amp-calls');
   const threadsFile = join(directory, 'amp-threads');
+  const githubFile = join(directory, 'github');
+  writeFileSync(githubFile, JSON.stringify(options.github ?? {}));
   writeFileSync(threadsFile, JSON.stringify(options.threads ?? issues.flatMap(i => i.comments.flatMap((c: any) => {
     const id = c.body.match(/factory-dispatch:thread (T-[a-f0-9-]{36})/)?.[1];
     return id ? [{ id, archived: false, updated: quietUpdated }] : [];
   }))));
-  writeFileSync(join(directory, 'clock.mjs'), `Date.now = () => Number(process.env.FAKE_NOW);`);
+  writeFileSync(join(directory, 'clock.mjs'), `
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+Date.now = () => Number(process.env.FAKE_NOW);
+const fetch = globalThis.fetch;
+globalThis.fetch = (url, options) => {
+  if (new URL(url).hostname !== '127.0.0.1') throw new Error('Only loopback fetches are allowed in tests');
+  return fetch(url, options);
+};
+const read = fs.readFileSync;
+fs.readFileSync = (path, ...args) => path === '/home/agent/work/factory/docs/PLAYBOOK.md' ? ${JSON.stringify(playbook)} : read(path, ...args);
+syncBuiltinESMExports();`);
   writeFileSync(join(directory, 'key'), key);
   writeFileSync(join(directory, 'lock'), '');
+  // No GitHub or Git command may escape to the network or the real main checkout.
+  for (const program of ['gh', 'git']) writeFileSync(join(directory, program), `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(process.env.FAKE_GITHUB, 'utf8'));
+fs.appendFileSync(process.env.FAKE_GITHUB + '-calls', JSON.stringify(['${program}', ...args]) + '\\n');
+if (process.env.FAKE_GITHUB_FAIL) process.exit(7);
+if ('${program}' === 'gh' && args[0] === 'api' && !args.includes('--paginate')) {
+  if (process.env.GH_TOKEN || args[2] !== '--hostname' || args[3] !== 'github.com') process.exit(9);
+  // Exercise the production gh argv without contacting GitHub or reading real credentials.
+  return void fetch(process.env.FAKE_GITHUB_URL + '/' + args[1]).then(async response => {
+    if (!response.ok) { console.error('${key} quota exhausted'); process.exit(7); }
+    console.log(await response.text());
+  }).catch(() => process.exit(7));
+}
+let output;
+if ('${program}' === 'git' && args[0] === 'ls-remote') {
+  const pr = args[2].match(/^refs\\/pull\\/(\\d+)\\/head$/)?.[1];
+  if (!state[pr]) process.exit(7);
+  output = (state[pr].remoteSha ?? state[pr].headRefOid) + '\\t' + args[2];
+} else if ('${program}' === 'git' && args[0] === '-C' && args[1] === '/home/agent/work/factory') {
+  if (args[2] === 'branch') output = process.env.FAKE_BRANCH ?? 'main';
+  else if (args[2] === 'status') output = process.env.FAKE_DIRTY ?? '';
+  else if (args[2] === 'merge-base') { if (process.env.FAKE_BEHIND) process.exit(1); output = ''; }
+  else if (args[2] === 'rev-parse') output = '${mergeSha}';
+  else if (args[2] === 'show') output = ${JSON.stringify(playbook)};
+} else if ('${program}' === 'gh' && args[0] === 'pr') {
+  const pr = state[args[2]];
+  if (!pr) process.exit(7);
+  if (args[1] === 'view') output = JSON.stringify(pr);
+  else if (args[1] === 'checks') {
+    output = JSON.stringify(pr.checks);
+    if (pr.pushDuringChecks) {
+      pr.headRefOid = pr.pushDuringChecks;
+      fs.writeFileSync(process.env.FAKE_GITHUB, JSON.stringify(state));
+    }
+    if (pr.checkExit) process.exit(pr.checkExit);
+  }
+} else if ('${program}' === 'gh' && args[0] === 'api') {
+  const pr = args[1].match(/^repos\\/Metacomet-Technologies\\/factory\\/pulls\\/(\\d+)\\/files\\?per_page=100$/)?.[1];
+  if (!state[pr] || !args.includes('--paginate') || !args.includes('--slurp')) process.exit(7);
+  output = JSON.stringify(state[pr].pages ?? [state[pr].files]);
+}
+if (output === undefined) process.exit(99);
+console.log(output);
+`, { mode: 0o755 });
   writeFileSync(join(directory, 'amp'), `#!${process.execPath}
 const fs = require('node:fs');
 const args = process.argv.slice(2);
@@ -85,7 +148,8 @@ if (args[0] === 'threads' && args[1] === 'archive') {
   fs.writeFileSync(process.env.FAKE_THREADS, JSON.stringify(threads));
   process.exit(0);
 }
-console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.com/threads/${threadId}');
+const id = args[0] === '-x' && args[1].includes('— QA PR') ? '${reviewId}' : '${threadId}';
+console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.com/threads/' + id);
 `, { mode: 0o755 });
   const mutations: any[] = [];
   const queries: any[] = [];
@@ -103,6 +167,28 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
   }
   const server = createServer(async (request, response) => {
     try {
+      if (request.url?.startsWith('/repos/Metacomet-Technologies/factory/')) {
+        assert.equal(request.headers.authorization, undefined);
+        const path = request.url.slice('/repos/Metacomet-Technologies/factory/'.length);
+        const github = JSON.parse(readFileSync(githubFile, 'utf8'));
+        const prNumber = path.match(/^pulls\/(\d+)/)?.[1];
+        const pr = prNumber ? github[prNumber] : Object.values(github).find((p: any) => path.startsWith(`commits/${p.headRefOid}/`)) as any;
+        if (!pr || pr.publicFail || (pr.checkExit && path.includes('/check-runs'))) { response.statusCode = 503; response.end('{}'); return; }
+        if (path === pr.quotaPath) { response.statusCode = 429; response.end('{}'); return; }
+        let data;
+        if (/^pulls\/\d+$/.test(path)) data = { state: pr.state === 'MERGED' ? 'closed' : pr.state.toLowerCase(), merged: pr.state === 'MERGED', draft: pr.isDraft,
+          head: { sha: pr.headRefOid }, base: { ref: pr.baseRefName }, merge_commit_sha: pr.mergeCommit?.oid };
+        else if (path.includes('/files?')) {
+          const pageNumber = Number(new URL(request.url, 'http://fake').searchParams.get('page'));
+          data = (pr.pages?.flat() ?? pr.files).slice((pageNumber - 1) * 100, pageNumber * 100);
+        } else if (path.includes('/check-runs?')) {
+          const checks = pr.checks.map((c: any) => ({ name: c.name, status: c.bucket === 'pending' ? 'in_progress' : 'completed', conclusion: c.bucket === 'pass' ? 'success' : c.bucket }));
+          data = { total_count: pr.checkTotal ?? checks.length, check_runs: checks };
+          if (pr.pushDuringChecks) { pr.headRefOid = pr.pushDuringChecks; writeFileSync(githubFile, JSON.stringify(github)); }
+        } else if (path.includes('/status?')) data = { total_count: pr.statuses?.length ?? 0, statuses: pr.statuses ?? [] };
+        else throw new Error(`Unexpected public GitHub path ${path}`);
+        response.setHeader('content-type', 'application/json'); response.end(JSON.stringify(data)); return;
+      }
       assert.equal(request.url, '/graphql');
       assert.equal(request.headers.authorization, key);
       let text = '';
@@ -119,6 +205,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
         if (operation === 'Comment') { i.comments.push({ body: v.input.body, createdAt: new Date().toISOString() }); data = { commentCreate: { success: true } }; }
         else if (operation === 'RemoveLabel') { i.labels = i.labels.filter((label: any) => label.id !== v.labelId); data = { issueRemoveLabel: { success: true } }; }
         else if (operation === 'Move') { i.stateId = v.input.stateId; data = { issueUpdate: { success: true } }; }
+        else if (operation === 'SyncPlaybook') { data = { documentUpdate: { success: true } }; }
         else throw new Error(`Unexpected mutation ${operation}`);
         if (crashHere === 'after') { crash = null; current.kill('SIGKILL'); response.destroy(); return; }
       } else {
@@ -152,12 +239,14 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
     await new Promise<void>(resolve => server.close(() => resolve()));
     rmSync(directory, { recursive: true, force: true });
   });
-  function run(args = ['poll'], environment: any = {}) {
+  function run(args = ['poll'], environment: any = {}, script = executable) {
     const started = performance.now();
-    const child = spawn(process.execPath, ['--import', join(directory, 'clock.mjs'), executable, ...args], { env: {
+    const child = spawn(process.execPath, ['--import', join(directory, 'clock.mjs'), script, ...args], { env: {
       PATH: `${directory}:/usr/bin:/bin`, HOME: directory, LINEAR_API_KEY_FILE: join(directory, 'key'),
       DISPATCH_LOCK_FILE: join(directory, 'lock'), DISPATCH_LINEAR_URL: `http://127.0.0.1:${(server.address() as any).port}/graphql`,
-      FAKE_CALLS: callsFile, FAKE_THREADS: threadsFile, FAKE_NOW: String(now), ...environment,
+      DISPATCH_GITHUB_URL: `http://127.0.0.1:${(server.address() as any).port}`,
+      FAKE_GITHUB_URL: `http://127.0.0.1:${(server.address() as any).port}`,
+      FAKE_CALLS: callsFile, FAKE_THREADS: threadsFile, FAKE_GITHUB: githubFile, FAKE_NOW: String(now), ...environment,
     }, stdio: ['ignore', 'pipe', 'pipe'] });
     current = child;
     children.add(child);
@@ -170,6 +259,9 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
     });
   }
   return { issues, mutations, queries, run, directory,
+    check: (pr = '90', head = sha, env = {}) => run(['check', pr, head], env, fileURLToPath(new URL('qa.ts', import.meta.url))),
+    setGitHub: (github: any) => writeFileSync(githubFile, JSON.stringify(github)),
+    githubCalls: () => existsSync(githubFile + '-calls') ? readFileSync(githubFile + '-calls', 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [],
     threads: () => JSON.parse(readFileSync(threadsFile, 'utf8')),
     setThreads: (threads: any[]) => writeFileSync(threadsFile, JSON.stringify(threads)),
     calls: () => existsSync(callsFile) ? readFileSync(callsFile, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [] };
@@ -185,6 +277,7 @@ test('full fake-server poll: dispatch, prompt contract, Linear state, and manual
   assert.equal(args[1].split('\n')[0], '**Thread title:** Use the Linear ticket identifier and title: `MET-123 — Build the useful widget today`.');
   assert.doesNotMatch(args[1], /GH_TOKEN/);
   assert.ok(args[1].includes("GitHub auth is preconfigured for agent (gh + git credential helper); don't set GitHub token environment variables or run gh auth commands. If `gh auth status` fails, stop and report."));
+  assert.ok(args[1].includes("Push, open the PR. Then subscribe this thread to your PR's comments and reviews, and to CI for its exact head commit; after every later push, subscribe to CI for the new head commit. If subscribing fails, note the error in your final reply and continue; subscriptions are optional feedback."));
   for (const text of ['git -C ~/work/factory fetch origin', 'git -C ~/work/factory worktree add -b met-123-build-the-useful-widget ~/work/factory-met-123-build-the-useful-widget origin/main', 'Never reuse or overwrite', 'Contributes MET-123', 'cargo fmt --check', 'cargo clippy --all-targets -- -D warnings', 'cargo test --workspace', 'vp check', 'factory-ssh', 'console-ssh', 'Never deploy']) assert.ok(args[1].includes(text), text);
   for (const text of [
     'Use the already-connected Linear MCP server', 'report their names without calling a write tool',
@@ -727,4 +820,311 @@ test('archive dry-run previews conditional Amp commands without claiming quiet t
   assert.equal(f.calls().length, 0);
   assert.equal(f.mutations.length, 0);
   assert.equal(f.threads()[0].archived, false);
+});
+
+const githubPR = (overrides: any = {}) => ({ state: 'OPEN', isDraft: false, baseRefName: 'main', headRefOid: sha,
+  checks: ['rust', 'kiosk', 'scripts'].map(name => ({ name, bucket: 'pass' })),
+  files: [{ filename: 'widgets/widget.rs', status: 'modified' }], ...overrides });
+const reviewable = (n = 123) => issue(n, { labels: [], comments: [claimComment(), threadComment()], attachments: [attachment('open')] });
+const qaMarker = (text: string) => ({ body: `<!-- factory-qa:${text} -->` });
+function reviewed(value = 'ready', head = sha) {
+  const i = reviewable();
+  i.comments.push(qaMarker(`start pr:90 sha:${head} runner:gpu`), qaMarker(`review-claim pr:90 sha:${head} thread:${reviewId}`));
+  i.comments.push({ body: `Findings for ${head}\n<!-- factory-qa:review pr:90 sha:${head} thread:${reviewId} verdict:${value} -->\n\n## Builder follow-up\nFix widgets/widget.rs boundary handling; run widget tests.` });
+  return i;
+}
+
+test('QA triggers once per head, sends each changes verdict directly, then stops after two rounds', { timeout: 10_000 }, async t => {
+  const i = reviewable();
+  const f = await fixture(t, [i], { github: { 90: githubPR() } });
+  const initial = await f.run();
+  assert.equal(initial.code, 0, initial.stdout);
+  await f.run();
+  assert.equal(f.calls().length, 1);
+  assert.equal(f.calls()[0][0], '-x');
+  assert.ok(f.calls()[0][1].includes(sha));
+  assert.doesNotMatch(f.calls()[0][1], /GH_TOKEN|auth setup-git/);
+  assert.ok(f.calls()[0][1].includes('GitHub auth is preconfigured for agent'));
+  for (const text of ['Never edit code', 'Isolation, Build and Done means', 'PLAYBOOK.md §5', 'update_diff', 'GitHub PR comment', 'Do not merge now', 'your own actual Amp thread ID']) assert.ok(f.calls()[0][1].includes(text), text);
+  i.comments.push(reviewed('changes').comments.at(-1));
+  const changes = await f.run();
+  assert.equal(changes.code, 0, changes.stdout);
+  await f.run();
+  assert.equal(f.calls().length, 2);
+  assert.deepEqual(f.calls()[1].slice(0, 4), ['threads', 'continue', threadId, '-ox']);
+  assert.ok(f.calls()[1][4].endsWith('Fix widgets/widget.rs boundary handling; run widget tests.'));
+  f.setGitHub({ 90: githubPR({ headRefOid: nextSha }) });
+  const push = await f.run();
+  assert.equal(push.code, 0, push.stdout);
+  assert.equal(f.calls().length, 3);
+  assert.ok(f.calls()[2][1].includes(nextSha));
+  i.comments.push(reviewed('changes', nextSha).comments.at(-1));
+  await f.run();
+  assert.equal(f.calls().length, 4);
+  assert.ok(i.comments.some((c: any) => c.body.includes('two rounds without ready') && c.body.includes('https://linear.app/metacomet/profiles/devon ')));
+  f.setGitHub({ 90: githubPR({ headRefOid: mergeSha }) });
+  await f.run();
+  assert.equal(f.calls().length, 4);
+  assert.equal(i.comments.filter((c: any) => c.body.includes('factory-qa:round ')).length, 2);
+  t.diagnostic(`QA fake polls: initial=${initial.durationMs.toFixed(1)} ms; changes=${changes.durationMs.toFixed(1)} ms; push=${push.durationMs.toFixed(1)} ms`);
+});
+
+test('QA has one slot per runner independent of full builder capacity, and never consumes builder slots', { timeout: 10_000 }, async t => {
+  const pending = [reviewable(1), reviewable(2), reviewable(3)];
+  pending[1].comments[1] = threadComment('console');
+  const f = await fixture(t, pending, { github: { 90: githubPR() } });
+  const result = await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '1' });
+  assert.equal(result.code, 0, result.stdout);
+  assert.deepEqual(f.calls().map(a => a[a.indexOf('--executor') + 1]), ['runner:factory-gpu', 'runner:factory-console']);
+  await f.run();
+  assert.equal(f.calls().length, 2);
+  assert.equal(pending[2].comments.length, 2);
+  // Free builder slots but retain the two QA claims. New builders must still start.
+  for (const i of pending) i.comments.push({ body: '<!-- factory-dispatch:wrapup -->' });
+  pending.push(issue(4), issue(5));
+  await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '1' });
+  assert.equal(f.calls().filter(a => a[0] === '-x' && !a[1].includes('— QA PR')).length, 2);
+});
+
+test('QA engine mapping uses grouped/flat builder engine labels, with Claude fallback', () => {
+  for (const [engine, expected] of [['amp', 'claude'], ['chatgpt', 'claude'], ['claude', 'amp'], ['unknown', 'claude']]) {
+    for (const label of [group('engine', engine), { id: engine, name: `engine/${engine}` }]) assert.equal(reviewerEngine(issue(1, { labels: [label] })), expected);
+  }
+  assert.equal(reviewerEngine(issue(1, { labels: [] })), 'claude');
+});
+
+test('QA excludes drafts, old/equal attachments, foreign repos, mismatched heads and missing claims', { timeout: 10_000 }, async t => {
+  for (const kind of ['draft', 'old', 'equal', 'foreign', 'mismatch', 'no-claim', 'closed']) {
+    const i = reviewable();
+    const pr = githubPR();
+    if (kind === 'draft') pr.isDraft = true;
+    if (kind === 'old') i.attachments[0].createdAt = '2020-01-01T00:00:00Z';
+    if (kind === 'equal') i.attachments[0].createdAt = claimComment().createdAt;
+    if (kind === 'foreign') i.attachments[0].url = 'https://github.com/other/repo/pull/90';
+    if (kind === 'mismatch') pr.remoteSha = nextSha;
+    if (kind === 'no-claim') i.comments.shift();
+    if (kind === 'closed') pr.state = 'CLOSED';
+    const f = await fixture(t, [i], { github: { 90: pr } });
+    assert.equal((await f.run()).code, 0);
+    assert.equal(f.calls().length, 0, kind);
+    assert.equal(f.mutations.length, 0, kind);
+  }
+});
+
+test('QA rejects fenced, inline, wrong-thread and conflicting verdicts; new head invalidates ready', { timeout: 10_000 }, async t => {
+  for (const kind of ['fenced', 'inline', 'wrong-thread', 'conflicting', 'no-start']) {
+    const i = reviewed();
+    const c = i.comments.at(-1);
+    if (kind === 'fenced') c.body = `\`\`\`\n${c.body}\n\`\`\``;
+    if (kind === 'inline') c.body = c.body.replace('<!-- factory-qa:review ', 'quoted <!-- factory-qa:review ');
+    if (kind === 'wrong-thread') c.body = c.body.replace(reviewId, threadId);
+    if (kind === 'conflicting') i.comments.push(reviewed('changes').comments.at(-1));
+    if (kind === 'no-start') i.comments.splice(2, 1);
+    const f = await fixture(t, [i], { github: { 90: githubPR() } });
+    await f.run();
+    assert.equal(f.calls().filter(a => a[0] === 'threads').length, 0, kind);
+  }
+  const i = reviewed();
+  const f = await fixture(t, [i], { github: { 90: githubPR({ headRefOid: nextSha }) } });
+  await f.run(); await f.run();
+  assert.equal(f.calls().length, 1);
+  assert.equal(f.calls()[0][0], '-x');
+  assert.ok(f.calls()[0][1].includes(nextSha));
+});
+
+test('QA ready authorizes only the reviewer; merge-time check independently rejects a later push', { timeout: 10_000 }, async t => {
+  const i = reviewed();
+  const f = await fixture(t, [i], { github: { 90: githubPR() } });
+  const result = await f.run(['poll'], { DISPATCH_GITHUB_URL: undefined, AGENT_GH_TOKEN: key });
+  assert.equal(result.code, 0, result.stdout);
+  assert.equal(f.calls().length, 1, 'authenticated reads must pass before the loopback-only repeat');
+  await f.run();
+  assert.equal(f.calls().length, 1);
+  assert.deepEqual(f.calls()[0].slice(0, 4), ['threads', 'continue', reviewId, '-ox']);
+  assert.ok(f.calls()[0][4].includes(`gh pr merge 90 --repo Metacomet-Technologies/factory --squash --match-head-commit ${sha}`));
+  assert.ok(f.calls()[0][4].includes('inside Isolation'));
+  assert.ok(f.calls()[0][4].includes('never tools from the PR'));
+  assert.doesNotMatch(f.calls()[0][4], /GH_TOKEN|auth setup-git/);
+  assert.ok(f.calls()[0][4].includes('GitHub auth is preconfigured for agent'));
+  assert.equal((await f.check()).code, 0);
+  f.setGitHub({ 90: githubPR({ headRefOid: nextSha }) });
+  assert.equal((await f.check()).code, 1);
+  assert.equal(f.githubCalls().some(a => a[0] === 'gh' && a[2] === 'merge'), false);
+  t.diagnostic(`QA ready fake poll: ${result.durationMs.toFixed(1)} ms`);
+});
+
+test('QA merge gate refuses bad CI, skipped/missing checks, head races, drafts and unsafe file lists', { timeout: 20_000 }, async t => {
+  const f = await fixture(t, [reviewed()], { github: { 90: githubPR() } });
+  const bad = [
+    { checks: [] }, { checks: [{ name: 'rust', bucket: 'pass' }] },
+    ...['pending', 'fail', 'skipping', 'cancel'].map(bucket => ({ checks: githubPR().checks.map((c: any) => c.name === 'scripts' ? { ...c, bucket } : c) })),
+    { checkExit: 8 }, { pushDuringChecks: nextSha }, { remoteSha: nextSha },
+    { isDraft: true }, { baseRefName: 'release' }, { files: [] },
+    { files: [{ filename: 'docs/renamed.md', status: 'renamed' }] },
+    { files: Array.from({ length: 3000 }, () => ({ filename: 'widgets/file.rs' })) },
+  ];
+  for (const overrides of bad) {
+    f.setGitHub({ 90: githubPR(overrides) });
+    const result = await f.run();
+    assert.equal(result.code, 0, result.stdout);
+    assert.equal(f.calls().length, 0, JSON.stringify(overrides).slice(0, 200));
+    f.setGitHub({ 90: githubPR(overrides) });
+    assert.equal((await f.check()).code, 1);
+  }
+  f.setGitHub({ 90: githubPR() });
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.calls().length, 1);
+});
+
+test('QA self-deploying additions/deletions/renames on later file pages ping once, never merge', { timeout: 10_000 }, async t => {
+  for (const path of ['scripts/dispatch/dispatch.ts', 'scripts/usage/collect.ts']) for (const status of ['modified', 'removed', 'renamed']) {
+    const i = reviewed();
+    const file = status === 'renamed' ? { filename: 'docs/moved.ts', previous_filename: path, status } : { filename: path, status };
+    const f = await fixture(t, [i], { github: { 90: githubPR({ pages: [Array.from({ length: 100 }, (_, n) => ({ filename: `widgets/file${n}.rs` })), [file]] }) } });
+    await f.run(); await f.run();
+    assert.equal(f.calls().length, 0);
+    assert.equal(i.comments.filter((c: any) => c.body.includes('ready; merging deploys it')).length, 1);
+    assert.equal((await f.check()).code, 1);
+  }
+});
+
+for (const step of ['start', 'review-claim', 'followup-claim', 'round', 'merge-claim', 'merge-sent', 'human', 'retired']) for (const boundary of ['before', 'after']) {
+  test(`QA crash ${boundary} ${step} never duplicates submission`, { timeout: 10_000 }, async t => {
+    const i = ['start', 'review-claim'].includes(step) ? reviewable() : reviewed(['followup-claim', 'round'].includes(step) ? 'changes' : 'ready');
+    const f = await fixture(t, [i], { github: { 90: githubPR(step === 'human' ? { files: [{ filename: 'scripts/dispatch/qa.ts' }] } : step === 'retired' ? { headRefOid: nextSha } : {}) },
+      crash: (op: string, v: any) => op === 'Comment' && v.input.body.includes(`<!-- factory-qa:${step} `) ? boundary : false });
+    assert.equal((await f.run()).signal, 'SIGKILL');
+    assert.equal((await f.run()).code, 0);
+    assert.equal((await f.run()).code, 0);
+    const stranded = ['start', 'followup-claim', 'merge-claim'].includes(step) && boundary === 'after';
+    assert.equal(f.calls().length, step === 'human' || stranded ? 0 : 1);
+  });
+}
+
+test('QA interrupted follow-up blocks later heads; failed Amp sends never retry', { timeout: 10_000 }, async t => {
+  for (const i of [reviewable(), reviewed('changes'), reviewed()]) {
+    const f = await fixture(t, [i], { github: { 90: githubPR() } });
+    assert.equal((await f.run(['poll'], { FAKE_FAIL: '1' })).code, 1);
+    await f.run();
+    assert.equal(f.calls().length, 1);
+    if (i.comments.some((c: any) => c.body.includes('factory-qa:followup-claim'))) {
+      f.setGitHub({ 90: githubPR({ headRefOid: nextSha }) });
+      await f.run();
+      assert.equal(f.calls().length, 1);
+    }
+  }
+});
+
+test('QA dry-run previews review/follow-up/merge without Amp or Linear writes', { timeout: 10_000 }, async t => {
+  for (const i of [reviewable(), reviewed('changes'), reviewed()]) {
+    const f = await fixture(t, [i], { github: { 90: githubPR() } });
+    const before = structuredClone(i);
+    const result = await f.run(['poll', '--dry-run']);
+    assert.equal(result.code, 0, result.stdout);
+    assert.match(result.stdout, /would-run.*\$QA_/);
+    assert.deepEqual(i, before);
+    assert.equal(f.calls().length, 0);
+    assert.equal(f.mutations.length, 0);
+    assert.ok(!result.stdout.includes('boundary handling'));
+  }
+});
+
+test('playbook sync waits for wrap-up, clean updated main, then copies the checkout with merge SHA once', { timeout: 10_000 }, async t => {
+  const i = reviewable();
+  i.attachments[0].metadata.status = 'merged';
+  i.comments.push({ body: '<!-- factory-dispatch:wrapup -->' });
+  const f = await fixture(t, [i], { github: { 90: githubPR({ state: 'MERGED', mergeCommit: { oid: mergeSha }, files: [{ filename: 'docs/PLAYBOOK.md' }] }) } });
+  await f.run();
+  assert.equal(f.mutations.length, 0);
+  i.comments.push({ body: '<!-- factory-dispatch:wrapup-done -->' });
+  for (const environment of [{ FAKE_DIRTY: ' M docs/PLAYBOOK.md' }, { FAKE_BEHIND: '1' }, { FAKE_BRANCH: 'feature' }]) {
+    await f.run(['poll'], environment);
+    assert.equal(f.mutations.length, 0);
+  }
+  const preview = await f.run(['poll', '--dry-run']);
+  assert.match(preview.stdout, /documentUpdate/);
+  assert.equal(f.mutations.length, 0);
+  const result = await f.run();
+  assert.equal(result.code, 0, result.stdout);
+  await f.run();
+  const syncs = f.mutations.filter(m => m.operation === 'SyncPlaybook');
+  assert.equal(syncs.length, 1);
+  assert.equal(syncs[0].id, 'f9581006-8200-4508-8726-06350b721932');
+  assert.ok(syncs[0].input.content.startsWith('> **Source of truth:**'));
+  assert.ok(syncs[0].input.content.includes(`merge ${mergeSha}`));
+  assert.ok(syncs[0].input.content.endsWith(playbook));
+  assert.equal(f.calls().length, 0);
+  t.diagnostic(`playbook fake sync: ${result.durationMs.toFixed(1)} ms`);
+});
+
+for (const step of ['SyncPlaybook', 'playbook-synced']) for (const boundary of ['before', 'after']) {
+  test(`playbook crash ${boundary} ${step} retries an idempotent replacement`, { timeout: 10_000 }, async t => {
+    const i = reviewable();
+    i.attachments[0].metadata.status = 'merged';
+    i.comments.push({ body: '<!-- factory-dispatch:wrapup -->' }, { body: '<!-- factory-dispatch:wrapup-done -->' });
+    const f = await fixture(t, [i], { github: { 90: githubPR({ state: 'MERGED', mergeCommit: { oid: mergeSha }, files: [{ filename: 'docs/PLAYBOOK.md' }] }) },
+      crash: (op: string, v: any) => (step === 'SyncPlaybook' ? op === step : op === 'Comment' && v.input.body.includes(`factory-qa:${step}`)) ? boundary : false });
+    assert.equal((await f.run()).signal, 'SIGKILL');
+    assert.equal((await f.run()).code, 0);
+    assert.equal((await f.run()).code, 0);
+    const syncs = f.mutations.filter(m => m.operation === 'SyncPlaybook');
+    assert.equal(syncs.length, step === 'playbook-synced' && boundary === 'after' ? 1 : 2);
+    assert.ok(syncs.every(m => m.input.content === syncs[0].input.content));
+    assert.equal(i.comments.filter((c: any) => c.body.includes('factory-qa:playbook-synced')).length, 1);
+  });
+}
+
+test('new pushes use spare review slots without losing in-flight reservations', { timeout: 10_000 }, async t => {
+  const i = reviewable();
+  const f = await fixture(t, [i], { github: { 90: githubPR() } });
+  await f.run();
+  f.setGitHub({ 90: githubPR({ headRefOid: nextSha }) });
+  await f.run();
+  assert.deepEqual(f.calls().map(a => a[a.indexOf('--executor') + 1]), ['runner:factory-gpu', 'runner:factory-console']);
+  f.setGitHub({ 90: githubPR({ headRefOid: mergeSha }) });
+  await f.run();
+  assert.equal(f.calls().length, 2);
+});
+
+test('CI truncation, commit-status failure and read failure defer without claims', { timeout: 10_000 }, async t => {
+  const f = await fixture(t, [reviewed()]);
+  for (const overrides of [{ checkTotal: 101 }, { statuses: [{ context: 'external', state: 'failure' }] }, { publicFail: true }]) {
+    f.setGitHub({ 90: githubPR(overrides) });
+    assert.equal((await f.run()).code, 0);
+    assert.equal(f.calls().length, 0);
+    assert.equal(f.mutations.length, 0);
+  }
+  f.setGitHub({ 90: githubPR() });
+  await f.run();
+  assert.equal(f.calls().length, 1);
+});
+
+test('authenticated API quota failures defer without claims and recover on a later poll', { timeout: 15_000 }, async t => {
+  const f = await fixture(t, [reviewed()]);
+  const environment = { DISPATCH_GITHUB_URL: undefined };
+  for (const quotaPath of ['pulls/90', 'pulls/90/files?per_page=100&page=1',
+    `commits/${sha}/check-runs?per_page=100&filter=latest`, `commits/${sha}/status?per_page=100`]) {
+    f.setGitHub({ 90: githubPR({ quotaPath }) });
+    const result = await f.run(['poll'], environment);
+    assert.equal(result.code, 0, result.stdout);
+    assert.match(result.stdout, /qa-pending/);
+    assert.ok(!JSON.stringify(result).includes(key));
+    assert.equal(f.calls().length, 0);
+    assert.equal(f.mutations.length, 0);
+  }
+  f.setGitHub({ 90: githubPR() });
+  assert.equal((await f.run(['poll'], environment)).code, 0);
+  assert.equal(f.calls().length, 1);
+});
+
+test('non-playbook merge records one checked marker without updating the document', { timeout: 10_000 }, async t => {
+  const i = reviewable();
+  i.attachments[0].metadata.status = 'merged';
+  i.comments.push({ body: '<!-- factory-dispatch:wrapup -->' }, { body: '<!-- factory-dispatch:wrapup-done -->' });
+  const f = await fixture(t, [i], { github: { 90: githubPR({ state: 'MERGED', mergeCommit: { oid: mergeSha } }) } });
+  assert.equal((await f.run()).code, 0);
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.mutations.length, 1);
+  assert.equal(f.mutations[0].operation, 'Comment');
+  assert.match(f.mutations[0].input.body, /factory-qa:playbook-checked pr:90/);
 });
