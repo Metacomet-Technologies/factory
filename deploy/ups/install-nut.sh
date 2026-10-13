@@ -75,7 +75,10 @@ for name in "${names[@]}"; do
         chmod 0640 "$root/etc/nut/$name"
     fi
 done
-if [[ $installed == false ]]; then apt-get install -y nut; fi
+if [[ $installed == false ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold nut
+fi
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=usb --attr-match=idVendor=0764 --action=add
 udevadm settle

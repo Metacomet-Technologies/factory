@@ -52,8 +52,12 @@ the complete `/etc/nut` tree (or records its absence) under
 Snapshots are private (0700) and contain credentials: do not share their contents.
 It creates the `nut` group if necessary so config can be written **before**
 `apt-get install -y nut`. This avoids the known unconfigured post-install startup
-deadlock. It reloads udev rules and retriggers USB vendor `0764`, then waits for
-udev to settle, fixing permissions when USB was attached before package install.
+deadlock. Package installation sets `DEBIAN_FRONTEND=noninteractive` and passes
+dpkg `--force-confdef --force-confold`, keeping the rendered files without a
+conffile prompt. dpkg may leave `*.dpkg-dist` copies in `/etc/nut`; these contain
+the stock samples, are safe to delete, and are captured by later snapshots.
+It reloads udev rules and retriggers USB vendor `0764`, then waits for udev to
+settle, fixing permissions when USB was attached before package install.
 
 Only changed config restarts `nut-server` and `nut-monitor`. Equivalent files
 retain their bytes, comments and modification times; permissions are enforced.

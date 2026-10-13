@@ -22,7 +22,8 @@ if name == "dpkg-query":
 elif name == "getent":
     print("nut:x:999:")
 elif name == "apt-get":
-    assert args == ["install", "-y", "nut"]
+    assert args == ["install", "-y", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold", "nut"]
+    assert os.environ.get("DEBIAN_FRONTEND") == "noninteractive"
     snapshots = list((root / "var/backups").glob("nut-*/complete"))
     assert snapshots, "config changed without a complete snapshot"
     for config in ("nut.conf", "ups.conf", "upsd.conf", "upsd.users", "upsmon.conf"):
@@ -128,7 +129,7 @@ class InstallerTest(unittest.TestCase):
         for name in NAMES:
             self.assertEqual(stat.S_IMODE((self.live / name).stat().st_mode), 0o640)
         calls = self.calls()
-        self.assertLess(calls.index("apt-get install -y nut"), calls.index("udevadm control --reload-rules"))
+        self.assertLess(calls.index("apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold nut"), calls.index("udevadm control --reload-rules"))
         self.assertLess(calls.index("udevadm settle"), calls.index("systemctl restart nut-server"))
         installed = tree(self.live)
         (self.base / "calls").unlink()
