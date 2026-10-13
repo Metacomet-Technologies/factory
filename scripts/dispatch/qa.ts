@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { commentMarkers, modes, prepareWorktree, runnerCommand, runWorktreeCommand, type Issue } from './dispatch.ts';
+import { commentMarkers, engineArgs, prepareWorktree, runnerCommand, runWorktreeCommand, type Issue } from './dispatch.ts';
 
 const config = JSON.parse(readFileSync(new URL('qa-config.json', import.meta.url), 'utf8'));
 const main = '/home/agent/work/factory';
@@ -238,7 +238,7 @@ export async function reviewPRs(ctx: Context) {
       const path = qaPath(pr, sha);
       const values = { identifier: issue.identifier, pr, sha, runner, qaBase: path };
       const prompt = readFileSync(new URL('review-prompt.md', import.meta.url), 'utf8').replace(/\{\{(\w+)\}\}/g, (_, key) => values[key]);
-      const args = ['-x', prompt, '--mode', modes[reviewerEngine(issue)].high, '--executor', `runner:${runners[runner]}`, '--runner-dir', path, '--title', `${issue.identifier} — QA PR ${pr}`, '--visibility', 'private', '--no-archive-after-execute'];
+      const args = ['-x', prompt, ...engineArgs(reviewerEngine(issue), 'high'), '--executor', `runner:${runners[runner]}`, '--runner-dir', path, '--title', `${issue.identifier} — QA PR ${pr}`, '--visibility', 'private', '--no-archive-after-execute'];
       let id = 'T-00000000-0000-0000-0000-000000000000';
       if (dryRun) {
         showAmp(issue, runnerCommand(runner, ['git', '-C', main, 'fetch', 'origin']));

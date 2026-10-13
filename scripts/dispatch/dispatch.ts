@@ -28,11 +28,17 @@ export function prepareWorktree(runner: string, path: string, branch?: string) {
 }
 
 export const NODE_VERSION = '24.21.0';
+export const CLAUDE_MODEL = 'claude-opus-5-5';
 export const modes = {
   amp: { low: 'low', medium: 'medium', high: 'high' },
   claude: { low: 'external-agent:claude-code', medium: 'external-agent:claude-code', high: 'external-agent:claude-code' },
   chatgpt: { low: 'gpt56l', medium: 'gpt61s', high: 'gpt61s' },
+  ultra: { low: 'ultra', medium: 'ultra', high: 'ultra' },
 };
+export function engineArgs(engine: string, effort: string) {
+  return ['--mode', modes[engine][effort],
+    ...(engine === 'claude' ? ['--features', `model:${CLAUDE_MODEL},effort:${effort}`] : [])];
+}
 const marker = (name: string) => `<!-- factory-dispatch:${name} -->`;
 const threadPattern = /^<!-- factory-dispatch:thread (T-[a-f0-9-]{36})(?: runner:(gpu|console))? -->$/;
 const claimPattern = /^<!-- factory-dispatch:claim runner:(gpu|console) -->$/;
@@ -328,11 +334,11 @@ export async function run(command: string, identifier: string | undefined, dryRu
     }
     if (!runnerAvailable(runner)) continue;
     await removeLabel(issue);
-    await comment(issue, `Dispatch claimed on ${runner}${overflow ? ' (overflow)' : ''}. If submission is interrupted, inspect Amp before manual recovery; do not delete this claim to retry blindly.\n\n${marker(`claim runner:${runner}`)}\n${marker(`worktree ${slug(issue.identifier, issue.title)}`)}`);
+    await comment(issue, `Dispatch claimed on ${runner}${overflow ? ' (overflow)' : ''}. If submission is interrupted, inspect Amp before manual recovery; do not delete this claim to retry blindly.${engine === 'ultra' ? '\nEngine ultra: bills Amp credits (or OpenCode Go)\nagent-effort is ignored for ultra.' : ''}\n\n${marker(`claim runner:${runner}`)}\n${marker(`worktree ${slug(issue.identifier, issue.title)}`)}`);
     active[runner]++;
     const branch = slug(issue.identifier, issue.title);
     const path = `${mainCheckout}-${branch}`;
-    const args = ['-x', prompt(issue, runner), '--mode', modes[engine][effort], '--executor', `runner:${runners[runner]}`, '--runner-dir', path, '--title', `${issue.identifier} — ${issue.title}`, '--visibility', 'private', '--no-archive-after-execute'];
+    const args = ['-x', prompt(issue, runner), ...engineArgs(engine, effort), '--executor', `runner:${runners[runner]}`, '--runner-dir', path, '--title', `${issue.identifier} — ${issue.title}`, '--visibility', 'private', '--no-archive-after-execute'];
     let id = 'T-00000000-0000-0000-0000-000000000000';
     if (dryRun) {
       showAmp(issue, runnerCommand(runner, ['git', '-C', mainCheckout, 'fetch', 'origin']));

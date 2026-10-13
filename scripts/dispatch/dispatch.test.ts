@@ -695,17 +695,38 @@ test('failed wrap-up is claimed, reported, and never automatically retried', { t
 });
 
 test('all engine/effort mappings and runner configuration reach exact Amp argv', { timeout: 15_000 }, async t => {
-  const expected = { amp: ['low', 'medium', 'high'], claude: ['external-agent:claude-code', 'external-agent:claude-code', 'external-agent:claude-code'], chatgpt: ['gpt56l', 'gpt61s', 'gpt61s'] };
+  const expected = { amp: ['low', 'medium', 'high'], claude: ['external-agent:claude-code', 'external-agent:claude-code', 'external-agent:claude-code'], chatgpt: ['gpt56l', 'gpt61s', 'gpt61s'], ultra: ['ultra', 'ultra', 'ultra'] };
   const issues: any[] = [];
   for (const engine of Object.keys(expected)) for (const effort of ['low', 'medium', 'high']) {
     const i = issue(100 + issues.length);
-    i.labels.push(group('engine', engine), group('agent-effort', effort), group('runner', 'console'));
+    i.labels.push(effort === 'medium' ? { id: engine, name: `engine/${engine}` } : group('engine', engine), group('agent-effort', effort), group('runner', 'console'));
     issues.push(i);
   }
   const f = await fixture(t, issues);
-  assert.equal((await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '9', DISPATCH_RUNNERS: 'gpu=gpu-id,console=console-id' })).code, 0);
+  assert.equal((await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '12', DISPATCH_RUNNERS: 'gpu=gpu-id,console=console-id' })).code, 0);
   assert.deepEqual(f.calls().map(args => args[args.indexOf('--mode') + 1]), Object.values(expected).flat());
-  for (const args of f.calls()) assert.equal(args[args.indexOf('--executor') + 1], 'runner:console-id');
+  for (const [n, args] of f.calls().entries()) {
+    assert.equal(args[args.indexOf('--executor') + 1], 'runner:console-id');
+    if (n >= 3 && n < 6) assert.deepEqual(args.slice(4, 6), ['--features', `model:claude-opus-5-5,effort:${['low', 'medium', 'high'][n - 3]}`]);
+    else assert.ok(!args.includes('--features'));
+    const claim = issues[n].comments.find((c: any) => c.body.includes('factory-dispatch:claim'));
+    if (n >= 9) {
+      assert.ok(claim.body.includes('\nEngine ultra: bills Amp credits (or OpenCode Go)\n'));
+      assert.ok(claim.body.includes('agent-effort is ignored for ultra.'));
+    } else assert.ok(!claim.body.includes('Engine ultra:'));
+  }
+});
+
+test('Claude defaults to medium effort and invalid engine labels never launch', { timeout: 10_000 }, async t => {
+  const claude = issue(100);
+  claude.labels.push(group('engine', 'claude'));
+  const invalid = issue(101);
+  invalid.labels.push(group('engine', 'unknown'));
+  const f = await fixture(t, [claude, invalid]);
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.calls().length, 1);
+  assert.deepEqual(f.calls()[0].slice(4, 6), ['--features', 'model:claude-opus-5-5,effort:medium']);
+  assert.match(invalid.comments[0].body, /Invalid engine label/);
 });
 
 test('dry-run prints decisions/commands/mutations, never prompts, secrets, Amp calls or writes', { timeout: 10_000 }, async t => {
@@ -1090,10 +1111,24 @@ test('unreachable console leaves QA unclaimed and retries on a later reachable p
 });
 
 test('QA engine mapping uses grouped/flat builder engine labels, with Claude fallback', () => {
-  for (const [engine, expected] of [['amp', 'claude'], ['chatgpt', 'claude'], ['claude', 'amp'], ['unknown', 'claude']]) {
+  for (const [engine, expected] of [['amp', 'claude'], ['chatgpt', 'claude'], ['ultra', 'claude'], ['claude', 'amp'], ['unknown', 'claude']]) {
     for (const label of [group('engine', engine), { id: engine, name: `engine/${engine}` }]) assert.equal(reviewerEngine(issue(1, { labels: [label] })), expected);
   }
   assert.equal(reviewerEngine(issue(1, { labels: [] })), 'claude');
+});
+
+test('QA launch uses high Claude features except for Claude builders, which get Amp high', { timeout: 10_000 }, async t => {
+  for (const engine of ['amp', 'chatgpt', 'ultra', 'claude', 'unknown']) {
+    const i = reviewable();
+    i.labels.push(group('engine', engine));
+    const f = await fixture(t, [i], { github: { 90: githubPR() } });
+    assert.equal((await f.run()).code, 0);
+    assert.equal(f.calls().length, 1);
+    assert.deepEqual(f.calls()[0].slice(2, engine === 'claude' ? 4 : 6), engine === 'claude'
+      ? ['--mode', 'high']
+      : ['--mode', 'external-agent:claude-code', '--features', 'model:claude-opus-5-5,effort:high']);
+    if (engine === 'claude') assert.ok(!f.calls()[0].includes('--features'));
+  }
 });
 
 test('QA excludes drafts, old/equal attachments, foreign repos, mismatched heads and missing claims', { timeout: 10_000 }, async t => {
