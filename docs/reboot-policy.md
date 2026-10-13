@@ -45,34 +45,30 @@ see even when no reboot is pending. Only the marker drives decisions:
 ### Agent process allowlist
 
 The root check runs `ps -u agent -ww -o pid=,ppid=,args=`. Each row is a numeric
-PID, parent PID, and the remaining full command line. **Every** agent-owned
-process blocks unless its full command matches an explicit Python regular
-expression in `/etc/factory-reboot/node.conf` (`agent_allowlist`). `parent_args`,
-when present, must also match the direct parent's command. Never allow all
-`amp`, `bash`, `node`, `python`, `cargo`, `ssh`, or all descendants of the runner.
+PID, parent PID, and the remaining full command line. The check obtains the
+runner identity with `systemctl show -p MainPID --value amp-runner.service`.
+That PID is idle regardless of its command line. Only its **direct** children
+whose command contains both `plugin-runtime.ts` and `official-modes@` are also
+idle. Runner flags, executable paths, runtime suffixes and plugin hashes can
+change without making the idle runner busy. A runner child running `cargo`,
+another Amp script, an orphan plugin or a plugin grandchild still blocks.
+
+Every other agent-owned process blocks unless its full command matches an
+explicit Python regular expression in `/etc/factory-reboot/node.conf`
+(`agent_allowlist`). `parent_args`, when present, must also match the direct
+parent's command. If MainPID is 0, invalid or unreadable, use only this allowlist;
+any unmatched process records `runner-pid-unknown: pid=<pid>` in
+`last_busy_reason`. An unknown runner PID alone does not block when every
+process is allowlisted or there are no agent processes. With a known runner,
+an unmatched process records `agent-busy: pid=<pid>`. Never allow all `amp`,
+`bash`, `node`, `python`, `cargo`, `ssh`, or all descendants of the runner.
 The verified procps empty-selection result is exit 1 with empty stdout/stderr;
 that is idle. Errors with diagnostics, other exit codes, and malformed rows skip.
 
-Read-only inspection on factory-gpu on 2026-10-11 found:
-
-- PID 2481, parent 1: `/home/agent/.local/bin/amp --no-tui --runner-id
-  factory-gpu --dir /home/agent/work --discover-dirs=/home/agent/work
-  --remote-control-terminal --amp-env --runner-account-email devon@metacomet.tech`.
-  Its exact long-lived runner command is allowed, not arbitrary Amp invocations.
-- PID 34170, parent 2481: Amp's `official-modes` plugin runtime. Its command
-  contains `/tmp/amp-plugin-runtime-q517Yo/plugin-runtime.ts` and
-  `official-modes@46ba5e96083e1347/index.ts`. Only the runtime directory suffix
-  and plugin hash vary in the rule; the parent must match the exact runner.
-- PID 31101, parent 1: `op daemon`, the idle 1Password background process.
-- The inspection shell and `ps` process also appeared. They are work, not allowed.
-
-Devon's read-only idle console capture found PID 4909 (parent 1), with the same
-runner flags but `--runner-id factory-console`, and its direct plugin child PID
-138429 with suffix `OuJYUh` and plugin hash `46ba5e96083e1347`. Console allows
-only that exact runner command and its direct plugin child; no `op` daemon.
-Both nodes pattern the alphanumeric runtime suffix and hexadecimal plugin hash,
-so plugin updates stay idle. Everything else remains exact and fully matched;
-a different `amp run` script under either runner still blocks reboot.
+Both repository configs remove the old full-argv runner and plugin regexes.
+GPU retains `op daemon`, the idle 1Password background process, as an additional
+allowlist rule. Console has no additional allowlist rules. Inspection shells
+and `ps` processes remain work, not idle.
 
 From the Mac, inspect and edit each node separately:
 
@@ -201,8 +197,8 @@ factory-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-pol
 console-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-console --mode observe --replace-config"
 ```
 
-MET-147 changed both service lists, so installed configurations from before it
-(console still listing `factory-api.service`) need this `--replace-config` rerun.
+MET-147 changed both service lists, and MET-151 removed the argv-based runner
+rules, so older installed configurations need this `--replace-config` rerun.
 Re-add any local allowlist edits afterwards; the printed snapshot keeps the old
 configuration.
 
