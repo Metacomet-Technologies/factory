@@ -2,6 +2,7 @@
 """Needs-only reboot decisions and post-boot observations; no forced reboots."""
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import fcntl
 import json
@@ -115,9 +116,11 @@ def busy_reason(config, root, now):
 
 def postboot_observations(config):
     # Overrides are for the no-root harness only; the installer removes them.
-    deadline = time.monotonic() + float(os.environ.get("REBOOT_POSTBOOT_WAIT_S", 180))
+    allowance = float(os.environ.get("REBOOT_POSTBOOT_WAIT_S", 180))
 
     def wait(probe, ready):
+        # Each probe gets its own allowance, so one slow probe cannot starve another.
+        deadline = time.monotonic() + allowance
         while True:
             value = probe()
             remaining = deadline - time.monotonic()
@@ -129,13 +132,15 @@ def postboot_observations(config):
         result = command("timedatectl", "show", "-p", "NTPSynchronized")
         return result.returncode == 0 and result.stdout.strip() == "NTPSynchronized=yes"
 
-    synced = wait(clock, bool)
-    services = {}
-    for service in config["services"]:
-        services[service] = wait(
-            lambda: command("systemctl", "is-active", service).stdout.strip() or "unknown",
-            lambda state: state != "activating")
-    return dict(services=services, clock_synced=synced)
+    def service_state(service):
+        return wait(lambda: command("systemctl", "is-active", service).stdout.strip() or "unknown",
+                    lambda state: state != "activating")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(config["services"]) + 1) as pool:
+        synced = pool.submit(wait, clock, bool)
+        services = {service: pool.submit(service_state, service) for service in config["services"]}
+        return dict(services={service: future.result() for service, future in services.items()},
+                    clock_synced=synced.result())
 
 
 def write_status(path, state):

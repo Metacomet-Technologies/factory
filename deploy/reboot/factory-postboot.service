@@ -9,7 +9,8 @@ Before=shutdown.target
 
 [Service]
 Type=oneshot
-# Postboot waits up to 180 s for the clock and activating services.
+# The clock and each service are polled concurrently for up to 180 s each; a final
+# probe can add its 15 s command timeout, so 240 s leaves margin for startup.
 TimeoutStartSec=240
 User=root
 UMask=0077

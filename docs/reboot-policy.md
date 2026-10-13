@@ -153,10 +153,14 @@ Logs go to the journal. A failed state write prevents a reboot.
   `timedatectl show -p NTPSynchronized` output `NTPSynchronized=yes`.
 
 `factory-postboot.service` runs after `multi-user.target` and `time-sync.target`,
-then waits until timedatectl reports synchronization and each configured unit
-leaves `activating`, sharing one 180-second deadline (`TimeoutStartSec=240`), and
-records whatever states remain. It waits before taking the state lock, so checks
-are not delayed.
+then polls the clock and every configured unit concurrently, every 2 seconds.
+Each one gets its own 180-second allowance: the clock until timedatectl reports
+synchronization, each unit until it leaves `activating`. A clock that never syncs
+or a stuck unit therefore cannot shorten another unit's observation. The final
+states are recorded as reported, including `activating`, failed, inactive or
+`unknown` (empty output). The total wait is about 180 seconds plus at most one
+15-second probe timeout, within `TimeoutStartSec=240`. Waiting happens before
+the state lock is taken, so checks are not delayed.
 It uses `DefaultDependencies=no` to avoid a cycle with the target enabling it,
 and retains explicit shutdown ordering. It observes rather than repairs
 services. GPU configuration includes meter, Ollama, Amp and operational NUT
@@ -238,7 +242,7 @@ The harness runs the real check scripts with `REBOOT_ROOT`, `REBOOT_CONFIG`,
 `REBOOT_NOW_MS`, and fake command paths. It covers decision order, both modes,
 busy/allowed processes, worktree activity, `last_busy_reason` without the
 marker, meter time boundaries/errors, UPS states/errors,
-consecutive dates, post-boot state and its bounded waits, both calendars and concurrent atomic reads.
+consecutive dates, post-boot state and its independent bounded clock/service waits, both calendars and concurrent atomic reads.
 Where usable `bwrap` exists, it additionally runs the real installer/rollback
 in root user namespaces with fake commands and temporary destinations; it
 models ownership rather than changing host ownership. Without namespaces that

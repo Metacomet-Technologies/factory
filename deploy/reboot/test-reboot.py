@@ -270,14 +270,30 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
     assert data["postboot"]["clock_synced"], data
     assert data["postboot"]["services"]["meter.service"] == "active"
     assert data["postboot"]["services"]["ollama.service"] == "failed"
-    assert 6 <= elapsed < 30, elapsed
+    assert 4 <= elapsed < 30, elapsed
+    # A clock that never syncs uses its whole allowance; a later-settling service still gets its own.
+    # A stuck service cannot deprive the others either, and the total stays near one allowance.
+    data, elapsed = postboot(6, clock="no", services={
+        "meter.service": "activating",
+        "ollama.service": ["activating", "activating", "active"],
+        "amp-runner.service": ["activating", "activating", "inactive"],
+        "nut-server.service": "failed", "factory-api.service": ""})
+    observed = data["postboot"]
+    assert not observed["clock_synced"], data
+    assert observed["services"]["meter.service"] == "activating"
+    assert observed["services"]["ollama.service"] == "active"
+    assert observed["services"]["amp-runner.service"] == "inactive"
+    assert observed["services"]["nut-server.service"] == "failed"
+    assert observed["services"]["factory-api.service"] == "unknown"
+    assert observed["services"]["factory-backup.timer"] == "active"
+    assert 6 <= elapsed < 15, elapsed
     data, elapsed = postboot(3, clock="yes", services={"meter.service": "activating"})
     assert data["postboot"]["services"]["meter.service"] == "activating"
-    assert 3 <= elapsed < 15, elapsed
+    assert 3 <= elapsed < 10, elapsed
     data, elapsed = postboot(3, clock="no", services={})
-    assert not data["postboot"]["clock_synced"] and 3 <= elapsed < 15, elapsed
+    assert not data["postboot"]["clock_synced"] and 3 <= elapsed < 10, elapsed
     commands.update(clock="yes", services={})
-    print("PASS: postboot waits for a late clock and activating services, bounded by the deadline")
+    print("PASS: postboot gives the clock and each service its own bounded allowance")
 
     flag.unlink()
     expect("not-needed")
