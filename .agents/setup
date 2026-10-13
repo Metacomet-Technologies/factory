@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(realpath "$(dirname "${BASH_SOURCE[0]}")/..")
+cd "$root"
+
+echo "[${SECONDS}s] Checking system packages"
+missing=()
+for package in build-essential ca-certificates curl python3 util-linux shellcheck sqlite3 zstd rsync; do
+    if [[ $(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true) != 'install ok installed' ]]; then
+        missing+=("$package")
+    fi
+done
+if ((${#missing[@]})); then
+    sudo apt-get update
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y "${missing[@]}"
+fi
+
+echo "[${SECONDS}s] Preparing Rust 1.99.0"
+if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
+rustup default 1.99.0
+# Amp and supervised services use non-interactive login shells.
+if ! grep -Fqx ". \"\$HOME/.cargo/env\"" "$HOME/.bash_profile" 2>/dev/null; then
+    printf '\n%s\n' ". \"\$HOME/.cargo/env\"" >> "$HOME/.bash_profile"
+fi
+
+echo "[${SECONDS}s] Preparing Vite+ 1.1.0"
+export VP_HOME="$HOME/.vite-plus"
+if [[ ! -x "$VP_HOME/bin/vp" ]] || ! "$VP_HOME/bin/vp" --version | grep -Fxq 'vp v1.1.0'; then
+    curl -fsSL https://vite.plus | VP_VERSION=1.1.0 VP_NODE_MANAGER=yes bash
+fi
+# shellcheck source=/dev/null
+source "$VP_HOME/env"
+
+echo "[${SECONDS}s] Fetching locked Rust dependencies (no compilation)"
+cargo fetch --locked --target x86_64-unknown-linux-gnu
+
+echo "[${SECONDS}s] Installing pinned kiosk runtime and locked dependencies"
+cd "$root/kiosk"
+vp env install
+vp install --frozen-lockfile
+node --version
+pnpm --version
+vp --version
+echo "[${SECONDS}s] Setup complete; services and builds remain on demand"
