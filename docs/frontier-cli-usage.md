@@ -1537,3 +1537,22 @@ The follow-up also parses each JSONL protocol message. `cargo fmt --check`,
 (one existing ignored test).
 Sandbox: none (docs-only). Deploy artifacts/steps: none. Disposable help/docs/
 probe captures are local scratch, not deployed or committed.
+
+## Collector (MET-125)
+
+The [collector](../scripts/usage/README.md) implements the selected GPU sources
+at 15-minute cadence, with hourly Amp pool-table validation, independent errors,
+45-minute freshness, atomic sanitized snapshots and `/v1/agents` plus
+`agents.usage` SSE. Deployment remains Devon's gate. No new inference, auth,
+reset consumption, transcript harvesting or runner configuration is required.
+
+The Codex implementation uses Devon's verified `jsonrpc: "2.0"` message form,
+superseding the header-omitted reproduction above. Its reset-credit count is
+`result.rateLimitResetCredits.availableCount`, beside `result.rateLimits`.
+Codex credits retain decimal string precision and are never USD. Amp exposes
+separate USD and normalized orb-hour balances; the date-only period end becomes
+UTC midnight, not a claim of exact renewal time. Claude's usage report does not
+identify Max versus Pro, so the normalized plan stays null. Scoped weekly limits
+remain separate. Extra-usage billing and Amp per-thread/token accounting are not
+part of this quota contract. See the README for parser/version boundaries,
+fixture provenance, stale/error semantics and deploy/rollback steps.

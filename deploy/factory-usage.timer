@@ -1,0 +1,10 @@
+[Unit]
+Description=Collect factory usage every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Unit=factory-usage.service
+
+[Install]
+WantedBy=timers.target

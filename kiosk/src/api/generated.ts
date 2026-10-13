@@ -147,10 +147,38 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
   schemas: {
+    AgentBalance: {
+      /** @description Decimal strings preserve provider precision; amount equals remaining. */
+      amount: string;
+      remaining: string;
+      total?: string | null;
+      unit: string;
+    };
     AgentTool: {
+      balance?: null | components["schemas"]["AgentBalance"];
+      /** @description Amp has independent USD and normalized orb-hour pools. Never sum units. */
+      balances: components["schemas"]["AgentBalance"][];
+      cli_version?: string | null;
       note?: string | null;
+      /** Format: int64 */
+      observed_at_ms?: number | null;
+      plan?: string | null;
+      reason?: string | null;
+      /** Format: int64 */
+      reset_credits_available?: number | null;
+      source?: string | null;
       status: string;
       tool: string;
+      windows: components["schemas"]["AgentWindow"][];
+    };
+    AgentWindow: {
+      name: string;
+      /** Format: int64 */
+      resets_at_ms?: number | null;
+      /** Format: double */
+      used_percent: number;
+      /** Format: int64 */
+      window_minutes?: number | null;
     };
     Agents: {
       tools: components["schemas"]["AgentTool"][];

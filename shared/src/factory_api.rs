@@ -142,6 +142,32 @@ pub struct AgentTool {
     pub tool: String,
     pub status: String,
     pub note: Option<String>,
+    pub reason: Option<String>,
+    pub observed_at_ms: Option<i64>,
+    pub source: Option<String>,
+    pub cli_version: Option<String>,
+    pub plan: Option<String>,
+    pub windows: Vec<AgentWindow>,
+    /// Primary balance; the first item in balances, not an additional pool.
+    pub balance: Option<AgentBalance>,
+    /// Amp has independent USD and normalized orb-hour pools. Never sum units.
+    pub balances: Vec<AgentBalance>,
+    pub reset_credits_available: Option<u64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AgentWindow {
+    pub name: String,
+    pub used_percent: f64,
+    pub resets_at_ms: Option<i64>,
+    pub window_minutes: Option<u64>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct AgentBalance {
+    /// Decimal strings preserve provider precision; amount equals remaining.
+    pub amount: String,
+    pub unit: String,
+    pub remaining: String,
+    pub total: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Agents {
