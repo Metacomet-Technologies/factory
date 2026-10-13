@@ -9,7 +9,8 @@ export const modes = {
   chatgpt: { low: 'gpt56l', medium: 'gpt61s', high: 'gpt61s' },
 };
 const marker = (name: string) => `<!-- factory-dispatch:${name} -->`;
-const threadPattern = /<!-- factory-dispatch:thread (T-[a-f0-9-]{36})(?: runner:(gpu|console))? -->/;
+const threadPattern = /^<!-- factory-dispatch:thread (T-[a-f0-9-]{36})(?: runner:(gpu|console))? -->$/;
+const claimPattern = /^<!-- factory-dispatch:claim runner:(gpu|console) -->$/;
 const headings = ['Goal', 'Link type', 'Context', 'Isolation', 'Build', 'Tests', 'Sandbox check', 'Deploy artifacts', 'Done means'];
 const required = ['Goal', 'Context', 'Isolation', 'Build', 'Sandbox check', 'Done means'];
 type Label = { id: string; name: string; parent?: { name: string } | null };
@@ -21,6 +22,23 @@ type Issue = {
   inverseRelations: { type: string; issue: { identifier: string; state: { type: string } } }[];
   attachments: { url: string; metadata: Record<string, unknown>; createdAt: string }[];
 };
+
+export function commentMarkers(body: string) {
+  const markers: string[] = [];
+  let fence = '';
+  for (const raw of body.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (fence) {
+      const closing = line.match(/^(`{3,}|~{3,})$/)?.[1];
+      if (closing && closing[0] === fence[0] && closing.length >= fence.length) fence = '';
+      continue;
+    }
+    const opening = line.match(/^(`{3,}|~{3,})/)?.[1];
+    if (opening) fence = opening;
+    else if (/^<!-- factory-(?:dispatch|qa):[^<>]+ -->$/.test(line)) markers.push(line);
+  }
+  return markers;
+}
 
 export function sections(description: string | null) {
   const result: Record<string, string> = {};
@@ -99,7 +117,8 @@ Push, open the PR, and reply with test results, deviations, anything unverified,
 }
 
 export function wrapupPrompt(issue: Issue) {
-  const branch = issue.comments.map(comment => comment.body.match(/<!-- factory-dispatch:worktree ([a-z0-9-]+) -->/)).find(Boolean)?.[1] ?? slug(issue.identifier, issue.title);
+  const branch = issue.comments.flatMap(comment => commentMarkers(comment.body))
+    .map(line => line.match(/^<!-- factory-dispatch:worktree ([a-z0-9-]+) -->$/)).find(Boolean)?.[1] ?? slug(issue.identifier, issue.title);
   return `export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git
 Confirm the linked PR for ${issue.identifier} is merged. Stop and report if it is not.
 Update and build in the main checkout /home/agent/work/factory, as agent, without sudo.
@@ -219,8 +238,8 @@ export async function run(command: string, identifier: string | undefined, dryRu
     await mutate(issue, 'mutation RemoveLabel($id: String!, $labelId: String!) { issueRemoveLabel(id: $id, labelId: $labelId) { success } }', { id: issue.id, labelId: label.id });
     issue.labels = issue.labels.filter(value => value.id !== label.id);
   }
-  const has = (issue: Issue, name: string) => issue.comments.some(comment => comment.body.includes(marker(name)));
-  const thread = (issue: Issue) => issue.comments.map(comment => comment.body.match(threadPattern)).find(Boolean);
+  const has = (issue: Issue, name: string) => issue.comments.some(comment => commentMarkers(comment.body).includes(marker(name)));
+  const thread = (issue: Issue) => issue.comments.flatMap(comment => commentMarkers(comment.body)).map(line => line.match(threadPattern)).find(Boolean);
   function showAmp(issue: Issue, args: string[]) {
     // Exact argv except prompt text: printing full prompts would leak issue content.
     log('would-run', { issue: issue.identifier, command: args.map(value => `'${value.replaceAll("'", "'\\''")}'`).join(' ') });
@@ -241,7 +260,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
   for (const issue of issues) {
     if (has(issue, 'wrapup')) continue;
     const match = thread(issue);
-    const claim = issue.comments.map(comment => comment.body.match(/<!-- factory-dispatch:claim runner:(gpu|console) -->/)).find(Boolean);
+    const claim = issue.comments.flatMap(comment => commentMarkers(comment.body)).map(line => line.match(claimPattern)).find(Boolean);
     const runner = match?.[2] ?? claim?.[1];
     if (runner) active[runner]++;
     else if (match) { active.gpu++; active.console++; }
@@ -265,7 +284,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
     const overflow = !issue.labels.some(label => label.parent?.name === 'runner' || label.name.startsWith('runner/')) && active.gpu >= cap;
     const runner = overflow ? 'console' : requestedRunner;
     if (active[runner] >= cap) { log('capacity', { issue: issue.identifier, runner }); continue; }
-    if (thread(issue) || issue.comments.some(comment => /<!-- factory-dispatch:claim runner:/.test(comment.body))) {
+    if (thread(issue) || issue.comments.some(comment => commentMarkers(comment.body).some(line => line.startsWith('<!-- factory-dispatch:claim runner:')))) {
       log('already-claimed', { issue: issue.identifier });
       await removeLabel(issue);
       continue;
@@ -296,7 +315,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
     const match = thread(issue);
     if (!match || has(issue, 'wrapup')) continue;
     if (has(issue, 'wrapup-claim')) { log('wrapup-claimed', { issue: issue.identifier }); continue; }
-    const claim = issue.comments.find(comment => /<!-- factory-dispatch:claim runner:(gpu|console) -->/.test(comment.body));
+    const claim = issue.comments.find(comment => commentMarkers(comment.body).some(line => claimPattern.test(line)));
     if (!issue.attachments.some(attachment => isMergedGitHubPR(attachment)
       && Date.parse(attachment.createdAt) > Date.parse(claim?.createdAt ?? ''))) {
       log('awaiting-merge', { issue: issue.identifier }); continue;

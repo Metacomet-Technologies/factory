@@ -52,6 +52,17 @@ Agents must never write or delete `<!-- factory-dispatch:… -->` or
 `<!-- factory-qa:… -->` markers, except the wrap-up completion authorized below.
 These are prompt rules, not a server-side permission boundary.
 
+Control markers count only when the entire line exactly matches after trimming
+whitespace and is outside any fenced code block (three or more backticks or
+tildes). This applies to every dispatcher marker and future `factory-qa` markers.
+Inline text and quoted diff/code markers never count. A closing fence must use
+the same character, be at least as long as the opening fence, and have no trailing
+text; an unclosed fence hides markers through the end of that comment. The queue's
+GraphQL substring filter only selects candidates; local parsing determines which
+markers count. All dispatcher-written markers already occupy standalone unfenced
+lines; their output format is unchanged. Future QA consumers must use the shared
+`commentMarkers` parser, not raw comment substring or regex searches.
+
 After opening the PR and after each later push, post one Linear comment on the
 task issue with the PR URL, head SHA and complete file list from
 `git diff --name-only origin/main...HEAD`. If `git diff origin/main...HEAD` is
