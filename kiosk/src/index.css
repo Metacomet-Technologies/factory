@@ -352,7 +352,11 @@
   text-align: right;
 }
 .agent-refresh [role="status"] {
-  max-width: 110px;
+  max-width: 140px;
+  line-height: 16px;
+}
+.agent-refresh button {
+  flex-shrink: 0;
 }
 .agent-list,
 .ticker {

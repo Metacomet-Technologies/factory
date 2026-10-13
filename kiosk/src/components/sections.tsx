@@ -462,10 +462,24 @@ export function AgentsSection({
   revision?: number;
 }) {
   const [now, setNow] = useState(Date.now);
-  const refresh = useAgentsRefresh(revision, now);
+  const observations = resource.data?.tools.flatMap((tool) =>
+    tool.observed_at_ms == null ? [] : [tool.observed_at_ms],
+  );
+  const refresh = useAgentsRefresh(
+    revision,
+    now,
+    observations?.length ? Math.max(...observations) : null,
+  );
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
+    const tick = () => setNow(Date.now());
+    const timer = setInterval(tick, 1000);
+    document.addEventListener("visibilitychange", tick);
+    window.addEventListener("pageshow", tick);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", tick);
+      window.removeEventListener("pageshow", tick);
+    };
   }, []);
   return (
     <Section
@@ -476,6 +490,7 @@ export function AgentsSection({
         <div className="agent-refresh">
           <span
             role="status"
+            aria-live="polite"
             className={
               refresh.message?.includes("fail") || refresh.message?.includes("didn't")
                 ? "status-warn"
@@ -483,6 +498,7 @@ export function AgentsSection({
             }
           >
             {refresh.message}
+            {refresh.countdown && <span className="muted block">{refresh.countdown}</span>}
           </span>
           <Button
             variant="ghost"

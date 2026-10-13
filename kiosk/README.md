@@ -14,11 +14,28 @@ The Frontier CLIs header has a keyboard-accessible refresh button on all layouts
 including `/?kiosk`. It posts without a body to `/v1/agents/refresh`; this requests
 quota reads, not inference or account changes. “Refreshing…” ends on the next
 `agents.usage` event; after 90 seconds without one it says “Refresh didn't complete”.
-Accepted and cooldown responses disable the button until the server's deadline,
-with native title “Next refresh in N s”. Other clients and timer runs can extend
-the server cooldown; a 429 supplies the updated deadline. Labeled balances show
+The completion timer remains active after HTTP 202; page visibility/restoration
+also checks its deadline, so a suspended page fails on wake rather than waiting
+for another interval tick. JavaScript cannot run while the browser suspends it.
+The named event's full `data.tools` snapshot renders immediately while the
+normal GET refetch is pending or failed; labels and independent balances remain
+intact. If reconnect misses the event, a fetched `observed_at_ms` newer than
+the attempt start also completes refresh. An unchanged snapshot does not.
+Regression tests replay `src/agents-usage.sse`, captured from the real
+sandbox API with synthetic quotas matching the reported fields (not phone data).
+The visible, polite live status shows “Updated just now”, then “Updated N min ago”.
+Accepted and cooldown responses disable the button until the server's deadline.
+Once no longer refreshing, “Next refresh in m:ss” counts down beside the button,
+including alongside an update or failure message. Native title “Next refresh in
+N s” remains available but is never the only cooldown signal. A 5xx also shows
+“Refresh didn't complete”; retry is enabled once any known cooldown expires.
+The last 202/429 deadline survives reloads in sessionStorage. Without one, the
+newest tool `observed_at_ms` plus 180 seconds supplies the initial estimate;
+this adds no fetch. Other clients and timer runs can extend the server cooldown;
+a 429 supplies the authoritative deadline. Labeled balances show
 `<label>: <amount>` (for example `workspace metacomet: $0`); unlabeled pools retain
-their existing formatting. Deploy the API, usage path unit, then kiosk in that order.
+their existing formatting. MET-141 requires only a kiosk build/static install;
+the MET-139 API and usage path unit are already deployed.
 
 ## Frontier CLIs (MET-126)
 

@@ -1,9 +1,10 @@
 import { useEffect, useReducer, useState } from "react";
 import { apiUrl } from "./client";
-import type { GpuSample, StreamEvent } from "./types";
+import type { Agents, GpuSample, StreamEvent } from "./types";
 
 export interface LiveState {
   gpu: GpuSample | null | undefined;
+  agents: Agents | null;
   requests: Extract<StreamEvent, { type: "llm.request" }>[];
   fleetRevision: number;
   pricingRevision: number;
@@ -11,6 +12,7 @@ export interface LiveState {
 }
 export const initialLiveState: LiveState = {
   gpu: undefined,
+  agents: null,
   requests: [],
   fleetRevision: 0,
   pricingRevision: 0,
@@ -27,7 +29,7 @@ export function streamReducer(state: LiveState, event: StreamEvent): LiveState {
     case "pricing.changed":
       return { ...state, pricingRevision: state.pricingRevision + 1 };
     case "agents.usage":
-      return { ...state, agentsRevision: state.agentsRevision + 1 };
+      return { ...state, agents: event.data, agentsRevision: state.agentsRevision + 1 };
   }
 }
 
@@ -92,8 +94,43 @@ export function parseEvent(value: unknown): StreamEvent | null {
         return value as StreamEvent;
       break;
     case "agents.usage":
-      // This event invalidates GET /v1/agents, like Fleet and pricing events.
-      if (Array.isArray(fields.tools)) return value as StreamEvent;
+      if (
+        Array.isArray(fields.tools) &&
+        fields.tools.every((tool: unknown) => {
+          if (!tool || typeof tool !== "object") return false;
+          const t = tool as Record<string, unknown>;
+          const balance = (value: unknown) => {
+            if (!value || typeof value !== "object") return false;
+            const b = value as Record<string, unknown>;
+            return (
+              ["unit", "amount", "remaining"].every((key) => typeof b[key] === "string") &&
+              ["label", "total"].every((key) => b[key] == null || typeof b[key] === "string")
+            );
+          };
+          return (
+            ["tool", "status"].every((key) => typeof t[key] === "string") &&
+            ["source", "cli_version", "plan", "reason"].every(
+              (key) => t[key] == null || typeof t[key] === "string",
+            ) &&
+            (t.observed_at_ms == null || Number.isSafeInteger(t.observed_at_ms)) &&
+            (t.balance == null || balance(t.balance)) &&
+            Array.isArray(t.balances) &&
+            t.balances.every(balance) &&
+            Array.isArray(t.windows) &&
+            t.windows.every((window: unknown) => {
+              if (!window || typeof window !== "object") return false;
+              const w = window as Record<string, unknown>;
+              return (
+                typeof w.name === "string" &&
+                typeof w.used_percent === "number" &&
+                Number.isFinite(w.used_percent) &&
+                (w.resets_at_ms == null || Number.isSafeInteger(w.resets_at_ms))
+              );
+            })
+          );
+        })
+      )
+        return value as StreamEvent;
       break;
   }
   return null;
