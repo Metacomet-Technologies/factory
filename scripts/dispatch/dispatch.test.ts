@@ -274,8 +274,8 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
         if (options.invalidJSON) { response.end(`not JSON: ${key}`); return; }
         if (operation === 'Queue') {
           assert.match(query, /team \{ id key \} state \{ type \}/);
-          assert.deepEqual(v.filter, { team: { key: { eq: 'MET' } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }] });
-          const selected = issues.filter(i => i.team.key === 'MET' && (labeled(i) || i.comments.some((c: any) => c.body.includes('<!-- factory-dispatch:'))));
+          assert.deepEqual(v.filter, { team: { key: { eq: 'MET' } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }, { comments: { some: { body: { contains: '<!-- factory-qa:' } } } }] });
+          const selected = issues.filter(i => i.team.key === 'MET' && (labeled(i) || i.comments.some((c: any) => /<!-- factory-(?:dispatch|qa):/.test(c.body))));
           const connection = page(selected, v.after);
           connection.nodes = connection.nodes.map(wire);
           data = { issues: connection };
@@ -327,7 +327,8 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
     events: () => readFileSync(eventsFile, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)),
     threads: () => JSON.parse(readFileSync(threadsFile, 'utf8')),
     setThreads: (threads: any[]) => writeFileSync(threadsFile, JSON.stringify(threads)),
-    calls: () => existsSync(callsFile) ? readFileSync(callsFile, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [] };
+    calls: () => existsSync(callsFile) ? readFileSync(callsFile, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      .filter(args => !options.submissionsOnly || args[0] === '-x' || args[1] === 'continue') : [] };
 }
 
 test('full fake-server poll: dispatch, prompt contract, Linear state, and manual/poll idempotency', { timeout: 10_000 }, async t => {
@@ -979,9 +980,105 @@ function reviewed(value = 'ready', head = sha) {
   return i;
 }
 
+test('finished QA reviews archive once; active and undelivered reviews remain open', { timeout: 20_000 }, async t => {
+  for (const end of ['changes', 'human', 'retired', 'merged', 'completed', 'canceled', 'active', 'ready', 'undelivered']) {
+    const i = reviewed(end === 'changes' || end === 'undelivered' ? 'changes' : 'ready');
+    // No builder markers: retroactive QA discovery must work independently.
+    i.comments.splice(0, 2);
+    if (end === 'active') i.comments.pop();
+    if (end === 'changes') i.comments.push(qaMarker(`round pr:90 sha:${sha}`));
+    if (['human', 'retired'].includes(end)) i.comments.push(qaMarker(`${end} pr:90 sha:${sha}`));
+    if (end === 'merged') i.attachments[0].metadata.status = 'merged';
+    if (['completed', 'canceled'].includes(end)) i.state.type = end;
+    const f = await fixture(t, [i], { threads: [{ id: reviewId, updated: quietUpdated, archived: false }] });
+    const first = await f.run();
+    assert.equal(first.code, 0, first.stdout);
+    await f.run();
+    const eligible = !['active', 'ready', 'undelivered'].includes(end);
+    assert.equal(f.calls().filter(a => a[1] === 'archive').length, eligible ? 1 : 0, end);
+    assert.equal(i.comments.filter((c: any) => c.body.includes(`factory-qa:archived pr:90 sha:${sha}`)).length, eligible ? 1 : 0, end);
+    t.diagnostic(`QA archive ${end}: ${first.durationMs.toFixed(1)} ms`);
+  }
+});
+
+test('QA archiving shares the five-attempt budget with builders and enforces quiet time', { timeout: 10_000 }, async t => {
+  const builders = Array.from({ length: 4 }, (_, n) => archivable(n + 1));
+  const i = reviewed(); i.comments.splice(0, 2); i.state.type = 'canceled';
+  const secondId = 'T-22345678-89ab-4cde-8fab-0123456789ab';
+  i.comments.push(qaMarker(`review-claim pr:90 sha:${sha} round:2 thread:${secondId}`));
+  const f = await fixture(t, [...builders, i]);
+  f.setThreads([...f.threads(), { id: reviewId, updated: quietUpdated, archived: false },
+    { id: secondId, updated: quietUpdated, archived: false }]);
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.calls().filter(a => a[1] === 'archive').length, 5);
+  f.setThreads(f.threads().map((entry: any) => entry.id === secondId ? { ...entry, updated: '2026-10-13T11:55:00.001Z' } : entry));
+  await f.run();
+  assert.equal(f.calls().filter(a => a[1] === 'archive').length, 5);
+  f.setThreads(f.threads().map((entry: any) => ({ ...entry, updated: quietUpdated })));
+  await f.run();
+  assert.equal(f.calls().filter(a => a[1] === 'archive').length, 6);
+  assert.ok(i.comments.some((c: any) => c.body.includes(`factory-qa:archived pr:90 sha:${sha} round:2`)));
+});
+
+test('QA archive crash after Amp before marker repairs without a second archive', { timeout: 10_000 }, async t => {
+  const i = reviewed(); i.comments.splice(0, 2); i.state.type = 'canceled';
+  const f = await fixture(t, [i], { threads: [{ id: reviewId, updated: quietUpdated, archived: false }],
+    crash: (operation: string, v: any) => operation === 'Comment' && v.input.body.includes('factory-qa:archived ') ? 'before' : null });
+  assert.equal((await f.run()).signal, 'SIGKILL');
+  assert.equal(f.threads()[0].archived, true);
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.calls().filter(a => a[1] === 'archive').length, 1);
+  assert.equal(i.comments.filter((c: any) => c.body.includes('factory-qa:archive-claim ')).length, 1);
+  assert.equal(i.comments.filter((c: any) => c.body.includes('factory-qa:archived ')).length, 1);
+});
+
+test('same-SHA newer diff evidence starts exactly one fresh review, then stops after round two', { timeout: 10_000 }, async t => {
+  const i = reviewed('changes');
+  i.comments.at(-1).createdAt = '2026-10-13T11:00:00Z';
+  const f = await fixture(t, [i], { github: { 90: githubPR() } });
+  assert.equal((await f.run()).code, 0);
+  const round = i.comments.find((c: any) => commentMarkers(c.body).includes(`<!-- factory-qa:round pr:90 sha:${sha} -->`));
+  round.createdAt = '2026-10-13T11:02:00Z';
+  const evidence = `PR: ${attachment('open').url}\nHead SHA: ${sha}\nComplete changed-file list:\n\`\`\`text\nwidgets/widget.rs\n\`\`\`\n\`\`\`diff\nEvidence fix, no push.\n\`\`\``;
+  i.comments.push({ body: evidence, createdAt: '2026-10-13T10:59:59Z' });
+  await f.run();
+  assert.equal(f.calls().filter(a => a[0] === '-x').length, 0);
+  i.comments.push({ body: evidence.replace(sha, nextSha), createdAt: '2026-10-13T11:03:00Z' });
+  await f.run();
+  assert.equal(f.calls().filter(a => a[0] === '-x').length, 0);
+  i.comments.push({ body: evidence, createdAt: '2026-10-13T11:01:00Z' });
+  await f.run();
+  assert.equal(f.calls().filter(a => a[0] === '-x').length, 0, 'evidence predates delivery');
+  i.comments.push({ body: evidence, createdAt: '2026-10-13T11:02:00Z' });
+  await f.run();
+  assert.equal(f.calls().filter(a => a[0] === '-x').length, 0, 'evidence equals delivery time');
+  i.comments.push({ body: evidence, createdAt: '2026-10-13T11:02:00.001Z' });
+  for (const timestamp of [undefined, 'invalid']) {
+    round.createdAt = timestamp;
+    await f.run();
+    assert.equal(f.calls().filter(a => a[0] === '-x').length, 0, 'delivery timestamp is unknown');
+  }
+  round.createdAt = '2026-10-13T11:02:00Z';
+  const rereview = await f.run();
+  await f.run();
+  const launches = f.calls().filter(a => a[0] === '-x');
+  assert.equal(launches.length, 1);
+  assert.ok(launches[0][1].includes(`factory-qa:review pr:90 sha:${sha} round:2 thread:T-REVIEW`));
+  assert.ok(launches[0].includes('/home/agent/work/factory-qa-90-aaaaaaaaaaaa-round-2'));
+  i.comments.push({ body: reviewed('changes').comments.at(-1).body.replace(`sha:${sha} thread:`, `sha:${sha} round:2 thread:`) });
+  await f.run();
+  i.comments.push({ body: evidence, createdAt: '2026-10-13T11:02:00Z' });
+  await f.run();
+  assert.equal(f.calls().filter(a => a[0] === '-x').length, 1);
+  assert.equal(i.comments.filter((c: any) => c.body.includes('factory-qa:round ')).length, 2);
+  assert.ok(i.comments.some((c: any) => c.body.includes('factory-qa:stopped pr:90')));
+  assert.equal(f.worktrees().gpu.length, 0);
+  t.diagnostic(`same-SHA evidence re-review: ${rereview.durationMs.toFixed(1)} ms`);
+});
+
 test('QA triggers once per head, sends each changes verdict directly, then stops after two rounds', { timeout: 10_000 }, async t => {
   const i = reviewable();
-  const f = await fixture(t, [i], { github: { 90: githubPR() } });
+  const f = await fixture(t, [i], { github: { 90: githubPR() }, submissionsOnly: true });
   const initial = await f.run();
   assert.equal(initial.code, 0, initial.stdout);
   await f.run();
@@ -1163,7 +1260,7 @@ test('QA rejects fenced, inline, wrong-thread and conflicting verdicts; new head
     assert.equal(f.calls().filter(a => a[0] === 'threads').length, 0, kind);
   }
   const i = reviewed();
-  const f = await fixture(t, [i], { github: { 90: githubPR({ headRefOid: nextSha }) } });
+  const f = await fixture(t, [i], { github: { 90: githubPR({ headRefOid: nextSha }) }, submissionsOnly: true });
   await f.run(); await f.run();
   assert.equal(f.calls().length, 1);
   assert.equal(f.calls()[0][0], '-x');
@@ -1192,7 +1289,6 @@ test('QA ready authorizes only the reviewer; merge-time check independently reje
 });
 
 test('QA merge gate refuses bad CI, skipped/missing checks, head races, drafts and unsafe file lists', { timeout: 20_000 }, async t => {
-  const f = await fixture(t, [reviewed()], { github: { 90: githubPR() } });
   const bad = [
     { checks: [] }, { checks: [{ name: 'rust', bucket: 'pass' }] },
     ...['pending', 'fail', 'skipping', 'cancel'].map(bucket => ({ checks: githubPR().checks.map((c: any) => c.name === 'scripts' ? { ...c, bucket } : c) })),
@@ -1202,14 +1298,14 @@ test('QA merge gate refuses bad CI, skipped/missing checks, head races, drafts a
     { files: Array.from({ length: 3000 }, () => ({ filename: 'widgets/file.rs' })) },
   ];
   for (const overrides of bad) {
-    f.setGitHub({ 90: githubPR(overrides) });
+    const f = await fixture(t, [reviewed()], { github: { 90: githubPR(overrides) }, submissionsOnly: true });
     const result = await f.run();
     assert.equal(result.code, 0, result.stdout);
     assert.equal(f.calls().length, 0, JSON.stringify(overrides).slice(0, 200));
     f.setGitHub({ 90: githubPR(overrides) });
     assert.equal((await f.check()).code, 1);
   }
-  f.setGitHub({ 90: githubPR() });
+  const f = await fixture(t, [reviewed()], { github: { 90: githubPR() } });
   assert.equal((await f.run()).code, 0);
   assert.equal(f.calls().length, 1);
 });
@@ -1218,7 +1314,7 @@ test('QA self-deploying additions/deletions/renames on later file pages ping onc
   for (const path of ['scripts/dispatch/dispatch.ts', 'scripts/usage/collect.ts']) for (const status of ['modified', 'removed', 'renamed']) {
     const i = reviewed();
     const file = status === 'renamed' ? { filename: 'docs/moved.ts', previous_filename: path, status } : { filename: path, status };
-    const f = await fixture(t, [i], { github: { 90: githubPR({ pages: [Array.from({ length: 100 }, (_, n) => ({ filename: `widgets/file${n}.rs` })), [file]] }) } });
+    const f = await fixture(t, [i], { github: { 90: githubPR({ pages: [Array.from({ length: 100 }, (_, n) => ({ filename: `widgets/file${n}.rs` })), [file]] }) }, submissionsOnly: true });
     await f.run(); await f.run();
     assert.equal(f.calls().length, 0);
     assert.equal(i.comments.filter((c: any) => c.body.includes('ready; merging deploys it')).length, 1);
@@ -1230,7 +1326,7 @@ for (const step of ['start', 'review-claim', 'followup-claim', 'round', 'merge-c
   test(`QA crash ${boundary} ${step} never duplicates submission`, { timeout: 10_000 }, async t => {
     const i = ['start', 'review-claim'].includes(step) ? reviewable() : reviewed(['followup-claim', 'round'].includes(step) ? 'changes' : 'ready');
     const f = await fixture(t, [i], { github: { 90: githubPR(step === 'human' ? { files: [{ filename: 'scripts/dispatch/qa.ts' }] } : step === 'retired' ? { headRefOid: nextSha } : {}) },
-      crash: (op: string, v: any) => op === 'Comment' && v.input.body.includes(`<!-- factory-qa:${step} `) ? boundary : false });
+      crash: (op: string, v: any) => op === 'Comment' && v.input.body.includes(`<!-- factory-qa:${step} `) ? boundary : false, submissionsOnly: true });
     assert.equal((await f.run()).signal, 'SIGKILL');
     assert.equal((await f.run()).code, 0);
     assert.equal((await f.run()).code, 0);

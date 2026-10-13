@@ -34,7 +34,7 @@ issue fields. Record unavailable checks as findings, never invent evidence.
 
 Post one Linear comment on {{identifier}} with findings and exactly one standalone
 unfenced marker, replacing T-REVIEW with your own actual Amp thread ID:
-<!-- factory-qa:review pr:{{pr}} sha:{{sha}} thread:T-REVIEW verdict:ready -->
+<!-- factory-qa:review {{reviewKey}} thread:T-REVIEW verdict:ready -->
 Use verdict:changes instead when fixes are needed. For changes, finish the comment
 with a heading `## Builder follow-up` and the exact, self-contained follow-up
 prompt, including findings, paths, expected behavior and verification. The
