@@ -16,6 +16,7 @@ type Label = { id: string; name: string; parent?: { name: string } | null };
 type Issue = {
   id: string; identifier: string; title: string; description: string | null;
   priority: number; createdAt: string; team: { id: string; key: string };
+  state: { type: string };
   labels: Label[]; comments: { body: string; createdAt?: string }[];
   inverseRelations: { type: string; issue: { identifier: string; state: { type: string } } }[];
   attachments: { url: string; metadata: Record<string, unknown>; createdAt: string }[];
@@ -65,8 +66,8 @@ export function validate(issue: Issue) {
   return { content, errors, runner, engine, effort, link };
 }
 
-export function prompt(issue: Issue) {
-  const { content, runner, effort, link } = validate(issue);
+export function prompt(issue: Issue, runner = validate(issue).runner) {
+  const { content, effort, link } = validate(issue);
   const branch = slug(issue.identifier, issue.title);
   const tests = 'Run cargo fmt --check, cargo clippy --all-targets -- -D warnings, and cargo test --workspace. For kiosk changes also run vp check, vp test --run, and vp build.';
   return `**Thread title:** Use the Linear ticket identifier and title: \`${issue.identifier} — ${issue.title}\`.
@@ -100,7 +101,7 @@ Remove this thread's worktree and local branch only after checking for unpushed 
 git -C /home/agent/work/factory worktree remove /home/agent/work/factory-${branch}
 git -C /home/agent/work/factory branch -D ${branch}
 Reply with exact Mac install/verify commands using factory-ssh or console-ssh and full /home/agent/work/factory paths.
-Never deploy. One deploy per runner at a time. Devon archives this thread only after deploy verification; if verification fails, fix it in this thread from a fresh worktree.`;
+Never deploy. One deploy per runner at a time. Devon owns deployment verification and marking the issue Done. The dispatcher archives this thread after Done and five quiet minutes; if verification fails, fix it in this thread from a fresh worktree.`;
 }
 
 // ponytail: Linear documents metadata as arbitrary JSON, not GitHub's keys.
@@ -116,7 +117,7 @@ const fields = {
   inverseRelations: 'type issue { identifier state { type } }',
   attachments: 'url metadata createdAt',
 };
-const issueFields = `id identifier title description priority createdAt team { id key }
+const issueFields = `id identifier title description priority createdAt team { id key } state { type }
   ${Object.entries(fields).map(([name, selection]) => `${name}(first: 20) { nodes { ${selection} } ${page} }`).join('\n')}`;
 
 async function amp(args: string[]) {
@@ -127,6 +128,19 @@ async function amp(args: string[]) {
     child.on('error', () => reject(new Error('Amp could not start')));
     child.on('close', (code, signal) => code === 0 ? resolve(stdout) : reject(new Error(`Amp failed (exit ${code}, signal ${signal ?? 'none'}); inspect the thread before recovery`)));
   });
+}
+
+async function listedThread(id: string, includeArchived: boolean) {
+  for (let offset = 0; ; offset += 100) {
+    const output = await amp(['threads', 'list', '--json', '--limit', '100', '--offset', String(offset), ...(includeArchived ? ['--include-archived'] : [])]);
+    let entries;
+    try { entries = JSON.parse(output); }
+    catch { throw new Error('Amp returned invalid thread listing'); }
+    if (!Array.isArray(entries) || entries.some(entry => typeof entry?.id !== 'string')) throw new Error('Amp returned invalid thread listing');
+    const entry = entries.find(entry => entry.id === id);
+    if (entry) return entry as { id: string; updated?: unknown };
+    if (entries.length < 100) return undefined;
+  }
 }
 
 export async function run(command: string, identifier: string | undefined, dryRun: boolean) {
@@ -224,13 +238,15 @@ export async function run(command: string, identifier: string | undefined, dryRu
       if (!has(issue, 'waiting')) await comment(issue, `Waiting on ${blockers.join(', ')}\n\n${marker('waiting')}`);
       continue;
     }
-    const { errors, runner, engine, effort } = validate(issue);
+    const { errors, runner: requestedRunner, engine, effort } = validate(issue);
     if (errors.length) {
       log('invalid', { issue: issue.identifier, reasons: errors });
       if (!has(issue, 'invalid')) await comment(issue, `Cannot dispatch:\n${errors.map(error => `- ${error}`).join('\n')}\n\n${marker('invalid')}`);
       await removeLabel(issue);
       continue;
     }
+    const overflow = !issue.labels.some(label => label.parent?.name === 'runner' || label.name.startsWith('runner/')) && active.gpu >= cap;
+    const runner = overflow ? 'console' : requestedRunner;
     if (active[runner] >= cap) { log('capacity', { issue: issue.identifier, runner }); continue; }
     if (thread(issue) || issue.comments.some(comment => /<!-- factory-dispatch:claim runner:/.test(comment.body))) {
       log('already-claimed', { issue: issue.identifier });
@@ -238,9 +254,9 @@ export async function run(command: string, identifier: string | undefined, dryRu
       continue;
     }
     await removeLabel(issue);
-    await comment(issue, `Dispatch claimed on ${runner}. If submission is interrupted, inspect Amp before manual recovery; do not delete this claim to retry blindly.\n\n${marker(`claim runner:${runner}`)}\n${marker(`worktree ${slug(issue.identifier, issue.title)}`)}`);
+    await comment(issue, `Dispatch claimed on ${runner}${overflow ? ' (overflow)' : ''}. If submission is interrupted, inspect Amp before manual recovery; do not delete this claim to retry blindly.\n\n${marker(`claim runner:${runner}`)}\n${marker(`worktree ${slug(issue.identifier, issue.title)}`)}`);
     active[runner]++;
-    const args = ['-x', prompt(issue), '--mode', modes[engine][effort], '--executor', `runner:${runners[runner]}`, '--runner-dir', '/home/agent/work', '--title', `${issue.identifier} — ${issue.title}`, '--visibility', 'private', '--no-archive-after-execute'];
+    const args = ['-x', prompt(issue, runner), '--mode', modes[engine][effort], '--executor', `runner:${runners[runner]}`, '--runner-dir', '/home/agent/work', '--title', `${issue.identifier} — ${issue.title}`, '--visibility', 'private', '--no-archive-after-execute'];
     let id = 'T-00000000-0000-0000-0000-000000000000';
     if (dryRun) showAmp(issue, ['amp', '-x', '$PROMPT', ...args.slice(2)]);
     else {
@@ -280,6 +296,43 @@ export async function run(command: string, identifier: string | undefined, dryRu
     }
     await comment(issue, `Wrap-up submitted to https://ampcode.com/threads/${match[1]}. Devon still owns deployment and verification.\n\n${marker('wrapup')}`);
     log('wrapup', { issue: issue.identifier });
+  }
+  let archives = 0;
+  for (const issue of issues) {
+    const match = thread(issue);
+    if (!match || !has(issue, 'wrapup') || has(issue, 'archived') || issue.state.type !== 'completed') continue;
+    if (archives >= 5) break;
+    if (dryRun) {
+      archives++;
+      log('archive-pending', { issue: issue.identifier, reason: 'dry-run: quiet time not checked; archive command is conditional on five quiet minutes' });
+      showAmp(issue, ['amp', 'threads', 'list', '--json', '--limit', '100', '--offset', '0']);
+      showAmp(issue, ['amp', 'threads', 'list', '--json', '--limit', '100', '--offset', '0', '--include-archived']);
+      showAmp(issue, ['amp', 'threads', 'archive', match[1]]);
+      continue;
+    }
+    let open, entry;
+    try {
+      open = await listedThread(match[1], false);
+      entry = open ?? await listedThread(match[1], true);
+    } catch {
+      log('archive-pending', { issue: issue.identifier, reason: 'Amp thread listing unreadable' });
+      continue;
+    }
+    const updated = typeof entry?.updated === 'string' ? Date.parse(entry.updated) : NaN;
+    if (!Number.isFinite(updated) || Date.now() - updated < 5 * 60_000) {
+      log('archive-pending', { issue: issue.identifier });
+      continue;
+    }
+    archives++;
+    if (!has(issue, 'archive-claim')) await comment(issue, `Archive claimed; interrupted attempts retry after checking Amp's archive state and quiet time.\n\n${marker('archive-claim')}`);
+    try {
+      if (open) await amp(['threads', 'archive', match[1]]);
+    } catch (error) {
+      log('error', { issue: issue.identifier, action: 'archive', message: (error as Error).message });
+      continue;
+    }
+    await comment(issue, `Thread archived.\n\n${marker('archived')}`);
+    log('archived', { issue: issue.identifier, thread: match[1] });
   }
 }
 
