@@ -31,9 +31,32 @@ Configuration:
 - `DISPATCH_RUNNERS`: `gpu=factory-gpu,console=factory-console`.
 
 The committed `modes` map sends Amp low/medium/high unchanged; Claude always
-uses `external-agent:claude-code` and ignores effort; ChatGPT low uses `gpt56l`,
+uses `external-agent:claude-code` with `--features model:claude-opus-5-5,effort:<low|medium|high>`
+(default medium); ChatGPT low uses `gpt56l`,
 medium/high use `gpt61s` (**proposed, unverified**). See [Amp CLI evidence](../../docs/amp-cli.md).
+`engine/ultra` explicitly selects `--mode ultra` regardless of `agent-effort`;
+the claim states that effort is ignored and includes
+"Engine ultra: bills Amp credits (or OpenCode Go)". Ultra is never the default;
+unlabeled issues still use Amp medium. Under Devon's ChatGPT Only preset,
+`engine/amp` means GPT through ChatGPT; ultra retains Amp routing. Never trust
+a thread's self-reported model; check usage metadata.
 Submission success is not execution success. Inspect the thread for results.
+
+CLI evidence, 2026-10-13: `amp --help` confirms `--features <value>` accepts
+comma-separated features. A tiny runner probe with the exact Claude features
+returned `OK`; its exported metadata records `model:claude-opus-5-5` and
+`effort:low`. Usage metadata was unavailable, so the serving model/provider
+remains unverified. The ultra probe records mode `ultra`, but failed before a
+reply with server error subtype `permission-denied`; successful execution,
+serving model/provider and billing remain unverified. Devon's thread-page
+screenshot identifies the cause: Claude Usage is set to Subscription Only,
+which blocks Claude outside Claude Code. Ultra's Claude routing requires
+Allow Paid-Per-Token Usage in Settings → Model Routing; enabling paid usage
+is an operator decision, not a dispatcher action. Both attached to the
+factory project from a disposable detached worktree, which was removed.
+
+- [Ultra probe](https://ampcode.com/threads/T-01a133dc-100b-72c8-bce7-b77d3d2d4998)
+- [Claude low probe](https://ampcode.com/threads/T-01a133dc-1b2d-744f-9db0-1d2e62b9119c)
 
 ## Project-attached worktrees (MET-134)
 
@@ -111,9 +134,10 @@ merge, handoff to Devon, or a new head before any merge continuation. Unresolved
 older reviews retain their slot; a new head may use the other runner. QA threads are not
 builder archive targets; keep them available for manual inspection/archival.
 
-The builder's grouped/flat engine label determines the reviewer: amp or chatgpt
+The builder's grouped/flat engine label determines the reviewer: amp, chatgpt or ultra
 gets claude; claude gets amp; missing/unknown gets claude. Reviews use high effort
-through the existing modes map. `review-prompt.md` requires the full diff and full
+through the shared engine arguments; Claude reviewers get
+`--features model:claude-opus-5-5,effort:high`. `review-prompt.md` requires the full diff and full
 changed deploy/migration/script files, Isolation/Build/Done-means checks, current
 CI, and contributes/closes correction via `update_diff`. Reviewers never edit code.
 
@@ -505,7 +529,8 @@ restoration of a previous dispatcher version. It does not cancel submitted work.
 in-process `node:http` fake Linear/GitHub servers and fake Amp/Git/gh executables
 on PATH. The main-checkout playbook read is replaced with a synthetic fixture.
 It exercises label removal, comment/status results, blockers, validation,
-caps/order, all nine mode mappings, slugs/hints, pagination, dry-run, real flock
+caps/order, all twelve engine/effort mappings, Claude feature passing, ultra billing
+claims and explicit-only selection, slugs/hints, pagination, dry-run, real flock
 contention, Amp errors and SIGKILL at dispatch/wrap-up/archive mutation boundaries.
 Archive fixtures cover exactly five quiet minutes, ongoing updates, missing and
 unreadable timestamps/listings, canceled/non-Done states, missing markers,
@@ -516,7 +541,8 @@ cover Linear MCP availability, agent permissions, diff posting and the wrap-up
 completion marker exception without real Linear writes. Tests print fake-server
 poll timings. The test child clock is fixed without any production clock override.
 There is no live Linear/Amp sandbox; these are external services covered by fakes.
-Root installation, real merge metadata and actual model execution remain unverified.
+Root installation and real merge metadata remain unverified by this suite;
+the tiny Claude/ultra live probe results are recorded above.
 QA coverage includes per-SHA deduplication, new pushes, independent capacity,
 engine fallback, thread-bound verdict parsing, direct two-round follow-up,
 current-head CI races, self-deploying rename/deletion paths, trusted gate CLI,
