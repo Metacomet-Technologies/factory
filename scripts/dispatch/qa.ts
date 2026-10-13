@@ -263,7 +263,7 @@ export async function reviewPRs(ctx: Context) {
       await comment(issue, `QA start claimed on ${runner}; interrupted submission requires manual inspection.\n\n${qa(`start ${key} runner:${runner}`)}`);
       active[runner]++;
       const path = qaPath(pr, sha, key.endsWith(' round:2') ? ' round:2' : '');
-      const values = { identifier: issue.identifier, issueLabel: issue.identifier.toLowerCase(), pr, sha, runner, qaBase: path, reviewKey: key };
+      const values = { identifier: issue.identifier, pr, sha, runner, qaBase: path, reviewKey: key };
       const prompt = readFileSync(new URL('review-prompt.md', import.meta.url), 'utf8').replace(/\{\{(\w+)\}\}/g, (_, key) => values[key]);
       const args = ['-x', prompt, ...engineArgs(reviewerEngine(issue), 'high'), '--executor', `runner:${runners[runner]}`, '--runner-dir', path, '--title', `${issue.identifier} — QA PR ${pr}`, '--visibility', 'private', '--no-archive-after-execute'];
       let id = 'T-00000000-0000-0000-0000-000000000000';
