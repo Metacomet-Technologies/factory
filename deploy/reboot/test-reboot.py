@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 
 HERE = Path(__file__).resolve().parent
 NOW = 1_791_799_200_000  # 2026-10-12 10:00 UTC (06:00 New York)
@@ -25,6 +26,18 @@ from pathlib import Path
 fixture = Path(os.environ['REBOOT_FIXTURE'])
 data = json.loads((fixture / 'commands.json').read_text())
 name = Path(sys.argv[0]).name
+
+
+def pick(key, value):
+    # A list is a per-call sequence; the last value repeats.
+    if not isinstance(value, list):
+        return value
+    counter = fixture / ('count-' + key)
+    count = int(counter.read_text()) if counter.exists() else 0
+    counter.write_text(str(count + 1))
+    return value[min(count, len(value) - 1)]
+
+
 with (fixture / 'calls').open('a') as log:
     log.write(name + ' ' + ' '.join(sys.argv[1:]) + '\n')
 if name == 'cp':
@@ -50,7 +63,7 @@ if name == 'upsc':
 if name == 'hostname':
     print(data['node'])
 if name == 'timedatectl':
-    print('NTPSynchronized=' + data.get('clock', 'yes'))
+    print('NTPSynchronized=' + pick('clock', data.get('clock', 'yes')))
 if name == 'systemctl':
     if sys.argv[1] == 'reboot':
         root = Path(os.environ.get('REBOOT_ROOT', '/'))
@@ -65,7 +78,7 @@ if name == 'systemctl':
         print('disabled')
         sys.exit(1)
     elif sys.argv[1] == 'is-active':
-        state = data.get('services', {}).get(sys.argv[2], 'active')
+        state = pick(sys.argv[2], data.get('services', {}).get(sys.argv[2], 'active'))
         print(state)
         sys.exit(0 if state == 'active' else 3)
 '''
@@ -93,7 +106,7 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
                     meter=json.dumps([{"ts": NOW - 600_001, "endpoint": "/api/chat"}]),
                     ups="OL", node="factory-gpu")
     env = dict(os.environ, REBOOT_ROOT=str(root), REBOOT_CONFIG=str(config_path),
-               REBOOT_NOW_MS=str(NOW), REBOOT_FIXTURE=str(fixture),
+               REBOOT_NOW_MS=str(NOW), REBOOT_FIXTURE=str(fixture), REBOOT_POSTBOOT_WAIT_S="0",
                PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])
 
     def run(script="reboot-check.sh", *args, updates=None, environment=None, success=True):
@@ -113,9 +126,63 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
         assert "systemctl reboot\n" not in calls.read_text() if calls.exists() else True
         return data
 
-    data = expect("not-needed")
+    data = expect("not-needed", "reboot-required absent")
     assert data["pending_since_ms"] is None and data["consecutive_skips"] == 0
-    assert not calls.exists(), "No busy tools should run when reboot is not needed"
+    assert data["last_busy_reason"] is None
+    data = expect("not-needed", "reboot-required absent", updates={"ps": f"2481 1 {RUNNER}\n9 2481 cargo test\n"})
+    assert data["last_busy_reason"] == "agent-busy: pid=9" and data["consecutive_skips"] == 0
+    assert not data["alert_due"] and data["pending_since_ms"] is None
+    data = expect("not-needed", updates={"meter": json.dumps([{"ts": NOW - 1, "endpoint": "/api/chat"}]),
+                                         "ps": commands["ps"].replace("9 2481 cargo test\n", "")})
+    assert data["last_busy_reason"] == "meter-recent", data
+    commands["meter"] = json.dumps([{"ts": NOW - 600_001, "endpoint": "/api/chat"}])
+    assert expect("not-needed")["last_busy_reason"] is None
+    print("PASS: not-required checks record the busy reason without changing decisions or counters")
+
+    work = root / "home/agent/work"
+    worktree = work / "factory-met-999-example"
+    (worktree / "src").mkdir(parents=True)
+    (worktree / ".git").write_text("gitdir: /home/agent/work/factory/.git/worktrees/x\n")
+    source = worktree / "src/main.rs"
+    source.write_text("fn main() {}\n")
+    (work / "factory/.git").mkdir(parents=True)
+    (work / "factory/README.md").write_text("main checkout\n")
+    (work / "other").mkdir()
+    (work / "other/recent").write_text("not a factory worktree\n")
+
+    def age(path, milliseconds):
+        stamp = (NOW - milliseconds) * 1_000_000
+        os.utime(path, ns=(stamp, stamp), follow_symlinks=False)
+
+    old = 1_800_001
+    for path in (source, worktree / ".git"):
+        age(path, old)
+    for path in (work / "factory/README.md", work / "other/recent"):
+        age(path, 1)
+    assert expect("not-needed")["last_busy_reason"] is None, "Main checkout and non-factory dirs are ignored"
+    for path, milliseconds, busy in ((source, 60_000, True), (source, 1_800_000, True),
+                                     (source, old, False), (source, -60_000, True)):
+        age(path, milliseconds)
+        reason = expect("not-needed")["last_busy_reason"]
+        assert reason == ("agent-worktree-active: /home/agent/work/factory-met-999-example"
+                          if busy else None), (milliseconds, reason)
+    age(source, old)
+    (worktree / ".git").write_text("gitdir: elsewhere\n")
+    age(worktree / ".git", 1)
+    git_dir = work / "factory-met-998-qa/.git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "index").write_text("index\n")
+    age(git_dir / "index", 1)
+    assert expect("not-needed")["last_busy_reason"] is None, ".git contents are not activity"
+    flag.touch()
+    (work / "factory-met-998-qa/notes.md").write_text("qa\n")
+    data = expect("skipped", "agent-worktree-active: /home/agent/work/factory-met-998-qa")
+    assert data["last_busy_reason"] == data["last_reason"]
+    shutil.rmtree(work / "factory-met-998-qa")
+    assert expect("would-reboot", "all checks clear")["last_busy_reason"] is None
+    print("PASS: recent factory-* worktree files block; old files, .git, the main checkout and other dirs do not")
+    flag.unlink()
+    expect("not-needed")
     flag.touch()
     data = expect("would-reboot")
     assert data["pending_since_ms"] == NOW and data["days_pending"] == 0
@@ -189,6 +256,29 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
     assert expect("skipped")["consecutive_skips"] == 1
     print("PASS: postboot boot timestamp, failed services, clock states and pending resolution")
 
+    def postboot(wait, **updates):
+        for counter in fixture.glob("count-*"):
+            counter.unlink()
+        started = time.monotonic()
+        data = run("postboot-check.sh", updates=updates,
+                   environment=dict(env, REBOOT_POSTBOOT_WAIT_S=str(wait)))
+        return data, time.monotonic() - started
+
+    data, elapsed = postboot(60, clock=["no", "no", "yes"],
+                             services={"meter.service": ["activating", "activating", "active"],
+                                       "ollama.service": ["activating", "failed"]})
+    assert data["postboot"]["clock_synced"], data
+    assert data["postboot"]["services"]["meter.service"] == "active"
+    assert data["postboot"]["services"]["ollama.service"] == "failed"
+    assert 6 <= elapsed < 30, elapsed
+    data, elapsed = postboot(3, clock="yes", services={"meter.service": "activating"})
+    assert data["postboot"]["services"]["meter.service"] == "activating"
+    assert 3 <= elapsed < 15, elapsed
+    data, elapsed = postboot(3, clock="no", services={})
+    assert not data["postboot"]["clock_synced"] and 3 <= elapsed < 15, elapsed
+    commands.update(clock="yes", services={})
+    print("PASS: postboot waits for a late clock and activating services, bounded by the deadline")
+
     flag.unlink()
     expect("not-needed")
     flag.touch()
@@ -210,7 +300,7 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
                 data = json.loads(status.read_text())
                 assert set(data) == {"mode", "reboot_required", "pending_since_ms", "days_pending",
                                      "consecutive_skips", "alert_due", "last_check_ms", "last_decision",
-                                     "last_reason", "last_boot_ms", "postboot"}
+                                     "last_reason", "last_busy_reason", "last_boot_ms", "postboot"}
             except Exception as error:
                 failures.append(error)
                 break
@@ -263,10 +353,14 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
     if probe is None or probe.returncode:
         print("SKIP: isolated installer execution requires usable bwrap (decision checks all passed)")
     else:
+        # Hide host homes so real agent worktrees cannot make the isolated probe busy.
+        artifacts = fixture / "artifacts"
+        shutil.copytree(HERE, artifacts, ignore=shutil.ignore_patterns("__pycache__"))
         for node, expected in (("factory-gpu", "06:00"), ("factory-console", "06:30")):
             isolated = fixture / node
             mounts = [bwrap, "--ro-bind", "/", "/", "--unshare-user", "--uid", "0", "--gid", "0",
                       "--unshare-uts", "--hostname", node, "--dev", "/dev", "--tmpfs", "/tmp",
+                      "--tmpfs", "/home",
                       "--bind", str(fixture), str(fixture)]
             for relative in ("etc", "usr/local/lib", "var/lib", "var/backups", "run"):
                 target = isolated / relative
@@ -293,7 +387,7 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             poisoned = dict(env, REBOOT_ROOT="/must-not-exist", REBOOT_CONFIG="/must-not-exist", REBOOT_NOW_MS="bad")
 
             def installer(script, *args, success=True):
-                result = subprocess.run(mounts + ["--", "bash", str(HERE / script), *args],
+                result = subprocess.run(mounts + ["--", "bash", str(artifacts / script), *args],
                                         env=poisoned, text=True, capture_output=True, timeout=60)
                 assert (result.returncode == 0) == success, str(result.returncode) + result.stdout + result.stderr + calls.read_text()
                 return result

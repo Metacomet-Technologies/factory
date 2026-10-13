@@ -9,6 +9,8 @@ Before=shutdown.target
 
 [Service]
 Type=oneshot
+# Postboot waits up to 180 s for the clock and activating services.
+TimeoutStartSec=240
 User=root
 UMask=0077
 Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin

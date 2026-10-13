@@ -3,7 +3,7 @@ set -Eeuo pipefail
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || fail 'Run as root: sudo bash deploy/reboot/rollback-reboot-policy.sh'
 [[ $# -eq 0 ]] || fail 'No arguments expected.'
-unset REBOOT_ROOT REBOOT_CONFIG REBOOT_NOW_MS PYTHONPATH PYTHONHOME
+unset REBOOT_ROOT REBOOT_CONFIG REBOOT_NOW_MS REBOOT_POSTBOOT_WAIT_S PYTHONPATH PYTHONHOME
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 trap 'printf "ERROR: rollback failed at line %s; resolve and rerun.\n" "$LINENO" >&2' ERR
 for tool in systemctl rm; do command -v "$tool" >/dev/null || fail "Missing tool: $tool"; done
