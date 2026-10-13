@@ -40,6 +40,8 @@ function issue(n = 123, overrides: any = {}) {
   return { id: `uuid-${n}`, identifier: `MET-${n}`, title: 'Build the useful widget today', description: body,
     priority: 2, createdAt: '2026-10-01T00:00:00Z', team: { id: 'team-id', key: 'MET' },
     state: { type: 'unstarted' },
+    completedAt: overrides.state?.type === 'completed' ? '2026-10-13T11:00:00Z' : null,
+    canceledAt: overrides.state?.type === 'canceled' ? '2026-10-13T11:00:00Z' : null,
     labels: [{ ...dispatchLabel }, { id: 'feature', name: 'Feature' }, { id: 'area', name: 'area:agents' }],
     comments: [], inverseRelations: [], attachments: [], ...overrides };
 }
@@ -65,7 +67,8 @@ async function fixture(t: any, issues = [issue()], options: any = {}) {
   writeFileSync(eventsFile, '');
   writeFileSync(githubFile, JSON.stringify(options.github ?? {}));
   writeFileSync(threadsFile, JSON.stringify(options.threads ?? issues.flatMap(i => i.comments.flatMap((c: any) => {
-    const id = c.body.match(/factory-dispatch:thread (T-[a-f0-9-]{36})/)?.[1];
+    const id = c.body.match(/factory-dispatch:thread (T-[a-f0-9-]{36})/)?.[1]
+      ?? c.body.match(/factory-qa:review-claim pr:\d+ sha:[a-f0-9]{40}(?: round:2)? thread:(T-[a-f0-9-]{36})/)?.[1];
     return id ? [{ id, archived: false, updated: quietUpdated }] : [];
   }))));
   writeFileSync(join(directory, 'clock.mjs'), `
@@ -199,7 +202,8 @@ if (args[0] === 'threads' && args[1] === 'search') {
   if (process.env.FAKE_BAD_SEARCH) { console.log(process.env.FAKE_BAD_SEARCH); process.exit(0); }
   const threads = JSON.parse(fs.readFileSync(process.env.FAKE_THREADS, 'utf8'));
   if (Number(args.at(-1)) > 500) process.exit(99);
-  console.log(JSON.stringify(threads.filter(t => t.labels?.includes(args[2].split(' ')[0].slice(6)) && !t.archived).slice(0, Number(args.at(-1))).map(t => ({ id: t.id, updatedAt: t.updated }))));
+  console.log(JSON.stringify(threads.filter(t => t.labels?.includes(args[2].split(' ')[0].slice(6)) && !t.archived
+    && (!args[2].includes('author:me') || (t.author ?? 'me') === 'me')).slice(0, Number(args.at(-1))).map(t => ({ id: t.id, updatedAt: t.updated }))));
   process.exit(0);
 }
 if (args[0] === 'threads' && args[1] === 'list') {
@@ -279,6 +283,9 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
         const crashHere = crash && crash(operation, v);
         if (crashHere === 'before') { crash = null; current.kill('SIGKILL'); response.destroy(); return; }
         if (options.rejectMutation === operation) { response.end(JSON.stringify({ data: { refused: { success: false } } })); return; }
+        if (options.rejectLabelMarker && operation === 'Comment' && v.input.body.includes('factory-dispatch:labeled ')) {
+          response.end(JSON.stringify({ data: { refused: { success: false } } })); return;
+        }
         if (operation === 'Comment') {
           i.comments.push({ body: v.input.body, createdAt: new Date().toISOString() });
           writeFileSync(eventsFile, JSON.stringify(['comment', v.input.body]) + '\n', { flag: 'a' });
@@ -715,7 +722,7 @@ test('failed wrap-up is claimed, reported, and never automatically retried', { t
   const f = await fixture(t, [i]);
   await f.run(['poll'], { FAKE_FAIL: '1' });
   await f.run();
-  assert.equal(f.calls().length, 1);
+  assert.equal(f.allCalls().filter(args => args[1] === 'continue').length, 1);
   assert.ok(i.comments.some((c: any) => /Wrap-up submission failed/.test(c.body)));
   assert.equal(i.comments.some((c: any) => c.body.includes('<!-- factory-dispatch:wrapup -->')), false);
 });
@@ -870,7 +877,7 @@ test('Done archive waits until exactly five quiet minutes from Amp updated, then
   t.diagnostic(`archive polls: 4:59.999=${early.durationMs.toFixed(1)} ms; 5:00.000=${eligible.durationMs.toFixed(1)} ms; repeat=${again.durationMs.toFixed(1)} ms`);
 });
 
-test('archive skips canceled/non-Done builders and missing threads; Done no longer requires wrap-up', { timeout: 10_000 }, async t => {
+test('archive skips canceled/non-Done builders and missing threads; Done without a PR needs no wrap-up', { timeout: 10_000 }, async t => {
   const issues = Array.from({ length: 4 }, (_, n) => archivable(100 + n));
   issues[0].state = { type: 'canceled', name: 'Done' };
   issues[1].state = { type: 'started', name: 'Done' };
@@ -1509,6 +1516,11 @@ test('builder and QA launches label their threads; label failure retries without
     assert.equal(f.allCalls().filter(args => args[0] === '-x').length, 1);
     assert.equal(f.allCalls().filter(args => args[1] === 'label' && args[2] === id).length, 2);
   }
+  const moved = await fixture(t, [issue()], { rejectLabelMarker: true });
+  const failedRecord = await moved.run();
+  assert.equal(failedRecord.code, 1);
+  assert.equal(moved.issues[0].stateId, 'started-id');
+  assert.match(failedRecord.stdout, /dispatched/);
 });
 
 test('backfill labels recorded open builders and legacy reviewers once, ignoring quoted markers', { timeout: 10_000 }, async t => {
@@ -1530,13 +1542,16 @@ test('backfill labels recorded open builders and legacy reviewers once, ignoring
 test('Done and Canceled groups archive probes and QA, retaining canceled builders and unrelated labels', { timeout: 15_000 }, async t => {
   const probeId = 'T-22345678-89ab-4cde-8fab-0123456789ab';
   const unrelatedId = 'T-32345678-89ab-4cde-8fab-0123456789ab';
+  const foreignId = 'T-42345678-89ab-4cde-8fab-0123456789ab';
   for (const state of ['completed', 'canceled']) {
     const i = reviewed(); i.state.type = state;
-    const f = await fixture(t, [i], { threads: [threadId, reviewId, probeId, unrelatedId].map(id => ({ id,
-      labels: [id === unrelatedId ? 'met-124' : 'met-123'], updated: quietUpdated, archived: false })) });
+    i.comments.push({ body: '<!-- factory-dispatch:wrapup -->' });
+    i.completedAt = i.canceledAt = '2026-10-13T11:00:00Z';
+    const f = await fixture(t, [i], { threads: [threadId, reviewId, probeId, unrelatedId, foreignId].map(id => ({ id,
+      author: id === foreignId ? 'other' : 'me', labels: [id === unrelatedId ? 'met-124' : 'met-123'], updated: quietUpdated, archived: false })) });
     const result = await f.run();
     assert.equal(result.code, 0, result.stdout);
-    assert.deepEqual(f.threads().map((entry: any) => entry.archived), [state === 'completed', true, true, false]);
+    assert.deepEqual(f.threads().map((entry: any) => entry.archived), [state === 'completed', true, true, false, false]);
     await f.run();
     assert.equal(f.calls().filter(args => args[1] === 'archive').length, state === 'completed' ? 3 : 2);
   }
@@ -1575,5 +1590,63 @@ test('invalid label search fails closed for probes', { timeout: 10_000 }, async 
     assert.equal(result.code, 0);
     assert.match(result.stdout, /Amp label search unreadable/);
     assert.equal(f.calls().filter(args => args[1] === 'archive').length, 0);
+  }
+});
+
+test('Done builder waits for its post-claim PR wrap-up before archive, including a pending archive claim', { timeout: 10_000 }, async t => {
+  const i = issue(123, { labels: [], state: { type: 'completed' }, attachments: [attachment('open')],
+    comments: [claimComment(), threadComment(), { body: `<!-- factory-dispatch:archive-claim thread:${threadId} -->` }] });
+  const f = await fixture(t, [i], { threads: [{ id: threadId, updated: quietUpdated, archived: false, labels: ['met-123'] }] });
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.threads()[0].archived, false);
+  assert.equal(f.allCalls().filter(args => args[1] === 'archive' || args[1] === 'continue').length, 0);
+  i.attachments[0].metadata.status = 'merged';
+  f.setThreads([{ ...f.threads()[0], updated: new Date(now).toISOString() }]);
+  assert.equal((await f.run()).code, 0);
+  assert.ok(i.comments.some((c: any) => c.body.includes('<!-- factory-dispatch:wrapup -->')));
+  assert.equal(f.threads()[0].archived, false);
+  f.setThreads([{ ...f.threads()[0], updated: quietUpdated }]);
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.threads()[0].archived, true);
+  assert.deepEqual(f.allCalls().filter(args => args[1] === 'archive' || args[1] === 'continue').map(args => args[1]), ['continue', 'archive']);
+  for (const claimedAt of [undefined, 'invalid', attachment('open').createdAt]) {
+    const dated = issue(124, { labels: [], state: { type: 'completed' }, attachments: [attachment('open')],
+      comments: [{ ...claimComment(), createdAt: claimedAt }, threadComment()] });
+    const chronology = await fixture(t, [dated]);
+    assert.equal((await chronology.run()).code, 0);
+    assert.equal(chronology.threads()[0].archived, claimedAt === attachment('open').createdAt);
+  }
+});
+
+test('closed issues without archive markers are never backfilled', { timeout: 10_000 }, async t => {
+  for (const state of ['completed', 'canceled']) {
+    const i = issue(123, { labels: [], state: { type: state }, comments: [threadComment(), qaMarker(`review-claim pr:90 sha:${sha} thread:${reviewId}`)] });
+    const f = await fixture(t, [i], { threads: [threadId, reviewId].map(id => ({ id, updated: quietUpdated, archived: false })) });
+    assert.equal((await f.run()).code, 0);
+    assert.equal((await f.run()).code, 0);
+    assert.equal(f.allCalls().filter(args => args[1] === 'label').length, 0);
+  }
+});
+
+test('manually archived open-issue threads stop label attempts after one recorded failure', { timeout: 10_000 }, async t => {
+  const i = issue(123, { labels: [], comments: [threadComment()] });
+  const f = await fixture(t, [i], { threads: [{ id: threadId, updated: quietUpdated, archived: true }] });
+  const results = [];
+  for (let pass = 0; pass < 3; pass++) { const result = await f.run(); assert.equal(result.code, 0); results.push(result.stdout); }
+  assert.equal(results.join('').match(/"action":"label"/g)?.length, 1);
+  assert.equal(f.allCalls().filter(args => args[1] === 'label').length, 1);
+  assert.equal(i.comments.filter((c: any) => c.body.includes(`factory-dispatch:label-skipped-archived ${threadId}`)).length, 1);
+});
+
+test('seven-day search boundary skips historical/unknown closes but never skips claim repair', { timeout: 10_000 }, async t => {
+  for (const state of ['completed', 'canceled']) for (const age of [7 * 24 * 60 * 60_000, 7 * 24 * 60 * 60_000 + 1, -1, null]) {
+    const closedAt = age === null ? null : new Date(now - age).toISOString();
+    const i = issue(123, { labels: [], state: { type: state }, completedAt: closedAt, canceledAt: closedAt,
+      comments: [{ body: `<!-- factory-dispatch:archive-claim thread:${reviewId} -->` }] });
+    const f = await fixture(t, [i], { threads: [{ id: reviewId, updated: quietUpdated, archived: true }] });
+    assert.equal((await f.run()).code, 0);
+    assert.equal(f.allCalls().filter(args => args[1] === 'search').length, age === 7 * 24 * 60 * 60_000 ? 1 : 0);
+    assert.equal(f.allCalls().filter(args => args[1] === 'archive').length, 0);
+    assert.ok(i.comments.some((c: any) => c.body.includes(`factory-dispatch:archived thread:${reviewId}`)));
   }
 });
