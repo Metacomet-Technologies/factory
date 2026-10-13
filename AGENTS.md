@@ -2,14 +2,9 @@
 
 Read docs/PLAYBOOK.md first: the working agreement, system facts, hard rules, prompt template and known gotchas.
 
-Before GitHub or Git authentication, run:
+GitHub auth is preconfigured for agent (gh + git credential helper); don't set GH_TOKEN or run gh auth commands. If `gh auth status` fails, stop and report.
 
-```sh
-export GH_TOKEN="$AGENT_GH_TOKEN"
-gh auth setup-git
-```
-
-Never print or commit the token. Work on a feature branch.
+Never print or commit tokens. Work on a feature branch.
 
 This repository is a Rust workspace. Run `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace` before pushing.

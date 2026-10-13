@@ -183,7 +183,9 @@ test('full fake-server poll: dispatch, prompt contract, Linear state, and manual
   assert.equal(args[0], '-x');
   assert.deepEqual(args.slice(2), ['--mode', 'medium', '--executor', 'runner:factory-gpu', '--runner-dir', '/home/agent/work', '--title', 'MET-123 — Build the useful widget today', '--visibility', 'private', '--no-archive-after-execute']);
   assert.equal(args[1].split('\n')[0], '**Thread title:** Use the Linear ticket identifier and title: `MET-123 — Build the useful widget today`.');
-  for (const text of ['export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git', 'git -C ~/work/factory fetch origin', 'git -C ~/work/factory worktree add -b met-123-build-the-useful-widget ~/work/factory-met-123-build-the-useful-widget origin/main', 'Never reuse or overwrite', 'Contributes MET-123', 'cargo fmt --check', 'cargo clippy --all-targets -- -D warnings', 'cargo test --workspace', 'vp check', 'factory-ssh', 'console-ssh', 'Never deploy']) assert.ok(args[1].includes(text), text);
+  assert.doesNotMatch(args[1], /GH_TOKEN/);
+  assert.ok(args[1].includes("GitHub auth is preconfigured for agent (gh + git credential helper); don't set GitHub token environment variables or run gh auth commands. If `gh auth status` fails, stop and report."));
+  for (const text of ['git -C ~/work/factory fetch origin', 'git -C ~/work/factory worktree add -b met-123-build-the-useful-widget ~/work/factory-met-123-build-the-useful-widget origin/main', 'Never reuse or overwrite', 'Contributes MET-123', 'cargo fmt --check', 'cargo clippy --all-targets -- -D warnings', 'cargo test --workspace', 'vp check', 'factory-ssh', 'console-ssh', 'Never deploy']) assert.ok(args[1].includes(text), text);
   for (const text of [
     'Use the already-connected Linear MCP server', 'report their names without calling a write tool',
     'If unavailable, stop and report', 'do not work around it or change MCP settings',
@@ -409,7 +411,8 @@ test('wrap-up only after merged GitHub attachment, sent once to existing thread'
   assert.equal(f.calls().length, 1);
   const args = f.calls()[0];
   assert.deepEqual(args.slice(0, 4), ['threads', 'continue', threadId, '-ox']);
-  assert.match(args[4], /^export GH_TOKEN="\$AGENT_GH_TOKEN" && gh auth setup-git/);
+  assert.doesNotMatch(args[4], /GH_TOKEN/);
+  assert.equal(args[4].split('\n')[0], "GitHub auth is preconfigured for agent (gh + git credential helper); don't set GitHub token environment variables or run gh auth commands. If `gh auth status` fails, stop and report.");
   assert.match(args[4], /Confirm the linked PR.*is merged/);
   assert.match(args[4], /Never deploy/);
   assert.match(args[4], /worktree remove \/home\/agent\/work\/factory-met-123-build-the-useful-widget/);

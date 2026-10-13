@@ -94,7 +94,7 @@ Runner: factory-${runner}. Directory: ~/work. Effort: ${effort}.
 
 ## 1. Start fresh
 Stop and report if branch ${branch} or directory ~/work/factory-${branch} already exists. Never reuse or overwrite either.
-export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git
+GitHub auth is preconfigured for agent (gh + git credential helper); don't set GitHub token environment variables or run gh auth commands. If \`gh auth status\` fails, stop and report.
 git -C ~/work/factory fetch origin
 git -C ~/work/factory worktree add -b ${branch} ~/work/factory-${branch} origin/main
 Work only in that worktree, never the main checkout. Read AGENTS.md and READMEs first.
@@ -119,7 +119,7 @@ Push, open the PR, and reply with test results, deviations, anything unverified,
 export function wrapupPrompt(issue: Issue) {
   const branch = issue.comments.flatMap(comment => commentMarkers(comment.body))
     .map(line => line.match(/^<!-- factory-dispatch:worktree ([a-z0-9-]+) -->$/)).find(Boolean)?.[1] ?? slug(issue.identifier, issue.title);
-  return `export GH_TOKEN="$AGENT_GH_TOKEN" && gh auth setup-git
+  return `GitHub auth is preconfigured for agent (gh + git credential helper); don't set GitHub token environment variables or run gh auth commands. If \`gh auth status\` fails, stop and report.
 Confirm the linked PR for ${issue.identifier} is merged. Stop and report if it is not.
 Update and build in the main checkout /home/agent/work/factory, as agent, without sudo.
 git -C /home/agent/work/factory fetch origin

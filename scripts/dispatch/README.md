@@ -247,14 +247,20 @@ as evidence of merge. The wrap-up prompt also requires confirming the PR merge.
 
 ## Administrator deployment from Mac, after merge
 
-For an already-installed dispatcher, MET-122 adds no deployment artifact, build,
+GitHub auth is preconfigured for agent (gh + git credential helper); don't set GH_TOKEN or run gh auth commands. If `gh auth status` fails, stop and report.
+
+Rendered build and wrap-up prompts say "GitHub token environment variables"
+instead of naming the variable, so neither generated instruction contains a
+token variable name. Issue section text is passed through unchanged.
+
+For an already-installed dispatcher, MET-131 adds no deployment artifact, build,
 installer invocation or restart. The post-merge wrap-up's `pull --ff-only` in
 `/home/agent/work/factory` on factory-gpu deploys the code; the next existing
 60-second timer pass uses it. Merge and that pull remain Devon's gates. From Mac,
 after confirming the merge and a clean main checkout:
 
 ```sh
-factory-ssh 'sudo -iu agent bash -c '\''set -e; export GH_TOKEN="$AGENT_GH_TOKEN"; gh auth setup-git; test -z "$(git -C /home/agent/work/factory status --porcelain)"; test "$(git -C /home/agent/work/factory branch --show-current)" = main; git -C /home/agent/work/factory pull --ff-only origin main'\'''
+factory-ssh 'sudo -iu agent bash -c '\''set -e; gh auth status; test -z "$(git -C /home/agent/work/factory status --porcelain)"; test "$(git -C /home/agent/work/factory branch --show-current)" = main; git -C /home/agent/work/factory pull --ff-only origin main'\'''
 factory-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts poll --dry-run'
 ```
 

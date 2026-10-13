@@ -390,10 +390,12 @@ variables, but sharing was not used here.
 **New Worktree remains unverified.** It fetches upstream before creating the
 thread. Documentation promises injected variables for thread shell commands,
 MCP servers and plugins, not that pre-thread Git operation. No New Worktree
-request or private fetch using injected credentials was attempted. Keep the
-PLAYBOOK start-fresh sequence: inside the thread, export GH_TOKEN from
-AGENT_GH_TOKEN, run `gh auth setup-git`, fetch, then create its worktree. Do not
-assume `--amp-env` fixes the known New Worktree authentication failure.
+request or private fetch using injected credentials was attempted.
+
+GitHub auth is preconfigured for agent (gh + git credential helper); don't set GH_TOKEN or run gh auth commands. If `gh auth status` fails, stop and report.
+
+Keep the PLAYBOOK start-fresh sequence: inside the thread, fetch, then create
+its worktree using the preconfigured auth.
 
 ## Recommended dispatcher invocation
 

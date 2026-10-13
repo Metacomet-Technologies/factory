@@ -641,9 +641,9 @@ sudo apt-get install sqlite3 zstd rsync openssh-client python3
 To avoid changing another agent's checkout/branch, fetch and create an isolated
 MET-74 checkout on **each node**, as the checkout owner (not root):
 
+GitHub auth is preconfigured for agent (gh + git credential helper); don't set GH_TOKEN or run gh auth commands. If `gh auth status` fails, stop and report.
+
 ```sh
-export GH_TOKEN="$AGENT_GH_TOKEN"
-gh auth setup-git
 git fetch origin
 git worktree add --detach /home/agent/work/factory-backup-fix \
   origin/devon/met-74-dedicated-backup-account
