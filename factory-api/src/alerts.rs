@@ -334,6 +334,8 @@ impl Engine {
     /// Evaluate, post due messages and persist changes.
     pub async fn tick(&mut self, now: i64, signals: &Signals) {
         self.evaluate(now, signals);
+        // Opens and clears (with their queued recoveries) are durable before any Slack call.
+        self.persist();
         self.deliver(now).await;
         self.persist();
     }
@@ -607,17 +609,23 @@ impl Engine {
         self.dirty = true;
     }
     /// Posts due openings and recoveries. Without a token nothing is ever posted.
+    ///
+    /// Each Slack result is persisted before the next network await, so a
+    /// shutdown or abort mid-delivery can never forget an acknowledged `ts`
+    /// (which would repost the opening or orphan its recovery).
     async fn deliver(&mut self, now: i64) {
         let Some(token) = self.config.token.clone() else {
             return;
         };
-        let mut active = std::mem::take(&mut self.stored.active);
-        for open in active
-            .iter_mut()
-            .filter(|open| open.slack_ts.is_none() && open.next_post_ms <= now)
-        {
+        for index in 0..self.stored.active.len() {
+            let open = &self.stored.active[index];
+            if open.slack_ts.is_some() || open.next_post_ms > now {
+                continue;
+            }
             let text = open_text(open.severity, &open.summary);
-            match post(&self.client, &self.config, &token, None, &text).await {
+            let result = post(&self.client, &self.config, &token, None, &text).await;
+            let open = &mut self.stored.active[index];
+            match result {
                 Ok(ts) => open.slack_ts = Some(ts),
                 Err(error) => {
                     open.attempts += 1;
@@ -626,38 +634,37 @@ impl Engine {
                 }
             }
             self.dirty = true;
+            self.persist();
         }
-        self.stored.active = active;
-        let mut outbox = vec![];
-        for mut recovery in std::mem::take(&mut self.stored.outbox) {
+        let mut index = 0;
+        while index < self.stored.outbox.len() {
+            let recovery = &self.stored.outbox[index];
             if recovery.next_post_ms > now {
-                outbox.push(recovery);
+                index += 1;
                 continue;
             }
-            self.dirty = true;
-            match post(
-                &self.client,
-                &self.config,
-                &token,
-                Some(&recovery.thread_ts),
-                &recovery.text,
-            )
-            .await
-            {
-                Ok(_) => (),
+            let (thread_ts, text) = (recovery.thread_ts.clone(), recovery.text.clone());
+            let result = post(&self.client, &self.config, &token, Some(&thread_ts), &text).await;
+            let recovery = &mut self.stored.outbox[index];
+            match result {
+                Ok(_) => {
+                    self.stored.outbox.remove(index);
+                }
                 Err(error) => {
                     recovery.attempts += 1;
                     if recovery.attempts >= MAX_RECOVERY_ATTEMPTS {
                         tracing::error!(key = %recovery.key, %error, "Slack recovery post failed; giving up");
+                        self.stored.outbox.remove(index);
                     } else {
                         tracing::warn!(key = %recovery.key, %error, attempts = recovery.attempts, "Slack recovery post failed; will retry");
                         recovery.next_post_ms = now + backoff(recovery.attempts);
-                        outbox.push(recovery);
+                        index += 1;
                     }
                 }
             }
+            self.dirty = true;
+            self.persist();
         }
-        self.stored.outbox = outbox;
     }
     fn persist(&mut self) {
         if !self.dirty {
@@ -828,6 +835,8 @@ impl AppState {
                     engine.tick(now_ms(), &signals).await;
                     *state.alerts.view.write().await = engine.view();
                 };
+                // Shutdown (and main's abort) may drop `work` mid-post: every acknowledged
+                // Slack result is already on disk, so a restart neither reposts nor orphans it.
                 tokio::select! { biased;
                     _ = state.shutdown.cancelled() => break,
                     _ = work => (),
@@ -880,6 +889,10 @@ mod tests {
     struct FakeSlack {
         posts: Arc<Mutex<Vec<Value>>>,
         fail: Arc<Mutex<u32>>,
+        /// Requests numbered at or after this (1-based) hang and are never acknowledged.
+        block_from: Arc<Mutex<Option<usize>>>,
+        received: Arc<std::sync::atomic::AtomicUsize>,
+        blocked: Arc<tokio::sync::Notify>,
     }
     async fn chat(
         State(slack): State<FakeSlack>,
@@ -887,6 +900,16 @@ mod tests {
         Json(body): Json<Value>,
     ) -> Json<Value> {
         assert_eq!(headers["authorization"], "Bearer xoxb-test-token");
+        let number = slack.received.fetch_add(1, Ordering::SeqCst) + 1;
+        let block = slack
+            .block_from
+            .lock()
+            .unwrap()
+            .is_some_and(|from| number >= from);
+        if block {
+            slack.blocked.notify_one();
+            std::future::pending::<()>().await;
+        }
         let mut fail = slack.fail.lock().unwrap();
         if *fail > 0 {
             *fail -= 1;
@@ -1056,6 +1079,107 @@ mod tests {
         let third = Engine::load(config(&url, Some(path), true));
         assert!(third.view().active.is_empty());
         assert_eq!(third.view().recent.len(), 1);
+    }
+
+    /// Runs one tick until the fake Slack is blocked on a request, then aborts it like shutdown does.
+    async fn interrupted_tick(slack: &FakeSlack, mut engine: Engine, now: i64, signals: Signals) {
+        let task = tokio::spawn(async move { engine.tick(now, &signals).await });
+        slack.blocked.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        *slack.block_from.lock().unwrap() = None;
+    }
+    fn clock_and_dispatch(synchronized: bool, last_trigger: Option<i64>) -> Signals {
+        Signals {
+            clock_synchronized: Some(synchronized),
+            dispatch_last_trigger_ms: Some(last_trigger),
+            ..Default::default()
+        }
+    }
+    fn texts_containing(slack: &FakeSlack, needle: &str) -> usize {
+        let posts = slack.posts.lock().unwrap();
+        posts
+            .iter()
+            .filter(|p| p["text"].as_str().unwrap().contains(needle))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn interrupted_open_delivery_keeps_the_acknowledged_ts() {
+        let (slack, url) = fake_slack().await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alerts.json");
+        // Two alerts open together: Slack acknowledges the first, the second hangs.
+        *slack.block_from.lock().unwrap() = Some(2);
+        let firing = clock_and_dispatch(false, None);
+        let engine = Engine::load(config(&url, Some(path.clone()), true));
+        interrupted_tick(&slack, engine, T0, firing.clone()).await;
+        assert_eq!(slack.posts.lock().unwrap().len(), 1);
+        assert!(texts_containing(&slack, "clock not NTP-synchronized") == 1);
+
+        let mut restarted = Engine::load(config(&url, Some(path.clone()), true));
+        let stored: Vec<_> = restarted
+            .stored
+            .active
+            .iter()
+            .map(|open| (open.key.as_str(), open.slack_ts.as_deref()))
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                ("clock:ntp", Some(posts_ts(1).as_str())),
+                ("dispatch:timer", None)
+            ]
+        );
+        restarted.tick(T0 + MIN, &firing).await;
+        restarted.tick(T0 + 2 * MIN, &firing).await;
+        assert_eq!(texts_containing(&slack, "clock not NTP-synchronized"), 1);
+        assert_eq!(
+            texts_containing(&slack, "factory-dispatch.timer has never fired"),
+            1
+        );
+        restarted
+            .tick(T0 + 3 * MIN, &clock_and_dispatch(true, Some(T0 + 3 * MIN)))
+            .await;
+        let posts = slack.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 4, "{posts:?}");
+        assert_eq!(posts[2]["thread_ts"], posts_ts(1));
+        assert!(posts[2]["text"].as_str().unwrap().contains("clock not NTP"));
+        assert_eq!(posts[3]["thread_ts"], posts_ts(2));
+        assert!(
+            posts[3]["text"]
+                .as_str()
+                .unwrap()
+                .contains("factory-dispatch.timer")
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_recovery_delivery_keeps_the_acknowledged_recovery() {
+        let (slack, url) = fake_slack().await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alerts.json");
+        let mut engine = Engine::load(config(&url, Some(path.clone()), true));
+        engine.tick(T0, &clock_and_dispatch(false, None)).await;
+        assert_eq!(slack.posts.lock().unwrap().len(), 2);
+        // Both clear: the first recovery is acknowledged, the second hangs.
+        *slack.block_from.lock().unwrap() = Some(4);
+        let cleared = clock_and_dispatch(true, Some(T0 + MIN));
+        interrupted_tick(&slack, engine, T0 + MIN, cleared.clone()).await;
+        assert_eq!(slack.posts.lock().unwrap().len(), 3);
+
+        let mut restarted = Engine::load(config(&url, Some(path), true));
+        assert!(restarted.stored.active.is_empty());
+        assert_eq!(restarted.stored.outbox.len(), 1);
+        assert_eq!(restarted.stored.outbox[0].thread_ts, posts_ts(2));
+        restarted.tick(T0 + 2 * MIN, &cleared).await;
+        restarted.tick(T0 + 3 * MIN, &cleared).await;
+        let posts = slack.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 4, "{posts:?}");
+        assert_eq!(posts[2]["thread_ts"], posts_ts(1));
+        assert_eq!(posts[3]["thread_ts"], posts_ts(2));
+        assert_eq!(texts_containing(&slack, "Recovered"), 2);
+        assert_eq!(restarted.view().recent.len(), 2);
     }
 
     #[tokio::test]

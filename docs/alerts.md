@@ -95,22 +95,42 @@ The installers take the bot token **on stdin only** and store it as
 - `--test-alert` (no stdin) posts one live test message and a threaded reply from
   that node through a transient unit using the same credential.
 
-`rollback-alerts.sh --node <node>` removes what the installer added. On factory-gpu
-it removes the drop-in and restarts factory-api before deleting the token. On
-the console it disables and removes the timer, service, script and state. The API's
+**Snapshots and restore.** Before changing anything, each install run saves a
+root-only snapshot in `/var/backups/factory-alerts/<UTC time>.XXXXXX` (0700). It
+holds the previous token copy (0600), the previous drop-in or watchdog files (or
+markers that they were absent), and the previous factory-api or timer state. The
+installer prints the snapshot path. If a later step fails, such as factory-api
+not reporting the token as loaded or the first watchdog run failing, the
+installer restores that snapshot automatically: the previous working token,
+files and service state. A rerun that changes nothing takes no snapshot.
+Snapshots are kept until removed by hand, and each one holds a copy of the token.
+
+`rollback-alerts.sh --node <node> <snapshot>` restores the state saved before that
+run. Rolling back a first-install snapshot, or running without a snapshot, removes
+everything the installer adds. On factory-gpu, removal deletes the drop-in, then
+the token, and restarts factory-api if it is running. On the console, removal
+disables and removes the timer, service, script and state. The API's
 `alerts.json` stays; without a token the engine only logs.
 
-From the Mac, after the MET-150 factory-api binary is deployed (factory-gpu first):
+From the Mac, after the MET-150 factory-api binary is deployed, install
+factory-gpu, then factory-console, then run the test alert. The token pipes over
+plain `ssh` (a byte stream with no PTY). The `factory-ssh` and `console-ssh`
+helpers run `_factory_ready` first, which can print or fail (see the PLAYBOOK).
+`sudo` must not prompt, because stdin carries the token.
 
 ```sh
-op read 'op://Factory/Factory Alerts Slack bot token/credential' | factory-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-gpu'
-op read 'op://Factory/Factory Alerts Slack bot token/credential' | console-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-console'
+op read 'op://Factory/Factory Alerts Slack bot token/credential' | ssh "$FACTORY_USER@$FACTORY_GPU" 'sudo bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-gpu'
+op read 'op://Factory/Factory Alerts Slack bot token/credential' | ssh "$FACTORY_USER@$FACTORY_CONSOLE" 'sudo bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-console'
 factory-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-gpu --test-alert'
 ```
 
-Rollback:
+Rollback: pass the snapshot path the installer printed to undo that run, or no
+path to remove everything. Console first:
 
 ```sh
+console-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh --node factory-console /var/backups/factory-alerts/<printed-console-snapshot>'
+factory-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh --node factory-gpu /var/backups/factory-alerts/<printed-gpu-snapshot>'
+# Full removal instead:
 console-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh --node factory-console'
 factory-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh --node factory-gpu'
 ```
@@ -118,17 +138,27 @@ factory-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh
 ## Tests and sandbox check
 
 - `cargo test -p factory-api --lib alerts` covers the engine with a fake clock and
-  fake Slack server: open, debounce, threaded recovery, restart, missing token,
-  unavailable source, retries and every signal rule.
-- `python3 -B deploy/alerts/test-watchdog.py` checks the watchdog against a fake
-  health endpoint and a fake Slack server.
-- `python3 -B deploy/alerts/test-install.py` checks both installers and rollback
-  against a fake root.
+  a fake Slack server. It checks:
+  - open, debounce and threaded recovery;
+  - restart, missing token, unavailable source and retries;
+  - every signal rule;
+  - interrupted deliveries. One post is acknowledged and the next hangs, then the
+    engine is aborted and restarted. The acknowledged opening or recovery is never
+    reposted, and later recoveries still thread under the original `ts`. Each
+    Slack result is persisted before the next network call.
+- `cargo test -p factory-api --test deploy_alerts` runs
+  `deploy/alerts/test-watchdog.py` and `deploy/alerts/test-install.py`. The first
+  checks the watchdog against a fake health endpoint and a fake Slack server. The
+  second checks the installers, snapshots, failed-update restore and rollback
+  against a fake root, with synthetic tokens.
 
-`scripts/sandbox up` starts a namespace-local fake Slack
-(`scripts/sandbox-shims/fake-slack.py`) with a synthetic token. It records each
-payload in `.sandbox/slack-posts.jsonl`. To force an alert, pause the fake Ollama
-(`kill -STOP <host pid of target/release/fake-ollama>`). Killing it would stop the
+`scripts/sandbox` has no Slack hook. There factory-api runs without a token, so
+alerts are evaluated and logged but never posted. To see payloads, give a local
+sandbox run a namespace-local fake Slack. That means a synthetic
+`CREDENTIALS_DIRECTORY` token plus `FACTORY_ALERTS_SLACK_URL` on the factory-api
+command in `scripts/sandbox-shims/runtime.py`, as a temporary change you do not
+commit. To force an alert, pause the fake Ollama with
+`kill -STOP <host pid of target/release/fake-ollama>`. Killing it would stop the
 whole sandbox. The `fake-ollama` service alert opens after three failed fleet
-checks. Resume it with `kill -CONT` to get the threaded recovery. Compare
+checks. Resume it with `kill -CONT` to get the threaded recovery, and compare
 `GET /v1/alerts` before and after.

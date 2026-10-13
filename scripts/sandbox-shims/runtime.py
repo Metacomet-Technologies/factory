@@ -126,9 +126,9 @@ def inside():
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
 
-    def start(name, args, env=None):
+    def start(name, args):
         with (STATE / f"{name}.log").open("ab") as log:
-            child = subprocess.Popen(args, stdout=log, stderr=log, env=None if env is None else {**os.environ, **env})
+            child = subprocess.Popen(args, stdout=log, stderr=log)
         children.append(child)
         (STATE / f"{name}.namespace-pid").write_text(str(child.pid))
         return child
@@ -200,25 +200,13 @@ def inside():
                                        stdout=log, stderr=log)
         if migration.returncode != 0:
             raise RuntimeError(f"Pricing migration failed (exit {migration.returncode}); see factory-api.log")
-        # MET-150: a namespace-local fake Slack and a synthetic token; alerts never leave the sandbox.
-        credentials = STATE / "credentials"
-        credentials.mkdir(mode=0o700, exist_ok=True)
-        atomic(credentials / "slack-bot-token", "xoxb-sandbox-synthetic\n")
-        start("fake-slack", ["python3", "-I", ROOT / "scripts/sandbox-shims/fake-slack.py", str(BASE + 3),
-                             STATE / "slack-posts.jsonl", credentials / "slack-bot-token"])
-        ready(BASE + 3, "/")
-        alerts_env = {"CREDENTIALS_DIRECTORY": str(credentials),
-                      "FACTORY_ALERTS_SLACK_URL": f"http://127.0.0.1:{BASE+3}/api"}
         start("factory-api", [binary / "factory-api", "--listen", f"127.0.0.1:{BASE+2}",
                               "--meter-url", f"http://127.0.0.1:{BASE+1}", "--db-path", STATE / "requests.db",
                               "--pricing-db-path", STATE / "pricing.db", "--services-config", STATE / "fleet.toml",
                               "--openrouter-feed-url", f"http://127.0.0.1:{BASE}/feeds/openrouter",
                               "--litellm-feed-url", f"http://127.0.0.1:{BASE}/feeds/litellm",
                               "--disable-pricing-collector",
-                              "--alerts-state", STATE / "alerts.json",
-                              "--backup-status", STATE / "backup-status.json",
-                              "--static-dir", ROOT / "kiosk/dist" if kiosk == "1" else STATE / "no-kiosk"],
-              alerts_env)
+                              "--static-dir", ROOT / "kiosk/dist" if kiosk == "1" else STATE / "no-kiosk"])
         ready(BASE + 2, "/v1/health")
         started = time.monotonic()
         pricing = {"refresh": request(BASE + 2, "/v1/pricing/refresh", {})}
