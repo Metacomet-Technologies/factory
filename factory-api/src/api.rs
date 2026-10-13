@@ -123,6 +123,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
             | "/v1/pricing/refresh"
             | "/v1/agents"
             | "/v1/agents/refresh"
+            | "/v1/alerts"
             | "/v1/stream"
             | "/openapi.json"
     ) && confirm.is_none()
@@ -152,6 +153,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
         "/v1/fleet" => fleet(&state).await.into_response(),
         "/v1/agents" => agents(&state).await.into_response(),
         "/v1/agents/refresh" => refresh_agents(&state, request).await,
+        "/v1/alerts" => alerts(&state).await.into_response(),
         "/openapi.json" => Json(ApiDoc::openapi()).into_response(),
         "/v1/stream" => stream(&state).into_response(),
         "/v1/gpu" => match range(&request, true) {
@@ -246,6 +248,11 @@ async fn fleet(state: &AppState) -> Json<Fleet> {
 #[utoipa::path(get, path="/v1/agents", responses((status=200, body=Agents)))]
 async fn agents(state: &AppState) -> Json<Agents> {
     Json(crate::usage::read(&state.usage_snapshot).await)
+}
+/// Active alerts and the last 20 cleared ones, as posted to Slack `#factory-alerts`.
+#[utoipa::path(get, path="/v1/alerts", responses((status=200, body=Alerts)))]
+async fn alerts(state: &AppState) -> Json<Alerts> {
+    Json(state.alerts.view().await)
 }
 #[utoipa::path(post, path="/v1/agents/refresh", responses(
     (status=202, body=AgentsRefresh),
@@ -387,6 +394,7 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         fleet,
         agents,
         refresh_agents,
+        alerts,
         stream,
         usage,
         gpu,
@@ -402,6 +410,7 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         Gpu,
         Pricing,
         Agents,
+        Alerts,
         StreamEvent,
         LlmRequest,
         FleetChange,

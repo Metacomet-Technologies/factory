@@ -214,3 +214,32 @@ pub struct PricingChanged {
     pub family: String,
     pub pending_model_id: Option<String>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertSeverity {
+    Critical,
+    Warning,
+    /// Posted once; clears without a recovery message.
+    Info,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ActiveAlert {
+    pub key: String,
+    pub severity: AlertSeverity,
+    pub summary: String,
+    pub opened_at_ms: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ClearedAlert {
+    pub key: String,
+    pub severity: AlertSeverity,
+    pub summary: String,
+    pub opened_at_ms: i64,
+    pub cleared_at_ms: i64,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct Alerts {
+    pub active: Vec<ActiveAlert>,
+    /// Last 20 cleared alerts, newest first.
+    pub recent: Vec<ClearedAlert>,
+}

@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use factory_api::{AppState, fleet, router};
+use factory_api::{AppState, alerts, fleet, router};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(Parser)]
@@ -52,6 +52,18 @@ struct Args {
         default_value = "/var/lib/factory-api/kiosk"
     )]
     static_dir: PathBuf,
+    #[arg(
+        long,
+        env = "FACTORY_API_ALERTS_STATE",
+        default_value = "/var/lib/factory-api/alerts.json"
+    )]
+    alerts_state: PathBuf,
+    #[arg(long, env = "FACTORY_ALERTS_CHANNEL", default_value = alerts::DEFAULT_CHANNEL)]
+    alerts_channel: String,
+    #[arg(long, env = "FACTORY_ALERTS_SLACK_URL", default_value = alerts::DEFAULT_SLACK_URL, value_parser = alerts::slack_url)]
+    alerts_slack_url: String,
+    #[arg(long, env = "FACTORY_API_BACKUP_STATUS", default_value = alerts::DEFAULT_BACKUP_STATUS)]
+    backup_status: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -61,6 +73,8 @@ enum Command {
         #[arg(long)]
         pricing_db: PathBuf,
     },
+    /// Post one Slack test alert plus a threaded reply, then exit.
+    AlertTest,
 }
 
 #[tokio::main]
@@ -72,6 +86,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    let alerts_config = alerts::Config {
+        state_path: Some(args.alerts_state.clone()),
+        channel: args.alerts_channel.clone(),
+        slack_url: args.alerts_slack_url.clone(),
+        token: alerts::Token::from_credentials(
+            std::env::var_os("CREDENTIALS_DIRECTORY")
+                .map(PathBuf::from)
+                .as_deref(),
+        ),
+    };
+    if let Some(Command::AlertTest) = args.command {
+        let ts = alerts::send_test(&alerts_config).await?;
+        println!("posted Slack test alert ts={ts} with a threaded reply");
+        return Ok(());
+    }
     if let Some(Command::Migrate { pricing_db }) = args.command {
         let report = pricing::migrate(&pricing_db)?;
         let db = rusqlite::Connection::open_with_flags(
@@ -127,6 +156,13 @@ async fn main() -> anyhow::Result<()> {
     state.usage_trigger = args.usage_trigger;
     state.pricing_sources = [args.openrouter_feed_url, args.litellm_feed_url];
     state.disable_pricing_collector = args.disable_pricing_collector;
+    state.backup_status = args.backup_status;
+    if alerts_config.token.is_some() {
+        tracing::info!(channel = %alerts_config.channel, "alerts: Slack token loaded; posting enabled");
+    } else {
+        tracing::info!("alerts: Slack token absent; alerts are evaluated and logged, never posted");
+    }
+    state.alerts = std::sync::Arc::new(alerts::Alerting::new(alerts_config));
     state.check_clock().await;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     let tasks = state.start_collectors();

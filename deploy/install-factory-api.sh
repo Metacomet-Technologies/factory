@@ -33,7 +33,7 @@ wait_ready() {
 trap 'printf "ERROR: factory-api install failed at line %s.\n" "$LINENO" >&2; rollback_hint' ERR
 
 # Complete preflight before creating the account or changing deployment files.
-for command in systemctl curl sudo tailscale useradd getent id install cp touch date mktemp realpath ss sqlite3 mv jq flock stat df awk sha256sum; do
+for command in systemctl curl sudo tailscale useradd getent id install cp touch date mktemp realpath ss sqlite3 mv jq flock stat df awk sha256sum cmp find; do
     command -v "$command" >/dev/null || fail "Required command missing: $command"
 done
 [[ -f "$binary" && -x "$binary" ]] || fail "Prebuilt binary missing or not executable: $binary"
@@ -48,10 +48,17 @@ for path in /var /var/lib /var/lib/factory-usage-trigger; do
     [[ ! -L "$path" ]] || fail "Refusing symlink: $path"
     [[ ! -e "$path" || -d "$path" ]] || fail "Not a directory: $path"
 done
-[[ ! -d /etc/systemd/system/factory-api.service.d ]] || fail 'Remove/review existing factory-api unit drop-ins before installing.'
 [[ -d /run/systemd/system ]] || fail 'systemd is not running.'
 systemctl show --property=Version --value >/dev/null
-[[ -z $(systemctl show factory-api.service --property=DropInPaths --value) ]] || fail 'Existing unit drop-ins would override this deployment; review them first.'
+# MET-150's alert credential drop-in (deploy/alerts) is the only tolerated override.
+alerts_dropin=/etc/systemd/system/factory-api.service.d/50-factory-alerts.conf
+if [[ -d /etc/systemd/system/factory-api.service.d ]]; then
+    extra=$(find /etc/systemd/system/factory-api.service.d -mindepth 1 ! -path "$alerts_dropin" -print -quit)
+    [[ -z "$extra" && ! -L "$alerts_dropin" ]] || fail 'Remove/review existing factory-api unit drop-ins before installing.'
+    [[ ! -e "$alerts_dropin" ]] || cmp -s "$alerts_dropin" "$root/deploy/alerts/factory-api-alerts.conf" || fail 'Remove/review existing factory-api unit drop-ins before installing.'
+fi
+dropins=$(systemctl show factory-api.service --property=DropInPaths --value)
+[[ -z "$dropins" || "$dropins" == "$alerts_dropin" ]] || fail 'Existing unit drop-ins would override this deployment; review them first.'
 enabled=$(systemctl is-enabled factory-api.service 2>/dev/null || true)
 case "$enabled" in enabled|disabled|static|indirect|not-found) ;; *) fail "Unsupported prior enable state: $enabled (resolve masks/runtime links first)." ;; esac
 active=$(systemctl is-active factory-api.service 2>/dev/null || true)

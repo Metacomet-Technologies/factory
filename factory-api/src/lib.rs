@@ -1,3 +1,4 @@
+pub mod alerts;
 mod api;
 pub mod data;
 pub mod fleet;
@@ -12,7 +13,10 @@ use shared::{GpuSample, RequestRecord};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{RwLock, broadcast};
@@ -36,6 +40,9 @@ pub struct AppState {
     pub static_dir: PathBuf,
     pub usage_snapshot: PathBuf,
     pub usage_trigger: PathBuf,
+    /// MET-74 backup status file read by the alert engine.
+    pub backup_status: PathBuf,
+    pub alerts: Arc<alerts::Alerting>,
     usage_refresh_lock: Arc<std::sync::Mutex<()>>,
     pub config: Arc<fleet::Config>,
     pub client: reqwest::Client,
@@ -48,6 +55,9 @@ pub struct AppState {
     pub shutdown: CancellationToken,
     started: Instant,
     fleet: Arc<RwLock<Fleet>>,
+    fleet_discovered: Arc<AtomicBool>,
+    gpu_latest: Arc<std::sync::Mutex<Option<(i64, f64)>>>,
+    meter_synced_at_ms: Arc<AtomicI64>,
     warnings: Arc<RwLock<BTreeMap<String, String>>>,
     events: broadcast::Sender<StreamEvent>,
 }
@@ -85,6 +95,8 @@ impl AppState {
             static_dir: "/var/lib/factory-api/kiosk".into(),
             usage_snapshot: "/var/lib/factory-usage/usage.json".into(),
             usage_trigger: "/var/lib/factory-usage-trigger/request".into(),
+            backup_status: alerts::DEFAULT_BACKUP_STATUS.into(),
+            alerts: Arc::new(alerts::Alerting::new(alerts::Config::default())),
             usage_refresh_lock: Default::default(),
             config: Arc::new(config),
             client,
@@ -99,6 +111,9 @@ impl AppState {
             shutdown: CancellationToken::new(),
             started: Instant::now(),
             fleet: Default::default(),
+            fleet_discovered: Default::default(),
+            gpu_latest: Default::default(),
+            meter_synced_at_ms: Arc::new(AtomicI64::new(now_ms())),
             warnings: Default::default(),
             events: broadcast::channel(1024).0,
         })
@@ -226,6 +241,9 @@ impl AppState {
             Ok(())
         }
         .await;
+        if result.is_ok() {
+            self.meter_synced_at_ms.store(now_ms(), Ordering::Release);
+        }
         self.warning(
             "meter",
             result.as_ref().err().map(|e: &anyhow::Error| e.to_string()),
@@ -279,6 +297,8 @@ impl AppState {
                         temperature_c: g.temperature_c,
                         power_w: g.power_w,
                     });
+                *self.gpu_latest.lock().expect("GPU sample lock") =
+                    current.as_ref().map(|g| (g.ts_ms, g.temperature_c));
                 let loaded = gpu.ollama_ps["models"]
                     .as_array()
                     .into_iter()
@@ -289,6 +309,7 @@ impl AppState {
                 (current, loaded)
             }
             Err(error) => {
+                *self.gpu_latest.lock().expect("GPU sample lock") = None;
                 self.warning("gpu", Some(error.to_string())).await;
                 (None, vec![])
             }
@@ -467,6 +488,7 @@ impl AppState {
     }
     pub fn start_collectors(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = vec![self.start_usage_collector()];
+        tasks.extend(self.start_alerts());
         if self.disable_pricing_collector {
             tracing::info!(
                 "pricing collector disabled; manual refresh and confirmation remain enabled"

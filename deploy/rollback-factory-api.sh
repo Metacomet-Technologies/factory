@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 0077
+repo=$(dirname "$(dirname "$(realpath "$0")")")
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/rollback-factory-api.sh <snapshot-directory>.'
 [[ $# -eq 1 ]] || fail 'Supply the exact snapshot directory printed by the installer.'
 snapshot=$1
 trap 'printf "ERROR: rollback failed at line %s; snapshot retained at %s.\n" "$LINENO" "$snapshot" >&2' ERR
-for command in systemctl cp rm cat mv mktemp date sudo curl touch sqlite3 jq flock sha256sum; do
+for command in systemctl cp rm cat mv mktemp date sudo curl touch sqlite3 jq flock sha256sum cmp find realpath; do
     command -v "$command" >/dev/null || fail "Required command missing: $command"
 done
 [[ -f "$snapshot/complete" && -f "$snapshot/enabled" && -f "$snapshot/active" ]] || fail 'Snapshot is incomplete.'
@@ -35,8 +36,15 @@ legacy_db=/var/lib/factory-api/pricing.v0.db
 for path in "$pricing_db" "$pricing_db-wal" "$pricing_db-shm" "$legacy_db" "$legacy_db-wal" "$legacy_db-shm"; do
     [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || fail "Unsafe pricing file: $path"
 done
-[[ ! -d /etc/systemd/system/factory-api.service.d ]] || fail 'Review factory-api unit drop-ins before rollback.'
-[[ -z $(systemctl show factory-api.service --property=DropInPaths --value) ]] || fail 'Review factory-api unit drop-ins before rollback.'
+# MET-150's alert credential drop-in (deploy/alerts) is the only tolerated override.
+alerts_dropin=/etc/systemd/system/factory-api.service.d/50-factory-alerts.conf
+if [[ -d /etc/systemd/system/factory-api.service.d ]]; then
+    extra=$(find /etc/systemd/system/factory-api.service.d -mindepth 1 ! -path "$alerts_dropin" -print -quit)
+    [[ -z "$extra" && ! -L "$alerts_dropin" ]] || fail 'Review factory-api unit drop-ins before rollback.'
+    [[ ! -e "$alerts_dropin" ]] || cmp -s "$alerts_dropin" "$repo/deploy/alerts/factory-api-alerts.conf" || fail 'Review factory-api unit drop-ins before rollback.'
+fi
+dropins=$(systemctl show factory-api.service --property=DropInPaths --value)
+[[ -z "$dropins" || "$dropins" == "$alerts_dropin" ]] || fail 'Review factory-api unit drop-ins before rollback.'
 if [[ "$pricing_mode" == legacy && -f "$legacy_db" ]]; then
     [[ -f "$snapshot/pricing.db.sha256" ]] || fail 'Verified legacy snapshot is missing.'
     sha256sum -c "$snapshot/pricing.db.sha256"
