@@ -213,12 +213,25 @@ export async function run(command: string, identifier: string | undefined, dryRu
   if (!Number.isSafeInteger(cap) || cap < 1) throw new Error('DISPATCH_MAX_ACTIVE_PER_RUNNER must be a positive integer');
   const runners = Object.fromEntries((process.env.DISPATCH_RUNNERS ?? 'gpu=factory-gpu,console=factory-console').split(',').map(item => item.split('=')));
   if (Object.keys(runners).length !== 2 || !['gpu', 'console'].every(name => /^[\w-]+$/.test(runners[name] ?? ''))) throw new Error('DISPATCH_RUNNERS must be gpu=<id>,console=<id>');
+  const caps: Record<string, number> = { gpu: cap, console: cap };
+  if (process.env.DISPATCH_RUNNER_CAPS !== undefined) {
+    const seen = new Set<string>();
+    for (const item of process.env.DISPATCH_RUNNER_CAPS.split(',')) {
+      const match = item.match(/^(gpu|console)=([0-9]+)$/);
+      if (!match || match[0] !== item || seen.has(match[1]) || !Number.isSafeInteger(Number(match[2])) || Number(match[2]) < 1) {
+        throw new Error('DISPATCH_RUNNER_CAPS must contain unique gpu=<positive integer> or console=<positive integer> entries separated by commas');
+      }
+      seen.add(match[1]);
+      caps[match[1]] = Number(match[2]);
+    }
+  }
   // Test-only endpoint override cannot send credentials to another remote host.
   const endpoint = process.env.DISPATCH_LINEAR_URL ?? 'https://api.linear.app/graphql';
   if (endpoint !== 'https://api.linear.app/graphql' && !/^http:\/\/127\.0\.0\.1:\d+\/graphql$/.test(endpoint)) throw new Error('Test endpoint must be loopback /graphql');
   const key = readFileSync(process.env.LINEAR_API_KEY_FILE ?? '/etc/factory-dispatch/linear-api-key', 'utf8').trim();
   if (!key) throw new Error('Linear key file is empty');
   const log = (decision: string, details: object = {}) => console.log(JSON.stringify({ decision, ...details }).replaceAll(key, '[redacted]'));
+  log('caps', { caps });
   let consoleAvailable: boolean | undefined;
   function runnerAvailable(runner: string) {
     if (runner === 'gpu') return true;
@@ -333,9 +346,9 @@ export async function run(command: string, identifier: string | undefined, dryRu
       await removeLabel(issue);
       continue;
     }
-    const overflow = !issue.labels.some(label => label.parent?.name === 'runner' || label.name.startsWith('runner/')) && active.gpu >= cap;
+    const overflow = !issue.labels.some(label => label.parent?.name === 'runner' || label.name.startsWith('runner/')) && active.gpu >= caps.gpu;
     const runner = overflow ? 'console' : requestedRunner;
-    if (active[runner] >= cap) { log('capacity', { issue: issue.identifier, runner }); continue; }
+    if (active[runner] >= caps[runner]) { log('capacity', { issue: issue.identifier, runner }); continue; }
     if (thread(issue) || issue.comments.some(comment => commentMarkers(comment.body).some(line => line.startsWith('<!-- factory-dispatch:claim runner:')))) {
       log('already-claimed', { issue: issue.identifier });
       await removeLabel(issue);
