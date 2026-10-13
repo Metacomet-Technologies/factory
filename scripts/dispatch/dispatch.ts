@@ -220,6 +220,15 @@ export async function run(command: string, identifier: string | undefined, dryRu
   const key = readFileSync(process.env.LINEAR_API_KEY_FILE ?? '/etc/factory-dispatch/linear-api-key', 'utf8').trim();
   if (!key) throw new Error('Linear key file is empty');
   const log = (decision: string, details: object = {}) => console.log(JSON.stringify({ decision, ...details }).replaceAll(key, '[redacted]'));
+  let consoleAvailable: boolean | undefined;
+  function runnerAvailable(runner: string) {
+    if (runner === 'gpu') return true;
+    if (consoleAvailable === undefined) {
+      try { runWorktreeCommand('console', ['true']); consoleAvailable = true; }
+      catch { consoleAvailable = false; log('console-unavailable'); }
+    }
+    return consoleAvailable;
+  }
   async function query(document: string, variables: object = {}) {
     let response;
     try {
@@ -317,6 +326,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
       await removeLabel(issue);
       continue;
     }
+    if (!runnerAvailable(runner)) continue;
     await removeLabel(issue);
     await comment(issue, `Dispatch claimed on ${runner}${overflow ? ' (overflow)' : ''}. If submission is interrupted, inspect Amp before manual recovery; do not delete this claim to retry blindly.\n\n${marker(`claim runner:${runner}`)}\n${marker(`worktree ${slug(issue.identifier, issue.title)}`)}`);
     active[runner]++;
@@ -346,7 +356,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
     await mutate(issue, 'mutation Move($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }', { id: issue.id, input: { stateId: states[0].id } });
     log('dispatched', { issue: issue.identifier, thread: dryRun ? '<new-thread-id>' : id, runner });
   }
-  const qaContext = { issues, dryRun, runners, comment, mutate, amp, showAmp, log };
+  const qaContext = { issues, dryRun, runners, runnerAvailable, comment, mutate, amp, showAmp, log };
   try { await reviewPRs(qaContext); }
   finally { cleanupQAWorktrees(qaContext); }
   for (const issue of issues) {

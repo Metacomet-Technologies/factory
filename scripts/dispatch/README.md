@@ -52,10 +52,19 @@ the builder only verifies its directory/branch. Post-merge wrap-up still removes
 Commands run locally for GPU and through noninteractive SSH as
 `agent@factory-console` for console, with strict host-key checking and timeouts.
 Runner ID overrides do not change these physical hosts. No SSH key, login,
-access rule or runner configuration is installed or changed. If existing
-agent-to-console access is unavailable, console preparation fails closed with a
-comment instead of launching in a missing or non-project directory. This transport
-is fake-tested, **not live-verified**; operator access setup is outside this change.
+access rule or runner configuration is installed or changed. Before any console
+builder or QA start claim, a side-effect-free `true` command checks that same SSH
+transport. Its result is shared across dispatch, QA and cleanup for one pass.
+Failure logs `console-unavailable` once, leaves builders labeled and QA unclaimed,
+and quietly skips console cleanup. A later pass retries; there are no failure
+comments or Amp submissions. Failures after a successful preflight still retain
+the durable claim for manual inspection.
+
+**Console launches are paused until an operator sets up agent-to-console SSH,
+including the trusted host key.** QA observed `Host key verification failed`
+(exit 255) with the exact transport. Successful live console SSH remains
+**unverified**; fake tests cover failure, recovery, and post-preflight failures.
+Operator access setup is outside this change.
 
 QA gets `/home/agent/work/factory-qa-<pr>-<first-12-sha-characters>`, detached at
 freshly fetched `origin/main`, as both its initial directory and `QA_BASE`.

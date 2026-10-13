@@ -114,6 +114,7 @@ export async function mergeCheck(pr: string, sha: string, restRead = false) {
 
 type Context = {
   issues: Issue[]; dryRun: boolean; runners: Record<string, string>;
+  runnerAvailable: (runner: string) => boolean;
   comment: (issue: Issue, body: string) => Promise<void>;
   mutate: (issue: Issue, document: string, variables: any) => Promise<void>;
   amp: (args: string[]) => Promise<string>;
@@ -132,7 +133,7 @@ export function cleanupQAWorktrees(ctx: Context) {
   }
   let attempts = 0;
   for (const runner of ['gpu', 'console']) {
-    if (ctx.dryRun) continue;
+    if (ctx.dryRun || !ctx.runnerAvailable(runner)) continue;
     try {
       const list = runWorktreeCommand(runner, ['git', '-C', main, 'worktree', 'list', '--porcelain']).output;
       for (const entry of list.split('\n\n')) {
@@ -227,6 +228,7 @@ export async function reviewPRs(ctx: Context) {
       if (starts(issue).some(start => start.key === key)) continue;
       const runner = active.gpu < 1 ? 'gpu' : 'console';
       if (active[runner] >= 1) { log('qa-capacity', { issue: issue.identifier }); continue; }
+      if (!ctx.runnerAvailable(runner)) continue;
       try {
         const data = await info(pr, true);
         if (data.state !== 'OPEN' || data.isDraft !== false || data.baseRefName !== 'main' || data.headRefOid !== sha) continue;

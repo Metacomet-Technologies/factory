@@ -84,9 +84,11 @@ syncBuiltinESMExports();`);
   writeFileSync(join(directory, 'lock'), '');
   writeFileSync(join(directory, 'ssh'), `#!${process.execPath}
 const { spawnSync } = require('node:child_process');
+const fs = require('node:fs');
 const args = process.argv.slice(2);
 if (args.slice(0, 7).join(' ') !== '-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes agent@factory-console') process.exit(99);
-if (process.env.FAKE_SSH_FAIL) process.exit(255);
+fs.appendFileSync(process.env.FAKE_EVENTS, JSON.stringify(['ssh', ...args]) + '\\n');
+if (process.env.FAKE_SSH_FAIL || (process.env.FAKE_SSH_AFTER_PREFLIGHT && args[7] !== "'true'")) process.exit(255);
 const result = spawnSync('/bin/sh', ['-c', 'exec ' + args[7]], { stdio: 'inherit', env: { ...process.env, FAKE_RUNNER: 'console' } });
 process.exit(result.status ?? 1);
 `, { mode: 0o755 });
@@ -380,7 +382,7 @@ test('full fake-server poll: dispatch, prompt contract, Linear state, and manual
 });
 
 test('worktree collisions and preparation failures comment, retain claims, and never launch or retry', { timeout: 15_000 }, async t => {
-  for (const runner of ['gpu', 'console']) for (const failure of ['FAKE_EXISTING_BRANCH', 'FAKE_EXISTING_DIR', 'FAKE_FETCH_FAIL', 'FAKE_ADD_FAIL', ...(runner === 'console' ? ['FAKE_SSH_FAIL'] : [])]) {
+  for (const runner of ['gpu', 'console']) for (const failure of ['FAKE_EXISTING_BRANCH', 'FAKE_EXISTING_DIR', 'FAKE_FETCH_FAIL', 'FAKE_ADD_FAIL', ...(runner === 'console' ? ['FAKE_SSH_AFTER_PREFLIGHT'] : [])]) {
     const i = issue(); i.labels.push(group('runner', runner));
     const f = await fixture(t, [i]);
     const result = await f.run(['poll'], { [failure]: '1' });
@@ -392,6 +394,31 @@ test('worktree collisions and preparation failures comment, retain claims, and n
     await f.run(['issue', 'MET-123']);
     assert.equal(f.calls().length, 0);
     assert.deepEqual(f.worktrees(), { gpu: [], console: [] });
+  }
+});
+
+test('unreachable console preserves explicit and overflow builders without claims or cleanup noise', { timeout: 10_000 }, async t => {
+  for (const explicit of [false, true]) {
+    const busy = issue(1, { labels: [], comments: [threadComment()] });
+    const pending = [issue(2), issue(3)];
+    if (explicit) for (const i of pending) i.labels.push(group('runner', 'console'));
+    const f = await fixture(t, [busy, ...pending]);
+    for (let pass = 0; pass < 2; pass++) {
+      const result = await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '1', FAKE_SSH_FAIL: '1' });
+      assert.equal(result.code, 0, result.stdout);
+      assert.equal(result.stdout.match(/"decision":"console-unavailable"/g)?.length, 1);
+      assert.doesNotMatch(result.stdout, /qa-cleanup-pending/);
+    }
+    assert.equal(f.mutations.length, 0);
+    assert.equal(f.calls().length, 0);
+    assert.ok(pending.every(i => labeled(i) && i.comments.length === 0));
+    assert.equal(f.events().filter(e => e[0] === 'ssh').length, 2);
+    assert.ok(f.events().filter(e => e[0] === 'ssh').every(e => e.at(-1) === "'true'"));
+    assert.equal((await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '1' })).code, 0);
+    assert.equal(f.calls().length, 1);
+    assert.equal(labeled(pending[0]), false);
+    assert.equal(labeled(pending[1]), true);
+    assert.equal(f.calls()[0][f.calls()[0].indexOf('--executor') + 1], 'runner:factory-console');
   }
 });
 
@@ -1040,6 +1067,26 @@ test('QA has one slot per runner independent of full builder capacity, and never
   pending.push(issue(4), issue(5));
   await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '1' });
   assert.equal(f.calls().filter(a => a[0] === '-x' && !a[1].includes('— QA PR')).length, 2);
+});
+
+test('unreachable console leaves QA unclaimed and retries on a later reachable pass', { timeout: 10_000 }, async t => {
+  const busy = reviewable(1);
+  busy.comments.push(qaMarker(`start pr:90 sha:${sha} runner:gpu`));
+  const pending = reviewable(2);
+  const f = await fixture(t, [busy, pending], { github: { 90: githubPR() } });
+  const failed = await f.run(['poll'], { FAKE_SSH_FAIL: '1' });
+  assert.equal(failed.code, 0, failed.stdout);
+  assert.equal(failed.stdout.match(/"decision":"console-unavailable"/g)?.length, 1);
+  assert.doesNotMatch(failed.stdout, /qa-cleanup-pending/);
+  assert.equal(f.mutations.length, 0);
+  assert.equal(f.calls().length, 0);
+  assert.equal(pending.comments.length, 2);
+  assert.deepEqual(f.events().filter(e => e[0] === 'ssh').map(e => e.at(-1)), ["'true'"]);
+  const recovered = await f.run();
+  assert.equal(recovered.code, 0, recovered.stdout);
+  assert.equal(f.calls().length, 1);
+  assert.equal(f.calls()[0][f.calls()[0].indexOf('--executor') + 1], 'runner:factory-console');
+  assert.ok(pending.comments.some(c => c.body.includes(`factory-qa:start pr:90 sha:${sha} runner:console`)));
 });
 
 test('QA engine mapping uses grouped/flat builder engine labels, with Claude fallback', () => {
