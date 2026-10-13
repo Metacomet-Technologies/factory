@@ -68,6 +68,11 @@ async function fixture(t: any, issues = [issue()], options: any = {}) {
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 Date.now = () => Number(process.env.FAKE_NOW);
+const fetch = globalThis.fetch;
+globalThis.fetch = (url, options) => {
+  if (new URL(url).hostname !== '127.0.0.1') throw new Error('Only loopback fetches are allowed in tests');
+  return fetch(url, options);
+};
 const read = fs.readFileSync;
 fs.readFileSync = (path, ...args) => path === '/home/agent/work/factory/docs/PLAYBOOK.md' ? ${JSON.stringify(playbook)} : read(path, ...args);
 syncBuiltinESMExports();`);
@@ -80,6 +85,14 @@ const args = process.argv.slice(2);
 const state = JSON.parse(fs.readFileSync(process.env.FAKE_GITHUB, 'utf8'));
 fs.appendFileSync(process.env.FAKE_GITHUB + '-calls', JSON.stringify(['${program}', ...args]) + '\\n');
 if (process.env.FAKE_GITHUB_FAIL) process.exit(7);
+if ('${program}' === 'gh' && args[0] === 'api' && !args.includes('--paginate')) {
+  if (process.env.GH_TOKEN || args[2] !== '--hostname' || args[3] !== 'github.com') process.exit(9);
+  // Exercise the production gh argv without contacting GitHub or reading real credentials.
+  return void fetch(process.env.FAKE_GITHUB_URL + '/' + args[1]).then(async response => {
+    if (!response.ok) { console.error('${key} quota exhausted'); process.exit(7); }
+    console.log(await response.text());
+  }).catch(() => process.exit(7));
+}
 let output;
 if ('${program}' === 'git' && args[0] === 'ls-remote') {
   const pr = args[2].match(/^refs\\/pull\\/(\\d+)\\/head$/)?.[1];
@@ -161,6 +174,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
         const prNumber = path.match(/^pulls\/(\d+)/)?.[1];
         const pr = prNumber ? github[prNumber] : Object.values(github).find((p: any) => path.startsWith(`commits/${p.headRefOid}/`)) as any;
         if (!pr || pr.publicFail || (pr.checkExit && path.includes('/check-runs'))) { response.statusCode = 503; response.end('{}'); return; }
+        if (path === pr.quotaPath) { response.statusCode = 429; response.end('{}'); return; }
         let data;
         if (/^pulls\/\d+$/.test(path)) data = { state: pr.state === 'MERGED' ? 'closed' : pr.state.toLowerCase(), merged: pr.state === 'MERGED', draft: pr.isDraft,
           head: { sha: pr.headRefOid }, base: { ref: pr.baseRefName }, merge_commit_sha: pr.mergeCommit?.oid };
@@ -231,6 +245,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
       PATH: `${directory}:/usr/bin:/bin`, HOME: directory, LINEAR_API_KEY_FILE: join(directory, 'key'),
       DISPATCH_LOCK_FILE: join(directory, 'lock'), DISPATCH_LINEAR_URL: `http://127.0.0.1:${(server.address() as any).port}/graphql`,
       DISPATCH_GITHUB_URL: `http://127.0.0.1:${(server.address() as any).port}`,
+      FAKE_GITHUB_URL: `http://127.0.0.1:${(server.address() as any).port}`,
       FAKE_CALLS: callsFile, FAKE_THREADS: threadsFile, FAKE_GITHUB: githubFile, FAKE_NOW: String(now), ...environment,
     }, stdio: ['ignore', 'pipe', 'pipe'] });
     current = child;
@@ -827,6 +842,8 @@ test('QA triggers once per head, sends each changes verdict directly, then stops
   assert.equal(f.calls().length, 1);
   assert.equal(f.calls()[0][0], '-x');
   assert.ok(f.calls()[0][1].includes(sha));
+  assert.doesNotMatch(f.calls()[0][1], /GH_TOKEN|auth setup-git/);
+  assert.ok(f.calls()[0][1].includes('GitHub auth is preconfigured for agent'));
   for (const text of ['Never edit code', 'Isolation, Build and Done means', 'PLAYBOOK.md §5', 'update_diff', 'GitHub PR comment', 'Do not merge now', 'your own actual Amp thread ID']) assert.ok(f.calls()[0][1].includes(text), text);
   i.comments.push(reviewed('changes').comments.at(-1));
   const changes = await f.run();
@@ -917,15 +934,17 @@ test('QA rejects fenced, inline, wrong-thread and conflicting verdicts; new head
 test('QA ready authorizes only the reviewer; merge-time check independently rejects a later push', { timeout: 10_000 }, async t => {
   const i = reviewed();
   const f = await fixture(t, [i], { github: { 90: githubPR() } });
-  const result = await f.run();
+  const result = await f.run(['poll'], { DISPATCH_GITHUB_URL: undefined, AGENT_GH_TOKEN: key });
   assert.equal(result.code, 0, result.stdout);
+  assert.equal(f.calls().length, 1, 'authenticated reads must pass before the loopback-only repeat');
   await f.run();
   assert.equal(f.calls().length, 1);
   assert.deepEqual(f.calls()[0].slice(0, 4), ['threads', 'continue', reviewId, '-ox']);
   assert.ok(f.calls()[0][4].includes(`gh pr merge 90 --repo Metacomet-Technologies/factory --squash --match-head-commit ${sha}`));
   assert.ok(f.calls()[0][4].includes('inside Isolation'));
   assert.ok(f.calls()[0][4].includes('never tools from the PR'));
-  assert.equal(f.githubCalls().some(a => a[0] === 'gh'), false, 'systemd dispatcher must not need gh credentials');
+  assert.doesNotMatch(f.calls()[0][4], /GH_TOKEN|auth setup-git/);
+  assert.ok(f.calls()[0][4].includes('GitHub auth is preconfigured for agent'));
   assert.equal((await f.check()).code, 0);
   f.setGitHub({ 90: githubPR({ headRefOid: nextSha }) });
   assert.equal((await f.check()).code, 1);
@@ -1066,7 +1085,7 @@ test('new pushes use spare review slots without losing in-flight reservations', 
   assert.equal(f.calls().length, 2);
 });
 
-test('public CI truncation, commit-status failure and public read failure defer without claims', { timeout: 10_000 }, async t => {
+test('CI truncation, commit-status failure and read failure defer without claims', { timeout: 10_000 }, async t => {
   const f = await fixture(t, [reviewed()]);
   for (const overrides of [{ checkTotal: 101 }, { statuses: [{ context: 'external', state: 'failure' }] }, { publicFail: true }]) {
     f.setGitHub({ 90: githubPR(overrides) });
@@ -1076,6 +1095,24 @@ test('public CI truncation, commit-status failure and public read failure defer 
   }
   f.setGitHub({ 90: githubPR() });
   await f.run();
+  assert.equal(f.calls().length, 1);
+});
+
+test('authenticated API quota failures defer without claims and recover on a later poll', { timeout: 15_000 }, async t => {
+  const f = await fixture(t, [reviewed()]);
+  const environment = { DISPATCH_GITHUB_URL: undefined };
+  for (const quotaPath of ['pulls/90', 'pulls/90/files?per_page=100&page=1',
+    `commits/${sha}/check-runs?per_page=100&filter=latest`, `commits/${sha}/status?per_page=100`]) {
+    f.setGitHub({ 90: githubPR({ quotaPath }) });
+    const result = await f.run(['poll'], environment);
+    assert.equal(result.code, 0, result.stdout);
+    assert.match(result.stdout, /qa-pending/);
+    assert.ok(!JSON.stringify(result).includes(key));
+    assert.equal(f.calls().length, 0);
+    assert.equal(f.mutations.length, 0);
+  }
+  f.setGitHub({ 90: githubPR() });
+  assert.equal((await f.run(['poll'], environment)).code, 0);
   assert.equal(f.calls().length, 1);
 });
 

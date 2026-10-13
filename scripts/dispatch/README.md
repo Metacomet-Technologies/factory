@@ -80,7 +80,7 @@ State transitions under the existing exclusive dispatcher lock:
    `scripts/usage/`), required checks, the Linear document ID and Devon's profile
    mention URL. Self-deploying PRs get one “ready; merging deploys it” ping,
    never a merge continuation.
-5. Otherwise precheck public CI for that SHA, then claim a continuation to the
+5. Otherwise precheck CI for that SHA with `gh api`, then claim a continuation to the
    **reviewer**. It reconfirms Isolation and runs the trusted temporary main clone's
    `node "$QA_BASE/scripts/dispatch/qa.ts" check <n> <sha>` after refreshing main.
    That independently runs `gh pr checks`, requires all checks to pass including
@@ -93,11 +93,12 @@ State transitions under the existing exclusive dispatcher lock:
    otherwise no deploy ping. Linear closes-links handle completion on merge;
    contributes-issues remain open. QA never changes issue status.
 
-The service has no declared GitHub credential. The dispatcher uses public REST
-for metadata/files and SHA-specific CI; only reviewers use their existing
-`AGENT_GH_TOKEN` with `gh`. Claimed idle reviews use only `ls-remote` per poll.
-Public REST quota/errors can delay new reviews or ready gates, never bypass them.
-Public CI over 100 check runs/statuses is refused rather than truncated. Files
+The service runs as agent with `HOME=/home/agent` and uses that user's
+preconfigured `gh` login (5,000 authenticated requests/hour). The dispatcher
+uses `gh api` for metadata/files and SHA-specific CI, without injecting tokens
+or changing auth. Claimed idle reviews use only `ls-remote` per poll.
+Quota/read errors defer new reviews or ready gates to the next poll, never bypass them.
+CI over 100 check runs/statuses is refused rather than truncated. Files
 paginate and refuse GitHub's 3,000-file ceiling. Reviewers still independently
 run `gh pr checks` immediately before merging.
 
@@ -178,7 +179,7 @@ This is the builder's sole marker exception. It reports wrap-up completion, not 
 verification or permission to mark Done. Archive logic still uses Done and five
 quiet minutes; QA document sync consumes the completion marker.
 
-Dry-run takes the same read-only lock and performs GraphQL/public GitHub/Git reads, but never
+Dry-run takes the same read-only lock and performs GraphQL/authenticated GitHub/Git reads, but never
 mutates Linear, invokes Amp, or writes files. It prints JSON decisions, exact
 mutation documents/variables and shell-quoted Amp flags. To honor the no-prompt
 logging rule, `$PROMPT`/`$WRAPUP_PROMPT`/`$QA_*` stand for the rendered text; the future
@@ -342,8 +343,8 @@ as evidence of merge. The wrap-up prompt also requires confirming the PR merge.
 
 GitHub auth is preconfigured for agent (gh + git credential helper); don't set GH_TOKEN or run gh auth commands. If `gh auth status` fails, stop and report.
 
-Rendered build and wrap-up prompts say "GitHub token environment variables"
-instead of naming the variable, so neither generated instruction contains a
+Rendered build, review, merge and wrap-up prompts say "GitHub token environment variables"
+instead of naming the variable, so no generated instruction contains a
 token variable name. Issue section text is passed through unchanged.
 
 For an already-installed dispatcher, MET-128 adds no deployment artifact, build,
