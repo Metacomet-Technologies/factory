@@ -363,6 +363,13 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
         updated_plugin = plugin.replace("OuJYUh", "NewSuffix99").replace(
             "q517Yo", "NewSuffix99").replace("46ba5e96083e1347", "012345abcdef")
         expect("would-reboot", updates={"ps": f"4909 1 {runner}\n138429 4909 {updated_plugin}\n"})
+        if node == "factory-gpu":
+            codex = ("/home/agent/.codex/packages/app-server-daemon/releases/"
+                     "0.162.1-x86_64-unknown-linux-musl/bin/codex app-server --listen unix:// "
+                     "--analytics-default-enabled --managed-daemon")
+            expect("would-reboot", updates={"ps": f"341001 1 {codex}\n"})
+            expect("would-reboot", updates={"ps": f"341001 1 {codex.replace('0.162.1', '9.9.9')}\n"})
+            expect("skipped", "agent-busy", updates={"ps": f"341001 1 {codex.split(' app-server')[0]} exec work\n"})
         expect("skipped", "agent-busy", updates={"ps": f"4909 1 {runner}\n"
                "138429 4909 /home/agent/.amp/bin/amp run /home/agent/work/task.ts\n"})
         expect("skipped", "agent-busy", updates={"ps": f"4909 1 {runner}\n138429 1 {updated_plugin}\n"})
@@ -372,7 +379,7 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             data = expect("would-reboot", updates={"ps": f"4909 1 {runner}\n138429 4909 {updated_plugin}\n",
                           "meter_code": 7, "ups_code": 1})
             assert "curl " not in calls.read_text() and "upsc " not in calls.read_text()
-    print("PASS: both node calendars and argv-independent idle runner; other Amp work blocks; console excludes op/meter/UPS")
+    print("PASS: both node calendars and argv-independent idle runner; idle Codex daemon versions allow; Codex exec and other Amp work block; console excludes op/meter/UPS")
 
     # Optional stronger installer check: real scripts in a root user namespace,
     # with a read-only host and every writable destination/command replaced.
