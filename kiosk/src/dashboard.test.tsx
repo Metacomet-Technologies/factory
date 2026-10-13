@@ -45,6 +45,7 @@ function api(outage = false, failing = "", empty = false) {
   const fetch = vi.fn((path: string) => {
     const url = new URL(path, "http://localhost");
     const data = fixtures(outage, url.searchParams.get("range") === "7d" ? "7d" : "24h");
+    data.fleet.nodes[0]!.services[0]!.name = "renamed-meter";
     if (empty) {
       data.fleet.nodes = [];
       data.usage.models = [];
@@ -226,6 +227,9 @@ describe("dashboard contract", () => {
     render(<App />);
     expect(screen.getAllByLabelText("Loading section").length).toBeGreaterThan(0);
     await screen.findByText("$3.41");
+    expect(screen.getByRole("contentinfo", { name: "Running versions" })).toHaveTextContent(
+      "meter a1b2c3d",
+    );
     expect(
       within(screen.getByRole("region", { name: "Fleet" })).getByText("Offline"),
     ).toBeInTheDocument();

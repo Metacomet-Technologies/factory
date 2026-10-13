@@ -170,7 +170,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
         [[nodes]]
         name="factory-gpu"
         services=[
-          {{name="meter-http",kind="http",target="{meter_url}/meter/health"}},
+          {{name="renamed-meter",kind="http",target="{meter_url}/meter/health"}},
           {{name="factory-api",kind="http",target="{meter_url}/v1/health"}},
           {{name="healthy",kind="http",target="{meter_url}/ok"}},
           {{name="redirect",kind="http",target="{meter_url}/redirect"}},

@@ -118,7 +118,9 @@ async fn check(state: &AppState, config: &ServiceConfig) -> Service {
             ServiceKind::Http => {
                 let response = state.client.get(&config.target).send().await?;
                 ensure!(response.status().is_success(), "HTTP {}", response.status());
-                if matches!(config.name.as_str(), "meter-http" | "factory-api") {
+                if matches!(config.name.as_str(), "meter-http" | "factory-api")
+                    || matches!(response.url().path(), "/meter/health" | "/v1/health")
+                {
                     // Legacy meters and non-JSON 2xx responses remain healthy but unidentified.
                     identity = response.json().await.unwrap_or(Value::Null);
                 }
