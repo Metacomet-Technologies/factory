@@ -1,7 +1,31 @@
 import { readFileSync, openSync, closeSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { reviewPRs, syncPlaybook, devonMention } from './qa.ts';
+import { reviewPRs, cleanupQAWorktrees, syncPlaybook, devonMention } from './qa.ts';
+
+export const mainCheckout = '/home/agent/work/factory';
+export function runnerCommand(runner: string, args: string[]) {
+  // The dispatcher runs on GPU. Console worktrees must exist on console, not GPU.
+  const argv = runner === 'gpu' ? args : ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+    '-o', 'StrictHostKeyChecking=yes', 'agent@factory-console', args.map(value => `'${value.replaceAll("'", "'\\''")}'`).join(' ')];
+  return argv;
+}
+export function runWorktreeCommand(runner: string, args: string[], allowed = [0]) {
+  const [program, ...argv] = runnerCommand(runner, args);
+  const result = spawnSync(program, argv, { encoding: 'utf8', timeout: 30_000, maxBuffer: 8_000_000 });
+  if (!allowed.includes(result.status ?? -1)) throw new Error(`Worktree command failed on ${runner}; inspect the claim and checkout before recovery`);
+  return { status: result.status, output: result.stdout.trim() };
+}
+export function prepareWorktree(runner: string, path: string, branch?: string) {
+  if (runWorktreeCommand(runner, ['test', '-e', path], [0, 1]).status === 0
+    || runWorktreeCommand(runner, ['test', '-L', path], [0, 1]).status === 0
+    || (branch && runWorktreeCommand(runner, ['git', '-C', mainCheckout, 'show-ref', '--verify', '--quiet', `refs/heads/${branch}`], [0, 1]).status === 0)) {
+    throw new Error(`Worktree refused on ${runner}: branch or directory already exists (${path}); never reuse or overwrite it`);
+  }
+  runWorktreeCommand(runner, ['git', '-C', mainCheckout, 'fetch', 'origin']);
+  runWorktreeCommand(runner, ['git', '-C', mainCheckout, 'worktree', 'add',
+    ...(branch ? ['-b', branch] : ['--detach', '--lock', '--reason', `factory-qa:${Date.now()}`]), path, 'origin/main']);
+}
 
 export const NODE_VERSION = '24.21.0';
 export const modes = {
@@ -91,13 +115,11 @@ export function prompt(issue: Issue, runner = validate(issue).runner) {
   const tests = 'Run cargo fmt --check, cargo clippy --all-targets -- -D warnings, and cargo test --workspace. For kiosk changes also run vp check, vp test --run, and vp build.';
   return `**Thread title:** Use the Linear ticket identifier and title: \`${issue.identifier} — ${issue.title}\`.
 
-Runner: factory-${runner}. Directory: ~/work. Effort: ${effort}.
+Runner: factory-${runner}. Directory: /home/agent/work/factory-${branch}. Effort: ${effort}.
 
 ## 1. Start fresh
-Stop and report if branch ${branch} or directory ~/work/factory-${branch} already exists. Never reuse or overwrite either.
+The dispatcher already created branch ${branch} and worktree /home/agent/work/factory-${branch} from origin/main. This thread starts inside that worktree. Do not create it again. Verify the current directory and branch; stop and report a mismatch.
 GitHub auth is preconfigured for agent (gh + git credential helper); don't set GitHub token environment variables or run gh auth commands. If \`gh auth status\` fails, stop and report.
-git -C ~/work/factory fetch origin
-git -C ~/work/factory worktree add -b ${branch} ~/work/factory-${branch} origin/main
 Work only in that worktree, never the main checkout. Read AGENTS.md and READMEs first.
 First push: git push -u origin ${branch}.
 PR title starts with ${issue.identifier}; body says "${link === 'closes' ? 'Closes' : 'Contributes'} ${issue.identifier}".
@@ -198,6 +220,15 @@ export async function run(command: string, identifier: string | undefined, dryRu
   const key = readFileSync(process.env.LINEAR_API_KEY_FILE ?? '/etc/factory-dispatch/linear-api-key', 'utf8').trim();
   if (!key) throw new Error('Linear key file is empty');
   const log = (decision: string, details: object = {}) => console.log(JSON.stringify({ decision, ...details }).replaceAll(key, '[redacted]'));
+  let consoleAvailable: boolean | undefined;
+  function runnerAvailable(runner: string) {
+    if (runner === 'gpu') return true;
+    if (consoleAvailable === undefined) {
+      try { runWorktreeCommand('console', ['true']); consoleAvailable = true; }
+      catch { consoleAvailable = false; log('console-unavailable'); }
+    }
+    return consoleAvailable;
+  }
   async function query(document: string, variables: object = {}) {
     let response;
     try {
@@ -295,14 +326,22 @@ export async function run(command: string, identifier: string | undefined, dryRu
       await removeLabel(issue);
       continue;
     }
+    if (!runnerAvailable(runner)) continue;
     await removeLabel(issue);
     await comment(issue, `Dispatch claimed on ${runner}${overflow ? ' (overflow)' : ''}. If submission is interrupted, inspect Amp before manual recovery; do not delete this claim to retry blindly.\n\n${marker(`claim runner:${runner}`)}\n${marker(`worktree ${slug(issue.identifier, issue.title)}`)}`);
     active[runner]++;
-    const args = ['-x', prompt(issue, runner), '--mode', modes[engine][effort], '--executor', `runner:${runners[runner]}`, '--runner-dir', '/home/agent/work', '--title', `${issue.identifier} — ${issue.title}`, '--visibility', 'private', '--no-archive-after-execute'];
+    const branch = slug(issue.identifier, issue.title);
+    const path = `${mainCheckout}-${branch}`;
+    const args = ['-x', prompt(issue, runner), '--mode', modes[engine][effort], '--executor', `runner:${runners[runner]}`, '--runner-dir', path, '--title', `${issue.identifier} — ${issue.title}`, '--visibility', 'private', '--no-archive-after-execute'];
     let id = 'T-00000000-0000-0000-0000-000000000000';
-    if (dryRun) showAmp(issue, ['amp', '-x', '$PROMPT', ...args.slice(2)]);
+    if (dryRun) {
+      showAmp(issue, runnerCommand(runner, ['git', '-C', mainCheckout, 'fetch', 'origin']));
+      showAmp(issue, runnerCommand(runner, ['git', '-C', mainCheckout, 'worktree', 'add', '-b', branch, path, 'origin/main']));
+      showAmp(issue, ['amp', '-x', '$PROMPT', ...args.slice(2)]);
+    }
     else {
       try {
+        prepareWorktree(runner, path, branch);
         const output = await amp(args);
         const ids = [...new Set(output.match(/\bT-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\b/g))];
         if (ids.length !== 1) throw new Error('Amp returned no unique thread ID; inspect Amp before recovery');
@@ -317,8 +356,9 @@ export async function run(command: string, identifier: string | undefined, dryRu
     await mutate(issue, 'mutation Move($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }', { id: issue.id, input: { stateId: states[0].id } });
     log('dispatched', { issue: issue.identifier, thread: dryRun ? '<new-thread-id>' : id, runner });
   }
-  const qaContext = { issues, dryRun, runners, comment, mutate, amp, showAmp, log };
-  await reviewPRs(qaContext);
+  const qaContext = { issues, dryRun, runners, runnerAvailable, comment, mutate, amp, showAmp, log };
+  try { await reviewPRs(qaContext); }
+  finally { cleanupQAWorktrees(qaContext); }
   for (const issue of issues) {
     const match = thread(issue);
     if (!match || has(issue, 'wrapup')) continue;

@@ -35,6 +35,64 @@ uses `external-agent:claude-code` and ignores effort; ChatGPT low uses `gpt56l`,
 medium/high use `gpt61s` (**proposed, unverified**). See [Amp CLI evidence](../../docs/amp-cli.md).
 Submission success is not execution success. Inspect the thread for results.
 
+## Project-attached worktrees (MET-134)
+
+The dispatcher creates each checkout **after its durable claim and before Amp
+submission**, then passes that absolute path as `--runner-dir`. Amp matches the
+Git remote to `metacomet/factory` at creation. Never pass `--project` to a runner;
+continuing a thread cannot repair its original project association.
+
+Builders get `/home/agent/work/factory-<slug>` on branch `<slug>`, created with
+`git -C /home/agent/work/factory fetch origin` followed by `worktree add -b
+<slug> <path> origin/main`. An existing branch, directory or dangling symlink
+is refused and commented on the issue. Fetch/create failures also retain the
+claim and disable automatic retry. The prompt says the worktree already exists;
+the builder only verifies its directory/branch. Post-merge wrap-up still removes it.
+
+Commands run locally for GPU and through noninteractive SSH as
+`agent@factory-console` for console, with strict host-key checking and timeouts.
+Runner ID overrides do not change these physical hosts. No SSH key, login,
+access rule or runner configuration is installed or changed. Before any console
+builder or QA start claim, a side-effect-free `true` command checks that same SSH
+transport. Its result is shared across dispatch, QA and cleanup for one pass.
+Failure logs `console-unavailable` once, leaves builders labeled and QA unclaimed,
+and quietly skips console cleanup. A later pass retries; there are no failure
+comments or Amp submissions. Failures after a successful preflight still retain
+the durable claim for manual inspection.
+
+**Console launches are paused until an operator sets up agent-to-console SSH,
+including the trusted host key.** QA observed `Host key verification failed`
+(exit 255) with the exact transport. Successful live console SSH remains
+**unverified**; fake tests cover failure, recovery, and post-preflight failures.
+Operator access setup is outside this change.
+
+QA gets `/home/agent/work/factory-qa-<pr>-<first-12-sha-characters>`, detached at
+freshly fetched `origin/main`, as both its initial directory and `QA_BASE`.
+It fetches the PR ref for inspection without checking it out. The trusted merge
+gate runs from this worktree, not from PR code or a new temporary clone.
+The dispatcher marks ownership/creation time with Git's native worktree lock
+reason `factory-qa:<UTC-ms>`. Reviewers must not unlock, remove or write artifacts
+into it. No PR code runs merely to prepare the checkout.
+
+Each pass attempts at most five QA removals across both hosts, including failures.
+Delivered changes, a human handoff, a superseded ready verdict or observed merge
+qualify immediately. Owned worktrees with no retained claim qualify only when
+older than 24 hours. Active, ready and interrupted claims retain their checkout
+even past 24 hours: age alone does not prove a reviewer stopped. Only exact QA
+paths with the ownership lock qualify. Dirty/untracked files refuse removal;
+the dispatcher re-locks and reports pending cleanup. A crash between unlock and
+remove leaves an unlocked checkout for manual inspection, never force deletion.
+Dry-run previews preparation without creating/removing worktrees or calling Amp.
+
+Live creation probe, 2026-10-13: Devon verified all three threads in the factory
+project in MET-134's 05:04 UTC comment; the runner discovered the new checkout
+without restarting. Probe worktree was removed and absence checked with
+`git worktree list`:
+
+- [low](https://ampcode.com/threads/T-01a133a4-eb1d-76ae-862e-3b204b068952)
+- [Claude Code](https://ampcode.com/threads/T-01a133a4-f364-74e5-bc99-45dd51fd67a4)
+- [gpt56l](https://ampcode.com/threads/T-01a133a4-fd63-713a-80d0-bec37000e42e)
+
 ## Automated QA and merge (MET-128)
 
 The dispatcher remains the control plane; fresh reviewer threads perform
@@ -61,7 +119,7 @@ CI, and contributes/closes correction via `update_diff`. Reviewers never edit co
 
 State transitions under the existing exclusive dispatcher lock:
 
-1. Write `factory-qa:start pr:<n> sha:<sha> runner:<runner>` before Amp.
+1. Write `factory-qa:start pr:<n> sha:<sha> runner:<runner>` before worktree creation and Amp.
    After one thread ID returns, write
    `factory-qa:review-claim pr:<n> sha:<sha> thread:<T-review>`.
 2. Accept exactly one `factory-qa:review pr:<n> sha:<sha> thread:<T-review>
@@ -81,7 +139,7 @@ State transitions under the existing exclusive dispatcher lock:
    mention URL. Self-deploying PRs get one “ready; merging deploys it” ping,
    never a merge continuation.
 5. Otherwise precheck CI for that SHA with `gh api`, then claim a continuation to the
-   **reviewer**. It reconfirms Isolation and runs the trusted temporary main clone's
+   **reviewer**. It reconfirms Isolation and runs the trusted-main QA worktree's
    `node "$QA_BASE/scripts/dispatch/qa.ts" check <n> <sha>` after refreshing main.
    That independently runs `gh pr checks`, requires all checks to pass including
    rust/kiosk/scripts, rechecks head/open/draft/base state and refuses
@@ -212,10 +270,16 @@ this same main-checkout lock, including invocations from another worktree.
 
 Order: read under lock; check blockers, shape, capacity, previous markers;
 remove `dispatch` and await success; post and await a durable
-`<!-- factory-dispatch:claim runner:gpu -->` (or console) comment; call Amp;
+`<!-- factory-dispatch:claim runner:gpu -->` (or console) comment; fetch origin
+and create the worktree on that runner's host; call Amp with that worktree;
 post URL plus `<!-- factory-dispatch:thread T-… runner:gpu -->`; move to
 In Progress. The claim also stores the original worktree slug, so renaming the
 issue does not change cleanup paths.
+
+A crash between worktree creation and submission leaves a claim plus checkout
+for inspection, never an automatic second thread. Do not remove either to retry
+without establishing the original submission outcome. QA start claims follow
+the same rule; retained claims are exempt from stale-worktree cleanup.
 
 **Why label removal alone is insufficient:** manual `issue` deliberately ignores
 the label. A crash after Amp succeeds but before its URL comment would otherwise

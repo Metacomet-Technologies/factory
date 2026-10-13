@@ -59,6 +59,10 @@ async function fixture(t: any, issues = [issue()], options: any = {}) {
   const callsFile = join(directory, 'amp-calls');
   const threadsFile = join(directory, 'amp-threads');
   const githubFile = join(directory, 'github');
+  const worktreesFile = join(directory, 'worktrees');
+  const eventsFile = join(directory, 'events');
+  writeFileSync(worktreesFile, JSON.stringify(options.worktrees ?? { gpu: [], console: [] }));
+  writeFileSync(eventsFile, '');
   writeFileSync(githubFile, JSON.stringify(options.github ?? {}));
   writeFileSync(threadsFile, JSON.stringify(options.threads ?? issues.flatMap(i => i.comments.flatMap((c: any) => {
     const id = c.body.match(/factory-dispatch:thread (T-[a-f0-9-]{36})/)?.[1];
@@ -78,12 +82,30 @@ fs.readFileSync = (path, ...args) => path === '/home/agent/work/factory/docs/PLA
 syncBuiltinESMExports();`);
   writeFileSync(join(directory, 'key'), key);
   writeFileSync(join(directory, 'lock'), '');
+  writeFileSync(join(directory, 'ssh'), `#!${process.execPath}
+const { spawnSync } = require('node:child_process');
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args.slice(0, 7).join(' ') !== '-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes agent@factory-console') process.exit(99);
+fs.appendFileSync(process.env.FAKE_EVENTS, JSON.stringify(['ssh', ...args]) + '\\n');
+if (process.env.FAKE_SSH_FAIL || (process.env.FAKE_SSH_AFTER_PREFLIGHT && args[7] !== "'true'")) process.exit(255);
+const result = spawnSync('/bin/sh', ['-c', 'exec ' + args[7]], { stdio: 'inherit', env: { ...process.env, FAKE_RUNNER: 'console' } });
+process.exit(result.status ?? 1);
+`, { mode: 0o755 });
+  writeFileSync(join(directory, 'test'), `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const trees = JSON.parse(fs.readFileSync(process.env.FAKE_WORKTREES, 'utf8'))[process.env.FAKE_RUNNER ?? 'gpu'];
+if (!['-e', '-L'].includes(args[0]) || !args[1].startsWith('/home/agent/work/factory-')) process.exit(99);
+process.exit(process.env.FAKE_EXISTING_DIR || trees.some(t => t.path === args[1]) ? 0 : 1);
+`, { mode: 0o755 });
   // No GitHub or Git command may escape to the network or the real main checkout.
   for (const program of ['gh', 'git']) writeFileSync(join(directory, program), `#!${process.execPath}
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 const state = JSON.parse(fs.readFileSync(process.env.FAKE_GITHUB, 'utf8'));
 fs.appendFileSync(process.env.FAKE_GITHUB + '-calls', JSON.stringify(['${program}', ...args]) + '\\n');
+fs.appendFileSync(process.env.FAKE_EVENTS, JSON.stringify(['${program}', process.env.FAKE_RUNNER ?? 'gpu', ...args]) + '\\n');
 if (process.env.FAKE_GITHUB_FAIL) process.exit(7);
 if ('${program}' === 'gh' && args[0] === 'api' && !args.includes('--paginate')) {
   if (process.env.GH_TOKEN || args[2] !== '--hostname' || args[3] !== 'github.com') process.exit(9);
@@ -99,7 +121,34 @@ if ('${program}' === 'git' && args[0] === 'ls-remote') {
   if (!state[pr]) process.exit(7);
   output = (state[pr].remoteSha ?? state[pr].headRefOid) + '\\t' + args[2];
 } else if ('${program}' === 'git' && args[0] === '-C' && args[1] === '/home/agent/work/factory') {
-  if (args[2] === 'branch') output = process.env.FAKE_BRANCH ?? 'main';
+  const all = JSON.parse(fs.readFileSync(process.env.FAKE_WORKTREES, 'utf8'));
+  const runner = process.env.FAKE_RUNNER ?? 'gpu';
+  const trees = all[runner];
+  if (args[2] === 'show-ref') process.exit(process.env.FAKE_EXISTING_BRANCH || trees.some(t => 'refs/heads/' + t.branch === args[5]) ? 0 : 1);
+  else if (args[2] === 'fetch') { if (process.env.FAKE_FETCH_FAIL) process.exit(7); output = ''; }
+  else if (args[2] === 'worktree') {
+    const action = args[3], path = args.at(-1);
+    if (action === 'list') output = trees.map(t => 'worktree ' + t.path + '\\nHEAD ${sha}\\n' + (t.branch ? 'branch refs/heads/' + t.branch : 'detached') + (t.locked ? '\\nlocked ' + t.locked : '') + '\\n').join('\\n');
+    else if (action === 'add') {
+      const path = args.at(-2);
+      if (process.env.FAKE_ADD_FAIL || trees.some(t => t.path === path)) process.exit(7);
+      trees.push({ path, branch: args.includes('-b') ? args[args.indexOf('-b') + 1] : undefined, locked: args.includes('--reason') ? args[args.indexOf('--reason') + 1] : undefined });
+      fs.writeFileSync(process.env.FAKE_WORKTREES, JSON.stringify(all));
+      if (process.env.FAKE_CRASH_AFTER_WORKTREE) process.kill(process.ppid, 'SIGKILL');
+      output = '';
+    } else {
+      const tree = trees.find(t => t.path === path);
+      if (!tree) process.exit(7);
+      if (action === 'unlock') delete tree.locked;
+      else if (action === 'lock') tree.locked = args[args.indexOf('--reason') + 1];
+      else if (action === 'remove') {
+        if (tree.dirty || tree.locked || process.env.FAKE_REMOVE_FAIL) process.exit(7);
+        trees.splice(trees.indexOf(tree), 1);
+      } else process.exit(99);
+      fs.writeFileSync(process.env.FAKE_WORKTREES, JSON.stringify(all));
+      output = '';
+    }
+  } else if (args[2] === 'branch') output = process.env.FAKE_BRANCH ?? 'main';
   else if (args[2] === 'status') output = process.env.FAKE_DIRTY ?? '';
   else if (args[2] === 'merge-base') { if (process.env.FAKE_BEHIND) process.exit(1); output = ''; }
   else if (args[2] === 'rev-parse') output = '${mergeSha}';
@@ -128,6 +177,13 @@ console.log(output);
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.FAKE_CALLS, JSON.stringify(args) + '\\n');
+fs.appendFileSync(process.env.FAKE_EVENTS, JSON.stringify(['amp', ...args]) + '\\n');
+if (args.includes('--project')) process.exit(99);
+if (args[0] === '-x') {
+  const runner = args[args.indexOf('--executor') + 1].includes('console') ? 'console' : 'gpu';
+  const trees = JSON.parse(fs.readFileSync(process.env.FAKE_WORKTREES, 'utf8'))[runner];
+  if (!trees.some(t => t.path === args[args.indexOf('--runner-dir') + 1])) process.exit(99);
+}
 if (process.env.FAKE_DELAY) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
 if (process.env.FAKE_FAIL) { console.error('${key} full prompt must not leak'); process.exit(7); }
 if (args[0] === 'threads' && args[1] === 'list') {
@@ -202,7 +258,11 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
         const crashHere = crash && crash(operation, v);
         if (crashHere === 'before') { crash = null; current.kill('SIGKILL'); response.destroy(); return; }
         if (options.rejectMutation === operation) { response.end(JSON.stringify({ data: { refused: { success: false } } })); return; }
-        if (operation === 'Comment') { i.comments.push({ body: v.input.body, createdAt: new Date().toISOString() }); data = { commentCreate: { success: true } }; }
+        if (operation === 'Comment') {
+          i.comments.push({ body: v.input.body, createdAt: new Date().toISOString() });
+          writeFileSync(eventsFile, JSON.stringify(['comment', v.input.body]) + '\n', { flag: 'a' });
+          data = { commentCreate: { success: true } };
+        }
         else if (operation === 'RemoveLabel') { i.labels = i.labels.filter((label: any) => label.id !== v.labelId); data = { issueRemoveLabel: { success: true } }; }
         else if (operation === 'Move') { i.stateId = v.input.stateId; data = { issueUpdate: { success: true } }; }
         else if (operation === 'SyncPlaybook') { data = { documentUpdate: { success: true } }; }
@@ -246,7 +306,8 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
       DISPATCH_LOCK_FILE: join(directory, 'lock'), DISPATCH_LINEAR_URL: `http://127.0.0.1:${(server.address() as any).port}/graphql`,
       DISPATCH_GITHUB_URL: `http://127.0.0.1:${(server.address() as any).port}`,
       FAKE_GITHUB_URL: `http://127.0.0.1:${(server.address() as any).port}`,
-      FAKE_CALLS: callsFile, FAKE_THREADS: threadsFile, FAKE_GITHUB: githubFile, FAKE_NOW: String(now), ...environment,
+      FAKE_CALLS: callsFile, FAKE_THREADS: threadsFile, FAKE_GITHUB: githubFile, FAKE_NOW: String(now),
+      FAKE_WORKTREES: worktreesFile, FAKE_EVENTS: eventsFile, ...environment,
     }, stdio: ['ignore', 'pipe', 'pipe'] });
     current = child;
     children.add(child);
@@ -262,6 +323,8 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
     check: (pr = '90', head = sha, env = {}) => run(['check', pr, head], env, fileURLToPath(new URL('qa.ts', import.meta.url))),
     setGitHub: (github: any) => writeFileSync(githubFile, JSON.stringify(github)),
     githubCalls: () => existsSync(githubFile + '-calls') ? readFileSync(githubFile + '-calls', 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [],
+    worktrees: () => JSON.parse(readFileSync(worktreesFile, 'utf8')),
+    events: () => readFileSync(eventsFile, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)),
     threads: () => JSON.parse(readFileSync(threadsFile, 'utf8')),
     setThreads: (threads: any[]) => writeFileSync(threadsFile, JSON.stringify(threads)),
     calls: () => existsSync(callsFile) ? readFileSync(callsFile, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [] };
@@ -273,12 +336,19 @@ test('full fake-server poll: dispatch, prompt contract, Linear state, and manual
   assert.equal(result.code, 0, result.stderr);
   const [args] = f.calls();
   assert.equal(args[0], '-x');
-  assert.deepEqual(args.slice(2), ['--mode', 'medium', '--executor', 'runner:factory-gpu', '--runner-dir', '/home/agent/work', '--title', 'MET-123 — Build the useful widget today', '--visibility', 'private', '--no-archive-after-execute']);
+  assert.deepEqual(args.slice(2), ['--mode', 'medium', '--executor', 'runner:factory-gpu', '--runner-dir', '/home/agent/work/factory-met-123-build-the-useful-widget', '--title', 'MET-123 — Build the useful widget today', '--visibility', 'private', '--no-archive-after-execute']);
   assert.equal(args[1].split('\n')[0], '**Thread title:** Use the Linear ticket identifier and title: `MET-123 — Build the useful widget today`.');
   assert.doesNotMatch(args[1], /GH_TOKEN/);
   assert.ok(args[1].includes("GitHub auth is preconfigured for agent (gh + git credential helper); don't set GitHub token environment variables or run gh auth commands. If `gh auth status` fails, stop and report."));
   assert.ok(args[1].includes("Push, open the PR. Then subscribe this thread to your PR's comments and reviews, and to CI for its exact head commit; after every later push, subscribe to CI for the new head commit. If subscribing fails, note the error in your final reply and continue; subscriptions are optional feedback."));
-  for (const text of ['git -C ~/work/factory fetch origin', 'git -C ~/work/factory worktree add -b met-123-build-the-useful-widget ~/work/factory-met-123-build-the-useful-widget origin/main', 'Never reuse or overwrite', 'Contributes MET-123', 'cargo fmt --check', 'cargo clippy --all-targets -- -D warnings', 'cargo test --workspace', 'vp check', 'factory-ssh', 'console-ssh', 'Never deploy']) assert.ok(args[1].includes(text), text);
+  for (const text of ['The dispatcher already created branch met-123-build-the-useful-widget', 'This thread starts inside that worktree', 'Work only in that worktree, never the main checkout', 'Contributes MET-123', 'cargo fmt --check', 'cargo clippy --all-targets -- -D warnings', 'cargo test --workspace', 'vp check', 'factory-ssh', 'console-ssh', 'Never deploy']) assert.ok(args[1].includes(text), text);
+  assert.doesNotMatch(args[1], /worktree add|--project/);
+  const events = f.events();
+  const claimed = events.findIndex(e => e[0] === 'comment' && e[1].includes('factory-dispatch:claim'));
+  const fetched = events.findIndex(e => e[0] === 'git' && e[4] === 'fetch');
+  const added = events.findIndex(e => e[0] === 'git' && e[5] === 'add');
+  assert.ok(claimed < fetched && fetched < added && added < events.findIndex(e => e[0] === 'amp'));
+  assert.deepEqual(events[added], ['git', 'gpu', '-C', '/home/agent/work/factory', 'worktree', 'add', '-b', 'met-123-build-the-useful-widget', '/home/agent/work/factory-met-123-build-the-useful-widget', 'origin/main']);
   for (const text of [
     'Use the already-connected Linear MCP server', 'report their names without calling a write tool',
     'If unavailable, stop and report', 'do not work around it or change MCP settings',
@@ -309,6 +379,60 @@ test('full fake-server poll: dispatch, prompt contract, Linear state, and manual
   await f.run();
   assert.equal(labeled(f.issues[0]), false);
   assert.equal(f.calls().length, 1);
+});
+
+test('worktree collisions and preparation failures comment, retain claims, and never launch or retry', { timeout: 15_000 }, async t => {
+  for (const runner of ['gpu', 'console']) for (const failure of ['FAKE_EXISTING_BRANCH', 'FAKE_EXISTING_DIR', 'FAKE_FETCH_FAIL', 'FAKE_ADD_FAIL', ...(runner === 'console' ? ['FAKE_SSH_AFTER_PREFLIGHT'] : [])]) {
+    const i = issue(); i.labels.push(group('runner', runner));
+    const f = await fixture(t, [i]);
+    const result = await f.run(['poll'], { [failure]: '1' });
+    assert.equal(result.code, 0, result.stdout);
+    assert.equal(f.calls().length, 0, `${runner} ${failure}`);
+    assert.match(i.comments.at(-1).body, /Worktree .*automatic retry is disabled/);
+    if (failure.startsWith('FAKE_EXISTING')) assert.match(i.comments.at(-1).body, /already exists/);
+    assert.equal(i.stateId, undefined);
+    await f.run(['issue', 'MET-123']);
+    assert.equal(f.calls().length, 0);
+    assert.deepEqual(f.worktrees(), { gpu: [], console: [] });
+  }
+});
+
+test('unreachable console preserves explicit and overflow builders without claims or cleanup noise', { timeout: 10_000 }, async t => {
+  for (const explicit of [false, true]) {
+    const busy = issue(1, { labels: [], comments: [threadComment()] });
+    const pending = [issue(2), issue(3)];
+    if (explicit) for (const i of pending) i.labels.push(group('runner', 'console'));
+    const f = await fixture(t, [busy, ...pending]);
+    for (let pass = 0; pass < 2; pass++) {
+      const result = await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '1', FAKE_SSH_FAIL: '1' });
+      assert.equal(result.code, 0, result.stdout);
+      assert.equal(result.stdout.match(/"decision":"console-unavailable"/g)?.length, 1);
+      assert.doesNotMatch(result.stdout, /qa-cleanup-pending/);
+    }
+    assert.equal(f.mutations.length, 0);
+    assert.equal(f.calls().length, 0);
+    assert.ok(pending.every(i => labeled(i) && i.comments.length === 0));
+    assert.equal(f.events().filter(e => e[0] === 'ssh').length, 2);
+    assert.ok(f.events().filter(e => e[0] === 'ssh').every(e => e.at(-1) === "'true'"));
+    assert.equal((await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '1' })).code, 0);
+    assert.equal(f.calls().length, 1);
+    assert.equal(labeled(pending[0]), false);
+    assert.equal(labeled(pending[1]), true);
+    assert.equal(f.calls()[0][f.calls()[0].indexOf('--executor') + 1], 'runner:factory-console');
+  }
+});
+
+test('crash after worktree creation leaves claim and checkout but never retries Amp', { timeout: 10_000 }, async t => {
+  for (const i of [issue(), reviewable()]) {
+    const f = await fixture(t, [i], { github: { 90: githubPR() } });
+    assert.equal((await f.run(['poll'], { FAKE_CRASH_AFTER_WORKTREE: '1' })).signal, 'SIGKILL');
+    assert.equal(f.calls().length, 0);
+    assert.equal(f.worktrees().gpu.length, 1);
+    await f.run(['issue', 'MET-123']);
+    await f.run();
+    assert.equal(f.calls().length, 0);
+    assert.equal(f.worktrees().gpu.length, 1);
+  }
 });
 
 test('only standalone unfenced marker lines count, including future QA markers', () => {
@@ -843,6 +967,16 @@ test('QA triggers once per head, sends each changes verdict directly, then stops
   assert.equal(f.calls().length, 1);
   assert.equal(f.calls()[0][0], '-x');
   assert.ok(f.calls()[0][1].includes(sha));
+  const path = '/home/agent/work/factory-qa-90-aaaaaaaaaaaa';
+  assert.equal(f.calls()[0][f.calls()[0].indexOf('--runner-dir') + 1], path);
+  assert.ok(f.calls()[0][1].includes(`Set QA_BASE=${path}`));
+  assert.doesNotMatch(f.calls()[0][1], /Clone https|temporary clone|worktree add|--project/);
+  assert.deepEqual(f.worktrees().gpu, [{ path, locked: `factory-qa:${now}` }]);
+  const events = f.events();
+  const added = events.findIndex(e => e[0] === 'git' && e[5] === 'add');
+  assert.ok(events.findIndex(e => e[0] === 'comment' && e[1].includes('factory-qa:start')) < added);
+  assert.ok(added < events.findIndex(e => e[0] === 'amp'));
+  assert.deepEqual(events[added], ['git', 'gpu', '-C', '/home/agent/work/factory', 'worktree', 'add', '--detach', '--lock', '--reason', `factory-qa:${now}`, path, 'origin/main']);
   assert.doesNotMatch(f.calls()[0][1], /GH_TOKEN|auth setup-git/);
   assert.ok(f.calls()[0][1].includes('GitHub auth is preconfigured for agent'));
   for (const text of ['Never edit code', 'Isolation, Build and Done means', 'PLAYBOOK.md §5', 'update_diff', 'GitHub PR comment', 'Do not merge now', 'your own actual Amp thread ID']) assert.ok(f.calls()[0][1].includes(text), text);
@@ -853,6 +987,7 @@ test('QA triggers once per head, sends each changes verdict directly, then stops
   assert.equal(f.calls().length, 2);
   assert.deepEqual(f.calls()[1].slice(0, 4), ['threads', 'continue', threadId, '-ox']);
   assert.ok(f.calls()[1][4].endsWith('Fix widgets/widget.rs boundary handling; run widget tests.'));
+  assert.deepEqual(f.worktrees().gpu, []);
   f.setGitHub({ 90: githubPR({ headRefOid: nextSha }) });
   const push = await f.run();
   assert.equal(push.code, 0, push.stdout);
@@ -867,6 +1002,54 @@ test('QA triggers once per head, sends each changes verdict directly, then stops
   assert.equal(f.calls().length, 4);
   assert.equal(i.comments.filter((c: any) => c.body.includes('factory-qa:round ')).length, 2);
   t.diagnostic(`QA fake polls: initial=${initial.durationMs.toFixed(1)} ms; changes=${changes.durationMs.toFixed(1)} ms; push=${push.durationMs.toFixed(1)} ms`);
+});
+
+test('QA refuses an existing worktree and reports preparation failure without retrying', { timeout: 10_000 }, async t => {
+  for (const failure of ['FAKE_EXISTING_DIR', 'FAKE_FETCH_FAIL', 'FAKE_ADD_FAIL']) {
+    const i = reviewable();
+    const f = await fixture(t, [i], { github: { 90: githubPR() } });
+    const result = await f.run(['poll'], { [failure]: '1' });
+    assert.equal(result.code, 0, result.stdout);
+    assert.match(i.comments.at(-1).body, /Worktree .*QA start claim retained; automatic retry is disabled/);
+    await f.run();
+    assert.equal(f.calls().length, 0);
+    assert.deepEqual(f.worktrees(), { gpu: [], console: [] });
+  }
+});
+
+test('QA removes completed and human-handoff worktrees, but retains pending and interrupted reviews', { timeout: 10_000 }, async t => {
+  for (const end of ['merged', 'human', 'pending', 'interrupted']) {
+    const i = reviewed();
+    if (end === 'merged') i.attachments[0].metadata.status = 'merged';
+    if (end === 'pending') i.comments.pop();
+    if (end === 'interrupted') i.comments.splice(3);
+    const tree = { path: '/home/agent/work/factory-qa-90-aaaaaaaaaaaa', locked: `factory-qa:${now - 25 * 60 * 60_000}` };
+    const f = await fixture(t, [i], { worktrees: { gpu: [tree], console: [] }, github: { 90: githubPR({ files: [{ filename: 'scripts/dispatch/qa.ts' }] }) } });
+    assert.equal((await f.run()).code, 0);
+    assert.equal(f.worktrees().gpu.length, ['merged', 'human'].includes(end) ? 0 : 1, end);
+  }
+});
+
+test('QA stale cleanup requires ownership and more than 24 hours, preserves dirty files, and bounds failed attempts', { timeout: 10_000 }, async t => {
+  const tree = (n: number, age: number, extra = {}) => ({ path: `/home/agent/work/factory-qa-${n}-aaaaaaaaaaaa`, locked: `factory-qa:${now - age}`, ...extra });
+  const day = 24 * 60 * 60_000;
+  const protectedTrees = [tree(1, day), tree(2, day - 1), tree(3, day + 1, { locked: 'operator-owned' }), tree(4, day + 1, { locked: undefined })];
+  const expired = Array.from({ length: 7 }, (_, n) => tree(10 + n, day + 1));
+  const f = await fixture(t, [], { worktrees: { gpu: [...protectedTrees, ...expired.slice(0, 3)], console: expired.slice(3) } });
+  assert.equal((await f.run(['poll', '--dry-run'])).code, 0);
+  assert.equal(f.githubCalls().length, 0);
+  assert.equal((await f.run(['poll'], { FAKE_REMOVE_FAIL: '1' })).code, 0);
+  assert.equal(f.githubCalls().filter(a => a[3] === 'worktree' && a[4] === 'remove').length, 5);
+  assert.equal(f.worktrees().gpu.length + f.worktrees().console.length, 11);
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.worktrees().gpu.length + f.worktrees().console.length, 6);
+  assert.equal((await f.run()).code, 0);
+  assert.deepEqual(f.worktrees().gpu, JSON.parse(JSON.stringify(protectedTrees)));
+  assert.deepEqual(f.worktrees().console, []);
+  const dirty = tree(99, day + 1, { dirty: true });
+  const d = await fixture(t, [], { worktrees: { gpu: [dirty], console: [] } });
+  assert.equal((await d.run()).code, 0);
+  assert.deepEqual(d.worktrees().gpu, [dirty]);
 });
 
 test('QA has one slot per runner independent of full builder capacity, and never consumes builder slots', { timeout: 10_000 }, async t => {
@@ -884,6 +1067,26 @@ test('QA has one slot per runner independent of full builder capacity, and never
   pending.push(issue(4), issue(5));
   await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '1' });
   assert.equal(f.calls().filter(a => a[0] === '-x' && !a[1].includes('— QA PR')).length, 2);
+});
+
+test('unreachable console leaves QA unclaimed and retries on a later reachable pass', { timeout: 10_000 }, async t => {
+  const busy = reviewable(1);
+  busy.comments.push(qaMarker(`start pr:90 sha:${sha} runner:gpu`));
+  const pending = reviewable(2);
+  const f = await fixture(t, [busy, pending], { github: { 90: githubPR() } });
+  const failed = await f.run(['poll'], { FAKE_SSH_FAIL: '1' });
+  assert.equal(failed.code, 0, failed.stdout);
+  assert.equal(failed.stdout.match(/"decision":"console-unavailable"/g)?.length, 1);
+  assert.doesNotMatch(failed.stdout, /qa-cleanup-pending/);
+  assert.equal(f.mutations.length, 0);
+  assert.equal(f.calls().length, 0);
+  assert.equal(pending.comments.length, 2);
+  assert.deepEqual(f.events().filter(e => e[0] === 'ssh').map(e => e.at(-1)), ["'true'"]);
+  const recovered = await f.run();
+  assert.equal(recovered.code, 0, recovered.stdout);
+  assert.equal(f.calls().length, 1);
+  assert.equal(f.calls()[0][f.calls()[0].indexOf('--executor') + 1], 'runner:factory-console');
+  assert.ok(pending.comments.some(c => c.body.includes(`factory-qa:start pr:90 sha:${sha} runner:console`)));
 });
 
 test('QA engine mapping uses grouped/flat builder engine labels, with Claude fallback', () => {
