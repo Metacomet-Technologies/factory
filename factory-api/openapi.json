@@ -416,6 +416,9 @@
           "git_sha": {
             "type": "string"
           },
+          "inputs_fingerprint": {
+            "type": "string"
+          },
           "status": {
             "type": "string"
           },
@@ -434,6 +437,7 @@
           "git_sha",
           "git_dirty",
           "built_at_ms",
+          "inputs_fingerprint",
           "uptime_ms"
         ],
         "type": "object"
@@ -687,6 +691,12 @@
             ]
           },
           "git_sha": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "inputs_fingerprint": {
             "type": [
               "string",
               "null"

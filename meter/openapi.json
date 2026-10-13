@@ -84,6 +84,9 @@
           "git_sha": {
             "type": "string"
           },
+          "inputs_fingerprint": {
+            "type": "string"
+          },
           "status": {
             "type": "string"
           },
@@ -96,7 +99,8 @@
           "version",
           "git_sha",
           "git_dirty",
-          "built_at_ms"
+          "built_at_ms",
+          "inputs_fingerprint"
         ],
         "type": "object"
       },

@@ -1,7 +1,7 @@
 //! Bounded snapshot and refresh-trigger boundaries. Never log private file contents.
+use crate::types::{AgentBalance, AgentTool, Agents};
 use crate::{AppState, now_ms};
 use serde::{Deserialize, Serialize};
-use shared::factory_api::{AgentBalance, AgentTool, Agents};
 use std::{os::unix::fs::MetadataExt, path::Path, time::Duration};
 use tokio::io::AsyncReadExt;
 

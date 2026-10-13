@@ -66,16 +66,29 @@ only after the MET-125 API deployment; merge and deployment remain human gates.
 `VERSION` at the repository root controls the kiosk's build-time version.
 `package.json` must match it or the build fails. The fixed footer shows
 `factory v0.2.0 · api <sha> · kiosk <sha> · meter <sha>` even while the page
-scrolls. It distinguishes version/SHA mismatch, any dirty build, and incomplete
+scrolls. It distinguishes version/input mismatch, any dirty build, and incomplete
 identity; legacy meter health without identity displays `meter unknown` rather
 than inventing a version. Native title text includes each component's version,
 dirty state, and UTC build time. Known versions also appear in Fleet.
 
+MET-149 compares each running API/meter `inputs_fingerprint` with the expected
+fingerprint embedded at kiosk build time, not with the other components' SHAs.
+Different SHAs with unchanged inputs are valid; missing fingerprints display
+`inputs unknown` without asserting a mismatch. Rebuild/install all three
+components once to introduce these additive health fields.
+`scripts/build-fingerprint.sh <meter|factory-api|kiosk>` hashes sorted tracked
+file names/content and transitive normal/build workspace path dependencies.
+Rust also includes workspace `Cargo.toml` and the locked normal/build Cargo tree;
+`--target all` and repository-relative paths keep the tree machine-independent.
+Kiosk includes its tracked pnpm lockfile and `factory-api/openapi.json`. All
+fingerprints include `VERSION` and the fingerprint script itself. Unrelated
+lockfile entries do not stale Rust components; their resolved trees do.
+
 Generate types and run the strict check against the updated isolated API using
 `OPENAPI_URL=http://127.0.0.1:18080/openapi.json`, not the still-deployed old schema.
 The source of truth remains the live OpenAPI response. No drift/lint/type gate is
-disabled. Footer tests cover matching builds, independent version/SHA mismatches,
-dirty builds, unknown SHA, and missing health/Fleet data.
+disabled. Footer tests cover matching builds, independent version/input mismatches,
+dirty builds, unknown SHA/fingerprint, and missing health/Fleet data.
 
 Desktop Fleet columns fill available space and pricing notices use two columns
 to reserve footer space at 1728×1117. Phone/tablet retain scrolling cards with

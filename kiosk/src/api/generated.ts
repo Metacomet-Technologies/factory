@@ -271,6 +271,7 @@ export interface components {
       built_at_ms: number;
       git_dirty: boolean;
       git_sha: string;
+      inputs_fingerprint: string;
       status: string;
       /** Format: int64 */
       uptime_ms: number;
@@ -343,6 +344,7 @@ export interface components {
       detail?: string | null;
       git_dirty?: boolean | null;
       git_sha?: string | null;
+      inputs_fingerprint?: string | null;
       kind: components["schemas"]["ServiceKind"];
       /** Format: double */
       latency_ms?: number | null;

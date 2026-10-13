@@ -406,6 +406,10 @@ async fn request_cursor_pages_without_gaps_and_preserves_legacy_behavior() {
         assert!(!health["git_sha"].as_str().unwrap().is_empty());
         assert!(health["git_dirty"].is_boolean());
         assert!(health["built_at_ms"].as_u64().unwrap() > 1_700_000_000_000);
+        assert_eq!(
+            health["inputs_fingerprint"],
+            env!("FACTORY_INPUTS_FINGERPRINT")
+        );
         let schema: Value = client
             .get(format!("{proxy}/meter/openapi.json"))
             .send()

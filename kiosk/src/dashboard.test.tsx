@@ -146,15 +146,21 @@ describe("dashboard contract", () => {
     expect(screen.getByRole("button", { name: "Use dark theme" })).toBeVisible();
     expect(localStorage.getItem("factory-theme")).toBe("light");
   });
-  it("renders matching, mismatched, dirty and unknown build identities", () => {
+  it("compares component inputs, not SHAs, and preserves version, dirty and unknown warnings", () => {
     const build = {
       version: "0.2.0",
       git_sha: "a1b2c3d",
       git_dirty: false,
       built_at_ms: 1_790_000_000_000,
+      inputs_fingerprint: "012345abcdef",
+      expected_inputs: { api: "111111111111", meter: "222222222222" },
     };
-    const health = { ...build, status: "ok", uptime_ms: 123 };
-    const meter = { ...fixtures().fleet.nodes[0]!.services[0]!, ...build };
+    const health = { ...build, inputs_fingerprint: "111111111111", status: "ok", uptime_ms: 123 };
+    const meter = {
+      ...fixtures().fleet.nodes[0]!.services[0]!,
+      ...build,
+      inputs_fingerprint: "222222222222",
+    };
     const { rerender } = render(<VersionFooter api={health} meter={meter} kiosk={build} />);
     const footer = screen.getByRole("contentinfo", { name: "Running versions" });
     expect(footer).toHaveTextContent("factory v0.2.0api a1b2c3dkiosk a1b2c3dmeter a1b2c3d");
@@ -162,7 +168,34 @@ describe("dashboard contract", () => {
     rerender(<VersionFooter api={health} meter={{ ...meter, version: "0.1.0" }} kiosk={build} />);
     expect(within(footer).getByRole("status")).toHaveTextContent("Build mismatch");
     rerender(<VersionFooter api={{ ...health, git_sha: "7654321" }} meter={meter} kiosk={build} />);
+    expect(within(footer).queryByRole("status")).not.toBeInTheDocument();
+    rerender(<VersionFooter api={health} meter={{ ...meter, git_sha: "d07c8bc" }} kiosk={build} />);
+    expect(within(footer).queryByRole("status")).not.toBeInTheDocument();
+    rerender(
+      <VersionFooter
+        api={health}
+        meter={{ ...meter, inputs_fingerprint: "333333333333" }}
+        kiosk={build}
+      />,
+    );
     expect(within(footer).getByRole("status")).toHaveTextContent("Build mismatch");
+    rerender(
+      <VersionFooter
+        api={{ ...health, inputs_fingerprint: "444444444444" }}
+        meter={meter}
+        kiosk={build}
+      />,
+    );
+    expect(within(footer).getByRole("status")).toHaveTextContent("Build mismatch");
+    rerender(
+      <VersionFooter api={health} meter={{ ...meter, inputs_fingerprint: null }} kiosk={build} />,
+    );
+    expect(footer).toHaveTextContent("meter a1b2c3d (inputs unknown)");
+    expect(footer).not.toHaveTextContent("Build mismatch");
+    const { inputs_fingerprint: _fingerprint, ...legacyHealth } = health;
+    rerender(<VersionFooter api={legacyHealth as typeof health} meter={meter} kiosk={build} />);
+    expect(footer).toHaveTextContent("api a1b2c3d (inputs unknown)");
+    expect(footer).not.toHaveTextContent("Build mismatch");
     rerender(<VersionFooter api={health} meter={{ ...meter, git_dirty: true }} kiosk={build} />);
     expect(within(footer).getByRole("status")).toHaveTextContent("Dirty build");
     rerender(<VersionFooter api={health} meter={{ ...meter, git_sha: "unknown" }} kiosk={build} />);

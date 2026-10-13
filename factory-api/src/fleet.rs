@@ -1,8 +1,8 @@
+use crate::types::*;
 use crate::{AppState, now_ms};
 use anyhow::{Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::Value;
-use shared::factory_api::*;
 use std::time::{Duration, Instant};
 use tokio::{net::TcpStream, process::Command};
 
@@ -145,6 +145,7 @@ async fn check(state: &AppState, config: &ServiceConfig) -> Service {
         git_sha: identity["git_sha"].as_str().map(str::to_owned),
         git_dirty: identity["git_dirty"].as_bool(),
         built_at_ms: identity["built_at_ms"].as_u64(),
+        inputs_fingerprint: identity["inputs_fingerprint"].as_str().map(str::to_owned),
     }
 }
 pub async fn collect(state: &AppState) -> Fleet {
@@ -176,6 +177,7 @@ pub async fn collect(state: &AppState) -> Fleet {
                         git_sha: None,
                         git_dirty: None,
                         built_at_ms: None,
+                        inputs_fingerprint: None,
                     },
                 }
             }))

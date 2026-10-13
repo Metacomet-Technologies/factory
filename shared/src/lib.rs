@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-pub mod factory_api;
-
 /// Durations reported by Ollama are nanoseconds. Timestamps are Unix milliseconds.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RequestRecord {
@@ -54,16 +52,18 @@ pub struct Health {
     pub git_sha: String,
     pub git_dirty: bool,
     pub built_at_ms: u64,
+    pub inputs_fingerprint: String,
 }
 
 /// Identity embedded at compilation, shared by the meter and aggregation API.
-pub fn build_info() -> Health {
+pub fn build_info(inputs_fingerprint: &str) -> Health {
     Health {
         status: "ok".into(),
         version: env!("FACTORY_VERSION").into(),
         git_sha: env!("FACTORY_GIT_SHA").into(),
         git_dirty: env!("FACTORY_GIT_DIRTY") == "true",
         built_at_ms: env!("FACTORY_BUILT_AT_MS").parse().unwrap(),
+        inputs_fingerprint: inputs_fingerprint.into(),
     }
 }
 

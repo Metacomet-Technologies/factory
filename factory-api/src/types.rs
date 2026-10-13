@@ -9,6 +9,7 @@ pub struct Health {
     pub git_sha: String,
     pub git_dirty: bool,
     pub built_at_ms: u64,
+    pub inputs_fingerprint: String,
     pub uptime_ms: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -40,6 +41,7 @@ pub struct Service {
     pub git_sha: Option<String>,
     pub git_dirty: Option<bool>,
     pub built_at_ms: Option<u64>,
+    pub inputs_fingerprint: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Node {

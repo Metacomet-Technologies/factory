@@ -38,4 +38,22 @@ fn main() {
     println!("cargo:rustc-env=FACTORY_GIT_SHA={sha}");
     println!("cargo:rustc-env=FACTORY_GIT_DIRTY={dirty}");
     println!("cargo:rustc-env=FACTORY_BUILT_AT_MS={built_at_ms}");
+    let component = env!("CARGO_PKG_NAME");
+    if matches!(component, "meter" | "factory-api") {
+        let output = Command::new("bash")
+            .arg(root.join("scripts/build-fingerprint.sh"))
+            .arg(component)
+            .output()
+            .expect("compute build inputs fingerprint");
+        assert!(
+            output.status.success(),
+            "build fingerprint failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let fingerprint = String::from_utf8(output.stdout).unwrap();
+        println!(
+            "cargo:rustc-env=FACTORY_INPUTS_FINGERPRINT={}",
+            fingerprint.trim()
+        );
+    }
 }
