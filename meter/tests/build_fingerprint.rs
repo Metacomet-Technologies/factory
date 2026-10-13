@@ -49,6 +49,19 @@ fn fingerprints_are_stable_relocatable_and_component_scoped() {
     let baseline = fingerprints(root);
     assert_eq!(baseline, fingerprints(root));
     assert_eq!(baseline, fingerprints(relocated.path()));
+    for (component, expected) in ["meter", "factory-api", "kiosk"].iter().zip(&baseline) {
+        let configured_target = run(
+            root,
+            "env",
+            &[
+                "CARGO_BUILD_TARGET=aarch64-apple-darwin",
+                "bash",
+                "scripts/build-fingerprint.sh",
+                component,
+            ],
+        );
+        assert_eq!(expected, configured_target.trim());
+    }
 
     let meter = root.join("meter/src/lib.rs");
     let original = fs::read(&meter).unwrap();

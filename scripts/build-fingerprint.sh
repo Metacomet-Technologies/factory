@@ -38,8 +38,9 @@ else:
         directories.add(directory)
         pending.extend(d["name"] for d in package["dependencies"]
                        if d.get("path") and d["kind"] != "dev")
-    # Include all target dependencies so Linux/macOS produce the same identity.
-    tree = run("cargo", "tree", "-p", component, "--locked", "-e", "normal,build", "--target", "all")
+    # Target selection and duplicate elision must not depend on the build host.
+    tree = run("cargo", "tree", "-p", component, "--locked", "-e", "normal,build",
+               "--target", "all", "--no-dedupe")
     tree = tree.replace(str(root).encode(), b".")
 
 tracked = run("git", "ls-files", "-z").decode().split("\0")

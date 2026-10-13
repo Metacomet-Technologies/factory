@@ -79,7 +79,8 @@ components once to introduce these additive health fields.
 `scripts/build-fingerprint.sh <meter|factory-api|kiosk>` hashes sorted tracked
 file names/content and transitive normal/build workspace path dependencies.
 Rust also includes workspace `Cargo.toml` and the locked normal/build Cargo tree;
-`--target all` and repository-relative paths keep the tree machine-independent.
+`--target all --no-dedupe` and repository-relative paths keep the tree
+machine-independent, including when Cargo has a configured build target.
 Kiosk includes its tracked pnpm lockfile and `factory-api/openapi.json`. All
 fingerprints include `VERSION` and the fingerprint script itself. Unrelated
 lockfile entries do not stale Rust components; their resolved trees do.
