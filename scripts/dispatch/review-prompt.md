@@ -28,6 +28,10 @@ every changed deploy file, migration and script in full, including deleted and
 renamed files. Check the complete file list against Isolation. Check tests,
 evidence, security, rollback, deviations and every Build/Done-means requirement.
 Compare the builder's Linear diff comment SHA and file list with the PR itself.
+The comment contains only the PR URL, current head SHA and complete changed-file
+list, with deletions and renames called out. A missing or stale evidence comment
+is a changes finding only when its SHA or file list is missing or wrong. Never
+request pasted diffs or file contents; read the actual diff and full files with git.
 Never execute code from the PR during review outside an appropriate sandbox.
 
 Run gh pr checks {{pr}} --repo Metacomet-Technologies/factory. Check the current
