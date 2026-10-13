@@ -367,9 +367,14 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             codex = ("/home/agent/.codex/packages/app-server-daemon/releases/"
                      "0.162.1-x86_64-unknown-linux-musl/bin/codex app-server --listen unix:// "
                      "--analytics-default-enabled --managed-daemon")
+            pid_update = ("/home/agent/.codex/packages/app-server-daemon/releases/"
+                          "0.162.1-x86_64-unknown-linux-musl/bin/codex app-server daemon pid-update-loop")
             expect("would-reboot", updates={"ps": f"341001 1 {codex}\n"})
             expect("would-reboot", updates={"ps": f"341001 1 {codex.replace('0.162.1', '9.9.9')}\n"})
+            expect("would-reboot", updates={"ps": f"341108 1 {pid_update}\n"})
+            expect("would-reboot", updates={"ps": f"341108 1 {pid_update.replace('0.162.1', '9.9.9')}\n"})
             expect("skipped", "agent-busy", updates={"ps": f"341001 1 {codex.split(' app-server')[0]} exec work\n"})
+            expect("skipped", "agent-busy", updates={"ps": f"341108 1 {pid_update.rsplit(' daemon', 1)[0]}\n"})
         expect("skipped", "agent-busy", updates={"ps": f"4909 1 {runner}\n"
                "138429 4909 /home/agent/.amp/bin/amp run /home/agent/work/task.ts\n"})
         expect("skipped", "agent-busy", updates={"ps": f"4909 1 {runner}\n138429 1 {updated_plugin}\n"})
@@ -379,7 +384,7 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             data = expect("would-reboot", updates={"ps": f"4909 1 {runner}\n138429 4909 {updated_plugin}\n",
                           "meter_code": 7, "ups_code": 1})
             assert "curl " not in calls.read_text() and "upsc " not in calls.read_text()
-    print("PASS: both node calendars and argv-independent idle runner; idle Codex daemon versions allow; Codex exec and other Amp work block; console excludes op/meter/UPS")
+    print("PASS: both node calendars and argv-independent idle runner; both idle Codex daemon helpers and versions allow; other Codex and Amp work block; console excludes op/meter/UPS")
 
     # Optional stronger installer check: real scripts in a root user namespace,
     # with a read-only host and every writable destination/command replaced.
