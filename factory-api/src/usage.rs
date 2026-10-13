@@ -62,6 +62,17 @@ fn valid_balance(b: &AgentBalance) -> bool {
         && b.total
             .as_ref()
             .is_none_or(|t| b.amount.parse::<f64>().unwrap() <= t.parse::<f64>().unwrap())
+        && b.label.as_deref().is_none_or(|label| {
+            b.unit == "usd"
+                && b.total.is_none()
+                && label.strip_prefix("workspace ").is_some_and(|slug| {
+                    (1..=63).contains(&slug.len())
+                        && slug.as_bytes()[0].is_ascii_alphanumeric()
+                        && slug
+                            .bytes()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                })
+        })
 }
 fn valid(t: &AgentTool, now: i64) -> bool {
     t.note.is_none()
@@ -71,6 +82,9 @@ fn valid(t: &AgentTool, now: i64) -> bool {
                 r,
                 "unknown, format changed"
                     | "CLI timed out"
+                    | "format changed"
+                    | "timeout"
+                    | "CLI missing"
                     | "CLI failed"
                     | "CLI output too large"
                     | "last good reading older than 45 minutes"
@@ -108,8 +122,17 @@ fn valid(t: &AgentTool, now: i64) -> bool {
                 && w.resets_at_ms.is_none_or(|at| at > 0)
                 && w.window_minutes.is_none_or(|minutes| minutes > 0)
         })
-        && t.balances.len() <= 2
-        && t.balances.iter().all(valid_balance)
+        && t.balances.len() <= if t.tool == "amp" { 8 } else { 2 }
+        && t.balances.iter().filter(|b| b.label.is_none()).count() <= 2
+        && t.balances.iter().enumerate().all(|(i, b)| {
+            valid_balance(b)
+                && b.label.as_ref().is_none_or(|label| {
+                    t.tool == "amp"
+                        && t.balances[..i]
+                            .iter()
+                            .all(|prior| prior.label.as_ref() != Some(label))
+                })
+        })
         && t.balance.as_ref() == t.balances.first()
         && match t.status.as_str() {
             "ok" => {
@@ -279,10 +302,74 @@ mod tests {
             assert_eq!(invalid["tools"][0]["reason"], "usage snapshot invalid");
             assert!(!invalid.to_string().contains("private"));
             let at = now_ms();
-            tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&fixture(at))?).await?;
+            let mut sample = fixture(at);
+            sample["tools"][0]["balances"].as_array_mut().unwrap().push(json!({
+                "amount":"0", "remaining":"0", "total":null, "unit":"usd", "label":"workspace metacomet"
+            }));
+            tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&sample)?).await?;
             let fresh = get().await?;
             assert_eq!(fresh["tools"][0]["status"], "ok");
             assert_eq!(fresh["tools"][0]["balance"]["remaining"], "171.27");
+            assert_eq!(fresh["tools"][0]["balances"], sample["tools"][0]["balances"]);
+            for diagnostic in ["format changed", "timeout", "CLI missing"] {
+                let mut failed = sample.clone();
+                failed["tools"][0]["status"] = json!("unknown");
+                failed["tools"][0]["reason"] = json!(diagnostic);
+                tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&failed)?).await?;
+                let unknown = get().await?;
+                assert_eq!(unknown["tools"][0]["status"], "unknown");
+                assert_eq!(unknown["tools"][0]["reason"], diagnostic);
+                failed["tools"][0]["observed_at_ms"] = json!(at - STALE_MS - 1);
+                tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&failed)?).await?;
+                let stale = get().await?;
+                assert_eq!(stale["tools"][0]["status"], "stale");
+                assert_eq!(stale["tools"][0]["reason"], diagnostic);
+            }
+            for (field, bad) in [
+                ("label", json!("workspace ")),
+                ("label", json!("workspace -bad")),
+                ("label", json!("workspace private@email")),
+                ("label", json!("workspace bad\nlabel")),
+                ("label", json!("workspace méta")),
+                ("label", json!(format!("workspace {}", "a".repeat(64)))),
+                ("label", Value::Null),
+                ("unit", json!("orb_hours")),
+                ("total", json!("200")),
+            ] {
+                let mut bad_sample = sample.clone();
+                bad_sample["tools"][0]["balances"][2][field] = bad;
+                tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&bad_sample)?).await?;
+                let invalid = get().await?;
+                assert_eq!(invalid["tools"][0]["reason"], "usage snapshot invalid");
+                assert!(!invalid.to_string().contains("private"));
+            }
+            let mut bounded = sample.clone();
+            for i in 0..5 {
+                bounded["tools"][0]["balances"].as_array_mut().unwrap().push(json!({
+                    "amount":"12.34", "remaining":"12.34", "total":null, "unit":"usd",
+                    "label":format!("workspace {}{i}", "a".repeat(62))
+                }));
+            }
+            tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&bounded)?).await?;
+            assert_eq!(get().await?["tools"][0]["balances"], bounded["tools"][0]["balances"]);
+            for extra in [sample["tools"][0]["balances"][2].clone(), json!({
+                "amount":"1", "remaining":"1", "total":null, "unit":"usd", "label":"workspace overflow"
+            })] {
+                let mut overflow = bounded.clone();
+                overflow["tools"][0]["balances"].as_array_mut().unwrap().push(extra);
+                tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&overflow)?).await?;
+                assert_eq!(get().await?["tools"][0]["reason"], "usage snapshot invalid");
+            }
+            let mut duplicate = sample.clone();
+            duplicate["tools"][0]["balances"].as_array_mut().unwrap().push(sample["tools"][0]["balances"][2].clone());
+            tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&duplicate)?).await?;
+            assert_eq!(get().await?["tools"][0]["reason"], "usage snapshot invalid");
+            let mut wrong_tool = sample.clone();
+            wrong_tool["tools"][2]["balances"] = json!([sample["tools"][0]["balances"][2].clone()]);
+            wrong_tool["tools"][2]["balance"] = sample["tools"][0]["balances"][2].clone();
+            tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&wrong_tool)?).await?;
+            assert_eq!(get().await?["tools"][0]["reason"], "usage snapshot invalid");
+            tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&sample)?).await?;
             let mut stream = client
                 .get(format!("http://{address}/v1/stream"))
                 .send()
@@ -308,17 +395,23 @@ mod tests {
             let initial = event(&mut stream).await?;
             assert_eq!(initial["type"], "agents.usage");
             assert_eq!(initial["data"]["tools"][0]["status"], "ok");
+            assert_eq!(initial["data"]["tools"][0]["balances"], sample["tools"][0]["balances"]);
             let old = at - STALE_MS - 1;
             let next = state.usage_snapshot.with_extension("tmp");
-            tokio::fs::write(&next, serde_json::to_vec(&fixture(old))?).await?;
+            sample["tools"][0]["status"] = json!("unknown");
+            sample["tools"][0]["reason"] = json!("format changed");
+            sample["tools"][0]["observed_at_ms"] = json!(old);
+            tokio::fs::write(&next, serde_json::to_vec(&sample)?).await?;
             tokio::fs::rename(next, &state.usage_snapshot).await?;
             let stale = get().await?;
             assert_eq!(stale["tools"][0]["status"], "stale");
+            assert_eq!(stale["tools"][0]["reason"], "format changed");
             assert_eq!(stale["tools"][0]["observed_at_ms"], old);
             let changed = event(&mut stream).await?;
             assert_eq!(changed["type"], "agents.usage");
             assert!(changed["ts_ms"].as_i64().unwrap() >= at);
             assert_eq!(changed["data"]["tools"][0]["status"], "stale");
+            assert_eq!(changed["data"]["tools"][0]["reason"], "format changed");
             state.shutdown.cancel();
             watcher.await?;
             server.abort();

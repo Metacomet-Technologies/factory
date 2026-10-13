@@ -448,8 +448,20 @@ describe("frontier capacity", () => {
       // Unknown must suppress even supplied old values, not merely rely on empty fixtures.
       if (status === "unknown")
         data.tools[0] = { ...agentFixtures().tools[0]!, status, reason: "format changed" };
+      if (status === "stale") data.tools[0]!.reason = "format changed";
+      data.tools[0]!.cli_version = "0.0.1791864325-g52e626";
+      data.tools[2]!.cli_version = null;
+      if (status !== "not_tracked") data.tools[2]!.reason = "timeout";
       render(<AgentsSection resource={{ data, error: null, loading: false }} icon={null} />);
       expect(screen.getByText("not tracked: Cursor, Kimi")).toBeInTheDocument();
+      if (status !== "not_tracked") {
+        expect(screen.getByText("format changed (amp 0.0.1791864325-g52e626)")).toHaveClass(
+          "status-warn",
+        );
+        expect(
+          within(screen.getByRole("listitem", { name: "ChatGPT" })).getByText("timeout"),
+        ).toHaveClass("status-warn");
+      }
       if (status === "stale") {
         expect(screen.getAllByText("stale · observed 51 min ago")).toHaveLength(3);
         expect(screen.getByText(/\$171.27 of \$200/)).toBeInTheDocument();
@@ -460,7 +472,6 @@ describe("frontier capacity", () => {
         expect(screen.getAllByText(status === "unknown" ? "unknown" : "not tracked")).toHaveLength(
           3,
         );
-        if (status === "unknown") expect(screen.getByText("format changed")).toBeInTheDocument();
       }
     },
   );
@@ -481,13 +492,13 @@ describe("frontier capacity", () => {
         }),
       ),
     );
-    expect(await screen.findAllByText("usage source unavailable")).toHaveLength(3);
+    expect(await screen.findAllByText(/usage source unavailable/)).toHaveLength(3);
     expect(screen.getByText("$3.41")).toBeInTheDocument();
     api();
     act(() => MockSource.latest.onerror?.());
     act(() => MockSource.latest.onopen?.());
     await screen.findByText("62,500 Codex credits");
-    expect(screen.queryByText("usage source unavailable")).not.toBeInTheDocument();
+    expect(screen.queryByText(/usage source unavailable/)).not.toBeInTheDocument();
   });
   it("isolates agents HTTP errors and recovers on the next usage event", async () => {
     api(false, "/v1/agents");

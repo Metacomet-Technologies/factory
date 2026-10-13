@@ -499,6 +499,12 @@ export function AgentsSection({ resource, icon }: { resource: Resource<Agents>; 
                           : "unknown"}
                     </p>
                   </div>
+                  {status !== "ok" && (
+                    <p className="status-warn agent-status">
+                      {tool?.reason ?? "—"}
+                      {tool?.cli_version ? ` (${id} ${tool.cli_version})` : ""}
+                    </p>
+                  )}
                   {known ? (
                     <div
                       className={status === "stale" ? "agent-values agent-stale" : "agent-values"}
@@ -539,8 +545,6 @@ export function AgentsSection({ resource, icon }: { resource: Resource<Agents>; 
                             : "Balance: —"}
                       </p>
                     </div>
-                  ) : status === "unknown" ? (
-                    <p className="muted">{tool?.reason ?? "—"}</p>
                   ) : null}
                 </li>
               );

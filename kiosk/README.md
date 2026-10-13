@@ -16,6 +16,9 @@ and SSE reconnect, using the same snapshot invalidation pattern as Fleet/pricing
 Amp's USD and orb-hour pools remain separate; Codex credits are never USD.
 Stale values use muted text/bars (not reduced opacity, preserving AA contrast);
 unknown values show the reason without quota numbers. Nulls show `—`.
+Every non-ok row also shows its reason and, when available, CLI version in
+the existing warning color, including stale rows. Observation age remains
+visible separately; an old reading never hides the collection failure.
 Reset labels have exact UTC native titles; a one-second clock keeps relative
 resets and minute ages current between snapshots. Rows are
 keyboard focusable. Cursor/Kimi remain a compact not-tracked line.

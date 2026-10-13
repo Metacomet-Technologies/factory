@@ -168,6 +168,9 @@ pub struct AgentBalance {
     pub unit: String,
     pub remaining: String,
     pub total: Option<String>,
+    /// Optional pool label; workspace USD has no inferred total.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Agents {
