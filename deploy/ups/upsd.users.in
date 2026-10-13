@@ -1,0 +1,3 @@
+[upsmon]
+    password = @PASSWORD@
+    upsmon primary
