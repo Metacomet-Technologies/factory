@@ -1,9 +1,13 @@
 import { createServer } from "node:http";
-import { fixtures } from "./fixtures.ts";
+import { agentFixtures, fixtures } from "./fixtures.ts";
 import type { GpuRange, UsageRange, StreamEvent } from "../src/api/types.ts";
 
 const port = Number(process.env.MOCK_PORT ?? 4179);
 const outage = process.env.MOCK_OUTAGE === "1";
+const agentStatus = process.env.MOCK_AGENTS_STATUS ?? (outage ? "unknown" : "ok");
+if (!["ok", "stale", "unknown", "not_tracked"].includes(agentStatus))
+  throw new Error("Invalid MOCK_AGENTS_STATUS");
+const agents = () => agentFixtures(agentStatus as Parameters<typeof agentFixtures>[0]);
 createServer((request, response) => {
   const url = new URL(request.url ?? "/", "http://localhost");
   response.setHeader("Access-Control-Allow-Origin", "*");
@@ -43,10 +47,15 @@ createServer((request, response) => {
           },
         });
     }, 5000);
+    const usage = setInterval(
+      () => send({ type: "agents.usage", ts_ms: Date.now(), data: agents() }),
+      15000,
+    );
     const keepalive = setInterval(() => response.write(": keepalive\n\n"), 15000);
     response.on("close", () => {
       clearInterval(gpu);
       clearInterval(llm);
+      clearInterval(usage);
       clearInterval(keepalive);
     });
     return;
@@ -66,7 +75,7 @@ createServer((request, response) => {
     "/v1/llm/usage": data.usage,
     "/v1/gpu": data.gpu,
     "/v1/pricing": data.pricing,
-    "/v1/agents": data.agents,
+    "/v1/agents": agents(),
   };
   if (!(url.pathname in routes)) {
     response.writeHead(404).end();

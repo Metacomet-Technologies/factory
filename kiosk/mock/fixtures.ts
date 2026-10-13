@@ -16,6 +16,110 @@ const build = {
   built_at_ms: 1_790_000_000_000,
 };
 
+export function agentFixtures(
+  status: "ok" | "stale" | "unknown" | "not_tracked" = "ok",
+  now = Date.now(),
+): Agents {
+  const tools: Agents["tools"] = [
+    {
+      tool: "amp",
+      status,
+      plan: "Gigawatt",
+      source: "amp-cli",
+      cli_version: "0.0.1791763306-ged595a",
+      observed_at_ms: now - 7 * 60_000,
+      windows: [
+        {
+          name: "agent",
+          used_percent: 14,
+          resets_at_ms: now + 29 * 86_400_000,
+          window_minutes: null,
+        },
+        { name: "orb", used_percent: 0, resets_at_ms: now + 29 * 86_400_000, window_minutes: null },
+      ],
+      balances: [
+        { amount: "171.27", remaining: "171.27", total: "200", unit: "usd" },
+        { amount: "998.1", remaining: "998.1", total: "1000", unit: "orb_hours" },
+      ],
+    },
+    {
+      tool: "claude-code",
+      status,
+      plan: null,
+      source: "claude-usage",
+      cli_version: "2.1.296",
+      observed_at_ms: now - 4 * 60_000,
+      windows: [
+        {
+          name: "five_hour",
+          used_percent: 13,
+          resets_at_ms: now + 95 * 60_000,
+          window_minutes: 300,
+        },
+        {
+          name: "weekly",
+          used_percent: 12,
+          resets_at_ms: now + 3 * 86_400_000,
+          window_minutes: 10080,
+        },
+        {
+          name: "weekly_fable",
+          used_percent: 0,
+          resets_at_ms: now + 3 * 86_400_000,
+          window_minutes: 10080,
+        },
+      ],
+      balances: [],
+      balance: null,
+    },
+    {
+      tool: "codex",
+      status,
+      plan: "pro",
+      source: "codex-app-server",
+      cli_version: "0.162.1",
+      observed_at_ms: now - 2 * 60_000,
+      windows: [
+        {
+          name: "weekly",
+          used_percent: 17,
+          resets_at_ms: now + 6 * 86_400_000,
+          window_minutes: 10080,
+        },
+      ],
+      balances: [
+        {
+          amount: "62500.0000000000",
+          remaining: "62500.0000000000",
+          total: null,
+          unit: "codex_credits",
+        },
+      ],
+    },
+  ];
+  for (const tool of tools) {
+    tool.balance = tool.balances[0] ?? null;
+    if (status === "stale") tool.observed_at_ms = now - 51 * 60_000;
+    if (status === "unknown" || status === "not_tracked") {
+      tool.plan = null;
+      tool.observed_at_ms = null;
+      tool.windows = [];
+      tool.balances = [];
+      tool.balance = null;
+      tool.reason = status === "unknown" ? "usage source unavailable" : null;
+    }
+  }
+  tools.push(
+    ...["cursor", "kimi"].map((tool) => ({
+      tool,
+      status: "not_tracked",
+      windows: [],
+      balances: [],
+    })),
+  );
+  return { tools };
+}
+
 export function fixtures(
   outage = false,
   usageRange: UsageRange = "24h",
@@ -230,18 +334,6 @@ export function fixtures(
     ],
     warnings: outage ? ["Pricing provider unavailable. Reference rates are unknown."] : [],
   };
-  const agents: Agents = {
-    tools: [
-      {
-        tool: "amp",
-        status: "not_tracked",
-        note: "CLI usage will appear when tracking is connected.",
-      },
-      { tool: "cursor", status: "not_tracked", note: null },
-      { tool: "claude-code", status: "not_tracked", note: null },
-      { tool: "codex", status: "not_tracked", note: null },
-      { tool: "kimi", status: "not_tracked", note: null },
-    ],
-  };
+  const agents = agentFixtures(outage ? "unknown" : "ok", now);
   return { health, fleet, usage, gpu, pricing, agents };
 }

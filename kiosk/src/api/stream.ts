@@ -7,12 +7,14 @@ export interface LiveState {
   requests: Extract<StreamEvent, { type: "llm.request" }>[];
   fleetRevision: number;
   pricingRevision: number;
+  agentsRevision: number;
 }
 export const initialLiveState: LiveState = {
   gpu: undefined,
   requests: [],
   fleetRevision: 0,
   pricingRevision: 0,
+  agentsRevision: 0,
 };
 export function streamReducer(state: LiveState, event: StreamEvent): LiveState {
   switch (event.type) {
@@ -24,6 +26,8 @@ export function streamReducer(state: LiveState, event: StreamEvent): LiveState {
       return { ...state, fleetRevision: state.fleetRevision + 1 };
     case "pricing.changed":
       return { ...state, pricingRevision: state.pricingRevision + 1 };
+    case "agents.usage":
+      return { ...state, agentsRevision: state.agentsRevision + 1 };
   }
 }
 
@@ -87,6 +91,10 @@ export function parseEvent(value: unknown): StreamEvent | null {
       )
         return value as StreamEvent;
       break;
+    case "agents.usage":
+      // This event invalidates GET /v1/agents, like Fleet and pricing events.
+      if (Array.isArray(fields.tools)) return value as StreamEvent;
+      break;
   }
   return null;
 }
@@ -116,7 +124,13 @@ export function useStream() {
       }
     };
     source.onmessage = receive;
-    for (const type of ["gpu.sample", "llm.request", "fleet.change", "pricing.changed"])
+    for (const type of [
+      "gpu.sample",
+      "llm.request",
+      "fleet.change",
+      "pricing.changed",
+      "agents.usage",
+    ])
       source.addEventListener(type, receive);
     return () => source.close();
   }, []);

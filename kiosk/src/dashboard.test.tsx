@@ -1,12 +1,12 @@
 import { render, screen, within, fireEvent, waitFor, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
 import App from "./App";
-import { fixtures } from "../mock/fixtures";
+import { agentFixtures, fixtures } from "../mock/fixtures";
 import { streamReducer, initialLiveState, parseEvent } from "./api/stream";
 import type { StreamEvent } from "./api/types";
 import { count, ms, usd, number, seen } from "./lib/format";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
-import { FleetSection } from "./components/sections";
+import { AgentsSection, FleetSection } from "./components/sections";
 import { VersionFooter } from "./components/version-footer";
 
 class MockSource extends EventTarget {
@@ -213,8 +213,8 @@ describe("dashboard contract", () => {
     const tools = within(screen.getByRole("region", { name: "Frontier CLIs" }));
     expect(
       tools.getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent),
-    ).toEqual(["amp", "cursor", "claude-code", "codex", "kimi"]);
-    expect(tools.getAllByText("Not tracked yet")).toHaveLength(5);
+    ).toEqual(["Amp", "Claude Code", "ChatGPT"]);
+    expect(tools.getByText("not tracked: Cursor, Kimi")).toBeInTheDocument();
     const event: StreamEvent = {
       type: "llm.request",
       ts_ms: 1000,
@@ -339,8 +339,9 @@ describe("dashboard contract", () => {
       await vi.advanceTimersByTimeAsync(0);
     });
     expect(screen.getByText("$3.41")).toBeInTheDocument();
-    // Only the usage request needs new data. Keep the other contracts unchanged.
+    // Change usage and agent capacity; the other contracts stay unchanged.
     const data = fixtures();
+    data.agents.tools[0]!.balances[0]!.remaining = "123.45";
     vi.stubGlobal("fetch", (path: string) => {
       const routes: Record<string, unknown> = {
         "/v1/health": data.health,
@@ -367,10 +368,12 @@ describe("dashboard contract", () => {
       await vi.advanceTimersByTimeAsync(59_999);
     });
     expect(screen.getByText("$3.41")).toBeInTheDocument();
+    expect(screen.getByText(/\$171.27 of \$200/)).toBeInTheDocument();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1);
     });
     expect(screen.getByText("$17.89")).toBeInTheDocument();
+    expect(screen.getByText(/\$123.45 of \$200/)).toBeInTheDocument();
   });
   it("renders shadcn Base UI tabs and changes panels with a keyboard-accessible control", async () => {
     render(
@@ -386,6 +389,123 @@ describe("dashboard contract", () => {
     expect(screen.getByRole("tab", { name: "First" })).toHaveAttribute("aria-selected", "true");
     fireEvent.click(screen.getByRole("tab", { name: "Second" }));
     await waitFor(() => expect(screen.getByRole("tabpanel")).toHaveTextContent("Second panel"));
+  });
+});
+describe("frontier capacity", () => {
+  it("shows independent balances, every window, UTC resets and observation age", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-13T00:00:00Z"));
+    const data = agentFixtures();
+    render(<AgentsSection resource={{ data, error: null, loading: false }} icon={null} />);
+    expect(screen.getByText("$171.27 of $200 · 998.1 of 1,000 orb hours")).toBeInTheDocument();
+    expect(screen.getByText("62,500 Codex credits")).toBeInTheDocument();
+    expect(screen.queryByText(/\$62,500/)).not.toBeInTheDocument();
+    expect(screen.getByText("Plan: Gigawatt")).toBeInTheDocument();
+    expect(screen.getByText("Plan: —")).toBeInTheDocument();
+    expect(screen.getByText("Balance: —")).toBeInTheDocument();
+    expect(screen.getByText("observed 7 min ago")).toBeInTheDocument();
+    expect(screen.getAllByRole("progressbar").map((bar) => bar.getAttribute("value"))).toEqual([
+      "14",
+      "0",
+      "13",
+      "12",
+      "0",
+      "17",
+    ]);
+    expect(screen.getByText("resets in 1.6 h")).toHaveAttribute(
+      "title",
+      "2026-10-13T01:35:00.000Z",
+    );
+    expect(screen.getByRole("listitem", { name: "Amp" })).toHaveAttribute("tabindex", "0");
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(screen.getByText("observed 8 min ago")).toBeInTheDocument();
+  });
+  it("renders null and omitted fields as unknown without inventing zero", () => {
+    const data = agentFixtures();
+    const amp = data.tools[0]!;
+    amp.plan = null;
+    amp.observed_at_ms = null;
+    amp.windows[0]!.resets_at_ms = null;
+    delete amp.windows[1]!.resets_at_ms;
+    amp.balances = [];
+    amp.balance = null;
+    data.tools[2]!.balances = [];
+    // Exercise the primary balance fallback independently of additive balances[].
+    render(<AgentsSection resource={{ data, error: null, loading: false }} icon={null} />);
+    const row = within(screen.getByRole("listitem", { name: "Amp" }));
+    expect(row.getByText("Plan: —")).toBeInTheDocument();
+    expect(row.getByText("observed —")).toBeInTheDocument();
+    expect(row.getAllByText("resets in —")).toHaveLength(2);
+    expect(row.getByText("Balance: —")).toBeInTheDocument();
+    expect(screen.getByText("62,500 Codex credits")).toBeInTheDocument();
+  });
+  it.each(["stale", "unknown", "not_tracked"] as const)(
+    "renders %s without implying live capacity",
+    (status) => {
+      const data = agentFixtures(status);
+      // Unknown must suppress even supplied old values, not merely rely on empty fixtures.
+      if (status === "unknown")
+        data.tools[0] = { ...agentFixtures().tools[0]!, status, reason: "format changed" };
+      render(<AgentsSection resource={{ data, error: null, loading: false }} icon={null} />);
+      expect(screen.getByText("not tracked: Cursor, Kimi")).toBeInTheDocument();
+      if (status === "stale") {
+        expect(screen.getAllByText("stale · observed 51 min ago")).toHaveLength(3);
+        expect(screen.getByText(/\$171.27 of \$200/)).toBeInTheDocument();
+        expect(screen.getAllByRole("progressbar")).toHaveLength(6);
+      } else {
+        expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+        expect(screen.queryByText(/\$171.27/)).not.toBeInTheDocument();
+        expect(screen.getAllByText(status === "unknown" ? "unknown" : "not tracked")).toHaveLength(
+          3,
+        );
+        if (status === "unknown") expect(screen.getByText("format changed")).toBeInTheDocument();
+      }
+    },
+  );
+  it("updates on agents.usage and recovers missed snapshots on reconnect", async () => {
+    api();
+    render(<App />);
+    await screen.findByText("62,500 Codex credits");
+    act(() => MockSource.latest.onopen?.());
+    api(true);
+    await act(() =>
+      MockSource.latest.dispatchEvent(
+        new MessageEvent("agents.usage", {
+          data: JSON.stringify({
+            type: "agents.usage",
+            ts_ms: Date.now(),
+            data: agentFixtures("unknown"),
+          }),
+        }),
+      ),
+    );
+    expect(await screen.findAllByText("usage source unavailable")).toHaveLength(3);
+    expect(screen.getByText("$3.41")).toBeInTheDocument();
+    api();
+    act(() => MockSource.latest.onerror?.());
+    act(() => MockSource.latest.onopen?.());
+    await screen.findByText("62,500 Codex credits");
+    expect(screen.queryByText("usage source unavailable")).not.toBeInTheDocument();
+  });
+  it("isolates agents HTTP errors and recovers on the next usage event", async () => {
+    api(false, "/v1/agents");
+    render(<App />);
+    await screen.findByText("$3.41");
+    const card = within(screen.getByRole("region", { name: "Frontier CLIs" }));
+    expect(card.getByRole("alert")).toHaveTextContent("HTTP 503");
+    expect(screen.getByRole("region", { name: "Fleet" })).toHaveTextContent("factory-gpu");
+    api();
+    await act(() =>
+      MockSource.latest.dispatchEvent(
+        new MessageEvent("agents.usage", {
+          data: JSON.stringify({ type: "agents.usage", ts_ms: Date.now(), data: agentFixtures() }),
+        }),
+      ),
+    );
+    await screen.findByText("62,500 Codex credits");
+    expect(card.queryByRole("alert")).not.toBeInTheDocument();
   });
 });
 it("reduces all SSE types, bounds the ticker and rejects malformed frames", () => {

@@ -1,4 +1,4 @@
-import { lazy, Suspense, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useState, type ReactNode } from "react";
 import { AlertTriangle, ArrowUpRight, Radio } from "lucide-react";
 import type { Resource } from "../api/client";
 import type { LiveState } from "../api/stream";
@@ -431,27 +431,135 @@ export function UsageSection({
 function InfoIcon() {
   return <AlertTriangle aria-hidden="true" />;
 }
+function balanceText(balance: Agents["tools"][number]["balances"][number]) {
+  const format = (value: string | null | undefined) => {
+    if (value == null) return "—";
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return "—";
+    return `${balance.unit === "usd" ? "$" : ""}${new Intl.NumberFormat("en-US", {
+      maximumFractionDigits: 2,
+    }).format(amount)}`;
+  };
+  const unit =
+    balance.unit === "usd"
+      ? ""
+      : balance.unit === "orb_hours"
+        ? " orb hours"
+        : balance.unit === "codex_credits"
+          ? " Codex credits"
+          : ` ${balance.unit}`;
+  return `${format(balance.remaining)}${balance.total == null ? "" : ` of ${format(balance.total)}`}${unit}`;
+}
 export function AgentsSection({ resource, icon }: { resource: Resource<Agents>; icon: ReactNode }) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
   return (
-    <Section title="Frontier CLIs" subtitle="Cloud tooling, separate from local usage" icon={icon}>
+    <Section
+      title="Frontier CLIs"
+      subtitle="Account capacity · separate from local usage"
+      icon={icon}
+    >
       <ResourceState
         resource={resource}
         empty={resource.data?.tools.length === 0 ? "No frontier tools configured." : undefined}
       />
       <ul className="agent-list">
-        {resource.data?.tools.map((tool) => (
-          <li key={tool.tool}>
-            <div className="row">
-              <h3>{tool.tool}</h3>
-              <div className="row">
-                {tool.note == null && <span className="muted">—</span>}
-                <Badge variant="secondary">Not tracked yet</Badge>
-              </div>
-            </div>
-            {tool.note != null && <p className="muted">{tool.note}</p>}
-          </li>
-        ))}
+        {resource.data?.tools.length
+          ? [
+              ["amp", "Amp"],
+              ["claude-code", "Claude Code"],
+              ["codex", "ChatGPT"],
+            ].map(([id, label]) => {
+              const tool = resource.data?.tools.find((tool) => tool.tool === id);
+              const status = tool?.status ?? "unknown";
+              const known = status === "ok" || status === "stale";
+              const observed =
+                tool?.observed_at_ms == null
+                  ? "observed —"
+                  : `observed ${Math.max(0, Math.floor((now - tool.observed_at_ms) / 60_000))} min ago`;
+              return (
+                <li key={id} tabIndex={0} aria-label={label}>
+                  <div className="row agent-heading">
+                    <h3
+                      title={
+                        [tool?.source, tool?.cli_version].filter(Boolean).join(" · ") || undefined
+                      }
+                    >
+                      {label}
+                    </h3>
+                    <span className="muted">Plan: {known ? (tool?.plan ?? "—") : "—"}</span>
+                    <p className={status === "ok" ? "muted" : "status-warn agent-status"}>
+                      {known
+                        ? `${status === "stale" ? "stale · " : ""}${observed}`
+                        : status === "not_tracked"
+                          ? "not tracked"
+                          : "unknown"}
+                    </p>
+                  </div>
+                  {known ? (
+                    <div
+                      className={status === "stale" ? "agent-values agent-stale" : "agent-values"}
+                    >
+                      {tool?.windows.length ? (
+                        tool.windows.map((window) => (
+                          <div className="agent-window" key={window.name}>
+                            <span>{window.name.replaceAll("_", " ")}</span>
+                            <progress
+                              aria-label={`${label} ${window.name} used`}
+                              max={100}
+                              value={window.used_percent}
+                            />
+                            <span>{number(window.used_percent)}% used</span>
+                            <span
+                              className="muted"
+                              title={
+                                window.resets_at_ms == null
+                                  ? undefined
+                                  : new Date(window.resets_at_ms).toISOString()
+                              }
+                            >
+                              resets in{" "}
+                              {window.resets_at_ms == null
+                                ? "—"
+                                : ms(Math.max(0, window.resets_at_ms - now))}
+                            </span>
+                          </div>
+                        ))
+                      ) : (
+                        <p className="muted">Windows: —</p>
+                      )}
+                      <p className="agent-balances">
+                        {tool?.balances.length
+                          ? tool.balances.map(balanceText).join(" · ")
+                          : tool?.balance
+                            ? balanceText(tool.balance)
+                            : "Balance: —"}
+                      </p>
+                    </div>
+                  ) : status === "unknown" ? (
+                    <p className="muted">{tool?.reason ?? "—"}</p>
+                  ) : null}
+                </li>
+              );
+            })
+          : null}
       </ul>
+      {resource.data?.tools.some(
+        (tool) => tool.status === "not_tracked" && ["cursor", "kimi"].includes(tool.tool),
+      ) && (
+        <p className="muted agent-untracked">
+          not tracked:{" "}
+          {resource.data.tools
+            .filter(
+              (tool) => tool.status === "not_tracked" && ["cursor", "kimi"].includes(tool.tool),
+            )
+            .map((tool) => (tool.tool === "cursor" ? "Cursor" : "Kimi"))
+            .join(", ")}
+        </p>
+      )}
     </Section>
   );
 }

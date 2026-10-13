@@ -368,6 +368,64 @@
 .agent-list p {
   margin-top: 6px;
 }
+.agent-heading > p {
+  flex-basis: 100%;
+}
+.agent-list .agent-status {
+  font-size: 12px;
+  line-height: 1.6;
+}
+.agent-values {
+  --agent-fill: var(--foreground);
+  margin-top: 6px;
+  font-size: 12px;
+}
+.agent-stale {
+  --agent-fill: var(--muted-foreground);
+  color: var(--muted-foreground);
+}
+.agent-window {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 8px;
+  margin-top: 6px;
+}
+.agent-window > progress {
+  grid-row: 2;
+  width: 100%;
+  height: 6px;
+  border: 0;
+  border-radius: 4px;
+  overflow: hidden;
+  appearance: none;
+  background: var(--muted);
+  accent-color: var(--agent-fill);
+}
+.agent-window > progress::-webkit-progress-bar {
+  background: var(--muted);
+}
+.agent-window > progress::-webkit-progress-value {
+  background: var(--agent-fill);
+}
+.agent-window > progress::-moz-progress-bar {
+  background: var(--agent-fill);
+}
+.agent-window > span:nth-child(3) {
+  grid-column: 2;
+  grid-row: 1;
+}
+.agent-window > span:last-child {
+  grid-column: 2;
+  grid-row: 2;
+}
+.agent-balances,
+.agent-untracked {
+  overflow-wrap: anywhere;
+}
+.agent-untracked {
+  margin-top: 12px;
+}
 .ticker p {
   font-size: 12px;
   margin-top: 5px;
@@ -472,7 +530,7 @@
   }
   .dashboard {
     padding-top: 8px;
-    padding-bottom: 60px;
+    padding-bottom: 56px;
   }
   .intro {
     margin-bottom: 4px;
@@ -543,10 +601,35 @@
     padding-block: 4px;
   }
   .agent-list li {
-    padding-block: 6px;
+    padding-block: 4px;
+  }
+  .agent-list .agent-heading > p {
+    flex-basis: auto;
+    margin-top: 0;
+  }
+  .agent-list p,
+  .agent-values,
+  .agent-window {
+    margin-top: 2px;
+  }
+  .agent-window {
+    grid-template-columns: 80px minmax(20px, 1fr) 58px 100px;
+    gap: 8px;
+  }
+  .agent-window > progress,
+  .agent-window > span:nth-child(3),
+  .agent-window > span:last-child {
+    grid-column: auto;
+    grid-row: auto;
+  }
+  .agent-window > span:last-child {
+    text-align: right;
+  }
+  .agent-untracked {
+    margin-top: 8px;
   }
   [role="log"] {
-    max-height: 210px;
+    max-height: 140px;
     overflow-y: auto;
     scrollbar-gutter: stable;
   }

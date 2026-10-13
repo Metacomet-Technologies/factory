@@ -43,7 +43,7 @@ export default function App() {
   );
   const gpu = useApi("/v1/gpu", `?range=${gpuRange}`, live.snapshotRevision);
   const pricing = useApi("/v1/pricing", "", live.pricingRevision + live.snapshotRevision);
-  const agents = useApi("/v1/agents");
+  const agents = useApi("/v1/agents", "", live.agentsRevision + live.snapshotRevision);
   useBuildUpdate(live.snapshotRevision, usage.loading || gpu.loading);
   return (
     <TooltipProvider>
