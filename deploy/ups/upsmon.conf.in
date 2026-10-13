@@ -1,0 +1,5 @@
+MONITOR cyberpower@localhost 1 upsmon @PASSWORD@ primary
+MINSUPPLIES 1
+SHUTDOWNCMD "/sbin/shutdown -h +0"
+POWERDOWNFLAG /etc/killpower
+FINALDELAY 5

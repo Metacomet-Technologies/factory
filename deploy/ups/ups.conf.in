@@ -1,0 +1,8 @@
+[cyberpower]
+    driver = usbhid-ups
+    port = auto
+    vendorid = 0764
+    productid = 0601
+    ignorelb
+    override.battery.charge.low = 30
+    override.battery.runtime.low = 300
