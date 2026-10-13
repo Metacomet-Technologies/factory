@@ -21,6 +21,7 @@ export type StreamEvent = Omit<components["schemas"]["StreamEvent"], "type" | "d
     | { type: "llm.request"; data: LlmRequest }
     | { type: "fleet.change"; data: components["schemas"]["FleetChange"] }
     | { type: "pricing.changed"; data: components["schemas"]["PricingChanged"] }
+    | { type: "agents.usage"; data: Agents }
   );
 export type Endpoints = {
   [

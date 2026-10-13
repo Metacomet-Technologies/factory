@@ -8,6 +8,27 @@ server, configuration, test and script sources are TypeScript. Both TypeScript
 projects enable `strict`, `noUncheckedIndexedAccess` and
 `exactOptionalPropertyTypes`.
 
+## Frontier CLIs (MET-126)
+
+The existing card now shows Amp, Claude Code and ChatGPT account capacity from
+`/v1/agents`. It polls on load/every 60 seconds and refetches on `agents.usage`
+and SSE reconnect, using the same snapshot invalidation pattern as Fleet/pricing.
+Amp's USD and orb-hour pools remain separate; Codex credits are never USD.
+Stale values use muted text/bars (not reduced opacity, preserving AA contrast);
+unknown values show the reason without quota numbers. Nulls show `—`.
+Reset labels have exact UTC native titles; a one-second clock keeps relative
+resets and minute ages current between snapshots. Rows are
+keyboard focusable. Cursor/Kimi remain a compact not-tracked line.
+
+Normal mock fixtures include all six windows. Set `MOCK_AGENTS_STATUS` to
+`ok`, `stale`, `unknown` or `not_tracked` with `vp run mock-dev` to inspect each
+state. Desktop quota rows are inline; the existing ticker viewport is shortened
+from 210px to 140px and bottom padding from 60px to 56px to fit 1728×1117.
+No cards move; phone cards still stack and scroll. No dependencies or deploy
+artifacts are added. Regenerate/check API types with `OPENAPI_URL=file:///.../factory-api/openapi.json`;
+the MET-125 committed types already match. Install with `deploy/install-kiosk.sh`
+only after the MET-125 API deployment; merge and deployment remain human gates.
+
 ## Running versions (MET-107 phase 1)
 
 `VERSION` at the repository root controls the kiosk's build-time version.
