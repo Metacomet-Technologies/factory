@@ -76,14 +76,14 @@ export async function collect(previous: Previous | null, run: Run = command, now
       let reading: Reading;
       if (tool === 'amp') {
         reading = parseAmp(await run('amp', ['usage']));
-        if (details.attempted_at_ms === null || now - details.attempted_at_ms >= 3_600_000) {
-          // Attempts, not successes: a broken format must not cause 15-minute retries.
+        if (details.cli_version !== cli_version || details.attempted_at_ms === null || now - details.attempted_at_ms >= 3_600_000) {
+          // A new CLI needs fresh validation. Every attempt restarts hourly backoff,
+          // including failures, so an update does not add a second hourly allowance.
           details = { attempted_at_ms: now, reason: null, cli_version };
           try { parseAmpDetails(await run('amp', ['usage', '--details'])); }
           catch (error) { details.reason = reason(error); }
         }
         if (details.reason) throw new Error(details.reason);
-        check(details.cli_version === cli_version);
       } else if (tool === 'claude-code') reading = parseClaude(await run('claude', CLAUDE_ARGS));
       else reading = parseCodex(JSON.parse(await run('codex', ['app-server'], 20_000, true)));
       return { tool, source, cli_version, status: 'ok', reason: null, note: null, observed_at_ms: now, ...reading };
@@ -140,9 +140,10 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const mainLock = '/home/agent/work/factory/scripts/usage/collect.lock';
     try { fd = openSync(mainLock, 'r'); } catch { fd = openSync(new URL('./collect.lock', import.meta.url), 'r'); }
     check(spawnSync('flock', ['--exclusive', '--timeout', '60', '3'], { stdio: ['ignore', 'ignore', 'ignore', fd] }).status === 0);
-    const snapshot = await collect(await readPrevious(SNAPSHOT));
+    const path = process.env.FACTORY_USAGE_SNAPSHOT ?? SNAPSHOT;
+    const snapshot = await collect(await readPrevious(path));
     if (args[0] === '--dry-run') console.log(JSON.stringify(snapshot, null, 2));
-    else await writeSnapshot(SNAPSHOT, snapshot);
+    else await writeSnapshot(path, snapshot);
   } catch {
     console.error('Usage collector failed: check runtime, arguments, lock and snapshot permissions.');
     process.exitCode = 1;
