@@ -10,8 +10,8 @@ No resume hook is needed.
 The setup uses Rust 1.99.0 with rustfmt/clippy, matching the observed factory
 runners, and Vite+ 1.1.0. Vite+ selects Node/pnpm from the kiosk's `devEngines`
 and the scripts' `.node-version` files. System packages provide the C compiler,
-Python 3, flock, shellcheck, SQLite CLI, zstd, and rsync. SQLite used by Rust is
-bundled; it does not depend on the host SQLite CLI version.
+Python 3, flock, Bubblewrap, shellcheck, SQLite CLI, zstd, and rsync. SQLite used
+by Rust is bundled; it does not depend on the host SQLite CLI version.
 
 Linux x86_64 and these development tools provide practical parity with the
 Ubuntu factory runners. Their kernels, GPU, real Ollama, Tailscale, systemd
@@ -24,6 +24,10 @@ and production checks require separately approved scope. Do not run production
 collectors, dispatcher commands, deployment scripts, or live verification scripts.
 
 ## Checks
+
+Use a non-interactive login shell (`bash -lc 'command'`) for tool calls that do
+not load profiles. This selects the pinned Rust/Vite+ environment rather than
+the orb's base Node runtime. Amp supervised services already use login shells.
 
 From the repository root:
 
@@ -47,15 +51,15 @@ vp build
 
 Shell checks and installer tests remain available through the commands in
 `.github/workflows/ci.yml`. Running the isolated real meter/API stack is outside
-this setup's scope: `scripts/sandbox` additionally needs Bubblewrap namespaces
-and an orb-supervised lifecycle. It must never fall back to production services.
+this setup's scope: `scripts/sandbox` additionally needs an orb-supervised
+lifecycle. It must never fall back to production services.
 
-The current usage test's final inode inequality can fail on the orb's `/tmp`
-filesystem: it reuses freed inodes over ten atomic replacements. Each adjacent
-replacement changes inode, but the first and final inode can match. Do not hide
-this failure or change the test as part of environment setup. Reboot decision
-checks run offline; their optional Bubblewrap installer checks are skipped when
-namespaces are unavailable.
+The usage test checks atomic replacement through an open reader, not inode
+uniqueness: filesystems may reuse freed inode numbers. Reboot checks run offline;
+their Bubblewrap installer fixtures preserve permissions and use relative source
+paths for portable GNU cp behavior. Require the installer PASS group when
+verifying orb parity; a namespace-related SKIP is not full verification. Never
+relax host security policy to make namespaces work.
 
 ## Mock preview
 
@@ -80,15 +84,30 @@ their matching browser installation; that download is not part of setup.
 
 ## Cost and verification limits
 
-The approved project default is `a1.small` (2 CPUs, 4 GB), with project-scoped
-`CARGO_BUILD_JOBS=2`. Standard pricing is $0.17/hour versus $0.33/hour for medium
-(4 CPUs, 8 GB); slower builds can offset the lower hourly rate. Fetch/install
-caches are reused, and builds/tests remain on demand. Routine setup edits suit
-low agent mode; troubleshooting may need medium. No premium features are needed.
+The approved project default is `a1.medium` (4 CPUs, 8 GB), with project-scoped
+`CARGO_BUILD_JOBS=2`. Standard pricing is $0.33/hour versus $0.17/hour for small
+(2 CPUs, 4 GB). Small passed builds/tests but repeatedly failed Vite+ linting:
+oxc's approximately 4 GiB aligned virtual allocation returned ENOMEM before
+analysis. Medium passed the same check twice without security-policy changes.
+Use medium for reliable full checks; the lower small hourly price does not cover
+this workload. Fetch/install caches are reused, and builds/tests remain on demand.
+Routine setup edits suit low agent mode; troubleshooting may need medium. No
+premium features are needed.
 
-Verify setup twice and check tools from a new non-interactive login shell.
-Verification in an existing medium orb does not prove clean installation or
-small-orb memory capacity. Ask before larger sizes, extra workers, paid services,
-or fresh verification orbs. Local setup files become active for future orbs only
-after they reach the project's base branch; changing the project size alone
-does not publish the setup.
+Clean medium measurement at the initial setup merge: cold setup 26.16 seconds,
+warm setup 0.59 seconds, clippy 37.53 seconds, Rust tests 117.88 seconds, kiosk
+check 3.47 seconds, tests 3.38 seconds, and build 1.15 seconds. Rust reported
+70 passing tests and one explicitly ignored test; kiosk reported 30 passing tests.
+The workload cgroup had a 6 GiB limit and reached that historical peak, with no
+OOM kills. This measures one run, not guaranteed spare capacity or build time.
+
+Follow-up validation of the Bubblewrap dependency and both portability fixes
+reused that medium orb: setup reruns took 0.64/0.70 seconds, Node offline tests
+passed 82/82, all nine reboot groups passed without skips, and kiosk check passed
+in 3.62 seconds. User and network namespace probes passed; OOM counters stayed
+zero. These warm runs do not measure a new cold installation.
+
+Verify setup twice and check tools from a new non-interactive login shell. Ask
+before larger sizes, extra workers, paid services, or fresh verification orbs.
+Local setup files become active for future orbs only after they reach the
+project's base branch; changing the project size alone does not publish setup.
