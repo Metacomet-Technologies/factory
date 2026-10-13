@@ -11,8 +11,12 @@ export const CLAUDE_ARGS = ['-p', '/usage', '--tools', '', '--strict-mcp-config'
 type Details = { attempted_at_ms: number | null; reason: string | null; cli_version: string | null };
 export type Snapshot = { schema_version: 1; generated_at_ms: number; amp_details: Details; tools: Tool[] };
 type Previous = { amp_details: Details; tools: Pick<Tool, 'tool' | 'observed_at_ms'>[] };
-const reasons = [FORMAT_CHANGED, 'CLI timed out', 'CLI failed', 'CLI output too large', 'last good reading older than 45 minutes'];
-function reason(error: unknown): string { return error instanceof Error && reasons.includes(error.message) ? error.message : FORMAT_CHANGED; }
+const reasons = [FORMAT_CHANGED, 'timeout', 'CLI missing', 'unknown, format changed', 'CLI timed out', 'CLI failed', 'CLI output too large', 'last good reading older than 45 minutes'];
+function reason(error: unknown): string {
+  if (!(error instanceof Error) || !reasons.includes(error.message)) return FORMAT_CHANGED;
+  if (error.message === 'unknown, format changed') return FORMAT_CHANGED;
+  return error.message === 'CLI timed out' ? 'timeout' : error.message;
+}
 
 // Never expose raw stdout/stderr or exception text. One process group per probe
 // ensures timeout cleanup cannot signal a runner or an unrelated CLI process.
@@ -27,9 +31,9 @@ export function command(program: string, args: string[], timeoutMs = 20_000, rpc
       if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* Already exited. */ } }
       if (error) reject(new Error(error)); else resolve(value);
     };
-    const timer = setTimeout(() => finish('CLI timed out'), timeoutMs);
+    const timer = setTimeout(() => finish('timeout'), timeoutMs);
     const send = (value: object) => child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', ...value })}\n`);
-    child.on('error', () => finish('CLI failed'));
+    child.on('error', error => finish((error as NodeJS.ErrnoException).code === 'ENOENT' ? 'CLI missing' : 'CLI failed'));
     child.stdin.on('error', () => finish('CLI failed'));
     child.on('close', code => finish(code === 0 && !rpc ? undefined : 'CLI failed'));
     child.stdout.setEncoding('utf8');

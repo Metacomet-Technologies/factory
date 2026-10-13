@@ -6,6 +6,11 @@ export const amp = `Signed in as redacted@example.invalid (redacted)
 
 # Run \`amp usage --details\` for more detailed information.
 `;
+// MET-137 capture: quota text unchanged, sign-in identity redacted.
+export const ampNew = `Signed in as redacted@example.invalid (redacted)
+Amp Gigawatt Tier: agent usage $170.30 of $200 remaining (85%), orb usage 997.4h of 1,000h a1.xxlarge orb hours remaining (100%) - period 2026-10-10 to 2026-11-10, resets upon renewal in 27 days
+Workspace metacomet: $0 remaining - https://ampcode.com/workspaces/metacomet
+`;
 export const details = `# Usage
 
 ${amp.split('\n').slice(0, 3).join('\n')}
@@ -35,6 +40,10 @@ Tier agent usage drawn in the selected range, by the model or feature that consu
 | Amp | 40,538,496 | $28.75 |
 | ChatGPT | 259,800,000 | $0 |
 `;
+// New details retain Markdown and add report sections after the summary block.
+export const detailsNew = details.replace(amp.split('\n').slice(0, 3).join('\n'),
+  ampNew.trimEnd().replace('Amp Gigawatt Tier:', '**Amp Gigawatt Tier:**').replace('Workspace metacomet:', '**Workspace metacomet:**'))
+  .replace('\n## Amp Tier: Agent Usage Pool', '\nRange: 2026-10-10T04:03:59.039Z to 2026-10-13T06:33:04.226Z (end exclusive; current tier period so far)\n\n## How to Read Recorded Costs\n\nReport explanations are not quota pools.\n\n## Amp Tier: Agent Usage Pool');
 export const claude = [
   { type: 'assistant', usage_report: { rate_limits: { limits: [
     { kind: 'session', group: 'session', percent: 13, resets_at: '2026-10-12T03:10:00.988448+00:00', scope: null, severity: 'normal', is_active: true },

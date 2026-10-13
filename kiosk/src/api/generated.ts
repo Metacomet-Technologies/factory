@@ -150,6 +150,8 @@ export interface components {
     AgentBalance: {
       /** @description Decimal strings preserve provider precision; amount equals remaining. */
       amount: string;
+      /** @description Optional pool label; workspace USD has no inferred total. */
+      label?: string | null;
       remaining: string;
       total?: string | null;
       unit: string;

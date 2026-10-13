@@ -1,8 +1,8 @@
 export const STALE_MS = 45 * 60_000;
-export const FORMAT_CHANGED = 'unknown, format changed';
+export const FORMAT_CHANGED = 'format changed';
 export type Window = { name: string; used_percent: number; resets_at_ms: number | null; window_minutes: number | null };
 // Decimal strings preserve source precision, including non-USD Codex credits.
-export type Balance = { amount: string; unit: 'usd' | 'orb_hours' | 'codex_credits'; remaining: string; total: string | null };
+export type Balance = { amount: string; unit: 'usd' | 'orb_hours' | 'codex_credits'; remaining: string; total: string | null; label?: string | null };
 export type Reading = { plan: string | null; windows: Window[]; balance: Balance | null; balances: Balance[]; reset_credits_available: number | null };
 export type Tool = Reading & { tool: string; status: 'ok' | 'unknown' | 'stale' | 'not_tracked'; reason: string | null; note: null; observed_at_ms: number | null; source: string | null; cli_version: string | null };
 export const sources = { amp: 'amp-cli', 'claude-code': 'claude-usage', codex: 'codex-app-server' } as const;
@@ -22,7 +22,7 @@ function iso(value: unknown): number | null {
   return result;
 }
 const number = '(?:0|[1-9]\\d{0,2}(?:,\\d{3})*|[1-9]\\d*)(?:\\.\\d+)?';
-const summary = new RegExp(`^\\*\\*Amp (Gigawatt) Tier:\\*\\* agent usage \\$(${number}) of \\$(${number}) remaining \\((\\d{1,3})%\\), orb usage (${number})h of (${number})h (a1\\.xxlarge) orb hours remaining \\((\\d{1,3})%\\) - period (\\d{4}-\\d{2}-\\d{2}) to (\\d{4}-\\d{2}-\\d{2}), resets upon renewal in (\\d+) days$`);
+const summary = new RegExp(`^Amp (Gigawatt) Tier: agent usage \\$(${number}) of \\$(${number}) remaining \\((\\d{1,3})%\\), orb usage (${number})h of (${number})h (?:a1\\.xxlarge )?orb hours remaining \\((\\d{1,3})%\\) - period (\\d{4}-\\d{2}-\\d{2}) to (\\d{4}-\\d{2}-\\d{2}), resets (?:upon renewal )?in (\\d+) days$`);
 function balance(amount: string, unit: Balance['unit'], total: string | null): Balance {
   amount = decimal(amount.replaceAll(',', ''));
   total = total === null ? null : decimal(total.replaceAll(',', ''));
@@ -31,13 +31,29 @@ function balance(amount: string, unit: Balance['unit'], total: string | null): B
 }
 export function parseAmp(text: string): Reading {
   const lines = text.trimEnd().split('\n');
-  check(lines.length === 5 && /^Signed in as [^\r\n]+ \([^\r\n]+\)$/.test(lines[0]) && lines[3] === '' && lines[4] === '# Run `amp usage --details` for more detailed information.');
-  check(new RegExp(`^\\*\\*Individual credits:\\*\\* \\$${number} remaining - https://ampcode.com/settings$`).test(lines[2]));
-  const match = lines[1].match(summary); check(match);
-  const [, plan, remaining, total, remainingPercent, hours, hoursTotal, , hoursPercent, start, end] = match;
+  // Recognize the identity line only to discard it; never return its contents.
+  if (/^Signed in as [^\r\n]+ \([^\r\n]+\)$/.test(lines[0])) lines.shift();
+  if (lines.at(-1) === '# Run `amp usage --details` for more detailed information.') {
+    lines.pop(); check(lines.pop() === '');
+  }
+  const match = lines.shift()?.replace(/^\*\*Amp Gigawatt Tier:\*\*/, 'Amp Gigawatt Tier:').match(summary); check(match);
+  const [, plan, remaining, total, remainingPercent, hours, hoursTotal, hoursPercent, start, end] = match;
   const resets = iso(`${end}T00:00:00Z`);
   check(iso(`${start}T00:00:00Z`)! < resets!);
   const balances = [balance(remaining, 'usd', total), balance(hours, 'orb_hours', hoursTotal)];
+  let individual = false;
+  const workspaces = new Set<string>();
+  for (const line of lines) {
+    if (new RegExp(`^(?:Individual credits:|\\*\\*Individual credits:\\*\\*) \\$${number} remaining - https://ampcode.com/settings$`).test(line)) {
+      check(!individual); individual = true;
+      continue;
+    }
+    const workspace = line.match(new RegExp(`^(?:Workspace ([a-z0-9][a-z0-9-]{0,62}):|\\*\\*Workspace ([a-z0-9][a-z0-9-]{0,62}):\\*\\*) \\$(${number}) remaining - https://ampcode.com/workspaces/([a-z0-9][a-z0-9-]{0,62})$`));
+    check(workspace);
+    const name = workspace[1] ?? workspace[2];
+    check(name === workspace[4] && !workspaces.has(name) && balances.length < 8); workspaces.add(name);
+    balances.push({ ...balance(workspace[3], 'usd', null), label: `workspace ${name}` });
+  }
   return { ...emptyReading(), plan, balances, balance: balances[0], windows: [
     { name: 'agent', used_percent: 100 - percent(Number(remainingPercent)), resets_at_ms: resets, window_minutes: null },
     { name: 'orb', used_percent: 100 - percent(Number(hoursPercent)), resets_at_ms: resets, window_minutes: null },
@@ -48,7 +64,9 @@ export function parseAmp(text: string): Reading {
 export function parseAmpDetails(text: string): void {
   const lines = text.split('\n');
   check(lines[0] === '# Usage' && lines[1] === '');
-  parseAmp(`${lines.slice(2, 5).join('\n')}\n\n# Run \`amp usage --details\` for more detailed information.\n`);
+  const summaryEnd = lines.findIndex((line, i) => i >= 2 && line === '');
+  check(summaryEnd > 2);
+  parseAmp(lines.slice(2, summaryEnd).join('\n'));
   for (const [heading, header, unit] of [
     ['## Amp Tier: Agent Usage Pool', '| Source | Recorded cost |', '\\$'],
     ['## Amp Tier: Orb Usage Pool', '| Source | a1.xxlarge orb hours |', ''],

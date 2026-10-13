@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { collect, command, readPrevious, writeSnapshot, CLAUDE_ARGS } from './collect.ts';
 import { age, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, STALE_MS } from './parsers.ts';
-import { amp, details, claude, codex, fixtureRun } from './fixtures.ts';
+import { amp, ampNew, details, detailsNew, claude, codex, fixtureRun } from './fixtures.ts';
 const now = 1791800000000;
 
 test('verified projections preserve units, percentages, scope and UTC milliseconds', async () => {
@@ -26,6 +26,47 @@ test('verified projections preserve units, percentages, scope and UTC millisecon
   assert.deepEqual(x.windows, [{ name: 'weekly', used_percent: 17, resets_at_ms: 1792299781000, window_minutes: 10080 }]);
   assert.equal(x.balance?.unit, 'codex_credits'); assert.equal(x.balance?.amount, '62500'); assert.equal(x.reset_credits_available, 3);
   assert.doesNotMatch(JSON.stringify(snapshot), /redacted@|private-|tokens|prompt|accountId/);
+});
+
+test('Amp plain summaries preserve workspace balance without identity or invented total', async () => {
+  const snapshot = await collect(null, async (program, args) => {
+    if (program !== 'amp') return fixtureRun(program, args);
+    if (args[0] === '--version') return '0.0.1791864325-g52e626 (released 2026-10-13T04:05:25.000Z, 2h ago)';
+    return args.includes('--details') ? detailsNew : ampNew;
+  }, now);
+  const a = snapshot.tools[0];
+  assert.equal(a.status, 'ok');
+  assert.equal(a.plan, 'Gigawatt');
+  assert.deepEqual(a.balances, [
+    { amount: '170.30', remaining: '170.30', total: '200', unit: 'usd' },
+    { amount: '997.4', remaining: '997.4', total: '1000', unit: 'orb_hours' },
+    { amount: '0', remaining: '0', total: null, unit: 'usd', label: 'workspace metacomet' },
+  ]);
+  assert.deepEqual(a.balance, a.balances[0]);
+  assert.deepEqual(a.windows.map(w => [w.used_percent, w.resets_at_ms]), [[15, 1794268800000], [0, 1794268800000]]);
+  assert.doesNotMatch(JSON.stringify(snapshot), /redacted|@|Signed in as/);
+  for (const text of [ampNew.replace('a1.xxlarge ', '').replace('upon renewal ', ''), ampNew.split('\n').slice(1).join('\n')]) {
+    assert.deepEqual(parseAmp(text), parseAmp(ampNew));
+  }
+  assert.equal(parseAmp(ampNew.replace('$0 remaining', '$12.34 remaining')).balances[2].amount, '12.34');
+  const bounded = ampNew + Array.from({ length: 5 }, (_, i) => `Workspace test-${i}: $1 remaining - https://ampcode.com/workspaces/test-${i}\n`).join('');
+  assert.equal(parseAmp(bounded).balances.length, 8);
+  for (const text of [
+    `${bounded}Workspace overflow: $1 remaining - https://ampcode.com/workspaces/overflow\n`,
+    `${ampNew}unexpected extra line\n`,
+    ampNew.replace('/workspaces/metacomet', '/workspaces/other'),
+    `${ampNew}${ampNew.split('\n')[2]}\n`,
+    ampNew.replace('a1.xxlarge', 'unknown-size'),
+    ampNew.replace('resets upon renewal', 'resets maybe'),
+  ]) {
+    const failed = await collect(snapshot, async (program, args) => program === 'amp' && args[0] === 'usage' ? text : fixtureRun(program, args), now + STALE_MS + 1);
+    assert.equal(failed.tools[0].status, 'stale');
+    assert.equal(failed.tools[0].reason, FORMAT_CHANGED);
+    assert.deepEqual(failed.tools[0].balances, []);
+    const unknown = await collect(null, async (program, args) => program === 'amp' && args[0] === 'usage' ? text : fixtureRun(program, args), now);
+    assert.equal(unknown.tools[0].status, 'unknown');
+    assert.equal(unknown.tools[0].reason, FORMAT_CHANGED);
+  }
 });
 
 test('new Claude and Codex versions stay ok unless the version or usage format changes', async () => {
@@ -89,9 +130,23 @@ test('Amp details attempts are at most hourly, including failures', async () => 
 });
 
 test('process timeout and output cap return fixed diagnostics', async () => {
-  await assert.rejects(command(process.execPath, ['-e', 'setInterval(()=>{},1000)'], 100), { message: 'CLI timed out' });
+  await assert.rejects(command(process.execPath, ['-e', 'setInterval(()=>{},1000)'], 100), { message: 'timeout' });
+  await assert.rejects(command('/missing-private-cli', []), { message: 'CLI missing' });
   await assert.rejects(command(process.execPath, ['-e', 'console.error("private-secret"); process.exit(1)']), { message: 'CLI failed' });
   await assert.rejects(command(process.execPath, ['-e', 'process.stdout.write("x".repeat(2100000))']), { message: 'CLI output too large' });
+  const good = await collect(null, fixtureRun, now);
+  for (const reason of ['timeout', 'CLI missing']) {
+    const run = async (program, args) => {
+      if (program === 'claude') throw new Error(reason);
+      return fixtureRun(program, args);
+    };
+    const failed = await collect(good, run, now + STALE_MS);
+    assert.equal(failed.tools[2].status, 'unknown');
+    assert.equal(failed.tools[2].reason, reason);
+    const stale = await collect(failed, run, now + STALE_MS + 1);
+    assert.equal(stale.tools[2].status, 'stale');
+    assert.equal(stale.tools[2].reason, reason);
+  }
 });
 
 test('Codex handshake waits for id 1 then id 2, ignores notifications, and keeps stdin open', async () => {

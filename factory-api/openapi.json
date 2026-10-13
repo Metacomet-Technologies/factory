@@ -7,6 +7,13 @@
             "description": "Decimal strings preserve provider precision; amount equals remaining.",
             "type": "string"
           },
+          "label": {
+            "description": "Optional pool label; workspace USD has no inferred total.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "remaining": {
             "type": "string"
           },

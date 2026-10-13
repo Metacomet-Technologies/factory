@@ -19,11 +19,18 @@ output or exception text. The collector kills only its own probe process group.
   and two pool tables have strict label/unit/row patterns. No token, model-cost,
   daily-cost or thread tables are collected: these overlap and contain identities.
   Pool details are validated, not substituted for the net summary balances.
-  Unknown shapes produce `unknown, format changed`. Fixtures use MET-121 values
-  with redacted identity; pool headings were also checked on GPU on 2026-10-13.
+  Unknown shapes produce status `unknown` with reason `format changed`.
+  Fixtures use MET-121 values with redacted identity; pool headings were also
+  checked on GPU on 2026-10-13.
   Supported observed shape: Gigawatt, a1.xxlarge-normalized hours. CLI version is
   recorded; the same shapes worked in `0.0.1791763306-ged595a` and
-  `0.0.1791849701-g1448da`. This is the approved terminal-parsing exception,
+  `0.0.1791849701-g1448da`. Version `0.0.1791864325-g52e626` (2026-10-13)
+  emits a plain summary with workspace balances; details retain Markdown.
+  Both summary styles accept an optional `a1.xxlarge` size label and either
+  `resets in N days` or `resets upon renewal in N days`. Sign-in identities are
+  discarded. Workspace USD balances carry `label: "workspace <name>"` and
+  `total: null`; unknown lines, duplicate pools and mismatched workspace URLs
+  fail closed. This is the approved terminal-parsing exception,
   not a vendor JSON API. A failed hourly check keeps Amp unknown until a successful
   hourly check; a CLI update also requires a successful details check.
 * **Claude:** the exact documented headless `/usage` command.
@@ -40,7 +47,7 @@ output or exception text. The collector kills only its own probe process group.
 
 Claude and Codex version strings are strictly parsed and recorded, not pinned.
 New versions with unchanged output remain supported; output-format changes
-produce `unknown, format changed`.
+produce status `unknown` with reason `format changed`.
 
 Normal scheduled Amp usage is five account requests/hour. No thread lookups or
 automatic retries. All readers share Amp's 60/hour limit. Manual dry-runs count
@@ -65,6 +72,9 @@ snapshot is missing; their added fields are null/empty.
 * A successful sample is `ok`. A failure clears its values, sets `unknown` with
   a fixed reason, and retains only its last-good `observed_at_ms`. More than
   45 minutes after that reading it becomes `stale`, preserving the failure reason.
+  Parse failures report `format changed`, timed-out probes report `timeout`,
+  and missing executables report `CLI missing`. Older scheduling diagnostics
+  remain readable and normalize to the new wording on the next collection.
   A source that has never succeeded remains unknown. No failed reading is live.
 * The API also ages successful samples on every read, so a stopped timer cannot
   leave `ok` forever. Values in these aged successful samples remain explicitly
@@ -74,6 +84,12 @@ snapshot is missing; their added fields are null/empty.
   **decimal strings**, preserving precision without floating-point money storage.
   `balance` aliases the first member of `balances`, not an additional pool.
   `balances` resolves the ticket's singular-balance/two-Amp-pools ambiguity.
+  The additive nullable `label` identifies workspace pools; older snapshots
+  may omit it. Labels are bounded workspace slugs, not sign-in identities.
+  Amp has at most eight balances, including its two unlabeled summary pools;
+  additional balances must be unique workspace USD pools with no total.
+  Workspace slugs are 1–63 lowercase ASCII letters/digits/hyphens and start
+  with a letter or digit. Other tools retain the two-balance limit.
   Never sum USD, orb hours and Codex credits. Codex credits are **not USD**.
 * Windows carry name, used percentage, UTC millisecond reset and nullable
   duration in minutes. Amp uses 100 minus the CLI's rounded remaining percentage;
@@ -132,12 +148,48 @@ Usage rollback removes only collector units and retains usage.json/backups.
 Without API rollback, retained usage ages stale after 45 minutes. API rollback
 restores the previous API binary/unit; no usage DB migration exists.
 
+## MET-137 upgrade and rollback (from Mac)
+
+Devon merges this self-deploying change; the wrap-up pull updates the collector
+in `/home/agent/work/factory`. Do not reinstall its unchanged timer/service.
+Until the API upgrade, the old API rejects the extra workspace balance or new
+diagnostic strings. After the clean main-checkout handoff, install in this order:
+
+```sh
+factory-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && cargo build --release --locked -p factory-api"'
+factory-ssh 'sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api'
+factory-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory/kiosk && vp install --frozen-lockfile && VITE_API_BASE= vp build"'
+factory-ssh 'sudo bash /home/agent/work/factory/deploy/install-kiosk.sh /home/agent/work/factory/kiosk/dist'
+factory-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && node scripts/usage/collect.ts --dry-run"'
+curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/agents | jq '.tools[] | select(.tool == "amp")'
+```
+
+Wait for the next scheduled collection (up to 15 minutes, or the next hourly
+details attempt after a failed check) before verifying the API row is live.
+UI only: inspect Frontier CLIs on the console kiosk after its self-reload.
+No console install, inference, migration or Ollama restart is needed.
+
+For rollback, first merge a reviewed revert PR and complete its wrap-up pull
+to restore the collector; do not reset main or restore the old API while the
+new collector keeps writing unsupported balances. Then restore the exact
+snapshots printed by the installers, in reverse order:
+
+```sh
+factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-kiosk.sh /var/backups/factory-kiosk/<printed-kiosk-snapshot>'
+factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/<printed-api-snapshot>'
+```
+
+The prior collector cannot parse this CLI format, so rollback restores the
+previous stale/unknown behavior rather than making Amp live.
+
 ## Checks
 
 Fixtures reconstruct the documented Claude/Codex envelope around verified values;
 they are not claimed as full original raw captures. Tests cover strict shape
 rejection, independent failures, time/credit units, exact stale boundary, hourly
 backoff, subprocess timeouts, fragmented RPC responses, privacy and atomic writes.
+The MET-137 summary preserves the supplied quota text with only the identity
+redacted; its details fixture reconstructs the observed Markdown/report layout.
 Rust exercises serialized contract, public HTTP snapshot reads and real SSE
 after an atomic replacement. No tests call live vendor services.
 
