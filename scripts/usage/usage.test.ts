@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, chown, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -26,6 +26,26 @@ test('verified projections preserve units, percentages, scope and UTC millisecon
   assert.deepEqual(x.windows, [{ name: 'weekly', used_percent: 17, resets_at_ms: 1792299781000, window_minutes: 10080 }]);
   assert.equal(x.balance?.unit, 'codex_credits'); assert.equal(x.balance?.amount, '62500'); assert.equal(x.reset_credits_available, 3);
   assert.doesNotMatch(JSON.stringify(snapshot), /redacted@|private-|tokens|prompt|accountId/);
+});
+
+test('new Claude and Codex versions stay ok unless the version or usage format changes', async () => {
+  const newer = { claude: '2.1.297 (Claude Code)', codex: 'codex-cli 0.163.0' };
+  for (const change of ['none', 'version', 'usage']) {
+    const snapshot = await collect(null, async (program, args) => {
+      if (!Object.hasOwn(newer, program)) return fixtureRun(program, args);
+      if (args[0] === '--version') return newer[program] + (change === 'version' ? ' unexpected' : '');
+      const output = await fixtureRun(program, args);
+      return change === 'usage' ? output.replaceAll(program === 'claude' ? '"percent"' : '"usedPercent"', '"percentage"') : output;
+    }, now);
+    for (const [index, expectedVersion] of [[2, '2.1.297'], [3, '0.163.0']] as const) {
+      const tool = snapshot.tools[index];
+      assert.equal(tool.status, change === 'none' ? 'ok' : 'unknown');
+      assert.equal(tool.reason, change === 'none' ? null : FORMAT_CHANGED);
+      assert.equal(tool.cli_version, change === 'version' ? null : expectedVersion);
+      assert.equal(tool.windows.length > 0, change === 'none');
+    }
+    assert.equal(snapshot.tools[0].status, 'ok');
+  }
 });
 
 test('format drift and nonzero Claude inference fail closed, with nullable resets retained', () => {
@@ -92,20 +112,34 @@ test('Codex handshake waits for id 1 then id 2, ignores notifications, and keeps
   assert.deepEqual(parseCodex(JSON.parse(result)), parseCodex(codex));
 });
 
-test('atomic replacement preserves complete JSON, 0640 and last-good timestamps; no temp files survive', async () => {
+test('atomic replacement inherits the setgid directory group and preserves owner, 0640 and complete JSON', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'usage-test-'));
   try {
+    // Use a non-primary group when available without requiring root or service accounts in CI.
+    const gid = process.getgroups().find(group => group !== process.getgid()) ?? process.getgid();
+    await chown(dir, -1, gid);
+    await chmod(dir, 0o2750);
+    assert.equal((await stat(dir)).mode & 0o7777, 0o2750);
     const path = join(dir, 'usage.json');
     const snapshot = await collect(null, fixtureRun, now);
     await writeSnapshot(path, snapshot);
+    const checkPermissions = async () => {
+      const file = await stat(path);
+      assert.equal(file.uid, process.getuid());
+      assert.equal(file.gid, gid);
+      assert.equal(file.mode & 0o7777, 0o640);
+    };
+    await checkPermissions();
     const before = (await stat(path)).ino;
     let reading = true;
     const reads = (async () => { while (reading) assert.equal(JSON.parse(await readFile(path, 'utf8')).schema_version, 1); })();
-    for (let i = 0; i < 10; i++) await writeSnapshot(path, { ...snapshot, generated_at_ms: now + i });
-    reading = false; await reads;
+    try {
+      for (let i = 0; i < 10; i++) {
+        await writeSnapshot(path, { ...snapshot, generated_at_ms: now + i });
+        await checkPermissions();
+      }
+    } finally { reading = false; await reads; }
     assert.notEqual((await stat(path)).ino, before);
-    assert.equal((await stat(path)).mode & 0o777, 0o640);
-    assert.equal((await stat(path)).gid, (await stat(dir)).gid);
     assert.deepEqual(await readdir(dir), ['usage.json']);
     assert.equal((await readPrevious(path, now + 100))?.tools[0].observed_at_ms, now);
     await writeFile(path, '{"tools":"private-secret"}'); assert.equal(await readPrevious(path), null);

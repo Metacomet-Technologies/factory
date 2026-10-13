@@ -1,9 +1,8 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { open, readFile, rename, stat, unlink } from 'node:fs/promises';
+import { open, readFile, rename, unlink } from 'node:fs/promises';
 import { openSync, closeSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { dirname } from 'node:path';
 import { age, check, emptyReading, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, sources } from './parsers.ts';
 import type { Tool, Reading } from './parsers.ts';
 
@@ -70,7 +69,6 @@ export async function collect(previous: Previous | null, run: Run = command, now
     try {
       const program = tool === 'claude-code' ? 'claude' : tool;
       cli_version = version(program, await run(program, ['--version']));
-      check(program === 'amp' || cli_version === (program === 'claude' ? '2.1.296' : '0.162.1'));
       let reading: Reading;
       if (tool === 'amp') {
         reading = parseAmp(await run('amp', ['usage']));
@@ -118,7 +116,6 @@ export async function writeSnapshot(path: string, snapshot: Snapshot): Promise<v
   try {
     const file = await open(temporary, 'wx', 0o640);
     try {
-      await file.chown(-1, (await stat(dirname(path))).gid);
       await file.chmod(0o640);
       await file.writeFile(`${JSON.stringify(snapshot, null, 2)}\n`);
       await file.sync();

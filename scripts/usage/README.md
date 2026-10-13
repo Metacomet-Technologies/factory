@@ -26,17 +26,21 @@ output or exception text. The collector kills only its own probe process group.
   `0.0.1791849701-g1448da`. This is the approved terminal-parsing exception,
   not a vendor JSON API. A failed hourly check keeps Amp unknown until a successful
   hourly check; a CLI update also requires a successful details check.
-* **Claude:** the exact documented headless `/usage` command, pinned to 2.1.296.
+* **Claude:** the exact documented headless `/usage` command.
   Parse only `assistant.usage_report.rate_limits`; require the final result to
   report zero turns, cost and token counts. Preserve session, weekly and known
   scoped weekly meters. Nullable resets stay null. The usage report does not
   identify Max versus Pro, so `plan` is null, not a guessed Max multiplier.
-* **Codex:** pinned to 0.162.1; JSON-RPC messages include `jsonrpc: "2.0"`.
+* **Codex:** JSON-RPC messages include `jsonrpc: "2.0"`.
   Wait for successful id 1 `initialize`, then send `initialized` and id 2
   `account/rateLimits/read`. Keep stdin open through the id 2 response; ignore
   notifications. No other RPC methods. Use the `codex` bucket once, not the
   overlapping `rateLimitsByLimitId` copy. Reset count comes from the result's
   `rateLimitResetCredits.availableCount`, never the credit ID array.
+
+Claude and Codex version strings are strictly parsed and recorded, not pinned.
+New versions with unchanged output remain supported; output-format changes
+produce `unknown, format changed`.
 
 Normal scheduled Amp usage is five account requests/hour. No thread lookups or
 automatic retries. All readers share Amp's 60/hour limit. Manual dry-runs count
@@ -81,8 +85,11 @@ snapshot is missing; their added fields are null/empty.
 
 The collector opens a unique sibling temporary file, writes/fyncs it, then
 renames it over the snapshot. No partially written snapshot becomes visible.
-The service's `Group=factory-api` gives files that group; directory is
-`agent:factory-api 0750`, snapshot `0640`. No group membership changes.
+The service keeps agent's default primary group and adds
+`SupplementaryGroups=factory-api`. The setgid directory is
+`agent:factory-api 2750`, so temporary files inherit `factory-api`; atomic
+replacement preserves that group and snapshot mode `0640`. No account group
+membership changes.
 
 API flag `--usage-snapshot` / `FACTORY_API_USAGE_SNAPSHOT` defaults to this path.
 Every request reads afresh. A separate task polls mtime/inode/length every 30

@@ -28,7 +28,7 @@ safe_path() {
 for file in scripts/usage/collect.ts scripts/usage/parsers.ts scripts/usage/.node-version scripts/usage/collect.lock deploy/install-usage.sh deploy/rollback-usage.sh deploy/factory-usage.service deploy/factory-usage.timer; do
     safe_path "$root/$file"
     [[ -f "$root/$file" ]] || fail "Missing artifact: $file"
-    sudo -u agent -g factory-api test -r "$root/$file"
+    sudo -u agent test -r "$root/$file"
 done
 for path in /var/backups/factory-usage /var/lib/factory-usage /var/lib/factory-usage/usage.json /etc/systemd/system; do
     safe_path "$path"
@@ -47,7 +47,7 @@ for unit in factory-usage.service factory-usage.timer; do
 done
 # A readable cwd is essential for the agent's Vite+ Node shim.
 cd /home/agent/work
-sudo -u agent -g factory-api test -x /home/agent/work
+sudo -u agent test -x /home/agent/work
 path=/usr/local/bin:/usr/bin:/bin
 declare -A executables
 for command in node amp claude codex; do
@@ -57,7 +57,7 @@ for command in node amp claude codex; do
     path="$(dirname "$executable"):$path"
     if [[ "$command" == node ]]; then node=$executable; fi
 done
-as_agent() { sudo -u agent -g factory-api env -i HOME=/home/agent USER=agent PATH="$path" "$@"; }
+as_agent() { sudo -u agent env -i HOME=/home/agent USER=agent PATH="$path" "$@"; }
 [[ $(as_agent "$node" --version) == v24.21.0 ]] || fail 'Select Node 24.21.0 as agent; this installer never installs runtimes.'
 for command in amp claude codex; do as_agent timeout 30s "${executables[$command]}" --version; done
 # Collector dry-run emits only its sanitized snapshot, never raw CLI output.
@@ -87,7 +87,7 @@ if [[ $(systemctl show factory-usage.timer --property=LoadState --value) != not-
 # Wait for any full collector run, using the committed shared lock inode.
 exec 9<"$root/scripts/usage/collect.lock"
 flock --exclusive --timeout 330 9
-install -d -o agent -g factory-api -m 0750 /var/lib/factory-usage
+install -d -o agent -g factory-api -m 2750 /var/lib/factory-usage
 if [[ -f /var/lib/factory-usage/usage.json ]]; then
     chown agent:factory-api /var/lib/factory-usage/usage.json
     chmod 0640 /var/lib/factory-usage/usage.json
@@ -102,7 +102,7 @@ exec 9<&-
 systemctl start factory-usage.service
 as_agent test -r /var/lib/factory-usage/usage.json
 sudo -u factory-api test -r /var/lib/factory-usage/usage.json
-[[ $(stat -c '%U:%G %a' /var/lib/factory-usage) == 'agent:factory-api 750' ]]
+[[ $(stat -c '%U:%G %a' /var/lib/factory-usage) == 'agent:factory-api 2750' ]]
 [[ $(stat -c '%U:%G %a' /var/lib/factory-usage/usage.json) == 'agent:factory-api 640' ]]
 for ((attempt=0; attempt<30; attempt++)); do
     if sudo -u factory-api curl --max-time 2 -fsS http://127.0.0.1:8080/v1/agents >/dev/null 2>&1; then break; fi
