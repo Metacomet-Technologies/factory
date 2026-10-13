@@ -112,7 +112,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
     let confirm = path
         .strip_prefix("/v1/pricing/confirm/")
         .filter(|family| !family.is_empty() && !family.contains('/'));
-    let post = path == "/v1/pricing/refresh" || confirm.is_some();
+    let post = matches!(path, "/v1/pricing/refresh" | "/v1/agents/refresh") || confirm.is_some();
     if !matches!(
         path,
         "/v1/health"
@@ -122,6 +122,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
             | "/v1/pricing"
             | "/v1/pricing/refresh"
             | "/v1/agents"
+            | "/v1/agents/refresh"
             | "/v1/stream"
             | "/openapi.json"
     ) && confirm.is_none()
@@ -150,6 +151,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
         "/v1/health" => health(&state).into_response(),
         "/v1/fleet" => fleet(&state).await.into_response(),
         "/v1/agents" => agents(&state).await.into_response(),
+        "/v1/agents/refresh" => refresh_agents(&state, request).await,
         "/openapi.json" => Json(ApiDoc::openapi()).into_response(),
         "/v1/stream" => stream(&state).into_response(),
         "/v1/gpu" => match range(&request, true) {
@@ -244,6 +246,77 @@ async fn fleet(state: &AppState) -> Json<Fleet> {
 async fn agents(state: &AppState) -> Json<Agents> {
     Json(crate::usage::read(&state.usage_snapshot).await)
 }
+#[utoipa::path(post, path="/v1/agents/refresh", responses(
+    (status=202, body=AgentsRefresh),
+    (status=429, body=AgentsRefreshCooldown, headers(("Retry-After"=u64, description="Seconds until next refresh, rounded up"))),
+    (status=400, body=ApiError), (status=403, body=ApiError),
+    (status=413, body=ApiError), (status=500, body=ApiError)
+))]
+async fn refresh_agents(state: &AppState, request: Request<Body>) -> Response {
+    // Block cross-site browser submissions without adding privileges or auth.
+    if request
+        .headers()
+        .get("sec-fetch-site")
+        .is_some_and(|v| v == "cross-site")
+    {
+        return error(
+            StatusCode::FORBIDDEN,
+            "cross_site",
+            "cross-site refresh refused",
+        );
+    }
+    match axum::body::to_bytes(request.into_body(), 1024).await {
+        Ok(body) if body.is_empty() => (),
+        Ok(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "unexpected_body",
+                "refresh takes no body",
+            );
+        }
+        Err(_) => {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body_too_large",
+                "body exceeds 1024 bytes",
+            );
+        }
+    }
+    match state.refresh_usage().await {
+        Ok((true, next_allowed_at_ms)) => (
+            StatusCode::ACCEPTED,
+            Json(AgentsRefresh {
+                status: "accepted".into(),
+                next_allowed_at_ms,
+            }),
+        )
+            .into_response(),
+        Ok((false, next_allowed_at_ms)) => {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(AgentsRefreshCooldown {
+                    error: ErrorDetail {
+                        code: "cooldown".into(),
+                        message: "usage refresh is cooling down".into(),
+                    },
+                    next_allowed_at_ms,
+                }),
+            )
+                .into_response();
+            let seconds =
+                (next_allowed_at_ms.saturating_sub(now_ms()).max(1) as u64).div_ceil(1000);
+            response
+                .headers_mut()
+                .insert("retry-after", seconds.to_string().parse().unwrap());
+            response
+        }
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "trigger_write_failed",
+            "could not request usage refresh",
+        ),
+    }
+}
 #[utoipa::path(get, path="/v1/stream", responses((status=200, content_type="text/event-stream", body=StreamEvent)))]
 fn stream(
     state: &AppState,
@@ -312,6 +385,7 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         health,
         fleet,
         agents,
+        refresh_agents,
         stream,
         usage,
         gpu,

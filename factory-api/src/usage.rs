@@ -1,6 +1,6 @@
-//! Read-only, bounded snapshot boundary. Never log snapshot contents or OS errors.
+//! Bounded snapshot and refresh-trigger boundaries. Never log private file contents.
 use crate::{AppState, now_ms};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use shared::factory_api::{AgentBalance, AgentTool, Agents};
 use std::{os::unix::fs::MetadataExt, path::Path, time::Duration};
 use tokio::io::AsyncReadExt;
@@ -152,14 +152,14 @@ fn valid(t: &AgentTool, now: i64) -> bool {
             _ => false,
         }
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Snapshot {
     schema_version: u8,
     generated_at_ms: i64,
     tools: Vec<AgentTool>,
 }
-fn parse(bytes: &[u8], now: i64) -> Option<Agents> {
-    let snapshot: Snapshot = serde_json::from_slice(bytes).ok()?;
+fn parse(bytes: &[u8], now: i64) -> Option<Snapshot> {
+    let mut snapshot: Snapshot = serde_json::from_slice(bytes).ok()?;
     if snapshot.schema_version != 1
         || snapshot.generated_at_ms <= 0
         || snapshot.generated_at_ms > now
@@ -167,8 +167,7 @@ fn parse(bytes: &[u8], now: i64) -> Option<Agents> {
     {
         return None;
     }
-    let mut tools = snapshot.tools;
-    for (tool, expected) in tools.iter_mut().zip(TOOLS) {
+    for (tool, expected) in snapshot.tools.iter_mut().zip(TOOLS) {
         if tool.tool != expected || !valid(tool, now) {
             return None;
         }
@@ -178,7 +177,7 @@ fn parse(bytes: &[u8], now: i64) -> Option<Agents> {
                 .get_or_insert_with(|| "last good reading older than 45 minutes".into());
         }
     }
-    Some(Agents { tools })
+    Some(snapshot)
 }
 pub(crate) async fn read(path: &Path) -> Agents {
     if !tokio::fs::metadata(path).await.is_ok_and(|m| m.is_file()) {
@@ -191,9 +190,67 @@ pub(crate) async fn read(path: &Path) -> Agents {
     if file.take(100_001).read_to_end(&mut bytes).await.is_err() || bytes.len() > 100_000 {
         return unavailable("usage snapshot invalid");
     }
-    parse(&bytes, now_ms()).unwrap_or_else(|| unavailable("usage snapshot invalid"))
+    parse(&bytes, now_ms())
+        .map(|snapshot| Agents {
+            tools: snapshot.tools,
+        })
+        .unwrap_or_else(|| unavailable("usage snapshot invalid"))
 }
 impl AppState {
+    /// The trigger itself records the accepted timestamp, including across restarts.
+    /// Keep the lock and filesystem transaction in one blocking task so HTTP
+    /// cancellation cannot release the lock while a rename is still in flight.
+    pub(crate) async fn refresh_usage(&self) -> anyhow::Result<(bool, i64)> {
+        let state = self.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            use std::os::unix::fs::OpenOptionsExt;
+            let _guard = state
+                .usage_refresh_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("refresh lock unavailable"))?;
+            let now = now_ms();
+            let last = match std::fs::File::open(&state.usage_trigger) {
+                Ok(file) => {
+                    let mut text = String::new();
+                    file.take(32).read_to_string(&mut text)?;
+                    text.trim().parse::<i64>()?
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(e) => return Err(e.into()),
+            };
+            let mut bytes = Vec::new();
+            let generated = std::fs::File::open(&state.usage_snapshot)
+                .ok()
+                .and_then(|file| file.take(100_001).read_to_end(&mut bytes).ok())
+                .filter(|_| bytes.len() <= 100_000)
+                .and_then(|_| parse(&bytes, now))
+                .map_or(0, |snapshot| snapshot.generated_at_ms);
+            let next = last.max(generated).saturating_add(180_000);
+            if now < next {
+                return Ok((false, next));
+            }
+            let temporary = state.usage_trigger.with_extension("tmp");
+            let result = (|| -> std::io::Result<()> {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&temporary)?;
+                writeln!(file, "{now}")?;
+                file.sync_all()?;
+                std::fs::rename(&temporary, &state.usage_trigger)
+            })();
+            if result.is_err() {
+                let _ = std::fs::remove_file(temporary);
+            }
+            result?;
+            Ok((true, now + 180_000))
+        })
+        .await?
+    }
+
     pub(crate) fn start_usage_collector(&self) -> tokio::task::JoinHandle<()> {
         let state = self.clone();
         tokio::spawn(async move {
@@ -262,6 +319,120 @@ mod tests {
             invalid["tools"][0][field] = bad;
             assert!(parse(&serde_json::to_vec(&invalid).unwrap(), at).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn http_refresh_cooldown_and_atomic_trigger() -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir()?;
+            pricing::migrate(dir.path().join("pricing.db"))?;
+            let mut state = AppState::new(
+                "http://127.0.0.1:1".into(),
+                dir.path().join("requests.db"),
+                dir.path().join("pricing.db"),
+                crate::fleet::Config { nodes: vec![] },
+            )
+            .await?;
+            state.usage_snapshot = dir.path().join("usage.json");
+            state.usage_trigger = dir.path().join("request");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/v1/agents/refresh", listener.local_addr()?);
+            let server =
+                tokio::spawn(axum::serve(listener, crate::router(state.clone())).into_future());
+            let client = reqwest::Client::new();
+            // Neither malformed requests nor foreign browser submissions write a trigger.
+            for (body, status) in [("x".into(), 400), ("x".repeat(1025), 413)] {
+                assert_eq!(client.post(&url).body(body).send().await?.status(), status);
+            }
+            assert_eq!(
+                client
+                    .post(&url)
+                    .header("sec-fetch-site", "cross-site")
+                    .send()
+                    .await?
+                    .status(),
+                403
+            );
+            assert_eq!(client.get(&url).send().await?.status(), 405);
+            assert!(!state.usage_trigger.exists());
+            let accepted = client.post(&url).send().await?;
+            assert_eq!(accepted.status(), 202);
+            let accepted: Value = accepted.json().await?;
+            assert_eq!(accepted["status"], "accepted");
+            let next = accepted["next_allowed_at_ms"].as_i64().unwrap();
+            let contents = std::fs::read_to_string(&state.usage_trigger)?;
+            assert_eq!(contents.trim().parse::<i64>()?, next - 180_000);
+            let repeat = client.post(&url).send().await?;
+            assert_eq!(repeat.status(), 429);
+            assert_eq!(repeat.headers()["retry-after"], "180");
+            let repeat: Value = repeat.json().await?;
+            assert_eq!(repeat["error"]["code"], "cooldown");
+            assert_eq!(repeat["next_allowed_at_ms"], next);
+            assert_eq!(std::fs::read_to_string(&state.usage_trigger)?, contents);
+
+            // A later timer snapshot wins over the persisted trigger. Fractional
+            // seconds round up rather than letting clients retry too early.
+            let generated = now_ms() - 60_200;
+            std::fs::write(&state.usage_trigger, (generated - 20_000).to_string())?;
+            std::fs::write(
+                &state.usage_snapshot,
+                serde_json::to_vec(&fixture(generated))?,
+            )?;
+            let repeat = client.post(&url).send().await?;
+            assert_eq!(repeat.status(), 429);
+            assert_eq!(repeat.headers()["retry-after"], "120");
+            assert_eq!(
+                repeat.json::<Value>().await?["next_allowed_at_ms"],
+                generated + 180_000
+            );
+
+            // Expired snapshot cannot block refresh; replacement preserves an
+            // already-open reader's complete old bytes (not truncate-in-place).
+            std::fs::write(
+                &state.usage_snapshot,
+                serde_json::to_vec(&fixture(now_ms() - 180_001))?,
+            )?;
+            std::fs::write(&state.usage_trigger, "1\n")?;
+            let old_inode = std::fs::File::open(&state.usage_trigger)?;
+            let (one, two) = tokio::join!(client.post(&url).send(), client.post(&url).send());
+            let mut statuses = [one?.status().as_u16(), two?.status().as_u16()];
+            statuses.sort();
+            assert_eq!(statuses, [202, 429]);
+            assert_ne!(
+                old_inode.metadata()?.ino(),
+                std::fs::metadata(&state.usage_trigger)?.ino()
+            );
+            assert_eq!(std::io::read_to_string(old_inode)?, "1\n");
+            assert!(!state.usage_trigger.with_extension("tmp").exists());
+
+            // A new API instance must honor the accepted trigger after restart.
+            server.abort();
+            let mut restarted = state.clone();
+            restarted.usage_refresh_lock = Default::default();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/v1/agents/refresh", listener.local_addr()?);
+            let server =
+                tokio::spawn(axum::serve(listener, crate::router(restarted)).into_future());
+            assert_eq!(client.post(&url).send().await?.status(), 429);
+
+            // Failed writes do not consume the cooldown; repair permits retry.
+            std::fs::write(&state.usage_trigger, "1\n")?;
+            std::fs::create_dir(state.usage_trigger.with_extension("tmp"))?;
+            let failed = client.post(&url).send().await?;
+            assert_eq!(failed.status(), 500);
+            assert_eq!(
+                failed.json::<Value>().await?["error"]["code"],
+                "trigger_write_failed"
+            );
+            assert_eq!(std::fs::read_to_string(&state.usage_trigger)?, "1\n");
+            std::fs::remove_dir(state.usage_trigger.with_extension("tmp"))?;
+            assert_eq!(client.post(&url).send().await?.status(), 202);
+            server.abort();
+            state.db.close().await?;
+            anyhow::Ok(())
+        })
+        .await??;
+        Ok(())
     }
 
     #[tokio::test]

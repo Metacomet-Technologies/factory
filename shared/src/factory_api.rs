@@ -177,6 +177,17 @@ pub struct Agents {
     pub tools: Vec<AgentTool>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AgentsRefresh {
+    /// Always "accepted"; completion arrives through agents.usage SSE.
+    pub status: String,
+    pub next_allowed_at_ms: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AgentsRefreshCooldown {
+    pub error: ErrorDetail,
+    pub next_allowed_at_ms: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StreamEvent {
     pub r#type: String,
     pub ts_ms: i64,

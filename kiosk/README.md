@@ -1,12 +1,24 @@
 # factory / kiosk
 
-A read-only React 19 dashboard for factory-api's v1 contract. MET-114 targets
+A React 19 dashboard for factory-api's v1 contract. MET-114 targets
 the API/static origin on factory-gpu; Chrome remains on factory-console.
 The app contacts only factory-api; the
 optional live verification script sends four small Ollama requests. All authored app,
 server, configuration, test and script sources are TypeScript. Both TypeScript
 projects enable `strict`, `noUncheckedIndexedAccess` and
 `exactOptionalPropertyTypes`.
+
+## Manual usage refresh (MET-139)
+
+The Frontier CLIs header has a keyboard-accessible refresh button on all layouts,
+including `/?kiosk`. It posts without a body to `/v1/agents/refresh`; this requests
+quota reads, not inference or account changes. “Refreshing…” ends on the next
+`agents.usage` event; after 90 seconds without one it says “Refresh didn't complete”.
+Accepted and cooldown responses disable the button until the server's deadline,
+with native title “Next refresh in N s”. Other clients and timer runs can extend
+the server cooldown; a 429 supplies the updated deadline. Labeled balances show
+`<label>: <amount>` (for example `workspace metacomet: $0`); unlabeled pools retain
+their existing formatting. Deploy the API, usage path unit, then kiosk in that order.
 
 ## Frontier CLIs (MET-126)
 

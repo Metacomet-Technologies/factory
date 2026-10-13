@@ -20,6 +20,9 @@ TimeoutStopSec=15
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
+# Must exist before API start; the installer creates it without replacing its
+# inode. Mount the directory, not request, so atomic file replacement works.
+ReadWritePaths=/var/lib/factory-usage-trigger
 ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true

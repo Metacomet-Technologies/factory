@@ -343,6 +343,17 @@
   align-content: start;
   gap: 20px;
 }
+.agent-refresh {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+  text-align: right;
+}
+.agent-refresh [role="status"] {
+  max-width: 110px;
+}
 .agent-list,
 .ticker {
   display: grid;

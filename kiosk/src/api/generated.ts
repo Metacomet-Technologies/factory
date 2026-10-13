@@ -15,6 +15,22 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v1/agents/refresh": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["refresh_agents"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v1/fleet": {
     parameters: {
       query?: never;
@@ -184,6 +200,17 @@ export interface components {
     };
     Agents: {
       tools: components["schemas"]["AgentTool"][];
+    };
+    AgentsRefresh: {
+      /** Format: int64 */
+      next_allowed_at_ms: number;
+      /** @description Always "accepted"; completion arrives through agents.usage SSE. */
+      status: string;
+    };
+    AgentsRefreshCooldown: {
+      error: components["schemas"]["ErrorDetail"];
+      /** Format: int64 */
+      next_allowed_at_ms: number;
     };
     ApiError: {
       error: components["schemas"]["ErrorDetail"];
@@ -381,6 +408,67 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["Agents"];
+        };
+      };
+    };
+  };
+  refresh_agents: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AgentsRefresh"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      429: {
+        headers: {
+          /** @description Seconds until next refresh, rounded up */
+          "Retry-After"?: number;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["AgentsRefreshCooldown"];
+        };
+      };
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
         };
       };
     };
