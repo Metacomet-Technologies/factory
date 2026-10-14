@@ -58,10 +58,28 @@ pub async fn socket_owner(peer: SocketAddr, local: SocketAddr) -> Option<u32> {
     if !peer.ip().is_loopback() {
         return None;
     }
+    // Both reading and parsing the growing socket table are blocking work.
+    // Keep the permit in that work even if the HTTP caller disconnects.
+    static SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    let permit = SCANS.acquire().await.ok()?;
     let file = if peer.is_ipv4() {
         "/proc/net/tcp"
     } else {
         "/proc/net/tcp6"
     };
-    owner(&tokio::fs::read_to_string(file).await.ok()?, peer, local)
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        // /proc socket walks are not atomic under connection churn. Retry a
+        // missing/ambiguous match, never substitute a header or cached UID.
+        for _ in 0..3 {
+            let table = std::fs::read_to_string(file).ok()?;
+            if let Some(uid) = owner(&table, peer, local) {
+                return Some(uid);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
 }

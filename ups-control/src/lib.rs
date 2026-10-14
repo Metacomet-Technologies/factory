@@ -749,7 +749,12 @@ async fn handle(
     } else {
         None
     };
-    let uid = guard::socket_owner(peer, control.config.listen).await;
+    // A missing/unlisted identity cannot pass, so do not let it force a /proc scan.
+    let uid = if login.is_some_and(|name| control.config.allowed_logins.iter().any(|s| s == name)) {
+        guard::socket_owner(peer, control.config.listen).await
+    } else {
+        None
+    };
     if !guard::authorize(
         peer,
         uid,

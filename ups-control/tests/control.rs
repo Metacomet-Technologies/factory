@@ -305,13 +305,19 @@ async fn real_socket_guard_and_notification_throttle() {
 #[tokio::test]
 async fn denial_flood_preserves_allowed_actions_and_aggregates_audit() {
     let h = Harness::new(uid()).await;
+    let wrong_uid = Harness::new(uid() + 1).await;
     let mut flood = tokio::task::JoinSet::new();
-    for _ in 0..512 {
-        let (client, url) = (h.client.clone(), h.url.clone());
+    for i in 0..512 {
+        let (target, login) = if i < 256 {
+            (&h, "forged@github")
+        } else {
+            (&wrong_uid, "DGarbs51@github")
+        };
+        let (client, url) = (target.client.clone(), target.url.clone());
         flood.spawn(async move {
             client
                 .get(format!("{url}/v1/state"))
-                .header("Tailscale-User-Login", "forged@github")
+                .header("Tailscale-User-Login", login)
                 .timeout(Duration::from_secs(30))
                 .send()
                 .await
@@ -321,12 +327,8 @@ async fn denial_flood_preserves_allowed_actions_and_aggregates_audit() {
         });
     }
     // Exercise allowed traffic while the denied requests are in flight.
-    assert_eq!(
-        h.request("/v1/state", Some("DGarbs51@github"), None)
-            .await
-            .0,
-        200
-    );
+    let (status, state) = h.request("/v1/state", Some("DGarbs51@github"), None).await;
+    assert_eq!(status, 200, "{state}");
     let (status, pending) = h.prepare("test.quick", None).await;
     assert_eq!(status, 200, "{pending}");
     let (status, result) = h.confirm(&pending).await;
@@ -335,6 +337,16 @@ async fn denial_flood_preserves_allowed_actions_and_aggregates_audit() {
     while let Some(status) = flood.join_next().await {
         assert_eq!(status.unwrap(), 403);
     }
+    assert_eq!(
+        wrong_uid
+            .control
+            .store
+            .rows(100, i64::MAX)
+            .await
+            .unwrap()
+            .len(),
+        8
+    );
     let rows = h.control.store.rows(100, i64::MAX).await.unwrap();
     assert_eq!(rows.iter().filter(|r| r.event == "guard-deny").count(), 8);
     assert!(
@@ -354,7 +366,7 @@ async fn denial_flood_preserves_allowed_actions_and_aggregates_audit() {
     assert_eq!(
         rows.iter()
             .filter(
-                |r| r.result == "suppressed 504 guard denials in preceding audit window"
+                |r| r.result == "suppressed 248 guard denials in preceding audit window"
                     && r.login.is_none()
             )
             .count(),

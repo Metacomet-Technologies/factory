@@ -121,6 +121,11 @@ socket's UID from `/proc/net/tcp` or `/proc/net/tcp6`, and exactly one allowlist
 `Tailscale-User-Login`. Matching uses both endpoints, ports and ESTABLISHED state;
 missing, ambiguous or unreadable ownership fails closed. The default trusted UID
 is 0 (tailscaled), never agent or the control-service UID. Root remains trusted.
+Missing/unlisted identities are rejected before scanning sockets. Required scans
+run on blocking workers, at most four concurrently, so parsing cannot stall the
+async NUT requests. A missing/ambiguous match receives up to three fresh reads
+because the kernel socket walk is not atomic under connection churn; no cached
+UID or header can substitute for a unique live match.
 The default users are `DGarbs51@github,metacometdave@github`, case-sensitive.
 Denials always return 403. The bounded audit samples retain the claimed,
 untrusted login; excess denials are counted in aggregate as described below.
