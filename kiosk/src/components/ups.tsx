@@ -25,7 +25,7 @@ function runtime(seconds: number | null | undefined) {
 export function UpsBadge(props: Props) {
   const label = state(props);
   const current = label === "No data" ? null : props.current;
-  const alarm = label === "On battery" || label === "Low battery" || label === "Replace battery";
+  const alarm = label === "On battery" || label === "Low battery";
   return (
     <Tooltip>
       <TooltipTrigger
@@ -34,7 +34,15 @@ export function UpsBadge(props: Props) {
             variant="ghost"
             size="icon"
             aria-label={`UPS: ${label}`}
-            className={alarm ? "status-fail" : label === "No data" ? "muted" : "status-ok"}
+            className={
+              alarm
+                ? "status-fail"
+                : label === "Replace battery"
+                  ? "status-warn"
+                  : label === "No data"
+                    ? "muted"
+                    : "status-ok"
+            }
           >
             {label === "No data" ? (
               <span className="ups-unknown-icon" aria-hidden="true">

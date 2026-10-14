@@ -101,7 +101,7 @@ describe("UPS telemetry", () => {
     ["OL", "Online", "plug"],
     ["OL OB RB", "On battery", "battery-warning"],
     ["OL OB LB RB", "Low battery", "battery-warning"],
-    ["OL RB", "Replace battery", "battery-warning"],
+    ["OL RB", "Replace battery", "plug"],
     [null, "No data", "battery"],
     ["stale", "No data", "battery"],
   ])("renders %s card and badge", (flags, label, icon) => {
@@ -121,9 +121,11 @@ describe("UPS telemetry", () => {
     );
     const card = screen.getByRole("region", { name: "UPS" });
     expect(within(card).getByText(label!)).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: `UPS: ${label}` }).querySelector(`.lucide-${icon}`),
-    ).not.toBeNull();
+    const badge = screen.getByRole("button", { name: `UPS: ${label}` });
+    expect(badge.querySelector(`.lucide-${icon}`)).not.toBeNull();
+    if (label === "On battery" || label === "Low battery") expect(badge).toHaveClass("status-fail");
+    else expect(badge).not.toHaveClass("status-fail");
+    if (label === "Replace battery") expect(badge).toHaveClass("status-warn");
     if (label !== "No data") {
       expect(within(card).getByText("14 m 7 s")).toBeInTheDocument();
       expect(within(card).getByText("144 W of 600 W")).toBeInTheDocument();
