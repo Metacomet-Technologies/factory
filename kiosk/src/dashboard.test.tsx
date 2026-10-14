@@ -204,7 +204,7 @@ describe("UPS telemetry", () => {
     expect(await screen.findByText("factory shut down during outage")).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Local LLM" })).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Controls" })).toHaveTextContent(
-      "No control actions available",
+      "Controls available from Devon's or David's devices",
     );
     for (const range of ["1h", "7d", "30d", "365d", "24h"]) {
       fireEvent.click(screen.getByRole("button", { name: range }));

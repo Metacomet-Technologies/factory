@@ -310,8 +310,90 @@
   padding: 6px;
 }
 .ups-controls {
-  min-height: 120px;
-  border-style: dashed;
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+.ups-control-tier {
+  display: grid;
+  gap: 12px;
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.ups-control-action,
+.ups-control-setting {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.ups-control-action p,
+.ups-control-setting p {
+  font-size: 13px;
+}
+.ups-control-setting input,
+.ups-control-setting select,
+.ups-confirm input {
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  color: var(--foreground);
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.ups-control-setting input,
+.ups-control-setting select {
+  max-width: 320px;
+}
+.ups-controls [data-slot="button"] {
+  min-height: 44px;
+  max-width: 100%;
+  height: auto;
+  white-space: normal;
+}
+.ups-control-audit {
+  max-height: 360px;
+  overflow: auto;
+}
+.ups-pending,
+.ups-control-result {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+}
+.ups-confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgb(0 0 0 / 65%);
+}
+.ups-confirm {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 61;
+  width: min(480px, calc(100% - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+  padding: 20px;
+  color: var(--foreground);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+.ups-confirm form {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+.ups-confirm [data-slot="button"] {
+  min-height: 44px;
 }
 .ups-unknown-icon {
   position: relative;

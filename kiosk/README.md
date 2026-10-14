@@ -2,11 +2,87 @@
 
 A React 19 dashboard for factory-api's v1 contract. MET-114 targets
 the API/static origin on factory-gpu; Chrome remains on factory-console.
-The app contacts only factory-api; the
+The app contacts factory-api and the same-origin UPS control service; the
 optional live verification script sends four small Ollama requests. All authored app,
 server, configuration, test and script sources are TypeScript. Both TypeScript
 projects enable `strict`, `noUncheckedIndexedAccess` and
 `exactOptionalPropertyTypes`.
+
+## UPS controls (MET-168)
+
+The Controls region on `/ups` fetches `/control/v1/state` on load and every
+30 seconds. A denied or failed state read renders only “Controls available
+from Devon's or David's devices”, with no controls buttons. The signed-in view
+groups the returned actions into Safe, Settings and Power. Settings use the
+server's current values, enums and disjoint integer ranges. Every enabled action
+first requests a server confirmation ID, then opens a Base UI modal with trapped
+keyboard focus, the value, exact phrase and server expiry. Whitespace and case
+are significant. No command executes until the typed phrase matches; the server
+still enforces identity, expiry, reuse and preconditions. Results and refusals
+are displayed verbatim; power buttons use the destructive token. The last 20
+audit rows come from state; Older audit uses `/control/v1/audit?limit=20&before_ms=…`.
+
+A pending power action displays a banner and polls `/v1/health` every five
+seconds. It does not mistake the healthy API before shutdown for recovery:
+the banner clears only after a failed health read followed by a successful one.
+The banner survives failed state reads while the Controls region becomes denied.
+Power actions never retry automatically. Physical completion is not asserted.
+
+Current MET-166 contract limits: state supplies action identifiers, not friendly
+labels, and only the disabled stay-off reason, not dynamic precondition hints.
+The UI therefore uses those identifiers and displays other refusals after the
+prepare/confirm request. State/prepare also supply no downtime or return timestamp.
+The consequence warns of disconnection without inventing N minutes; the banner
+says “return time unavailable”. The confirmed power-cycle response's 5–15 minute
+budget is shown verbatim, not converted into a promised return time. If the
+service supplies `label`, `refusal_reason` or `expected_return_ms`, those values
+render directly. Audit paging inherits the service's timestamp-only cursor:
+rows tied at a page boundary can be omitted; the kiosk cannot repair that contract.
+
+### Synthetic controls check
+
+Start with fresh disposable sandbox data: confirmed tests have cooldowns and FSD
+remains pending until a new boot. Do not rerun against production or reset an
+unrelated worktree. From this repository root:
+
+```sh
+scripts/sandbox up --rows 1k --kiosk
+scripts/sandbox status
+# From kiosk/, substitute the printed sandbox API and fake-serve ports:
+KIOSK_API_PROXY=http://127.0.0.1:<factory-api-port> KIOSK_CONTROL_PROXY=http://127.0.0.1:<fake-serve-port> vp preview --host 127.0.0.1 --port 14168 --strictPort
+# In another terminal, from kiosk/ with Playwright Chromium installed:
+vp run ups-controls:check
+```
+
+The browser completes a quick test, changes sensitivity to high, confirms
+power-cycle, checks FSD in the fake upsd log and checks the audit results. It also
+checks exact typing, real keyboard focus trapping, disabled stay-off, phone
+overflow, AA text contrast in both themes, and an unlisted-login 403 view. The
+fake never shuts down: recovery uses browser-only health 503 followed by the real
+sandbox health response. Required screenshots plus a pending-banner capture and
+`ups-controls-check.json` go to `.amp/in/artifacts/`. For another clean run, stop
+the sandbox, then `scripts/sandbox reset --rows 1k --kiosk` deletes only this
+worktree's disposable data and starts again. Stop with `scripts/sandbox down`.
+
+### Mac install and rollback (Devon only)
+
+Install only after MET-166's service and same-origin `/control` Serve route are
+available. These commands replace static kiosk assets only; no deployment was
+performed by the agent. Build/read `/home/agent` files as agent and stage outside
+that directory for the root-only installer. Preserve its printed snapshot path.
+
+```sh
+factory-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-168-ups-page-controls-typed/kiosk && VITE_API_BASE= vp build'"
+factory-ssh 'set -euo pipefail; stage=$(mktemp -d /tmp/met-168-kiosk.XXXXXX); trap '\''rm -rf -- "$stage"'\'' EXIT; sudo -u agent tar -C /home/agent/work/factory-met-168-ups-page-controls-typed/kiosk/dist -cf - . | tar -xf - -C "$stage"; sudo -u agent cat /home/agent/work/factory-met-168-ups-page-controls-typed/deploy/install-kiosk.sh | sudo bash -s -- "$stage"'
+# Immediate rollback to the latest complete kiosk snapshot:
+factory-ssh 'set -euo pipefail; sudo -u agent cat /home/agent/work/factory-met-168-ups-page-controls-typed/deploy/rollback-kiosk.sh | sudo bash -s'
+```
+
+If another installation intervened, append the preserved snapshot path to
+`sudo bash -s -- /var/backups/factory-kiosk/<printed-snapshot>` instead of using
+the latest snapshot. Devon's gate remains: from his phone, check controls, one
+quick test and its audit row; from the console, check that Controls contains only
+the denied text. Neither physical device nor a real power interruption was tested.
 
 ## UPS history and settings (MET-167)
 
@@ -14,8 +90,8 @@ projects enable `strict`, `noUncheckedIndexedAccess` and
 five history ranges, outage markers, energy/cost/coverage, a paged event timeline,
 battery health, and settings. Every other path remains the dashboard. The UPS
 card and header badge navigate using the browser; Back returns to the dashboard.
-No router or other dependency was added. Controls are intentionally reserved,
-with no command, self-test, shutdown, or power action exposed.
+No router or other dependency was added. Controls now use the separate MET-168
+flow described above.
 
 On battery, the runtime countdown subtracts elapsed time and the 300-second
 reserve; it reaches zero immediately at 30% charge. It does not predict charge
