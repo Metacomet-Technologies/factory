@@ -1,0 +1,120 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "factory-ups-control",
+    "version": "0.2.0",
+    "description": "Private Tailscale Serve API. Serve strips /control before forwarding. Every request requires an allowlisted user identity and a loopback socket owned by the trusted UID. 30 requests per login per minute. No factory-api dependency. Credentials never enter API requests."
+  },
+  "servers": [{"url": "/control"}],
+  "security": [{"serveIdentity": []}],
+  "paths": {
+    "/v1/state": {"get": {
+      "operationId": "state",
+      "responses": {
+        "200": {"description": "Current identity, allowlist, settings, pending FSD and latest 20 audit rows", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/State"}}}},
+        "403": {"$ref": "#/components/responses/GuardDenied"},
+        "409": {"$ref": "#/components/responses/Refused"},
+        "429": {"$ref": "#/components/responses/RateLimited"}
+      }
+    }},
+    "/v1/actions": {"post": {
+      "operationId": "requestAction",
+      "description": "Preflight and create a single-use confirmation, valid for 60 seconds. Settings take a string value; other actions reject values. No mutation occurs yet.",
+      "requestBody": {"required": true, "content": {"application/json": {"schema": {
+        "type": "object", "additionalProperties": false, "required": ["action"],
+        "properties": {"action": {"$ref": "#/components/schemas/ActionName"}, "value": {"type": ["string", "null"], "maxLength": 64}}
+      }}}},
+      "responses": {
+        "200": {"description": "Confirmation created", "content": {"application/json": {"schema": {
+          "type": "object", "required": ["id", "confirm_phrase", "expires_ms"],
+          "properties": {"id": {"type": "integer", "format": "int64"}, "confirm_phrase": {"type": "string"}, "expires_ms": {"type": "integer", "format": "int64"}}
+        }}}},
+        "403": {"$ref": "#/components/responses/GuardDenied"},
+        "409": {"$ref": "#/components/responses/Refused"},
+        "429": {"$ref": "#/components/responses/RateLimited"}
+      }
+    }},
+    "/v1/actions/{id}/confirm": {"post": {
+      "operationId": "confirmAction",
+      "description": "Requires the original login, exact phrase, unused ID and unexpired confirmation. Consumes ID before repeating preflight. All attempts consume per-action cooldown (tests 10 minutes, power 30 minutes), including unknown outcomes. INSTCMD/SET VAR require tracking SUCCESS to count as executed. Timeout means not confirmed, not guaranteed absent. Never automatically retry. FSD is untracked; FSD_SET acknowledges the latch only and executed remains false.",
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer", "format": "int64"}}],
+      "requestBody": {"required": true, "content": {"application/json": {"schema": {
+        "type": "object", "additionalProperties": false, "required": ["phrase"], "properties": {"phrase": {"type": "string"}}
+      }}}},
+      "responses": {
+        "200": {"description": "Tracking SUCCESS, or FSD_SET acknowledgement (not physical shutdown completion)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Outcome"}}}},
+        "202": {"description": "PENDING after ten seconds; executed=false, ID consumed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Outcome"}}}},
+        "403": {"$ref": "#/components/responses/GuardDenied"},
+        "409": {"description": "Refusal or tracking FAILURE (executed=false)", "content": {"application/json": {"schema": {"oneOf": [{"$ref": "#/components/schemas/Error"}, {"$ref": "#/components/schemas/Outcome"}]}}}},
+        "429": {"$ref": "#/components/responses/RateLimited"}
+      }
+    }},
+    "/v1/audit": {"get": {
+      "operationId": "audit",
+      "parameters": [
+        {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}},
+        {"name": "before_ms", "in": "query", "description": "Exclusive UTC millisecond cutoff", "schema": {"type": "integer", "format": "int64", "minimum": 1}}
+      ],
+      "responses": {
+        "200": {"description": "Newest first, retained indefinitely", "content": {"application/json": {"schema": {"type": "object", "required": ["rows"], "properties": {"rows": {"type": "array", "items": {"$ref": "#/components/schemas/AuditRow"}}}}}}},
+        "403": {"$ref": "#/components/responses/GuardDenied"},
+        "409": {"$ref": "#/components/responses/Refused"},
+        "429": {"$ref": "#/components/responses/RateLimited"}
+      }
+    }}
+  },
+  "components": {
+    "securitySchemes": {"serveIdentity": {"type": "apiKey", "in": "header", "name": "Tailscale-User-Login", "description": "Injected by Serve, never trusted without the kernel socket UID check. Tagged clients have no identity."}},
+    "responses": {
+      "GuardDenied": {"description": "Identity guard denied; audited", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "Refused": {"description": "Validation, preflight, confirmation or upstream refusal", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+      "RateLimited": {"description": "30 requests per login per minute", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}
+    },
+    "schemas": {
+      "Error": {"type": "object", "required": ["error"], "properties": {"error": {"type": "string"}}},
+      "ActionName": {"type": "string", "enum": ["test.quick", "test.stop", "beeper.enable", "beeper.disable", "beeper.mute", "shutdown.stop", "input.sensitivity", "input.transfer.low", "input.transfer.high", "ups.delay.shutdown", "ups.delay.start", "power.cycle", "power.off_stay"]},
+      "Outcome": {
+        "type": "object", "required": ["audit_id", "executed", "tracking_status", "tracking_id", "result", "nut_response", "expected_downtime"],
+        "properties": {
+          "audit_id": {"type": "integer", "format": "int64"}, "executed": {"type": "boolean"},
+          "tracking_status": {"type": "string", "enum": ["SUCCESS", "FAILURE", "PENDING", "FSD_SET"]},
+          "tracking_id": {"type": ["string", "null"]}, "result": {"type": "string"}, "nut_response": {"type": "string"},
+          "expected_downtime": {"type": ["string", "null"], "description": "Operator budget, not measured or guaranteed"}
+        }
+      },
+      "AuditRow": {
+        "type": "object", "required": ["id", "ts_ms", "event", "login", "action", "value", "old_value", "result", "nut_response", "boot_id", "attempted", "executed", "tracking_status", "tracking_id"],
+        "properties": {
+          "id": {"type": "integer", "format": "int64"}, "ts_ms": {"type": "integer", "format": "int64"},
+          "event": {"type": "string", "enum": ["request", "confirm", "dispatch", "execute", "refuse", "guard-deny"]},
+          "login": {"type": ["string", "null"], "description": "For guard-deny, an untrusted claimed header, not authenticated identity"},
+          "action": {"type": ["string", "null"]}, "value": {"type": ["string", "null"]}, "old_value": {"type": ["string", "null"]},
+          "result": {"type": "string"}, "nut_response": {"type": ["string", "null"]}, "boot_id": {"type": "string"},
+          "attempted": {"type": "boolean"}, "executed": {"type": "boolean"},
+          "tracking_status": {"type": ["string", "null"]}, "tracking_id": {"type": ["string", "null"]}
+        }
+      },
+      "Setting": {
+        "type": "object", "required": ["value", "allowed_values", "ranges", "range_source"],
+        "properties": {
+          "value": {"type": "string"}, "allowed_values": {"type": "array", "items": {"type": "string"}},
+          "ranges": {"type": "array", "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "integer"}}},
+          "range_source": {"type": "string"}
+        }
+      },
+      "State": {
+        "type": "object", "required": ["login", "actions", "settings", "ups_status", "pending_power_action", "audit"],
+        "properties": {
+          "login": {"type": "string"}, "ups_status": {"type": ["string", "null"]},
+          "actions": {"type": "array", "items": {"type": "object", "required": ["action", "tier", "confirm_phrase", "enabled", "disabled_reason"], "properties": {
+            "action": {"$ref": "#/components/schemas/ActionName"}, "tier": {"type": "string", "enum": ["safe", "settings", "power"]},
+            "confirm_phrase": {"type": "string"}, "enabled": {"type": "boolean"}, "disabled_reason": {"type": ["string", "null"]}
+          }}},
+          "settings": {"type": "object", "additionalProperties": {"$ref": "#/components/schemas/Setting"}},
+          "pending_power_action": {"type": ["object", "null"], "properties": {"audit_id": {"type": "integer"}, "ts_ms": {"type": "integer"}, "action": {"type": "string"}, "result": {"type": "string"}}},
+          "audit": {"type": "array", "maxItems": 20, "items": {"$ref": "#/components/schemas/AuditRow"}}
+        }
+      }
+    }
+  }
+}

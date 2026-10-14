@@ -1,3 +1,13 @@
 [upsmon]
     password = @PASSWORD@
     upsmon primary
+
+[factory-control]
+    password = @CONTROL_PASSWORD@
+    actions = SET FSD
+    instcmds = test.battery.start.quick
+    instcmds = test.battery.stop
+    instcmds = beeper.enable
+    instcmds = beeper.disable
+    instcmds = beeper.mute
+    instcmds = shutdown.stop

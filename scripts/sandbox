@@ -36,7 +36,7 @@ case "$command" in
         python3 "$helper" preflight "$root" "$rows" "$seed"
         command -v bwrap >/dev/null || { echo 'Install bubblewrap; sandbox never falls back to host networking' >&2; exit 1; }
         bwrap --unshare-net --ro-bind / / true
-        cargo build --manifest-path "$root/Cargo.toml" --target-dir "$root/target" --release --locked -p sandbox -p meter -p factory-api
+        cargo build --manifest-path "$root/Cargo.toml" --target-dir "$root/target" --release --locked -p sandbox -p meter -p factory-api -p factory-ups-control
         if ((kiosk)); then
             (cd "$root/kiosk"; vp install --frozen-lockfile; VITE_API_BASE='' vp build)
         fi
@@ -55,7 +55,7 @@ case "$command" in
         (($# == 0)) || { echo 'Unexpected arguments' >&2; exit 1; }
         python3 "$helper" "$command" "$root" ;;
     logs)
-        [[ $# == 1 && "$1" =~ ^(fake-ollama|fake-upsd|meter|factory-api|seed|traffic|runtime)$ ]] || { echo 'Usage: scripts/sandbox logs <fake-ollama|fake-upsd|meter|factory-api|seed|traffic|runtime>' >&2; exit 1; }
+        [[ $# == 1 && "$1" =~ ^(fake-ollama|fake-upsd|fake-serve|ups-control|meter|factory-api|seed|traffic|runtime)$ ]] || { echo 'Usage: scripts/sandbox logs <fake-ollama|fake-upsd|fake-serve|ups-control|meter|factory-api|seed|traffic|runtime>' >&2; exit 1; }
         tail -n 100 "$state/$1.log" ;;
     *) echo 'Usage: scripts/sandbox {up [--rows 100k] [--seed 42] [--kiosk]|status|reset [up options]|down|logs <svc>}' >&2; exit 1 ;;
 esac
