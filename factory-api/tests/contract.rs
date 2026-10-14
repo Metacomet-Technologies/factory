@@ -62,12 +62,22 @@ async fn ups_unavailable_and_silent_peer_do_not_block_collectors() -> Result<()>
         let (_socket, _) = silent.accept().await.unwrap();
         std::future::pending::<()>().await;
     });
-    let (url, server) = serve(router(state.clone())).await;
+    let subscribed = Arc::new(tokio::sync::Notify::new());
+    let app = router(state.clone()).layer(axum::middleware::map_response({
+        let subscribed = subscribed.clone();
+        move |response: Response| {
+            subscribed.notify_one();
+            async move { response }
+        }
+    }));
+    let (url, server) = serve(app).await;
     let client = reqwest::Client::new();
-    let mut stream = client.get(format!("{url}/v1/stream")).send();
+    let stream = tokio::spawn(async move { client.get(format!("{url}/v1/stream")).send().await });
+    // The response middleware runs after the SSE handler subscribes to broadcasts.
+    tokio::time::timeout(Duration::from_secs(2), subscribed.notified()).await?;
     let tasks = state.start_collectors();
     let started = tokio::time::Instant::now();
-    let mut response = tokio::time::timeout(Duration::from_secs(2), &mut stream).await??;
+    let mut response = tokio::time::timeout(Duration::from_secs(2), stream).await???;
     let mut frames = String::new();
     tokio::time::timeout(Duration::from_secs(4), async {
         loop {
