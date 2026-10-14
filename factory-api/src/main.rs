@@ -8,6 +8,10 @@ struct Args {
     command: Option<Command>,
     #[arg(long, env = "FACTORY_API_LISTEN", default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
+    #[arg(long, env = "FACTORY_API_UPS_ADDR", default_value = "127.0.0.1:3493")]
+    ups_addr: String,
+    #[arg(long, env = "FACTORY_API_UPS_NAME", default_value = "cyberpower")]
+    ups_name: String,
     #[arg(
         long,
         env = "FACTORY_API_METER_URL",
@@ -152,6 +156,8 @@ async fn main() -> anyhow::Result<()> {
     let mut state =
         AppState::new(args.meter_url, args.db_path, args.pricing_db_path, config).await?;
     state.static_dir = args.static_dir;
+    state.ups_addr = args.ups_addr;
+    state.ups_name = args.ups_name;
     state.usage_snapshot = args.usage_snapshot;
     state.usage_trigger = args.usage_trigger;
     state.pricing_sources = [args.openrouter_feed_url, args.litellm_feed_url];

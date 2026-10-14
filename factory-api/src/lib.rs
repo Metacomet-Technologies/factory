@@ -5,6 +5,7 @@ pub mod fleet;
 mod kiosk;
 pub mod pool;
 pub mod types;
+pub mod ups;
 mod usage;
 
 use anyhow::Result;
@@ -48,6 +49,8 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub pricing_sources: [String; 2],
     pub disable_pricing_collector: bool,
+    pub ups_addr: String,
+    pub ups_name: String,
     pricing_client: reqwest::Client,
     pub db: Arc<pool::Pool>,
     /// Explicit request/job handle propagated to both database pools.
@@ -102,6 +105,8 @@ impl AppState {
             client,
             pricing_sources: [pricing::OPENROUTER_URL.into(), pricing::LITELLM_URL.into()],
             disable_pricing_collector: false,
+            ups_addr: "127.0.0.1:3493".into(),
+            ups_name: "cyberpower".into(),
             pricing_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
                 .user_agent("factory-pricing/0.1")
@@ -486,6 +491,22 @@ impl AppState {
             })
             .await
     }
+    pub async fn ups(&self) -> ups::Ups {
+        let result = ups::read(&self.ups_addr, &self.ups_name).await;
+        let warnings = result
+            .as_ref()
+            .err()
+            .map(|e| format!("ups: {e}"))
+            .into_iter()
+            .collect();
+        self.warning("ups", result.as_ref().err().map(ToString::to_string))
+            .await;
+        ups::Ups {
+            generated_at_ms: now_ms(),
+            current: result.ok(),
+            warnings,
+        }
+    }
     pub fn start_collectors(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = vec![self.start_usage_collector()];
         tasks.extend(self.start_alerts());
@@ -494,7 +515,9 @@ impl AppState {
                 "pricing collector disabled; manual refresh and confirmation remain enabled"
             );
         }
-        for kind in ["meter", "fleet", "gpu", "pricing", "clock", "database"] {
+        for kind in [
+            "meter", "fleet", "gpu", "ups", "pricing", "clock", "database",
+        ] {
             if kind == "pricing" && self.disable_pricing_collector {
                 continue;
             }
@@ -504,6 +527,7 @@ impl AppState {
                     // Retry promptly after clock synchronization; feed attempts stay daily.
                     "pricing" | "clock" => 2,
                     "gpu" => 15,
+                    "ups" => 10,
                     "database" => 300,
                     _ => 30,
                 }));
@@ -525,6 +549,9 @@ impl AppState {
                             "gpu" => {
                                 let (current, _) = state.gpu_current().await;
                                 state.emit("gpu.sample", current);
+                            }
+                            "ups" => {
+                                state.emit("ups.sample", state.ups().await.current);
                             }
                             "clock" => {
                                 state.check_clock().await;

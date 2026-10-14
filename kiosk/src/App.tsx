@@ -14,6 +14,7 @@ import {
 import { Button } from "./components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
 import { VersionFooter } from "./components/version-footer";
+import { UpsBadge, UpsSection } from "./components/ups";
 
 export default function App() {
   const [usageRange, setUsageRange] = useState<UsageRange>("24h");
@@ -42,6 +43,13 @@ export default function App() {
     live.pricingRevision + live.snapshotRevision,
   );
   const gpu = useApi("/v1/gpu", `?range=${gpuRange}`, live.snapshotRevision);
+  const ups = useApi("/v1/ups", "", live.snapshotRevision);
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const upsCurrent = live.upsAt > (ups.data?.generated_at_ms ?? 0) ? live.ups : ups.data?.current;
   const pricing = useApi("/v1/pricing", "", live.pricingRevision + live.snapshotRevision);
   const agents = useApi("/v1/agents", "", live.agentsRevision + live.snapshotRevision);
   useBuildUpdate(live.snapshotRevision, usage.loading || gpu.loading);
@@ -67,6 +75,7 @@ export default function App() {
             <Radio aria-hidden="true" size={14} />
             {live.connected ? "Live" : "Reconnecting"}
           </span>
+          <UpsBadge current={upsCurrent} now={now} />
           <Tooltip>
             <TooltipTrigger
               render={
@@ -120,6 +129,15 @@ export default function App() {
             range={gpuRange}
             setRange={setGpuRange}
             icon={<Cpu />}
+          />
+          <UpsSection
+            current={upsCurrent}
+            now={now}
+            warnings={
+              live.upsAt > (ups.data?.generated_at_ms ?? 0)
+                ? []
+                : (ups.data?.warnings ?? (ups.error ? [ups.error] : []))
+            }
           />
           <UsageSection
             resource={usage}

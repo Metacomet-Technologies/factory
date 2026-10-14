@@ -1,9 +1,11 @@
 import { useEffect, useReducer, useState } from "react";
 import { apiUrl } from "./client";
-import type { Agents, GpuSample, StreamEvent } from "./types";
+import type { Agents, GpuSample, UpsCurrent, StreamEvent } from "./types";
 
 export interface LiveState {
   gpu: GpuSample | null | undefined;
+  ups: UpsCurrent | null | undefined;
+  upsAt: number;
   agents: Agents | null;
   requests: Extract<StreamEvent, { type: "llm.request" }>[];
   fleetRevision: number;
@@ -12,6 +14,8 @@ export interface LiveState {
 }
 export const initialLiveState: LiveState = {
   gpu: undefined,
+  ups: undefined,
+  upsAt: 0,
   agents: null,
   requests: [],
   fleetRevision: 0,
@@ -22,6 +26,8 @@ export function streamReducer(state: LiveState, event: StreamEvent): LiveState {
   switch (event.type) {
     case "gpu.sample":
       return { ...state, gpu: event.data };
+    case "ups.sample":
+      return { ...state, ups: event.data, upsAt: event.ts_ms };
     case "llm.request":
       return { ...state, requests: [event, ...state.requests].slice(0, 6) };
     case "fleet.change":
@@ -47,13 +53,45 @@ export function parseEvent(value: unknown): StreamEvent | null {
   )
     return null;
   const data = value.data;
-  if (value.type === "gpu.sample" && data === null) return value as StreamEvent;
+  if ((value.type === "gpu.sample" || value.type === "ups.sample") && data === null)
+    return value as StreamEvent;
   if (!data || typeof data !== "object") return null;
   const fields = data as Record<string, unknown>;
   const numbers = (keys: string[]) =>
     keys.every((key) => typeof fields[key] === "number" && Number.isFinite(fields[key]));
   const strings = (keys: string[]) => keys.every((key) => typeof fields[key] === "string");
   switch (value.type) {
+    case "ups.sample":
+      if (
+        numbers(["ts_ms"]) &&
+        Array.isArray(fields.flags) &&
+        fields.flags.every((flag: unknown) => typeof flag === "string") &&
+        ["status", "model", "test_result"].every(
+          (key) => fields[key] == null || typeof fields[key] === "string",
+        ) &&
+        ["on_line", "on_battery", "low_battery", "replace_battery"].every(
+          (key) => fields[key] == null || typeof fields[key] === "boolean",
+        ) &&
+        [
+          "charge_percent",
+          "charge_low_percent",
+          "charge_warning_percent",
+          "runtime_s",
+          "runtime_low_s",
+          "load_percent",
+          "load_w",
+          "load_nominal_w",
+          "input_v",
+          "output_v",
+          "battery_v",
+        ].every(
+          (key) =>
+            fields[key] == null ||
+            (typeof fields[key] === "number" && Number.isFinite(fields[key])),
+        )
+      )
+        return value as StreamEvent;
+      break;
     case "gpu.sample":
       if (
         numbers([
@@ -163,6 +201,7 @@ export function useStream() {
     source.onmessage = receive;
     for (const type of [
       "gpu.sample",
+      "ups.sample",
       "llm.request",
       "fleet.change",
       "pricing.changed",

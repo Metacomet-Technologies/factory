@@ -118,6 +118,29 @@ so synthetic ingestion can run; it does not assert host clock synchronization.
 Background traffic sends one request every two seconds through meter. API SSE
 and the kiosk ticker advance on the existing 30-second sync cadence.
 
+## UPS fake (MET-162)
+
+The namespace also runs `fake-upsd` on its private `127.0.0.1:3493`; the API's
+`FACTORY_API_UPS_ADDR` points there, never at the host's NUT service. No host
+port or relay is added. It supports `VER`, `LIST VAR cyberpower`, and `LOGOUT`
+with the real variable names and synthetic values. Set this worktree's mode:
+
+```sh
+printf '%s\n' 'OL' > .sandbox/ups-status
+printf '%s\n' 'OB DISCHRG' > .sandbox/ups-status
+printf '%s\n' 'OB DISCHRG LB' > .sandbox/ups-status
+printf '%s\n' 'ERR DATA-STALE' > .sandbox/ups-status
+```
+
+The file defaults to `OL` on first startup and survives `down`/`up`.
+Each read consults it; any other content returns `ERR DATA-STALE`.
+`GET /v1/ups` reads immediately; `ups.sample` updates every 10 seconds.
+Use `scripts/sandbox logs fake-upsd` for protocol server failures.
+
+The API's usage snapshot and refresh trigger also point inside `.sandbox`.
+Without a synthetic `.sandbox/usage.json`, Frontier CLIs show unknown usage;
+the sandbox never displays the host's account quota snapshot.
+
 ## Pricing hooks (MET-111)
 
 `up` passes `--openrouter-feed-url` and `--litellm-feed-url` pointing to the

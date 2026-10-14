@@ -3,7 +3,9 @@ import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
 import App from "./App";
 import { agentFixtures, fixtures } from "../mock/fixtures";
 import { streamReducer, initialLiveState, parseEvent } from "./api/stream";
-import type { StreamEvent } from "./api/types";
+import type { StreamEvent, UpsCurrent } from "./api/types";
+import { UpsBadge, UpsSection } from "./components/ups";
+import { TooltipProvider } from "./components/ui/tooltip";
 import { count, ms, usd, number, seen } from "./lib/format";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { AgentsSection, FleetSection } from "./components/sections";
@@ -59,6 +61,7 @@ function api(outage = false, failing = "", empty = false) {
       "/v1/fleet": data.fleet,
       "/v1/llm/usage": data.usage,
       "/v1/gpu": data.gpu,
+      "/v1/ups": { generated_at_ms: Date.now(), current: null, warnings: [] },
       "/v1/pricing": data.pricing,
       "/v1/agents": data.agents,
     };
@@ -71,6 +74,113 @@ function api(outage = false, failing = "", empty = false) {
   vi.stubGlobal("fetch", fetch);
   return fetch;
 }
+const upsSample = (flags: string[], ts_ms = Date.now()): UpsCurrent => ({
+  ts_ms,
+  flags,
+  status: flags.join(" "),
+  on_line: flags.includes("OL"),
+  on_battery: flags.includes("OB"),
+  low_battery: flags.includes("LB"),
+  replace_battery: flags.includes("RB"),
+  charge_percent: 48,
+  charge_warning_percent: 20,
+  charge_low_percent: 30,
+  runtime_s: 847,
+  runtime_low_s: 300,
+  load_w: 144,
+  load_nominal_w: 600,
+  load_percent: 24,
+  input_v: 121,
+  output_v: 120,
+  battery_v: 25.9,
+  test_result: "Done and passed",
+  model: "CyberPower synthetic",
+});
+describe("UPS telemetry", () => {
+  it.each([
+    ["OL", "Online", "plug"],
+    ["OL OB RB", "On battery", "battery-warning"],
+    ["OL OB LB RB", "Low battery", "battery-warning"],
+    ["OL RB", "Replace battery", "plug"],
+    [null, "No data", "battery"],
+    ["stale", "No data", "battery"],
+  ])("renders %s card and badge", (flags, label, icon) => {
+    const now = Date.now();
+    const current =
+      flags === null
+        ? null
+        : upsSample(
+            flags === "stale" ? ["OL"] : flags.split(" "),
+            flags === "stale" ? now - 30_001 : now,
+          );
+    render(
+      <TooltipProvider>
+        <UpsBadge current={current} now={now} />
+        <UpsSection current={current} now={now} warnings={[]} />
+      </TooltipProvider>,
+    );
+    const card = screen.getByRole("region", { name: "UPS" });
+    expect(within(card).getByText(label!)).toBeInTheDocument();
+    const badge = screen.getByRole("button", { name: `UPS: ${label}` });
+    expect(badge.querySelector(`.lucide-${icon}`)).not.toBeNull();
+    if (label === "On battery" || label === "Low battery") expect(badge).toHaveClass("status-fail");
+    else expect(badge).not.toHaveClass("status-fail");
+    if (label === "Replace battery") expect(badge).toHaveClass("status-warn");
+    if (label !== "No data") {
+      expect(within(card).getByText("14 m 7 s")).toBeInTheDocument();
+      expect(within(card).getByText("144 W of 600 W")).toBeInTheDocument();
+      expect(within(card).getByText(/Warning 20% · Low\/shutdown 30%/)).toBeInTheDocument();
+    } else expect(within(card).queryByText("48%")).not.toBeInTheDocument();
+  });
+  it("shows telemetry and age in the keyboard tooltip", async () => {
+    const now = Date.now();
+    render(
+      <TooltipProvider>
+        <UpsBadge current={upsSample(["OL"], now - 2000)} now={now} />
+      </TooltipProvider>,
+    );
+    act(() => screen.getByRole("button", { name: "UPS: Online" }).focus());
+    expect(await screen.findByText(/UPS: Online · Charge 48%/)).toHaveTextContent(
+      "UPS: Online · Charge 48% · Runtime 14 m 7 s · Load 144 W · Input 121 V · Sample age 2 s",
+    );
+  });
+  it("updates from named SSE, clears on failure, and expires without another event", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    api();
+    await act(async () => {
+      render(<App />);
+    });
+    expect(screen.getByRole("button", { name: "UPS: No data" })).toBeInTheDocument();
+    const emit = (data: UpsCurrent | null) =>
+      MockSource.latest.dispatchEvent(
+        new MessageEvent("ups.sample", {
+          data: JSON.stringify({ type: "ups.sample", ts_ms: Date.now() + 1, data }),
+        }),
+      );
+    act(() => {
+      emit(upsSample(["OB"]));
+    });
+    expect(screen.getByRole("button", { name: "UPS: On battery" })).toBeInTheDocument();
+    act(() => {
+      emit(null);
+    });
+    expect(screen.getByRole("button", { name: "UPS: No data" })).toBeInTheDocument();
+    const at = Date.now();
+    act(() => {
+      emit(upsSample(["OL"], at));
+    });
+    expect(screen.getByRole("button", { name: "UPS: Online" })).toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(30_000);
+    });
+    expect(screen.getByRole("button", { name: "UPS: Online" })).toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(screen.getByRole("button", { name: "UPS: No data" })).toBeInTheDocument();
+    vi.useRealTimers();
+  });
+});
 describe("human formats", () => {
   it("formats units, boundaries, nulls and zero without confusing them", () => {
     expect(count(1_240_000)).toBe("1.2M");

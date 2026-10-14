@@ -27,6 +27,79 @@ async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
     )
 }
+
+#[tokio::test]
+async fn ups_unavailable_and_silent_peer_do_not_block_collectors() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    pricing::migrate(directory.path().join("pricing.db"))?;
+    let mut state = AppState::new(
+        "http://127.0.0.1:1".into(),
+        directory.path().join("requests.db"),
+        directory.path().join("pricing.db"),
+        fleet::Config { nodes: vec![] },
+    )
+    .await?;
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    state.ups_addr = closed.local_addr()?.to_string();
+    drop(closed);
+    let (url, server) = serve(router(state.clone())).await;
+    let response = reqwest::get(format!("{url}/v1/ups")).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await?;
+    assert!(body["current"].is_null());
+    assert!(
+        body["warnings"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("ups: connect failed")
+    );
+    server.abort();
+
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    state.ups_addr = silent.local_addr()?.to_string();
+    state.disable_pricing_collector = true;
+    let peer = tokio::spawn(async move {
+        let (_socket, _) = silent.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let (url, server) = serve(router(state.clone())).await;
+    let client = reqwest::Client::new();
+    let mut response = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get(format!("{url}/v1/stream")).send(),
+    )
+    .await??;
+    let started = tokio::time::Instant::now();
+    let tasks = state.start_collectors();
+    let mut frames = String::new();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            frames.push_str(std::str::from_utf8(&response.chunk().await?.unwrap())?);
+            if frames.contains("event: ups.sample") {
+                break;
+            }
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(
+        frames.contains("event: gpu.sample"),
+        "GPU must emit while UPS is waiting: {frames}"
+    );
+    assert!(frames.contains("\"type\":\"ups.sample\"") && frames.contains("\"data\":null"));
+    let warnings = state.ups().await;
+    assert!(warnings.current.is_none());
+    assert!(warnings.warnings[0].contains("timed out after 3 s"));
+    state.shutdown.cancel();
+    for task in tasks {
+        task.abort();
+    }
+    peer.abort();
+    server.abort();
+    state.db.close().await?;
+    Ok(())
+}
 fn keys(value: &Value, expected: &[&str]) {
     let mut actual: Vec<_> = value
         .as_object()

@@ -9,6 +9,8 @@ export type ModelUsage = components["schemas"]["ModelUsage"];
 export type Usage = components["schemas"]["Usage"];
 export type GpuSample = components["schemas"]["GpuCurrent"];
 export type Gpu = components["schemas"]["Gpu"];
+export type Ups = components["schemas"]["Ups"];
+export type UpsCurrent = components["schemas"]["UpsCurrent"];
 export type Pricing = components["schemas"]["Pricing"];
 export type Agents = components["schemas"]["Agents"];
 export type LlmRequest = components["schemas"]["LlmRequest"];
@@ -18,6 +20,7 @@ export type LlmRequest = components["schemas"]["LlmRequest"];
 export type StreamEvent = Omit<components["schemas"]["StreamEvent"], "type" | "data"> &
   (
     | { type: "gpu.sample"; data: GpuSample | null }
+    | { type: "ups.sample"; data: UpsCurrent | null }
     | { type: "llm.request"; data: LlmRequest }
     | { type: "fleet.change"; data: components["schemas"]["FleetChange"] }
     | { type: "pricing.changed"; data: components["schemas"]["PricingChanged"] }
