@@ -372,14 +372,24 @@ pub struct UpsEnergy {
     pub electricity_rate_micro_usd_per_kwh: Option<i64>,
     pub coverage_percent: f64,
 }
-pub fn energy(db: &Connection, since: i64, now: i64) -> Result<UpsEnergy> {
+/// Internal read result; intervals are not part of the API response.
+pub struct CoveredEnergy {
+    pub energy: UpsEnergy,
+    pub intervals: Option<Vec<(i64, i64)>>,
+}
+pub const ENERGY_SQL: &str = "SELECT energy_mwh,coverage_ms,NULL,0 FROM ups_rollup_hourly WHERE ts_ms>=?1 AND ts_ms<=?2 UNION ALL SELECT energy_mwh,coverage_ms,ts_ms,coverage_ms FROM ups_samples WHERE ts_ms>=?3 AND ts_ms<?1 UNION ALL SELECT 0,0,ts_ms,coverage_ms FROM ups_samples WHERE ts_ms>=?1 AND ts_ms<=?2 AND coverage_ms>0 AND EXISTS(SELECT 1 FROM ups_rollup_hourly WHERE ts_ms=ups_samples.ts_ms/3600000*3600000)";
+pub fn energy(db: &Connection, since: i64, now: i64) -> Result<CoveredEnergy> {
     let rate = settings(db)?.electricity_rate_micro_usd_per_kwh;
     let first_hour = (since + HOUR_MS - 1) / HOUR_MS * HOUR_MS;
     // Full buckets plus the retained leading partial hour. Beyond raw retention,
     // omit that partial hour rather than inventing energy; coverage exposes it.
-    let mut statement = db.prepare("SELECT energy_mwh,coverage_ms FROM ups_rollup_hourly WHERE ts_ms>=?1 AND ts_ms<=?2 UNION ALL SELECT energy_mwh,coverage_ms FROM ups_samples WHERE ts_ms>=?3 AND ts_ms<?1")?;
+    // Return raw intervals alongside the same energy buckets, in one statement.
+    // A retained rollup without its raw intervals cannot establish GPU coverage.
+    let mut statement = db.prepare(ENERGY_SQL)?;
     let mut rows = statement.query(params![first_hour, now, since])?;
     let (mut energy, mut coverage) = (0i64, 0i64);
+    let mut intervals = Vec::new();
+    let mut raw_coverage = 0i64;
     while let Some(row) = rows.next()? {
         energy = energy
             .checked_add(row.get(0)?)
@@ -387,39 +397,62 @@ pub fn energy(db: &Connection, since: i64, now: i64) -> Result<UpsEnergy> {
         coverage = coverage
             .checked_add(row.get(1)?)
             .ok_or_else(|| anyhow::anyhow!("coverage sum overflow"))?;
+        let elapsed: i64 = row.get(3)?;
+        if elapsed > 0 {
+            let end: i64 = row.get(2)?;
+            intervals.push((end - elapsed, end));
+            raw_coverage = raw_coverage
+                .checked_add(elapsed)
+                .ok_or_else(|| anyhow::anyhow!("coverage sum overflow"))?;
+        }
     }
-    Ok(UpsEnergy {
-        energy_mwh: energy,
-        cost_nano_usd: rate.map(|r| cost(energy, r)).transpose()?,
-        gpu_energy_mwh: None,
-        electricity_rate_micro_usd_per_kwh: rate,
-        coverage_percent: (100.0 * coverage as f64 / (now - since) as f64).min(100.0),
+    intervals.sort_unstable();
+    Ok(CoveredEnergy {
+        energy: UpsEnergy {
+            energy_mwh: energy,
+            cost_nano_usd: rate.map(|r| cost(energy, r)).transpose()?,
+            gpu_energy_mwh: None,
+            electricity_rate_micro_usd_per_kwh: rate,
+            coverage_percent: (100.0 * coverage as f64 / (now - since) as f64).min(100.0),
+        },
+        intervals: (raw_coverage == coverage).then_some(intervals),
     })
 }
 
-/// GPU 0 is the same device exposed by /v1/gpu. Require complete coverage,
-/// including both edges and no gap >30s; never extrapolate retained history.
-pub fn gpu_energy(samples: &[shared::GpuSample], since: i64, now: i64) -> Result<Option<i64>> {
+/// Integrate GPU 0 only over stored UPS intervals. Require samples within 30s
+/// of both edges and reject gaps inside an interval. Round each UPS interval
+/// once, using its right-endpoint GPU reading just like the UPS load reading.
+pub fn gpu_energy(samples: &[shared::GpuSample], intervals: &[(i64, i64)]) -> Result<Option<i64>> {
     let mut points: Vec<_> = samples.iter().filter(|s| s.index == 0).collect();
     points.sort_by_key(|s| s.ts);
-    let Some(first) = points.first() else {
-        return Ok(None);
-    };
-    if first.ts > since + 30_000 || points.last().unwrap().ts < now - 30_000 {
-        return Ok(None);
-    }
     let mut total = 0i64;
-    for pair in points.windows(2) {
-        let elapsed = pair[1].ts - pair[0].ts;
-        if elapsed > 30_000 {
+    for &(start, end) in intervals {
+        // Latest reading at each endpoint; if no recent one precedes it, the
+        // first following reading is usable within the same 30s tolerance.
+        let at = |ts| {
+            let i = points.partition_point(|s| s.ts <= ts);
+            let point = if i > 0 && ts - points[i - 1].ts <= 30_000 {
+                points[i - 1]
+            } else {
+                *points.get(i)?
+            };
+            ((point.ts - ts).abs() <= 30_000).then_some(point)
+        };
+        let (Some(_), Some(right)) = (at(start), at(end)) else {
             return Ok(None);
+        };
+        // Include the readings bracketing the interval, not just readings
+        // inside it: a hole can span the entire covered UPS interval.
+        let first = points.partition_point(|s| s.ts <= start).saturating_sub(1);
+        let last = (points.partition_point(|s| s.ts < end) + 1).min(points.len());
+        for pair in points[first..last].windows(2) {
+            if pair[0].ts < end && pair[1].ts > start && pair[1].ts - pair[0].ts > 30_000 {
+                return Ok(None);
+            }
         }
-        let elapsed = pair[1].ts.min(now) - pair[0].ts.max(since);
-        if elapsed > 0 {
-            total = total
-                .checked_add(sample_energy(Some(pair[1].power_w), elapsed)?)
-                .ok_or_else(|| anyhow::anyhow!("GPU energy sum overflow"))?;
-        }
+        total = total
+            .checked_add(sample_energy(Some(right.power_w), end - start)?)
+            .ok_or_else(|| anyhow::anyhow!("GPU energy sum overflow"))?;
     }
     Ok(Some(total))
 }

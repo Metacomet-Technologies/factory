@@ -218,7 +218,8 @@ export interface paths {
     /**
      * Costs round half-up once per range. Coverage counts intervals between reads
      *     no more than 30s apart. An expired leading partial hour is omitted, not estimated.
-     *     GPU energy is null unless GPU 0 history covers the range with gaps <=30s.
+     *     GPU energy uses the same covered UPS intervals and right-endpoint rounding.
+     *     It is null if GPU coverage is missing or its energy exceeds the UPS load.
      */
     get: operations["ups_energy"];
     put?: never;
@@ -1035,7 +1036,7 @@ export interface operations {
   ups_energy: {
     parameters: {
       query?: {
-        /** @description 24h (default), 7d, 30d, 365d */
+        /** @description 1h, 24h (default), 7d, 30d, 365d */
         range?: string;
       };
       header?: never;

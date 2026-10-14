@@ -1791,7 +1791,7 @@
         "operationId": "ups_energy",
         "parameters": [
           {
-            "description": "24h (default), 7d, 30d, 365d",
+            "description": "1h, 24h (default), 7d, 30d, 365d",
             "in": "query",
             "name": "range",
             "required": false,
@@ -1832,7 +1832,7 @@
             "description": ""
           }
         },
-        "summary": "Costs round half-up once per range. Coverage counts intervals between reads\nno more than 30s apart. An expired leading partial hour is omitted, not estimated.\nGPU energy is null unless GPU 0 history covers the range with gaps <=30s.",
+        "summary": "Costs round half-up once per range. Coverage counts intervals between reads\nno more than 30s apart. An expired leading partial hour is omitted, not estimated.\nGPU energy uses the same covered UPS intervals and right-endpoint rounding.\nIt is null if GPU coverage is missing or its energy exceeds the UPS load.",
         "tags": []
       }
     },
