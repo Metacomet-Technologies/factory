@@ -49,6 +49,10 @@ beforeEach(() => {
 function api(outage = false, failing = "", empty = false) {
   const fetch = vi.fn((path: string) => {
     const url = new URL(path, "http://localhost");
+    if (url.pathname === "/control/v1/state")
+      return Promise.resolve(
+        new Response(JSON.stringify({ error: "controls denied" }), { status: 403 }),
+      );
     const data = fixtures(outage, url.searchParams.get("range") === "7d" ? "7d" : "24h");
     data.fleet.nodes[0]!.services[0]!.name = "renamed-meter";
     if (empty) {
@@ -204,7 +208,7 @@ describe("UPS telemetry", () => {
     expect(await screen.findByText("factory shut down during outage")).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Local LLM" })).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Controls" })).toHaveTextContent(
-      "No control actions available",
+      "Controls available from Devon's or David's devices",
     );
     for (const range of ["1h", "7d", "30d", "365d", "24h"]) {
       fireEvent.click(screen.getByRole("button", { name: range }));

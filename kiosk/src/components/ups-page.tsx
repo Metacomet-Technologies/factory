@@ -6,6 +6,7 @@ import { ms, number, usd } from "../lib/format";
 import { electricityRate, rateInput } from "../lib/ups";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
+import UpsControls from "./ups-controls";
 
 const UpsCharts = lazy(() => import("./ups-charts"));
 const ranges: UpsRange[] = ["1h", "24h", "7d", "30d", "365d"];
@@ -462,10 +463,7 @@ export default function UpsPage({
           )}
           {settingsRevision > 0 && <p role="status">Settings saved.</p>}
         </section>
-        <section className="ups-panel ups-controls" aria-label="Controls">
-          <h3>Controls</h3>
-          <p className="muted">Reserved for future UPS controls. No control actions available.</p>
-        </section>
+        <UpsControls />
       </div>
     </main>
   );

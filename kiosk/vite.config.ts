@@ -13,7 +13,15 @@ const proxyTarget =
   process.env.KIOSK_API_PROXY ??
   (process.env.KIOSK_MOCK ? `http://127.0.0.1:${process.env.MOCK_PORT ?? 4179}` : undefined);
 const proxy = proxyTarget
-  ? Object.fromEntries(["/v1", "/openapi.json"].map((path) => [path, { target: proxyTarget }]))
+  ? Object.fromEntries(
+      ["/v1", "/openapi.json", "/control"].map((path) => [
+        path,
+        {
+          target:
+            path === "/control" ? (process.env.KIOSK_CONTROL_PROXY ?? proxyTarget) : proxyTarget,
+        },
+      ]),
+    )
   : {};
 
 // https://vite.dev/config/
@@ -31,6 +39,7 @@ export default defineConfig({
       "mock-outage": { command: "MOCK_PORT=4182 MOCK_OUTAGE=1 node mock/server.ts", cache: false },
       screenshots: { command: "node scripts/screenshots.ts", cache: false },
       "ups:check": { command: "node scripts/ups-check.ts", cache: false },
+      "ups-controls:check": { command: "node scripts/ups-controls-check.ts", cache: false },
       "api:types": { command: "node scripts/api-types.ts", cache: false },
       "api:types:check": { command: "node scripts/api-types.ts --check", cache: false },
       "screenshots:live": { command: "node scripts/live-check.ts", cache: false },
