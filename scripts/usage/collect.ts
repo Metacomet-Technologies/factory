@@ -149,8 +149,11 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const snapshot = await collect(await readPrevious(path));
     if (args[0] === '--dry-run') console.log(JSON.stringify(snapshot, null, 2));
     else await writeSnapshot(path, snapshot);
-  } catch {
-    console.error('Usage collector failed: check runtime, arguments, lock and snapshot permissions.');
+  } catch (error) {
+    const message = error instanceof Error && error.message.startsWith('Use Node 24.x')
+      ? error.message
+      : 'Usage collector failed: check runtime, arguments, lock and snapshot permissions.';
+    console.error(message);
     process.exitCode = 1;
   } finally { if (fd !== undefined) closeSync(fd); }
 }
