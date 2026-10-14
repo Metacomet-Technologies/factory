@@ -61,6 +61,8 @@ pub struct AppState {
     fleet: Arc<RwLock<Fleet>>,
     fleet_discovered: Arc<AtomicBool>,
     gpu_latest: Arc<std::sync::Mutex<Option<(i64, f64)>>>,
+    ups_latest: Arc<RwLock<alerts::UpsRead>>,
+    ups_changed: Arc<tokio::sync::Notify>,
     meter_synced_at_ms: Arc<AtomicI64>,
     warnings: Arc<RwLock<BTreeMap<String, String>>>,
     events: broadcast::Sender<StreamEvent>,
@@ -119,6 +121,11 @@ impl AppState {
             fleet: Default::default(),
             fleet_discovered: Default::default(),
             gpu_latest: Default::default(),
+            ups_latest: Arc::new(RwLock::new(alerts::UpsRead {
+                current: None,
+                last_success_ms: now_ms(),
+            })),
+            ups_changed: Default::default(),
             meter_synced_at_ms: Arc::new(AtomicI64::new(now_ms())),
             warnings: Default::default(),
             events: broadcast::channel(1024).0,
@@ -555,6 +562,7 @@ impl AppState {
                             "ups" => {
                                 let sample = state.ups().await.current;
                                 state.emit("ups.sample", &sample);
+                                let reading = sample.clone();
                                 let collector = ups_collector.clone();
                                 let result = state
                                     .db
@@ -580,6 +588,14 @@ impl AppState {
                                         state.warning("ups history", Some(e.to_string())).await
                                     }
                                 }
+                                // Publish after history commits so recovery sees restart endings.
+                                let mut latest = state.ups_latest.write().await;
+                                if let Some(s) = &reading {
+                                    latest.last_success_ms = s.ts_ms;
+                                }
+                                latest.current = reading;
+                                drop(latest);
+                                state.ups_changed.notify_one();
                             }
                             "clock" => {
                                 state.check_clock().await;

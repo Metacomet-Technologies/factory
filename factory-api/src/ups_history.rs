@@ -108,6 +108,15 @@ fn event(row: &Row<'_>) -> rusqlite::Result<UpsEvent> {
         end_reason: row.get(7)?,
     })
 }
+/// Include the event spanning the alert's start, plus all later restart segments.
+/// Both branches use ups_events_started; history before the outage is not loaded.
+pub const ALERT_EVENTS_SQL: &str = "SELECT id,kind,started_ms,ended_ms,min_charge_percent,min_runtime_s,detail,end_reason FROM ups_events WHERE kind='on_battery' AND started_ms>=?1 UNION ALL SELECT id,kind,started_ms,ended_ms,min_charge_percent,min_runtime_s,detail,end_reason FROM ups_events WHERE id=(SELECT id FROM ups_events WHERE kind='on_battery' AND started_ms<?1 ORDER BY started_ms DESC,id DESC LIMIT 1) AND (ended_ms IS NULL OR ended_ms>=?1)";
+pub fn alert_events(db: &Connection, since: i64) -> Result<Vec<UpsEvent>> {
+    Ok(db
+        .prepare(ALERT_EVENTS_SQL)?
+        .query_map([since], event)?
+        .collect::<rusqlite::Result<_>>()?)
+}
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UpsEvents {
     pub events: Vec<UpsEvent>,

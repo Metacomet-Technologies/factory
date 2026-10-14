@@ -1,10 +1,10 @@
 //! Slack alerts for signals factory-api already has (MET-150).
 //!
-//! Every 30 s the engine turns current signals into per-key verdicts, posts one
+//! Every 10 s the engine turns current signals into per-key verdicts, posts one
 //! Slack message when a key opens and a threaded recovery when it clears. State
 //! lives in a small JSON file (never SQLite) so restarts do not repost. A source
-//! that cannot be read is logged once as unavailable and never alerts; its open
-//! alerts are held until it is readable again. Never log the Slack token.
+//! that cannot be read holds its open alerts until readable again. UPS alone
+//! alerts on communication loss after 60 s. Never log the Slack token.
 use crate::types::{ActiveAlert, AlertSeverity, Alerts, ClearedAlert, Fleet};
 use crate::{AppState, fleet, now_ms};
 use anyhow::{Context, Result, anyhow, bail};
@@ -42,8 +42,8 @@ const DISPATCH_STALE_MS: i64 = 5 * 60_000;
 const USAGE_STALE_MS: i64 = crate::usage::STALE_MS;
 const MAX_BACKOFF_MS: i64 = 15 * 60_000;
 const MAX_RECOVERY_ATTEMPTS: u32 = 12;
-const SOURCES: [&str; 9] = [
-    "node", "service", "gpu", "meter", "pricing", "backup", "clock", "dispatch", "usage",
+const SOURCES: [&str; 10] = [
+    "node", "service", "gpu", "meter", "pricing", "backup", "clock", "dispatch", "usage", "ups",
 ];
 
 /// Slack bot token. Debug output is redacted; the value only reaches the HTTP header.
@@ -100,6 +100,14 @@ pub struct BackupEntry {
     pub last_attempt_ms: Option<i64>,
     pub error: Option<String>,
 }
+/// Latest collector read and the start of its communication-loss grace period.
+#[derive(Clone, Debug)]
+pub struct UpsRead {
+    pub current: Option<crate::ups::UpsCurrent>,
+    /// Startup time until the first successful collector read.
+    pub last_success_ms: i64,
+}
+
 /// One evaluation's inputs. `None` means the source is unreadable right now.
 #[derive(Clone, Debug, Default)]
 pub struct Signals {
@@ -117,6 +125,8 @@ pub struct Signals {
     pub dispatch_last_trigger_ms: Option<Option<i64>>,
     /// Collected tools and their last good reading.
     pub usage: Option<Vec<(String, Option<i64>)>>,
+    pub ups: Option<UpsRead>,
+    pub ups_events: Vec<crate::ups_history::UpsEvent>,
 }
 
 enum Verdict {
@@ -139,6 +149,15 @@ struct Open {
     attempts: u32,
     #[serde(default)]
     next_post_ms: i64,
+    #[serde(default)]
+    ups: Option<UpsOutage>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct UpsOutage {
+    started_ms: i64,
+    min_charge: Option<f64>,
+    min_runtime: Option<i64>,
+    restarted: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Recovery {
@@ -156,6 +175,7 @@ struct Stored {
     recent: Vec<ClearedAlert>,
     /// Recovery replies not yet accepted by Slack.
     outbox: Vec<Recovery>,
+    ups_test_result: Option<String>,
 }
 
 pub struct Engine {
@@ -190,6 +210,30 @@ fn duration(ms: i64) -> String {
 }
 fn backoff(attempts: u32) -> i64 {
     (30_000_i64 << attempts.saturating_sub(1).min(10)).min(MAX_BACKOFF_MS)
+}
+fn reading<T: std::fmt::Display>(value: Option<T>, unit: &str) -> String {
+    value.map_or_else(|| "unknown".into(), |v| format!("{v}{unit}"))
+}
+fn ups_detail(sample: &crate::ups::UpsCurrent) -> String {
+    format!(
+        "charge {}, runtime {}, load {}, input {}",
+        reading(sample.charge_percent, "%"),
+        reading(sample.runtime_s, " s"),
+        reading(sample.load_w, " W"),
+        reading(sample.input_v, " V")
+    )
+}
+impl UpsOutage {
+    fn observe(&mut self, charge: Option<f64>, runtime: Option<i64>) {
+        self.min_charge = match (self.min_charge, charge) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.min_runtime = match (self.min_runtime, runtime) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
 }
 pub fn open_text(severity: AlertSeverity, summary: &str) -> String {
     let icon = match severity {
@@ -341,6 +385,20 @@ impl Engine {
     }
     /// Applies one evaluation; returns sources newly reported unavailable.
     pub fn evaluate(&mut self, now: i64, signals: &Signals) -> Vec<&'static str> {
+        for open in &mut self.stored.active {
+            if let Some(outage) = &mut open.ups {
+                if let Some(sample) = signals.ups.as_ref().and_then(|u| u.current.as_ref()) {
+                    outage.observe(sample.charge_percent, sample.runtime_s);
+                }
+                if open.key == "ups:on_battery" {
+                    for event in &signals.ups_events {
+                        outage.observe(event.min_charge_percent, event.min_runtime_s);
+                        outage.restarted |= event.end_reason.as_deref() == Some("restart");
+                    }
+                }
+                self.dirty = true;
+            }
+        }
         let mut newly = vec![];
         for source in SOURCES {
             match self.findings(source, now, signals) {
@@ -357,7 +415,7 @@ impl Engine {
                     if self.unavailable.remove(source) {
                         tracing::info!(source, "alert source available again");
                     }
-                    self.reconcile(source, now, findings);
+                    self.reconcile(source, now, findings, signals);
                 }
             }
         }
@@ -370,6 +428,115 @@ impl Engine {
     fn findings(&mut self, source: &str, now: i64, signals: &Signals) -> Option<Findings> {
         let mut out = Findings::new();
         match source {
+            "ups" => {
+                let read = signals.ups.as_ref()?;
+                // One 60s grace period measured from the last good read, not two holds.
+                if now - read.last_success_ms >= 60_000 {
+                    out.insert("ups:comms_lost".into(), Verdict::Fire(
+                        AlertSeverity::Warning, "UPS comms lost: no successful read for 60 s; charge unknown, runtime unknown, load unknown, input unknown".into()));
+                }
+                let Some(sample) = read.current.as_ref().filter(|s| now - s.ts_ms <= 20_000) else {
+                    self.pending_since.remove("ups:on_battery");
+                    // An unreadable source cannot prove a battery condition has cleared.
+                    for open in &self.stored.active {
+                        if open.key.starts_with("ups:") {
+                            out.entry(open.key.clone()).or_insert(Verdict::Hold);
+                        }
+                    }
+                    return Some(out);
+                };
+                let detail = ups_detail(sample);
+                let thresholds = format!(
+                    "shutdown thresholds: charge {}, runtime {}",
+                    reading(sample.charge_low_percent, "%"),
+                    reading(sample.runtime_low_s, " s")
+                );
+                match sample.on_battery {
+                    Some(true) => {
+                        self.pending_since
+                            .entry("ups:on_battery".into())
+                            .or_insert(sample.ts_ms);
+                        let verdict = if self.held("ups:on_battery", now, 30_000) {
+                            Verdict::Fire(
+                                AlertSeverity::Warning,
+                                format!("UPS on battery: {detail}; {thresholds}"),
+                            )
+                        } else {
+                            Verdict::Hold
+                        };
+                        out.insert("ups:on_battery".into(), verdict);
+                    }
+                    Some(false) if sample.on_line == Some(true) => {
+                        self.pending_since.remove("ups:on_battery");
+                    }
+                    _ => {
+                        self.pending_since.remove("ups:on_battery");
+                        out.insert("ups:on_battery".into(), Verdict::Hold);
+                    }
+                }
+                let low_charge = sample
+                    .charge_percent
+                    .map(|c| c <= sample.charge_warning_percent.unwrap_or(20.0));
+                for (key, active, severity, text) in [
+                    (
+                        "ups:low_battery",
+                        if sample.low_battery == Some(true) || low_charge == Some(true) {
+                            Some(true)
+                        } else if sample.low_battery == Some(false) && low_charge == Some(false) {
+                            Some(false)
+                        } else {
+                            None
+                        },
+                        AlertSeverity::Critical,
+                        format!("UPS low battery: {detail}; {thresholds}"),
+                    ),
+                    (
+                        "ups:replace_battery",
+                        sample.replace_battery,
+                        AlertSeverity::Warning,
+                        format!("UPS replace battery: {detail}"),
+                    ),
+                ] {
+                    match active {
+                        Some(true) => {
+                            out.insert(key.into(), Verdict::Fire(severity, text));
+                        }
+                        None => {
+                            out.insert(key.into(), Verdict::Hold);
+                        }
+                        Some(false) => (),
+                    }
+                }
+                // CyberPower cps-hid.c uses test_read_info from usbhid-ups.c:
+                // https://github.com/networkupstools/nut/blob/v2.8.4/drivers/usbhid-ups.c
+                // 1: Done and passed; 2: Done and warning; 3: Done and error;
+                // 4: Aborted; 5: In progress; 6: No test initiated; 7: Test scheduled.
+                if let Some(result) = &sample.test_result {
+                    let changed = self
+                        .stored
+                        .ups_test_result
+                        .as_ref()
+                        .is_some_and(|old| old != result);
+                    if self.stored.ups_test_result.as_ref() != Some(result) {
+                        self.stored.ups_test_result = Some(result.clone());
+                        self.dirty = true;
+                    }
+                    let key = format!("ups:self_test:{}", one_line(result, 160));
+                    if !matches!(result.as_str(), "No test initiated" | "Done and passed") {
+                        if changed {
+                            out.insert(key, Verdict::Fire(AlertSeverity::Warning, format!("UPS self-test failed: {}; {detail}; this is the replace-battery signal on NUT 2.8.4 (CyberPower RB reporting requires NUT >= 2.8.5)", one_line(result, 160))));
+                        } else {
+                            out.insert(key, Verdict::Hold);
+                        }
+                    }
+                } else {
+                    for open in &self.stored.active {
+                        if open.key.starts_with("ups:self_test:") {
+                            out.insert(open.key.clone(), Verdict::Hold);
+                        }
+                    }
+                }
+            }
             "node" => {
                 let fleet = signals
                     .fleet
@@ -555,7 +722,7 @@ impl Engine {
         }
         Some(out)
     }
-    fn reconcile(&mut self, source: &str, now: i64, findings: Findings) {
+    fn reconcile(&mut self, source: &str, now: i64, findings: Findings, signals: &Signals) {
         let prefix = format!("{source}:");
         let (clear, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.stored.active)
             .into_iter()
@@ -569,7 +736,18 @@ impl Engine {
                 && !self.stored.active.iter().any(|open| open.key == key)
             {
                 tracing::info!(%key, ?severity, %summary, posting = self.config.token.is_some(), "alert opened");
+                let ups = key.starts_with("ups:").then(|| {
+                    let mut outage = UpsOutage {
+                        started_ms: self.pending_since.get(&key).copied().unwrap_or(now),
+                        ..Default::default()
+                    };
+                    if let Some(sample) = signals.ups.as_ref().and_then(|u| u.current.as_ref()) {
+                        outage.observe(sample.charge_percent, sample.runtime_s);
+                    }
+                    outage
+                });
                 self.stored.active.push(Open {
+                    ups,
                     key,
                     severity,
                     summary,
@@ -587,10 +765,26 @@ impl Engine {
         if open.severity != AlertSeverity::Info
             && let Some(thread_ts) = open.slack_ts.clone()
         {
+            let text = if let Some(outage) = &open.ups {
+                format!(
+                    ":white_check_mark: Recovered after {} s: {}; minimum charge {}, minimum runtime {}{} · {DASHBOARD_URL}",
+                    (now - outage.started_ms).max(0) / 1000,
+                    open.summary,
+                    reading(outage.min_charge, "%"),
+                    reading(outage.min_runtime, " s"),
+                    if outage.restarted {
+                        "; factory shut down during the outage (UPS history end_reason=restart)"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                recovery_text(&open.summary, now - open.opened_at_ms)
+            };
             self.stored.outbox.push(Recovery {
                 key: open.key.clone(),
                 thread_ts,
-                text: recovery_text(&open.summary, now - open.opened_at_ms),
+                text,
                 attempts: 0,
                 next_post_ms: now,
             });
@@ -799,6 +993,7 @@ impl AppState {
             pricing,
             crate::usage::observations(&self.usage_snapshot, now)
         );
+        let ups = Some(self.ups_latest.read().await.clone());
         Signals {
             fleet: (fleet.generated_at_ms != 0).then_some(fleet),
             fleet_discovered: self.fleet_discovered.load(Ordering::Acquire),
@@ -809,6 +1004,8 @@ impl AppState {
             clock_synchronized,
             dispatch_last_trigger_ms,
             usage,
+            ups,
+            ups_events: vec![],
         }
     }
     pub(crate) fn start_alerts(&self) -> Option<tokio::task::JoinHandle<()>> {
@@ -820,18 +1017,56 @@ impl AppState {
             .take()?;
         let mut state = self.clone();
         Some(tokio::spawn(async move {
-            // The first tick waits one interval so fleet and GPU collectors have run.
+            // UPS follows its 10s collector; other source reads keep their 30s cadence.
+            let ups_interval = Duration::from_secs(10);
             let mut timer =
-                tokio::time::interval_at(tokio::time::Instant::now() + INTERVAL, INTERVAL);
+                tokio::time::interval_at(tokio::time::Instant::now() + ups_interval, ups_interval);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut signals = Signals::default();
+            let mut next_collection = 0;
             loop {
                 tokio::select! { biased;
                     _ = state.shutdown.cancelled() => break,
+                    _ = state.ups_changed.notified() => (),
                     _ = timer.tick() => (),
                 }
                 state.query_scope = factory_db::Scope::default();
                 let work = async {
-                    let signals = state.alert_signals().await;
+                    if now_ms() >= next_collection {
+                        signals = state.alert_signals().await;
+                        next_collection = now_ms() + INTERVAL.as_millis() as i64;
+                    }
+                    signals.ups = Some(state.ups_latest.read().await.clone());
+                    signals.ups_events.clear();
+                    if let Some(since) = engine
+                        .stored
+                        .active
+                        .iter()
+                        .filter(|a| a.key == "ups:on_battery")
+                        .map(|a| {
+                            a.ups
+                                .as_ref()
+                                .map_or(a.opened_at_ms - 30_000, |u| u.started_ms)
+                        })
+                        .min()
+                    {
+                        match state
+                            .db
+                            .requests
+                            .read(&state.query_scope, move |db| {
+                                crate::ups_history::alert_events(db, since)
+                            })
+                            .await
+                        {
+                            Ok(events) => signals.ups_events = events,
+                            Err(error) => {
+                                tracing::warn!(%error, "UPS recovery history unavailable; holding battery alert");
+                                if let Some(read) = &mut signals.ups {
+                                    read.current = None;
+                                }
+                            }
+                        }
+                    }
                     engine.tick(now_ms(), &signals).await;
                     *state.alerts.view.write().await = engine.view();
                 };
@@ -990,6 +1225,226 @@ mod tests {
     type BackupRow<'a> = (&'a str, Option<i64>, Option<i64>, Option<&'a str>);
     const T0: i64 = 1_791_900_000_000;
     const MIN: i64 = 60_000;
+
+    fn ups(at: i64, status: &str, charge: f64, runtime: i64, result: &str) -> Signals {
+        let sample = serde_json::from_value(json!({
+            "ts_ms": at, "status": status, "flags": status.split_whitespace().collect::<Vec<_>>(),
+            "on_line": status.contains("OL"), "on_battery": status.contains("OB"),
+            "low_battery": status.contains("LB"), "replace_battery": status.contains("RB"),
+            "charge_percent": charge, "charge_low_percent": 10, "charge_warning_percent": 20,
+            "runtime_s": runtime, "runtime_low_s": 120, "load_w": 144, "input_v": 121,
+            "test_result": result
+        }))
+        .unwrap();
+        Signals {
+            ups: Some(UpsRead {
+                current: Some(sample),
+                last_success_ms: at,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn ups_debounce_restart_minima_and_message_snapshots() {
+        let (slack, url) = fake_slack().await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alerts.json");
+        let mut engine = Engine::load(config(&url, Some(path.clone()), true));
+        engine
+            .tick(T0, &ups(T0, "OB DISCHRG", 80.0, 900, "Done and passed"))
+            .await;
+        engine
+            .tick(
+                T0 + 10_000,
+                &ups(T0 + 10_000, "OL", 80.0, 900, "Done and passed"),
+            )
+            .await;
+        assert!(slack.posts.lock().unwrap().is_empty());
+        for seconds in [20, 49] {
+            let at = T0 + seconds * 1000;
+            engine
+                .tick(at, &ups(at, "OB DISCHRG", 48.0, 600, "Done and passed"))
+                .await;
+        }
+        assert!(slack.posts.lock().unwrap().is_empty());
+        let at = T0 + 51_000;
+        engine
+            .tick(at, &ups(at, "OB DISCHRG", 48.0, 600, "Done and passed"))
+            .await;
+        assert_eq!(engine.view().active[0].key, "ups:on_battery");
+        assert_eq!(
+            slack.posts.lock().unwrap()[0],
+            json!({"channel":"C-test", "text":format!(":warning: UPS on battery: charge 48%, runtime 600 s, load 144 W, input 121 V; shutdown thresholds: charge 10%, runtime 120 s · {DASHBOARD_URL}")})
+        );
+        engine
+            .tick(
+                T0 + 60_000,
+                &ups(T0 + 60_000, "OB", 35.0, 450, "Done and passed"),
+            )
+            .await;
+        drop(engine);
+        let mut restarted = Engine::load(config(&url, Some(path.clone()), true));
+        // Holds survive restart even though the in-memory pending timer does not.
+        restarted
+            .tick(
+                T0 + 70_000,
+                &ups(T0 + 70_000, "OB", 40.0, 500, "Done and passed"),
+            )
+            .await;
+        assert_eq!(slack.posts.lock().unwrap().len(), 1);
+        let mut recovered = ups(T0 + 111_000, "OL", 60.0, 700, "Done and passed");
+        recovered.ups_events.push(crate::ups_history::UpsEvent {
+            id: 1,
+            kind: "on_battery".into(),
+            started_ms: T0 + 20_000,
+            ended_ms: Some(T0 + 70_000),
+            min_charge_percent: Some(32.0),
+            min_runtime_s: Some(390),
+            detail: None,
+            end_reason: Some("restart".into()),
+        });
+        restarted.tick(T0 + 111_000, &recovered).await;
+        let posts = slack.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(
+            posts[1],
+            json!({"channel":"C-test", "thread_ts":posts_ts(1), "text":format!(":white_check_mark: Recovered after 91 s: UPS on battery: charge 48%, runtime 600 s, load 144 W, input 121 V; shutdown thresholds: charge 10%, runtime 120 s; minimum charge 32%, minimum runtime 390 s; factory shut down during the outage (UPS history end_reason=restart) · {DASHBOARD_URL}")})
+        );
+        let reloaded = Engine::load(config(&url, Some(path), true));
+        assert!(reloaded.view().active.is_empty());
+        assert_eq!(reloaded.view().recent[0].key, "ups:on_battery");
+    }
+
+    #[tokio::test]
+    async fn ups_low_replace_and_comms_boundaries() {
+        let (slack, url) = fake_slack().await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alerts.json");
+        let mut engine = Engine::load(config(&url, Some(path.clone()), true));
+        engine
+            .tick(T0, &ups(T0, "OL", 20.1, 900, "No test initiated"))
+            .await;
+        assert!(slack.posts.lock().unwrap().is_empty());
+        engine
+            .tick(
+                T0 + 1000,
+                &ups(T0 + 1000, "OL", 20.0, 800, "No test initiated"),
+            )
+            .await;
+        assert_eq!(engine.view().active[0].severity, AlertSeverity::Critical);
+        assert_eq!(
+            slack.posts.lock().unwrap()[0]["text"],
+            format!(
+                ":rotating_light: UPS low battery: charge 20%, runtime 800 s, load 144 W, input 121 V; shutdown thresholds: charge 10%, runtime 120 s · {DASHBOARD_URL}"
+            )
+        );
+        engine
+            .tick(
+                T0 + 2000,
+                &ups(T0 + 2000, "OB LB RB", 80.0, 900, "No test initiated"),
+            )
+            .await;
+        assert_eq!(engine.view().active.len(), 2);
+        assert_eq!(
+            slack.posts.lock().unwrap()[1]["text"],
+            format!(
+                ":warning: UPS replace battery: charge 80%, runtime 900 s, load 144 W, input 121 V · {DASHBOARD_URL}"
+            )
+        );
+        let lost = Signals {
+            ups: Some(UpsRead {
+                current: None,
+                last_success_ms: T0 + 2000,
+            }),
+            ..Default::default()
+        };
+        engine.tick(T0 + 61_999, &lost).await;
+        assert_eq!(slack.posts.lock().unwrap().len(), 2);
+        engine.tick(T0 + 62_000, &lost).await;
+        assert_eq!(
+            slack.posts.lock().unwrap()[2]["text"],
+            format!(
+                ":warning: UPS comms lost: no successful read for 60 s; charge unknown, runtime unknown, load unknown, input unknown · {DASHBOARD_URL}"
+            )
+        );
+        assert_eq!(
+            engine.view().active.len(),
+            3,
+            "unreadable UPS must not clear battery alerts"
+        );
+        drop(engine);
+        let mut engine = Engine::load(config(&url, Some(path), true));
+        let startup = Signals {
+            ups: Some(UpsRead {
+                current: None,
+                last_success_ms: T0 + 63_000,
+            }),
+            ..Default::default()
+        };
+        engine.tick(T0 + 63_000, &startup).await;
+        assert_eq!(engine.view().active.len(), 3);
+        assert_eq!(slack.posts.lock().unwrap().len(), 3);
+        engine
+            .tick(
+                T0 + 72_000,
+                &ups(T0 + 72_000, "OL", 90.0, 1200, "No test initiated"),
+            )
+            .await;
+        let posts = slack.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 6);
+        assert_eq!(posts[3]["thread_ts"], posts_ts(1));
+        assert_eq!(posts[4]["thread_ts"], posts_ts(2));
+        assert_eq!(posts[5]["thread_ts"], posts_ts(3));
+        assert!(engine.view().active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ups_self_test_posts_once_per_result_change_across_restart() {
+        let (slack, url) = fake_slack().await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alerts.json");
+        let mut engine = Engine::load(config(&url, Some(path.clone()), true));
+        engine
+            .tick(T0, &ups(T0, "OL", 80.0, 900, "No test initiated"))
+            .await;
+        for seconds in [1, 2, 3] {
+            let at = T0 + seconds * 1000;
+            engine
+                .tick(at, &ups(at, "OL", 80.0, 900, "Done and warning"))
+                .await;
+        }
+        assert_eq!(slack.posts.lock().unwrap().len(), 1);
+        assert_eq!(
+            slack.posts.lock().unwrap()[0]["text"],
+            format!(
+                ":warning: UPS self-test failed: Done and warning; charge 80%, runtime 900 s, load 144 W, input 121 V; this is the replace-battery signal on NUT 2.8.4 (CyberPower RB reporting requires NUT >= 2.8.5) · {DASHBOARD_URL}"
+            )
+        );
+        drop(engine);
+        let mut engine = Engine::load(config(&url, Some(path), true));
+        engine
+            .tick(
+                T0 + 4000,
+                &ups(T0 + 4000, "OL", 80.0, 900, "Done and warning"),
+            )
+            .await;
+        assert_eq!(slack.posts.lock().unwrap().len(), 1);
+        for (seconds, result) in [
+            (5, "Done and error"),
+            (6, "Done and passed"),
+            (7, "Done and warning"),
+            (8, "Done and warning"),
+        ] {
+            let at = T0 + seconds * 1000;
+            engine.tick(at, &ups(at, "OL", 80.0, 900, result)).await;
+        }
+        assert_eq!(
+            texts_containing(&slack, ":warning: UPS self-test failed"),
+            3
+        );
+        assert_eq!(engine.view().active.len(), 1);
+    }
 
     #[tokio::test]
     async fn opens_once_debounces_and_threads_recovery() {
