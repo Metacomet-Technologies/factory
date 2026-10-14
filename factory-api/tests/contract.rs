@@ -1145,7 +1145,8 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
     const PRICING: usize = 9;
     const CONFIRM: usize = 29;
     const NO_DATABASE: usize = 0;
-    const REQUESTS_SETUP: usize = 72;
+    // Includes the requests v1 migration manifest and runner validation.
+    const REQUESTS_SETUP: usize = 85;
     const PRICING_SETUP: usize = 74;
     for n in [3usize, 1001] {
         let temp = tempfile::tempdir()?;

@@ -1,6 +1,41 @@
 use anyhow::{Result, ensure};
 use rusqlite::Connection;
 
+/// Application integer settings. The owner creates `settings(key TEXT PRIMARY
+/// KEY, value INTEGER) STRICT` in its versioned migration, never in a handler.
+pub fn integers(db: &Connection, keys: &[&str]) -> Result<Vec<Option<i64>>> {
+    let placeholders = std::iter::repeat_n("?", keys.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut statement = db.prepare(&format!(
+        "SELECT key,value FROM settings WHERE key IN ({placeholders})"
+    ))?;
+    let values = statement
+        .query_map(rusqlite::params_from_iter(keys), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?
+        .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?;
+    Ok(keys
+        .iter()
+        .map(|key| values.get(*key).copied().flatten())
+        .collect())
+}
+
+/// One statement; multiple settings change together even without a transaction.
+pub fn put_integers(db: &Connection, values: &[(&str, Option<i64>)]) -> Result<()> {
+    if values.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("(?,?)", values.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let parameters = values
+        .iter()
+        .flat_map(|(key, value)| [rusqlite::types::Value::Text((*key).into()), (*value).into()]);
+    db.execute(&format!("INSERT INTO settings(key,value) VALUES {placeholders} ON CONFLICT(key) DO UPDATE SET value=excluded.value"), rusqlite::params_from_iter(parameters))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub journal_mode: String,

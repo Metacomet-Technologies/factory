@@ -6,6 +6,7 @@ mod kiosk;
 pub mod pool;
 pub mod types;
 pub mod ups;
+pub mod ups_history;
 mod usage;
 
 use anyhow::Result;
@@ -534,6 +535,7 @@ impl AppState {
                 timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut last_pricing = None::<Instant>;
                 let mut last_optimize = Instant::now();
+                let mut ups_collector = None::<ups_history::Collector>;
                 loop {
                     tokio::select! { biased;
                         _ = state.shutdown.cancelled() => break,
@@ -551,7 +553,33 @@ impl AppState {
                                 state.emit("gpu.sample", current);
                             }
                             "ups" => {
-                                state.emit("ups.sample", state.ups().await.current);
+                                let sample = state.ups().await.current;
+                                state.emit("ups.sample", &sample);
+                                let collector = ups_collector.clone();
+                                let result = state
+                                    .db
+                                    .write(&state.query_scope, move |db| {
+                                        let mut collector = match collector {
+                                            Some(c) => c,
+                                            None => ups_history::Collector::new(db, now_ms())?,
+                                        };
+                                        let events =
+                                            collector.record(db, sample.as_ref(), now_ms())?;
+                                        Ok((collector, events))
+                                    })
+                                    .await;
+                                match result {
+                                    Ok((collector, events)) => {
+                                        ups_collector = Some(collector);
+                                        for event in events {
+                                            state.emit("ups.event", event);
+                                        }
+                                        state.warning("ups history", None).await;
+                                    }
+                                    Err(e) => {
+                                        state.warning("ups history", Some(e.to_string())).await
+                                    }
+                                }
                             }
                             "clock" => {
                                 state.check_clock().await;
@@ -560,6 +588,12 @@ impl AppState {
                                 let optimize =
                                     last_optimize.elapsed() >= Duration::from_secs(86400);
                                 let result = async {
+                                    state
+                                        .db
+                                        .write(&state.query_scope, |db| {
+                                            ups_history::retain(db, now_ms())
+                                        })
+                                        .await?;
                                     let requests = state
                                         .db
                                         .requests

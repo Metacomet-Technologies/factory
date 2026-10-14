@@ -23,9 +23,9 @@ impl Pool {
         let requests = factory_db::Pool::open(
             requests,
             Config::default(),
-            |db, reader| {
+            |mut db, reader| {
                 if !reader {
-                    crate::data::initialize(&db)?;
+                    crate::data::initialize(&mut db)?;
                 }
                 Ok(db)
             },
