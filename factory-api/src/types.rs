@@ -191,8 +191,10 @@ pub struct AgentsRefreshCooldown {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StreamEvent {
-    /// Named SSE event: gpu.sample, ups.sample, llm.request, fleet.change,
+    /// Named SSE event: gpu.sample, ups.sample, ups.event, llm.request, fleet.change,
     /// pricing.changed, or agents.usage. ups.sample data is UpsCurrent or null on failure.
+    /// ups.event data is UpsEvent, sent once when an event opens and once when it closes.
+    /// Zero-length self_test events send both an open frame and a closed frame.
     pub r#type: String,
     pub ts_ms: i64,
     pub data: serde_json::Value,

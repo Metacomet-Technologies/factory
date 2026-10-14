@@ -160,6 +160,22 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v1/settings/ups": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["get_ups_settings"];
+    put: operations["put_ups_settings"];
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v1/stream": {
     parameters: {
       query?: never;
@@ -184,6 +200,63 @@ export interface paths {
       cookie?: never;
     };
     get: operations["ups"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/ups/energy": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * Costs round half-up once per range. Coverage counts intervals between reads
+     *     no more than 30s apart. An expired leading partial hour is omitted, not estimated.
+     *     GPU energy is null unless GPU 0 history covers the range with gaps <=30s.
+     */
+    get: operations["ups_energy"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/ups/events": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["ups_events"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/ups/history": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * Raw ranges use at most 720 time buckets. All metrics expose min/avg/max;
+     *     runtime is the minimum. Longer ranges include the overlapping hourly bucket.
+     */
+    get: operations["ups_history"];
     put?: never;
     post?: never;
     delete?: never;
@@ -425,8 +498,10 @@ export interface components {
       /** Format: int64 */
       ts_ms: number;
       /**
-       * @description Named SSE event: gpu.sample, ups.sample, llm.request, fleet.change,
+       * @description Named SSE event: gpu.sample, ups.sample, ups.event, llm.request, fleet.change,
        *     pricing.changed, or agents.usage. ups.sample data is UpsCurrent or null on failure.
+       *     ups.event data is UpsEvent, sent once when an event opens and once when it closes.
+       *     Zero-length self_test events send both an open frame and a closed frame.
        */
       type: string;
     };
@@ -476,6 +551,68 @@ export interface components {
       test_result?: string | null;
       /** Format: int64 */
       ts_ms: number;
+    };
+    UpsEnergy: {
+      /** Format: int64 */
+      cost_nano_usd?: number | null;
+      /** Format: double */
+      coverage_percent: number;
+      /** Format: int64 */
+      electricity_rate_micro_usd_per_kwh?: number | null;
+      /** Format: int64 */
+      energy_mwh: number;
+      /** Format: int64 */
+      gpu_energy_mwh?: number | null;
+    };
+    UpsEvent: {
+      detail?: string | null;
+      end_reason?: string | null;
+      /** Format: int64 */
+      ended_ms?: number | null;
+      /** Format: int64 */
+      id: number;
+      kind: string;
+      /** Format: double */
+      min_charge_percent?: number | null;
+      /** Format: int64 */
+      min_runtime_s?: number | null;
+      /** Format: int64 */
+      started_ms: number;
+    };
+    UpsEvents: {
+      events: components["schemas"]["UpsEvent"][];
+      /** Format: int64 */
+      next_before_id?: number | null;
+      /**
+       * Format: int64
+       * @description Pass both cursor fields to avoid skipping simultaneous transitions.
+       */
+      next_before_ms?: number | null;
+    };
+    UpsMetric: {
+      /** Format: double */
+      avg?: number | null;
+      /** Format: double */
+      max?: number | null;
+      /** Format: double */
+      min?: number | null;
+    };
+    UpsPoint: {
+      charge_percent: components["schemas"]["UpsMetric"];
+      input_v: components["schemas"]["UpsMetric"];
+      load_w: components["schemas"]["UpsMetric"];
+      /** Format: int64 */
+      runtime_s?: number | null;
+      /** Format: int64 */
+      sample_count: number;
+      /** Format: int64 */
+      ts_ms: number;
+    };
+    UpsSettings: {
+      /** Format: int64 */
+      battery_installed_ms: number | null;
+      /** Format: int64 */
+      electricity_rate_micro_usd_per_kwh: number | null;
     };
     Usage: {
       /** Format: int64 */
@@ -767,6 +904,96 @@ export interface operations {
       };
     };
   };
+  get_ups_settings: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["UpsSettings"];
+        };
+      };
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  put_ups_settings: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["UpsSettings"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["UpsSettings"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
   stream: {
     parameters: {
       query?: never;
@@ -801,6 +1028,124 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["Ups"];
+        };
+      };
+    };
+  };
+  ups_energy: {
+    parameters: {
+      query?: {
+        /** @description 24h (default), 7d, 30d, 365d */
+        range?: string;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["UpsEnergy"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  ups_events: {
+    parameters: {
+      query?: {
+        /** @description 1–200; default 50 */
+        limit?: number;
+        /** @description Exclusive timestamp cursor */
+        before_ms?: number;
+        /** @description Use with next_before_ms to page simultaneous events without loss */
+        before_id?: number;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["UpsEvents"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  ups_history: {
+    parameters: {
+      query?: {
+        /** @description 1h, 24h (default), 7d, 30d, 365d */
+        range?: string;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["UpsPoint"][];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
         };
       };
     };

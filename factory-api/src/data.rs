@@ -15,15 +15,37 @@ pub fn tps(tokens: Option<u64>, ns: Option<u64>) -> Option<f64> {
     }
 }
 pub fn open(path: &Path) -> Result<Connection> {
-    let db = Connection::open(path)?;
+    let mut db = Connection::open(path)?;
     factory_db::settings::apply(&db, false, 65_536)?;
-    initialize(&db)?;
+    initialize(&mut db)?;
     Ok(db)
 }
-pub fn initialize(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, ts_ms INTEGER NOT NULL, record TEXT NOT NULL);
-        CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts_ms);
-        CREATE TABLE IF NOT EXISTS warnings(message TEXT PRIMARY KEY);")?;
+pub fn initialize(db: &mut Connection) -> Result<()> {
+    use factory_db::migrations::{LegacySchema, Migration, run, schema_fingerprint};
+    let legacy = Connection::open_in_memory()?;
+    legacy.execute_batch(include_str!("requests_legacy.sql"))?;
+    // PRAGMA optimize on the deployed cache may already have created sqlite_stat1.
+    if db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='sqlite_stat1')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        legacy.execute_batch("ANALYZE")?;
+    }
+    run(
+        db,
+        &[Migration {
+            version: 1,
+            sql: include_str!("ups_schema.sql"),
+            checksum: 0xf7820cc3e88268c1,
+        }],
+        Some(LegacySchema {
+            fingerprint: &schema_fingerprint(&legacy)?,
+            version: 0,
+        }),
+        |_, _| Ok(()),
+        |_, _| Ok(()),
+    )?;
     Ok(())
 }
 pub fn sync(db: &mut Connection, records: Vec<RequestRecord>) -> Result<Vec<RequestRecord>> {

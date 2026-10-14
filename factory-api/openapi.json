@@ -868,7 +868,7 @@
             "type": "integer"
           },
           "type": {
-            "description": "Named SSE event: gpu.sample, ups.sample, llm.request, fleet.change,\npricing.changed, or agents.usage. ups.sample data is UpsCurrent or null on failure.",
+            "description": "Named SSE event: gpu.sample, ups.sample, ups.event, llm.request, fleet.change,\npricing.changed, or agents.usage. ups.sample data is UpsCurrent or null on failure.\nups.event data is UpsEvent, sent once when an event opens and once when it closes.\nZero-length self_test events send both an open frame and a closed frame.",
             "type": "string"
           }
         },
@@ -1067,6 +1067,216 @@
         "required": [
           "ts_ms",
           "flags"
+        ],
+        "type": "object"
+      },
+      "UpsEnergy": {
+        "properties": {
+          "cost_nano_usd": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "coverage_percent": {
+            "format": "double",
+            "type": "number"
+          },
+          "electricity_rate_micro_usd_per_kwh": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "energy_mwh": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "gpu_energy_mwh": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "energy_mwh",
+          "coverage_percent"
+        ],
+        "type": "object"
+      },
+      "UpsEvent": {
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "end_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ended_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "min_charge_percent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "min_runtime_s": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "started_ms": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "started_ms"
+        ],
+        "type": "object"
+      },
+      "UpsEvents": {
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/UpsEvent"
+            },
+            "type": "array"
+          },
+          "next_before_id": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "next_before_ms": {
+            "description": "Pass both cursor fields to avoid skipping simultaneous transitions.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "events"
+        ],
+        "type": "object"
+      },
+      "UpsMetric": {
+        "properties": {
+          "avg": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "min": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpsPoint": {
+        "properties": {
+          "charge_percent": {
+            "$ref": "#/components/schemas/UpsMetric"
+          },
+          "input_v": {
+            "$ref": "#/components/schemas/UpsMetric"
+          },
+          "load_w": {
+            "$ref": "#/components/schemas/UpsMetric"
+          },
+          "runtime_s": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sample_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "ts_ms": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ts_ms",
+          "sample_count",
+          "charge_percent",
+          "load_w",
+          "input_v"
+        ],
+        "type": "object"
+      },
+      "UpsSettings": {
+        "additionalProperties": false,
+        "properties": {
+          "battery_installed_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "electricity_rate_micro_usd_per_kwh": {
+            "format": "int64",
+            "maximum": 10000000,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "electricity_rate_micro_usd_per_kwh",
+          "battery_installed_ms"
         ],
         "type": "object"
       },
@@ -1436,6 +1646,110 @@
         "tags": []
       }
     },
+    "/v1/settings/ups": {
+      "get": {
+        "operationId": "get_ups_settings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpsSettings"
+                }
+              }
+            },
+            "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      },
+      "put": {
+        "operationId": "put_ups_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpsSettings"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
     "/v1/stream": {
       "get": {
         "operationId": "stream",
@@ -1469,6 +1783,180 @@
             "description": ""
           }
         },
+        "tags": []
+      }
+    },
+    "/v1/ups/energy": {
+      "get": {
+        "operationId": "ups_energy",
+        "parameters": [
+          {
+            "description": "24h (default), 7d, 30d, 365d",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpsEnergy"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "Costs round half-up once per range. Coverage counts intervals between reads\nno more than 30s apart. An expired leading partial hour is omitted, not estimated.\nGPU energy is null unless GPU 0 history covers the range with gaps <=30s.",
+        "tags": []
+      }
+    },
+    "/v1/ups/events": {
+      "get": {
+        "operationId": "ups_events",
+        "parameters": [
+          {
+            "description": "1–200; default 50",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Exclusive timestamp cursor",
+            "in": "query",
+            "name": "before_ms",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Use with next_before_ms to page simultaneous events without loss",
+            "in": "query",
+            "name": "before_id",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpsEvents"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
+    "/v1/ups/history": {
+      "get": {
+        "operationId": "ups_history",
+        "parameters": [
+          {
+            "description": "1h, 24h (default), 7d, 30d, 365d",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/UpsPoint"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "Raw ranges use at most 720 time buckets. All metrics expose min/avg/max;\nruntime is the minimum. Longer ranges include the overlapping hourly bucket.",
         "tags": []
       }
     }

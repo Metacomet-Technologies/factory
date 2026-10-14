@@ -1,5 +1,6 @@
 use crate::types::*;
 use crate::ups::{Ups, UpsCurrent};
+use crate::ups_history::{self, UpsEnergy, UpsEvents, UpsPoint, UpsSettings};
 use crate::{AppState, now_ms};
 use axum::{
     Json, Router,
@@ -121,6 +122,10 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
             | "/v1/llm/usage"
             | "/v1/gpu"
             | "/v1/ups"
+            | "/v1/ups/history"
+            | "/v1/ups/events"
+            | "/v1/ups/energy"
+            | "/v1/settings/ups"
             | "/v1/pricing"
             | "/v1/pricing/refresh"
             | "/v1/agents"
@@ -135,7 +140,8 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
         }
         return error(StatusCode::NOT_FOUND, "not_found", "unknown endpoint");
     }
-    if request.method() != if post { Method::POST } else { Method::GET } {
+    let settings_put = path == "/v1/settings/ups" && request.method() == Method::PUT;
+    if !settings_put && request.method() != if post { Method::POST } else { Method::GET } {
         let mut response = error(
             StatusCode::METHOD_NOT_ALLOWED,
             "method_not_allowed",
@@ -145,9 +151,18 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
                 "endpoint requires GET"
             },
         );
-        response
-            .headers_mut()
-            .insert("allow", if post { "POST" } else { "GET" }.parse().unwrap());
+        response.headers_mut().insert(
+            "allow",
+            if path == "/v1/settings/ups" {
+                "GET, PUT"
+            } else if post {
+                "POST"
+            } else {
+                "GET"
+            }
+            .parse()
+            .unwrap(),
+        );
         return response;
     }
     match path {
@@ -157,6 +172,11 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
         "/v1/agents/refresh" => refresh_agents(&state, request).await,
         "/v1/alerts" => alerts(&state).await.into_response(),
         "/v1/ups" => ups(&state).await.into_response(),
+        "/v1/ups/history" => ups_history(&state, request).await,
+        "/v1/ups/events" => ups_events(&state, request).await,
+        "/v1/ups/energy" => ups_energy(&state, request).await,
+        "/v1/settings/ups" if settings_put => put_ups_settings(&state, request).await,
+        "/v1/settings/ups" => get_ups_settings(&state).await,
         "/openapi.json" => Json(ApiDoc::openapi()).into_response(),
         "/v1/stream" => stream(&state).into_response(),
         "/v1/gpu" => match range(&request, true) {
@@ -251,6 +271,169 @@ async fn fleet(state: &AppState) -> Json<Fleet> {
 #[utoipa::path(get, path="/v1/ups", responses((status=200, body=Ups)))]
 async fn ups(state: &AppState) -> Json<Ups> {
     Json(state.ups().await)
+}
+
+fn ups_range(request: &Request<Body>, energy: bool) -> Result<(String, i64, i64), String> {
+    let Query(query) =
+        Query::<RangeQuery>::try_from_uri(request.uri()).map_err(|e| e.to_string())?;
+    let range = query.range.unwrap_or_else(|| "24h".into());
+    let hours = match range.as_str() {
+        "1h" if !energy => 1,
+        "24h" => 24,
+        "7d" => 168,
+        "30d" => 720,
+        "365d" => 8760,
+        _ => return Err("range must be 24h, 7d, 30d, 365d (history also accepts 1h)".into()),
+    };
+    let now = now_ms();
+    Ok((range, now - hours * ups_history::HOUR_MS, now))
+}
+/// Raw ranges use at most 720 time buckets. All metrics expose min/avg/max;
+/// runtime is the minimum. Longer ranges include the overlapping hourly bucket.
+#[utoipa::path(get, path="/v1/ups/history", params(("range"=Option<String>, Query, description="1h, 24h (default), 7d, 30d, 365d")), responses((status=200, body=[UpsPoint]),(status=400, body=ApiError),(status=500, body=ApiError)))]
+async fn ups_history(state: &AppState, request: Request<Body>) -> Response {
+    let (_, since, now) = match ups_range(&request, false) {
+        Ok(v) => v,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_range", e),
+    };
+    response(
+        state
+            .db
+            .requests
+            .read(&state.query_scope, move |db| {
+                ups_history::history(db, since, now, now - since <= ups_history::DAY_MS)
+            })
+            .await,
+    )
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpsEventsQuery {
+    limit: Option<u32>,
+    before_ms: Option<i64>,
+    before_id: Option<i64>,
+}
+#[utoipa::path(get, path="/v1/ups/events", params(("limit"=Option<u32>, Query, description="1–200; default 50"),("before_ms"=Option<i64>, Query, description="Exclusive timestamp cursor"),("before_id"=Option<i64>, Query, description="Use with next_before_ms to page simultaneous events without loss")), responses((status=200, body=UpsEvents),(status=400, body=ApiError),(status=500, body=ApiError)))]
+async fn ups_events(state: &AppState, request: Request<Body>) -> Response {
+    let query = match Query::<UpsEventsQuery>::try_from_uri(request.uri()) {
+        Ok(Query(v)) => v,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_query", e.to_string()),
+    };
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=200).contains(&limit)
+        || query.before_ms.is_some_and(|v| v < 0)
+        || query.before_id.is_some_and(|v| v < 1)
+        || (query.before_id.is_some() && query.before_ms.is_none())
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "limit must be 1–200; cursor must contain a nonnegative timestamp and optional positive ID",
+        );
+    }
+    let before_ms = query.before_ms.unwrap_or(i64::MAX);
+    let before_id = query.before_id.unwrap_or(if query.before_ms.is_some() {
+        0
+    } else {
+        i64::MAX
+    });
+    response(
+        state
+            .db
+            .requests
+            .read(&state.query_scope, move |db| {
+                ups_history::events(db, limit, before_ms, before_id)
+            })
+            .await,
+    )
+}
+/// Costs round half-up once per range. Coverage counts intervals between reads
+/// no more than 30s apart. An expired leading partial hour is omitted, not estimated.
+/// GPU energy is null unless GPU 0 history covers the range with gaps <=30s.
+#[utoipa::path(get, path="/v1/ups/energy", params(("range"=Option<String>, Query, description="24h (default), 7d, 30d, 365d")), responses((status=200, body=UpsEnergy),(status=400, body=ApiError),(status=500, body=ApiError)))]
+async fn ups_energy(state: &AppState, request: Request<Body>) -> Response {
+    let (range, since, now) = match ups_range(&request, true) {
+        Ok(v) => v,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_range", e),
+    };
+    let result = async {
+        let mut energy = state
+            .db
+            .requests
+            .read(&state.query_scope, move |db| {
+                ups_history::energy(db, since, now)
+            })
+            .await?;
+        // Meter retains only seven days; a missing upstream must not hide UPS data.
+        if matches!(range.as_str(), "24h" | "7d")
+            && let Ok(Ok(samples)) = tokio::time::timeout(
+                Duration::from_secs(2),
+                state.get::<Vec<shared::GpuSample>>(&format!("/meter/gpu/history?range={range}")),
+            )
+            .await
+        {
+            energy.gpu_energy_mwh = ups_history::gpu_energy(&samples, since, now)?;
+        }
+        anyhow::Ok(energy)
+    }
+    .await;
+    response(result)
+}
+#[utoipa::path(get, path="/v1/settings/ups", responses((status=200, body=UpsSettings),(status=500, body=ApiError)))]
+async fn get_ups_settings(state: &AppState) -> Response {
+    response(
+        state
+            .db
+            .requests
+            .read(&state.query_scope, ups_history::settings)
+            .await,
+    )
+}
+#[utoipa::path(put, path="/v1/settings/ups", request_body=UpsSettings, responses((status=200, body=UpsSettings),(status=400, body=ApiError),(status=403, body=ApiError),(status=413, body=ApiError),(status=503, body=ApiError),(status=500, body=ApiError)))]
+async fn put_ups_settings(state: &AppState, request: Request<Body>) -> Response {
+    if request
+        .headers()
+        .get("sec-fetch-site")
+        .is_some_and(|v| v == "cross-site")
+    {
+        return error(
+            StatusCode::FORBIDDEN,
+            "cross_site",
+            "cross-site settings write refused",
+        );
+    }
+    if let Err(e) = state.require_clock() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "clock_unsynchronized",
+            e.to_string(),
+        );
+    }
+    let body = match axum::body::to_bytes(request.into_body(), 1024).await {
+        Ok(v) => v,
+        Err(_) => {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body_too_large",
+                "body exceeds 1024 bytes",
+            );
+        }
+    };
+    let values: UpsSettings = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_settings", e.to_string()),
+    };
+    if let Err(e) = values.validate(now_ms()) {
+        return error(StatusCode::BAD_REQUEST, "invalid_settings", e.to_string());
+    }
+    response(
+        state
+            .db
+            .write(&state.query_scope, move |db| {
+                ups_history::put_settings(db, values, now_ms())
+            })
+            .await,
+    )
 }
 #[utoipa::path(get, path="/v1/agents", responses((status=200, body=Agents)))]
 async fn agents(state: &AppState) -> Json<Agents> {
@@ -406,6 +589,11 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         usage,
         gpu,
         ups,
+        ups_history,
+        ups_events,
+        ups_energy,
+        get_ups_settings,
+        put_ups_settings,
         pricing,
         refresh,
         confirm_selection
