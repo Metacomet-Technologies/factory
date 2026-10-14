@@ -319,6 +319,13 @@ fn indexed_queries_and_downsampling_boundaries() -> Result<()> {
             Some("ups_events_started"),
             false,
         ),
+        (
+            ALERT_EVENTS_SQL,
+            vec![DAY_MS],
+            "ups_events",
+            Some("ups_events_started"),
+            false,
+        ),
     ] {
         let plan = explain::query_plan(&db, sql, rusqlite::params_from_iter(args))?;
         let exceptions = if grouped {
@@ -338,6 +345,35 @@ fn indexed_queries_and_downsampling_boundaries() -> Result<()> {
     assert_eq!(points[0].load_w.min, Some(0.0));
     assert_eq!(points[0].load_w.max, Some(12.0));
     assert_eq!(points[0].load_w.avg, Some(6.0));
+    Ok(())
+}
+
+#[test]
+fn alert_history_includes_outage_start_and_restart_segments_only() -> Result<()> {
+    let mut db = database()?;
+    let mut collector = Collector::new(&db, 0)?;
+    // A preceding self-test blip must not contaminate the outage minima.
+    let mut blip = sample(1, "OB");
+    blip.charge_percent = Some(1.0);
+    collector.record(&mut db, Some(&blip), 1)?;
+    collector.record(&mut db, Some(&sample(10_001, "OL")), 10_001)?;
+    collector.record(&mut db, Some(&sample(20_001, "OB")), 20_001)?;
+    let mut lower = sample(30_001, "OB");
+    lower.charge_percent = Some(37.0);
+    lower.runtime_s = Some(401);
+    collector.record(&mut db, Some(&lower), 30_001)?;
+    let mut restarted = Collector::new(&db, 40_001)?;
+    restarted.record(&mut db, Some(&sample(40_001, "OB")), 40_001)?;
+    restarted.record(&mut db, Some(&sample(50_001, "OL")), 50_001)?;
+    let events = alert_events(&db, 25_001)?;
+    assert_eq!(events.len(), 2);
+    let original = events.iter().find(|e| e.started_ms == 20_001).unwrap();
+    assert_eq!(original.end_reason.as_deref(), Some("restart"));
+    assert_eq!(original.min_charge_percent, Some(37.0));
+    assert_eq!(original.min_runtime_s, Some(401));
+    let subsequent = events.iter().find(|e| e.started_ms == 40_001).unwrap();
+    assert_eq!(subsequent.end_reason.as_deref(), Some("recovered"));
+    assert!(alert_events(&db, 50_002)?.is_empty());
     Ok(())
 }
 
@@ -366,6 +402,14 @@ async fn endpoint_contract_and_constant_query_budgets() -> Result<()> {
                 Ok(())
             })
             .await?;
+        let scope = Scope::default();
+        let outage_events = state
+            .db
+            .requests
+            .read(&scope, move |db| alert_events(db, now - 20_000))
+            .await?;
+        assert_eq!(scope.counts().data, 1, "UPS alert history n={n}");
+        assert_eq!(outage_events.len(), 1);
         let client = reqwest::Client::new();
         for (path, budget) in [
             ("/v1/ups/history?range=1h", 1),
