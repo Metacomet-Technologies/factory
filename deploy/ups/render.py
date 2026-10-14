@@ -15,7 +15,7 @@ def tokens(line):
     return shlex.split(line, comments=True)
 
 
-def password_from(path):
+def password_from(path, user="upsmon"):
     if not path.exists():
         return None
     section = None
@@ -24,7 +24,7 @@ def password_from(path):
         parts = tokens(line)
         if parts and parts[0].startswith("["):
             section = parts[0]
-        elif section == "[upsmon]" and parts and parts[0] == "password":
+        elif section == f"[{user}]" and parts and parts[0] == "password":
             if len(parts) != 3 or parts[1] != "=" or not parts[2]:
                 raise ValueError("Invalid existing upsmon password assignment")
             passwords.append(parts[2])
@@ -59,10 +59,21 @@ def main():
         ).strip()
     if any(c in password for c in "\r\n\x00"):
         raise ValueError("Unsupported control character in password")
+    credential = live / "factory-control.password"
+    control = credential.read_text().rstrip("\n") if credential.exists() else password_from(live / "upsd.users", "factory-control")
+    if control is None:
+        control = "<generated-on-install>" if dry else subprocess.check_output(
+            ["openssl", "rand", "-hex", "16"], text=True
+        ).strip()
+    if not control or any(c in control for c in "\r\n\x00"):
+        raise ValueError("Invalid control password")
+    if not dry:
+        (pathlib.Path(sys.argv[2]) / "factory-control.password").write_text(control + "\n")
     quoted = '"' + password.replace("\\", "\\\\").replace('"', '\\"') + '"'
     templates = pathlib.Path(__file__).parent
     for name in NAMES:
-        rendered = (templates / (name + ".in")).read_text().replace("@PASSWORD@", quoted)
+        rendered = (templates / (name + ".in")).read_text().replace("@PASSWORD@", quoted).replace(
+            "@CONTROL_PASSWORD@", '"' + control.replace("\\", "\\\\").replace('"', '\\"') + '"')
         old = (live / name).read_text() if (live / name).exists() else ""
         if dry:
             old_masked = normalized(old, mask=True)

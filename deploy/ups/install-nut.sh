@@ -33,6 +33,8 @@ for name in "${names[@]}"; do
     path=$root/etc/nut/$name
     [[ ! -L $path && ( ! -e $path || -f $path ) ]] || fail "Unsafe config: $path"
 done
+path=$root/etc/nut/factory-control.password
+[[ ! -L $path && ( ! -e $path || -f $path ) ]] || fail "Unsafe credential: $path"
 if [[ ${1:-} == --dry-run ]]; then
     python3 "$here/render.py" "$root/etc/nut" --dry-run
     echo 'Read-only, normalized config diff complete; passwords masked. No changes made.'
@@ -75,6 +77,12 @@ for name in "${names[@]}"; do
         chmod 0640 "$root/etc/nut/$name"
     fi
 done
+if ! cmp -s "$staging/factory-control.password" "$root/etc/nut/factory-control.password"; then
+    install -o root -g root -m 0600 "$staging/factory-control.password" "$root/etc/nut/factory-control.password"
+else
+    chown root:root "$root/etc/nut/factory-control.password"
+    chmod 0600 "$root/etc/nut/factory-control.password"
+fi
 if [[ $installed == false ]]; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold nut

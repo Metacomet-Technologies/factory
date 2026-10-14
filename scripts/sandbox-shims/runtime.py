@@ -18,7 +18,8 @@ import urllib.request
 MODE, ROOT = sys.argv[1], Path(sys.argv[2]).resolve()
 STATE = ROOT / ".sandbox"
 BASE = 20000 + int.from_bytes(hashlib.sha256(os.fsencode(ROOT)).digest()[:4], "big") % 9997
-SERVICES = {"fake-ollama": BASE, "meter": BASE + 1, "factory-api": BASE + 2}
+SERVICES = {"fake-ollama": BASE, "meter": BASE + 1, "factory-api": BASE + 2,
+            "fake-serve": BASE + 3}
 STOP = threading.Event()
 
 
@@ -150,6 +151,42 @@ def inside():
         if not ups_status.exists():
             ups_status.write_text("OL\n")
         start("fake-upsd", ["python3", ROOT / "scripts/sandbox-shims/fake-upsd.py", "3493", ups_status])
+        credentials = STATE / "credentials"
+        credentials.mkdir(mode=0o700, exist_ok=True)
+        for name in ("nut-password", "slack-bot-token"):
+            (credentials / name).write_text("sandbox-only-" + name)
+            (credentials / name).chmod(0o600)
+        os.environ["CREDENTIALS_DIRECTORY"] = str(credentials)
+        (STATE / "serve-login").write_text("DGarbs51@github\n")
+        start("fake-serve", ["python3", ROOT / "scripts/sandbox-shims/fake-serve.py", str(BASE + 3), "8090", STATE])
+        control_args = [binary / "factory-ups-control", "--db-path", STATE / "ups-control.db",
+                        "--slack-url", f"http://127.0.0.1:{BASE+3}/slack/chat.postMessage"]
+        subprocess.run([*control_args, "migrate"], check=True, timeout=30)
+        # Same-UID fakes cannot model a root proxy. First exercise the actual
+        # production default UID boundary on 8090, then allow the sandbox UID.
+        probe = start("ups-control", control_args)
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                req = urllib.request.Request("http://127.0.0.1:8090/v1/state",
+                                             headers={"Tailscale-User-Login": "DGarbs51@github"})
+                with urllib.request.urlopen(req, timeout=5):
+                    raise RuntimeError("Default UID guard accepted a forged local header")
+            except urllib.error.HTTPError as error:
+                assert error.code == 403
+                atomic(STATE / "ups-guard-check.json", json.dumps({"status": error.code,
+                       "trusted_peer_uid": 0, "client_uid": os.getuid(), "port": 8090,
+                       "response": json.load(error)}))
+                break
+            except OSError:
+                if probe.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError("UPS guard probe failed; see ups-control.log")
+                time.sleep(0.1)
+        probe.terminate()
+        probe.wait(timeout=10)
+        children.remove(probe)
+        start("ups-control", [*control_args, "--trusted-peer-uid", str(os.getuid())])
+        ready(BASE + 3, "/control/v1/state")
         if not (STATE / "seed.json").exists():
             end_ms = int(time.time() // 86400) * 86400000
             child = start("seed", [binary / "sandbox-seed", "--legacy", "--db-path", STATE / "meter.v0.db",

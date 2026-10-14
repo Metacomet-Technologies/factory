@@ -1,0 +1,10 @@
+[Unit]
+Description=First Saturday UPS quick selftest at 11:00 local time
+
+[Timer]
+OnCalendar=Sat *-*-01..07 11:00:00
+Persistent=false
+Unit=factory-ups-selftest.service
+
+[Install]
+WantedBy=timers.target

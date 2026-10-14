@@ -55,7 +55,7 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
     threads = []
     environments = {}
     try:
-        for host, names in (("factory-gpu", ["meter", "requests", "pricing"]),):
+        for host, names in (("factory-gpu", ["meter", "requests", "pricing", "ups-control"]),):
             peer = "factory-console" if host == "factory-gpu" else "factory-gpu"
             env = dict(os.environ, BACKUP_HOST=host, BACKUP_TRANSPORT="local",
                        LOCAL_ROOT=str(root / "local"),
@@ -66,7 +66,7 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
             environments[host] = env
             for name in names:
                 db = root / f"{name}.db"
-                env[f"{name.upper()}_DB"] = str(db)
+                env[f"{name.upper().replace('-', '_')}_DB"] = str(db)
                 ready = threading.Event()
                 thread = threading.Thread(target=writer, args=(db, stop, ready))
                 thread.start()
@@ -122,7 +122,7 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
                 assert entry["last_success_ms"] >= entry["last_attempt_ms"] > 0
                 assert entry["integrity"] == "ok" and entry["pushed_to_peer"]
                 assert entry["error"] is None and entry["size_bytes"] > 0
-        print("PASS: three live WAL snapshots, integrity, zstd, checksum, local/replica retention")
+        print("PASS: four live WAL snapshots including ups-control, integrity, zstd, checksum, local/replica retention")
     finally:
         stop.set()
         for thread in threads:
@@ -161,8 +161,8 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
     live_files = {path: hashlib.sha256(path.read_bytes()).digest() for path in root.glob("*.db*")}
     for env in environments.values():
         output = run("restore-check.sh", env, "all")
-        assert output.count("integrity_check=ok") == 3, output
-        assert output.count('odd"table: 3 rows') == 3, output
+        assert output.count("integrity_check=ok") == 4, output
+        assert output.count('odd"table: 3 rows') == 4, output
     assert all(hashlib.sha256(path.read_bytes()).digest() == digest for path, digest in live_files.items())
     print("PASS: restore-check reports every table and never changes live databases")
 

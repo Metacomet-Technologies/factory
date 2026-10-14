@@ -107,6 +107,7 @@ class InstallerTest(unittest.TestCase):
         quoted = '"' + secret.replace("\\", "\\\\").replace('"', '\\"') + '"'
         (self.live / "upsd.users").write_text(f"[other]\npassword = other-fixture\n[upsmon]\npassword={quoted}\nupsmon primary\n")
         (self.live / "upsmon.conf").write_text(f"MONITOR cyberpower@localhost 1 upsmon {quoted} primary\nFINALDELAY 9\n")
+        (self.live / "factory-control.password").write_text("control-fixture-secret\n")
         (self.live / "upssched.conf").write_bytes(b"# stock sample\n\x00")
         (self.live / "extra").write_bytes(b"preserve me\n")
         original = tree(self.live)
@@ -114,6 +115,7 @@ class InstallerTest(unittest.TestCase):
         output = self.run_script(args=("--dry-run",))
         self.assertNotIn(secret, output)
         self.assertNotIn("other-fixture", output)
+        self.assertNotIn("control-fixture-secret", output)
         self.assertIn("<masked>", output)
         self.assertIn("-FINALDELAY 9", output)
         self.assertEqual(before, tree(self.root))
@@ -121,6 +123,8 @@ class InstallerTest(unittest.TestCase):
         output = self.run_script()
         self.assertNotIn(secret, output)
         self.assertEqual(self.credentials(), secret)
+        self.assertEqual((self.live / "factory-control.password").read_text(), "control-fixture-secret\n")
+        self.assertEqual(stat.S_IMODE((self.live / "factory-control.password").stat().st_mode), 0o600)
         self.assertFalse(any(c.startswith("openssl") for c in self.calls()))
         snapshots = list((self.root / "var/backups").glob("nut-*"))
         self.assertEqual(len(snapshots), 1)
@@ -150,6 +154,15 @@ class InstallerTest(unittest.TestCase):
         self.run_script()
         password = self.credentials()
         self.assertRegex(password, r"^[0-9a-f]{32}$")
+        control = (self.live / "factory-control.password").read_text().strip()
+        self.assertRegex(control, r"^[0-9a-f]{32}$")
+        self.assertNotEqual(control, password)
+        section = (self.live / "upsd.users").read_text().split("[factory-control]\n")[1]
+        self.assertIn(f'password = "{control}"', section)
+        self.assertIn("actions = SET FSD", section)
+        self.assertNotIn("upsmon", section)
+        self.assertEqual([line.split("=", 1)[1].strip() for line in section.splitlines() if "instcmds" in line],
+                         ["test.battery.start.quick", "test.battery.stop", "beeper.enable", "beeper.disable", "beeper.mute", "shutdown.stop"])
         self.assertEqual((self.live / "nut.conf").read_text(), "MODE=standalone\n")
         self.assertEqual((self.live / "upsd.conf").read_text(), "LISTEN 127.0.0.1 3493\n")
         ups = (self.live / "ups.conf").read_text()
@@ -185,6 +198,17 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("Recover with: sudo bash", output)
         self.assertIn("rollback-nut.sh", output)
         self.assertEqual(len(list((self.root / "var/backups").glob("nut-*/complete"))), 1)
+
+    def test_existing_control_user_password_is_reused(self):
+        (self.live / "upsd.users").write_text('[upsmon]\npassword = monitor-fixture\nupsmon primary\n[factory-control]\npassword = existing-control-fixture\n')
+        before = tree(self.root)
+        output = self.run_script(args=("--dry-run",))
+        self.assertNotIn("existing-control-fixture", output)
+        self.assertNotIn("monitor-fixture", output)
+        self.assertEqual(tree(self.root), before)
+        self.run_script()
+        self.assertEqual((self.live / "factory-control.password").read_text(), "existing-control-fixture\n")
+        self.assertFalse(any(c.startswith("openssl") for c in self.calls()))
 
     def test_bad_password_and_symlink_fail_before_changes(self):
         (self.live / "upsd.users").write_text('[upsmon]\npassword = "unterminated-fixture\n')

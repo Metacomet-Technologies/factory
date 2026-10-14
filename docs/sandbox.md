@@ -42,8 +42,9 @@ integers or `k`, with a 1,000,000-row ceiling.
 
 SHA-256 of the absolute, resolved worktree path selects a base port:
 `20000 + first_four_bytes_as_big_endian_integer % 9997`. Fake Ollama uses the
-base, meter base+1, and factory-api/kiosk base+2. All listeners use 127.0.0.1.
-Startup reserves all three host ports and fails clearly on collision. Different
+base, meter base+1, factory-api/kiosk base+2, and fake Serve base+3.
+All listeners use 127.0.0.1. Startup reserves all four host ports and fails clearly
+on collision. Different
 paths normally yield different ports; a hash collision needs another worktree
 path, not silently selected ephemeral ports. `status` prints URLs and
 `.sandbox/ports.json` records the mapping.
@@ -53,7 +54,7 @@ not reachable directly from another machine. No firewall or Tailscale changes
 are made. The API serves the built kiosk at `/`; without `--kiosk`, it serves its
 existing placeholder.
 
-The three services share a private Bubblewrap network namespace with only
+The services share a private Bubblewrap network namespace with only
 loopback. Fixed-destination Python stdlib relays bridge each host loopback port
 through a Unix socket into that namespace. Relays do not accept arbitrary
 destinations. Host ports 11434/11435 are unreachable from inside, and no external
@@ -122,7 +123,7 @@ and the kiosk ticker advance on the existing 30-second sync cadence.
 
 The namespace also runs `fake-upsd` on its private `127.0.0.1:3493`; the API's
 `FACTORY_API_UPS_ADDR` points there, never at the host's NUT service. No host
-port or relay is added. It supports `VER`, `LIST VAR cyberpower`, and `LOGOUT`
+port or relay to upsd is added. It supports `VER`, `LIST VAR cyberpower`, and `LOGOUT`
 with the real variable names and synthetic values. Set this worktree's mode:
 
 ```sh
@@ -136,6 +137,51 @@ The file defaults to `OL` on first startup and survives `down`/`up`.
 Each read consults it; any other content returns `ERR DATA-STALE`.
 `GET /v1/ups` reads immediately; `ups.sample` updates every 10 seconds.
 Use `scripts/sandbox logs fake-upsd` for protocol server failures.
+
+### UPS control and fake Serve (MET-166)
+
+The namespace also runs `factory-ups-control` on private port 8090, using only
+synthetic credentials under `.sandbox/credentials`, its own `.sandbox/ups-control.db`,
+and the private fake upsd. Fake Serve at base+3 strips `/control` and injects the
+login from `.sandbox/serve-login`; it never trusts HTTP identity headers. Set that
+file to `DGarbs51@github`, `metacometdave@github`, an unlisted login, or `tagged`
+(no identity header). Its local Slack sink writes only message JSON, never the
+authorization header, to `.sandbox/slack-posts.jsonl`.
+
+Startup first runs the **production default trusted UID 0** configuration on 8090
+and sends an allowed-but-forged identity as the sandbox user. It requires 403 and
+saves `.sandbox/ups-guard-check.json`. It then stops that process and runs the same
+binary trusting the sandbox user's UID for fake Serve. This is deliberately a
+two-phase test: a same-UID direct caller is indistinguishable from fake Serve in
+the second phase. It does not claim otherwise or weaken the production default.
+
+Fake upsd additionally supports USERNAME/PASSWORD, INSTCMD, SET VAR, LIST ENUM,
+LIST RANGE, LIST CMD/RW, SET TRACKING ON, GET TRACKING and FSD. It advertises the
+real command/variable set, enforces the control user's instant-command allowlist,
+and records received lines in `.sandbox/ups-received.log`, masking PASSWORD.
+FSD only acknowledges the fake latch; it cannot shut down any host.
+
+Optional fixture files: `.sandbox/ups-values.json` overrides variable values;
+`.sandbox/ups-ranges.json` maps variables to arrays of `[min,max]` ranges.
+`.sandbox/ups-tracking` selects `SUCCESS` (default), `FAILURE`, `PENDING`, or
+`PLAIN_OK` (missing tracking receipt). A SET changes the fake value only after
+tracking SUCCESS. These controls are local files, not remotely exposed APIs.
+
+Run once on fresh synthetic state (a second run correctly meets cooldown/pending
+refusals; reset only disposable sandbox data if another clean run is needed):
+
+```sh
+scripts/sandbox up --rows 1k
+python3 scripts/sandbox-shims/ups-smoke.py
+python3 scripts/sandbox-shims/smoke.py
+scripts/sandbox down
+```
+
+The UPS check prints state, the saved direct-guard 403, unlisted/tagged 403s,
+request/confirm quick test and sensitivity change, OB power refusal, FSD acknowledgement,
+the received mutation/tracking lines and all audit rows. Evidence is also saved
+at `.sandbox/ups-check.json`. No screenshots, real credentials, physical outlet
+changes, production Serve or live NUT calls occur.
 
 The API's usage snapshot and refresh trigger also point inside `.sandbox`.
 Without a synthetic `.sandbox/usage.json`, Frontier CLIs show unknown usage;

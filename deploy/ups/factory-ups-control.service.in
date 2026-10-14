@@ -1,0 +1,26 @@
+[Unit]
+Description=Allowlisted UPS control and audit service
+After=network.target nut-server.service
+
+[Service]
+User=factory-ups-control
+Group=factory-ups-control
+StateDirectory=factory-ups-control
+StateDirectoryMode=0700
+UMask=0077
+LoadCredential=nut-password:/etc/nut/factory-control.password
+LoadCredential=slack-bot-token:/etc/factory-alerts/slack-token
+ExecStartPre=/usr/local/bin/factory-ups-control --db-path /var/lib/factory-ups-control/audit.db migrate
+ExecStart=/usr/local/bin/factory-ups-control --db-path /var/lib/factory-ups-control/audit.db --listen 127.0.0.1:8090 --trusted-peer-uid @UID@ --allowed-logins @LOGINS@
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

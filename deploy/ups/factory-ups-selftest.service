@@ -1,0 +1,18 @@
+[Unit]
+Description=Monthly UPS battery quick selftest
+Requires=factory-ups-control.service
+After=factory-ups-control.service
+
+[Service]
+Type=oneshot
+User=factory-ups-control
+Group=factory-ups-control
+UMask=0077
+LoadCredential=nut-password:/etc/nut/factory-control.password
+LoadCredential=slack-bot-token:/etc/factory-alerts/slack-token
+ExecStart=/usr/local/bin/factory-ups-control --db-path /var/lib/factory-ups-control/audit.db selftest --scheduled
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/factory-ups-control
+ProtectHome=true
+PrivateTmp=true
