@@ -146,7 +146,7 @@ fn energy_gap_cap_rounding_overflow_and_missing_values() -> Result<()> {
         },
         2 * HOUR_MS,
     )?;
-    let e = energy(&db, HOUR_MS, 2 * HOUR_MS)?;
+    let e = energy(&db, HOUR_MS, 2 * HOUR_MS)?.energy;
     assert_eq!(e.energy_mwh, 2200);
     assert_eq!(e.cost_nano_usd, Some(385_000));
     assert!((e.coverage_percent - 100.0 * 50.0 / 3600.0).abs() < 1e-9);
@@ -313,6 +313,13 @@ fn indexed_queries_and_downsampling_boundaries() -> Result<()> {
             false,
         ),
         (
+            ENERGY_SQL,
+            vec![HOUR_MS, DAY_MS, 10_000],
+            "ups_samples",
+            None,
+            false,
+        ),
+        (
             EVENTS_SQL,
             vec![DAY_MS, 5000, 200],
             "ups_events",
@@ -418,6 +425,7 @@ async fn endpoint_contract_and_constant_query_budgets() -> Result<()> {
             ("/v1/ups/history?range=30d", 1),
             ("/v1/ups/history?range=365d", 1),
             ("/v1/ups/events?limit=200", 1),
+            ("/v1/ups/energy?range=1h", 2),
             ("/v1/ups/energy?range=24h", 2),
             ("/v1/ups/energy?range=7d", 2),
             ("/v1/ups/energy?range=30d", 2),
@@ -441,7 +449,9 @@ async fn endpoint_contract_and_constant_query_budgets() -> Result<()> {
                 assert!(!body.as_array().unwrap().is_empty());
             }
             if path.contains("energy") {
-                assert_eq!(body["energy_mwh"], 400 * (n - 1));
+                if !path.ends_with("range=1h") {
+                    assert_eq!(body["energy_mwh"], 400 * (n - 1));
+                }
                 assert!(body["gpu_energy_mwh"].is_null());
             }
             if path == "/v1/settings/ups" {
@@ -483,7 +493,7 @@ async fn endpoint_contract_and_constant_query_budgets() -> Result<()> {
                 assert_eq!(body, values);
                 for bad in [
                     "/v1/ups/history?range=2h",
-                    "/v1/ups/energy?range=1h",
+                    "/v1/ups/energy?range=2h",
                     "/v1/ups/events?limit=201",
                     "/v1/ups/events?limit=0",
                     "/v1/ups/events?before_id=1",
@@ -518,12 +528,127 @@ fn gpu_history_must_cover_range() -> Result<()> {
             power_w: 72.0 + (i as f64) * 36.0,
         })
         .collect();
-    assert_eq!(gpu_energy(&points, 0, 60_000)?, Some(2700));
-    assert_eq!(gpu_energy(&points, 0, 100_000)?, None);
-    assert_eq!(gpu_energy(&points[3..], 0, 60_000)?, None);
+    let intervals = [
+        (0, 15_000),
+        (15_000, 30_000),
+        (30_000, 45_000),
+        (45_000, 60_000),
+    ];
+    assert_eq!(gpu_energy(&points, &intervals)?, Some(2700));
+    // One UPS interval rounds once and takes its right endpoint, not an
+    // average of GPU readings or a sum rounded at GPU cadence.
+    assert_eq!(gpu_energy(&points, &[(0, 30_000)])?, Some(1200));
+    assert_eq!(gpu_energy(&points[2..], &[(0, 30_000)])?, Some(1200));
+    assert_eq!(gpu_energy(&points[2..], &[(0, 29_999)])?, Some(1200));
+    assert_eq!(gpu_energy(&points[2..], &[(-1, 29_999)])?, None);
+    assert_eq!(gpu_energy(&points, &[(80_000, 100_000)])?, None);
+    assert_eq!(gpu_energy(&points[3..], &intervals)?, None);
+    // Nearby endpoint readings do not excuse a >30s GPU hole spanning the
+    // UPS interval. The same hole wholly inside a UPS outage is irrelevant.
+    let sparse = [points[0].clone(), points[3].clone(), points[4].clone()];
+    assert_eq!(gpu_energy(&sparse, &[(10_000, 20_000)])?, None);
+    assert_eq!(gpu_energy(&sparse, &[(45_000, 60_000)])?, Some(900));
     assert_eq!(
-        gpu_energy(&[points[0].clone(), points[4].clone()], 0, 60_000)?,
+        gpu_energy(&[points[0].clone(), points[4].clone()], &intervals)?,
         None
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn gpu_energy_uses_only_ups_intervals_and_warns_instead_of_clamping() -> Result<()> {
+    // Cross an hourly boundary: intervals from both rollups must be included,
+    // but the 70s UPS outage must not be.
+    let base = now_ms() / HOUR_MS * HOUR_MS - HOUR_MS - 30_000;
+    for (name, gpu_w, missing, expected, warning) in [
+        ("short window", 72.0, false, Some(400), false),
+        ("UPS gap", 72.0, false, Some(600), false),
+        ("GPU gap", 72.0, true, None, false),
+        ("GPU exceeds UPS", 288.0, false, None, true),
+    ] {
+        let points: Vec<_> = (-360..=360)
+            .filter(|i| !missing || !(-3..=3).contains(i))
+            .map(|i| shared::GpuSample {
+                ts: base + i * 10_000,
+                index: 0,
+                memory_used_mib: 0.0,
+                memory_total_mib: 0.0,
+                utilization_percent: 0.0,
+                temperature_c: 0.0,
+                power_w: gpu_w,
+            })
+            .collect();
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let upstream_addr = upstream.local_addr()?;
+        let upstream_app = axum::Router::new().route(
+            "/meter/gpu/history",
+            axum::routing::get(move || async move { axum::Json(points) }),
+        );
+        let upstream_task = tokio::spawn(async move { axum::serve(upstream, upstream_app).await });
+        let dir = tempfile::tempdir()?;
+        pricing::migrate(dir.path().join("pricing.db"))?;
+        let state = AppState::new(
+            format!("http://{upstream_addr}"),
+            dir.path().join("requests.db"),
+            dir.path().join("pricing.db"),
+            fleet::Config { nodes: vec![] },
+        )
+        .await?;
+        state.db.clock_synchronized.store(true, Ordering::Release);
+        state
+            .db
+            .write(&Scope::default(), move |db| {
+                let mut collector = Collector::new(db, base)?;
+                let deltas = if name == "short window" {
+                    vec![0, 10_000, 20_000]
+                } else {
+                    vec![0, 10_000, 20_000, 90_000, 100_000]
+                };
+                for delta in deltas {
+                    let s = sample(base + delta, "OL");
+                    collector.record(db, Some(&s), s.ts_ms)?;
+                }
+                Ok(())
+            })
+            .await?;
+        let scope = Scope::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let app = router(state.clone()).layer(axum::Extension(scope.clone()));
+        let task = tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = reqwest::Client::new();
+        let body: Value = client
+            .get(format!("http://{addr}/v1/ups/energy?range=24h"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(
+            body["energy_mwh"],
+            if name == "short window" { 800 } else { 1200 },
+            "{name}"
+        );
+        assert_eq!(body["gpu_energy_mwh"], json!(expected), "{name}");
+        assert_eq!(scope.counts().data, 2, "{name}");
+        let usage: Value = client
+            .get(format!("http://{addr}/v1/llm/usage?range=24h"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(
+            usage["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap().starts_with("energy:")),
+            warning,
+            "{name}"
+        );
+        task.abort();
+        upstream_task.abort();
+        state.db.close().await?;
+    }
     Ok(())
 }

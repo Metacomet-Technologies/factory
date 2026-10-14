@@ -273,17 +273,17 @@ async fn ups(state: &AppState) -> Json<Ups> {
     Json(state.ups().await)
 }
 
-fn ups_range(request: &Request<Body>, energy: bool) -> Result<(String, i64, i64), String> {
+fn ups_range(request: &Request<Body>) -> Result<(String, i64, i64), String> {
     let Query(query) =
         Query::<RangeQuery>::try_from_uri(request.uri()).map_err(|e| e.to_string())?;
     let range = query.range.unwrap_or_else(|| "24h".into());
     let hours = match range.as_str() {
-        "1h" if !energy => 1,
+        "1h" => 1,
         "24h" => 24,
         "7d" => 168,
         "30d" => 720,
         "365d" => 8760,
-        _ => return Err("range must be 24h, 7d, 30d, 365d (history also accepts 1h)".into()),
+        _ => return Err("range must be 1h, 24h, 7d, 30d, 365d".into()),
     };
     let now = now_ms();
     Ok((range, now - hours * ups_history::HOUR_MS, now))
@@ -292,7 +292,7 @@ fn ups_range(request: &Request<Body>, energy: bool) -> Result<(String, i64, i64)
 /// runtime is the minimum. Longer ranges include the overlapping hourly bucket.
 #[utoipa::path(get, path="/v1/ups/history", params(("range"=Option<String>, Query, description="1h, 24h (default), 7d, 30d, 365d")), responses((status=200, body=[UpsPoint]),(status=400, body=ApiError),(status=500, body=ApiError)))]
 async fn ups_history(state: &AppState, request: Request<Body>) -> Response {
-    let (_, since, now) = match ups_range(&request, false) {
+    let (_, since, now) = match ups_range(&request) {
         Ok(v) => v,
         Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_range", e),
     };
@@ -349,15 +349,19 @@ async fn ups_events(state: &AppState, request: Request<Body>) -> Response {
 }
 /// Costs round half-up once per range. Coverage counts intervals between reads
 /// no more than 30s apart. An expired leading partial hour is omitted, not estimated.
-/// GPU energy is null unless GPU 0 history covers the range with gaps <=30s.
-#[utoipa::path(get, path="/v1/ups/energy", params(("range"=Option<String>, Query, description="24h (default), 7d, 30d, 365d")), responses((status=200, body=UpsEnergy),(status=400, body=ApiError),(status=500, body=ApiError)))]
+/// GPU energy uses the same covered UPS intervals and right-endpoint rounding.
+/// It is null if GPU coverage is missing or its energy exceeds the UPS load.
+#[utoipa::path(get, path="/v1/ups/energy", params(("range"=Option<String>, Query, description="1h, 24h (default), 7d, 30d, 365d")), responses((status=200, body=UpsEnergy),(status=400, body=ApiError),(status=500, body=ApiError)))]
 async fn ups_energy(state: &AppState, request: Request<Body>) -> Response {
-    let (range, since, now) = match ups_range(&request, true) {
+    let (range, since, now) = match ups_range(&request) {
         Ok(v) => v,
         Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_range", e),
     };
     let result = async {
-        let mut energy = state
+        let ups_history::CoveredEnergy {
+            mut energy,
+            intervals,
+        } = state
             .db
             .requests
             .read(&state.query_scope, move |db| {
@@ -365,15 +369,31 @@ async fn ups_energy(state: &AppState, request: Request<Body>) -> Response {
             })
             .await?;
         // Meter retains only seven days; a missing upstream must not hide UPS data.
-        if matches!(range.as_str(), "24h" | "7d")
+        if matches!(range.as_str(), "1h" | "24h" | "7d")
+            && let Some(intervals) = intervals
             && let Ok(Ok(samples)) = tokio::time::timeout(
                 Duration::from_secs(2),
-                state.get::<Vec<shared::GpuSample>>(&format!("/meter/gpu/history?range={range}")),
+                state.get::<Vec<shared::GpuSample>>(&format!(
+                    "/meter/gpu/history?range={}",
+                    if range == "1h" { "24h" } else { &range }
+                )),
             )
             .await
         {
-            energy.gpu_energy_mwh = ups_history::gpu_energy(&samples, since, now)?;
+            energy.gpu_energy_mwh = ups_history::gpu_energy(&samples, &intervals)?;
         }
+        let exceeds = energy
+            .gpu_energy_mwh
+            .is_some_and(|gpu| gpu > energy.energy_mwh);
+        if exceeds {
+            energy.gpu_energy_mwh = None;
+        }
+        state
+            .warning(
+                "energy",
+                exceeds.then(|| "GPU energy exceeds UPS energy over covered intervals".into()),
+            )
+            .await;
         anyhow::Ok(energy)
     }
     .await;
