@@ -15,6 +15,7 @@ import { Button } from "./components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
 import { VersionFooter } from "./components/version-footer";
 import { UpsBadge, UpsSection } from "./components/ups";
+import UpsPage from "./components/ups-page";
 
 export default function App() {
   const [usageRange, setUsageRange] = useState<UsageRange>("24h");
@@ -43,13 +44,14 @@ export default function App() {
     live.pricingRevision + live.snapshotRevision,
   );
   const gpu = useApi("/v1/gpu", `?range=${gpuRange}`, live.snapshotRevision);
-  const ups = useApi("/v1/ups", "", live.snapshotRevision);
+  const ups = useApi("/v1/ups", "", live.snapshotRevision + live.upsWarningRevision);
   const [now, setNow] = useState(Date.now);
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
   const upsCurrent = live.upsAt > (ups.data?.generated_at_ms ?? 0) ? live.ups : ups.data?.current;
+  const upsWarnings = ups.data?.warnings ?? (ups.error ? [ups.error] : []);
   const pricing = useApi("/v1/pricing", "", live.pricingRevision + live.snapshotRevision);
   const agents = useApi("/v1/agents", "", live.agentsRevision + live.snapshotRevision);
   useBuildUpdate(live.snapshotRevision, usage.loading || gpu.loading);
@@ -75,7 +77,7 @@ export default function App() {
             <Radio aria-hidden="true" size={14} />
             {live.connected ? "Live" : "Reconnecting"}
           </span>
-          <UpsBadge current={upsCurrent} now={now} />
+          <UpsBadge current={upsCurrent} now={now} warnings={upsWarnings} />
           <Tooltip>
             <TooltipTrigger
               render={
@@ -113,53 +115,55 @@ export default function App() {
           </Button>
         </div>
       </header>
-      <main id="main" className="dashboard">
-        <div className="intro">
-          <div>
-            <p className="eyebrow">OPERATIONS OVERVIEW</p>
-            <h2>Your local compute. In focus.</h2>
+      {window.location.pathname === "/ups" ? (
+        <UpsPage
+          current={upsCurrent}
+          now={now}
+          warnings={upsWarnings}
+          live={live}
+          revision={live.snapshotRevision + live.upsEventRevision}
+        />
+      ) : (
+        <main id="main" className="dashboard">
+          <div className="intro">
+            <div>
+              <p className="eyebrow">OPERATIONS OVERVIEW</p>
+              <h2>Your local compute. In focus.</h2>
+            </div>
+            <p className="muted">Auto-refreshes every 60s</p>
           </div>
-          <p className="muted">Auto-refreshes every 60s</p>
-        </div>
-        <div className="dashboard-grid">
-          <FleetSection resource={fleet} icon={<Server />} />
-          <GpuSection
-            resource={gpu}
-            live={live.gpu}
-            range={gpuRange}
-            setRange={setGpuRange}
-            icon={<Cpu />}
-          />
-          <UpsSection
-            current={upsCurrent}
-            now={now}
-            warnings={
-              live.upsAt > (ups.data?.generated_at_ms ?? 0)
-                ? []
-                : (ups.data?.warnings ?? (ups.error ? [ups.error] : []))
-            }
-          />
-          <UsageSection
-            resource={usage}
-            pricing={pricing}
-            range={usageRange}
-            setRange={setUsageRange}
-            icon={<Activity />}
-          />
-          <aside className="sidebar" aria-label="Frontier tools and live requests">
-            <AgentsSection
-              resource={
-                live.agents && !agents.data
-                  ? { data: live.agents, loading: false, error: null }
-                  : agents
-              }
-              icon={<Terminal />}
-              revision={live.agentsRevision}
+          <div className="dashboard-grid">
+            <FleetSection resource={fleet} icon={<Server />} />
+            <GpuSection
+              resource={gpu}
+              live={live.gpu}
+              range={gpuRange}
+              setRange={setGpuRange}
+              icon={<Cpu />}
             />
-            <TickerSection requests={live.requests} connected={live.connected} />
-          </aside>
-        </div>
-      </main>
+            <UpsSection current={upsCurrent} now={now} warnings={upsWarnings} />
+            <UsageSection
+              resource={usage}
+              pricing={pricing}
+              range={usageRange}
+              setRange={setUsageRange}
+              icon={<Activity />}
+            />
+            <aside className="sidebar" aria-label="Frontier tools and live requests">
+              <AgentsSection
+                resource={
+                  live.agents && !agents.data
+                    ? { data: live.agents, loading: false, error: null }
+                    : agents
+                }
+                icon={<Terminal />}
+                revision={live.agentsRevision}
+              />
+              <TickerSection requests={live.requests} connected={live.connected} />
+            </aside>
+          </div>
+        </main>
+      )}
       <VersionFooter
         api={health.data}
         meter={fleet.data?.nodes

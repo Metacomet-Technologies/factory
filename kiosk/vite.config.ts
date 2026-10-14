@@ -30,6 +30,7 @@ export default defineConfig({
       "mock-preview": { command: "node scripts/serve.ts --preview", cache: false },
       "mock-outage": { command: "MOCK_PORT=4182 MOCK_OUTAGE=1 node mock/server.ts", cache: false },
       screenshots: { command: "node scripts/screenshots.ts", cache: false },
+      "ups:check": { command: "node scripts/ups-check.ts", cache: false },
       "api:types": { command: "node scripts/api-types.ts", cache: false },
       "api:types:check": { command: "node scripts/api-types.ts --check", cache: false },
       "screenshots:live": { command: "node scripts/live-check.ts", cache: false },

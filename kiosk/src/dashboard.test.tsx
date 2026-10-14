@@ -5,6 +5,7 @@ import { agentFixtures, fixtures } from "../mock/fixtures";
 import { streamReducer, initialLiveState, parseEvent } from "./api/stream";
 import type { StreamEvent, UpsCurrent } from "./api/types";
 import { UpsBadge, UpsSection } from "./components/ups";
+import UpsPage from "./components/ups-page";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { count, ms, usd, number, seen } from "./lib/format";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
@@ -25,6 +26,7 @@ class MockSource extends EventTarget {
   close() {}
 }
 beforeEach(() => {
+  window.history.replaceState(null, "", "/");
   document.documentElement.dataset.theme = "dark";
   delete document.documentElement.dataset.themePreference;
   localStorage.clear();
@@ -62,6 +64,30 @@ function api(outage = false, failing = "", empty = false) {
       "/v1/llm/usage": data.usage,
       "/v1/gpu": data.gpu,
       "/v1/ups": { generated_at_ms: Date.now(), current: null, warnings: [] },
+      "/v1/ups/history": [],
+      "/v1/ups/events": {
+        events: [
+          {
+            id: 9,
+            kind: "on_battery",
+            started_ms: Date.now() - 60_000,
+            ended_ms: Date.now(),
+            min_charge_percent: 43,
+            min_runtime_s: 512,
+            detail: "Outage",
+            end_reason: "restart",
+          },
+        ],
+        next_before_ms: null,
+        next_before_id: null,
+      },
+      "/v1/ups/energy": {
+        energy_mwh: 1234567,
+        cost_nano_usd: null,
+        coverage_percent: 20,
+        gpu_energy_mwh: 500000,
+      },
+      "/v1/settings/ups": { electricity_rate_micro_usd_per_kwh: null, battery_installed_ms: null },
       "/v1/pricing": data.pricing,
       "/v1/agents": data.agents,
     };
@@ -97,6 +123,195 @@ const upsSample = (flags: string[], ts_ms = Date.now()): UpsCurrent => ({
   model: "CyberPower synthetic",
 });
 describe("UPS telemetry", () => {
+  it("refetches null SSE warnings and keeps the cause in the card and badge tooltip", async () => {
+    const fetch = api();
+    const defaults = fetch.getMockImplementation()!;
+    let warning = "ups: initial failure";
+    fetch.mockImplementation((path) =>
+      path === "/v1/ups"
+        ? Promise.resolve(
+            new Response(
+              JSON.stringify({ generated_at_ms: Date.now(), current: null, warnings: [warning] }),
+            ),
+          )
+        : defaults(path),
+    );
+    render(<App />);
+    expect(await screen.findByText(warning)).toBeInTheDocument();
+    warning = "ups: ERR DATA-STALE";
+    act(() => {
+      MockSource.latest.dispatchEvent(
+        new MessageEvent("ups.sample", {
+          data: JSON.stringify({ type: "ups.sample", ts_ms: Date.now() + 1, data: null }),
+        }),
+      );
+    });
+    expect(await screen.findByText(warning)).toBeInTheDocument();
+    act(() => screen.getByRole("button", { name: "UPS: No data" }).focus());
+    expect(await screen.findByText(/UPS: No data · Charge/)).toHaveTextContent(warning);
+    expect(screen.queryByText("ups: initial failure")).not.toBeInTheDocument();
+  });
+  it.each([null, "stale"])("shows warning in the %s badge tooltip", async (mode) => {
+    render(
+      <TooltipProvider>
+        <UpsBadge
+          current={mode ? upsSample(["OL"], Date.now() - 31_000) : null}
+          now={Date.now()}
+          warnings={["ups: ERR DATA-STALE"]}
+        />
+      </TooltipProvider>,
+    );
+    act(() => screen.getByRole("button", { name: "UPS: No data" }).focus());
+    expect(await screen.findByText(/UPS: No data · Charge/)).toHaveTextContent(
+      "ups: ERR DATA-STALE",
+    );
+  });
+  it("routes /ups, switches every chart range, and renders restart wording and settings", async () => {
+    window.history.replaceState(null, "", "/ups");
+    const fetch = api();
+    render(<App />);
+    expect(
+      await screen.findByRole("heading", { name: "UPS · Power & battery" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("factory shut down during outage")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Local LLM" })).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Controls" })).toHaveTextContent(
+      "No control actions available",
+    );
+    for (const range of ["1h", "7d", "30d", "365d", "24h"]) {
+      fireEvent.click(screen.getByRole("button", { name: range }));
+      await waitFor(() =>
+        expect(fetch).toHaveBeenCalledWith(`/v1/ups/history?range=${range}`, expect.anything()),
+      );
+      expect(screen.getByRole("button", { name: range })).toHaveAttribute("aria-pressed", "true");
+    }
+    const rate = await screen.findByLabelText("Electricity rate · USD per kWh");
+    for (const invalid of ["0.1234567", "-0.1"]) {
+      fireEvent.change(rate, { target: { value: invalid } });
+      fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "nonnegative USD rate with at most 6 decimals",
+      );
+    }
+    fireEvent.change(rate, { target: { value: "0.123456" } });
+    fireEvent.change(screen.getByLabelText("Battery installed date"), {
+      target: { value: "2024-02-29" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith(
+        "/v1/settings/ups",
+        expect.objectContaining({
+          method: "PUT",
+          body: '{"electricity_rate_micro_usd_per_kwh":123456,"battery_installed_ms":1709164800000}',
+        }),
+      ),
+    );
+    expect(await screen.findByText("Settings saved.")).toBeInTheDocument();
+  });
+  it("never shows a negative duration for an event newer than the UI clock", async () => {
+    window.history.replaceState(null, "", "/ups");
+    const fetch = api();
+    const defaults = fetch.getMockImplementation()!;
+    fetch.mockImplementation((path) =>
+      path.startsWith("/v1/ups/events")
+        ? Promise.resolve(
+            new Response(
+              JSON.stringify({
+                events: [{ id: 1, kind: "on_battery", started_ms: Date.now() + 2000 }],
+                next_before_ms: null,
+                next_before_id: null,
+              }),
+            ),
+          )
+        : defaults(path),
+    );
+    render(<App />);
+    expect(await screen.findByText(/Duration 0 ms · ongoing/)).toBeInTheDocument();
+  });
+  it("counts down the runtime reserve, stops at 30% charge, and expires stale telemetry", () => {
+    api();
+    const now = Date.now();
+    const current = upsSample(["OB"], now);
+    const props = { current, now, warnings: [], live: initialLiveState, revision: 0 };
+    const view = render(<UpsPage {...props} />);
+    const live = screen.getByRole("region", { name: "Live UPS" });
+    expect(within(live).getByText("547 s")).toBeInTheDocument();
+    view.rerender(<UpsPage {...props} now={now + 2000} />);
+    expect(within(live).getByText("545 s")).toBeInTheDocument();
+    view.rerender(<UpsPage {...props} current={{ ...current, charge_percent: 30 }} />);
+    expect(within(live).getByText("0 s")).toBeInTheDocument();
+    view.rerender(<UpsPage {...props} current={{ ...current, runtime_s: 300 }} />);
+    expect(within(live).getByText("0 s")).toBeInTheDocument();
+    view.rerender(<UpsPage {...props} now={now + 30_001} />);
+    expect(within(live).getByText("No data")).toBeInTheDocument();
+    expect(within(live).queryByText("144 W")).not.toBeInTheDocument();
+  });
+  it("pages tied event cursors, refreshes on ups.event, and limits hourly health to 70–110 W", async () => {
+    window.history.replaceState(null, "", "/ups");
+    const fetch = api();
+    const defaults = fetch.getMockImplementation()!;
+    let detail = "Passed self-test";
+    const at = Date.now() - 3_600_000;
+    fetch.mockImplementation((path) => {
+      if (path === "/v1/ups/history?range=365d")
+        return Promise.resolve(
+          new Response(
+            JSON.stringify(
+              [69, 70, 110, 111].map((load, index) => ({
+                ts_ms: at + index * 1000,
+                sample_count: 360,
+                load_w: { min: load, avg: load, max: load },
+                charge_percent: { min: 70, avg: 75, max: 80 },
+                input_v: { min: 120, avg: 121, max: 122 },
+                runtime_s: 400 + index * 100,
+              })),
+            ),
+          ),
+        );
+      if (path.startsWith("/v1/ups/events"))
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              events: [{ id: 9, kind: "self_test", started_ms: at, ended_ms: at, detail }],
+              next_before_ms: path.includes("before_ms") || path.includes("limit=200") ? null : at,
+              next_before_id: 9,
+            }),
+          ),
+        );
+      return defaults(path);
+    });
+    render(<App />);
+    const health = await screen.findByRole("region", { name: "Hourly runtime trend" });
+    expect(within(health).getAllByRole("row")).toHaveLength(3);
+    expect(within(health).getByText("70")).toBeInTheDocument();
+    expect(within(health).getByText("110")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Battery health" })).toHaveTextContent(
+      new Date(at).toLocaleString(),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Older events" }));
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith(
+        `/v1/ups/events?limit=20&before_ms=${at}&before_id=9`,
+        expect.anything(),
+      ),
+    );
+    detail = "New self-test result";
+    act(() => {
+      MockSource.latest.dispatchEvent(
+        new MessageEvent("ups.event", {
+          data: JSON.stringify({
+            type: "ups.event",
+            ts_ms: Date.now(),
+            data: { id: 10, kind: "self_test", started_ms: at, ended_ms: at, detail },
+          }),
+        }),
+      );
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("region", { name: "Power events" })).toHaveTextContent(detail),
+    );
+  });
   it.each([
     ["OL", "Online", "plug"],
     ["OL OB RB", "On battery", "battery-warning"],

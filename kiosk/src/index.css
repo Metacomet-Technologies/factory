@@ -188,6 +188,131 @@
 .ups {
   grid-column: 1 / -1;
 }
+.ups-card-link {
+  display: block;
+  height: 100%;
+  color: inherit;
+  text-decoration: none;
+}
+.ups-card-link:hover [data-slot="card"] {
+  border-color: var(--accent-text);
+}
+.ups-page {
+  display: grid;
+  gap: 20px;
+}
+.ups-page a {
+  color: var(--accent-text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.ups-page .intro {
+  margin: 0;
+}
+.dashboard.ups-page {
+  padding-bottom: 24px;
+}
+.ups-page + .version-footer {
+  position: static;
+}
+.ups-panel {
+  min-width: 0;
+  padding: 16px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.ups-panel h3 {
+  margin-bottom: 8px;
+}
+.ups-chart-grid,
+.ups-energy {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1fr);
+}
+.ups-history-chart {
+  height: 210px;
+  width: 100%;
+  aspect-ratio: auto;
+}
+.ups-live {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px 24px;
+}
+.ups-live strong,
+.ups-live span {
+  display: block;
+}
+.ups-live strong {
+  font-size: 22px;
+}
+.ups-live-note {
+  flex-basis: 100%;
+}
+.ups-spark {
+  flex: 1 1 150px;
+}
+.ups-spark svg {
+  width: 100%;
+  height: 44px;
+}
+.ups-range {
+  margin-bottom: 12px;
+}
+.ups-range [role="group"] {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.ups-energy-period {
+  padding: 8px 0;
+}
+.ups-energy-period strong {
+  font-size: 20px;
+}
+.ups-events li {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.ups-events time,
+.ups-events p {
+  font-size: 12px;
+  line-height: 1.6;
+}
+.ups-settings {
+  display: grid;
+  gap: 8px;
+}
+.ups-settings input {
+  width: 100%;
+  min-width: 0;
+  padding: 8px;
+  color: var(--foreground);
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.ups-trend {
+  max-height: 240px;
+  overflow: auto;
+}
+.ups-trend table {
+  width: 100%;
+  font-size: 12px;
+  text-align: left;
+}
+.ups-trend th,
+.ups-trend td {
+  padding: 6px;
+}
+.ups-controls {
+  min-height: 120px;
+  border-style: dashed;
+}
 .ups-unknown-icon {
   position: relative;
 }
@@ -554,6 +679,12 @@
   top: 10px;
 }
 @media (min-width: 640px) {
+  .ups-chart-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .ups-energy {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
   .ups-readings {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
@@ -594,7 +725,7 @@
   }
   .dashboard {
     padding-top: 8px;
-    padding-bottom: 56px;
+    padding-bottom: 48px;
   }
   .intro {
     margin-bottom: 4px;
@@ -605,7 +736,69 @@
   }
   .dashboard-grid {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(300px, 0.8fr);
-    gap: 16px;
+    gap: 12px;
+  }
+  .dashboard-grid .ups [data-slot="card"] {
+    display: grid;
+    grid-template-columns: 200px minmax(0, 1fr);
+    align-items: center;
+    --card-spacing: 8px;
+  }
+  .dashboard-grid .ups .ups-charge,
+  .dashboard-grid .ups .ups-runtime,
+  .dashboard-grid .ups .ups-runtime-alarm {
+    font-size: 20px;
+  }
+  .dashboard-grid .ups .ups-charge-track {
+    margin-block: 4px;
+  }
+  .dashboard-grid .ups .ups-readings {
+    margin-bottom: 2px;
+    flex-basis: 100%;
+  }
+  .dashboard-grid .ups .ups-readings > div {
+    display: flex;
+    align-content: start;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0 8px;
+  }
+  .dashboard-grid .ups .ups-charge-track,
+  .dashboard-grid .ups .ups-readings p:last-child:not(:first-child) {
+    flex-basis: 100%;
+  }
+  .dashboard-grid .ups [data-slot="card-content"] {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 12px;
+  }
+  .dashboard-grid .ups .status-warn {
+    font-size: 12px;
+  }
+  .dashboard-grid .gpu .loaded-models {
+    margin-top: 4px;
+  }
+  .dashboard-grid .node {
+    padding: 8px;
+  }
+  .dashboard-grid .node [data-slot="separator"] {
+    margin-block: 6px;
+  }
+  .dashboard-grid .services {
+    gap: 4px;
+  }
+  .dashboard-grid .usage .spend-grid {
+    margin-top: 6px;
+  }
+  .dashboard-grid .usage .warnings {
+    margin-top: 8px;
+  }
+  .dashboard-grid .usage [data-slot="alert"] {
+    font-size: 12px;
+    padding-block: 6px;
+  }
+  .dashboard-grid .usage [data-slot="alert-description"] {
+    font-size: 12px;
   }
   .fleet {
     grid-column: 1 / 3;
@@ -622,32 +815,35 @@
   .sidebar {
     grid-column: 3;
     grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
   }
   .gpu-metrics {
     grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 10px;
   }
   .gpu .metric-value {
-    font-size: 21px;
+    font-size: 19px;
+    line-height: 1.2;
   }
   .gpu-chart {
-    height: 56px;
+    height: 40px;
+    margin-top: 6px;
   }
   .usage .metric-value {
     line-height: 1.2;
   }
   .usage [data-slot="separator"] {
-    margin-block: 12px;
+    margin-block: 6px;
   }
   .spend-card {
-    padding: 8px 12px;
+    padding: 4px 12px;
   }
   .spend-value {
-    font-size: 30px;
+    font-size: 26px;
     line-height: 1.3;
   }
   .pricing-state {
-    margin-top: 12px;
+    margin-top: 6px;
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .pricing-state > .warnings,
@@ -657,6 +853,9 @@
     grid-column: 1 / -1;
   }
   .model-heading {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
     margin-top: 12px;
     margin-bottom: 8px;
   }
@@ -693,7 +892,7 @@
     margin-top: 8px;
   }
   [role="log"] {
-    max-height: 140px;
+    max-height: 72px;
     overflow-y: auto;
     scrollbar-gutter: stable;
   }

@@ -11,6 +11,10 @@ export type GpuSample = components["schemas"]["GpuCurrent"];
 export type Gpu = components["schemas"]["Gpu"];
 export type Ups = components["schemas"]["Ups"];
 export type UpsCurrent = components["schemas"]["UpsCurrent"];
+export type UpsEvent = components["schemas"]["UpsEvent"];
+export type UpsPoint = components["schemas"]["UpsPoint"];
+export type UpsSettings = components["schemas"]["UpsSettings"];
+export type UpsRange = "1h" | "24h" | "7d" | "30d" | "365d";
 export type Pricing = components["schemas"]["Pricing"];
 export type Agents = components["schemas"]["Agents"];
 export type LlmRequest = components["schemas"]["LlmRequest"];
@@ -21,6 +25,7 @@ export type StreamEvent = Omit<components["schemas"]["StreamEvent"], "type" | "d
   (
     | { type: "gpu.sample"; data: GpuSample | null }
     | { type: "ups.sample"; data: UpsCurrent | null }
+    | { type: "ups.event"; data: UpsEvent }
     | { type: "llm.request"; data: LlmRequest }
     | { type: "fleet.change"; data: components["schemas"]["FleetChange"] }
     | { type: "pricing.changed"; data: components["schemas"]["PricingChanged"] }
