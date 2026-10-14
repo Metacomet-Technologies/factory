@@ -91,6 +91,8 @@ class Handler(socketserver.StreamRequestHandler):
                         values.update(overrides())
                     self.wfile.write(b"BEGIN LIST VAR cyberpower\n")
                     for key, value in values.items():
+                        if value is None:  # A null fixture removes a variable.
+                            continue
                         self.wfile.write(f"VAR cyberpower {key} {json.dumps(value)}\n".encode())
                     self.wfile.write(b"END LIST VAR cyberpower\n")
             elif parts[:3] in (["LIST", "ENUM", "cyberpower"], ["LIST", "RANGE", "cyberpower"]) and len(parts) == 4:

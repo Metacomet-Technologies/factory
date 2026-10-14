@@ -122,7 +122,8 @@ socket's UID from `/proc/net/tcp` or `/proc/net/tcp6`, and exactly one allowlist
 missing, ambiguous or unreadable ownership fails closed. The default trusted UID
 is 0 (tailscaled), never agent or the control-service UID. Root remains trusted.
 The default users are `DGarbs51@github,metacometdave@github`, case-sensitive.
-Denials return 403 and retain the claimed, untrusted login in the audit.
+Denials always return 403. The bounded audit samples retain the claimed,
+untrusted login; excess denials are counted in aggregate as described below.
 
 The current [Serve documentation, Identity headers](https://tailscale.com/kb/1312/serve#identity-headers)
 explicitly says: “These identity headers are not populated for traffic originating
@@ -182,7 +183,10 @@ for the later battery-test outcome. See NUT 2.8.4
 and [tracking status implementation](https://github.com/networkupstools/nut/blob/v2.8.4/server/upsd.c).
 
 Quick tests require exactly `OL`, exactly 100% charge and a known non-running test
-result. Tests have a per-action ten-minute cooldown, including unconfirmed attempts.
+result: `Done and passed`, `Done and warning`, `Done and error`, `Aborted`, or
+`No test initiated` (case-insensitive exact matches). `In progress`, `Test scheduled`,
+unknown and missing results are refused, including by the scheduled command.
+Tests have a per-action ten-minute cooldown, including unconfirmed attempts.
 Settings use upsd ENUM/RANGE; without transfer ranges the policy is low 90–105,
 high 130–140, always low < high. Shutdown delay is restricted to 30–600 and start
 delay to 0–600, intersected with any reported ranges. Audit records old and requested
@@ -244,14 +248,24 @@ Both systemd units load `nut-password` and the existing alerts bot's
 `/etc/factory-alerts/slack-token` as `slack-bot-token`. The service reads credential
 files directly, never argv or a shell. Slack uses the existing `#factory-alerts`
 channel ID `C0C9N9HCRG8`. Every execution/failure and scheduled refusal is queued
-in the audit database; guard alerts are selected at most once per minute while
-every denial is still audited. Failed Slack delivery remains queued for retry.
+in the audit database. An in-memory, process-wide budget admits at most eight
+individual guard-denial audit attempts per window, before any database work.
+Denial writes are serialized, occupying at most one pool slot rather than allowing
+a flood to exhaust the queue needed by allowed callers. Excess denials still
+receive 403 and increment a saturating in-memory count. After at least 60 seconds,
+the next notification-worker tick writes one additional `guard-deny` summary row
+with no login and the suppressed count, then renews the budget. This happens even
+if the flood stops; empty summaries are omitted. Windows can extend while the
+worker is busy. Restart resets the budget and loses any unflushed suppressed count.
+Sample and summary guard alerts share the existing at-most-one-per-minute Slack
+selection rule. Failed Slack delivery remains queued for retry.
 Delivery is at-least-once: a crash after posting but before acknowledgement can
 duplicate a post. Unknown dispatches are reported after 30 seconds.
 
 `factory-ups-selftest.timer`: `Sat *-*-01..07 11:00:00`, host-local time,
 `Persistent=false`. It runs `factory-ups-control selftest --scheduled`, applies
-the same preflight/cooldown and refuses uptime under one hour. The deployed
+the same preflight/cooldown and refuses uptime under one hour. A busy action lock
+is also recorded as a scheduled refusal and queued for Slack. The deployed
 `factory-gpu.conf` reboot window is 06:00 America/New_York, five hours earlier
 when the host timezone is America/New_York. The installer requires that timezone
 and never changes it. No missed monthly tests catch up.

@@ -69,7 +69,24 @@ pub struct Control {
     slack_token: String,
     client: reqwest::Client,
     rates: Mutex<(Instant, BTreeMap<String, u32>)>,
+    guard_denials: Mutex<GuardDenials>,
     notifications: Mutex<()>,
+}
+
+struct GuardDenials {
+    window: tokio::time::Instant,
+    recorded: u32,
+    suppressed: u64,
+}
+
+impl Default for GuardDenials {
+    fn default() -> Self {
+        Self {
+            window: tokio::time::Instant::now(),
+            recorded: 0,
+            suppressed: 0,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -220,6 +237,7 @@ impl Control {
                 .timeout(Duration::from_secs(3))
                 .build()?,
             rates: Mutex::new((Instant::now(), BTreeMap::new())),
+            guard_denials: Mutex::new(GuardDenials::default()),
             notifications: Mutex::new(()),
         }))
     }
@@ -258,6 +276,50 @@ impl Control {
                 notify,
             )
             .await
+    }
+
+    async fn guard_denial(&self, login: Option<&str>) -> Result<()> {
+        // Hold this lock through the write: denied callers can occupy at most
+        // one pool slot, independently of the allowed-login request budget.
+        let mut denials = self.guard_denials.lock().await;
+        if denials.recorded >= 8 {
+            denials.suppressed = denials.suppressed.saturating_add(1);
+            return Ok(());
+        }
+        denials.recorded += 1;
+        self.audit(
+            "guard-deny",
+            login,
+            None,
+            "untrusted peer or identity",
+            None,
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn flush_guard_denials(&self) -> Result<()> {
+        let mut denials = self.guard_denials.lock().await;
+        if denials.window.elapsed() < Duration::from_secs(60) {
+            return Ok(());
+        }
+        let previous = std::mem::take(&mut *denials);
+        if previous.suppressed > 0 {
+            self.audit(
+                "guard-deny",
+                None,
+                None,
+                &format!(
+                    "suppressed {} guard denials in preceding audit window",
+                    previous.suppressed
+                ),
+                None,
+                true,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn settings(
@@ -309,8 +371,10 @@ impl Control {
                     value,
                     allowed_values: values,
                     ranges,
-                    range_source: if reported {
+                    range_source: if reported && policy.is_some() {
                         "upsd (intersected with policy)"
+                    } else if reported {
+                        "upsd"
                     } else {
                         "policy fallback"
                     },
@@ -374,9 +438,14 @@ impl Control {
                 .context("test status unavailable")?
                 .to_ascii_lowercase();
             ensure!(
-                !test.contains("progress")
-                    && !test.contains("running")
-                    && (test.starts_with("done") || test.starts_with("no test")),
+                matches!(
+                    test.as_str(),
+                    "done and passed"
+                        | "done and warning"
+                        | "done and error"
+                        | "aborted"
+                        | "no test initiated"
+                ),
                 "test running or status unknown"
             );
         }
@@ -562,7 +631,6 @@ impl Control {
     }
 
     pub async fn selftest(&self, uptime_seconds: f64) -> Result<Value> {
-        let _lock = lock(&self.config.db_path.with_extension("action.lock"))?;
         let action = Action {
             action: "test.quick".into(),
             value: None,
@@ -576,6 +644,22 @@ impl Control {
             false,
         )
         .await?;
+        let _lock = match lock(&self.config.db_path.with_extension("action.lock")) {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.audit(
+                    "refuse",
+                    Some("scheduled"),
+                    Some(&action),
+                    &error.to_string(),
+                    None,
+                    true,
+                )
+                .await?;
+                self.flush_notifications().await?;
+                return Err(error);
+            }
+        };
         if !uptime_seconds.is_finite() || uptime_seconds < 3600.0 {
             self.audit(
                 "refuse",
@@ -601,6 +685,8 @@ impl Control {
 
     pub async fn flush_notifications(&self) -> Result<()> {
         let _serial = self.notifications.lock().await;
+        // The daemon calls this every ten seconds, even after a flood stops.
+        self.flush_guard_denials().await?;
         // Cross-process serialization avoids duplicate concurrent deliveries.
         let Ok(_lock) = lock(&self.config.db_path.with_extension("slack.lock")) else {
             return Ok(());
@@ -672,18 +758,7 @@ async fn handle(
         &control.config.allowed_logins,
     ) {
         // An untrusted header is an assertion, not an authenticated identity.
-        if control
-            .audit(
-                "guard-deny",
-                login,
-                None,
-                "untrusted peer or identity",
-                None,
-                true,
-            )
-            .await
-            .is_err()
-        {
+        if control.guard_denial(login).await.is_err() {
             eprintln!("guard denial audit write failed");
         }
         return reply(StatusCode::FORBIDDEN, "identity guard denied");

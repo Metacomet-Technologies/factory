@@ -303,6 +303,88 @@ async fn real_socket_guard_and_notification_throttle() {
 }
 
 #[tokio::test]
+async fn denial_flood_preserves_allowed_actions_and_aggregates_audit() {
+    let h = Harness::new(uid()).await;
+    let mut flood = tokio::task::JoinSet::new();
+    for _ in 0..512 {
+        let (client, url) = (h.client.clone(), h.url.clone());
+        flood.spawn(async move {
+            client
+                .get(format!("{url}/v1/state"))
+                .header("Tailscale-User-Login", "forged@github")
+                .timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+    }
+    // Exercise allowed traffic while the denied requests are in flight.
+    assert_eq!(
+        h.request("/v1/state", Some("DGarbs51@github"), None)
+            .await
+            .0,
+        200
+    );
+    let (status, pending) = h.prepare("test.quick", None).await;
+    assert_eq!(status, 200, "{pending}");
+    let (status, result) = h.confirm(&pending).await;
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result["executed"], true);
+    while let Some(status) = flood.join_next().await {
+        assert_eq!(status.unwrap(), 403);
+    }
+    let rows = h.control.store.rows(100, i64::MAX).await.unwrap();
+    assert_eq!(rows.iter().filter(|r| r.event == "guard-deny").count(), 8);
+    assert!(
+        rows.iter().any(|r| r.event == "execute"
+            && r.action.as_deref() == Some("test.quick")
+            && r.executed)
+    );
+
+    // Advance only the monotonic audit window; no minute-long test sleep.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::time::resume();
+    h.control.flush_notifications().await.unwrap();
+    h.control.flush_notifications().await.unwrap();
+    let rows = h.control.store.rows(100, i64::MAX).await.unwrap();
+    assert_eq!(rows.iter().filter(|r| r.event == "guard-deny").count(), 9);
+    assert_eq!(
+        rows.iter()
+            .filter(
+                |r| r.result == "suppressed 504 guard denials in preceding audit window"
+                    && r.login.is_none()
+            )
+            .count(),
+        1
+    );
+    assert_eq!(h.request("/v1/state", None, None).await.0, 403);
+    assert_eq!(
+        h.control
+            .store
+            .rows(100, i64::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.event == "guard-deny")
+            .count(),
+        10
+    );
+    h.control.flush_notifications().await.unwrap();
+    // Wall time has not advanced: samples and summary still share one Slack allowance.
+    let posts = fs::read_to_string(h.dir.path().join("slack-posts.jsonl")).unwrap();
+    assert_eq!(
+        posts
+            .lines()
+            .filter(|line| line.contains("guard-deny"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn confirmation_owner_phrase_expiry_reuse_cooldown_and_credentials() {
     let h = Harness::new(uid()).await;
     let csrf = h
@@ -461,6 +543,11 @@ async fn exact_allowlist_and_settings_boundaries() {
         r#"{"input.transfer.low":[[95,103]],"input.transfer.high":[[104,150]]}"#,
     )
     .unwrap();
+    let (_, state) = h.request("/v1/state", Some("DGarbs51@github"), None).await;
+    assert_eq!(
+        state["settings"]["input.transfer.low"]["range_source"],
+        "upsd"
+    );
     assert_eq!(h.prepare("input.transfer.low", Some("94")).await.0, 409);
     assert_eq!(h.prepare("input.transfer.low", Some("95")).await.0, 200);
     assert_eq!(h.prepare("input.transfer.low", Some("103")).await.0, 200);
@@ -529,8 +616,59 @@ async fn power_preflight_rechecked_and_pending_survives_restart() {
 }
 
 #[tokio::test]
+async fn quick_and_scheduled_tests_accept_only_known_idle_results() {
+    for result in [
+        "Done and passed",
+        "Done and warning",
+        "DONE AND ERROR",
+        "Aborted",
+        "nO TeSt InItIaTeD",
+    ] {
+        // Independent instances avoid the successful API call's ten-minute cooldown.
+        for scheduled in [false, true] {
+            let h = Harness::new(uid()).await;
+            h.fixture(json!({"ups.test.result":result}));
+            if scheduled {
+                assert!(h.control.selftest(3600.0).await.unwrap()["executed"] == true);
+            } else {
+                let (status, pending) = h.prepare("test.quick", None).await;
+                assert_eq!(status, 200, "{result}: {pending}");
+                assert_eq!(h.confirm(&pending).await.0, 200, "{result}");
+            }
+        }
+    }
+    let h = Harness::new(uid()).await;
+    for result in [
+        Some("Test scheduled"),
+        Some("In progress"),
+        Some("unknown"),
+        Some("Done something else"),
+        Some("No test mystery"),
+        None,
+    ] {
+        h.fixture(json!({"ups.test.result":result}));
+        assert_eq!(h.prepare("test.quick", None).await.0, 409, "{result:?}");
+        assert!(h.control.selftest(3600.0).await.is_err(), "{result:?}");
+    }
+    assert!(!h.received().contains("INSTCMD"));
+}
+
+#[tokio::test]
 async fn quick_and_scheduled_preflight_migrations_and_strict_schema() {
     let h = Harness::new(uid()).await;
+    let action_lock = fs::File::create(h.dir.path().join("audit.action.lock")).unwrap();
+    action_lock.try_lock().unwrap();
+    assert!(h.control.selftest(3600.0).await.is_err());
+    let rows = h.control.store.rows(20, i64::MAX).await.unwrap();
+    assert!(rows.iter().any(|r| r.event == "refuse"
+        && r.login.as_deref() == Some("scheduled")
+        && r.result.contains("another action is in progress")));
+    assert!(
+        fs::read_to_string(h.dir.path().join("slack-posts.jsonl"))
+            .unwrap()
+            .contains("another action is in progress")
+    );
+    drop(action_lock);
     assert!(h.control.selftest(3599.99).await.is_err());
     for values in [
         json!({"battery.charge":"99"}),
