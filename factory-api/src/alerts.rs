@@ -511,7 +511,11 @@ impl Engine {
                 // https://github.com/networkupstools/nut/blob/v2.8.4/drivers/usbhid-ups.c
                 // 1: Done and passed; 2: Done and warning; 3: Done and error;
                 // 4: Aborted; 5: In progress; 6: No test initiated; 7: Test scheduled.
-                if let Some(result) = &sample.test_result {
+                if let Some(result) = sample
+                    .test_result
+                    .as_ref()
+                    .filter(|result| !matches!(result.as_str(), "In progress" | "Test scheduled"))
+                {
                     let changed = self
                         .stored
                         .ups_test_result
@@ -1405,45 +1409,99 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("alerts.json");
         let mut engine = Engine::load(config(&url, Some(path.clone()), true));
-        engine
-            .tick(T0, &ups(T0, "OL", 80.0, 900, "No test initiated"))
-            .await;
-        for seconds in [1, 2, 3] {
-            let at = T0 + seconds * 1000;
-            engine
-                .tick(at, &ups(at, "OL", 80.0, 900, "Done and warning"))
-                .await;
+        let mut at = T0;
+        // Transients do not establish a baseline; the first terminal result does.
+        for result in [
+            "In progress",
+            "Test scheduled",
+            "Done and warning",
+            "In progress",
+            "Done and warning",
+            "Done and passed",
+            "In progress",
+            "Done and passed",
+        ] {
+            engine.tick(at, &ups(at, "OL", 80.0, 900, result)).await;
+            at += 1000;
+            assert!(slack.posts.lock().unwrap().is_empty());
+            assert!(engine.view().active.is_empty());
         }
-        assert_eq!(slack.posts.lock().unwrap().len(), 1);
+        // A running/scheduled test neither clears nor reposts an existing failure.
+        for result in [
+            "Done and warning",
+            "In progress",
+            "Done and warning",
+            "Test scheduled",
+            "Done and warning",
+        ] {
+            engine.tick(at, &ups(at, "OL", 80.0, 900, result)).await;
+            at += 1000;
+            assert_eq!(slack.posts.lock().unwrap().len(), 1);
+            assert_eq!(
+                engine.view().active[0].key,
+                "ups:self_test:Done and warning"
+            );
+        }
         assert_eq!(
             slack.posts.lock().unwrap()[0]["text"],
             format!(
                 ":warning: UPS self-test failed: Done and warning; charge 80%, runtime 900 s, load 144 W, input 121 V; this is the replace-battery signal on NUT 2.8.4 (CyberPower RB reporting requires NUT >= 2.8.5) · {DASHBOARD_URL}"
             )
         );
+        engine
+            .tick(at, &ups(at, "OL", 80.0, 900, "In progress"))
+            .await;
+        at += 1000;
         drop(engine);
         let mut engine = Engine::load(config(&url, Some(path), true));
-        engine
-            .tick(
-                T0 + 4000,
-                &ups(T0 + 4000, "OL", 80.0, 900, "Done and warning"),
-            )
-            .await;
-        assert_eq!(slack.posts.lock().unwrap().len(), 1);
-        for (seconds, result) in [
-            (5, "Done and error"),
-            (6, "Done and passed"),
-            (7, "Done and warning"),
-            (8, "Done and warning"),
-        ] {
-            let at = T0 + seconds * 1000;
+        for result in ["Done and warning", "In progress"] {
             engine.tick(at, &ups(at, "OL", 80.0, 900, result)).await;
+            at += 1000;
+            assert_eq!(slack.posts.lock().unwrap().len(), 1);
+            assert_eq!(
+                engine.view().active[0].key,
+                "ups:self_test:Done and warning"
+            );
+        }
+        engine
+            .tick(at, &ups(at, "OL", 80.0, 900, "Done and passed"))
+            .await;
+        at += 1000;
+        let posts = slack.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[1]["thread_ts"], posts_ts(1));
+        assert!(
+            posts[1]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with(":white_check_mark: Recovered")
+        );
+        assert!(engine.view().active.is_empty());
+        for result in [
+            "Done and passed",
+            "Done and error",
+            "Done and passed",
+            "Done and warning",
+            "Done and warning",
+            "Aborted",
+            "Aborted",
+        ] {
+            engine.tick(at, &ups(at, "OL", 80.0, 900, result)).await;
+            at += 1000;
         }
         assert_eq!(
             texts_containing(&slack, ":warning: UPS self-test failed"),
-            3
+            4
         );
         assert_eq!(engine.view().active.len(), 1);
+        assert_eq!(engine.view().active[0].key, "ups:self_test:Aborted");
+        engine
+            .tick(at, &ups(at, "OL", 80.0, 900, "No test initiated"))
+            .await;
+        assert!(engine.view().active.is_empty());
+        let posts = slack.posts.lock().unwrap();
+        assert_eq!(posts.len(), 8);
+        assert_eq!(posts[7]["thread_ts"], posts_ts(6));
     }
 
     #[tokio::test]
