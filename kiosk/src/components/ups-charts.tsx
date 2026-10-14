@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import {
   CartesianGrid,
   Line,
@@ -10,6 +11,7 @@ import {
   YAxis,
 } from "recharts";
 import type { Gpu, UpsEvent, UpsPoint } from "../api/types";
+import { upsChartData } from "../lib/ups";
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from "./ui/chart";
 
 const config = {
@@ -39,18 +41,13 @@ export default function UpsCharts({
   events: UpsEvent[];
   now: number;
 }) {
-  const data = history.map((point) => {
-    // GPU telemetry has shorter retention. Never extend a sample over a gap.
-    const match = gpu.find((sample) => Math.abs(sample.ts_ms - point.ts_ms) <= 30_000);
+  const { data, scatter } = useMemo(() => {
+    const data = upsChartData(history, gpu);
     return {
-      ts_ms: point.ts_ms,
-      load: point.load_w.avg,
-      input: point.input_v.avg,
-      charge: point.charge_percent.avg,
-      runtime: point.runtime_s == null ? null : point.runtime_s / 60,
-      gpu: match?.power_w,
+      data,
+      scatter: data.filter((point) => point.load != null && point.runtime != null),
     };
-  });
+  }, [history, gpu]);
   const markers = events.filter(
     (event) =>
       event.kind === "on_battery" &&
@@ -172,11 +169,7 @@ export default function UpsCharts({
             <XAxis type="number" dataKey="load" name="Load" unit=" W" />
             <YAxis type="number" dataKey="runtime" name="Runtime" unit=" min" width={50} />
             <ChartTooltip content={<ChartTooltipContent />} />
-            <Scatter
-              data={data.filter((point) => point.load != null && point.runtime != null)}
-              fill="var(--accent-text)"
-              isAnimationActive={false}
-            />
+            <Scatter data={scatter} fill="var(--accent-text)" isAnimationActive={false} />
           </ScatterChart>
         </ChartContainer>
         {!history.length && <p className="muted">No history in this range.</p>}

@@ -8,6 +8,7 @@ import { UpsBadge, UpsSection } from "./components/ups";
 import UpsPage from "./components/ups-page";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { count, ms, usd, number, seen } from "./lib/format";
+import { upsChartData } from "./lib/ups";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { AgentsSection, FleetSection } from "./components/sections";
 import { VersionFooter } from "./components/version-footer";
@@ -123,6 +124,33 @@ const upsSample = (flags: string[], ts_ms = Date.now()): UpsCurrent => ({
   model: "CyberPower synthetic",
 });
 describe("UPS telemetry", () => {
+  it("matches nearest GPU samples within 30 seconds without carrying across gaps", () => {
+    const history = [100, 300, 229, 10, 370, 431, 40].map((seconds) => ({
+      ts_ms: seconds * 1000,
+      sample_count: 1,
+      load_w: { min: 90, avg: 100, max: 110 },
+      input_v: { min: 119, avg: 120, max: 121 },
+      charge_percent: { min: 80, avg: 85, max: 90 },
+      runtime_s: 600,
+    }));
+    // Sorted GPU timestamps include duplicates; UPS timestamps need not be sorted.
+    const gpu = [10, 10, 71, 131, 210, 239, 400].map((seconds) => ({
+      ...fixtures().gpu.history[0]!,
+      ts_ms: seconds * 1000,
+      power_w: seconds,
+    }));
+    const data = upsChartData(history, gpu);
+    expect(data.map((point) => point.gpu)).toEqual([71, undefined, 239, 10, 400, undefined, 10]);
+    expect(data[0]).toEqual({
+      ts_ms: 100_000,
+      load: 100,
+      input: 120,
+      charge: 85,
+      runtime: 10,
+      gpu: 71,
+    });
+    expect(upsChartData(history, []).every((point) => point.gpu === undefined)).toBe(true);
+  });
   it("refetches null SSE warnings and keeps the cause in the card and badge tooltip", async () => {
     const fetch = api();
     const defaults = fetch.getMockImplementation()!;
