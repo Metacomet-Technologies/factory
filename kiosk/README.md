@@ -8,6 +8,79 @@ server, configuration, test and script sources are TypeScript. Both TypeScript
 projects enable `strict`, `noUncheckedIndexedAccess` and
 `exactOptionalPropertyTypes`.
 
+## UPS history and settings (MET-167)
+
+`/ups` shows live UPS telemetry, a session-only 15-minute SSE load sparkline,
+five history ranges, outage markers, energy/cost/coverage, a paged event timeline,
+battery health, and settings. Every other path remains the dashboard. The UPS
+card and header badge navigate using the browser; Back returns to the dashboard.
+No router or other dependency was added. Controls are intentionally reserved,
+with no command, self-test, shutdown, or power action exposed.
+
+On battery, the runtime countdown subtracts elapsed time and the 300-second
+reserve; it reaches zero immediately at 30% charge. It does not predict charge
+drain or promise a shutdown time under changing load. Telemetry expires after
+30 seconds. Null SSE samples refetch `/v1/ups`; both the card and badge tooltip
+show the returned warning while data is unavailable and clear it on recovery.
+
+Chart series use average load, voltage, and charge; runtime uses the API's
+minimum. GPU points are overlaid only within 30 seconds of a UPS history point.
+The health trend is an accessible, scrollable chronological table of hourly
+minimum runtimes whose average load is 70–110 W, inclusive. A missing self-test
+event explicitly says its date was not recorded. Event history pages use both
+`before_ms` and `before_id`, including chart markers and the last self-test search.
+Live event transitions return the timeline to its newest page. Energy is measured,
+not extrapolated across gaps; missing GPU coverage is not represented as zero.
+Rates are parsed as decimal digits into integer micro-USD, bounded to $0–$10/kWh.
+Blank settings unset values; installation dates represent UTC calendar dates.
+
+At desktop widths, the UPS readings use a compact horizontal row. Reduced card
+spacing and the existing keyboard-scrollable request ticker reserve room above
+the fixed dashboard footer at 1728×1117, including the populated mock fixtures.
+The longer UPS page scrolls normally with its footer in document flow. Phones
+retain stacked cards. Arbitrarily large fleets/model lists can still scroll;
+content is never clipped to force a fit.
+
+Run the synthetic real-stack check from this worktree (no production access):
+
+```sh
+scripts/sandbox up --rows 1k --kiosk
+# From kiosk/, with Playwright Chromium installed under this user:
+vp run ups:check
+# From the repository root when finished:
+scripts/sandbox down
+```
+
+The check drives the real fake-upsd through OL → OB DISCHRG → OL, saves the
+rate through the form, verifies browser navigation/back, all history requests,
+outage markers, chart-label contrast in both themes, null-state warnings and
+recovery, and layout bounds at 1728×1117 and 390px. It also stresses the desktop
+with existing three-node/model/quota fixtures. Screenshots and numeric reports
+go to `.amp/in/artifacts/`. It leaves the synthetic rate/date set and returns
+fake-upsd to OL. The fake's constant 144 W load cannot supply a 70–110 W health
+trend, and its short history cannot supply year-long GPU energy coverage; those
+nullable/boundary cases are covered with UI fixtures, not claimed as live data.
+Physical phone Safari and console Chrome checks remain Devon's deployment gate.
+
+### Mac installation and rollback
+
+Devon runs these only when ready to install. No API deployment or service restart
+is needed once MET-165's API is installed. Build and read worktree files as agent;
+the administrator stages a disposable copy outside `/home/agent` for the existing
+root-only installer. Preserve the printed rollback snapshot path.
+
+```sh
+factory-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-167-ups-page-charts-power/kiosk && VITE_API_BASE= vp build'"
+factory-ssh 'set -euo pipefail; stage=$(mktemp -d /tmp/met-167-kiosk.XXXXXX); trap '\''rm -rf -- "$stage"'\'' EXIT; sudo -u agent tar -C /home/agent/work/factory-met-167-ups-page-charts-power/kiosk/dist -cf - . | tar -xf - -C "$stage"; sudo -u agent cat /home/agent/work/factory-met-167-ups-page-charts-power/deploy/install-kiosk.sh | sudo bash -s -- "$stage"'
+# Immediate rollback to the latest complete kiosk snapshot:
+factory-ssh 'set -euo pipefail; sudo -u agent cat /home/agent/work/factory-met-167-ups-page-charts-power/deploy/rollback-kiosk.sh | sudo bash -s'
+```
+
+If another installation has occurred since, pass the preserved snapshot path to
+`sudo bash -s -- /var/backups/factory-kiosk/<printed-snapshot>` instead of using
+the latest-snapshot default. Then check `/ups` on the phone and confirm the console
+dashboard, including its model rows, fits above the footer without page scrolling.
+
 ## Manual usage refresh (MET-139)
 
 The Frontier CLIs header has a keyboard-accessible refresh button on all layouts,

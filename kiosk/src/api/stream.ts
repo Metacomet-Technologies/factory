@@ -6,6 +6,9 @@ export interface LiveState {
   gpu: GpuSample | null | undefined;
   ups: UpsCurrent | null | undefined;
   upsAt: number;
+  upsSamples: UpsCurrent[];
+  upsWarningRevision: number;
+  upsEventRevision: number;
   agents: Agents | null;
   requests: Extract<StreamEvent, { type: "llm.request" }>[];
   fleetRevision: number;
@@ -16,6 +19,9 @@ export const initialLiveState: LiveState = {
   gpu: undefined,
   ups: undefined,
   upsAt: 0,
+  upsSamples: [],
+  upsWarningRevision: 0,
+  upsEventRevision: 0,
   agents: null,
   requests: [],
   fleetRevision: 0,
@@ -27,7 +33,23 @@ export function streamReducer(state: LiveState, event: StreamEvent): LiveState {
     case "gpu.sample":
       return { ...state, gpu: event.data };
     case "ups.sample":
-      return { ...state, ups: event.data, upsAt: event.ts_ms };
+      return {
+        ...state,
+        ups: event.data,
+        upsAt: event.ts_ms,
+        upsWarningRevision: state.upsWarningRevision + (event.data === null ? 1 : 0),
+        upsSamples: event.data
+          ? [
+              ...state.upsSamples.filter(
+                (sample) =>
+                  sample.ts_ms > event.ts_ms - 900_000 && sample.ts_ms < event.data!.ts_ms,
+              ),
+              event.data,
+            ].slice(-180)
+          : state.upsSamples,
+      };
+    case "ups.event":
+      return { ...state, upsEventRevision: state.upsEventRevision + 1 };
     case "llm.request":
       return { ...state, requests: [event, ...state.requests].slice(0, 6) };
     case "fleet.change":
@@ -61,6 +83,23 @@ export function parseEvent(value: unknown): StreamEvent | null {
     keys.every((key) => typeof fields[key] === "number" && Number.isFinite(fields[key]));
   const strings = (keys: string[]) => keys.every((key) => typeof fields[key] === "string");
   switch (value.type) {
+    case "ups.event":
+      if (
+        numbers(["id", "started_ms"]) &&
+        ["on_battery", "low_battery", "replace_battery", "comms_lost", "self_test"].includes(
+          String(fields.kind),
+        ) &&
+        ["ended_ms", "min_charge_percent", "min_runtime_s"].every(
+          (key) =>
+            fields[key] == null ||
+            (typeof fields[key] === "number" && Number.isFinite(fields[key])),
+        ) &&
+        ["detail", "end_reason"].every(
+          (key) => fields[key] == null || typeof fields[key] === "string",
+        )
+      )
+        return value as StreamEvent;
+      break;
     case "ups.sample":
       if (
         numbers(["ts_ms"]) &&
@@ -202,6 +241,7 @@ export function useStream() {
     for (const type of [
       "gpu.sample",
       "ups.sample",
+      "ups.event",
       "llm.request",
       "fleet.change",
       "pricing.changed",
