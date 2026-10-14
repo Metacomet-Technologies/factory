@@ -146,6 +146,10 @@ def inside():
         binary = ROOT / "target/release"
         start("fake-ollama", [binary / "fake-ollama", "--port", str(BASE), "--seed", seed])
         ready(BASE, "/api/version")
+        ups_status = STATE / "ups-status"
+        if not ups_status.exists():
+            ups_status.write_text("OL\n")
+        start("fake-upsd", ["python3", ROOT / "scripts/sandbox-shims/fake-upsd.py", "3493", ups_status])
         if not (STATE / "seed.json").exists():
             end_ms = int(time.time() // 86400) * 86400000
             child = start("seed", [binary / "sandbox-seed", "--legacy", "--db-path", STATE / "meter.v0.db",
@@ -200,9 +204,11 @@ def inside():
                                        stdout=log, stderr=log)
         if migration.returncode != 0:
             raise RuntimeError(f"Pricing migration failed (exit {migration.returncode}); see factory-api.log")
+        os.environ["FACTORY_API_UPS_ADDR"] = "127.0.0.1:3493"
         start("factory-api", [binary / "factory-api", "--listen", f"127.0.0.1:{BASE+2}",
                               "--meter-url", f"http://127.0.0.1:{BASE+1}", "--db-path", STATE / "requests.db",
                               "--pricing-db-path", STATE / "pricing.db", "--services-config", STATE / "fleet.toml",
+                              "--usage-snapshot", STATE / "usage.json", "--usage-trigger", STATE / "usage-trigger",
                               "--openrouter-feed-url", f"http://127.0.0.1:{BASE}/feeds/openrouter",
                               "--litellm-feed-url", f"http://127.0.0.1:{BASE}/feeds/litellm",
                               "--disable-pricing-collector",

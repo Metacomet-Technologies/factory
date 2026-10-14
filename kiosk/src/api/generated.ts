@@ -176,6 +176,22 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v1/ups": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["ups"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -408,6 +424,10 @@ export interface components {
       data: unknown;
       /** Format: int64 */
       ts_ms: number;
+      /**
+       * @description Named SSE event: gpu.sample, ups.sample, llm.request, fleet.change,
+       *     pricing.changed, or agents.usage. ups.sample data is UpsCurrent or null on failure.
+       */
       type: string;
     };
     Totals: {
@@ -416,6 +436,46 @@ export interface components {
       /** Format: int64 */
       prompt_tokens: number;
       requests: number;
+    };
+    Ups: {
+      current?: null | components["schemas"]["UpsCurrent"];
+      /** Format: int64 */
+      generated_at_ms: number;
+      warnings: string[];
+    };
+    UpsCurrent: {
+      /** Format: double */
+      battery_v?: number | null;
+      /** Format: double */
+      charge_low_percent?: number | null;
+      /** Format: double */
+      charge_percent?: number | null;
+      /** Format: double */
+      charge_warning_percent?: number | null;
+      flags: string[];
+      /** Format: double */
+      input_v?: number | null;
+      /** Format: double */
+      load_nominal_w?: number | null;
+      /** Format: double */
+      load_percent?: number | null;
+      /** Format: double */
+      load_w?: number | null;
+      low_battery?: boolean | null;
+      model?: string | null;
+      on_battery?: boolean | null;
+      on_line?: boolean | null;
+      /** Format: double */
+      output_v?: number | null;
+      replace_battery?: boolean | null;
+      /** Format: int64 */
+      runtime_low_s?: number | null;
+      /** Format: int64 */
+      runtime_s?: number | null;
+      status?: string | null;
+      test_result?: string | null;
+      /** Format: int64 */
+      ts_ms: number;
     };
     Usage: {
       /** Format: int64 */
@@ -722,6 +782,25 @@ export interface operations {
         };
         content: {
           "text/event-stream": components["schemas"]["StreamEvent"];
+        };
+      };
+    };
+  };
+  ups: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Ups"];
         };
       };
     };

@@ -1,4 +1,5 @@
 use crate::types::*;
+use crate::ups::{Ups, UpsCurrent};
 use crate::{AppState, now_ms};
 use axum::{
     Json, Router,
@@ -119,6 +120,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
             | "/v1/fleet"
             | "/v1/llm/usage"
             | "/v1/gpu"
+            | "/v1/ups"
             | "/v1/pricing"
             | "/v1/pricing/refresh"
             | "/v1/agents"
@@ -154,6 +156,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
         "/v1/agents" => agents(&state).await.into_response(),
         "/v1/agents/refresh" => refresh_agents(&state, request).await,
         "/v1/alerts" => alerts(&state).await.into_response(),
+        "/v1/ups" => ups(&state).await.into_response(),
         "/openapi.json" => Json(ApiDoc::openapi()).into_response(),
         "/v1/stream" => stream(&state).into_response(),
         "/v1/gpu" => match range(&request, true) {
@@ -244,6 +247,10 @@ async fn fleet(state: &AppState) -> Json<Fleet> {
         state.collect_fleet().await;
     }
     Json(state.fleet.read().await.clone())
+}
+#[utoipa::path(get, path="/v1/ups", responses((status=200, body=Ups)))]
+async fn ups(state: &AppState) -> Json<Ups> {
+    Json(state.ups().await)
 }
 #[utoipa::path(get, path="/v1/agents", responses((status=200, body=Agents)))]
 async fn agents(state: &AppState) -> Json<Agents> {
@@ -398,6 +405,7 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         stream,
         usage,
         gpu,
+        ups,
         pricing,
         refresh,
         confirm_selection
@@ -408,6 +416,8 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         Fleet,
         Usage,
         Gpu,
+        Ups,
+        UpsCurrent,
         Pricing,
         Agents,
         Alerts,
