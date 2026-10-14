@@ -587,13 +587,19 @@ impl AppState {
                             "database" => {
                                 let optimize =
                                     last_optimize.elapsed() >= Duration::from_secs(86400);
+                                let retention = state
+                                    .db
+                                    .write(&state.query_scope, |db| {
+                                        ups_history::retain(db, now_ms())
+                                    })
+                                    .await;
+                                state
+                                    .warning(
+                                        "ups retention",
+                                        retention.err().map(|e| e.to_string()),
+                                    )
+                                    .await;
                                 let result = async {
-                                    state
-                                        .db
-                                        .write(&state.query_scope, |db| {
-                                            ups_history::retain(db, now_ms())
-                                        })
-                                        .await?;
                                     let requests = state
                                         .db
                                         .requests
