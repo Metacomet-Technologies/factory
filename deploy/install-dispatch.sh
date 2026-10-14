@@ -61,7 +61,9 @@ LOOKUP
 [[ "$node" =~ ^/[a-zA-Z0-9_./-]+$ && "$amp" =~ ^/[a-zA-Z0-9_./-]+$ ]] || fail 'Node and Amp must resolve to absolute executable paths without spaces.'
 path="$(dirname "$node"):$(dirname "$amp"):/usr/local/bin:/usr/bin:/bin"
 as_agent() { sudo -u agent env -i HOME=/home/agent USER=agent PATH="$path" "$@"; }
-[[ $(as_agent "$node" --version) == "v$(cat "$root/scripts/dispatch/.node-version")" ]] || fail 'Select Node 24.21.0 as agent before installing; this installer never installs runtimes.'
+supported_node() { [[ $1 =~ ^v?24\.([0-9]+)\.([0-9]+)$ && ${BASH_REMATCH[1]} -ge 12 ]]; }
+node_version=$(as_agent "$node" --version)
+supported_node "$node_version" || fail "Use Node 24.x (>= 24.12.0); found $node_version"
 as_agent "$amp" --version
 local_runners=$(as_agent "$amp" runner list --json)
 [[ ! -t 0 ]] || fail 'Pipe fresh console amp runner list --json into this installer; see scripts/dispatch/README.md.'

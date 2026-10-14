@@ -182,6 +182,7 @@ factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
 
 **Services / apps**
 - `node --check` doesn't strip TypeScript types and fails on `.ts` files with `Unexpected token ':'`; verify dispatcher and collector scripts with `node --test`, never `node --check`.
+- Exact Node patch pins broke the dispatcher when the Vite+ shim default moved on 2026-10-14. Runtime checks accept Node 24.x at 24.12.0 or newer; `.node-version` remains the preferred version.
 - GNOME RDP headless: set credentials with `sudo grdctl --system rdp set-credentials` and register a TLS cert; the Windows App hangs at TLS, use `sdl-freerdp`. Remote Login refuses while the same user is logged in locally.
 - After changing the kiosk's autostart `Exec=`, relaunch the console session (reboot) and verify the live process with `pgrep -u console -af -- '--app='`; the dashboard working in another browser doesn't prove the kiosk switched.
 - Ollama `/api/ps` misreports gemma4's size; use `nvidia-smi`. Exclude non-inference requests (health checks) from usage.

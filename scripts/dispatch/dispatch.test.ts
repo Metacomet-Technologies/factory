@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { sections, slug, prompt, wrapupPrompt, validate, isMergedGitHubPR, commentMarkers } from './dispatch.ts';
+import { sections, slug, prompt, wrapupPrompt, validate, isMergedGitHubPR, commentMarkers, supportedNode } from './dispatch.ts';
 import { reviewerEngine } from './qa.ts';
 
 const executable = fileURLToPath(new URL('dispatch.ts', import.meta.url));
@@ -55,6 +55,11 @@ const archived = (i: any) => i.comments.some((c: any) => commentMarkers(c.body).
 const archivable = (n = 123) => issue(n, { labels: [], state: { type: 'completed' }, comments: [
   { body: `<!-- factory-dispatch:thread T-01234567-89ab-4cde-8fab-${String(n).padStart(12, '0')} runner:gpu -->` }, { body: '<!-- factory-dispatch:wrapup -->' },
 ] });
+
+test('supported Node versions require Node 24.12.0 or newer', () => {
+  for (const version of ['24.12.0', '24.21.0', '24.22.0']) assert.equal(supportedNode(version), true);
+  for (const version of ['24.11.1', '22.18.0', '25.0.0', '26.1.0', '24.12', 'v24.12.0', '24.12.0-beta']) assert.equal(supportedNode(version), false);
+});
 
 async function fixture(t: any, issues = [issue()], options: any = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'factory-dispatch-test-'));

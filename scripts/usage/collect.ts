@@ -129,10 +129,15 @@ export async function writeSnapshot(path: string, snapshot: Snapshot): Promise<v
   } finally { await unlink(temporary).catch(() => {}); }
 }
 
+export function supportedNode(version: string): boolean {
+  const match = version.match(/^24\.(\d+)\.(\d+)$/);
+  return match !== null && Number(match[1]) >= 12;
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   let fd: number | undefined;
   try {
-    if (process.versions.node !== '24.21.0') throw new Error('Unsupported runtime');
+    if (!supportedNode(process.versions.node)) throw new Error(`Use Node 24.x (>= 24.12.0); found ${process.versions.node}`);
     const args = process.argv.slice(2);
     if (args.length > 1 || (args.length === 1 && args[0] !== '--dry-run')) throw new Error('Invalid arguments');
     // Same lock from all worktrees once deployed; a fresh worktree uses its own
