@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 import type { ControlState } from "../src/api/ups-control.ts";
 
 // Only this worktree's isolated stack and local kiosk preview are used.
@@ -22,6 +23,18 @@ const errors: string[] = [];
 page.on("pageerror", (error) => errors.push(error.message));
 const reports: unknown[] = [];
 const login = (value: string) => writeFile(new URL(".sandbox/serve-login", root), value);
+const guardDenials = () =>
+  Number(
+    execFileSync(
+      "python3",
+      [
+        "-c",
+        "import sqlite3,sys; db=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); print(db.execute(\"SELECT count(*) FROM audit WHERE event='guard-deny'\").fetchone()[0])",
+        fileURLToPath(new URL(".sandbox/ups-control.db", root)),
+      ],
+      { encoding: "utf8" },
+    ),
+  );
 const controls = page.getByRole("region", { name: "Controls", exact: true });
 const capture = (name: string) =>
   page.screenshot({ path: fileURLToPath(new URL(name, artifacts)), animations: "disabled" });
@@ -174,7 +187,26 @@ try {
     audit: snapshot.audit,
     recovery: "Browser-only health 503 then real sandbox 200; no physical outage",
   });
+  await page.route("**/control/v1/state", (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "ups snapshot unavailable" }),
+    }),
+  );
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.reload();
+  await expect(controls).toHaveText("ups snapshot unavailable");
+  await expect(controls.getByRole("button")).toHaveCount(0);
+  await controls.scrollIntoViewIfNeeded();
+  await capture("390-dark-ups-controls-error.png");
+  await page.unroute("**/control/v1/state");
   await login("unlisted@github");
+  const deniedRequests: string[] = [];
+  page.on("request", (request) => {
+    const path = new URL(request.url()).pathname;
+    if (path.startsWith("/control/")) deniedRequests.push(path);
+  });
   await page.setViewportSize({ width: 1728, height: 1117 });
   await page.emulateMedia({ colorScheme: "dark" });
   await page.reload();
@@ -182,6 +214,17 @@ try {
   await expect(controls.getByRole("button")).toHaveCount(0);
   await controls.scrollIntoViewIfNeeded();
   await capture("1728-dark-ups-controls-denied.png");
+  const before = guardDenials();
+  await page.waitForTimeout(70_000);
+  const after = guardDenials();
+  expect(after).toBe(before);
+  expect(deniedRequests).toEqual(["/control/v1/state"]);
+  reports.push({
+    deniedObservationMs: 70_000,
+    guardDenialsBefore: before,
+    guardDenialsAfter: after,
+    deniedRequests,
+  });
   expect(errors).toEqual([]);
   await writeFile(
     new URL("ups-controls-check.json", artifacts),

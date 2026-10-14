@@ -11,8 +11,13 @@ projects enable `strict`, `noUncheckedIndexedAccess` and
 ## UPS controls (MET-168)
 
 The Controls region on `/ups` fetches `/control/v1/state` on load and every
-30 seconds. A denied or failed state read renders only “Controls available
-from Devon's or David's devices”, with no controls buttons. The signed-in view
+30 seconds. HTTP 403 renders only “Controls available from Devon's or David's
+devices”, closes any confirmation dialog, and stops all `/control` requests until
+reload. Network errors show the same text but retry no sooner than 30 seconds.
+Other HTTP failures show the server's error verbatim, without action buttons, and
+keep polling. A transient failed poll does not close an open confirmation dialog.
+Confirmation network/timeout/non-JSON failures warn that the outcome is unknown
+and to check the audit before retrying, including the error detail. The signed-in view
 groups the returned actions into Safe, Settings and Power. Settings use the
 server's current values, enums and disjoint integer ranges. Every enabled action
 first requests a server confirmation ID, then opens a Base UI modal with trapped
@@ -57,7 +62,10 @@ vp run ups-controls:check
 The browser completes a quick test, changes sensitivity to high, confirms
 power-cycle, checks FSD in the fake upsd log and checks the audit results. It also
 checks exact typing, real keyboard focus trapping, disabled stay-off, phone
-overflow, AA text contrast in both themes, and an unlisted-login 403 view. The
+overflow, AA text contrast in both themes, a browser-only 409 view, and an
+unlisted-login 403 view. It observes that view for 70 seconds, requiring exactly
+one control request and no growth in the sandbox database's guard-deny row count.
+The guard count uses Python's standard-library SQLite connection in read-only mode. The
 fake never shuts down: recovery uses browser-only health 503 followed by the real
 sandbox health response. Required screenshots plus a pending-banner capture and
 `ups-controls-check.json` go to `.amp/in/artifacts/`. For another clean run, stop

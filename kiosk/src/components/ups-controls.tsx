@@ -1,5 +1,5 @@
 import { Dialog } from "@base-ui/react/dialog";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { apiUrl } from "../api/client";
 import type {
   AuditRow,
@@ -14,22 +14,15 @@ import { Button } from "./ui/button";
 
 const denied = "Controls available from Devon's or David's devices";
 
-async function controlRequest<T>(path: string, body?: object, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(apiUrl(`/control/v1/${path}`), {
-    signal: signal
-      ? AbortSignal.any([signal, AbortSignal.timeout(20_000)])
-      : AbortSignal.timeout(20_000),
-    ...(body
-      ? {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        }
-      : {}),
-  });
-  const data = (await response.json()) as T & { error?: string; result?: string };
-  if (!response.ok) throw new Error(data.error ?? data.result ?? `HTTP ${response.status}`);
-  return data;
+class ControlError extends Error {
+  status: number;
+  validJson: boolean;
+
+  constructor(message: string, status: number, validJson = true) {
+    super(message);
+    this.status = status;
+    this.validJson = validJson;
+  }
 }
 
 function consequence(action: string) {
@@ -117,32 +110,94 @@ export default function UpsControls() {
   const [audit, setAudit] = useState<AuditRow[] | null>(null);
   const [pending, setPending] = useState<PendingPower | null>(null);
   const [recoveredId, setRecoveredId] = useState<number | null>(null);
+  const [stateError, setStateError] = useState(denied);
+  const forbidden = useRef(false);
+  const stateTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const nextStateRead = useRef(0);
+
+  const controlRequest = useCallback(
+    async <T,>(path: string, body?: object, signal?: AbortSignal): Promise<T> => {
+      if (forbidden.current) throw new ControlError(denied, 403);
+      const response = await fetch(apiUrl(`/control/v1/${path}`), {
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(20_000)])
+          : AbortSignal.timeout(20_000),
+        ...(body
+          ? {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            }
+          : {}),
+      });
+      if (response.status === 403) {
+        forbidden.current = true;
+        if (stateTimer.current !== null) clearInterval(stateTimer.current);
+        setState(null);
+        setStateError(denied);
+        setMessage("");
+        setLoading(false);
+        setDialog(null);
+      } else if (forbidden.current) {
+        // An earlier in-flight request cannot restore controls after denial.
+        throw new ControlError(denied, 403);
+      }
+      let data: T & { error?: string; result?: string };
+      try {
+        data = (await response.json()) as typeof data;
+      } catch (error) {
+        throw new ControlError(
+          `HTTP ${response.status}: ${error instanceof Error ? error.message : "Invalid JSON response"}`,
+          response.status,
+          false,
+        );
+      }
+      if (forbidden.current && response.status !== 403) throw new ControlError(denied, 403);
+      if (!response.ok)
+        throw new ControlError(
+          data.error ?? data.result ?? `HTTP ${response.status}`,
+          response.status,
+        );
+      return data;
+    },
+    [],
+  );
 
   const refresh = useCallback(
-    (signal?: AbortSignal) =>
-      controlRequest<ControlState>("state", undefined, signal)
+    (signal?: AbortSignal) => {
+      if (forbidden.current || Date.now() < nextStateRead.current) return Promise.resolve();
+      return controlRequest<ControlState>("state", undefined, signal)
         .then((next) => {
-          if (!signal?.aborted) {
+          if (!signal?.aborted && !forbidden.current) {
             setState(next);
             setLoading(false);
+            nextStateRead.current = 0;
             if (next.pending_power_action) setPending(next.pending_power_action);
           }
         })
-        .catch(() => {
+        .catch((error: unknown) => {
           if (!signal?.aborted) {
             setState(null);
-            setDialog(null);
+            setStateError(
+              !forbidden.current && error instanceof ControlError && error.status !== 403
+                ? error.message
+                : denied,
+            );
             setLoading(false);
+            nextStateRead.current = Date.now() + 30_000;
           }
-        }),
-    [],
+        });
+    },
+    [controlRequest],
   );
   useEffect(() => {
+    if (forbidden.current) return;
     const controller = new AbortController();
-    void refresh(controller.signal);
     const timer = setInterval(() => {
       void refresh(controller.signal);
     }, 30_000);
+    stateTimer.current = timer;
+    void refresh(controller.signal);
     return () => {
       controller.abort();
       clearInterval(timer);
@@ -205,13 +260,14 @@ export default function UpsControls() {
         setNow(Date.now());
         setDialog({ action, value, confirmation });
       } catch (error) {
-        setMessage(error instanceof Error ? error.message : "Request failed");
+        if (!forbidden.current)
+          setMessage(error instanceof Error ? error.message : "Request failed");
       } finally {
         setBusy(false);
         void refresh();
       }
     },
-    [refresh],
+    [refresh, controlRequest],
   );
   async function confirm() {
     if (
@@ -243,11 +299,12 @@ export default function UpsControls() {
         });
       }
     } catch (error) {
-      setMessage(
-        error instanceof Error
-          ? error.message
-          : "Confirmation failed; outcome unknown. Check audit before retrying.",
-      );
+      if (!forbidden.current)
+        setMessage(
+          error instanceof ControlError && error.validJson
+            ? error.message
+            : `Confirmation failed; outcome unknown. Check audit before retrying. ${error instanceof Error ? error.message : String(error)}`,
+        );
     } finally {
       setDialog(null);
       setBusy(false);
@@ -276,122 +333,139 @@ export default function UpsControls() {
         <p className="muted">Loading controls…</p>
       </section>
     );
-  if (!state)
-    return (
-      <div className="ups-controls">
-        {pendingBanner}
-        <section className="ups-panel" aria-label="Controls">
-          <p className="muted">{denied}</p>
-        </section>
-      </div>
-    );
-  const rows = audit ?? state.audit;
+  const rows = audit ?? state?.audit ?? [];
   return (
-    <section className="ups-panel ups-controls" aria-label="Controls">
-      <h3>Controls</h3>
-      <p className="muted">Signed in as {state.login}</p>
-      {pendingBanner}
-      {message && (
-        <p role="status" className="ups-control-result">
-          {message}
-        </p>
-      )}
-      {(["safe", "settings", "power"] as const).map((tier) => (
-        <div className="ups-control-tier" key={tier}>
-          <h4>{tier === "safe" ? "Safe" : tier === "settings" ? "Settings" : "Power"}</h4>
-          {state.actions
-            .filter((action) => action.tier === tier)
-            .map((action) => {
-              const setting = state.settings[action.action];
-              return setting ? (
-                <SettingForm
-                  key={`${action.action}:${setting.value}`}
-                  action={action}
-                  setting={setting}
-                  busy={busy}
-                  prepare={(action, value) => {
-                    void prepare(action, value);
-                  }}
-                />
-              ) : (
-                <div key={action.action} className="ups-control-action">
-                  <Button
-                    variant={tier === "power" ? "destructive" : "outline"}
-                    disabled={busy || !action.enabled}
-                    aria-describedby={
-                      action.disabled_reason || action.refusal_reason || tier === "power"
-                        ? `hint-${action.action}`
-                        : undefined
-                    }
-                    onClick={() => {
-                      void prepare(action);
-                    }}
-                  >
-                    {action.label ?? action.action}
-                  </Button>
-                  <div id={`hint-${action.action}`}>
-                    {tier === "power" && <p>{consequence(action.action)}</p>}
-                    {(action.disabled_reason || action.refusal_reason) && (
-                      <p className="status-warn">
-                        {action.disabled_reason ?? action.refusal_reason}
-                      </p>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
+    <>
+      {!state ? (
+        <div className="ups-controls">
+          {pendingBanner}
+          {message && (
+            <p role="status" className="ups-control-result">
+              {message}
+            </p>
+          )}
+          <section className="ups-panel" aria-label="Controls">
+            <p
+              className={stateError === denied ? "muted" : "status-fail"}
+              role={stateError === denied ? undefined : "alert"}
+            >
+              {stateError}
+            </p>
+          </section>
         </div>
-      ))}
-      <div className="ups-control-tier">
-        <h4>Audit log</h4>
-        {!rows.length && <p className="muted">No audit rows.</p>}
-        <ol className="ups-events ups-control-audit">
-          {rows.map((row) => (
-            <li key={row.id}>
-              <time dateTime={new Date(row.ts_ms).toISOString()}>
-                {new Date(row.ts_ms).toLocaleString()}
-              </time>
-              <p>
-                {row.login ?? "—"} · {row.action ?? "—"} · {row.value ?? "—"}
-              </p>
-              <p>{row.result}</p>
-            </li>
+      ) : (
+        <section className="ups-panel ups-controls" aria-label="Controls">
+          <h3>Controls</h3>
+          <p className="muted">Signed in as {state.login}</p>
+          {pendingBanner}
+          {message && (
+            <p role="status" className="ups-control-result">
+              {message}
+            </p>
+          )}
+          {(["safe", "settings", "power"] as const).map((tier) => (
+            <div className="ups-control-tier" key={tier}>
+              <h4>{tier === "safe" ? "Safe" : tier === "settings" ? "Settings" : "Power"}</h4>
+              {state.actions
+                .filter((action) => action.tier === tier)
+                .map((action) => {
+                  const setting = state.settings[action.action];
+                  return setting ? (
+                    <SettingForm
+                      key={`${action.action}:${setting.value}`}
+                      action={action}
+                      setting={setting}
+                      busy={busy}
+                      prepare={(action, value) => {
+                        void prepare(action, value);
+                      }}
+                    />
+                  ) : (
+                    <div key={action.action} className="ups-control-action">
+                      <Button
+                        variant={tier === "power" ? "destructive" : "outline"}
+                        disabled={busy || !action.enabled}
+                        aria-describedby={
+                          action.disabled_reason || action.refusal_reason || tier === "power"
+                            ? `hint-${action.action}`
+                            : undefined
+                        }
+                        onClick={() => {
+                          void prepare(action);
+                        }}
+                      >
+                        {action.label ?? action.action}
+                      </Button>
+                      <div id={`hint-${action.action}`}>
+                        {tier === "power" && <p>{consequence(action.action)}</p>}
+                        {(action.disabled_reason || action.refusal_reason) && (
+                          <p className="status-warn">
+                            {action.disabled_reason ?? action.refusal_reason}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
           ))}
-        </ol>
-        <div className="row">
-          {audit && (
-            <Button
-              variant="outline"
-              disabled={busy}
-              onClick={() => {
-                setAudit(null);
-                void refresh();
-              }}
+          <div className="ups-control-tier">
+            <h4>Audit log</h4>
+            {!rows.length && <p className="muted">No audit rows.</p>}
+            <ol
+              className="ups-events ups-control-audit"
+              tabIndex={0}
+              aria-label="UPS control audit rows"
             >
-              Newest audit
-            </Button>
-          )}
-          {rows.length === 20 && (
-            <Button
-              variant="outline"
-              disabled={busy}
-              onClick={() => {
-                setBusy(true);
-                void controlRequest<{ rows: AuditRow[] }>(
-                  `audit?limit=20&before_ms=${rows[rows.length - 1]!.ts_ms}`,
-                )
-                  .then((page) => setAudit(page.rows))
-                  .catch((error: unknown) =>
-                    setMessage(error instanceof Error ? error.message : "Audit unavailable"),
-                  )
-                  .finally(() => setBusy(false));
-              }}
-            >
-              Older audit
-            </Button>
-          )}
-        </div>
-      </div>
+              {rows.map((row) => (
+                <li key={row.id}>
+                  <time dateTime={new Date(row.ts_ms).toISOString()}>
+                    {new Date(row.ts_ms).toLocaleString()}
+                  </time>
+                  <p>
+                    {row.login ?? "—"} · {row.action ?? "—"} · {row.value ?? "—"}
+                  </p>
+                  <p>{row.result}</p>
+                </li>
+              ))}
+            </ol>
+            <div className="row">
+              {audit && (
+                <Button
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => {
+                    setAudit(null);
+                    void refresh();
+                  }}
+                >
+                  Newest audit
+                </Button>
+              )}
+              {rows.length === 20 && (
+                <Button
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => {
+                    setBusy(true);
+                    void controlRequest<{ rows: AuditRow[] }>(
+                      `audit?limit=20&before_ms=${rows[rows.length - 1]!.ts_ms}`,
+                    )
+                      .then((page) => setAudit(page.rows))
+                      .catch((error: unknown) => {
+                        if (!forbidden.current)
+                          setMessage(error instanceof Error ? error.message : "Audit unavailable");
+                      })
+                      .finally(() => setBusy(false));
+                  }}
+                >
+                  Older audit
+                </Button>
+              )}
+            </div>
+          </div>
+        </section>
+      )}
       <Dialog.Root
         open={dialog !== null}
         onOpenChange={(open) => {
@@ -451,6 +525,6 @@ export default function UpsControls() {
           </Dialog.Popup>
         </Dialog.Portal>
       </Dialog.Root>
-    </section>
+    </>
   );
 }

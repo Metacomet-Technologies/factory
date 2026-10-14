@@ -49,6 +49,10 @@ beforeEach(() => {
 function api(outage = false, failing = "", empty = false) {
   const fetch = vi.fn((path: string) => {
     const url = new URL(path, "http://localhost");
+    if (url.pathname === "/control/v1/state")
+      return Promise.resolve(
+        new Response(JSON.stringify({ error: "controls denied" }), { status: 403 }),
+      );
     const data = fixtures(outage, url.searchParams.get("range") === "7d" ? "7d" : "24h");
     data.fleet.nodes[0]!.services[0]!.name = "renamed-meter";
     if (empty) {
