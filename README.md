@@ -1,5 +1,7 @@
 # factory: meter
 
+UPS operating architecture and procedures: [docs/ups.md](docs/ups.md).
+
 `meter` is a transparent Ollama metering proxy for factory-gpu. It forwards
 all non-`/meter/*` paths (including NDJSON, OpenAI SSE, embeddings, and unknown
 future Ollama endpoints), records usage in SQLite, and samples NVIDIA GPUs.
