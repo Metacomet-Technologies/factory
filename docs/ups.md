@@ -8,18 +8,23 @@ Never install on factory-console: it is not connected to this UPS.
 ## End-to-end architecture
 
 NUT reads the CyberPower UPS over USB on factory-gpu. `factory-api` collects that
-state for the dashboard card, `/ups` history, and alert evaluation. The kiosk
-uses the same-origin `/control` mount only for control state and requests.
+state for the dashboard card, [`/ups` controls](../kiosk/README.md#ups-controls-met-168),
+[`/ups` history and settings](../kiosk/README.md#ups-history-and-settings-met-167),
+and [synthetic UPS checks](sandbox.md#ups-fake-met-162). The kiosk uses the
+same-origin `/control` mount only for control state and requests.
 `factory-ups-control` accepts those requests only after its independent identity
 guard verifies the live loopback peer and Devon or David's Tailscale identity;
 tagged nodes have no identity header and are refused. A requested action needs a
 short-lived, exact typed confirmation before the service performs its fixed NUT
 command. It records confirmation and result in its own audit DB, then queues
-Slack delivery. This connects the components below without duplicating their
-configuration: [identity guard](#control-identity-is-checked-independently-of-factory-api),
+control-service [Slack delivery](#audit-slack-timer-and-rollback-preserve-state).
+Factory-api's alert engine evaluates five UPS alerts and posts to `#factory-alerts`:
+on battery (30 s hold), low battery (critical), replace battery, communications
+lost (60 s), and self-test failed. This connects the components below without
+duplicating their configuration: [identity guard](#control-identity-is-checked-independently-of-factory-api),
 [confirmation and tracking](#confirmations-and-tracking-distinguish-acceptance-from-execution),
 [power behavior](#power-cycle-uses-only-the-late-nut-shutdown-path), and
-[audit, alerts, and timer](#audit-slack-timer-and-rollback-preserve-state).
+[audit and timer](#audit-slack-timer-and-rollback-preserve-state).
 
 ## Installed configuration
 
