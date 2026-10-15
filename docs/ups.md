@@ -5,6 +5,22 @@ updates the clean `/home/agent/work/factory` checkout and builds
 `cargo build --release --locked -p factory-ups-control` as agent.
 Never install on factory-console: it is not connected to this UPS.
 
+## End-to-end architecture
+
+NUT reads the CyberPower UPS over USB on factory-gpu. `factory-api` collects that
+state for the dashboard card, `/ups` history, and alert evaluation. The kiosk
+uses the same-origin `/control` mount only for control state and requests.
+`factory-ups-control` accepts those requests only after its independent identity
+guard verifies the live loopback peer and Devon or David's Tailscale identity;
+tagged nodes have no identity header and are refused. A requested action needs a
+short-lived, exact typed confirmation before the service performs its fixed NUT
+command. It records confirmation and result in its own audit DB, then queues
+Slack delivery. This connects the components below without duplicating their
+configuration: [identity guard](#control-identity-is-checked-independently-of-factory-api),
+[confirmation and tracking](#confirmations-and-tracking-distinguish-acceptance-from-execution),
+[power behavior](#power-cycle-uses-only-the-late-nut-shutdown-path), and
+[audit, alerts, and timer](#audit-slack-timer-and-rollback-preserve-state).
+
 ## Installed configuration
 
 `deploy/ups/install-nut.sh` installs Ubuntu's `nut` package only when missing.
