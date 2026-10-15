@@ -4,6 +4,7 @@ umask 0027
 here=$(dirname "$(realpath "$0")")
 # shellcheck source=deploy/backup/nodes.conf
 source "${BACKUP_CONFIG:-$here/nodes.conf}"
+export PUBLISHED_STATUS
 state=$here/backup-state.py
 
 if [[ ${1:-} == --check-access ]]; then

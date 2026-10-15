@@ -7,7 +7,7 @@ fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ $# -eq 0 || ( $# -eq 1 && $1 == --prepare-only ) ]] || fail 'Expected --prepare-only or no arguments.'
 trap 'printf "ERROR: backup installation failed at line %s. Fix the error and rerun; no automatic rollback.\n" "$LINENO" >&2' ERR
 # Ignore development overrides during installation.
-unset BACKUP_CONFIG BACKUP_HOST BACKUP_HOME LOCAL_ROOT STATUS_FILE REPLICA_ROOT PEER_REPLICA_ROOT METER_DB REQUESTS_DB PRICING_DB UPS_CONTROL_DB BACKUP_TRANSPORT
+unset BACKUP_CONFIG BACKUP_HOST BACKUP_HOME LOCAL_ROOT STATUS_FILE PUBLISHED_STATUS REPLICA_ROOT PEER_REPLICA_ROOT METER_DB REQUESTS_DB PRICING_DB UPS_CONTROL_DB BACKUP_TRANSPORT
 # shellcheck source=deploy/backup/nodes.conf
 source "$here/nodes.conf"
 # shellcheck source=deploy/backup/account.sh
@@ -46,11 +46,25 @@ for path in /usr/local/lib/factory-backup /etc/factory-backup "$BACKUP_HOME" \
         parent=$(dirname "$parent")
     done
 done
+published_directory=
+if [[ -n "$PUBLISHED_STATUS" ]]; then
+    if getent group factory-api >/dev/null; then
+        published_directory=$(dirname "$PUBLISHED_STATUS")
+        parent=$PUBLISHED_STATUS
+        while [[ "$parent" != / ]]; do
+            [[ ! -L "$parent" ]] || fail "Refusing symlink destination: $parent"
+            parent=$(dirname "$parent")
+        done
+        [[ ! -e "$published_directory" || -d "$published_directory" ]] || fail "Not a directory: $published_directory"
+    else
+        echo 'Skipping published backup status: factory-api group is missing.'
+    fi
+fi
 preflight_backup_account
 
 # Configuration-only rollback: accounts, archive trees, trust files and live DBs
 # are deliberately outside this snapshot and must never be deleted on rollback.
-bash "$here/rollback-backup-config.sh" --snapshot
+PUBLISHED_STATUS=${published_directory:+$PUBLISHED_STATUS} bash "$here/rollback-backup-config.sh" --snapshot
 if [[ $(systemctl show factory-backup.timer --property=LoadState --value) != not-found ]]; then
     systemctl disable --now factory-backup.timer
 fi
@@ -58,6 +72,10 @@ if [[ $(systemctl show factory-backup.service --property=LoadState --value) != n
     systemctl stop factory-backup.service
 fi
 prepare_backup_account
+if [[ -n "$published_directory" ]]; then
+    install -d -o root -g factory-api -m 0750 "$published_directory"
+    PUBLISHED_STATUS=$PUBLISHED_STATUS python3 "$here/backup-state.py" publish "$STATUS_FILE"
+fi
 install -d -o root -g root -m 0755 /usr/local/lib/factory-backup /etc/factory-backup
 for file in factory-backup.sh restore-check.sh; do
     install -o root -g root -m 0755 "$here/$file" "/usr/local/lib/factory-backup/$file"
