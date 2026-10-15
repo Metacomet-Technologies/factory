@@ -1,16 +1,17 @@
 # Agent contract
 
 Work only in the assigned worktree and feature branch, never the main checkout.
-Never deploy or use sudo. Never merge or use main without an explicit dispatcher
+Never deploy or use sudo, even `sudo -u agent`: you already run as `agent`. Never
+merge or use main without an explicit dispatcher
 continuation. Never print or commit secrets or production data.
 GitHub auth is preconfigured; never set token environment variables or run gh auth commands.
 
 Before pushing: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
 `cargo test --workspace`. Kiosk: also `vp check`, `vp test --run`, `vp build`.
 Dispatcher: also `node --test scripts/dispatch` (not `node --check`).
-Live checks use `scripts/sandbox`, never production; read `docs/sandbox.md` when needed.
-Read `docs/agents/<area>.md` when Isolation touches that area: `db.md` for database
-work (including meter/API/pricing), `kiosk.md` for kiosk.
+Live checks: `scripts/sandbox` (see `docs/sandbox.md`), never production.
+Read `docs/agents/<area>.md` when Isolation touches it: `db.md` for DB work
+(incl. meter/API/pricing), `kiosk.md` for kiosk.
 
 Linear: read issues; comment/link PRs only on your issue; create related follow-ups
 in Backlog. Never edit other issues or existing status, labels, assignee or priority.
