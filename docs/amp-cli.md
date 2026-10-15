@@ -15,7 +15,7 @@ This is a versioned observation, not a stable API guarantee.
 | Runner directory/title/attachment | Yes | Correct remote cwd, exact title, attachment URL in prompt | Probe A; [Execute][execute] |
 | Runner stdout/exit and concurrency | Yes | Async URL/0; streamed result/0; two threads overlap | A/B; [Execute][execute] |
 | Offline runner | Yes | Missing ID exits 1, no thread URL | Offline check |
-| Orb dispatch/billing | Partial | Official docs only; no orb created | [Spawn][spawn], [Costs][costs] |
+| Orb dispatch/billing | Partial | MET-184 verified plain `-ox` URL/0 and private factory-access checkout; billing remains docs-only | §3; [Spawn][spawn], [Costs][costs] |
 | Runner follow-up with `-x` | No, while attached | Exit 1: already active in another Amp | Follow-up C |
 | Runner follow-up with `-ox` | Yes | Existing runner executes; no orb created | Follow-up D; CLI help |
 | List fields/archive/visibility | Yes | Five JSON fields; async stays active; streamed new thread archives; private probes | List/status checks; [Threads][threads] |
@@ -114,7 +114,7 @@ There is no verified CLI switch here that forbids provider fallback.
 | Local `-x` | Documented, not live-tested | Documented, not live-tested | Documented, not live-tested |
 | Runner `-x` | `low` verified | Async submission verified; initial missing binary failure | `gpt56l` verified |
 | Runner `-x --stream-json` | `low` verified | Successful Bash tool/reply verified after install | `gpt56l` verified |
-| New orb `-ox` | Documented, not run | Documented, not run | Documented, not run |
+| New orb `-ox` | `high` verified on factory-access (MET-184) | Documented, not run | Documented, not run |
 | New orb `-ox --stream-json` | Documented, not run | Not live-tested | Documented, not run |
 
 ## 2. Runner dispatch contract
@@ -146,14 +146,36 @@ runner. Logs showed two running threads; there was no busy rejection or queue.
 MET-80 must enforce its own concurrency cap and isolate worktrees. Saturation
 limits beyond two concurrent threads were not tested.
 
-## 3. Orbs and billing (docs only)
+## 3. Orbs and billing
 
-No orb was created. `-ox` means `--orb-execute -x`; a new async orb dispatch
-prints its URL and returns immediately. `--project` accepts an Amp namespace/name,
+MET-184 live check, 2026-10-15 UTC, factory-gpu as `agent`, Amp
+`0.0.1792022479-ge66e24`: plain `-ox` returned exit 0 and exactly one thread URL
+on stdout, without `--stream-json`:
+
+```sh
+amp -ox "$PROMPT" --mode high --project Metacomet-Technologies/factory-access --orb-size a1.medium --title 'MET-184 probe: plain orb dispatch ID' --visibility private --no-archive-after-execute
+```
+
+Stdout was `https://ampcode.com/threads/T-01a13da9-38c5-7162-a614-3685d0a0462e`.
+The [probe](https://ampcode.com/threads/T-01a13da9-38c5-7162-a614-3685d0a0462e)
+confirmed `pwd` was `/home/user/workspace/repo` and origin matched the private
+`Metacomet-Technologies/factory-access` repository. It made no repository or
+issue changes, was labeled `factory`, and was archived after finishing.
+The dispatcher uses the existing unique-thread-ID parser; streaming is unnecessary.
+This verifies submission and checkout, not the full issue lifecycle or billing.
+MET-183's 2026-10-14 orb separately verified pushing, opening a PR with `gh`, and
+commenting through Linear MCP. Post-deployment dispatch through PR, Devon's merge,
+green apply, Done and archive remains to be observed on the next eligible issue.
+
+`-ox` means `--orb-execute -x`. `--project` accepts an Amp namespace/name,
 GitHub owner/repo, or repository URL. Without it, Git remotes determine the
-project; no match produces a warning and a no-project orb. This factory checkout
-currently reports **Project: none**. Provisioning a project is outside this task.
-Do not silently overflow into a repository-less orb.
+project; no match produces a warning and a no-project orb. The dispatcher always
+passes the allowlisted `ampProject` from `scripts/dispatch/repos.json` for orbs.
+Factory still refuses orbs; factory-access defaults to an orb with one active
+slot per repo (`maxActiveOrbs`). Only an explicit `runner/gpu` uses the configured
+fallback checkout. Failed submissions retain their claim, remove `dispatch`,
+and mention Devon on the issue because no dispatcher Slack alert path exists.
+Unknown outcomes require inspection before manual recovery, never automatic retry.
 
 `--orb-size` overrides the project default for a new thread, not an existing
 orb. All listed sizes have 60 GB disk:
@@ -174,7 +196,7 @@ no interaction for twenty minutes. Portals and opening threads can wake them.
 `a1.3xlarge` requires Gigawatt or Enterprise; enterprise prices may differ.
 Spawn pacing permits a burst of twenty metered orbs per user, then one every
 five minutes; later starts wait. Tiny suits investigation, not a full factory
-Rust build. Start factory overflow at medium unless measured needs justify more.
+Rust build. The factory-access dispatcher uses medium; factory has no orb overflow.
 
 Async `-ox` leaves a new thread unarchived. `-ox --stream-json` waits and archives
 after the turn unless `--no-archive-after-execute` is supplied. Keep long-lived
@@ -467,8 +489,8 @@ amp threads continue "$THREAD_ID" -ox "$FOLLOW_UP" --stream-json --no-archive-af
 * Claude now passes on the temporary console runner. Factory-gpu execution,
   Claude model/effort features, and Claude-specific policy enforcement remain
   unverified. Claude thread usage accounting was unavailable at immediate check.
-* No orb execution, setup, private-repository access or current project mapping
-  was tested. Orb overflow needs project provisioning and a budget policy.
+* MET-184 verified factory-access orb dispatch and private checkout (§3); other
+  orb engine combinations, provider billing and the deployed issue lifecycle remain unverified.
 * New Worktree's pre-thread fetch credential environment remains unknown.
 * Permissions docs/schema and CLI behavior diverge. Pin and re-probe after CLI
   updates; custom policy and OS boundaries need review before unattended coding.

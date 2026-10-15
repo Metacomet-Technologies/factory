@@ -2,8 +2,10 @@ import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { commentMarkers, engineArgs, prepareWorktree, runnerCommand, runWorktreeCommand, type Issue } from './dispatch.ts';
+import { repos } from './repos.ts';
 
 const config = JSON.parse(readFileSync(new URL('qa-config.json', import.meta.url), 'utf8'));
+const factory = repos.find(repo => repo.name === 'factory')!;
 const main = '/home/agent/work/factory';
 const shaPattern = /^[a-f0-9]{40}$/;
 const qa = (text: string) => `<!-- factory-qa:${text} -->`;
@@ -124,7 +126,7 @@ export async function mergeCheck(pr: string, sha: string, restRead = false) {
       ...statuses.statuses.map(c => ({ name: c.context, bucket: c.state === 'success' ? 'pass' : 'fail' }))];
   } else checks = JSON.parse(gh(['pr', 'checks', pr, '--json', 'name,bucket']));
   if (!Array.isArray(checks) || !checks.length || checks.some(c => c.bucket !== 'pass')
-    || config.requiredChecks.some((name: string) => !checks.some(c => c.name === name && c.bucket === 'pass'))) throw new Error('QA CI is not green');
+    || factory.requiredChecks.some((name: string) => !checks.some(c => c.name === name && c.bucket === 'pass'))) throw new Error('QA CI is not green');
   const after = await info(pr, restRead);
   if (after.state !== 'OPEN' || after.isDraft !== false || after.baseRefName !== 'main'
     || after.headRefOid !== sha || head(pr) !== sha) throw new Error('QA head changed during checks');

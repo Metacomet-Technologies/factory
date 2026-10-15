@@ -6,8 +6,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { sections, slug, prompt, wrapupPrompt, validate, isMergedGitHubPR, commentMarkers, supportedNode } from './dispatch.ts';
+import { sections, slug, prompt, simplePrompt, wrapupPrompt, validate, isMergedGitHubPR, commentMarkers, supportedNode } from './dispatch.ts';
 import { reviewerEngine } from './qa.ts';
+import { repos, validateRepos } from './repos.ts';
 
 const executable = fileURLToPath(new URL('dispatch.ts', import.meta.url));
 const threadId = 'T-01234567-89ab-4cde-8fab-0123456789ab';
@@ -86,7 +87,9 @@ globalThis.fetch = (url, options) => {
   return fetch(url, options);
 };
 const read = fs.readFileSync;
-fs.readFileSync = (path, ...args) => path === '/home/agent/work/factory/docs/PLAYBOOK.md' ? ${JSON.stringify(playbook)} : read(path, ...args);
+const repoConfig = ${JSON.stringify(options.repos === undefined ? null : JSON.stringify(options.repos))};
+fs.readFileSync = (path, ...args) => path === '/home/agent/work/factory/docs/PLAYBOOK.md' ? ${JSON.stringify(playbook)}
+  : repoConfig !== null && String(path).endsWith('/scripts/dispatch/repos.json') ? repoConfig : read(path, ...args);
 syncBuiltinESMExports();`);
   writeFileSync(join(directory, 'key'), key);
   writeFileSync(join(directory, 'lock'), '');
@@ -128,7 +131,7 @@ if ('${program}' === 'git' && args[0] === 'ls-remote') {
   const pr = args[2].match(/^refs\\/pull\\/(\\d+)\\/head$/)?.[1];
   if (!state[pr]) process.exit(7);
   output = (state[pr].remoteSha ?? state[pr].headRefOid) + '\\t' + args[2];
-} else if ('${program}' === 'git' && args[0] === '-C' && args[1] === '/home/agent/work/factory') {
+} else if ('${program}' === 'git' && args[0] === '-C' && ['/home/agent/work/factory', '/home/agent/work/factory-access'].includes(args[1])) {
   const all = JSON.parse(fs.readFileSync(process.env.FAKE_WORKTREES, 'utf8'));
   const runner = process.env.FAKE_RUNNER ?? 'gpu';
   const trees = all[runner];
@@ -161,9 +164,15 @@ if ('${program}' === 'git' && args[0] === 'ls-remote') {
   else if (args[2] === 'merge-base') { if (process.env.FAKE_BEHIND) process.exit(1); output = ''; }
   else if (args[2] === 'rev-parse') output = '${mergeSha}';
   else if (args[2] === 'show') output = ${JSON.stringify(playbook)};
+} else if ('${program}' === 'git' && args[0] === '-C' && args[1].startsWith('/home/agent/work/factory-access-') && args[2] === 'status') {
+  const trees = JSON.parse(fs.readFileSync(process.env.FAKE_WORKTREES, 'utf8'))[process.env.FAKE_RUNNER ?? 'gpu'];
+  const tree = trees.find(t => t.path === args[1]);
+  if (!tree) process.exit(7);
+  output = tree.dirty ? '?? untracked-file' : '';
 } else if ('${program}' === 'gh' && args[0] === 'pr') {
   const pr = state[args[2]];
   if (!pr) process.exit(7);
+  if (pr.repo && args[args.indexOf('--repo') + 1] !== pr.repo) process.exit(99);
   if (args[1] === 'view') output = JSON.stringify(pr);
   else if (args[1] === 'checks') {
     output = JSON.stringify(pr.checks);
@@ -173,6 +182,9 @@ if ('${program}' === 'git' && args[0] === 'ls-remote') {
     }
     if (pr.checkExit) process.exit(pr.checkExit);
   }
+} else if ('${program}' === 'gh' && args[0] === 'run' && args[1] === 'list') {
+  if (args[args.indexOf('--repo') + 1] !== 'Metacomet-Technologies/factory-access') process.exit(99);
+  output = JSON.stringify(state.runs ?? []);
 } else if ('${program}' === 'gh' && args[0] === 'api') {
   const pr = args[1].match(/^repos\\/Metacomet-Technologies\\/factory\\/pulls\\/(\\d+)\\/files\\?per_page=100$/)?.[1];
   if (!state[pr] || !args.includes('--paginate') || !args.includes('--slurp')) process.exit(7);
@@ -186,7 +198,7 @@ const fs = require('node:fs');
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.FAKE_CALLS, JSON.stringify(args) + '\\n');
 fs.appendFileSync(process.env.FAKE_EVENTS, JSON.stringify(['amp', ...args]) + '\\n');
-if (args.includes('--project')) process.exit(99);
+if (args.includes('--project') && args[0] !== '-ox') process.exit(99);
 if (args[0] === '-x') {
   const runner = args[args.indexOf('--executor') + 1].includes('console') ? 'console' : 'gpu';
   const trees = JSON.parse(fs.readFileSync(process.env.FAKE_WORKTREES, 'utf8'))[runner];
@@ -230,7 +242,7 @@ if (args[0] === 'threads' && args[1] === 'archive') {
   process.exit(0);
 }
 const id = args[0] === '-x' && args[1].includes('— QA PR') ? '${reviewId}' : '${threadId}';
-if (args[0] === '-x' && !process.env.FAKE_NO_ID) {
+if (['-x', '-ox'].includes(args[0]) && !process.env.FAKE_NO_ID) {
   const threads = JSON.parse(fs.readFileSync(process.env.FAKE_THREADS, 'utf8'));
   if (!threads.some(t => t.id === id)) threads.push({ id, archived: false, updated: new Date(Number(process.env.FAKE_NOW)).toISOString() });
   fs.writeFileSync(process.env.FAKE_THREADS, JSON.stringify(threads));
@@ -297,7 +309,11 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
           data = { commentCreate: { success: true } };
         }
         else if (operation === 'RemoveLabel') { i.labels = i.labels.filter((label: any) => label.id !== v.labelId); data = { issueRemoveLabel: { success: true } }; }
-        else if (operation === 'Move') { i.stateId = v.input.stateId; data = { issueUpdate: { success: true } }; }
+        else if (operation === 'Move') {
+          i.stateId = v.input.stateId;
+          if (i.stateId === 'done-id') i.state = { type: 'completed' };
+          data = { issueUpdate: { success: true } };
+        }
         else if (operation === 'SyncPlaybook') { data = { documentUpdate: { success: true } }; }
         else throw new Error(`Unexpected mutation ${operation}`);
         if (crashHere === 'after') { crash = null; current.kill('SIGKILL'); response.destroy(); return; }
@@ -319,6 +335,9 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
         } else if (operation === 'States') {
           assert.deepEqual(v.filter, { team: { key: { eq: 'MET' } }, name: { eq: 'In Progress' } });
           data = { workflowStates: page([{ id: 'started-id', name: 'In Progress', type: 'started' }], v.after) };
+        } else if (operation === 'DoneStates') {
+          assert.deepEqual(v.filter, { team: { key: { eq: 'MET' } }, name: { eq: 'Done' } });
+          data = { workflowStates: page([{ id: 'done-id', name: 'Done', type: 'completed' }], v.after) };
         } else throw new Error(`Unexpected query ${operation}`);
       }
       response.setHeader('content-type', 'application/json');
@@ -1762,4 +1781,241 @@ test('seven-day search boundary skips historical/unknown closes but never skips 
     assert.equal(f.allCalls().filter(args => args[1] === 'archive').length, 0);
     assert.ok(i.comments.some((c: any) => c.body.includes(`factory-dispatch:archived thread:${reviewId}`)));
   }
+});
+
+const accessRepo = 'Metacomet-Technologies/factory-access';
+const accessLabel = group('repo', 'factory-access');
+const accessIssue = (n = 123) => issue(n, { labels: [...issue().labels, accessLabel] });
+const accessMerged = (runner = 'orb') => issue(123, { labels: [accessLabel], state: { type: 'started' },
+  comments: [{ ...claimComment(), body: `<!-- factory-dispatch:claim runner:${runner} -->\n<!-- factory-dispatch:worktree met-123-build-the-useful-widget -->\n<!-- factory-dispatch:repo factory-access -->` }, threadComment(runner),
+    { body: `<!-- factory-dispatch:labeled ${threadId} factory -->` }],
+  attachments: [{ ...attachment('merged'), url: `https://github.com/${accessRepo}/pull/90` }] });
+const appliedRun = (overrides = {}) => ({ databaseId: 987, status: 'completed', conclusion: 'success',
+  url: `https://github.com/${accessRepo}/actions/runs/987`, headSha: mergeSha, event: 'push', headBranch: 'main', ...overrides });
+const accessGitHub = (runs = [appliedRun()]) => ({ 90: { repo: accessRepo, state: 'MERGED', baseRefName: 'main', mergeCommit: { oid: mergeSha } }, runs });
+
+test('repo selection is optional, unique and allowlisted; runners follow that repo', () => {
+  assert.equal(validate(issue()).repo?.name, 'factory');
+  assert.equal(validate(issue()).runner, 'gpu');
+  for (const label of [accessLabel, { id: 'flat', name: 'repo/factory-access' }]) {
+    const i = issue(123, { labels: [...issue().labels, label] });
+    assert.deepEqual(validate(i).errors, []);
+    assert.equal(validate(i).runner, 'orb');
+    for (const runner of ['orb', 'gpu', 'console']) {
+      const selected = validate({ ...i, labels: [...i.labels, group('runner', runner)] });
+      assert.equal(selected.errors.length, runner === 'console' ? 1 : 0);
+    }
+  }
+  for (const labels of [[group('repo', 'unknown')], [accessLabel, accessLabel], [accessLabel, group('repo', 'factory')]]) {
+    assert.match(validate(issue(123, { labels: [...issue().labels, ...labels] })).errors.join('\n'), /allowlisted repo/);
+  }
+  assert.match(validate(issue(123, { labels: [...issue().labels, group('runner', 'orb')] })).errors.join('\n'), /orb/);
+});
+
+test('repo configuration rejects unsafe, incomplete, duplicate and unsupported entries', () => {
+  assert.deepEqual(validateRepos(structuredClone(repos)), repos);
+  for (const edit of [
+    (r: any[]) => { r[1].name = undefined; },
+    (r: any[]) => { r[1].name = r[0].name; },
+    (r: any[]) => { r[1].slug = r[0].slug; },
+    (r: any[]) => { r[1].ampProject = ''; },
+    (r: any[]) => { r[1].flow = 'full'; },
+    (r: any[]) => { r[0].defaultRunner = 'orb'; },
+    (r: any[]) => { r[1].defaultRunner = 'console'; },
+    (r: any[]) => { r[1].fallbackRunners.gpu.checkout = '/home/agent/work/../factory'; },
+    (r: any[]) => { r[1].fallbackRunners.orb = { checkout: '/tmp' }; },
+    (r: any[]) => { r[1].requiredChecks = []; },
+    (r: any[]) => { delete r[1].applyWorkflow; },
+    (r: any[]) => { r[1].maxActiveOrbs = 0; },
+    (r: any[]) => { delete r[1].maxActiveOrbs; },
+  ]) {
+    const config = structuredClone(repos); edit(config);
+    assert.throws(() => validateRepos(config), /Invalid.*repos.json/);
+  }
+});
+
+test('simple builder stays within 1800 fixed bytes and forbids merge and control markers', () => {
+  for (const runner of ['orb', 'gpu']) {
+    const text = simplePrompt(accessIssue(), runner);
+    const fixed = text.replace(/## Goal[\s\S]*?(?=Reply with tests)/, '');
+    assert.ok(Buffer.byteLength(fixed) <= 1800, `${runner}: ${Buffer.byteLength(fixed)}`);
+    assert.match(text, /Never merge or write control markers/);
+    assert.match(text, /No sudo; never touch credentials or the console/);
+    assert.match(text, /Contributes MET-123/);
+    assert.match(text, /tailscale-test/);
+    assert.match(text, /PR URL, head SHA, complete git diff --name-only origin\/main\.\.\.HEAD list/);
+    assert.match(text, runner === 'orb' ? /create branch met-123.*from origin\/main/ : /already created the branch and worktree/);
+  }
+  assert.match(simplePrompt({ ...accessIssue(), description: body.replace('> Defaults to contributes.', 'closes') }), /## Link type\ncontributes/);
+});
+
+test('simple orb launch selects project/title, reserves one slot and never overflows or creates QA', { timeout: 10_000 }, async t => {
+  const first = accessIssue(), second = accessIssue(124);
+  const f = await fixture(t, [first, second]);
+  assert.equal((await f.run()).code, 0);
+  const args = f.allCalls().find(args => args[0] === '-ox');
+  assert.deepEqual(args.slice(2), ['--mode', 'medium', '--project', accessRepo, '--orb-size', 'a1.medium',
+    '--title', 'MET-123 — Build the useful widget today', '--visibility', 'private', '--no-archive-after-execute']);
+  assert.match(args[1], /\/home\/user\/workspace\/repo/);
+  assert.ok(first.comments.some((c: any) => c.body.includes(`thread ${threadId} runner:orb`)));
+  assert.ok(first.comments.some((c: any) => c.body.includes('<!-- factory-dispatch:repo factory-access -->')));
+  assert.equal(first.stateId, 'started-id');
+  assert.equal(labeled(first), false);
+  assert.equal(labeled(second), true);
+  first.labels = first.labels.filter((label: any) => label !== accessLabel);
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.allCalls().filter(args => ['-x', '-ox'].includes(args[0])).length, 1);
+  assert.deepEqual(f.worktrees(), { gpu: [], console: [] });
+});
+
+test('orb failures alert Devon, keep dispatch off and never retry or create a thread marker', { timeout: 10_000 }, async t => {
+  for (const env of [{ FAKE_FAIL: '1' }, { FAKE_NO_ID: '1' }]) {
+    const i = accessIssue(), f = await fixture(t, [i]);
+    assert.equal((await f.run(['poll'], env)).code, 0);
+    assert.equal(labeled(i), false);
+    assert.equal(i.stateId, undefined);
+    assert.ok(i.comments.some((c: any) => c.body.includes('https://linear.app/metacomet/profiles/devon')));
+    assert.ok(!i.comments.some((c: any) => c.body.includes('factory-dispatch:thread ')));
+    i.labels.push(dispatchLabel);
+    assert.equal((await f.run(['issue', i.identifier])).code, 0);
+    assert.equal(labeled(i), false);
+    assert.equal(f.allCalls().filter(args => ['-x', '-ox'].includes(args[0])).length, 1);
+  }
+});
+
+test('simple merged apply success moves Done, then archives without QA/wrap-up; repeated poll is inert', { timeout: 10_000 }, async t => {
+  const i = accessMerged(), f = await fixture(t, [i], { github: accessGitHub() });
+  assert.equal((await f.run()).code, 0);
+  assert.equal(i.state.type, 'completed');
+  assert.equal(i.stateId, 'done-id');
+  assert.equal(f.threads()[0].archived, true);
+  assert.ok(i.comments.some((c: any) => c.body.startsWith(`Applied: ${appliedRun().url}`)));
+  assert.ok(!i.comments.some((c: any) => /factory-qa:|factory-dispatch:wrapup/.test(c.body)));
+  assert.deepEqual(f.allCalls().filter(args => args[1] !== 'list'), [['threads', 'archive', threadId]]);
+  assert.deepEqual(f.githubCalls().find(args => args[1] === 'run'), ['gh', 'run', 'list', '--repo', accessRepo, '--commit', mergeSha,
+    '--workflow', 'Tailscale policy', '--event', 'push', '--branch', 'main', '--limit', '1', '--json', 'conclusion,status,url,databaseId,headSha,event,headBranch']);
+  const mutations = f.mutations.length;
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.mutations.length, mutations);
+});
+
+test('simple apply failure pings once without state/archive changes; a successful rerun completes', { timeout: 10_000 }, async t => {
+  const i = accessMerged(), f = await fixture(t, [i], { github: accessGitHub([appliedRun({ conclusion: 'failure' })]) });
+  for (let n = 0; n < 2; n++) assert.equal((await f.run()).code, 0);
+  assert.equal(f.mutations.length, 1);
+  assert.match(f.mutations[0].input.body, /Apply did not succeed.*failure/);
+  assert.match(f.mutations[0].input.body, /https:\/\/linear.app\/metacomet\/profiles\/devon/);
+  assert.equal(i.state.type, 'started');
+  assert.equal(f.threads()[0].archived, false);
+  assert.deepEqual(f.allCalls(), []);
+  f.setGitHub(accessGitHub());
+  assert.equal((await f.run()).code, 0);
+  assert.equal(i.state.type, 'completed');
+  assert.equal(f.threads()[0].archived, true);
+});
+
+test('simple pending, missing, wrong-SHA and PR-event runs never complete or archive even an already Done issue', { timeout: 15_000 }, async t => {
+  for (const runs of [[], [appliedRun({ status: 'in_progress', conclusion: '' }), appliedRun()],
+    [appliedRun({ headSha: sha })], [appliedRun({ event: 'pull_request' })], [appliedRun({ headBranch: 'feature' })]]) {
+    const i = accessMerged(); i.state.type = 'completed';
+    const f = await fixture(t, [i], { github: accessGitHub(runs) });
+    assert.equal((await f.run()).code, 0);
+    assert.deepEqual(f.mutations, []);
+    assert.deepEqual(f.allCalls(), []);
+    assert.equal(f.threads()[0].archived, false);
+  }
+});
+
+test('simple PR selection ignores open, foreign, stale and ambiguous attachments without QA or wrap-up', { timeout: 10_000 }, async t => {
+  for (const change of [
+    (i: any) => { i.attachments[0].metadata.status = 'open'; },
+    (i: any) => { i.attachments[0] = attachment('merged'); },
+    (i: any) => { i.attachments[0].createdAt = claimComment().createdAt; },
+    (i: any) => { i.attachments.push({ ...i.attachments[0], url: i.attachments[0].url.replace('90', '91') }); },
+  ]) {
+    const i = accessMerged(); change(i);
+    const f = await fixture(t, [i], { github: accessGitHub() });
+    assert.equal((await f.run()).code, 0);
+    assert.deepEqual(f.allCalls(), []);
+    assert.deepEqual(f.mutations, []);
+    assert.equal(f.githubCalls().filter(args => args[0] === 'gh').length, 0);
+  }
+});
+
+test('simple apply completion recovers lost mutation responses without duplicate comments or archives', { timeout: 15_000 }, async t => {
+  for (const boundary of ['applied', 'Move', 'archived']) {
+    const i = accessMerged();
+    const f = await fixture(t, [i], { github: accessGitHub(), crash: (op: string, v: any) =>
+      (boundary === 'Move' ? op === 'Move' : op === 'Comment' && v.input.body.includes(`factory-dispatch:${boundary}`)) ? 'after' : undefined });
+    assert.equal((await f.run()).signal, 'SIGKILL');
+    assert.equal((await f.run()).code, 0);
+    assert.equal(i.state.type, 'completed');
+    assert.equal(f.threads()[0].archived, true);
+    assert.equal(i.comments.filter((c: any) => c.body.includes('factory-dispatch:applied')).length, 1);
+    assert.equal(f.allCalls().filter(args => args[1] === 'archive').length, 1);
+  }
+});
+
+test('simple gpu fallback uses its checkout, retains active or dirty trees, and removes only after archive', { timeout: 15_000 }, async t => {
+  const i = accessIssue(); i.labels.push(group('runner', 'gpu'));
+  const f = await fixture(t, [i]);
+  assert.equal((await f.run()).code, 0);
+  const path = '/home/agent/work/factory-access-met-123-build-the-useful-widget';
+  const args = f.allCalls().find(args => args[0] === '-x');
+  assert.equal(args[args.indexOf('--runner-dir') + 1], path);
+  assert.equal(args.includes('--project'), false);
+  assert.match(args[1], /already created the branch and worktree/);
+  assert.ok(f.githubCalls().some(args => args.join(' ') === `git -C /home/agent/work/factory-access worktree add -b met-123-build-the-useful-widget ${path} origin/main`));
+  assert.equal(f.worktrees().gpu.length, 1);
+
+  const merged = accessMerged('gpu'); i.comments = merged.comments; i.attachments = merged.attachments;
+  i.labels = []; // Post-claim label changes must not switch lifecycle or checkout.
+  f.setGitHub(accessGitHub());
+  assert.equal((await f.run()).code, 0); // Builder is still inside the quiet period.
+  assert.equal(i.state.type, 'completed');
+  assert.equal(f.worktrees().gpu.length, 1);
+  const trees = f.worktrees(); trees.gpu[0].dirty = true;
+  writeFileSync(join(f.directory, 'worktrees'), JSON.stringify(trees));
+  f.setThreads([{ ...f.threads()[0], updated: quietUpdated }]);
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.threads()[0].archived, true);
+  assert.equal(f.worktrees().gpu.length, 1);
+  trees.gpu[0].dirty = false;
+  writeFileSync(join(f.directory, 'worktrees'), JSON.stringify(trees));
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.worktrees().gpu.length, 0);
+  const events = f.events();
+  assert.ok(events.findIndex(e => e[0] === 'amp' && e[1] === 'threads' && e[2] === 'archive')
+    < events.findIndex(e => e[0] === 'git' && e[5] === 'remove'));
+});
+
+test('simple dry-run previews orb without local worktree or Amp side effects', async t => {
+  const i = accessIssue(), f = await fixture(t, [i]);
+  const result = await f.run(['poll', '--dry-run']);
+  assert.equal(result.code, 0);
+  assert.match(result.stdout, /'-ox' '\$PROMPT'.*'--project' 'Metacomet-Technologies\/factory-access'/);
+  assert.doesNotMatch(result.stdout, /'worktree' 'add'/);
+  assert.deepEqual(f.allCalls(), []);
+  assert.deepEqual(f.mutations, []);
+});
+
+test('orb capacity is configurable per repo and independent of full runner slots', { timeout: 10_000 }, async t => {
+  const config = structuredClone(repos);
+  config[1].maxActiveOrbs = 2;
+  config.push({ ...config[1], name: 'another', slug: 'example/another', ampProject: 'example/another', maxActiveOrbs: 1 });
+  const waiting = accessIssue(125), other = accessIssue(126);
+  other.labels = [...issue().labels, group('repo', 'another')];
+  const f = await fixture(t, [accessIssue(), accessIssue(124), waiting, other, issue(127)], { repos: config });
+  assert.equal((await f.run()).code, 0);
+  const submissions = f.allCalls().filter(args => ['-ox', '-x'].includes(args[0]));
+  assert.equal(submissions.filter(args => args.includes(accessRepo)).length, 2);
+  assert.equal(submissions.filter(args => args.includes('example/another')).length, 1);
+  assert.equal(submissions.filter(args => args.includes('runner:factory-gpu')).length, 1);
+  assert.equal(labeled(waiting), true);
+
+  const invalid = await fixture(t, [accessIssue()], { repos: [{ ...repos[1], maxActiveOrbs: 0 }] });
+  assert.notEqual((await invalid.run()).code, 0);
+  assert.deepEqual(invalid.queries, []);
+  assert.deepEqual(invalid.mutations, []);
+  assert.deepEqual(invalid.allCalls(), []);
 });
