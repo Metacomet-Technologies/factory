@@ -2,13 +2,36 @@
 """Atomic status updates and calendar-day retention for verified backup pairs."""
 
 import datetime as dt
+from contextlib import suppress
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import tempfile
+
+
+def publish(path):
+    destination = os.environ.get("PUBLISHED_STATUS")
+    if not destination:
+        return
+    temp = None
+    try:
+        data = path.read_bytes()
+        with tempfile.NamedTemporaryFile(dir=Path(destination).parent, delete=False) as out:
+            temp = out.name
+            out.write(data)
+            os.chmod(temp, 0o640)
+            shutil.chown(temp, user="root", group="factory-api")
+        os.replace(temp, destination)
+    except Exception as error:
+        print(f"WARNING: could not publish backup status to {destination}: {error}", file=sys.stderr)
+    finally:
+        if temp is not None:
+            with suppress(OSError):
+                Path(temp).unlink(missing_ok=True)
 
 
 def status(path, operation, args):
@@ -38,6 +61,7 @@ def status(path, operation, args):
         out.write("\n")
         temp = out.name
     os.replace(temp, path)
+    publish(path)
 
 
 def prune(root, names):
@@ -95,5 +119,7 @@ if __name__ == "__main__":
     command, location, *arguments = sys.argv[1:]
     if command == "prune":
         prune(Path(location), arguments)
+    elif command == "publish":
+        publish(Path(location))
     else:
         status(Path(location), command, arguments)

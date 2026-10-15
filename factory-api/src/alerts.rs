@@ -19,7 +19,7 @@ use std::{
 
 pub const DEFAULT_CHANNEL: &str = "C0C9N9HCRG8";
 pub const DEFAULT_SLACK_URL: &str = "https://slack.com/api";
-pub const DEFAULT_BACKUP_STATUS: &str = "/var/lib/factory-backup/status.json";
+pub const DEFAULT_BACKUP_STATUS: &str = "/var/lib/factory-backup-status/status.json";
 pub const DASHBOARD_URL: &str = "https://factory-gpu.bearded-pompano.ts.net";
 /// systemd credential name; the unit loads it with `LoadCredential=`.
 pub const TOKEN_CREDENTIAL: &str = "slack-bot-token";

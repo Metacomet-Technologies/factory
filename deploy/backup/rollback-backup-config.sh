@@ -32,6 +32,9 @@ if [[ $1 == --snapshot ]]; then
         systemctl is-enabled "$unit" > "$snapshot/$unit.enabled" 2>/dev/null || true
         systemctl is-active "$unit" > "$snapshot/$unit.active" 2>/dev/null || true
     done
+    if [[ -n ${PUBLISHED_STATUS:-} && ! -e $(dirname "$PUBLISHED_STATUS") ]]; then
+        printf '%s\n' "$PUBLISHED_STATUS" > "$snapshot/published-status.created"
+    fi
     touch "$snapshot/complete"
     printf 'Configuration rollback: bash %q %q\n' "$(realpath "$0")" "$snapshot"
     exit 0
@@ -55,6 +58,17 @@ for path in "${files[@]}"; do
         cp -a -- "$snapshot/$path" "$root/$path"
     fi
 done
+if [[ -f "$snapshot/published-status.created" ]]; then
+    published=$(cat "$snapshot/published-status.created")
+    [[ $published == /* && $(dirname "$published") != / ]] || { echo 'Unsafe published status path' >&2; exit 1; }
+    parent=$published
+    while [[ $parent != / ]]; do
+        [[ ! -L $parent ]] || { echo 'Unsafe published status parent' >&2; exit 1; }
+        parent=$(dirname "$parent")
+    done
+    rm -f -- "$published"
+    if [[ -d $(dirname "$published") ]]; then rmdir -- "$(dirname "$published")"; fi
+fi
 systemctl daemon-reload
 for unit in factory-backup.service factory-backup.timer; do
     if [[ $(cat "$snapshot/$unit.enabled") == enabled ]]; then systemctl enable "$unit"; fi

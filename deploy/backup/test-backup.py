@@ -2,7 +2,10 @@
 """No-root contract check: live WAL writers, retention, failures and restores."""
 
 import datetime as dt
+import contextlib
 import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 
@@ -51,6 +55,55 @@ def writer(path, stop, ready):
 
 with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
     root = Path(temp)
+    spec = importlib.util.spec_from_file_location("backup_state", HERE / "backup-state.py")
+    state_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(state_module)
+    home = root / "private-home"
+    home.mkdir(mode=0o700)
+    main_status = home / "status.json"
+    published = root / "published" / "status.json"
+    published.parent.mkdir(mode=0o750)
+    owners = {}
+
+    def chown(path, *, user, group):
+        owners[Path(path).parent] = (user, group)
+
+    with patch.dict(os.environ, PUBLISHED_STATUS=str(published)), \
+            patch("shutil.chown", chown):
+        for operation, args in (("attempt", ["meter"]),
+                                ("result", ["meter", "321", "ok", "true", ""]),
+                                ("fatal", ["test failure"])):
+            state_module.status(main_status, operation, args)
+            assert published.read_bytes() == main_status.read_bytes()
+            assert published.stat().st_mode & 0o777 == 0o640
+            assert owners[published.parent] == ("root", "factory-api")
+            assert main_status.stat().st_mode & 0o777 == 0o600
+            assert home.stat().st_mode & 0o777 == 0o700
+        previous_copy = published.read_bytes()
+        replace = os.replace
+
+        def failed_replace(source, destination):
+            if str(destination) == str(published):
+                raise OSError("test publication failure")
+            replace(source, destination)
+
+        warning = io.StringIO()
+        with patch.object(state_module.os, "replace", failed_replace), contextlib.redirect_stderr(warning):
+            state_module.status(main_status, "attempt", ["requests"])
+        assert "WARNING: could not publish backup status" in warning.getvalue()
+        assert published.read_bytes() == previous_copy
+        assert set(json.loads(main_status.read_text())) == {"requests"}
+        assert list(published.parent.iterdir()) == [published]
+        with patch("shutil.chown", side_effect=PermissionError("test chown failure")), \
+                contextlib.redirect_stderr(warning):
+            state_module.status(main_status, "fatal", ["still recorded"])
+        assert json.loads(main_status.read_text())["requests"]["error"] == "still recorded"
+        assert published.read_bytes() == previous_copy
+        assert list(published.parent.iterdir()) == [published]
+    with patch.dict(os.environ, PUBLISHED_STATUS=""):
+        state_module.status(main_status, "attempt", [])
+    assert published.read_bytes() == previous_copy
+    print("PASS: atomic 0640 root:factory-api copy; publish failures preserve main status and previous copy; empty disables publication")
     stop = threading.Event()
     threads = []
     environments = {}
@@ -61,6 +114,7 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
                        LOCAL_ROOT=str(root / "local"),
                        REPLICA_ROOT=str(root / host / "replica"),
                        PEER_REPLICA_ROOT=str(root / peer / "replica"),
+                       PUBLISHED_STATUS="",
                        STATUS_FILE=str(root / host / "status" / "status.json"))
             env.pop("BACKUP_CONFIG", None)
             environments[host] = env
@@ -191,12 +245,13 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
     assert all(value["integrity"] == "ok" and not value["pushed_to_peer"]
                and value["error"] for value in status.values())
     print("PASS: missing/corrupt DB and failed push exit nonzero; neither tree loses files")
-    run("factory-backup.sh", env)
+    output = run("factory-backup.sh", dict(env, PUBLISHED_STATUS=str(root / "missing-publish-dir" / "status.json")))
+    assert "WARNING: could not publish backup status" in output
     status = json.loads(Path(env["STATUS_FILE"]).read_text())
     assert all(value["pushed_to_peer"] and value["error"] is None
                and value["last_success_ms"] > previous[name]["last_success_ms"]
                for name, value in status.items())
-    print("PASS: retry after failures clears errors and resumes retention")
+    print("PASS: retry clears errors and resumes retention even when status publication fails")
 
     replica = root / "factory-console" / "replica" / "factory-gpu"
     for name in ("meter", "requests", "pricing"):
@@ -427,3 +482,111 @@ prepare_backup_account
             assert result.returncode != 0 and "Review unexpected legacy SSH artifact" in result.stderr
             assert key.read_text() == "administrator-added key"
     print("PASS: both-node legacy/already-restored migrations are idempotent; accounts, data and host keys preserved")
+
+    # Run the real installer against rewritten absolute paths. Reuse the account
+    # stubs above; systemctl is an executable stub so child rollback is safe too.
+    with tempfile.TemporaryDirectory(prefix="backup-installer-") as install_temp:
+        for scenario in ("new", "existing", "missing-group", "console", "symlink"):
+            fixture = Path(install_temp) / scenario
+            artifact = fixture / "artifact"
+            artifact.mkdir(parents=True)
+            for source in HERE.iterdir():
+                if source.suffix in (".sh", ".py", ".conf", ".service", ".timer"):
+                    text = source.read_text()
+                    if source.name != "rollback-backup-config.sh":
+                        for prefix in ("/var/", "/etc/", "/usr/local/", "/srv/", "/run/"):
+                            text = text.replace(prefix, str(fixture) + prefix)
+                    if source.name == "install-backup.sh":
+                        text = text.replace('[[ $EUID -eq 0 ]]', '[[ $EUID -ne 0 ]]')
+                    (artifact / source.name).write_text(text)
+            (fixture / "run/systemd/system").mkdir(parents=True)
+            (fixture / "etc/systemd/system").mkdir(parents=True)
+            for path in ("srv/factory/meter/meter.db", "var/lib/factory-api/requests.db",
+                         "var/lib/factory-api/pricing.db", "var/lib/factory-ups-control/audit.db"):
+                db = fixture / path
+                db.parent.mkdir(parents=True, exist_ok=True)
+                db.touch()
+            home = fixture / "var/lib/factory-backup"
+            home.mkdir(mode=0o700)
+            status = home / "status.json"
+            status.write_text('{"meter":{"error":"current status"}}\n')
+            status.chmod(0o600)
+            published = fixture / "var/lib/factory-backup-status/status.json"
+            if scenario == "existing":
+                published.parent.mkdir()
+                (published.parent / "keep").write_text("administrator file")
+            if scenario == "symlink":
+                target = fixture / "symlink-target"
+                target.mkdir()
+                published.parent.symlink_to(target, target_is_directory=True)
+            if scenario != "missing-group":
+                (fixture / "factory-api").touch()
+            bin_dir = fixture / "bin"
+            bin_dir.mkdir()
+            for name, body in {
+                "hostname": 'echo "$FAKE_HOST"',
+                "tailscale": "exit 0",
+                "systemctl": '''case "$1" in
+is-active) if [[ ${2:-} == --quiet ]]; then exit 0; else echo inactive; fi ;;
+is-enabled) echo disabled ;;
+show) case "$*" in *LoadState*) echo loaded ;; esac ;;
+esac''',
+            }.items():
+                script = bin_dir / name
+                script.write_text("#!/usr/bin/env bash\n" + body + "\n")
+                script.chmod(0o755)
+            env = dict(os.environ, FIXTURE=str(fixture), BACKUP_TEST_ROOT=str(fixture),
+                       FAKE_HOST="factory-console" if scenario == "console" else "factory-gpu",
+                       INSTALL_SCRIPT=str(artifact / "install-backup.sh"),
+                       PATH=f"{bin_dir}:/usr/bin:/bin")
+            harness = account_harness.split('source "$ACCOUNT_SCRIPT"')[0] + r'''
+python3() {
+    if [[ ${2:-} == publish ]]; then
+        command python3 -c 'import os,runpy,shutil,sys
+def chown(path, *, user, group):
+    with open(os.environ["FIXTURE"] + "/owners", "a") as out:
+        out.write(f"{user}\t{group}\t{path}\n")
+shutil.chown = chown
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")' "$@"
+    else
+        command python3 "$@"
+    fi
+}
+export -f id getent usermod useradd install chown chgrp runuser python3
+bash "$INSTALL_SCRIPT" --prepare-only
+'''
+            snapshots = []
+            for attempt in range(2 if scenario in ("new", "existing") else 1):
+                result = subprocess.run(["bash", "-c", harness], env=env,
+                                        capture_output=True, text=True, timeout=30)
+                output = result.stdout + result.stderr
+                if scenario == "symlink":
+                    assert result.returncode != 0 and "Refusing symlink destination" in output, output
+                    assert not list(target.iterdir())
+                    break
+                assert result.returncode == 0, output
+                snapshot = max((fixture / "var/backups").glob("backup-config.*"), key=lambda p: p.stat().st_mtime_ns)
+                snapshots.append(snapshot)
+                enabled = scenario not in ("missing-group", "console")
+                assert published.exists() == enabled
+                assert (snapshot / "published-status.created").exists() == (scenario == "new" and attempt == 0)
+                if enabled:
+                    assert published.read_bytes() == status.read_bytes()
+                    assert published.stat().st_mode & 0o777 == 0o640
+                    assert published.parent.stat().st_mode & 0o777 == 0o750
+                    assert f"root\tfactory-api\t{published.parent}\n" in (fixture / "owners").read_text()
+                if scenario == "missing-group":
+                    assert "factory-api group is missing" in output
+                assert home.stat().st_mode & 0o777 == 0o700
+                assert status.stat().st_mode & 0o777 == 0o600
+            if scenario == "symlink":
+                continue
+            for snapshot in reversed(snapshots):
+                run("rollback-backup-config.sh", env, str(snapshot))
+            assert published.parent.exists() == (scenario == "existing")
+            if scenario == "existing":
+                assert (published.parent / "keep").read_text() == "administrator file"
+            assert status.read_text() == '{"meter":{"error":"current status"}}\n'
+            assert home.stat().st_mode & 0o777 == 0o700
+    print("PASS: installer publishes immediately, reruns safely, skips missing groups/console, refuses symlinks; rollback removes only newly created directory")
