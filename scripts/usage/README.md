@@ -1,7 +1,8 @@
 # Account usage collector (MET-125)
 
-Run on factory-gpu as its already authenticated `agent`. Node **24.21.0**, like
-`scripts/dispatch`; no npm dependencies. No inference, login/logout, reset-credit
+Run on factory-gpu as its already authenticated `agent`. Node **24.21.0** in
+`.node-version` remains the preferred and CI version; runtime accepts Node 24.x at
+**24.12.0** or newer. No npm dependencies, inference, login/logout, reset-credit
 consumption, runner changes, settings changes, transcript reads or DB writes.
 
 ## Kiosk-triggered refresh (MET-139)

@@ -27,7 +27,11 @@ export function prepareWorktree(runner: string, path: string, branch?: string) {
     ...(branch ? ['-b', branch] : ['--detach', '--lock', '--reason', `factory-qa:${Date.now()}`]), path, 'origin/main']);
 }
 
-export const NODE_VERSION = '24.21.0';
+export function supportedNode(version: string): boolean {
+  const match = version.match(/^24\.(\d+)\.(\d+)$/);
+  return match !== null && Number(match[1]) >= 12;
+}
+
 export const CLAUDE_MODEL = 'claude-opus-5-5';
 export const modes = {
   amp: { low: 'low', medium: 'medium', high: 'high' },
@@ -209,7 +213,7 @@ async function listedThread(id: string, includeArchived: boolean) {
 }
 
 export async function run(command: string, identifier: string | undefined, dryRun: boolean) {
-  if (process.versions.node !== NODE_VERSION) throw new Error(`Use Node ${NODE_VERSION}`);
+  if (!supportedNode(process.versions.node)) throw new Error(`Use Node 24.x (>= 24.12.0); found ${process.versions.node}`);
   const team = process.env.DISPATCH_TEAM ?? 'MET';
   const cap = Number(process.env.DISPATCH_MAX_ACTIVE_PER_RUNNER ?? 2);
   if (!Number.isSafeInteger(cap) || cap < 1) throw new Error('DISPATCH_MAX_ACTIVE_PER_RUNNER must be a positive integer');

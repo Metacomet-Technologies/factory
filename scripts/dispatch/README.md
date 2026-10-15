@@ -2,9 +2,9 @@
 
 Single-user, outbound-only automation of [PLAYBOOK §4](../../docs/PLAYBOOK.md#4-agent-prompt-template).
 No dependencies, database, webhook, OAuth app, new credential, or runner changes.
-Node **24.21.0** is pinned in `.node-version` and checked at startup, matching
-[the existing eval run](../../evals/ask/README.md). Requires Linux `flock` and the
-agent's existing Amp login. This is not the MET-120 hardening project.
+Node **24.21.0** in `.node-version` remains the preferred and CI version; runtime
+accepts Node 24.x at **24.12.0** or newer. Requires Linux `flock` and the agent's
+existing Amp login. This is not the MET-120 hardening project.
 
 ```sh
 node scripts/dispatch/dispatch.ts poll --dry-run

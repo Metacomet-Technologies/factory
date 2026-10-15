@@ -5,10 +5,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { collect, command, readPrevious, writeSnapshot, CLAUDE_ARGS } from './collect.ts';
+import { collect, command, readPrevious, writeSnapshot, CLAUDE_ARGS, supportedNode } from './collect.ts';
 import { age, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, STALE_MS } from './parsers.ts';
 import { amp, ampNew, details, detailsNew, claude, codex, fixtureRun } from './fixtures.ts';
 const now = 1791800000000;
+
+test('supported Node versions require Node 24.12.0 or newer', () => {
+  for (const version of ['24.12.0', '24.21.0', '24.22.0']) assert.equal(supportedNode(version), true);
+  for (const version of ['24.11.1', '22.18.0', '25.0.0', '26.1.0', '24.12', 'v24.12.0', '24.12.0-beta']) assert.equal(supportedNode(version), false);
+});
 
 test('verified projections preserve units, percentages, scope and UTC milliseconds', async () => {
   const snapshot = await collect(null, fixtureRun, now);

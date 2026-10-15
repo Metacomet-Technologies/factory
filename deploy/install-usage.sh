@@ -66,7 +66,9 @@ LOOKUP
     if [[ "$command" == node ]]; then node=$executable; fi
 done
 as_agent() { sudo -u agent env -i HOME=/home/agent USER=agent PATH="$path" "$@"; }
-[[ $(as_agent "$node" --version) == v24.21.0 ]] || fail 'Select Node 24.21.0 as agent; this installer never installs runtimes.'
+supported_node() { [[ $1 =~ ^v?24\.([0-9]+)\.([0-9]+)$ && ${BASH_REMATCH[1]} -ge 12 ]]; }
+node_version=$(as_agent "$node" --version)
+supported_node "$node_version" || fail "Use Node 24.x (>= 24.12.0); found $node_version"
 for command in amp claude codex; do as_agent timeout 30s "${executables[$command]}" --version; done
 # Collector dry-run emits only its sanitized snapshot, never raw CLI output.
 preview_status=0
