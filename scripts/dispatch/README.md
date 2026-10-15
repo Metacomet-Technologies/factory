@@ -21,7 +21,49 @@ Goal, Context, Isolation, Build, Sandbox check, Done means. Empty Link type mean
 contributes. Link type section must contain only `closes` or `contributes`; put notes in Context. Tests get the playbook
 defaults when empty. Exactly one Bug/Feature/Improvement and at least one
 `area:*` label are required. Group labels use `parent.name` plus the child name;
-flattened `runner/gpu`-style labels also work. Orb is refused explicitly.
+flattened `runner/gpu`-style labels also work. Factory refuses orb explicitly.
+
+## Other repositories (MET-184)
+
+The lifecycle documented below remains the default `factory` full flow. One
+optional grouped or flat `repo/<name>` label selects `repos.json`; multiple or
+unknown repos are refused. The file validates on startup before API calls.
+`full` is supported only for factory; other allowlisted repos use `simple`.
+Each entry names its GitHub `slug`, `ampProject`, flow, default runner, required
+checks, and allowed local `fallbackRunners` with checkout paths. The local map
+includes the default runner when it is local. Only an orb default allows `orb`;
+`maxActiveOrbs` sets its positive per-repo capacity (factory-access: one).
+
+Factory-access uses plain `amp -ox` with its project, medium orb size and issue
+title. The live URL/ID and private-checkout probe is recorded in
+[Amp CLI §3](../../docs/amp-cli.md#3-orbs-and-billing). Orb claims reserve capacity
+until archive, including failed or unknown submissions. Factory runner capacity
+and GPU-to-console overflow are unchanged. Simple flows never overflow: explicit
+`runner/gpu` uses `/home/agent/work/factory-access-<branch>` instead. Failed starts
+keep `dispatch` off and mention Devon on the issue; there is no Slack alert path.
+Claims prevent all automatic retries, even after relabeling. Inspect the outcome
+before manual recovery; adding a fallback label does not erase a failed claim.
+Simple claims also pin the repo name, so later label edits cannot switch lifecycle
+or cleanup to factory. Removing that repo from the allowlist defers its lifecycle.
+
+Simple builders open contributes PRs and post URL/SHA/file-list evidence only.
+GitHub's ruleset and Devon enforce required checks/review; the dispatcher never
+starts QA, sends wrap-up, or merges for these repos. It accepts one matching
+merged PR attachment newer than the dispatch claim, confirms GitHub's merge to
+main, and reads the latest configured `applyWorkflow` run for that merge SHA,
+restricted to `push` on `main`. PR test runs cannot satisfy the apply gate.
+Missing/pending/unreadable runs wait. Failed terminal runs mention Devon once
+per run ID without changing state; a successful rerun can still complete.
+Success posts `Applied` with the run URL and an `applied` marker, then moves to
+the team's completed `Done` state. The marker recovers an interrupted state move.
+Done alone cannot archive a simple builder without the apply marker.
+
+The existing five-quiet-minute archive path, markers and shared attempt budget
+apply unchanged. GPU fallback worktrees are removed only after recorded archive,
+with a clean/untracked check and no force. Dirty or failed cleanup retries on
+later polls; local branches remain. No installer or deployment artifact changes.
+The deployed issue-to-PR-to-apply lifecycle remains unverified until Devon merges
+and updates main, then the next eligible factory-access issue completes.
 
 Configuration:
 
@@ -199,7 +241,7 @@ State transitions under the existing exclusive dispatcher lock:
    records a stop marker and @-mentions Devon. Later pushes cannot restart it.
 4. For ready, inspect all changed paths, including deleted and renamed sources.
    `qa-config.json` lists self-deploying paths (`scripts/dispatch/` and
-   `scripts/usage/`), required checks, the Linear document ID and Devon's profile
+   `scripts/usage/`), the Linear document ID and Devon's profile
    mention URL. Self-deploying PRs get one “ready; merging deploys it” ping,
    never a merge continuation.
 5. Otherwise precheck CI for that SHA with `gh api`, then claim a continuation to the

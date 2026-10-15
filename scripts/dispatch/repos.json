@@ -1,0 +1,27 @@
+[
+  {
+    "name": "factory",
+    "slug": "Metacomet-Technologies/factory",
+    "ampProject": "Metacomet-Technologies/factory",
+    "flow": "full",
+    "defaultRunner": "gpu",
+    "fallbackRunners": {
+      "gpu": { "checkout": "/home/agent/work/factory" },
+      "console": { "checkout": "/home/agent/work/factory" }
+    },
+    "requiredChecks": ["rust", "kiosk", "scripts"]
+  },
+  {
+    "name": "factory-access",
+    "slug": "Metacomet-Technologies/factory-access",
+    "ampProject": "Metacomet-Technologies/factory-access",
+    "flow": "simple",
+    "defaultRunner": "orb",
+    "fallbackRunners": {
+      "gpu": { "checkout": "/home/agent/work/factory-access" }
+    },
+    "maxActiveOrbs": 1,
+    "requiredChecks": ["tailscale-test"],
+    "applyWorkflow": "Tailscale policy"
+  }
+]
