@@ -159,10 +159,17 @@ override; override tests use an isolated generated Cargo/TypeScript fixture.
 
 ## Operator handoff from Mac
 
-No host installer or service restart applies to the publisher. Deployment means
-Devon's protected PR merge and separately approved workflow activation. After the
-reviewed fix is merged and activation is approved, Devon can request
-reconciliation from Mac:
+No host installer or service restart applies to the publisher. Merging this fix
+into main activates automatic release reconciliation and publication: the workflow
+runs on main pushes and main CI completion events. There is no separate approval
+step after merge. Devon must explicitly approve the merge as activation of live
+publication, including pending eligible history, before it proceeds. Publication
+still requires successful exact-SHA main CI, a verified build and all existing
+publication checks; a merge does not guarantee those checks succeed. It does not
+authorize deployment.
+
+Manual reconciliation is optional recovery, not an activation or approval gate.
+After that approval and merge, Devon can request it from Mac:
 
 ```sh
 gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-157-publish-immutable-release-assets && gh workflow run release.yml --repo Metacomet-Technologies/factory --ref main'"
