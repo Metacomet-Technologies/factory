@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use factory_api::{AppState, alerts, fleet, router};
+use factory_api::{AppState, alerts, devices, fleet, router};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(Parser)]
@@ -68,6 +68,10 @@ struct Args {
     alerts_slack_url: String,
     #[arg(long, env = "FACTORY_API_BACKUP_STATUS", default_value = alerts::DEFAULT_BACKUP_STATUS)]
     backup_status: PathBuf,
+    #[arg(long, env = "FACTORY_DEVICES_ROOT", default_value = "/")]
+    devices_root: PathBuf,
+    #[arg(long, env = "FACTORY_API_REBOOT_STATUS", default_value = devices::DEFAULT_REBOOT_STATUS)]
+    reboot_status: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -163,6 +167,20 @@ async fn main() -> anyhow::Result<()> {
     state.pricing_sources = [args.openrouter_feed_url, args.litellm_feed_url];
     state.disable_pricing_collector = args.disable_pricing_collector;
     state.backup_status = args.backup_status;
+    state.devices_root = args.devices_root;
+    state.reboot_status = args.reboot_status;
+    if state.devices_root != std::path::Path::new("/") {
+        if state.backup_status == std::path::Path::new(alerts::DEFAULT_BACKUP_STATUS) {
+            state.backup_status = state
+                .devices_root
+                .join("var/lib/factory-backup-status/status.json");
+        }
+        if state.reboot_status == std::path::Path::new(devices::DEFAULT_REBOOT_STATUS) {
+            state.reboot_status = state
+                .devices_root
+                .join("var/lib/factory-reboot/status.json");
+        }
+    }
     if alerts_config.token.is_some() {
         tracing::info!(channel = %alerts_config.channel, "alerts: Slack token loaded; posting enabled");
     } else {

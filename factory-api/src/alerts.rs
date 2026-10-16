@@ -42,9 +42,52 @@ const DISPATCH_STALE_MS: i64 = 5 * 60_000;
 const USAGE_STALE_MS: i64 = crate::usage::STALE_MS;
 const MAX_BACKOFF_MS: i64 = 15 * 60_000;
 const MAX_RECOVERY_ATTEMPTS: u32 = 12;
-const SOURCES: [&str; 10] = [
+const SOURCES: [&str; 11] = [
     "node", "service", "gpu", "meter", "pricing", "backup", "clock", "dispatch", "usage", "ups",
+    "devices",
 ];
+const DEVICE_STALE_MS: i64 = 120_000;
+const DEVICE_CPU_WARN_C: f64 = 80.0;
+const DEVICE_CPU_CRIT_C: f64 = 95.0;
+const DEVICE_CPU_WARN_CLEAR_C: f64 = 75.0;
+const DEVICE_CPU_CRIT_CLEAR_C: f64 = 90.0;
+const DEVICE_CPU_WARN_MS: i64 = 5 * 60_000;
+const DEVICE_CPU_CRIT_MS: i64 = 2 * 60_000;
+const DEVICE_FS_WARN: f64 = 85.0;
+const DEVICE_FS_CRIT: f64 = 95.0;
+const DEVICE_FS_WARN_CLEAR: f64 = 80.0;
+const DEVICE_FS_CRIT_CLEAR: f64 = 90.0;
+const DEVICE_FS_MS: i64 = 10 * 60_000;
+const DEVICE_SMART_MS: i64 = 60_000;
+const DEVICE_SMART_CLEAR_MS: i64 = 2 * 60_000;
+
+struct DeviceBand {
+    warn: f64,
+    crit: f64,
+    warn_clear: f64,
+    crit_clear: f64,
+    warn_ms: i64,
+    crit_ms: i64,
+    unit: &'static str,
+}
+const CPU_BAND: DeviceBand = DeviceBand {
+    warn: DEVICE_CPU_WARN_C,
+    crit: DEVICE_CPU_CRIT_C,
+    warn_clear: DEVICE_CPU_WARN_CLEAR_C,
+    crit_clear: DEVICE_CPU_CRIT_CLEAR_C,
+    warn_ms: DEVICE_CPU_WARN_MS,
+    crit_ms: DEVICE_CPU_CRIT_MS,
+    unit: " C",
+};
+const FS_BAND: DeviceBand = DeviceBand {
+    warn: DEVICE_FS_WARN,
+    crit: DEVICE_FS_CRIT,
+    warn_clear: DEVICE_FS_WARN_CLEAR,
+    crit_clear: DEVICE_FS_CRIT_CLEAR,
+    warn_ms: DEVICE_FS_MS,
+    crit_ms: DEVICE_FS_MS,
+    unit: "%",
+};
 
 /// Slack bot token. Debug output is redacted; the value only reaches the HTTP header.
 #[derive(Clone)]
@@ -127,6 +170,8 @@ pub struct Signals {
     pub usage: Option<Vec<(String, Option<i64>)>>,
     pub ups: Option<UpsRead>,
     pub ups_events: Vec<crate::ups_history::UpsEvent>,
+    /// None means the device collector cannot be evaluated. Open device alerts stay open.
+    pub devices: Option<crate::devices::DeviceAlertInput>,
 }
 
 enum Verdict {
@@ -425,9 +470,214 @@ impl Engine {
         let since = *self.pending_since.entry(key.into()).or_insert(now);
         now - since >= hold_ms
     }
+    fn alert_open(&self, key: &str) -> bool {
+        self.stored.active.iter().any(|open| open.key == key)
+    }
+    fn device_level(
+        &mut self,
+        out: &mut Findings,
+        now: i64,
+        key: &str,
+        reading: Option<Option<f64>>,
+        band: &DeviceBand,
+        noun: &str,
+    ) {
+        let DeviceBand {
+            warn,
+            crit,
+            warn_clear,
+            crit_clear,
+            warn_ms,
+            crit_ms,
+            unit,
+        } = *band;
+        let crit_key = format!("{key}:critical");
+        let warn_key = format!("{key}:warning");
+        let Some(reading) = reading else {
+            for name in [&crit_key, &warn_key] {
+                if self.alert_open(name) {
+                    out.insert(name.clone(), Verdict::Hold);
+                }
+            }
+            return;
+        };
+        let Some(value) = reading else {
+            self.pending_since.remove(&crit_key);
+            self.pending_since.remove(&warn_key);
+            return;
+        };
+        let summary = |value: f64, level: &str, threshold: f64| {
+            format!("{noun} {value}{unit} ({level} {threshold}{unit})")
+        };
+        let crit_open = self.alert_open(&crit_key);
+        let warn_open = self.alert_open(&warn_key);
+        if value >= crit {
+            if self.held(&crit_key, now, crit_ms) {
+                self.pending_since.remove(&warn_key);
+                out.insert(
+                    crit_key,
+                    Verdict::Fire(AlertSeverity::Critical, summary(value, "critical", crit)),
+                );
+            } else {
+                if crit_open {
+                    out.insert(crit_key, Verdict::Hold);
+                }
+                if warn_open {
+                    out.insert(warn_key, Verdict::Hold);
+                }
+            }
+            return;
+        }
+        if crit_open && value >= crit_clear {
+            self.pending_since.remove(&crit_key);
+            out.insert(crit_key, Verdict::Hold);
+        } else {
+            self.pending_since.remove(&crit_key);
+        }
+        if value >= warn {
+            if self.held(&warn_key, now, warn_ms) {
+                out.insert(
+                    warn_key,
+                    Verdict::Fire(AlertSeverity::Warning, summary(value, "warning", warn)),
+                );
+            } else if warn_open {
+                out.insert(warn_key, Verdict::Hold);
+            }
+        } else if warn_open && value >= warn_clear {
+            self.pending_since.remove(&warn_key);
+            out.insert(warn_key, Verdict::Hold);
+        } else {
+            self.pending_since.remove(&warn_key);
+        }
+    }
+    fn device_findings(&mut self, now: i64, input: &crate::devices::DeviceAlertInput) -> Findings {
+        let mut out = Findings::new();
+        let stale_key = "devices:telemetry";
+        match input.fast_success_ms {
+            Some(at) if now.saturating_sub(at) >= DEVICE_STALE_MS => {
+                self.pending_since.remove(stale_key);
+                out.insert(
+                    stale_key.into(),
+                    Verdict::Fire(
+                        AlertSeverity::Warning,
+                        format!(
+                            "device telemetry stale: no fast sample for {}",
+                            duration(now - at)
+                        ),
+                    ),
+                );
+            }
+            Some(_) => {
+                self.pending_since.remove(stale_key);
+            }
+            None => {
+                if self.alert_open(stale_key) {
+                    out.insert(stale_key.into(), Verdict::Hold);
+                } else if self.held(stale_key, now, DEVICE_STALE_MS) {
+                    out.insert(
+                        stale_key.into(),
+                        Verdict::Fire(
+                            AlertSeverity::Warning,
+                            "device telemetry stale: no fast sample for 2 min".into(),
+                        ),
+                    );
+                }
+            }
+        }
+        self.device_level(
+            &mut out,
+            now,
+            "devices:cpu:temperature",
+            input.cpu_temp_c,
+            &CPU_BAND,
+            "CPU temperature",
+        );
+        match &input.filesystems {
+            None => {
+                for open in &self.stored.active {
+                    if open.key.starts_with("devices:fs:") {
+                        out.insert(open.key.clone(), Verdict::Hold);
+                    }
+                }
+            }
+            Some(filesystems) => {
+                for fs in filesystems {
+                    let id = one_line(&fs.id, 160);
+                    self.device_level(
+                        &mut out,
+                        now,
+                        &format!("devices:fs:{id}:space"),
+                        fs.space_percent.map(Some),
+                        &FS_BAND,
+                        &format!("filesystem {id} space"),
+                    );
+                    self.device_level(
+                        &mut out,
+                        now,
+                        &format!("devices:fs:{id}:inodes"),
+                        fs.inode_percent.map(Some),
+                        &FS_BAND,
+                        &format!("filesystem {id} inodes"),
+                    );
+                }
+            }
+        }
+        match &input.smart {
+            None => {
+                for open in &self.stored.active {
+                    if open.key.starts_with("devices:smart:") {
+                        out.insert(open.key.clone(), Verdict::Hold);
+                    }
+                }
+            }
+            Some(drives) => {
+                for drive in drives {
+                    let key = format!("devices:smart:{}", one_line(&drive.id, 160));
+                    let open = self.alert_open(&key);
+                    let clear = format!("{key}:clear");
+                    match drive.unhealthy {
+                        Some(true) => {
+                            self.pending_since.remove(&clear);
+                            if self.held(&key, now, DEVICE_SMART_MS) {
+                                out.insert(
+                                    key,
+                                    Verdict::Fire(
+                                        AlertSeverity::Critical,
+                                        format!("SMART unhealthy for {}", one_line(&drive.id, 160)),
+                                    ),
+                                );
+                            } else if open {
+                                out.insert(key, Verdict::Hold);
+                            }
+                        }
+                        Some(false) if open => {
+                            if self.held(&clear, now, DEVICE_SMART_CLEAR_MS) {
+                                self.pending_since.remove(&key);
+                                self.pending_since.remove(&clear);
+                            } else {
+                                out.insert(key, Verdict::Hold);
+                            }
+                        }
+                        Some(false) => {
+                            self.pending_since.remove(&key);
+                        }
+                        None if open => {
+                            out.insert(key, Verdict::Hold);
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+        out
+    }
     fn findings(&mut self, source: &str, now: i64, signals: &Signals) -> Option<Findings> {
         let mut out = Findings::new();
         match source {
+            "devices" => {
+                let input = signals.devices.as_ref()?;
+                out = self.device_findings(now, input);
+            }
             "ups" => {
                 let read = signals.ups.as_ref()?;
                 // One 60s grace period measured from the last good read, not two holds.
@@ -998,10 +1248,19 @@ impl AppState {
             crate::usage::observations(&self.usage_snapshot, now)
         );
         let ups = Some(self.ups_latest.read().await.clone());
+        let gpu = *self.gpu_latest.lock().expect("GPU sample lock");
+        let devices = Some(
+            self.devices_latest
+                .read()
+                .await
+                .clone()
+                .unwrap_or_else(|| crate::devices::unavailable(now))
+                .alert_input(now),
+        );
         Signals {
             fleet: (fleet.generated_at_ms != 0).then_some(fleet),
             fleet_discovered: self.fleet_discovered.load(Ordering::Acquire),
-            gpu: *self.gpu_latest.lock().expect("GPU sample lock"),
+            gpu,
             meter_synced_at_ms: Some(self.meter_synced_at_ms.load(Ordering::Acquire)),
             pricing_pending,
             backup,
@@ -1010,6 +1269,7 @@ impl AppState {
             usage,
             ups,
             ups_events: vec![],
+            devices,
         }
     }
     pub(crate) fn start_alerts(&self) -> Option<tokio::task::JoinHandle<()>> {
@@ -1978,5 +2238,213 @@ mod tests {
             slack_url("http://127.0.0.1:9/api/").unwrap(),
             "http://127.0.0.1:9/api"
         );
+    }
+
+    #[test]
+    fn device_alerts_debounce_hold_and_hysteresis() {
+        use crate::devices::{DeviceAlertInput, FsPressure, SmartPressure};
+        let mut engine = Engine::load(Config {
+            state_path: None,
+            channel: "C-test".into(),
+            slack_url: "http://127.0.0.1:1/api".into(),
+            token: None,
+        });
+        let signals = |input: DeviceAlertInput| Signals {
+            devices: Some(input),
+            ..Default::default()
+        };
+        let fresh = |at: i64, cpu: Option<Option<f64>>, filesystems, smart| DeviceAlertInput {
+            fast_success_ms: Some(at),
+            cpu_temp_c: cpu,
+            filesystems,
+            smart,
+        };
+        let quiet_fs = Some(vec![FsPressure {
+            id: "root".into(),
+            space_percent: Some(10.0),
+            inode_percent: Some(10.0),
+        }]);
+        let quiet_smart = Some(vec![SmartPressure {
+            id: "wwn-a".into(),
+            unhealthy: Some(false),
+        }]);
+        let keys = |engine: &Engine| {
+            engine
+                .view()
+                .active
+                .iter()
+                .map(|open| open.key.clone())
+                .collect::<Vec<_>>()
+        };
+        engine.evaluate(
+            T0,
+            &signals(fresh(
+                T0,
+                Some(Some(70.0)),
+                quiet_fs.clone(),
+                quiet_smart.clone(),
+            )),
+        );
+        assert!(keys(&engine).is_empty());
+        engine.evaluate(T0, &signals(DeviceAlertInput::default()));
+        assert!(keys(&engine).is_empty());
+        engine.evaluate(T0 + 120_000, &signals(DeviceAlertInput::default()));
+        assert_eq!(keys(&engine), vec!["devices:telemetry".to_string()]);
+        engine.evaluate(T0 + 130_000, &Signals::default());
+        assert_eq!(keys(&engine), vec!["devices:telemetry".to_string()]);
+        engine.evaluate(
+            T0 + 140_000,
+            &signals(fresh(
+                T0 + 140_000,
+                Some(Some(70.0)),
+                quiet_fs.clone(),
+                quiet_smart.clone(),
+            )),
+        );
+        assert!(keys(&engine).is_empty());
+
+        let hot = fresh(
+            T0 + 140_000,
+            Some(Some(96.0)),
+            quiet_fs.clone(),
+            quiet_smart.clone(),
+        );
+        engine.evaluate(T0 + 140_000, &signals(hot));
+        assert!(keys(&engine).iter().all(|key| !key.contains("temperature")));
+        engine.evaluate(
+            T0 + 260_000,
+            &signals(fresh(
+                T0 + 260_000,
+                Some(Some(96.0)),
+                quiet_fs.clone(),
+                quiet_smart.clone(),
+            )),
+        );
+        assert!(keys(&engine).contains(&"devices:cpu:temperature:critical".into()));
+        engine.evaluate(
+            T0 + 270_000,
+            &signals(fresh(T0, None, None, quiet_smart.clone())),
+        );
+        let aged = keys(&engine);
+        assert!(aged.contains(&"devices:telemetry".into()));
+        assert!(aged.contains(&"devices:cpu:temperature:critical".into()));
+        engine.evaluate(
+            T0 + 280_000,
+            &signals(fresh(
+                T0 + 280_000,
+                Some(Some(92.0)),
+                quiet_fs.clone(),
+                quiet_smart.clone(),
+            )),
+        );
+        assert!(keys(&engine).contains(&"devices:cpu:temperature:critical".into()));
+        assert!(!keys(&engine).contains(&"devices:telemetry".into()));
+        engine.evaluate(
+            T0 + 290_000,
+            &signals(fresh(
+                T0 + 290_000,
+                Some(Some(82.0)),
+                quiet_fs.clone(),
+                quiet_smart.clone(),
+            )),
+        );
+        assert!(!keys(&engine).iter().any(|key| key.contains("critical")));
+        engine.evaluate(
+            T0 + 290_000 + 5 * MIN,
+            &signals(fresh(
+                T0 + 290_000 + 5 * MIN,
+                Some(Some(82.0)),
+                quiet_fs.clone(),
+                quiet_smart.clone(),
+            )),
+        );
+        assert!(keys(&engine).contains(&"devices:cpu:temperature:warning".into()));
+        engine.evaluate(
+            T0 + 700_000,
+            &signals(fresh(
+                T0 + 700_000,
+                Some(None),
+                quiet_fs.clone(),
+                quiet_smart.clone(),
+            )),
+        );
+        assert!(keys(&engine).iter().all(|key| !key.contains("temperature")));
+
+        let full = fresh(
+            T0 + 700_000,
+            Some(Some(70.0)),
+            Some(vec![FsPressure {
+                id: "root".into(),
+                space_percent: Some(96.0),
+                inode_percent: Some(96.0),
+            }]),
+            quiet_smart.clone(),
+        );
+        engine.evaluate(T0 + 700_000, &signals(full.clone()));
+        assert!(keys(&engine).iter().all(|key| !key.contains("devices:fs:")));
+        engine.evaluate(
+            T0 + 700_000 + 10 * MIN,
+            &signals(fresh(
+                T0 + 700_000 + 10 * MIN,
+                Some(Some(70.0)),
+                full.filesystems.clone(),
+                quiet_smart.clone(),
+            )),
+        );
+        let pressure = keys(&engine);
+        assert!(pressure.contains(&"devices:fs:root:space:critical".into()));
+        assert!(pressure.contains(&"devices:fs:root:inodes:critical".into()));
+        engine.evaluate(
+            T0 + 700_000 + 11 * MIN,
+            &signals(fresh(
+                T0 + 700_000 + 11 * MIN,
+                Some(Some(70.0)),
+                None,
+                quiet_smart.clone(),
+            )),
+        );
+        assert!(keys(&engine).contains(&"devices:fs:root:space:critical".into()));
+
+        let bad = fresh(
+            T0 + 1_500_000,
+            Some(Some(70.0)),
+            quiet_fs.clone(),
+            Some(vec![SmartPressure {
+                id: "wwn-a".into(),
+                unhealthy: Some(true),
+            }]),
+        );
+        engine.evaluate(T0 + 1_500_000, &signals(bad.clone()));
+        assert!(keys(&engine).iter().all(|key| !key.contains("smart")));
+        engine.evaluate(
+            T0 + 1_560_000,
+            &signals(fresh(
+                T0 + 1_560_000,
+                Some(Some(70.0)),
+                quiet_fs.clone(),
+                bad.smart.clone(),
+            )),
+        );
+        assert!(keys(&engine).contains(&"devices:smart:wwn-a".into()));
+        engine.evaluate(
+            T0 + 1_570_000,
+            &signals(fresh(
+                T0 + 1_570_000,
+                Some(Some(70.0)),
+                quiet_fs.clone(),
+                quiet_smart.clone(),
+            )),
+        );
+        assert!(keys(&engine).contains(&"devices:smart:wwn-a".into()));
+        engine.evaluate(
+            T0 + 1_690_000,
+            &signals(fresh(
+                T0 + 1_690_000,
+                Some(Some(70.0)),
+                quiet_fs,
+                quiet_smart,
+            )),
+        );
+        assert!(keys(&engine).iter().all(|key| !key.contains("smart")));
     }
 }
