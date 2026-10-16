@@ -102,6 +102,8 @@ jobs:
           node-version-file: scripts/dispatch/.node-version
       - name: Test dispatcher and usage collector
         run: node --test scripts/dispatch scripts/usage
+      - name: Test immutable release fixtures and build metadata
+        run: python3 scripts/release/test-release.py
       - name: Install script check dependencies
         run: |
           sudo apt-get update

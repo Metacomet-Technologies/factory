@@ -1,46 +1,70 @@
-name: Release check
+name: Publish exact-SHA releases
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to verify (dry run; creates no release or artifacts)
-        required: true
+        description: Optional existing tag to verify only; leave empty to reconcile
+        required: false
         type: string
 
-permissions:
-  contents: read
+permissions: {}
+
+# Events are hints, not a queue: every run reconciles first-parent history.
+concurrency:
+  group: immutable-release-publisher
+  cancel-in-progress: false
 
 jobs:
-  verify:
-    runs-on: ubuntu-24.04
-    outputs:
-      commit: ${{ steps.tag.outputs.commit }}
+  reconcile:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      actions: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
+          ref: main
           fetch-depth: 0
-      - name: Verify tag, version and main ancestry
-        id: tag
-        env:
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+      - name: Read pinned kiosk versions
+        id: versions
         run: |
-          [[ "$TAG" =~ ^v0\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'Tag must be v0.X.Y SemVer without leading zeroes'; exit 1; }
-          commit=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
-          git checkout --detach "$commit"
-          [[ "$TAG" == "v$(cat VERSION)" ]] || { echo 'Tag must exactly match VERSION at the tagged commit'; exit 1; }
-          git merge-base --is-ancestor "$commit" origin/main || { echo 'Tagged commit is not in main history'; exit 1; }
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-
-  ci:
-    needs: verify
-    # Local workflow calls use the same commit as this workflow; GitHub does not accept a SHA suffix here.
-    uses: ./.github/workflows/ci.yml
-    with:
-      ref: ${{ needs.verify.outputs.commit }}
-
-  # PHASE 3 PLACEHOLDER: add versioned artifact and installer jobs after verify and ci.
-  # This workflow deliberately never edits or deletes a release.
+          node -e 'const p = require("./kiosk/package.json"); console.log("node=" + p.devEngines.runtime.version); console.log("pnpm=" + p.devEngines.packageManager.version)' >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ steps.versions.outputs.node }}
+      - name: Prepare user-space build tools
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          mkdir -p "$RUNNER_TEMP/bubblewrap"
+          cd "$RUNNER_TEMP/bubblewrap"
+          apt-get download bubblewrap
+          dpkg-deb -x ./*.deb unpacked
+          echo "$RUNNER_TEMP/bubblewrap/unpacked/usr/bin" >> "$GITHUB_PATH"
+      - name: Reconcile or verify (never deploy)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            [[ "$REQUESTED_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'Invalid tag'; exit 1; }
+            sha=$(git rev-parse --verify "refs/tags/$REQUESTED_TAG^{commit}") || { echo 'tag not found'; exit 1; }
+            git show "$sha:deploy/components.json" > "$RUNNER_TEMP/verify-inventory.json"
+            python3 scripts/release/release.py verify --tag "$REQUESTED_TAG" --sha "$sha" --inventory "$RUNNER_TEMP/verify-inventory.json" --directory "$RUNNER_TEMP/verified"
+          else
+            python3 scripts/release/release.py publish --directory "$RUNNER_TEMP/releases"
+          fi
