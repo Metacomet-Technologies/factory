@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -69,6 +69,12 @@ async function fixture(t: any, issues = [issue()], options: any = {}) {
   const githubFile = join(directory, 'github');
   const worktreesFile = join(directory, 'worktrees');
   const eventsFile = join(directory, 'events');
+  const sweepPath = join(directory, '.local/state/factory-dispatch/sweep.json');
+  function setSweep(state: any) {
+    mkdirSync(join(directory, '.local/state/factory-dispatch'), { recursive: true });
+    writeFileSync(sweepPath, typeof state === 'string' ? state : JSON.stringify(state));
+  }
+  if (options.sweep !== undefined) setSweep(options.sweep);
   writeFileSync(worktreesFile, JSON.stringify(options.worktrees ?? { gpu: [], console: [] }));
   writeFileSync(eventsFile, '');
   writeFileSync(githubFile, JSON.stringify(options.github ?? {}));
@@ -216,11 +222,13 @@ if (args[0] === 'threads' && args[1] === 'label') {
   process.exit(0);
 }
 if (args[0] === 'threads' && args[1] === 'search') {
+  if (args[2] === 'author:me archived:false' && process.env.FAKE_BAD_OPEN) { console.log(process.env.FAKE_BAD_OPEN); process.exit(0); }
+  if (args[2].startsWith('label:') && process.env.FAKE_BAD_LABEL) { console.log(process.env.FAKE_BAD_LABEL); process.exit(0); }
   if (process.env.FAKE_BAD_SEARCH) { console.log(process.env.FAKE_BAD_SEARCH); process.exit(0); }
   const threads = JSON.parse(fs.readFileSync(process.env.FAKE_THREADS, 'utf8'));
   if (Number(args.at(-1)) > 500) process.exit(99);
-  console.log(JSON.stringify(threads.filter(t => t.labels?.includes(args[2].split(' ')[0].slice(6)) && !t.archived
-    && (!args[2].includes('author:me') || (t.author ?? 'me') === 'me')).slice(0, Number(args.at(-1))).map(t => ({ id: t.id, title: t.title, updatedAt: t.updated }))));
+  console.log(JSON.stringify(threads.filter(t => (!args[2].startsWith('label:') || t.labels?.includes(args[2].split(' ')[0].slice(6))) && !t.archived
+    && (!args[2].includes('author:me') || (t.author ?? 'me') === 'me')).slice(0, Number(args.at(-1))).map(t => ({ id: t.id, title: t.title ?? 'Synthetic thread', updatedAt: t.updated }))));
   process.exit(0);
 }
 if (args[0] === 'threads' && args[1] === 'list') {
@@ -380,7 +388,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
   // Existing lifecycle assertions exclude the independent label bookkeeping.
   // Label/group tests use allCalls and inspect the persisted threads.
   return { issues, get mutations() { return mutations.filter(m => !m.input?.body?.includes('<!-- factory-dispatch:labeled ')); },
-    allCalls, queries, run, directory,
+    allCalls, queries, run, directory, sweepPath, setSweep,
     check: (pr = '90', head = sha, env = {}) => run(['check', pr, head], env, fileURLToPath(new URL('qa.ts', import.meta.url))),
     setGitHub: (github: any) => writeFileSync(githubFile, JSON.stringify(github)),
     githubCalls: () => existsSync(githubFile + '-calls') ? readFileSync(githubFile + '-calls', 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [],
@@ -896,7 +904,8 @@ test('runner cap parsing, precedence and idle logging', { timeout: 10_000 }, asy
     const f = await fixture(t, []);
     const result = await f.run(['poll'], environment);
     assert.equal(result.code, 0, result.stdout);
-    assert.deepEqual(result.stdout.trim().split('\n').map(line => JSON.parse(line)), [{ decision: 'caps', caps }]);
+    assert.deepEqual(result.stdout.trim().split('\n').map(line => JSON.parse(line)), [{ decision: 'caps', caps },
+      { decision: 'archive-sweep', reason: 'sweep state missing, unreadable or invalid', openCount: 0, unknownCount: 0, issueCount: 0 }]);
     assert.equal(f.calls().length, 0);
     assert.equal(f.mutations.length, 0);
   }
@@ -1714,7 +1723,7 @@ test('factory groups require the exact title prefix and retain seven-day legacy 
     assert.deepEqual(f.threads().map((entry: any) => entry.archived), age === 7 * 24 * 60 * 60_000
       ? [true, false, false, true, true] : [false, false, false, false, false]);
     assert.deepEqual(f.allCalls().filter(args => args[1] === 'search').map(args => args[2]), age === 7 * 24 * 60 * 60_000
-      ? ['label:factory author:me archived:false', 'label:met-14 author:me archived:false'] : []);
+      ? ['author:me archived:false', 'label:factory author:me archived:false', 'label:met-14 author:me archived:false'] : ['author:me archived:false']);
     assert.equal(f.allCalls().filter(args => args[1] === 'archive').length, age === 7 * 24 * 60 * 60_000 ? 3 : 0);
   }
 });
@@ -1782,9 +1791,101 @@ test('seven-day search boundary skips historical/unknown closes but never skips 
       comments: [{ body: `<!-- factory-dispatch:archive-claim thread:${reviewId} -->` }] });
     const f = await fixture(t, [i], { threads: [{ id: reviewId, updated: quietUpdated, archived: true }] });
     assert.equal((await f.run()).code, 0);
-    assert.equal(f.allCalls().filter(args => args[1] === 'search').length, age === 7 * 24 * 60 * 60_000 ? 2 : 0);
+    assert.equal(f.allCalls().filter(args => args[1] === 'search').length, age === 7 * 24 * 60 * 60_000 ? 3 : 1);
     assert.equal(f.allCalls().filter(args => args[1] === 'archive').length, 0);
     assert.ok(i.comments.some((c: any) => c.body.includes(`factory-dispatch:archived thread:${reviewId}`)));
+  }
+});
+
+test('sweep skips known IDs from every standalone marker, but not quoted markers', { timeout: 10_000 }, async t => {
+  const ids = Array.from({ length: 4 }, (_, n) => `T-22345678-89ab-4cde-8fab-${String(n).padStart(12, '0')}`);
+  const closed = issue(123, { labels: [], state: { type: 'canceled' }, comments: [claimComment()] });
+  const recorded = issue(124, { labels: [], state: { type: 'canceled' }, canceledAt: null, comments: [
+    { body: [`<!-- factory-dispatch:thread ${ids[0]} -->`, `<!-- factory-dispatch:archived thread:${ids[1]} -->`,
+      `<!-- factory-dispatch:archive-claim thread:${ids[2]} -->`, `<!-- factory-qa:review-claim pr:90 sha:${sha} round:2 thread:${ids[3]} -->`].join('\n') },
+  ] });
+  const f = await fixture(t, [closed, recorded], { sweep: { unknownIds: [], issues: [], candidates: [] },
+    threads: ids.map(id => ({ id, updated: new Date(now).toISOString(), archived: false })) });
+  const result = await f.run();
+  assert.equal(result.code, 0, result.stdout);
+  assert.match(result.stdout, /"decision":"archive-sweep-skip".*"unknownCount":0/);
+  assert.deepEqual(f.allCalls().filter(args => args[1] === 'search').map(args => args[2]), ['author:me archived:false']);
+  recorded.comments[0].body = `\`\`\`\n${recorded.comments[0].body}\n\`\`\``;
+  assert.match((await f.run()).stdout, /"decision":"archive-sweep".*"unknownCount":4/);
+});
+
+test('sweep stores a sorted key atomically, skips unchanged personal threads, and notices new IDs and closes', { timeout: 10_000 }, async t => {
+  const closed = (n: number) => issue(n, { labels: [], state: { type: 'canceled' }, comments: [claimComment()] });
+  const f = await fixture(t, [closed(124), closed(123)], { sweep: { unknownIds: [], issues: [], candidates: [] },
+    threads: [reviewId, threadId].map(id => ({ id, title: 'Personal work', archived: false })) });
+  const before = statSync(f.sweepPath).ino;
+  assert.equal((await f.run()).code, 0);
+  assert.deepEqual(JSON.parse(readFileSync(f.sweepPath, 'utf8')), { unknownIds: [threadId, reviewId], issues: ['MET-123', 'MET-124'], candidates: [] });
+  assert.equal(statSync(f.sweepPath).mode & 0o777, 0o600);
+  assert.notEqual(statSync(f.sweepPath).ino, before);
+  assert.equal(f.allCalls().filter(args => args[2] === 'label:factory author:me archived:false').length, 1);
+  const count = f.allCalls().length;
+  f.setThreads(f.threads().reverse());
+  assert.match((await f.run()).stdout, /"decision":"archive-sweep-skip".*unchanged key/);
+  assert.deepEqual(f.allCalls().slice(count), [['threads', 'search', 'author:me archived:false', '--json', '--limit', '500']]);
+  const newId = 'T-32345678-89ab-4cde-8fab-0123456789ab';
+  f.setThreads([...f.threads(), { id: newId, title: 'Another personal thread', archived: false }]);
+  assert.match((await f.run()).stdout, /"decision":"archive-sweep".*changed key/);
+  assert.deepEqual(JSON.parse(readFileSync(f.sweepPath, 'utf8')).unknownIds, [threadId, reviewId, newId]);
+  f.issues.push(closed(125));
+  assert.match((await f.run()).stdout, /"decision":"archive-sweep".*"issueCount":3/);
+  assert.deepEqual(JSON.parse(readFileSync(f.sweepPath, 'utf8')).issues, ['MET-123', 'MET-124', 'MET-125']);
+});
+
+test('sweep failures and unsafe discovery never store a key', { timeout: 20_000 }, async t => {
+  for (const scenario of ['label', 'open', 'limit', 'missing', 'invalid', 'unreadable']) {
+    const f = await fixture(t, [issue(123, { labels: [], state: { type: 'canceled' }, comments: [claimComment()] })], {
+      sweep: scenario === 'missing' ? undefined : scenario === 'invalid' ? '{bad' : { unknownIds: [], issues: [], candidates: [] },
+      threads: Array.from({ length: scenario === 'limit' ? 500 : 1 }, (_, n) => ({
+        id: `T-22345678-89ab-4cde-8fab-${String(n).padStart(12, '0')}`, title: 'Personal work', archived: false })),
+    });
+    if (scenario === 'unreadable') { rmSync(f.sweepPath); mkdirSync(f.sweepPath); }
+    const before = existsSync(f.sweepPath) && scenario !== 'unreadable' ? readFileSync(f.sweepPath, 'utf8') : null;
+    const result = await f.run(['poll'], scenario === 'label' ? { FAKE_BAD_LABEL: '{}' } : scenario === 'open' ? { FAKE_BAD_OPEN: 'not json' } : {});
+    assert.equal(result.code, 0, result.stdout);
+    assert.match(result.stdout, /"decision":"archive-sweep"/);
+    assert.equal(f.allCalls().filter(args => args[1] === 'search').length, 3);
+    if (scenario === 'missing') assert.equal(existsSync(f.sweepPath), false);
+    else if (scenario === 'unreadable') assert.ok(statSync(f.sweepPath).isDirectory());
+    else assert.equal(readFileSync(f.sweepPath, 'utf8'), before);
+  }
+});
+
+test('cached discoveries still archive after quiet time, including beyond the shared attempt cap', { timeout: 10_000 }, async t => {
+  const threads = Array.from({ length: 7 }, (_, n) => ({ id: `T-22345678-89ab-4cde-8fab-${String(n).padStart(12, '0')}`,
+    title: 'MET-123 probe: quiet', labels: ['factory'], updated: new Date(now).toISOString(), archived: false }));
+  const f = await fixture(t, [issue(123, { labels: [], state: { type: 'canceled' }, comments: [claimComment()] })], {
+    sweep: { unknownIds: [], issues: [], candidates: [] }, threads,
+  });
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.threads().filter((entry: any) => entry.archived).length, 0);
+  const count = f.allCalls().length;
+  assert.match((await f.run(['poll'], { FAKE_NOW: String(now + 5 * 60_000) })).stdout, /archive-sweep-skip/);
+  assert.equal(f.allCalls().slice(count).filter(args => args[1] === 'search').length, 1);
+  assert.equal(f.threads().filter((entry: any) => entry.archived).length, 5);
+  assert.equal((await f.run(['poll'], { FAKE_NOW: String(now + 5 * 60_000) })).code, 0);
+  assert.ok(f.threads().every((entry: any) => entry.archived));
+});
+
+test('dry-run performs one open search and previews decisions without writing state or mutations', { timeout: 10_000 }, async t => {
+  for (const sweep of [undefined, { unknownIds: [], issues: [], candidates: [] }, { unknownIds: [reviewId], issues: ['MET-123'], candidates: [] }]) {
+    const f = await fixture(t, [issue(123, { labels: [], state: { type: 'canceled' }, comments: [claimComment()] })], {
+      sweep, threads: [{ id: reviewId, title: 'Personal work', archived: false }],
+    });
+    const before = sweep === undefined ? null : readFileSync(f.sweepPath, 'utf8');
+    const result = await f.run(['poll', '--dry-run']);
+    assert.equal(result.code, 0, result.stdout);
+    assert.match(result.stdout, /'author:me archived:false'/);
+    assert.match(result.stdout, /archive-sweep/);
+    assert.deepEqual(f.allCalls(), [['threads', 'search', 'author:me archived:false', '--json', '--limit', '500']]);
+    assert.equal(f.mutations.length, 0);
+    if (before === null) assert.equal(existsSync(join(f.directory, '.local')), false);
+    else assert.equal(readFileSync(f.sweepPath, 'utf8'), before);
   }
 });
 
@@ -1976,7 +2077,8 @@ test('simple merged apply success moves Done, then archives without QA/wrap-up; 
   assert.equal(f.threads()[0].archived, true);
   assert.ok(i.comments.some((c: any) => c.body.startsWith(`Applied: ${appliedRun().url}`)));
   assert.ok(!i.comments.some((c: any) => /factory-qa:|factory-dispatch:wrapup/.test(c.body)));
-  assert.deepEqual(f.allCalls().filter(args => args[1] !== 'list'), [['threads', 'archive', threadId]]);
+  assert.deepEqual(f.allCalls().filter(args => args[1] !== 'list'), [
+    ['threads', 'search', 'author:me archived:false', '--json', '--limit', '500'], ['threads', 'archive', threadId]]);
   assert.deepEqual(f.githubCalls().find(args => args[1] === 'run'), ['gh', 'run', 'list', '--repo', accessRepo, '--commit', mergeSha,
     '--workflow', 'Tailscale policy', '--event', 'push', '--branch', 'main', '--limit', '1', '--json', 'conclusion,status,url,databaseId,headSha,event,headBranch']);
   const mutations = f.mutations.length;
@@ -1992,7 +2094,7 @@ test('simple apply failure pings once without state/archive changes; a successfu
   assert.match(f.mutations[0].input.body, /https:\/\/linear.app\/metacomet\/profiles\/devon/);
   assert.equal(i.state.type, 'started');
   assert.equal(f.threads()[0].archived, false);
-  assert.deepEqual(f.allCalls(), []);
+  assert.deepEqual(f.allCalls(), Array(2).fill(['threads', 'search', 'author:me archived:false', '--json', '--limit', '500']));
   f.setGitHub(accessGitHub());
   assert.equal((await f.run()).code, 0);
   assert.equal(i.state.type, 'completed');
@@ -2006,7 +2108,7 @@ test('simple pending, missing, wrong-SHA and PR-event runs never complete or arc
     const f = await fixture(t, [i], { github: accessGitHub(runs) });
     assert.equal((await f.run()).code, 0);
     assert.deepEqual(f.mutations, []);
-    assert.deepEqual(f.allCalls(), []);
+    assert.deepEqual(f.allCalls(), [['threads', 'search', 'author:me archived:false', '--json', '--limit', '500']]);
     assert.equal(f.threads()[0].archived, false);
   }
 });
@@ -2021,7 +2123,7 @@ test('simple PR selection ignores open, foreign, stale and ambiguous attachments
     const i = accessMerged(); change(i);
     const f = await fixture(t, [i], { github: accessGitHub() });
     assert.equal((await f.run()).code, 0);
-    assert.deepEqual(f.allCalls(), []);
+    assert.deepEqual(f.allCalls(), [['threads', 'search', 'author:me archived:false', '--json', '--limit', '500']]);
     assert.deepEqual(f.mutations, []);
     assert.equal(f.githubCalls().filter(args => args[0] === 'gh').length, 0);
   }
@@ -2080,7 +2182,7 @@ test('simple dry-run previews orb without local worktree or Amp side effects', a
   assert.equal(result.code, 0);
   assert.match(result.stdout, /'-ox' '\$PROMPT'.*'--project' 'Metacomet-Technologies\/factory-access'/);
   assert.doesNotMatch(result.stdout, /'worktree' 'add'/);
-  assert.deepEqual(f.allCalls(), []);
+  assert.deepEqual(f.allCalls(), [['threads', 'search', 'author:me archived:false', '--json', '--limit', '500']]);
   assert.deepEqual(f.mutations, []);
 });
 
