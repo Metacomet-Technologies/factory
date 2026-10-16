@@ -1,9 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type MouseEvent } from "react";
 import { Activity, Cpu, Moon, Server, Sun, Terminal, Radio, Info } from "lucide-react";
 import { useApi } from "./api/client";
 import { useStream } from "./api/stream";
 import { useBuildUpdate } from "./api/build-update";
-import type { UsageRange, GpuRange } from "./api/types";
+import type { UsageRange, GpuRange, DeviceRange } from "./api/types";
 import {
   FleetSection,
   GpuSection,
@@ -16,10 +16,29 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./comp
 import { VersionFooter } from "./components/version-footer";
 import { UpsBadge, UpsSection } from "./components/ups";
 import UpsPage from "./components/ups-page";
+import DevicesPage from "./components/devices-page";
+import { Card, CardContent, CardHeader } from "./components/ui/card";
+
+function followLink(event: MouseEvent<HTMLAnchorElement>) {
+  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0)
+    return;
+  event.preventDefault();
+  const href = event.currentTarget.getAttribute("href");
+  if (!href || href === window.location.pathname) return;
+  window.history.pushState(null, "", href);
+  window.dispatchEvent(new PopStateEvent("popstate"));
+}
 
 export default function App() {
+  const [path, setPath] = useState(() => window.location.pathname);
   const [usageRange, setUsageRange] = useState<UsageRange>("24h");
   const [gpuRange, setGpuRange] = useState<GpuRange>("1h");
+  const [deviceRange, setDeviceRange] = useState<DeviceRange>("1h");
+  useEffect(() => {
+    const sync = () => setPath(window.location.pathname);
+    window.addEventListener("popstate", sync);
+    return () => window.removeEventListener("popstate", sync);
+  }, []);
   const [dark, setDark] = useState(() => document.documentElement.dataset.theme === "dark");
   const [followsSystem, setFollowsSystem] = useState(
     () => !document.documentElement.dataset.themePreference,
@@ -54,6 +73,20 @@ export default function App() {
   const upsWarnings = ups.data?.warnings ?? (ups.error ? [ups.error] : []);
   const pricing = useApi("/v1/pricing", "", live.pricingRevision + live.snapshotRevision);
   const agents = useApi("/v1/agents", "", live.agentsRevision + live.snapshotRevision);
+  const deviceRevision = live.devicesRevision + live.snapshotRevision;
+  const devices = useApi("/v1/devices", "", deviceRevision);
+  const deviceCurrent = useApi("/v1/devices/factory-gpu", "", deviceRevision);
+  const deviceHistory = useApi(
+    "/v1/devices/factory-gpu/history",
+    `?range=${deviceRange}`,
+    deviceRevision,
+  );
+  const collectorDown = live.connected && live.devices === null;
+  const deviceView = collectorDown
+    ? null
+    : live.connected && live.devices
+      ? live.devices
+      : deviceCurrent.data;
   useBuildUpdate(live.snapshotRevision, usage.loading || gpu.loading);
   return (
     <TooltipProvider>
@@ -77,6 +110,9 @@ export default function App() {
             <Radio aria-hidden="true" size={14} />
             {live.connected ? "Live" : "Reconnecting"}
           </span>
+          <a href="/devices" onClick={followLink}>
+            Devices
+          </a>
           <UpsBadge current={upsCurrent} now={now} warnings={upsWarnings} />
           <Tooltip>
             <TooltipTrigger
@@ -115,7 +151,56 @@ export default function App() {
           </Button>
         </div>
       </header>
-      {window.location.pathname === "/ups" ? (
+      {path === "/devices/factory-gpu" ? (
+        <DevicesPage
+          view={deviceView}
+          history={deviceHistory.data}
+          range={deviceRange}
+          setRange={setDeviceRange}
+          error={collectorDown ? "Device collector unavailable" : deviceCurrent.error}
+          loading={deviceCurrent.loading}
+          connected={live.connected}
+          live={live.connected && live.devices != null}
+          now={now}
+        />
+      ) : path === "/devices" ? (
+        <main id="main" className="dashboard devices-page">
+          <div className="intro">
+            <div>
+              <p className="eyebrow">DEVICES</p>
+              <h2>Devices</h2>
+            </div>
+            <p className="muted">
+              <a href="/" onClick={followLink}>
+                Dashboard
+              </a>
+            </p>
+          </div>
+          {devices.error && (
+            <p role="alert" className="status-fail">
+              {devices.error}
+            </p>
+          )}
+          {!devices.loading && devices.data?.devices.length === 0 && (
+            <p className="muted">No devices reported.</p>
+          )}
+          <div className="dashboard-grid">
+            {devices.data?.devices.map((device) => (
+              <a
+                key={device.device_id}
+                href={device.href}
+                onClick={followLink}
+                className="ups-card-link"
+              >
+                <Card>
+                  <CardHeader>{device.device_id}</CardHeader>
+                  <CardContent>{device.health}</CardContent>
+                </Card>
+              </a>
+            ))}
+          </div>
+        </main>
+      ) : path === "/ups" ? (
         <UpsPage
           current={upsCurrent}
           now={now}
@@ -142,6 +227,14 @@ export default function App() {
               icon={<Cpu />}
             />
             <UpsSection current={upsCurrent} now={now} warnings={upsWarnings} />
+            <a href="/devices/factory-gpu" onClick={followLink} className="ups-card-link">
+              <Card>
+                <CardHeader>factory-gpu</CardHeader>
+                <CardContent>
+                  {devices.error ? devices.error : (devices.data?.devices[0]?.health ?? "—")}
+                </CardContent>
+              </Card>
+            </a>
             <UsageSection
               resource={usage}
               pricing={pricing}

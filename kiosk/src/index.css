@@ -197,22 +197,27 @@
 .ups-card-link:hover [data-slot="card"] {
   border-color: var(--accent-text);
 }
-.ups-page {
+.ups-page,
+.devices-page {
   display: grid;
   gap: 20px;
 }
-.ups-page a {
+.ups-page a,
+.devices-page a {
   color: var(--accent-text);
   text-decoration: underline;
   text-underline-offset: 3px;
 }
-.ups-page .intro {
+.ups-page .intro,
+.devices-page .intro {
   margin: 0;
 }
-.dashboard.ups-page {
+.dashboard.ups-page,
+.dashboard.devices-page {
   padding-bottom: 24px;
 }
-.ups-page + .version-footer {
+.ups-page + .version-footer,
+.devices-page + .version-footer {
   position: static;
 }
 .ups-panel {
