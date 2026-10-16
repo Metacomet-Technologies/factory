@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { collect, command, readPrevious, writeSnapshot, CLAUDE_ARGS, supportedNode } from './collect.ts';
 import { age, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, STALE_MS } from './parsers.ts';
-import { amp, ampNew, details, detailsNew, claude, codex, fixtureRun } from './fixtures.ts';
+import { amp, ampAutoReload, ampNew, details, detailsAutoReload, detailsNew, claude, codex, fixtureRun, versions } from './fixtures.ts';
 const now = 1791800000000;
 
 test('supported Node versions require Node 24.12.0 or newer', () => {
@@ -72,6 +72,29 @@ test('Amp plain summaries preserve workspace balance without identity or invente
     assert.equal(unknown.tools[0].status, 'unknown');
     assert.equal(unknown.tools[0].reason, FORMAT_CHANGED);
   }
+});
+
+test('Amp accepts only the exact optional auto-reload note and validates new-version details', async () => {
+  const previous = await collect(null, fixtureRun, now);
+  const snapshot = await collect(previous, async (program, args) => {
+    if (program !== 'amp') return fixtureRun(program, args);
+    if (args[0] === '--version') return versions.ampAutoReload;
+    return args.includes('--details') ? detailsAutoReload : ampAutoReload;
+  }, now + 15 * 60_000);
+  const a = snapshot.tools[0];
+  assert.equal(a.status, 'ok');
+  assert.equal(a.cli_version, '0.0.1792108872-gab0eb7');
+  assert.deepEqual(a.balances, [
+    { amount: '170.29', remaining: '170.29', total: '200', unit: 'usd' },
+    { amount: '997.2', remaining: '997.2', total: '1000', unit: 'orb_hours' },
+    { amount: '0', remaining: '0', total: null, unit: 'usd', label: 'workspace metacomet' },
+  ]);
+  assert.deepEqual(a.windows.map(w => w.used_percent), [15, 0]);
+  assert.doesNotThrow(() => parseAmpDetails(detailsAutoReload));
+  for (const text of [
+    ampAutoReload.replace('(set up auto-reload to avoid running out)', '(auto-reload on)'),
+    ampAutoReload.replace(' - https://ampcode.com/settings', ' (set up auto-reload to avoid running out) - https://ampcode.com/settings'),
+  ]) assert.throws(() => parseAmp(text), { message: FORMAT_CHANGED });
 });
 
 test('new Claude and Codex versions stay ok unless the version or usage format changes', async () => {

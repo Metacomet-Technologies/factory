@@ -44,7 +44,7 @@ export function parseAmp(text: string): Reading {
   let individual = false;
   const workspaces = new Set<string>();
   for (const line of lines) {
-    if (new RegExp(`^(?:Individual credits:|\\*\\*Individual credits:\\*\\*) \\$${number} remaining - https://ampcode.com/settings$`).test(line)) {
+    if (new RegExp(`^(?:Individual credits:|\\*\\*Individual credits:\\*\\*) \\$${number} remaining(?: \\(set up auto-reload to avoid running out\\))? - https://ampcode.com/settings$`).test(line)) {
       check(!individual); individual = true;
       continue;
     }

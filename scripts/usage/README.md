@@ -52,7 +52,9 @@ output or exception text. The collector kills only its own probe process group.
   Supported observed shape: Gigawatt, a1.xxlarge-normalized hours. CLI version is
   recorded; the same shapes worked in `0.0.1791763306-ged595a` and
   `0.0.1791849701-g1448da`. Version `0.0.1791864325-g52e626` (2026-10-13)
-  emits a plain summary with workspace balances; details retain Markdown.
+  emits a plain summary with workspace balances; details retain Markdown. Version
+  `0.0.1792108872-gab0eb7` (2026-10-16) may append the exact optional Individual
+  credits note ` (set up auto-reload to avoid running out)`.
   Both summary styles accept an optional `a1.xxlarge` size label and either
   `resets in N days` or `resets upon renewal in N days`. Sign-in identities are
   discarded. Workspace USD balances carry `label: "workspace <name>"` and
