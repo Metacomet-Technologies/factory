@@ -59,7 +59,12 @@ The publisher requires successful exact-SHA `push`/`main` CI from `ci.yml`, with
 successful `rust`, `kiosk`, `scripts` and `sandbox` jobs. PR test-merge checks,
 skipped jobs, older successful runs hiding newer failures and partial evidence
 do not qualify. Existing merge-required checks are unchanged; publishing is not
-a merge check. A failed/pending/cancelled predecessor blocks later publication.
+a merge check. A pending predecessor stops planning at that SHA, prints
+`waiting for CI on <sha> run <id>` and exits successfully without reserving or
+publishing it. This covers queued, in-progress, waiting, requested and pending
+runs, including a CI rerun starting between build and publication. Missing CI,
+mismatched evidence, missing required jobs and completed failed/cancelled runs
+still fail with actionable errors; none permit skipping to a later SHA.
 Existing CI cancels superseded main runs: Devon must inspect and rerun the printed
 exact-SHA CI run (`gh run rerun RUN_ID --repo Metacomet-Technologies/factory`) when
 appropriate, then reconcile. The publisher has actions:read, not CI-rerun power.
@@ -71,7 +76,15 @@ SHAs. Completed history is checked against its immutable manifest receipt and
 GitHub asset sizes/digests without rebuilding or downloading all old binaries.
 CI retention does not invalidate an already completed immutable release.
 
-Crash recovery is monotonic: reserve tag, build, create draft, upload manifest and
+The read-only job computes plans, builds exact-SHA bundles and verifies them before
+uploading `plans.json` and the bundles through a SHA-pinned artifact action. No
+plans means no publish job. The dependent publish job downloads only this run's
+artifact, recomputes the current plans from GitHub/main and requires an exact
+match. A changed plan requires a fresh build; pending CI instead waits without
+writes. It verifies every bundle and its plan before the first remote write.
+Its builder callback only copies those verified files, never executes them.
+
+Crash recovery is monotonic: build and verify, reserve tag, create draft, upload manifest and
 six assets, download and validate all assets, then publish with a manifest digest
 receipt. Every upload inspects existing assets first. Lost write acknowledgements
 stop the attempt; rerunning inspects remote state before another write. Identical
@@ -87,8 +100,17 @@ without changing its own checkout. Rust 1.99.0 uses locked dependencies; each SH
 exact Node/pnpm pins and Vite+ 1.1.0 are installed outside source. Rust paths and
 archive metadata are normalized. Any byte difference on retry fails rather than
 replacing an uploaded asset; OS/compiler system-library changes may require human
-recovery. The source is never rewritten or bumped. Build subprocesses receive no
-publication token. Builds require Linux x86_64 and working Bubblewrap namespaces.
+recovery. The source is never rewritten or bumped. Builds require Linux x86_64
+and working Bubblewrap namespaces.
+
+The credential boundary is job-level separation, not environment filtering.
+All dependency installation, builds and sandbox execution run in a job with
+contents:read, actions:read and pull-requests:read. The dependent publication job
+has contents:write, actions:read and pull-requests:read, installs no tools, and
+executes no repository code except trusted main `release.py`. Checkout and
+artifact actions are SHA-pinned. Downloaded bundles remain data, outside the
+trusted checkout. The immutable-policy checks still run before writes and again
+before publication; job separation does not resolve the policy-read gate.
 
 The existing synthetic sandbox validates real meter/API health. Kiosk emitted JS
 must contain the allocated identity; its generated receipt is included in the

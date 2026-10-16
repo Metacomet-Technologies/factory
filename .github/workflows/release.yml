@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  reconcile:
+  build:
     if: >-
       github.ref == 'refs/heads/main' &&
       (github.event_name != 'workflow_run' ||
@@ -31,9 +31,11 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     permissions:
-      contents: write
+      contents: read
       actions: read
       pull-requests: read
+    outputs:
+      has-plans: ${{ steps.bundles.outputs.has-plans }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -55,7 +57,8 @@ jobs:
           apt-get download bubblewrap
           dpkg-deb -x ./*.deb unpacked
           echo "$RUNNER_TEMP/bubblewrap/unpacked/usr/bin" >> "$GITHUB_PATH"
-      - name: Reconcile or verify (never deploy)
+      - name: Plan and build or verify (read-only)
+        id: bundles
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.tag }}
@@ -66,5 +69,42 @@ jobs:
             git show "$sha:deploy/components.json" > "$RUNNER_TEMP/verify-inventory.json"
             python3 scripts/release/release.py verify --tag "$REQUESTED_TAG" --sha "$sha" --inventory "$RUNNER_TEMP/verify-inventory.json" --directory "$RUNNER_TEMP/verified"
           else
-            python3 scripts/release/release.py publish --directory "$RUNNER_TEMP/releases"
+            python3 scripts/release/release.py build --directory "$RUNNER_TEMP/release-build"
+            if [[ -d "$RUNNER_TEMP/release-build/bundles" ]]; then
+              echo 'has-plans=true' >> "$GITHUB_OUTPUT"
+            fi
           fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.bundles.outputs.has-plans == 'true'
+        with:
+          name: release-build
+          path: ${{ runner.temp }}/release-build
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: needs.build.outputs.has-plans == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: read
+      pull-requests: read
+    steps:
+      # Only trusted main release.py runs here. Never execute downloaded content,
+      # install dependencies, or build in the job that holds the write credential.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-build
+          path: ${{ runner.temp }}/release-build
+      - name: Revalidate plans and publish verified bundles (never build or deploy)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release/release.py publish --directory "$RUNNER_TEMP/release-build"

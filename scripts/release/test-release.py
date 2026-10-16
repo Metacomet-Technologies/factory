@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline release contracts; all publication requests go to FakeGitHub."""
 import copy
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -11,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 import release as r
@@ -229,8 +231,9 @@ class Releases(unittest.TestCase):
         api = FakeGitHub()
         api.eligible(SHA, 1, "minor")
         self.assertEqual(api.evidence(SHA, INVENTORY)["bump"], "minor")
-        for field, value in (("head_sha", "b" * 40), ("status", "in_progress"),
-                             ("conclusion", "cancelled"), ("event", "pull_request"), ("head_branch", "feature")):
+        for field, value in (("head_sha", "b" * 40), ("status", "unknown"),
+                             ("conclusion", "cancelled"), ("conclusion", "failure"),
+                             ("event", "pull_request"), ("head_branch", "feature"), ("path", "other.yml")):
             saved = api.runs[1][field]
             api.runs[1][field] = value
             with self.assertRaisesRegex(ValueError, "CI"):
@@ -243,7 +246,7 @@ class Releases(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "merged-PR"):
             api.evidence(SHA, INVENTORY)
 
-    def test_adjacent_merges_missed_trigger_and_failed_tail(self):
+    def history(self):
         root = self.directory / "repo"
         root.mkdir()
         run(root, "git", "init", "-q")
@@ -259,6 +262,113 @@ class Releases(unittest.TestCase):
         commit(root, "second merge")
         second = r.git(root, "rev-parse", "HEAD")
         run(root, "git", "update-ref", "refs/remotes/origin/main", second)
+        return root, inventory, first, second
+
+    def test_pending_ci_is_a_clean_wait(self):
+        root, inventory, first, second = self.history()
+        for reserved in (False, True):
+            api = FakeGitHub()
+            api.eligible(first, 1)
+            api.eligible(second, 2)
+            if reserved:
+                r.reserve(api, plan(first))
+            writes = api.writes
+            # A newer pending run must hide the older successful run.
+            api.runs[3] = {**api.runs[1], "id": 3, "conclusion": None}
+            for status in ("queued", "in_progress", "waiting", "requested", "pending"):
+                with self.subTest(reserved=reserved, status=status):
+                    api.runs[3]["status"] = status
+                    output = self.directory / f"wait-{reserved}-{status}"
+                    message = io.StringIO()
+                    with patch.object(r, "GitHub", return_value=api), redirect_stderr(message), \
+                            patch.object(r, "build_exact", side_effect=AssertionError("pending CI built")), \
+                            patch.object(sys, "argv", ["release.py", "build", "--root", str(root), "--directory", str(output)]):
+                        self.assertIsNone(r.main())  # Normal CLI return means exit 0.
+                    self.assertEqual(message.getvalue().strip(), f"waiting for CI on {first} run 3")
+                    self.assertEqual(json.loads((output / "plans.json").read_bytes()), [])
+                    self.assertFalse((output / "bundles").exists())
+                    self.assertEqual(api.writes, writes)
+            for conclusion in ("cancelled", "failure"):
+                api.runs[3].update(status="completed", conclusion=conclusion)
+                with self.assertRaisesRegex(ValueError, "inspect/rerun CI run 3"):
+                    list(r.planned(api, root, inventory))
+            api.runs[3].update(status="queued", event="pull_request")
+            with self.assertRaisesRegex(ValueError, "mismatched CI evidence"):
+                list(r.planned(api, root, inventory))
+            api.runs.clear()
+            with self.assertRaisesRegex(ValueError, "CI not found"):
+                list(r.planned(api, root, inventory))
+            self.assertEqual(api.writes, writes)
+
+    def test_publish_downloaded_never_builds_and_validates_before_writes(self):
+        root, inventory, first, second = self.history()
+        api = FakeGitHub()
+        api.eligible(first, 1)
+        api.eligible(second, 2, "minor")
+        handoff = self.directory / "handoff"
+        with patch.object(r, "build_exact", side_effect=lambda root, p, d: fixture_build(p, d, inventory)):
+            r.build_pending(api, root, inventory, handoff)
+        self.assertEqual(api.writes, 0)
+        plans_path = handoff / "plans.json"
+        plans = json.loads(plans_path.read_bytes())
+        self.assertEqual([(p["source_sha"], p["release_tag"]) for p in plans], [(first, "v0.2.1"), (second, "v0.3.0")])
+        argv = ["release.py", "publish", "--root", str(root), "--directory", str(handoff)]
+        original_run = subprocess.run
+
+        def only_git_reads(args, *positional, **kwargs):
+            self.assertEqual(args[0], "git", "publisher attempted a subprocess build")
+            return original_run(args, *positional, **kwargs)
+
+        with patch.object(r, "GitHub", return_value=api), patch.object(sys, "argv", argv), \
+                patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REF": "refs/heads/main"}), \
+                patch.object(r, "build_exact", side_effect=AssertionError("publisher invoked build_exact")), \
+                patch.object(subprocess, "run", side_effect=only_git_reads), redirect_stdout(io.StringIO()):
+            changed = copy.deepcopy(plans)
+            changed[1]["release_tag"] = "v9.0.0"
+            plans_path.write_bytes(r.canonical(changed))
+            with self.assertRaisesRegex(ValueError, "downloaded plans differ"):
+                r.main()
+            plans_path.write_bytes(r.canonical(plans))
+            self.assertEqual(api.writes, 0)
+            # Validate the entire batch before reserving even the first release.
+            bundle = handoff / "bundles/v0.3.0"
+            for name, error in (("manifest.json", "bundle plan mismatch"), ("meter-linux-x86_64", "checksum mismatch")):
+                path = bundle / name
+                original = path.read_bytes()
+                if name == "manifest.json":
+                    manifest = json.loads(original)
+                    manifest["evidence"]["ci_run"] += 1
+                    path.write_bytes(r.canonical(manifest))
+                else:
+                    path.write_bytes(original + b"tamper")
+                with self.assertRaisesRegex(ValueError, error):
+                    r.main()
+                self.assertEqual(api.writes, 0)
+                path.write_bytes(original)
+            api.prs[2]["labels"] = [{"name": "bump:major"}]
+            with self.assertRaisesRegex(ValueError, "downloaded plans differ"):
+                r.main()
+            api.prs[2]["labels"] = [{"name": "bump:minor"}]
+            # A rerun starting during the build is a wait, not a stale publication.
+            api.runs[1]["status"] = "queued"
+            with redirect_stderr(io.StringIO()) as message:
+                self.assertIsNone(r.main())
+            self.assertIn(f"waiting for CI on {first} run 1", message.getvalue())
+            self.assertEqual(api.writes, 0)
+            api.runs[1]["status"] = "completed"
+            api.crash_at, api.crash_after = 4, True
+            with self.assertRaises(OSError):
+                r.main()
+            api.crash_at = None
+            self.assertIsNone(r.main())
+            self.assertEqual([release["tag_name"] for release in api.releases], ["v0.2.1", "v0.3.0"])
+            self.assertEqual(len(api.uploaded), len(set(api.uploaded)))
+            for p in plans:
+                r.verify_bundle(handoff / "bundles" / p["release_tag"], inventory, p["source_sha"],
+                                r.release_for(api, p["release_tag"]))
+
+    def test_adjacent_merges_missed_trigger_and_failed_tail(self):
+        root, inventory, first, second = self.history()
         api = FakeGitHub()
         api.eligible(first, 1)
         api.eligible(second, 2, "minor")
@@ -401,7 +511,14 @@ def build_fixture(output):
     reservation["source_version"] = (ROOT / "VERSION").read_text().strip()
     reservation["release_tag"] = r.allocate([], reservation["source_version"], "patch")
     api = FakeGitHub()
-    r.publish_one(api, reservation, INVENTORY, output / "assets", lambda p, d: r.build_exact(ROOT, p, d))
+    # Synthetic approval evidence only; build the real current commit, then cross
+    # the same prebuilt-artifact boundary as the two workflow jobs.
+    with patch.object(r, "planned", side_effect=lambda *_: iter([reservation])):
+        r.build_pending(api, ROOT, INVENTORY, output / "handoff")
+        assert api.writes == 0
+        with patch.object(r, "build_exact", side_effect=AssertionError("publisher attempted a build")):
+            r.publish_downloaded(api, ROOT, INVENTORY, output / "handoff")
+    shutil.copytree(output / "handoff/bundles" / reservation["release_tag"], output / "assets")
     publication = r.release_for(api, reservation["release_tag"])
     (output / "publication.json").write_bytes(r.canonical(publication))
     manifest = r.verify_bundle(output / "assets", INVENTORY, reservation["source_sha"], publication)

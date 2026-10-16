@@ -214,6 +214,7 @@ class GitHub:
         self.tag_objects = {}
         self.release_ids = None
         self.anonymous = anonymous
+        self.waiting_for_ci = False
 
     def request(self, path, method="GET", data=None, binary=False, upload=None):
         endpoint = f"repos/{REPO}/{path}"
@@ -296,8 +297,13 @@ class GitHub:
         require(runs, f"{sha}: exact-SHA main CI not found; reconcile after CI completes")
         run = max(runs, key=lambda row: row["id"])
         require(run["head_sha"] == sha and run["event"] == "push" and run["head_branch"] == "main"
-                and run["path"] == ".github/workflows/ci.yml" and run["status"] == "completed"
-                and run["conclusion"] == "success", f"{sha}: exact-SHA main CI incomplete or check-failed; "
+                and run["path"] == ".github/workflows/ci.yml", f"{sha}: mismatched CI evidence for run {run['id']}")
+        if run["status"] in ("queued", "in_progress", "waiting", "requested", "pending"):
+            self.waiting_for_ci = True
+            print(f"waiting for CI on {sha} run {run['id']}", file=sys.stderr)
+            return None
+        require(run["status"] == "completed" and run["conclusion"] == "success",
+                f"{sha}: exact-SHA main CI incomplete or check-failed; "
                 f"Devon must inspect/rerun CI run {run['id']}, then reconcile (never skip this SHA)")
         jobs = self.pages(f"actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs", "jobs")
         for name in inventory["required_ci"]:
@@ -309,6 +315,7 @@ class GitHub:
 
 
 def planned(api, root, inventory):
+    api.waiting_for_ci = False
     inventory_check(inventory)
     history = git(root, "rev-list", "--first-parent", "--reverse", "origin/main").splitlines()
     baseline = inventory["activation_baseline"]
@@ -340,6 +347,8 @@ def planned(api, root, inventory):
             release = release_for(api, tag)
             if not release or release["draft"]:
                 evidence = api.evidence(sha, source_inventory)
+                if evidence is None:
+                    return
                 require(reservation["bump"] == evidence["bump"]
                         and reservation["pull_request"] == evidence["pull_request"], "reservation intent changed")
             else:
@@ -354,6 +363,8 @@ def planned(api, root, inventory):
             # and inspect every artifact and archive before accepting a release.
         else:
             evidence = api.evidence(sha, source_inventory)
+            if evidence is None:
+                return
             require(not any(later in by_sha for later in history[index + 1:]), "out-of-order reservation after missing SHA")
             tag = allocate(tags, floor, evidence["bump"])
             reservation = {"schema_version": SCHEMA, "repository": REPO, "source_sha": sha,
@@ -553,17 +564,60 @@ def build_exact(root, plan, output):
         subprocess.run(["git", "-C", str(checkout), "checkout", "--detach", plan["source_sha"]], check=True)
         plan_path = output.parent / "plan.json"
         plan_path.write_bytes(canonical(plan))
-        # Build scripts/dependencies cannot inherit the publication credential.
+        # The workflow's separate read-only job is the credential boundary.
+        # Environment filtering alone cannot isolate a write-enabled job's token.
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "RUSTUP_HOME", "CARGO_HOME")}
         subprocess.run(["bash", str(checkout / "scripts/release/build.sh"), plan["source_sha"],
                         str(plan_path), str(output.resolve())], cwd=checkout, env=env, check=True)
+        plan_path.unlink()
     finally:
         shutil.rmtree(checkout)
 
 
+def build_pending(api, root, inventory, directory):
+    """Read-only job: transfer plans and verified bundles, never reserve a tag."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=False)
+    plans = list(planned(api, root, inventory))
+    (directory / "plans.json").write_bytes(canonical(plans))
+    for plan in plans:
+        output = directory / "bundles" / plan["release_tag"]
+        output.mkdir(parents=True)
+        build_exact(root, plan, output)
+        source_inventory = json.loads(git(root, "show", f"{plan['source_sha']}:deploy/components.json"))
+        manifest = verify_bundle(output, source_inventory, plan["source_sha"])
+        require(manifest["evidence"] == plan, "build identity conflict")
+
+
+def publish_downloaded(api, root, inventory, directory):
+    """Write-enabled job: validate the entire handoff before any remote write."""
+    directory = Path(directory)
+    plans = json.loads((directory / "plans.json").read_bytes())
+    current = list(planned(api, root, inventory))
+    if api.waiting_for_ci and plans != current:
+        return  # CI restarted during the build; wait without reserving anything.
+    require(plans == current,
+            "downloaded plans differ from current reconciliation; rebuild before publishing")
+    inventories = []
+    for plan in plans:
+        source_inventory = json.loads(git(root, "show", f"{plan['source_sha']}:deploy/components.json"))
+        manifest = verify_bundle(directory / "bundles" / plan["release_tag"], source_inventory, plan["source_sha"])
+        require(manifest["evidence"] == plan, "downloaded bundle plan mismatch")
+        inventories.append(source_inventory)
+
+    def copy_verified(plan, output):
+        for name in ASSETS | {"manifest.json"}:
+            shutil.copyfile(directory / "bundles" / plan["release_tag"] / name, output / name)
+
+    for plan, source_inventory in zip(plans, inventories):
+        with tempfile.TemporaryDirectory() as output:
+            result = publish_one(api, plan, source_inventory, output, copy_verified)
+        print(plan["release_tag"], plan["source_sha"], result, flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("plan", "publish", "verify", "package"))
+    parser.add_argument("command", choices=("plan", "build", "publish", "verify", "package"))
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--inventory", type=Path)
     parser.add_argument("--directory", type=Path)
@@ -599,15 +653,14 @@ def main():
         print("complete: exact SHA, inventory and every digest verified")
     elif args.command == "plan":
         print(json.dumps(list(planned(api, args.root, inventory)), indent=2))
+    elif args.command == "build":
+        require(args.directory, "build requires a new output directory")
+        build_pending(api, args.root, inventory, args.directory)
     else:
         require(os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("GITHUB_REF") == "refs/heads/main",
                 "live publish is restricted to the approved main workflow; use the fake API for fixtures")
-        require(args.directory, "publish requires an output directory")
-        for plan in planned(api, args.root, inventory):
-            output = args.directory / plan["release_tag"]
-            source_inventory = json.loads(git(args.root, "show", f"{plan['source_sha']}:deploy/components.json"))
-            print(plan["release_tag"], plan["source_sha"], publish_one(api, plan, source_inventory, output,
-                  lambda p, out: build_exact(args.root, p, out)), flush=True)
+        require(args.directory, "publish requires a downloaded build directory")
+        publish_downloaded(api, args.root, inventory, args.directory)
 
 
 if __name__ == "__main__":
