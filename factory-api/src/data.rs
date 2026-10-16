@@ -34,11 +34,18 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
     }
     run(
         db,
-        &[Migration {
-            version: 1,
-            sql: include_str!("ups_schema.sql"),
-            checksum: 0xf7820cc3e88268c1,
-        }],
+        &[
+            Migration {
+                version: 1,
+                sql: include_str!("ups_schema.sql"),
+                checksum: 0xf7820cc3e88268c1,
+            },
+            Migration {
+                version: 2,
+                sql: include_str!("devices_schema.sql"),
+                checksum: 0xec390e5b72cf3828,
+            },
+        ],
         Some(LegacySchema {
             fingerprint: &schema_fingerprint(&legacy)?,
             version: 0,

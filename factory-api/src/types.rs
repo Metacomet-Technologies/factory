@@ -28,7 +28,7 @@ pub enum ServiceKind {
     Tcp,
     Systemd,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Service {
     pub name: String,
     pub kind: ServiceKind,
@@ -192,7 +192,9 @@ pub struct AgentsRefreshCooldown {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StreamEvent {
     /// Named SSE event: gpu.sample, ups.sample, ups.event, llm.request, fleet.change,
-    /// pricing.changed, or agents.usage. ups.sample data is UpsCurrent or null on failure.
+    /// pricing.changed, agents.usage, or devices.sample. ups.sample data is UpsCurrent or null
+    /// on failure. devices.sample data is a device view, or null when the collector fails.
+    /// History is not in the event.
     /// ups.event data is UpsEvent, sent once when an event opens and once when it closes.
     /// Zero-length self_test events send both an open frame and a closed frame.
     pub r#type: String,

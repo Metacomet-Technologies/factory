@@ -1,6 +1,8 @@
 pub mod alerts;
 mod api;
 pub mod data;
+pub mod devices;
+pub mod devices_history;
 pub mod fleet;
 mod kiosk;
 pub mod pool;
@@ -44,6 +46,8 @@ pub struct AppState {
     pub usage_trigger: PathBuf,
     /// MET-74 backup status file read by the alert engine.
     pub backup_status: PathBuf,
+    pub devices_root: PathBuf,
+    pub reboot_status: PathBuf,
     pub alerts: Arc<alerts::Alerting>,
     usage_refresh_lock: Arc<std::sync::Mutex<()>>,
     pub config: Arc<fleet::Config>,
@@ -63,6 +67,8 @@ pub struct AppState {
     gpu_latest: Arc<std::sync::Mutex<Option<(i64, f64)>>>,
     ups_latest: Arc<RwLock<alerts::UpsRead>>,
     ups_changed: Arc<tokio::sync::Notify>,
+    devices_latest: Arc<RwLock<Option<devices::DeviceView>>>,
+    devices_guard: Arc<AtomicBool>,
     meter_synced_at_ms: Arc<AtomicI64>,
     warnings: Arc<RwLock<BTreeMap<String, String>>>,
     events: broadcast::Sender<StreamEvent>,
@@ -102,6 +108,8 @@ impl AppState {
             usage_snapshot: "/var/lib/factory-usage/usage.json".into(),
             usage_trigger: "/var/lib/factory-usage-trigger/request".into(),
             backup_status: alerts::DEFAULT_BACKUP_STATUS.into(),
+            devices_root: PathBuf::from("/"),
+            reboot_status: devices::DEFAULT_REBOOT_STATUS.into(),
             alerts: Arc::new(alerts::Alerting::new(alerts::Config::default())),
             usage_refresh_lock: Default::default(),
             config: Arc::new(config),
@@ -126,6 +134,8 @@ impl AppState {
                 last_success_ms: now_ms(),
             })),
             ups_changed: Default::default(),
+            devices_latest: Default::default(),
+            devices_guard: Default::default(),
             meter_synced_at_ms: Arc::new(AtomicI64::new(now_ms())),
             warnings: Default::default(),
             events: broadcast::channel(1024).0,
@@ -515,6 +525,67 @@ impl AppState {
             warnings,
         }
     }
+    pub async fn devices_view(&self) -> devices::DeviceView {
+        let now = now_ms();
+        let stored = self.devices_latest.read().await.clone();
+        devices::freshen(&stored.unwrap_or_else(|| devices::unavailable(now)), now)
+    }
+    pub async fn collect_devices(&self, sampler: &mut devices::Sampler) {
+        if self.devices_guard.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let root = self.devices_root.clone();
+        let backup = self.backup_status.clone();
+        let reboot = self.reboot_status.clone();
+        let (gpu, _) = self.gpu_current().await;
+        let ups = self.ups_latest.read().await.current.clone();
+        let services = {
+            let fleet = self.fleet.read().await;
+            fleet
+                .nodes
+                .iter()
+                .find(|node| node.name == devices::DEVICE_ID)
+                .map(|node| node.services.clone())
+                .unwrap_or_default()
+        };
+        let clock = self.db.clock_synchronized.load(Ordering::Acquire);
+        let now = now_ms();
+        let mut owned = std::mem::take(sampler);
+        let joined = tokio::task::spawn_blocking(move || {
+            let inputs = devices::Inputs {
+                now_ms: now,
+                gpu,
+                ups,
+                services,
+                backup_path: backup,
+                reboot_path: reboot,
+                clock_synchronized: clock,
+            };
+            let view = devices::sample(&root, &mut owned, &inputs);
+            (view, owned)
+        })
+        .await;
+        self.devices_guard.store(false, Ordering::Release);
+        let (view, owned) = match joined {
+            Ok(pair) => pair,
+            Err(error) => {
+                self.emit("devices.sample", &None::<devices::DeviceView>);
+                self.warning("devices", Some(error.to_string())).await;
+                return;
+            }
+        };
+        *sampler = owned;
+        self.emit("devices.sample", &view);
+        *self.devices_latest.write().await = Some(view.clone());
+        let result = self
+            .db
+            .write(&self.query_scope, move |db| {
+                devices_history::record_view(db, &view)
+            })
+            .await;
+        self.warning("devices history", result.err().map(|e| e.to_string()))
+            .await;
+    }
     pub fn start_collectors(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = vec![self.start_usage_collector()];
         tasks.extend(self.start_alerts());
@@ -524,7 +595,7 @@ impl AppState {
             );
         }
         for kind in [
-            "meter", "fleet", "gpu", "ups", "pricing", "clock", "database",
+            "meter", "fleet", "gpu", "ups", "devices", "pricing", "clock", "database",
         ] {
             if kind == "pricing" && self.disable_pricing_collector {
                 continue;
@@ -534,7 +605,7 @@ impl AppState {
                 let mut timer = tokio::time::interval(Duration::from_secs(match kind {
                     // Retry promptly after clock synchronization; feed attempts stay daily.
                     "pricing" | "clock" => 2,
-                    "gpu" => 15,
+                    "gpu" | "devices" => 15,
                     "ups" => 10,
                     "database" => 300,
                     _ => 30,
@@ -543,6 +614,7 @@ impl AppState {
                 let mut last_pricing = None::<Instant>;
                 let mut last_optimize = Instant::now();
                 let mut ups_collector = None::<ups_history::Collector>;
+                let mut devices_sampler = devices::Sampler::default();
                 loop {
                     tokio::select! { biased;
                         _ = state.shutdown.cancelled() => break,
@@ -597,6 +669,7 @@ impl AppState {
                                 drop(latest);
                                 state.ups_changed.notify_one();
                             }
+                            "devices" => state.collect_devices(&mut devices_sampler).await,
                             "clock" => {
                                 state.check_clock().await;
                             }
@@ -613,6 +686,18 @@ impl AppState {
                                     .warning(
                                         "ups retention",
                                         retention.err().map(|e| e.to_string()),
+                                    )
+                                    .await;
+                                let device_retention = state
+                                    .db
+                                    .write(&state.query_scope, |db| {
+                                        devices_history::retain(db, now_ms())
+                                    })
+                                    .await;
+                                state
+                                    .warning(
+                                        "devices retention",
+                                        device_retention.err().map(|e| e.to_string()),
                                     )
                                     .await;
                                 let result = async {
