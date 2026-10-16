@@ -183,6 +183,9 @@ class Releases(unittest.TestCase):
                     with self.assertRaises(OSError):
                         r.publish_one(api, plan(), INVENTORY, output, fixture_build)
                     api.crash_at = None
+                    # Owner inspection confirms no release after a tag-only crash.
+                    if api.refs and not api.releases:
+                        api.create_reserved_releases.add("v0.2.1")
                     r.publish_one(api, plan(), INVENTORY, output, fixture_build)
                     writes = api.writes
                     self.assertEqual(r.publish_one(api, plan(), INVENTORY, output,
@@ -193,10 +196,193 @@ class Releases(unittest.TestCase):
                     self.assertEqual(len(api.uploaded), 7)
                     self.assertEqual(len(set(api.uploaded)), 7)
 
+    def test_creation_response_survives_invisible_release_collection(self):
+        api = FakeGitHub()
+        original = api.handle
+
+        def hidden(path, method, data, binary, upload):
+            if method == "GET" and urlsplit(path).path == "releases":
+                return []
+            return original(path, method, data, binary, upload)
+
+        with patch.object(api, "handle", side_effect=hidden):
+            self.assertEqual(r.publish_one(api, plan(), INVENTORY, self.directory, fixture_build), "complete")
+            # Looking for another tag must not discard the directly acknowledged ID.
+            self.assertIsNone(r.release_for(api, "v0.2.2"))
+            self.assertEqual(r.release_for(api, "v0.2.1")["id"], 1)
+        self.assertEqual(len(api.releases), 1)
+        self.assertEqual(len(api.uploaded), 7)
+
+    def test_invalid_creation_acknowledgement_never_uploads_or_publishes(self):
+        for change in ({"id": None}, {"id": True}, {"id": 0}, {"id": "1"},
+                       {"tag_name": "v0.2.2"}, {"draft": False}, {"draft": "true"}):
+            with self.subTest(change=change):
+                api = FakeGitHub()
+                original = api.request
+
+                def request(path, method="GET", *args, **kwargs):
+                    result = original(path, method, *args, **kwargs)
+                    return {**result, **change} if path == "releases" and method == "POST" else result
+
+                with patch.object(api, "request", side_effect=request), self.assertRaises(ValueError):
+                    r.publish_one(api, plan(), INVENTORY, self.directory, fixture_build)
+                self.assertEqual(len(api.releases), 1)
+                self.assertEqual(api.uploaded, [])
+                self.assertTrue(api.releases[0]["draft"])
+
+    def test_direct_read_identity_or_access_failure_stops_without_more_writes(self):
+        for change in ("denied", "id", "tag", "draft"):
+            with self.subTest(change=change):
+                api = FakeGitHub()
+                original = api.request
+
+                def request(path, method="GET", *args, **kwargs):
+                    if path == "releases/1" and method == "GET":
+                        if change == "denied":
+                            raise ValueError("direct read denied")
+                        result = original(path, method, *args, **kwargs)
+                        result.update({"id": 2} if change == "id" else
+                                      {"tag_name": "v0.2.2"} if change == "tag" else {"draft": False})
+                        return result
+                    return original(path, method, *args, **kwargs)
+
+                with patch.object(api, "request", side_effect=request), self.assertRaises(ValueError):
+                    r.publish_one(api, plan(), INVENTORY, self.directory, fixture_build)
+                self.assertEqual(api.uploaded, [])
+                self.assertEqual(api.writes, 3)
+
+    def test_recover_invisible_draft_by_id_and_retry_completed_release(self):
+        api = FakeGitHub()
+        r.reserve(api, plan())
+        api.request("releases", "POST", {"tag_name": "v0.2.1", "draft": True, "body": "incomplete", "prerelease": False})
+        original = api.handle
+
+        def hidden(path, method, data, binary, upload):
+            if method == "GET" and urlsplit(path).path == "releases":
+                return []
+            return original(path, method, data, binary, upload)
+
+        with patch.object(api, "handle", side_effect=hidden):
+            for completed in (False, True):
+                api.release_ids = None  # A fresh process cannot rely on its old cache.
+                writes = api.writes
+                r.resume_release(api, "v0.2.1=1")
+                self.assertEqual(api.writes, writes)
+                result = r.publish_one(api, plan(), INVENTORY, self.directory, fixture_build)
+                self.assertEqual(result, "already complete" if completed else "complete")
+                if completed:
+                    self.assertEqual(api.writes, writes)
+        self.assertEqual(len(api.releases), 1)
+        self.assertEqual(sum(path == "releases" and method == "POST" for path, method, _ in api.requests), 1)
+        self.assertFalse(any(method == "DELETE" for _, method, _ in api.requests))
+
+    def test_recovered_draft_preserves_conflicting_assets_and_missing_tag(self):
+        for change in ("bytes", "starter", "missing_tag", "wrong_plan"):
+            with self.subTest(change=change):
+                api = FakeGitHub()
+                r.reserve(api, plan())
+                api.request("releases", "POST", {"tag_name": "v0.2.1", "draft": True})
+                fixture_build(plan(), self.directory)
+                api.request("releases/1/assets?name=manifest.json", "POST",
+                            upload=self.directory / "manifest.json")
+                r.resume_release(api, "v0.2.1=1")
+                if change == "bytes":
+                    api.blobs[1] = b"conflict"
+                elif change == "starter":
+                    api.releases[0]["assets"][0]["state"] = "starter"
+                elif change == "missing_tag":
+                    api.refs.clear()
+                else:
+                    key = api.refs["refs/tags/v0.2.1"]["object"]["sha"]
+                    api.objects["d" * 40] = copy.deepcopy(api.objects[key])
+                    api.objects["d" * 40]["message"] = r.canonical({**plan(), "ci_attempt": 2}).decode()
+                    api.refs["refs/tags/v0.2.1"]["object"]["sha"] = "d" * 40
+                writes = api.writes
+                with self.assertRaises(ValueError):
+                    r.publish_one(api, plan(), INVENTORY, self.directory, fixture_build)
+                self.assertEqual(api.writes, writes)
+                self.assertTrue(api.releases[0]["draft"])
+                self.assertEqual(len(api.releases), 1)
+
+    def test_reserved_hidden_draft_needs_explicit_recovery_before_any_writes(self):
+        root, inventory, first, second = self.history()
+        api = FakeGitHub()
+        api.eligible(first, 1)
+        api.eligible(second, 2)
+        reservation = list(r.planned(api, root, inventory))[0]
+        r.reserve(api, reservation)
+        api.request("releases", "POST", {"tag_name": "v0.2.1", "draft": True})
+        original = api.handle
+
+        def hidden(path, method, data, binary, upload):
+            if method == "GET" and urlsplit(path).path == "releases":
+                return []
+            return original(path, method, data, binary, upload)
+
+        writes = api.writes
+        with patch.object(api, "handle", side_effect=hidden):
+            with self.assertRaisesRegex(ValueError, "explicit recovery"):
+                list(r.planned(api, root, inventory))
+            with self.assertRaisesRegex(ValueError, "explicit recovery"):
+                r.publish_one(api, reservation, inventory, self.directory,
+                              lambda *_: self.fail("built before recovery validation"))
+        self.assertEqual(api.writes, writes)
+        self.assertEqual(len(api.releases), 1)
+
+    def test_explicit_create_is_per_tag_and_does_not_bypass_read_failure(self):
+        root, inventory, first, second = self.history()
+        api = FakeGitHub()
+        api.eligible(first, 1)
+        api.eligible(second, 2)
+        reservations = list(r.planned(api, root, inventory))
+        for reservation in reservations:
+            r.reserve(api, reservation)
+        api.create_reserved_releases.add("v0.2.1")
+        writes = api.writes
+        with self.assertRaisesRegex(ValueError, "v0.2.2: reserved tag"):
+            list(r.planned(api, root, inventory))
+        api.create_reserved_releases.add("v0.2.2")
+        self.assertEqual(list(r.planned(api, root, inventory)), reservations)
+        self.assertEqual(api.writes, writes)
+        with patch.object(api, "pages", side_effect=ValueError("list access denied")), \
+                self.assertRaisesRegex(ValueError, "list access denied"):
+            r.publish_one(api, reservations[0], inventory, self.directory, fixture_build)
+        self.assertEqual(api.writes, writes)
+
+    def test_workflow_passes_same_recovery_hint_to_both_jobs(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertEqual(workflow.count("RESUME_RELEASE: ${{ inputs.resume_release }}"), 2)
+        self.assertEqual(workflow.count('resume_args+=(--resume-release "$RESUME_RELEASE")'), 2)
+        for command in ("build", "publish"):
+            self.assertIn('release.py ' + command + ' --directory "$RUNNER_TEMP/release-build" "${resume_args[@]}"', workflow)
+        self.assertIn('[[ -z "$REQUESTED_TAG" ]]', workflow)
+
+    def test_recovery_rejects_bad_identity_reservation_and_conflicting_list(self):
+        for identity in ("v0.2.1=0", "v0.2.1=-1", "v0.2.1=True", "v0.2.1=01",
+                         "v0.2.1=1/evil", "v00.2.1=1", "v0.2.1=1\n", "v0.2.2=1"):
+            with self.subTest(identity=identity):
+                api = FakeGitHub()
+                r.reserve(api, plan())
+                api.request("releases", "POST", {"tag_name": "v0.2.1", "draft": True})
+                writes = api.writes
+                with self.assertRaises(ValueError):
+                    r.resume_release(api, identity)
+                self.assertEqual(api.writes, writes)
+        api = FakeGitHub()
+        api.request("releases", "POST", {"tag_name": "v0.2.1", "draft": True})
+        with self.assertRaisesRegex(ValueError, "recovery tag reservation conflict"):
+            r.resume_release(api, "v0.2.1=1")
+        r.reserve(api, plan())
+        r.resume_release(api, "v0.2.1=1")
+        api.releases[0]["id"] = 2
+        with self.assertRaisesRegex(ValueError, "conflicting release identity"):
+            r.release_for(api, "v0.2.2")
+
     def test_existing_reservation_release_requests_omit_commit_target(self):
         api = FakeGitHub()
         reservation = plan()
         r.reserve(api, reservation)
+        api.create_reserved_releases.add("v0.2.1")
         refs = copy.deepcopy(api.refs)
         objects = copy.deepcopy(api.objects)
         api.requests.clear()
@@ -222,6 +408,7 @@ class Releases(unittest.TestCase):
                     api = FakeGitHub()
                     reservation = plan()
                     r.reserve(api, reservation)
+                    api.create_reserved_releases.add("v0.2.1")
                     writes_after_change = []
 
                     def change_tag():

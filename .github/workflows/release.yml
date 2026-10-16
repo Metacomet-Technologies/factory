@@ -14,6 +14,16 @@ on:
         required: false
         type: string
 
+      resume_release:
+        description: 'Optional existing release identity for recovery: vMAJOR.MINOR.PATCH=NUMERIC_ID'
+        required: false
+        type: string
+
+      create_reserved_releases:
+        description: 'Comma-separated reserved tags inspected by an owner and confirmed to have NO release (including hidden drafts)'
+        required: false
+        type: string
+
 permissions: {}
 
 # Events are hints, not a queue: every run reconciles first-parent history.
@@ -62,14 +72,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.tag }}
+          RESUME_RELEASE: ${{ inputs.resume_release }}
+          CREATE_RESERVED_RELEASES: ${{ inputs.create_reserved_releases }}
         run: |
+          resume_args=()
+          if [[ -n "$CREATE_RESERVED_RELEASES" ]]; then
+            [[ "$CREATE_RESERVED_RELEASES" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(,v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))*$ ]] || { echo 'Invalid reserved tags'; exit 1; }
+            IFS=',' read -ra create_tags <<< "$CREATE_RESERVED_RELEASES"
+            for tag in "${create_tags[@]}"; do resume_args+=(--create-reserved-release "$tag"); done
+          fi
+          if [[ -n "$RESUME_RELEASE" ]]; then
+            [[ -z "$REQUESTED_TAG" ]] || { echo 'Choose verification or recovery, not both'; exit 1; }
+            resume_args+=(--resume-release "$RESUME_RELEASE")
+          fi
           if [[ -n "$REQUESTED_TAG" ]]; then
+            [[ ${#resume_args[@]} -eq 0 ]] || { echo 'Choose verification or recovery, not both'; exit 1; }
             [[ "$REQUESTED_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo 'Invalid tag'; exit 1; }
             sha=$(git rev-parse --verify "refs/tags/$REQUESTED_TAG^{commit}") || { echo 'tag not found'; exit 1; }
             git show "$sha:deploy/components.json" > "$RUNNER_TEMP/verify-inventory.json"
             python3 scripts/release/release.py verify --tag "$REQUESTED_TAG" --sha "$sha" --inventory "$RUNNER_TEMP/verify-inventory.json" --directory "$RUNNER_TEMP/verified"
           else
-            python3 scripts/release/release.py build --directory "$RUNNER_TEMP/release-build"
+            python3 scripts/release/release.py build --directory "$RUNNER_TEMP/release-build" "${resume_args[@]}"
             if [[ -d "$RUNNER_TEMP/release-build/bundles" ]]; then
               echo 'has-plans=true' >> "$GITHUB_OUTPUT"
             fi
@@ -107,5 +130,17 @@ jobs:
       - name: Revalidate plans and publish verified bundles (never build or deploy)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/release/release.py publish --directory "$RUNNER_TEMP/release-build"
+          RESUME_RELEASE: ${{ inputs.resume_release }}
+          CREATE_RESERVED_RELEASES: ${{ inputs.create_reserved_releases }}
+        run: |
+          resume_args=()
+          if [[ -n "$CREATE_RESERVED_RELEASES" ]]; then
+            [[ "$CREATE_RESERVED_RELEASES" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(,v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))*$ ]] || { echo 'Invalid reserved tags'; exit 1; }
+            IFS=',' read -ra create_tags <<< "$CREATE_RESERVED_RELEASES"
+            for tag in "${create_tags[@]}"; do resume_args+=(--create-reserved-release "$tag"); done
+          fi
+          if [[ -n "$RESUME_RELEASE" ]]; then
+            resume_args+=(--resume-release "$RESUME_RELEASE")
+          fi
+          python3 scripts/release/release.py publish --directory "$RUNNER_TEMP/release-build" "${resume_args[@]}"
 
