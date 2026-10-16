@@ -485,7 +485,22 @@ export async function run(command: string, identifier: string | undefined, dryRu
   await syncPlaybook(qaContext);
   for (const issue of issues) {
     const repo = claimedRepo(issue);
-    if (repo?.flow !== 'simple' || !thread(issue) || issue.state.type === 'canceled') continue;
+    if (repo?.flow !== 'simple' || !thread(issue)) continue;
+    for (const attachment of issue.attachments) {
+      const pr = attachment.url.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)\/?$/);
+      if (!pr || pr[1].toLowerCase() !== repo.slug.toLowerCase() || attachment.metadata.status !== 'open'
+        || attachment.metadata.linkKind !== 'closes' || has(issue, `link-fix-failed pr:${pr[2]}`)) continue;
+      // Do not deduplicate successes: Linear can restore closes on a later push.
+      try {
+        await mutate(issue, 'mutation LinkContributes($issueId: String!, $url: String!) { attachmentLinkGitHubPR(issueId: $issueId, url: $url, linkKind: contributes) { success } }',
+          { issueId: issue.id, url: attachment.url });
+      } catch {
+        await comment(issue, `${devonMention}: PR #${pr[2]} link correction failed; the outcome may be unknown. Inspect the link and remove the failure marker to allow another attempt.\n\n${marker(`link-fix-failed pr:${pr[2]}`)}`);
+        continue;
+      }
+      await comment(issue, `Changed PR #${pr[2]} link to contributes; Done still waits for a successful apply.\n\n${marker(`link-contributes pr:${pr[2]}`)}`);
+    }
+    if (issue.state.type === 'canceled') continue;
     if (!has(issue, 'applied')) {
       const claim = issue.comments.find(c => commentMarkers(c.body).some(line => claimPattern.test(line)));
       const attachments = issue.attachments.filter(a => isMergedGitHubPR(a)
