@@ -511,6 +511,45 @@ def commit(root, message):
         "commit", "-qm", message)
 
 
+class RunnerProvisioning(unittest.TestCase):
+    def test_historical_sandbox_gets_system_bubblewrap_before_build(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        build, publish = workflow.split("\n  publish:\n", 1)
+        install = "sudo apt-get install --no-install-recommends -y bubblewrap"
+        probe = "env -i PATH=/usr/bin:/bin bwrap --unshare-net --ro-bind / / true"
+        self.assertIn("runs-on: ubuntu-22.04", build)
+        self.assertIn("sudo apt-get update", build)
+        self.assertIn(install, build)
+        self.assertIn(probe, build)
+        self.assertLess(build.index("sudo apt-get update"), build.index(install))
+        self.assertLess(build.index(install), build.index(probe))
+        self.assertLess(build.index(probe), build.index("python3 scripts/release/release.py build"))
+        self.assertNotIn("apt-get download bubblewrap", build)
+        self.assertNotIn("dpkg-deb", build)
+        self.assertIn("contents: read", build)
+        self.assertNotIn("contents: write", build)
+        self.assertIn("contents: write", publish)
+        self.assertNotIn("sudo", publish)
+        self.assertNotIn("apt-get", publish)
+        self.assertNotIn("bwrap", publish)
+
+    def test_sanitized_runtime_ignores_user_space_bubblewrap(self):
+        # Reproduce why an outer PATH/GITHUB_PATH entry cannot fix old checkouts.
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate = Path(tmp) / "bwrap"
+            candidate.write_text("#!/bin/sh\nexit 0\n")
+            candidate.chmod(0o755)
+            outer = {**os.environ, "PATH": f"{tmp}:/usr/bin:/bin"}
+            self.assertEqual(shutil.which("bwrap", path=outer["PATH"]), str(candidate))
+            result = subprocess.run(
+                ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "/usr/bin/python3", "-c",
+                 "import os, shutil; print(os.environ['PATH']); print(shutil.which('bwrap'))"],
+                env=outer, check=True, capture_output=True, text=True)
+            runtime_path, resolved = result.stdout.strip().splitlines()
+            self.assertEqual(runtime_path, "/usr/bin:/bin")
+            self.assertNotEqual(resolved, str(candidate))
+
+
 class BuildMetadata(unittest.TestCase):
     def test_normal_invalid_changed_unset_and_source_consistency(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -599,3 +638,4 @@ if __name__ == "__main__":
         build_fixture(Path(sys.argv[2]))
     else:
         unittest.main(verbosity=2)
+
