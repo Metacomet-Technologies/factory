@@ -2004,7 +2004,7 @@ test('simple open PR closes link changes once, then rechecks and repairs a relin
   assert.deepEqual(f.mutations[0], { operation: 'LinkContributes', issueId: i.id, url: i.attachments[0].url });
   assert.match(f.mutations[1].input.body, /\n<!-- factory-dispatch:link-contributes pr:90 -->$/);
   assert.equal(i.state.type, 'started');
-  assert.deepEqual(f.allCalls(), []);
+  assert.deepEqual(f.allCalls(), Array(2).fill(['threads', 'search', 'author:me archived:false', '--json', '--limit', '500']));
   i.attachments[0].metadata.linkKind = 'closes';
   assert.equal((await f.run()).code, 0);
   assert.equal(i.attachments[0].metadata.linkKind, 'contributes');
@@ -2042,7 +2042,7 @@ test('link mutation failure mentions Devon once, blocks retries until marker rem
   assert.match(f.mutations[1].input.body, /\n<!-- factory-dispatch:link-fix-failed pr:90 -->$/);
   assert.equal(i.attachments[0].metadata.linkKind, 'closes');
   assert.equal(i.state.type, 'started');
-  assert.deepEqual(f.allCalls(), []);
+  assert.deepEqual(f.allCalls(), Array(2).fill(['threads', 'search', 'author:me archived:false', '--json', '--limit', '500']));
   i.comments = i.comments.filter((c: any) => !c.body.includes('factory-dispatch:link-fix-failed'));
   assert.equal((await f.run()).code, 0);
   assert.deepEqual(f.mutations.map(m => m.operation), ['LinkContributes', 'Comment', 'LinkContributes', 'Comment']);
@@ -2071,7 +2071,7 @@ test('simple link dry-run previews correction without mutations or comments', as
   assert.match(result.stdout, /attachmentLinkGitHubPR/);
   assert.deepEqual(i, before);
   assert.deepEqual(f.mutations, []);
-  assert.deepEqual(f.allCalls(), []);
+  assert.deepEqual(f.allCalls(), [['threads', 'search', 'author:me archived:false', '--json', '--limit', '500']]);
 });
 
 test('simple merged apply success moves Done, then archives without QA/wrap-up; repeated poll is inert', { timeout: 10_000 }, async t => {
