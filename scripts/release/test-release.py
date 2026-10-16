@@ -64,9 +64,8 @@ class FakeGitHub(r.GitHub):
         self.crash_at = None
         self.crash_after = False
         self.uploaded = []
-        self.policy = {"enabled": True}
-        self.policy_checks = 0
-        self.disable_final = False
+        self.published_immutable = True
+        self.requests = []
 
     def eligible(self, sha, number, bump=None):
         self.prs[number] = {"number": number, "merged": True, "merged_at": "2026-10-16T00:00:00Z",
@@ -79,7 +78,9 @@ class FakeGitHub(r.GitHub):
                               "status": "completed", "conclusion": "success"}
                              for i, name in enumerate(INVENTORY["required_ci"])]
 
-    def request(self, path, method="GET", data=None, binary=False, upload=None):
+    def request(self, path, method="GET", data=None, binary=False, upload=None,
+                api_version=r.API_VERSION):
+        self.requests.append((path, method, api_version))
         if method != "GET":
             self.writes += 1
             if self.crash_at == self.writes and not self.crash_after:
@@ -87,17 +88,18 @@ class FakeGitHub(r.GitHub):
         result = self.handle(path, method, data, binary, upload)
         if method != "GET" and self.crash_at == self.writes and self.crash_after:
             raise OSError("simulated lost write acknowledgement")
-        return copy.deepcopy(result)
+        result = copy.deepcopy(result)
+        # Model the actual API break, not a version-insensitive idealized fake.
+        if api_version == "2026-03-10" and (
+                path.startswith("commits/") or path.startswith("pulls/")):
+            for pr in result if isinstance(result, list) else [result]:
+                pr.pop("merge_commit_sha", None)
+        return result
 
     def handle(self, path, method, data, binary, upload):
         url = urlsplit(path)
         parts = url.path.split("/")
         query = parse_qs(url.query)
-        if path == "immutable-releases":
-            self.policy_checks += 1
-            if self.policy is None:
-                raise ValueError("policy permission denied")
-            return {"enabled": False} if self.disable_final and self.policy_checks > 1 else self.policy
         if method == "POST" and path == "git/tags":
             key = f"{len(self.objects) + 1:040x}"
             self.objects[key] = {"message": data["message"], "object": {"sha": data["object"], "type": "commit"}}
@@ -131,7 +133,7 @@ class FakeGitHub(r.GitHub):
             release = self.releases[int(parts[1]) - 1]
             if method == "PATCH":
                 r.require(release["draft"], "cannot mutate published release")
-                release.update(data, immutable=True, published_at="2026-10-16T00:00:00Z")
+                release.update(data, immutable=self.published_immutable, published_at="2026-10-16T00:00:00Z")
                 return release
             if upload is not None:
                 name = query["name"][0]
@@ -209,23 +211,75 @@ class Releases(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "conflicting tags"):
             api.tags()
 
-    def test_policy_gate_and_nonpaginated_refs(self):
-        for policy in (None, {}, {"enabled": False}):
-            api = FakeGitHub()
-            api.policy = policy
-            with self.assertRaises(ValueError):
-                r.publish_one(api, plan(), INVENTORY, self.directory, fixture_build)
-            self.assertEqual(api.writes, 0)
-        api = FakeGitHub()
-        api.disable_final = True
-        with self.assertRaisesRegex(ValueError, "preserve draft"):
-            r.publish_one(api, plan(), INVENTORY, self.directory, fixture_build)
-        self.assertTrue(api.releases[0]["draft"])
+    def test_enforced_publication_without_policy_reads_and_nonpaginated_refs(self):
+        api = FakeGitHub()  # Any policy endpoint is an unexpected request.
+        self.assertEqual(r.publish_one(api, plan(), INVENTORY, self.directory, fixture_build), "complete")
+        self.assertTrue(api.releases[0]["immutable"])
+        self.assertFalse(any(path == "immutable-releases" for path, _, _ in api.requests))
         for i in range(100):
             tag = f"v1.0.{i}"
             api.refs["refs/tags/" + tag] = {"ref": "refs/tags/" + tag,
                 "object": {"sha": f"{i + 1000:040x}", "type": "commit"}}
         self.assertEqual(len(api.tags()), 101)
+
+    def test_disabled_enforcement_fails_after_publication_without_repair(self):
+        api = FakeGitHub()
+        api.published_immutable = False
+        with self.assertRaisesRegex(ValueError, "non-immutable publication"):
+            r.publish_one(api, plan(), INVENTORY, self.directory, fixture_build)
+        self.assertFalse(api.releases[0]["draft"])  # Cannot prevent or undo publication.
+        self.assertFalse(api.releases[0]["immutable"])
+        writes = api.writes
+        with self.assertRaisesRegex(ValueError, "non-immutable publication"):
+            r.publish_one(api, plan(), INVENTORY, self.directory, fixture_build)
+        self.assertEqual(api.writes, writes)
+        self.assertFalse(any(path == "immutable-releases" for path, _, _ in api.requests))
+
+    def test_pr_api_contract_preserves_exact_merge_guard(self):
+        api = FakeGitHub()
+        api.eligible(SHA, 1)
+        self.assertNotIn("merge_commit_sha", api.request("pulls/1"))
+        api.requests.clear()
+        self.assertEqual(api.evidence(SHA, INVENTORY)["pull_request"], 1)
+        for path, method, api_version in api.requests:
+            self.assertEqual(method, "GET")
+            self.assertEqual(api_version, "2022-11-28" if path.startswith(("commits/", "pulls/"))
+                             else "2026-03-10")
+        # Association alone is not approval; the detail must independently match.
+        original = api.request
+        for field, value in (("merge_commit_sha", "b" * 40), ("merge_commit_sha", None),
+                             ("merged", False), ("merged_at", None),
+                             ("base", {"ref": "main", "repo": {"full_name": "other/repo"}})):
+            def changed_detail(path, *args, **kwargs):
+                result = original(path, *args, **kwargs)
+                if path == "pulls/1":
+                    result[field] = value
+                return result
+            with self.subTest(field=field, value=value), patch.object(api, "request", side_effect=changed_detail):
+                with self.assertRaisesRegex(ValueError, "merged-PR"):
+                    api.evidence(SHA, INVENTORY)
+        api.eligible(SHA, 2)
+        with self.assertRaisesRegex(ValueError, "merged-PR"):
+            api.evidence(SHA, INVENTORY)
+        self.assertEqual(api.writes, 0)
+
+    def test_api_version_headers_and_pagination(self):
+        api = r.GitHub()
+        response = subprocess.CompletedProcess([], 0, stdout=b"[]", stderr=b"")
+        with patch.object(subprocess, "run", return_value=response) as request:
+            api.request("pulls/1", api_version=r.PR_API_VERSION)
+            self.assertIn("X-GitHub-Api-Version: 2022-11-28", request.call_args.args[0])
+            api.request("releases")
+            self.assertIn("X-GitHub-Api-Version: 2026-03-10", request.call_args.args[0])
+        with patch.object(api, "request", side_effect=[[{}] * 100, []]) as request:
+            self.assertEqual(len(api.pages(f"commits/{SHA}/pulls", api_version=r.PR_API_VERSION)), 100)
+            self.assertEqual(request.call_count, 2)
+            for call in request.call_args_list:
+                self.assertEqual(call.kwargs["api_version"], "2022-11-28")
+        with patch.object(r.urllib.request, "urlopen") as request:
+            request.return_value.__enter__.return_value.read.return_value = b"[]"
+            r.GitHub(anonymous=True).request("releases")
+            self.assertEqual(request.call_args.args[0].get_header("X-github-api-version"), "2026-03-10")
 
     def test_exact_merge_and_ci_evidence(self):
         api = FakeGitHub()

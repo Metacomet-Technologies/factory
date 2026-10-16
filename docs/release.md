@@ -6,21 +6,19 @@ MET-158 must independently verify a release before proposing any installation.
 The enabled auto-deploy allowlist is empty. Shipping an installer is not
 authorization to run it.
 
-## Activation is blocked pending the policy-read decision
+## Immutability relies on organization/repository enforcement
 
-The repository reported immutable releases enabled and owner-enforced during
-read-only implementation inspection. The publisher nevertheless checks the live
-`GET /repos/Metacomet-Technologies/factory/immutable-releases` setting before its
-first write and again before publication. Unknown, disabled or unreadable policy
-fails closed. It also requires `immutable: true` after publication.
+Devon approved relying on the organization and repository immutable-release
+settings. The publisher does not query policy before reservation or publication;
+no Administration:read credential or additional GitHub App is required. Owners
+must keep enforcement enabled. This contract cannot prevent publication if
+someone disables enforcement beforehand.
 
-GitHub documents Administration:read for this preflight, which standard Actions
-`GITHUB_TOKEN` cannot request. No new credential, permission grant or bypass is
-included. **Do not consider the live publisher activated or the canary complete
-until Devon resolves this gate.** Devon can review an explicit reliance on the
-existing owner-enforced policy or a separately approved verification arrangement;
-neither is silently substituted here. Even an authorized preflight cannot make
-the policy read atomic with publication. Owner policy must remain enabled.
+The publisher still requires `immutable: true` on the published release and
+validates its complete receipt, assets and tag. A missing or false immutable flag
+fails verification after publication; it cannot undo that publication. Preserve
+remote state and investigate rather than deleting, replacing or retagging it.
+This policy decision does not itself prove the live canary succeeded.
 
 ## Source version and release identity are different
 
@@ -45,8 +43,11 @@ first exists are preactivation and ineligible; removing it afterward fails.
 Every later first-parent commit needs one verified merged PR whose exact merge
 SHA and base repository/main match. Rebase intermediates without their own
 verifiable merge identity stop reconciliation; never infer approval from ancestry
-alone. Bump intent comes only from merged PR labels: `bump:minor`, `bump:major`,
-or optional `bump:patch`; no label means patch. Multiple/unknown bump labels fail.
+alone. Both PR association and detail reads use REST API `2022-11-28`,
+which retains `merge_commit_sha`; other requests use `2026-03-10`. Missing or
+mismatched merge evidence still fails closed. Bump intent comes only from merged
+PR labels: `bump:minor`, `bump:major`, or optional `bump:patch`; no label means
+patch. Multiple/unknown bump labels fail.
 
 Allocate above the greatest valid existing vMAJOR.MINOR.PATCH tag and source
 VERSION floor. Non-v tags are unrelated; malformed v tags fail. An annotated tag
@@ -109,8 +110,8 @@ contents:read, actions:read and pull-requests:read. The dependent publication jo
 has contents:write, actions:read and pull-requests:read, installs no tools, and
 executes no repository code except trusted main `release.py`. Checkout and
 artifact actions are SHA-pinned. Downloaded bundles remain data, outside the
-trusted checkout. The immutable-policy checks still run before writes and again
-before publication; job separation does not resolve the policy-read gate.
+trusted checkout. Publication relies on organization/repository immutability
+enforcement and verifies `immutable: true` afterward.
 
 The existing synthetic sandbox validates real meter/API health. Kiosk emitted JS
 must contain the allocated identity; its generated receipt is included in the
@@ -158,18 +159,34 @@ override; override tests use an isolated generated Cargo/TypeScript fixture.
 
 ## Operator handoff from Mac
 
-No host installer or service restart applies to the publisher. Deployment means
-Devon's protected PR merge and separately approved workflow activation. After the
-policy gate is resolved, Devon can request reconciliation from Mac:
+No host installer or service restart applies to the publisher. Merging this fix
+into main activates automatic release reconciliation and publication:
+`.github/workflows/release.yml` is already active on every push to main and
+each main CI completion. There is no separate approval
+step after merge. Devon must explicitly approve the merge as activation of live
+publication, including pending eligible history, before it proceeds. Publication
+still requires successful exact-SHA main CI, a verified build and all existing
+publication checks; a merge does not guarantee those checks succeed. It does not
+authorize deployment.
+
+Merging PR #85 starts reconciliation immediately for all eligible first-parent
+SHAs after the activation baseline:
+first `5c17159bbd397c669ccce425511398ad1e760c51`, then the PR #85 merge commit
+once its exact-SHA CI succeeds. This reconciliation publishes live immutable
+releases with no further approval step. **The merge is the activation and must
+be Devon's own action.**
+
+Manual reconciliation is optional recovery, not an activation or approval gate.
+After that approval and merge, Devon can request a manual reconcile/retry from Mac:
 
 ```sh
-gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-157-publish-immutable-release-assets && gh workflow run release.yml --repo Metacomet-Technologies/factory --ref main'"
+gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory && gh workflow run release.yml --repo Metacomet-Technologies/factory --ref main'"
 ```
 
 Emergency rollback of publisher activation disables future workflow starts:
 
 ```sh
-gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-157-publish-immutable-release-assets && gh workflow disable release.yml --repo Metacomet-Technologies/factory'"
+gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory && gh workflow disable release.yml --repo Metacomet-Technologies/factory'"
 ```
 
 Disabling does not cancel an in-flight publication. Inspect `gh run list --workflow
