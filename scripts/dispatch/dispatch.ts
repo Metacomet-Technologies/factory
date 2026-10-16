@@ -494,6 +494,13 @@ export async function run(command: string, identifier: string | undefined, dryRu
       try {
         await mutate(issue, 'mutation LinkContributes($issueId: String!, $url: String!) { attachmentLinkGitHubPR(issueId: $issueId, url: $url, linkKind: contributes) { success } }',
           { issueId: issue.id, url: attachment.url });
+        if (!dryRun) {
+          const attachments = await pages(`query IssuePage($id: String!, $after: String) { issue(id: $id) { attachments(first: 100, after: $after) { nodes { ${fields.attachments} } ${page} } } }`,
+            { id: issue.id }, data => data.issue.attachments);
+          if (!attachments.some(a => a.url === attachment.url && a.metadata?.linkKind === 'contributes')) {
+            throw new Error('Linear link correction not confirmed');
+          }
+        }
       } catch {
         await comment(issue, `${devonMention}: PR #${pr[2]} link correction failed; the outcome may be unknown. Inspect the link and remove the failure marker to allow another attempt.\n\n${marker(`link-fix-failed pr:${pr[2]}`)}`);
         continue;

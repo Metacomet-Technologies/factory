@@ -316,7 +316,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
         }
         else if (operation === 'LinkContributes') {
           assert.match(query, /attachmentLinkGitHubPR\(issueId: \$issueId, url: \$url, linkKind: contributes\) \{ success \}/);
-          i.attachments.find((a: any) => a.url === v.url).metadata.linkKind = 'contributes';
+          if (!options.noOpLinkMutation) i.attachments.find((a: any) => a.url === v.url).metadata.linkKind = 'contributes';
           data = { attachmentLinkGitHubPR: { success: true } };
         }
         else if (operation === 'SyncPlaybook') { data = { documentUpdate: { success: true } }; }
@@ -1940,6 +1940,19 @@ test('link mutation failure mentions Devon once, blocks retries until marker rem
   i.comments = i.comments.filter((c: any) => !c.body.includes('factory-dispatch:link-fix-failed'));
   assert.equal((await f.run()).code, 0);
   assert.deepEqual(f.mutations.map(m => m.operation), ['LinkContributes', 'Comment', 'LinkContributes', 'Comment']);
+});
+
+test('successful link mutation without a changed link mentions Devon once and blocks retries', { timeout: 10_000 }, async t => {
+  const i = accessMerged();
+  i.attachments[0].metadata = { status: 'open', linkKind: 'closes' };
+  const f = await fixture(t, [i], { noOpLinkMutation: true });
+  for (let n = 0; n < 2; n++) assert.equal((await f.run()).code, 0);
+  assert.deepEqual(f.mutations.map(m => m.operation), ['LinkContributes', 'Comment']);
+  assert.match(f.mutations[1].input.body, /https:\/\/linear.app\/metacomet\/profiles\/devon/);
+  assert.match(f.mutations[1].input.body, /\n<!-- factory-dispatch:link-fix-failed pr:90 -->$/);
+  assert.ok(!i.comments.some((c: any) => c.body.includes('factory-dispatch:link-contributes')));
+  assert.equal(i.attachments[0].metadata.linkKind, 'closes');
+  assert.equal(i.state.type, 'started');
 });
 
 test('simple link dry-run previews correction without mutations or comments', async t => {
