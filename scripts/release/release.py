@@ -507,10 +507,11 @@ def package(root, output, plan):
          'import {buildInfo} from "./kiosk/scripts/build-info.ts"; console.log(JSON.stringify(buildInfo()))'], cwd=root))
     # Inspect emitted JS, not just the metadata generator, before attaching its receipt.
     kiosk = identities["kiosk"]
-    js = b"\n".join(p.read_bytes() for p in (root / "kiosk/dist/assets").glob("*.js"))
-    for text in (f'version:"{kiosk["version"]}"', f'git_sha:"{sha}"', "git_dirty:!1",
-                 f'inputs_fingerprint:"{kiosk["inputs_fingerprint"]}"'):
-        require(text.encode() in js, f"emitted kiosk identity missing: {text}")
+    js = "\n".join(p.read_text() for p in (root / "kiosk/dist/assets").glob("*.js"))
+    for key in ("version", "git_sha", "inputs_fingerprint"):
+        require(re.search(rf"{key}:([`'\"]){re.escape(kiosk[key])}\1", js),
+                f"emitted kiosk identity missing: {key}")
+    require(re.search(r"git_dirty:(?:!1|false)", js), "emitted kiosk identity is not clean")
     for binary in ("meter", "factory-api", "pricing", "factory-ups-control"):
         (output / (binary + "-linux-x86_64")).write_bytes((root / "target/release" / binary).read_bytes())
     kiosk_files = {p.relative_to(root / "kiosk/dist").as_posix(): (p.read_bytes(), False)
