@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "defaults": {
+    "spec": "Human",
+    "dispatch": "Auto-pilot",
+    "merge": "Agent",
+    "deploy": "Agent",
+    "verify": "Agent",
+    "recovery": "Agent"
+  },
+  "repositories": {}
+}
