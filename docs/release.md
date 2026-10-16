@@ -160,25 +160,33 @@ override; override tests use an isolated generated Cargo/TypeScript fixture.
 ## Operator handoff from Mac
 
 No host installer or service restart applies to the publisher. Merging this fix
-into main activates automatic release reconciliation and publication: the workflow
-runs on main pushes and main CI completion events. There is no separate approval
+into main activates automatic release reconciliation and publication:
+`.github/workflows/release.yml` is already active on every push to main and
+each main CI completion. There is no separate approval
 step after merge. Devon must explicitly approve the merge as activation of live
 publication, including pending eligible history, before it proceeds. Publication
 still requires successful exact-SHA main CI, a verified build and all existing
 publication checks; a merge does not guarantee those checks succeed. It does not
 authorize deployment.
 
+Merging PR #85 starts reconciliation immediately for all eligible first-parent
+SHAs after the activation baseline:
+first `5c17159bbd397c669ccce425511398ad1e760c51`, then the PR #85 merge commit
+once its exact-SHA CI succeeds. This reconciliation publishes live immutable
+releases with no further approval step. **The merge is the activation and must
+be Devon's own action.**
+
 Manual reconciliation is optional recovery, not an activation or approval gate.
-After that approval and merge, Devon can request it from Mac:
+After that approval and merge, Devon can request a manual reconcile/retry from Mac:
 
 ```sh
-gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-157-publish-immutable-release-assets && gh workflow run release.yml --repo Metacomet-Technologies/factory --ref main'"
+gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory && gh workflow run release.yml --repo Metacomet-Technologies/factory --ref main'"
 ```
 
 Emergency rollback of publisher activation disables future workflow starts:
 
 ```sh
-gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-157-publish-immutable-release-assets && gh workflow disable release.yml --repo Metacomet-Technologies/factory'"
+gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory && gh workflow disable release.yml --repo Metacomet-Technologies/factory'"
 ```
 
 Disabling does not cancel an in-flight publication. Inspect `gh run list --workflow
