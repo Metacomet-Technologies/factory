@@ -586,19 +586,28 @@ export async function run(command: string, identifier: string | undefined, dryRu
     unknownCount = unknownIds.length;
     reason = 'open search reached limit';
     if (open.length < 500) {
-      reason = 'sweep state missing, unreadable or invalid';
-      const previous = JSON.parse(readFileSync(statePath, 'utf8'));
-      if (!Array.isArray(previous?.unknownIds) || !previous.unknownIds.every(id => typeof id === 'string' && /^T-[a-f0-9-]{36}$/.test(id))
-        || !Array.isArray(previous.issues) || !previous.issues.every(id => typeof id === 'string' && /^[A-Z][A-Z0-9]*-\d+$/.test(id))
-        || !Array.isArray(previous.candidates) || previous.candidates.some(candidate => typeof candidate?.issue !== 'string'
-          || !/^[A-Z][A-Z0-9]*-\d+$/.test(candidate.issue) || typeof candidate.id !== 'string'
-          || !/^T-[a-f0-9-]{36}$/.test(candidate.id))) {
-        throw new Error('Invalid sweep state');
+      reason = 'sweep state unreadable or invalid';
+      const currentKey = JSON.stringify({ unknownIds, issues: sweepIssues.map(issue => issue.identifier).sort() });
+      let previous;
+      try { previous = JSON.parse(readFileSync(statePath, 'utf8')); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        reason = 'sweep state missing';
+        sweepKey = currentKey;
       }
-      cachedCandidates = previous.candidates;
-      sweepKey = JSON.stringify({ unknownIds, issues: sweepIssues.map(issue => issue.identifier).sort() });
-      skipSweep = unknownIds.length === 0 || sweepKey === JSON.stringify({ unknownIds: previous.unknownIds, issues: previous.issues });
-      reason = unknownIds.length === 0 ? 'no unknown open threads' : skipSweep ? 'unchanged key' : 'changed key';
+      if (previous !== undefined) {
+        if (!Array.isArray(previous?.unknownIds) || !previous.unknownIds.every(id => typeof id === 'string' && /^T-[a-f0-9-]{36}$/.test(id))
+          || !Array.isArray(previous.issues) || !previous.issues.every(id => typeof id === 'string' && /^[A-Z][A-Z0-9]*-\d+$/.test(id))
+          || !Array.isArray(previous.candidates) || previous.candidates.some(candidate => typeof candidate?.issue !== 'string'
+            || !/^[A-Z][A-Z0-9]*-\d+$/.test(candidate.issue) || typeof candidate.id !== 'string'
+            || !/^T-[a-f0-9-]{36}$/.test(candidate.id))) {
+          throw new Error('Invalid sweep state');
+        }
+        cachedCandidates = previous.candidates;
+        sweepKey = currentKey;
+        skipSweep = unknownIds.length === 0 || sweepKey === JSON.stringify({ unknownIds: previous.unknownIds, issues: previous.issues });
+        reason = unknownIds.length === 0 ? 'no unknown open threads' : skipSweep ? 'unchanged key' : 'changed key';
+      }
     }
   } catch { /* Unreadable discovery or state must preserve the full sweep without a cache write. */ }
   log(skipSweep ? 'archive-sweep-skip' : 'archive-sweep', { reason, openCount, unknownCount, issueCount: sweepIssues.length });

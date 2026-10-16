@@ -905,7 +905,7 @@ test('runner cap parsing, precedence and idle logging', { timeout: 10_000 }, asy
     const result = await f.run(['poll'], environment);
     assert.equal(result.code, 0, result.stdout);
     assert.deepEqual(result.stdout.trim().split('\n').map(line => JSON.parse(line)), [{ decision: 'caps', caps },
-      { decision: 'archive-sweep', reason: 'sweep state missing, unreadable or invalid', openCount: 0, unknownCount: 0, issueCount: 0 }]);
+      { decision: 'archive-sweep', reason: 'sweep state missing', openCount: 0, unknownCount: 0, issueCount: 0 }]);
     assert.equal(f.calls().length, 0);
     assert.equal(f.mutations.length, 0);
   }
@@ -1816,13 +1816,16 @@ test('sweep skips known IDs from every standalone marker, but not quoted markers
 
 test('sweep stores a sorted key atomically, skips unchanged personal threads, and notices new IDs and closes', { timeout: 10_000 }, async t => {
   const closed = (n: number) => issue(n, { labels: [], state: { type: 'canceled' }, comments: [claimComment()] });
-  const f = await fixture(t, [closed(124), closed(123)], { sweep: { unknownIds: [], issues: [], candidates: [] },
+  const f = await fixture(t, [closed(124), closed(123)], {
     threads: [reviewId, threadId].map(id => ({ id, title: 'Personal work', archived: false })) });
-  const before = statSync(f.sweepPath).ino;
-  assert.equal((await f.run()).code, 0);
+  assert.equal(existsSync(join(f.directory, '.local')), false);
+  const bootstrap = await f.run();
+  assert.equal(bootstrap.code, 0, bootstrap.stdout);
+  assert.match(bootstrap.stdout, /"decision":"archive-sweep".*sweep state missing/);
   assert.deepEqual(JSON.parse(readFileSync(f.sweepPath, 'utf8')), { unknownIds: [threadId, reviewId], issues: ['MET-123', 'MET-124'], candidates: [] });
   assert.equal(statSync(f.sweepPath).mode & 0o777, 0o600);
-  assert.notEqual(statSync(f.sweepPath).ino, before);
+  assert.equal(statSync(join(f.directory, '.local/state/factory-dispatch')).mode & 0o777, 0o700);
+  const before = statSync(f.sweepPath).ino;
   assert.equal(f.allCalls().filter(args => args[2] === 'label:factory author:me archived:false').length, 1);
   const count = f.allCalls().length;
   f.setThreads(f.threads().reverse());
@@ -1832,25 +1835,28 @@ test('sweep stores a sorted key atomically, skips unchanged personal threads, an
   f.setThreads([...f.threads(), { id: newId, title: 'Another personal thread', archived: false }]);
   assert.match((await f.run()).stdout, /"decision":"archive-sweep".*changed key/);
   assert.deepEqual(JSON.parse(readFileSync(f.sweepPath, 'utf8')).unknownIds, [threadId, reviewId, newId]);
+  assert.notEqual(statSync(f.sweepPath).ino, before);
   f.issues.push(closed(125));
   assert.match((await f.run()).stdout, /"decision":"archive-sweep".*"issueCount":3/);
   assert.deepEqual(JSON.parse(readFileSync(f.sweepPath, 'utf8')).issues, ['MET-123', 'MET-124', 'MET-125']);
 });
 
 test('sweep failures and unsafe discovery never store a key', { timeout: 20_000 }, async t => {
-  for (const scenario of ['label', 'open', 'limit', 'missing', 'invalid', 'unreadable']) {
+  for (const scenario of ['label', 'open', 'limit', 'invalid', 'schema-invalid', 'unreadable', 'missing-label', 'missing-open', 'missing-limit']) {
+    const missing = scenario.startsWith('missing-');
+    const failure = scenario.replace('missing-', '');
     const f = await fixture(t, [issue(123, { labels: [], state: { type: 'canceled' }, comments: [claimComment()] })], {
-      sweep: scenario === 'missing' ? undefined : scenario === 'invalid' ? '{bad' : { unknownIds: [], issues: [], candidates: [] },
-      threads: Array.from({ length: scenario === 'limit' ? 500 : 1 }, (_, n) => ({
+      sweep: missing ? undefined : scenario === 'invalid' ? '{bad' : scenario === 'schema-invalid' ? {} : { unknownIds: [], issues: [], candidates: [] },
+      threads: Array.from({ length: failure === 'limit' ? 500 : 1 }, (_, n) => ({
         id: `T-22345678-89ab-4cde-8fab-${String(n).padStart(12, '0')}`, title: 'Personal work', archived: false })),
     });
     if (scenario === 'unreadable') { rmSync(f.sweepPath); mkdirSync(f.sweepPath); }
     const before = existsSync(f.sweepPath) && scenario !== 'unreadable' ? readFileSync(f.sweepPath, 'utf8') : null;
-    const result = await f.run(['poll'], scenario === 'label' ? { FAKE_BAD_LABEL: '{}' } : scenario === 'open' ? { FAKE_BAD_OPEN: 'not json' } : {});
+    const result = await f.run(['poll'], failure === 'label' ? { FAKE_BAD_LABEL: '{}' } : failure === 'open' ? { FAKE_BAD_OPEN: 'not json' } : {});
     assert.equal(result.code, 0, result.stdout);
     assert.match(result.stdout, /"decision":"archive-sweep"/);
     assert.equal(f.allCalls().filter(args => args[1] === 'search').length, 3);
-    if (scenario === 'missing') assert.equal(existsSync(f.sweepPath), false);
+    if (missing) assert.equal(existsSync(join(f.directory, '.local')), false);
     else if (scenario === 'unreadable') assert.ok(statSync(f.sweepPath).isDirectory());
     else assert.equal(readFileSync(f.sweepPath, 'utf8'), before);
   }
@@ -1859,10 +1865,9 @@ test('sweep failures and unsafe discovery never store a key', { timeout: 20_000 
 test('cached discoveries still archive after quiet time, including beyond the shared attempt cap', { timeout: 10_000 }, async t => {
   const threads = Array.from({ length: 7 }, (_, n) => ({ id: `T-22345678-89ab-4cde-8fab-${String(n).padStart(12, '0')}`,
     title: 'MET-123 probe: quiet', labels: ['factory'], updated: new Date(now).toISOString(), archived: false }));
-  const f = await fixture(t, [issue(123, { labels: [], state: { type: 'canceled' }, comments: [claimComment()] })], {
-    sweep: { unknownIds: [], issues: [], candidates: [] }, threads,
-  });
+  const f = await fixture(t, [issue(123, { labels: [], state: { type: 'canceled' }, comments: [claimComment()] })], { threads });
   assert.equal((await f.run()).code, 0);
+  assert.deepEqual(JSON.parse(readFileSync(f.sweepPath, 'utf8')).candidates, threads.map(({ id }) => ({ issue: 'MET-123', id })));
   assert.equal(f.threads().filter((entry: any) => entry.archived).length, 0);
   const count = f.allCalls().length;
   assert.match((await f.run(['poll'], { FAKE_NOW: String(now + 5 * 60_000) })).stdout, /archive-sweep-skip/);
