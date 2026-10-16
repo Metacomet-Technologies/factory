@@ -411,7 +411,8 @@ test('full fake-server poll: dispatch, prompt contract, Linear state, and manual
   assert.doesNotMatch(args[1], /GH_TOKEN/);
   assert.match(args[1], /Verify `pwd`, branch and `gh auth status` once; stop and report a mismatch or auth failure/);
   assert.doesNotMatch(args[1], /subscribe|report their names|READMEs first|Read docs\/PLAYBOOK/);
-  for (const text of ['The dispatcher already created branch met-123-build-the-useful-widget', 'Do not recreate it', 'Contributes MET-123', 'AGENTS.md defaults', 'factory-ssh', 'console-ssh']) assert.ok(args[1].includes(text), text);
+  for (const text of ['The dispatcher already created branch met-123-build-the-useful-widget', 'Do not recreate it', 'Contributes MET-123', 'AGENTS.md defaults', 'gpu-ssh', 'console-ssh']) assert.ok(args[1].includes(text), text);
+  assert.doesNotMatch(args[1], new RegExp('factory-' + 'ssh'));
   assert.doesNotMatch(args[1], /worktree add|--project/);
   const events = f.events();
   const claimed = events.findIndex(e => e[0] === 'comment' && e[1].includes('factory-dispatch:claim'));
@@ -733,6 +734,8 @@ test('wrap-up only after merged GitHub attachment, sent once to existing thread'
   assert.match(args[4].split('\n')[0], /Verify `pwd`, branch and `gh auth status` once/);
   assert.match(args[4], /Confirm the linked PR.*is merged/);
   assert.match(args[4], /Never deploy/);
+  assert.match(args[4], /gpu-ssh/);
+  assert.doesNotMatch(args[4], new RegExp('factory-' + 'ssh'));
   assert.match(args[4], /worktree remove \/home\/agent\/work\/factory-met-123-build-the-useful-widget/);
   for (const text of [
     'Use connected Linear get_issue/save_comment when needed',

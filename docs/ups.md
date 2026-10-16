@@ -96,8 +96,8 @@ Failures stop with a rollback command; rollback is never automatic.
 Optional verification from Mac (no power-loss test):
 
 ```sh
-factory-ssh 'upsc cyberpower@localhost ups.status'
-factory-ssh 'sudo journalctl -u nut-server -b --no-pager --grep="upsmon@127.0.0.1 logged into UPS"'
+gpu-ssh 'upsc cyberpower@localhost ups.status'
+gpu-ssh 'sudo journalctl -u nut-server -b --no-pager --grep="upsmon@127.0.0.1 logged into UPS"'
 ```
 
 ## Rollback (from Devon's Mac)
@@ -323,27 +323,27 @@ Stage non-secret artifacts using agent's filesystem access. Keep the stage paths
 in this Mac shell until verification/rollback finishes:
 
 ```sh
-GPU_STAGE=$(factory-ssh 'mktemp -d /var/tmp/factory-met-166.XXXXXX')
+GPU_STAGE=$(gpu-ssh 'mktemp -d /var/tmp/factory-met-166.XXXXXX')
 CONSOLE_STAGE=$(console-ssh 'mktemp -d /var/tmp/factory-met-166.XXXXXX')
-factory-ssh "set -o pipefail; sudo -u agent tar -C /home/agent/work/factory -cf - deploy/ups deploy/backup target/release/factory-ups-control | tar --no-same-owner -xf - -C '$GPU_STAGE'"
+gpu-ssh "set -o pipefail; sudo -u agent tar -C /home/agent/work/factory -cf - deploy/ups deploy/backup target/release/factory-ups-control | tar --no-same-owner -xf - -C '$GPU_STAGE'"
 console-ssh "set -o pipefail; sudo -u agent tar -C /home/agent/work/factory -cf - deploy/backup | tar --no-same-owner -xf - -C '$CONSOLE_STAGE'"
 
 # 1. Review masked NUT dry-run, then install both users/credential and shutdown mode.
-factory-ssh "sudo bash '$GPU_STAGE/deploy/ups/install-nut.sh' --dry-run"
-factory-ssh "sudo bash '$GPU_STAGE/deploy/ups/install-nut.sh'"
+gpu-ssh "sudo bash '$GPU_STAGE/deploy/ups/install-nut.sh' --dry-run"
+gpu-ssh "sudo bash '$GPU_STAGE/deploy/ups/install-nut.sh'"
 
 # 2. Install the prebuilt control service (never builds or runs a test).
-factory-ssh 'timedatectl show --property=Timezone --value'
-factory-ssh "sudo bash '$GPU_STAGE/deploy/ups/install-ups-control.sh' '$GPU_STAGE/target/release/factory-ups-control' 0 'DGarbs51@github,metacometdave@github' --dry-run"
-factory-ssh "sudo bash '$GPU_STAGE/deploy/ups/install-ups-control.sh' '$GPU_STAGE/target/release/factory-ups-control' 0 'DGarbs51@github,metacometdave@github'"
+gpu-ssh 'timedatectl show --property=Timezone --value'
+gpu-ssh "sudo bash '$GPU_STAGE/deploy/ups/install-ups-control.sh' '$GPU_STAGE/target/release/factory-ups-control' 0 'DGarbs51@github,metacometdave@github' --dry-run"
+gpu-ssh "sudo bash '$GPU_STAGE/deploy/ups/install-ups-control.sh' '$GPU_STAGE/target/release/factory-ups-control' 0 'DGarbs51@github,metacometdave@github'"
 
 # 3. Add only the control mount; preserve the existing dashboard root mount.
-factory-ssh 'sudo tailscale serve --bg --https=443 --set-path /control http://127.0.0.1:8090'
+gpu-ssh 'sudo tailscale serve --bg --https=443 --set-path /control http://127.0.0.1:8090'
 
 # 4. Update receiver first, then origin; verify all four archived databases.
 console-ssh "sudo bash '$CONSOLE_STAGE/deploy/backup/install-backup.sh'"
-factory-ssh "sudo bash '$GPU_STAGE/deploy/backup/install-backup.sh'"
-factory-ssh 'sudo /usr/local/lib/factory-backup/restore-check.sh all'
+gpu-ssh "sudo bash '$GPU_STAGE/deploy/backup/install-backup.sh'"
+gpu-ssh 'sudo /usr/local/lib/factory-backup/restore-check.sh all'
 console-ssh 'sudo /usr/local/lib/factory-backup/restore-check.sh all'
 ```
 
@@ -353,11 +353,11 @@ When restoring an earlier control version rather than removing it, restore its
 previous matching Serve mount after checks. No database is deleted:
 
 ```sh
-factory-ssh "sudo bash '$GPU_STAGE/deploy/backup/rollback-backup-config.sh' /var/backups/backup-config.GPU_SNAPSHOT"
+gpu-ssh "sudo bash '$GPU_STAGE/deploy/backup/rollback-backup-config.sh' /var/backups/backup-config.GPU_SNAPSHOT"
 console-ssh "sudo bash '$CONSOLE_STAGE/deploy/backup/rollback-backup-config.sh' /var/backups/backup-config.CONSOLE_SNAPSHOT"
-factory-ssh 'sudo tailscale serve --bg --https=443 --set-path /control off'
-factory-ssh "sudo bash '$GPU_STAGE/deploy/ups/rollback-ups-control.sh' /var/backups/ups-control.CONTROL_SNAPSHOT"
-factory-ssh "sudo bash '$GPU_STAGE/deploy/ups/rollback-nut.sh' /var/backups/nut-NUT_SNAPSHOT"
+gpu-ssh 'sudo tailscale serve --bg --https=443 --set-path /control off'
+gpu-ssh "sudo bash '$GPU_STAGE/deploy/ups/rollback-ups-control.sh' /var/backups/ups-control.CONTROL_SNAPSHOT"
+gpu-ssh "sudo bash '$GPU_STAGE/deploy/ups/rollback-nut.sh' /var/backups/nut-NUT_SNAPSHOT"
 ```
 
 ## Devon's manual checks remain necessary
@@ -368,10 +368,10 @@ factory-ssh "sudo bash '$GPU_STAGE/deploy/ups/rollback-nut.sh' /var/backups/nut-
 2. From tagged factory-console, require 403, even with a forged login header:
    `console-ssh 'curl -i https://factory-gpu.bearded-pompano.ts.net/control/v1/state'`.
 3. As agent on GPU, require 403:
-   `factory-ssh 'sudo -u agent curl -i -H "Tailscale-User-Login: DGarbs51@github" http://127.0.0.1:8090/v1/state'`.
+   `gpu-ssh 'sudo -u agent curl -i -H "Tailscale-User-Login: DGarbs51@github" http://127.0.0.1:8090/v1/state'`.
 4. From the phone, request/confirm `test.quick` with the returned phrase. Require
    tracking SUCCESS, audit `executed=true`, Slack notification, and inspect
-   `factory-ssh 'upsc cyberpower@localhost ups.test.result'` for the battery result.
+   `gpu-ssh 'upsc cyberpower@localhost ups.test.result'` for the battery result.
 5. Only while Devon is home, supervise `power.cycle`, confirm
    `power-cycle factory-gpu`, and record total downtime and whether outlets return
    without wall power ever leaving. Check host boot and both factory nodes afterward.

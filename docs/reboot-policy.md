@@ -76,7 +76,7 @@ Inspection shells and `ps` processes remain work, not idle.
 From the Mac, inspect and edit each node separately:
 
 ```sh
-factory-ssh "ps -u agent -ww -o pid=,ppid=,args="
+gpu-ssh "ps -u agent -ww -o pid=,ppid=,args="
 console-ssh "ps -u agent -ww -o pid=,ppid=,args="
 ssh -t dgarbs51@factory-gpu 'sudoedit /etc/factory-reboot/node.conf'
 ssh -t dgarbs51@factory-console 'sudoedit /etc/factory-reboot/node.conf'
@@ -177,7 +177,7 @@ After this PR is merged and both node checkouts have been updated, run **from
 the Mac**, GPU first. No build artifact is required for this host-only tooling.
 
 ```sh
-factory-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-gpu --mode observe"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-gpu --mode observe"
 console-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-console --mode observe"
 ```
 
@@ -196,7 +196,7 @@ configuration, including local edits, after snapshotting the old config. Mode
 still comes from `--mode` (observe by default), not the repository file:
 
 ```sh
-factory-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-gpu --mode observe --replace-config"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-gpu --mode observe --replace-config"
 console-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-console --mode observe --replace-config"
 ```
 
@@ -208,14 +208,14 @@ configuration.
 Read status and recent decisions from the Mac:
 
 ```sh
-factory-ssh "sudo cat /var/lib/factory-reboot/status.json; sudo journalctl -u factory-reboot.service -u factory-postboot.service -n 30 --no-pager"
+gpu-ssh "sudo cat /var/lib/factory-reboot/status.json; sudo journalctl -u factory-reboot.service -u factory-postboot.service -n 30 --no-pager"
 console-ssh "sudo cat /var/lib/factory-reboot/status.json; sudo journalctl -u factory-reboot.service -u factory-postboot.service -n 30 --no-pager"
 ```
 
 Only after reviewing observe results and both allowlists, switch modes:
 
 ```sh
-factory-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-gpu --mode enforce"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-gpu --mode enforce"
 console-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-console --mode enforce"
 ```
 
@@ -225,7 +225,7 @@ Rollback disables/stops and removes this policy, preserving status, journals and
 snapshots; it does not automatically restore old policy files or enable states:
 
 ```sh
-factory-ssh "sudo bash /home/agent/work/factory/deploy/reboot/rollback-reboot-policy.sh"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/reboot/rollback-reboot-policy.sh"
 console-ssh "sudo bash /home/agent/work/factory/deploy/reboot/rollback-reboot-policy.sh"
 ```
 

@@ -826,7 +826,7 @@ commands are part of the move.
 
 The move is deliberately split: the existing MET-73 node-to-node identity is
 `factory-backup`, without sudo. Giving it administrative SSH would expand
-privilege. Instead the administrator uses existing Mac `factory-ssh` and
+privilege. Instead the administrator uses existing Mac `gpu-ssh` and
 `console-ssh` helpers, authenticated over Tailscale SSH as their admin account.
 The Mac relays the private verified bundle; no credentials/keys are created,
 copied, or delegated. Helpers must support byte-clean stdin/stdout without a
@@ -839,11 +839,11 @@ Serve was configured with different flags, stop and adapt the off command to
 those original flags rather than using `serve reset`.
 
 ```sh
-factory-ssh 'sudo tailscale serve status --json'
+gpu-ssh 'sudo tailscale serve status --json'
 console-ssh 'sudo tailscale serve status --json'
 console-ssh "sudo -u console grep '^Exec=' /home/console/.config/autostart/console-kiosk.desktop"
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api --check-only'
-SHA=$(factory-ssh 'sudo -u agent git -C /home/agent/work/factory rev-parse --short=7 HEAD')
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api --check-only'
+SHA=$(gpu-ssh 'sudo -u agent git -C /home/agent/work/factory rev-parse --short=7 HEAD')
 
 # Downtime starts. This disables/stops API and backup timer/service, takes
 # fresh MET-74 snapshots, and leaves console DBs/binary/unit/static files intact.
@@ -856,21 +856,21 @@ umask 077
 BUNDLE=$(mktemp -t factory-met-114)
 console-ssh 'sudo tar -C /var/backups/factory-api-move/console/bundle -cf - requests.db.zst requests.db.zst.sha256 pricing.db.zst pricing.db.zst.sha256 counts.json' > "$BUNDLE"
 tar -tf "$BUNDLE"
-factory-ssh 'sudo install -d -m 0700 /var/backups/factory-api-move/incoming && sudo tar --no-same-owner -xf - -C /var/backups/factory-api-move/incoming requests.db.zst requests.db.zst.sha256 pricing.db.zst pricing.db.zst.sha256 counts.json' < "$BUNDLE"
-factory-ssh "sudo bash /home/agent/work/factory/deploy/move-factory-api-to-gpu.sh --dry-run /home/agent/work/factory/target/release/factory-api /home/agent/work/factory/kiosk/dist /var/backups/factory-api-move/incoming $SHA"
-factory-ssh "sudo bash /home/agent/work/factory/deploy/move-factory-api-to-gpu.sh /home/agent/work/factory/target/release/factory-api /home/agent/work/factory/kiosk/dist /var/backups/factory-api-move/incoming $SHA"
+gpu-ssh 'sudo install -d -m 0700 /var/backups/factory-api-move/incoming && sudo tar --no-same-owner -xf - -C /var/backups/factory-api-move/incoming requests.db.zst requests.db.zst.sha256 pricing.db.zst pricing.db.zst.sha256 counts.json' < "$BUNDLE"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/move-factory-api-to-gpu.sh --dry-run /home/agent/work/factory/target/release/factory-api /home/agent/work/factory/kiosk/dist /var/backups/factory-api-move/incoming $SHA"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/move-factory-api-to-gpu.sh /home/agent/work/factory/target/release/factory-api /home/agent/work/factory/kiosk/dist /var/backups/factory-api-move/incoming $SHA"
 
 # Prepare both backup nodes BEFORE the first push with the new layout.
 # GPU's original backup config was saved by the move; console's by preparation.
 console-ssh 'sudo bash /home/agent/work/factory/deploy/backup/install-backup.sh --prepare-only'
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/backup/install-backup.sh --prepare-only'
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/backup/install-backup.sh'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/backup/install-backup.sh --prepare-only'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/backup/install-backup.sh'
 console-ssh 'sudo bash /home/agent/work/factory/deploy/backup/install-backup.sh'
-factory-ssh 'sudo /usr/local/lib/factory-backup/restore-check.sh all'
+gpu-ssh 'sudo /usr/local/lib/factory-backup/restore-check.sh all'
 console-ssh 'sudo /usr/local/lib/factory-backup/restore-check.sh all'
 
 # Scripts print these Serve commands but never execute them.
-factory-ssh 'sudo tailscale serve --bg --https=443 http://127.0.0.1:8080'
+gpu-ssh 'sudo tailscale serve --bg --https=443 http://127.0.0.1:8080'
 curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/health
 curl -fsS https://factory-gpu.bearded-pompano.ts.net/version.json
 console-ssh 'sudo tailscale serve --bg --https=443 off'
@@ -906,11 +906,11 @@ After both backup timers resume, wait 30 seconds for Fleet's next collection,
 then verify from Mac:
 
 ```sh
-factory-ssh "sudo -u factory-api curl -fsS http://127.0.0.1:8080/v1/fleet"
+gpu-ssh "sudo -u factory-api curl -fsS http://127.0.0.1:8080/v1/fleet"
 curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/llm/usage
 curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/pricing
-factory-ssh "ss -H -ltn 'sport = :8080'"
-factory-ssh 'systemctl is-active factory-api.service factory-backup.timer'
+gpu-ssh "ss -H -ltn 'sport = :8080'"
+gpu-ssh 'systemctl is-active factory-api.service factory-backup.timer'
 console-ssh 'systemctl is-active factory-backup.timer'
 ```
 
@@ -935,12 +935,12 @@ replaced. Post-cutover pricing changes and API-only history are **not merged
 back**; preserve GPU files for reconciliation before accepting rollback.
 
 ```sh
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh --dry-run gpu'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh --dry-run gpu'
 console-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh --dry-run console'
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh gpu'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh gpu'
 console-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh console'
 console-ssh 'sudo tailscale serve --bg --https=443 http://127.0.0.1:8080'
-factory-ssh 'sudo tailscale serve --bg --https=443 off'
+gpu-ssh 'sudo tailscale serve --bg --https=443 off'
 console-ssh "sudo -u console sed -i '/^Exec=/s|--app=https://factory-gpu.bearded-pompano.ts.net|--app=http://localhost:8080|' /home/console/.config/autostart/console-kiosk.desktop"
 curl -fsS https://factory-console.bearded-pompano.ts.net/v1/health
 ```

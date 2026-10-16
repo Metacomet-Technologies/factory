@@ -61,7 +61,7 @@ fi
 cat <<'COMMANDS'
 Only after BOTH rollback steps succeed, run from Mac (Serve/kiosk commands are printed, never run here):
 console-ssh 'sudo tailscale serve --bg --https=443 http://127.0.0.1:8080'
-factory-ssh 'sudo tailscale serve --bg --https=443 off'
+gpu-ssh 'sudo tailscale serve --bg --https=443 off'
 console-ssh "sudo -u console sed -i '/^Exec=/s|--app=https://factory-gpu.bearded-pompano.ts.net|--app=http://localhost:8080|' /home/console/.config/autostart/console-kiosk.desktop"
 Relaunch Chrome in the console desktop session. GPU DBs and console originals remain in place; post-cutover GPU writes are not merged back.
 COMMANDS

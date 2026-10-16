@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 0077
 [[ $EUID -eq 0 ]] || { echo 'Run rollback-usage.sh as root on factory-gpu.' >&2; exit 1; }
-trap 'echo "Rollback stopped. Retry: factory-ssh '\''sudo bash /home/agent/work/factory/deploy/rollback-usage.sh'\''" >&2' ERR
+trap 'echo "Rollback stopped. Retry: gpu-ssh '\''sudo bash /home/agent/work/factory/deploy/rollback-usage.sh'\''" >&2' ERR
 [[ $# -eq 0 ]] || { echo 'Usage: rollback-usage.sh' >&2; exit 1; }
 [[ $(hostname) == factory-gpu ]]
 for command in systemctl install mktemp cp date rm dirname; do command -v "$command" >/dev/null; done

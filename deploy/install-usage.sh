@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 0077
 root=$(dirname "$(dirname "$(realpath "$0")")")
 snapshot=
-rollback_hint() { printf '%s\n' "Rollback: factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-usage.sh'" >&2; }
+rollback_hint() { printf '%s\n' "Rollback: gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-usage.sh'" >&2; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; rollback_hint; exit 1; }
 [[ $EUID -eq 0 ]] || fail 'Run install-usage.sh as root on factory-gpu.'
 trap 'printf "ERROR: usage install failed at line %s; snapshot: %s\n" "$LINENO" "${snapshot:-none}" >&2; rollback_hint' ERR
