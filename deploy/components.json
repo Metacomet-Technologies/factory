@@ -1,0 +1,144 @@
+{
+  "schema_version": 1,
+  "repository": "Metacomet-Technologies/factory",
+  "activation_baseline": "95a1d3beac77e9503cc0d11bff019eb76aa33b67",
+  "required_ci": ["rust", "kiosk", "scripts", "sandbox"],
+  "enabled_auto_deploy": [],
+  "target": "x86_64-unknown-linux-gnu",
+  "required_files": [
+    "deploy/components.json",
+    "deploy/meter.service", "deploy/factory-api.service",
+    "deploy/install-meter.sh", "deploy/rollback-meter.sh",
+    "deploy/install-factory-api.sh", "deploy/rollback-factory-api.sh",
+    "deploy/install-kiosk.sh", "deploy/rollback-kiosk.sh",
+    "deploy/factory-dispatch.service", "deploy/factory-dispatch.timer",
+    "deploy/install-dispatch.sh", "deploy/rollback-dispatch.sh",
+    "scripts/dispatch/index.js", "scripts/dispatch/dispatch.ts", "scripts/dispatch/qa.ts",
+    "scripts/dispatch/repos.ts", "scripts/dispatch/repos.json", "scripts/dispatch/qa-config.json",
+    "scripts/dispatch/review-prompt.md", "scripts/dispatch/.node-version",
+    "deploy/factory-usage.service", "deploy/factory-usage.timer", "deploy/factory-usage-refresh.path",
+    "deploy/install-usage.sh", "deploy/rollback-usage.sh",
+    "scripts/usage/index.js", "scripts/usage/collect.ts", "scripts/usage/parsers.ts", "scripts/usage/.node-version",
+    "deploy/alerts/factory-watchdog.service", "deploy/alerts/factory-watchdog.timer",
+    "deploy/alerts/factory-watchdog.py", "deploy/alerts/factory-api-alerts.conf",
+    "deploy/alerts/install-alerts.sh", "deploy/alerts/rollback-alerts.sh",
+    "deploy/backup/factory-backup.service", "deploy/backup/factory-backup.timer",
+    "deploy/backup/factory-backup.sh", "deploy/backup/backup-state.py", "deploy/backup/account.sh",
+    "deploy/backup/nodes.conf", "deploy/backup/install-backup.sh", "deploy/backup/rollback-backup-config.sh",
+    "deploy/reboot/factory-postboot.service", "deploy/reboot/factory-reboot.service", "deploy/reboot/factory-reboot.timer",
+    "deploy/reboot/postboot-check.sh", "deploy/reboot/reboot-check.sh", "deploy/reboot/reboot-policy.py",
+    "deploy/reboot/factory-console.conf", "deploy/reboot/factory-gpu.conf",
+    "deploy/reboot/install-reboot-policy.sh", "deploy/reboot/rollback-reboot-policy.sh",
+    "deploy/ups/factory-ups-control.service.in", "deploy/ups/factory-ups-selftest.service", "deploy/ups/factory-ups-selftest.timer",
+    "deploy/ups/control-state.sh", "deploy/ups/install-ups-control.sh", "deploy/ups/rollback-ups-control.sh",
+    "deploy/ups/install-nut.sh", "deploy/ups/rollback-nut.sh", "deploy/ups/render.py",
+    "deploy/ups/nut.conf.in", "deploy/ups/ups.conf.in", "deploy/ups/upsd.conf.in",
+    "deploy/ups/upsd.users.in", "deploy/ups/upsmon.conf.in"
+  ],
+  "components": [
+    {
+      "id": "meter", "artifact": "meter-linux-x86_64", "sources": ["meter", "shared", "factory-db"],
+      "nodes": ["factory-gpu"], "services": ["meter.service"],
+      "installer": "deploy/install-meter.sh", "health": "GET /meter/health; exact release version, SHA, clean identity and inputs fingerprint",
+      "rollback": "deploy/rollback-meter.sh with retained snapshot; never restore data automatically",
+      "eligibility": "human-only", "reversible_candidate": true,
+      "constraints": "Existing compatible database only. Migration and legacy rollback require separate human approval."
+    },
+    {
+      "id": "factory-api", "artifact": "factory-api-linux-x86_64", "sources": ["factory-api", "shared", "factory-db", "pricing"],
+      "nodes": ["factory-gpu"], "services": ["factory-api.service"],
+      "installer": "deploy/install-factory-api.sh", "health": "GET /v1/health; exact release version, SHA, clean identity and inputs fingerprint",
+      "rollback": "deploy/rollback-factory-api.sh with retained snapshot; preserve pricing and request databases",
+      "eligibility": "human-only", "reversible_candidate": true,
+      "constraints": "Existing compatible schema only. Account, credentials, Serve routing and migration changes require human approval."
+    },
+    {
+      "id": "kiosk", "artifact": "kiosk.tar.gz", "sources": ["kiosk", "factory-api/openapi.json"],
+      "nodes": ["factory-gpu"], "services": [],
+      "installer": "deploy/install-kiosk.sh", "health": "GET /version.json and rendered footer; factory-console is browser-only",
+      "rollback": "deploy/rollback-kiosk.sh with retained snapshot",
+      "eligibility": "human-only", "reversible_candidate": true,
+      "constraints": "Static assets only. Console autostart, browser lifecycle and physical device acceptance remain human-owned."
+    },
+    {
+      "id": "pricing", "artifact": "pricing-linux-x86_64", "sources": ["pricing", "factory-db"],
+      "nodes": ["factory-gpu"], "services": [],
+      "installer": null, "health": "No standalone health/version contract; manifest and checksum only",
+      "rollback": "No supported standalone installer or automatic database rollback",
+      "eligibility": "ineligible", "reversible_candidate": false,
+      "constraints": "CLI changes dated prices and schemas; human approval only."
+    },
+    {
+      "id": "ups-control", "artifact": "factory-ups-control-linux-x86_64", "sources": ["ups-control", "factory-db", "deploy/ups"],
+      "nodes": ["factory-gpu"], "services": ["factory-ups-control.service.in", "factory-ups-selftest.service", "factory-ups-selftest.timer"],
+      "installer": "deploy/ups/install-ups-control.sh", "health": "GET /control/v1/state through trusted Serve identity; no generic version interface",
+      "rollback": "deploy/ups/rollback-ups-control.sh restores binaries/units only; never replaces or removes audit.db",
+      "eligibility": "ineligible", "reversible_candidate": false,
+      "constraints": "Human-only power and authority control. ExecStartPre migrates audit schema. Quiesce both audit writers and verify SQLite backup before approved migration; schema compatibility gates rollback. Never package audit.db, NUT password or Slack token."
+    },
+    {
+      "id": "dispatcher", "artifact": "deployment.tar.gz", "sources": ["scripts/dispatch", "deploy/install-dispatch.sh", "deploy/rollback-dispatch.sh"],
+      "nodes": ["factory-gpu"], "services": ["factory-dispatch.service", "factory-dispatch.timer"],
+      "installer": "deploy/install-dispatch.sh", "health": "Read-only service/timer status and dispatcher logs",
+      "rollback": "deploy/rollback-dispatch.sh; preserve dispatcher state and claims",
+      "eligibility": "ineligible", "reversible_candidate": false,
+      "constraints": "Self-deploying authority changes; Devon owns merge and deployment. Never invoke poll as a release check."
+    },
+    {
+      "id": "usage", "artifact": "deployment.tar.gz", "sources": ["scripts/usage", "deploy/install-usage.sh", "deploy/rollback-usage.sh"],
+      "nodes": ["factory-gpu"], "services": ["factory-usage.service", "factory-usage.timer", "factory-usage-refresh.path"],
+      "installer": "deploy/install-usage.sh", "health": "Read-only snapshot freshness and service/timer/path status",
+      "rollback": "deploy/rollback-usage.sh; preserve usage snapshots and trigger directory",
+      "eligibility": "human-only", "reversible_candidate": true,
+      "constraints": "Credentials and local account access are not assets. Activation needs a bounded install contract separate from publication."
+    },
+    {
+      "id": "alerts", "artifact": "deployment.tar.gz", "sources": ["deploy/alerts"],
+      "nodes": ["factory-gpu"], "services": ["factory-watchdog.service", "factory-watchdog.timer"],
+      "installer": "deploy/alerts/install-alerts.sh", "health": "Read-only watchdog status; never send test Slack messages automatically",
+      "rollback": "deploy/alerts/rollback-alerts.sh with retained snapshot",
+      "eligibility": "ineligible", "reversible_candidate": false,
+      "constraints": "Credential and alert authority changes require human approval."
+    },
+    {
+      "id": "backup", "artifact": "deployment.tar.gz", "sources": ["deploy/backup"],
+      "nodes": ["factory-gpu", "factory-console"], "services": ["factory-backup.service", "factory-backup.timer"],
+      "installer": "deploy/backup/install-backup.sh", "health": "Read-only backup status; no production backup/restore during publication",
+      "rollback": "deploy/backup/rollback-backup-config.sh; never delete backups",
+      "eligibility": "ineligible", "reversible_candidate": false,
+      "constraints": "Backup credentials, retention, access and restore operations require human approval."
+    },
+    {
+      "id": "reboot", "artifact": "deployment.tar.gz", "sources": ["deploy/reboot"],
+      "nodes": ["factory-gpu", "factory-console"], "services": ["factory-postboot.service", "factory-reboot.service", "factory-reboot.timer"],
+      "installer": "deploy/reboot/install-reboot-policy.sh", "health": "Read-only timer and postboot status",
+      "rollback": "deploy/reboot/rollback-reboot-policy.sh",
+      "eligibility": "ineligible", "reversible_candidate": false,
+      "constraints": "Power/reboot policy is human-only; never run reboot checks as a release health probe."
+    },
+    {
+      "id": "nut", "artifact": "deployment.tar.gz", "sources": ["deploy/ups"],
+      "nodes": ["factory-gpu"], "services": ["nut-server.service", "nut-monitor.service"],
+      "installer": "deploy/ups/install-nut.sh", "health": "Human read-only NUT telemetry check",
+      "rollback": "deploy/ups/rollback-nut.sh; preserve credentials and approved power policy",
+      "eligibility": "ineligible", "reversible_candidate": false,
+      "constraints": "System NUT packages are not supplied. Templates are not credentials. Shutdown authority requires human approval."
+    },
+    {
+      "id": "migration-and-host-tools", "artifact": "deployment.tar.gz", "sources": ["deploy", "scripts/release", "scripts/build-fingerprint.sh", "scripts/bump-version.sh"],
+      "nodes": ["factory-gpu", "factory-console"], "services": [],
+      "installer": null, "health": "No automatic health contract for migration, relocation or host changes",
+      "rollback": "Procedure-specific human recovery; no automatic data restore",
+      "eligibility": "ineligible", "reversible_candidate": false,
+      "constraints": "Packaging a script is not authority to execute it. Unknown components fail closed."
+    },
+    {
+      "id": "external-host-services", "artifact": null, "sources": [],
+      "nodes": ["factory-gpu", "factory-console"], "services": ["ollama.service", "tailscaled.service", "sshd.service", "amp-runner"],
+      "installer": null, "health": "Outside this release contract",
+      "rollback": "Vendor and host-specific human procedure",
+      "eligibility": "ineligible", "reversible_candidate": false,
+      "constraints": "External binaries, credentials, runner permissions, firewall and console session are not shipped or managed."
+    }
+  ]
+}
