@@ -441,7 +441,10 @@ def publish_one(api, plan, inventory, directory, builder):
     manifest = verify_bundle(directory, inventory, sha)
     require(manifest["evidence"] == plan, "build identity conflict")
     if release is None:
-        api.request("releases", "POST", {"tag_name": tag, "target_commitish": sha,
+        # Require the exact annotated reservation before requesting its draft.
+        # GitHub documents target_commitish as unused for an existing tag.
+        require(api.tags().get(tag) == {"sha": sha, "reservation": plan}, "draft tag reservation conflict")
+        api.request("releases", "POST", {"tag_name": tag,
                                          "name": tag, "body": "incomplete", "draft": True, "prerelease": False})
         release = release_for(api, tag)
         require(release is not None, "draft acknowledgement missing; inspect before retry")
@@ -466,7 +469,7 @@ def publish_one(api, plan, inventory, directory, builder):
         require((Path(downloaded) / "manifest.json").read_bytes() == (directory / "manifest.json").read_bytes(),
                 "remote manifest changed")
     # Inspect tag again immediately before the one-way publication boundary.
-    reserve(api, plan)
+    require(api.tags().get(tag) == {"sha": sha, "reservation": plan}, "publication tag reservation conflict")
     api.request(f"releases/{release['id']}", "PATCH", {
         "draft": False, "make_latest": "false",
         "body": "factory-release-v1:" + digest((directory / "manifest.json").read_bytes())})

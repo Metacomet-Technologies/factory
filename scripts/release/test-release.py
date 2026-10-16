@@ -193,6 +193,80 @@ class Releases(unittest.TestCase):
                     self.assertEqual(len(api.uploaded), 7)
                     self.assertEqual(len(set(api.uploaded)), 7)
 
+    def test_existing_reservation_release_requests_omit_commit_target(self):
+        api = FakeGitHub()
+        reservation = plan()
+        r.reserve(api, reservation)
+        refs = copy.deepcopy(api.refs)
+        objects = copy.deepcopy(api.objects)
+        api.requests.clear()
+        with patch.object(api, "request", wraps=api.request) as request:
+            self.assertEqual(r.publish_one(api, reservation, INVENTORY, self.directory, fixture_build), "complete")
+        mutations = [call for call in request.call_args_list
+                     if len(call.args) > 1 and call.args[1] in ("POST", "PATCH")]
+        draft = [call.args[2] for call in mutations if call.args[:2] == ("releases", "POST")]
+        self.assertEqual(draft, [{"tag_name": "v0.2.1", "name": "v0.2.1", "body": "incomplete",
+                                 "draft": True, "prerelease": False}])
+        for call in mutations:
+            if len(call.args) > 2:
+                self.assertNotIn("target_commitish", call.args[2])
+        self.assertFalse(any(path.startswith("git/") and method != "GET"
+                             for path, method, _ in api.requests))
+        self.assertEqual(api.refs, refs)
+        self.assertEqual(api.objects, objects)
+
+    def test_changed_reservation_fails_closed_at_release_boundaries(self):
+        for boundary in ("draft", "publication"):
+            for change in ("missing", "lightweight", "wrong_sha", "wrong_plan", "missing_reservation"):
+                with self.subTest(boundary=boundary, change=change):
+                    api = FakeGitHub()
+                    reservation = plan()
+                    r.reserve(api, reservation)
+                    writes_after_change = []
+
+                    def change_tag():
+                        ref = "refs/tags/" + reservation["release_tag"]
+                        if change == "missing":
+                            del api.refs[ref]
+                        elif change == "lightweight":
+                            api.refs[ref]["object"] = {"sha": SHA, "type": "commit"}
+                        else:
+                            # A replacement immutable object must bypass the tag-object cache.
+                            obj = copy.deepcopy(api.objects[api.refs[ref]["object"]["sha"]])
+                            if change == "wrong_sha":
+                                obj["object"]["sha"] = "b" * 40
+                            elif change == "wrong_plan":
+                                obj["message"] = r.canonical({**reservation, "ci_attempt": 2}).decode()
+                            else:
+                                obj["message"] = "no reservation evidence"
+                            api.objects["c" * 40] = obj
+                            api.refs[ref]["object"]["sha"] = "c" * 40
+                        writes_after_change.append(api.writes)
+
+                    def builder(reservation, output):
+                        fixture_build(reservation, output)
+                        if boundary == "draft":
+                            change_tag()
+
+                    original = api.request
+
+                    def request(path, method="GET", *args, **kwargs):
+                        result = original(path, method, *args, **kwargs)
+                        if boundary == "publication" and method == "POST" and len(api.uploaded) == 7:
+                            change_tag()
+                        return result
+
+                    with patch.object(api, "request", side_effect=request):
+                        with self.assertRaisesRegex(ValueError, boundary + " tag reservation conflict"):
+                            r.publish_one(api, reservation, INVENTORY, self.directory, builder)
+                    self.assertEqual(len(writes_after_change), 1)
+                    self.assertEqual(api.writes, writes_after_change[0])
+                    self.assertFalse(any(method == "PATCH" for _, method, _ in api.requests))
+                    if boundary == "draft":
+                        self.assertEqual(api.releases, [])
+                    else:
+                        self.assertTrue(api.releases[0]["draft"])
+
     def test_conflicting_assets_and_tags_stop(self):
         api = FakeGitHub()
         api.crash_at, api.crash_after = 4, True
