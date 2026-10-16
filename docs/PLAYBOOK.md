@@ -161,6 +161,7 @@ factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
 
 **Process**
 - Tests that pass locally can hang on GitHub runners: every CI job sets `timeout-minutes`, and async tests wrap their waits in an explicit timeout so a hang fails fast with a message.
+- Linear sets the link type from the branch name (`met-<n>`), not from "Contributes" in the PR body. QA fixes it for factory PRs, and the dispatcher fixes it for simple-flow PRs.
 - `rg` is not installed on factory nodes. Use `grep -R` or `git grep`; the MET-165 wrap-up stopped on `rg: command not found` (2026-10-14).
 - Repo Actions options greyed out means the org setting is off; enable it at org → Settings → Actions first (the default token stays read-only).
 - When a Linear **Decided** section changes a rule, update `AGENTS.md`/docs in the next PR. Agents follow the repo file, not Linear.
