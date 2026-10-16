@@ -125,12 +125,23 @@ Without intent for every release-less reservation, planning stops before any
 build or publication, even when a prior draft's ID was supplied. This includes
 reservations left by a crash immediately after creating a tag reference.
 
-Both the read-only build job and the publish job independently read that ID using
-their existing workflow credentials, validate the exact tag and annotated
-reservation, and retain the ID across other collection reads. No new credential
-or permission is needed or requested by this mechanism. If either credential
-cannot read that release or its assets, recovery stops; owner-browser visibility
-alone is not proof that the workflow can access it.
+The read-only build job parses the tag/ID as an untrusted planning hint and checks
+the exact annotated reservation and CI evidence. It does not fetch the draft ID
+or its assets: GitHub may hide drafts from the contents:read credential. If the
+collection explicitly identifies that tag as non-draft, the build job may read and
+verify that public completed release, making a completed recovery retry a no-op.
+An omitted release is never assumed complete. If it completed but remains hidden
+from the read-only job, the publisher rejects the differing plans without writes;
+inspect visibility before retrying; completed-history verification needs a
+publicly readable release. The hint
+only permits planning that reserved tag; it is never permission to create a draft.
+The publish job must independently read the ID using its existing contents:write
+credential and validate the exact ID, tag and state before recomputing plans or
+performing any write. Verified IDs remain pinned across collection reads. The
+publish job then compares the complete recomputed plans with the downloaded plans
+and verifies every bundle before publication. No new credential or permission is
+needed or requested. If the publish credential cannot read the release or assets,
+recovery stops; owner-browser visibility alone does not prove workflow access.
 
 This hint selects an existing identity, not permission to change tags, replace
 assets or skip history. Full plan/CI, downloaded bundle, byte-for-byte existing
