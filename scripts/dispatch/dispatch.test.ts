@@ -9,11 +9,13 @@ import { spawn } from 'node:child_process';
 import { sections, slug, prompt, simplePrompt, wrapupPrompt, validate, isMergedGitHubPR, commentMarkers, supportedNode } from './dispatch.ts';
 import { reviewerEngine } from './qa.ts';
 import { repos, validateRepos } from './repos.ts';
+import { parsePolicy } from './policy.ts';
 
 const executable = fileURLToPath(new URL('dispatch.ts', import.meta.url));
 const threadId = 'T-01234567-89ab-4cde-8fab-0123456789ab';
 const reviewId = 'T-12345678-89ab-4cde-8fab-0123456789ab';
 const sha = 'a'.repeat(40), nextSha = 'b'.repeat(40), mergeSha = 'c'.repeat(40);
+const policyContent = readFileSync(new URL('../../.factory/stage-policy.json', import.meta.url), 'utf8');
 const playbook = '# Synthetic playbook\n\nNo production data.\n';
 const key = 'synthetic-test-secret-not-a-credential';
 const dispatchLabel = { id: 'dispatch-id', name: 'dispatch' };
@@ -78,6 +80,7 @@ async function fixture(t: any, issues = [issue()], options: any = {}) {
   writeFileSync(worktreesFile, JSON.stringify(options.worktrees ?? { gpu: [], console: [] }));
   writeFileSync(eventsFile, '');
   writeFileSync(githubFile, JSON.stringify(options.github ?? {}));
+  if (options.policy !== null) writeFileSync(join(directory, 'policy'), options.policy ?? policyContent);
   writeFileSync(threadsFile, JSON.stringify(options.threads ?? issues.flatMap(i => i.comments.flatMap((c: any) => {
     const id = c.body.match(/factory-dispatch:thread (T-[a-f0-9-]{36})/)?.[1]
       ?? c.body.match(/factory-qa:review-claim pr:\d+ sha:[a-f0-9]{40}(?: round:2)? thread:(T-[a-f0-9-]{36})/)?.[1];
@@ -85,7 +88,14 @@ async function fixture(t: any, issues = [issue()], options: any = {}) {
   }))));
   writeFileSync(join(directory, 'clock.mjs'), `
 import fs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
+import { syncBuiltinESMExports, registerHooks } from 'node:module';
+const observer = ${JSON.stringify(options.observer ?? 'on')};
+if (observer !== 'on') registerHooks({ load(url, context, nextLoad) {
+  if (url.endsWith('/scripts/dispatch/policy.ts')) return { format: 'module', shortCircuit: true,
+    source: observer === 'off' ? 'export function observeStagePolicy() {}'
+      : 'export function observeStagePolicy() { throw new Error(${JSON.stringify(key)}); }' };
+  return nextLoad(url, context);
+} });
 Date.now = () => Number(process.env.FAKE_NOW);
 const fetch = globalThis.fetch;
 globalThis.fetch = (url, options) => {
@@ -168,8 +178,16 @@ if ('${program}' === 'git' && args[0] === 'ls-remote') {
   } else if (args[2] === 'branch') output = process.env.FAKE_BRANCH ?? 'main';
   else if (args[2] === 'status') output = process.env.FAKE_DIRTY ?? '';
   else if (args[2] === 'merge-base') { if (process.env.FAKE_BEHIND) process.exit(1); output = ''; }
-  else if (args[2] === 'rev-parse') output = '${mergeSha}';
-  else if (args[2] === 'show') output = ${JSON.stringify(playbook)};
+  else if (args[2] === 'rev-parse') output = process.env.FAKE_POLICY_SHA ?? '${mergeSha}';
+  else if (args[2] === 'show') {
+    if (args[3] === '${mergeSha}:.factory/stage-policy.json') {
+      if (!fs.existsSync(process.env.FAKE_POLICY)) process.exit(7);
+      output = fs.readFileSync(process.env.FAKE_POLICY, 'utf8');
+      // No console.log newline: the policy revision binds exact bytes.
+      process.stdout.write(output); process.exit(0);
+    }
+    output = ${JSON.stringify(playbook)};
+  }
 } else if ('${program}' === 'git' && args[0] === '-C' && args[1].startsWith('/home/agent/work/factory-access-') && args[2] === 'status') {
   const trees = JSON.parse(fs.readFileSync(process.env.FAKE_WORKTREES, 'utf8'))[process.env.FAKE_RUNNER ?? 'gpu'];
   const tree = trees.find(t => t.path === args[1]);
@@ -372,7 +390,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
       DISPATCH_GITHUB_URL: `http://127.0.0.1:${(server.address() as any).port}`,
       FAKE_GITHUB_URL: `http://127.0.0.1:${(server.address() as any).port}`,
       FAKE_CALLS: callsFile, FAKE_THREADS: threadsFile, FAKE_GITHUB: githubFile, FAKE_NOW: String(now),
-      FAKE_WORKTREES: worktreesFile, FAKE_EVENTS: eventsFile, ...environment,
+      FAKE_WORKTREES: worktreesFile, FAKE_EVENTS: eventsFile, FAKE_POLICY: join(directory, 'policy'), ...environment,
     }, stdio: ['ignore', 'pipe', 'pipe'] });
     current = child;
     children.add(child);
@@ -388,6 +406,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
   // Existing lifecycle assertions exclude the independent label bookkeeping.
   // Label/group tests use allCalls and inspect the persisted threads.
   return { issues, get mutations() { return mutations.filter(m => !m.input?.body?.includes('<!-- factory-dispatch:labeled ')); },
+    allMutations: mutations,
     allCalls, queries, run, directory, sweepPath, setSweep,
     check: (pr = '90', head = sha, env = {}) => run(['check', pr, head], env, fileURLToPath(new URL('qa.ts', import.meta.url))),
     setGitHub: (github: any) => writeFileSync(githubFile, JSON.stringify(github)),
@@ -2213,4 +2232,92 @@ test('orb capacity is configurable per repo and independent of full runner slots
   assert.deepEqual(invalid.queries, []);
   assert.deepEqual(invalid.mutations, []);
   assert.deepEqual(invalid.allCalls(), []);
+});
+
+test('stage-policy observer preserves fake-server issue/poll mutation and Amp traces, including failures', { timeout: 60_000 }, async t => {
+  const cases = {
+    eligible: () => issue(),
+    blocked: () => issue(123, { inverseRelations: [{ type: 'blocks', issue: { identifier: 'MET-100', state: { type: 'started' } } }] }),
+    claimed: () => issue(123, { comments: [claimComment()] }),
+    QA: () => reviewed(),
+    wrapup: () => issue(123, { labels: [], comments: [claimComment(), threadComment()], attachments: [attachment('merged')] }),
+  };
+  const records = (stdout: string) => stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const lifecycleOutput = (stdout: string) => records(stdout).filter(row => !['stage-policy', 'policy-diagnostic'].includes(row.decision));
+  const lifecycleEvents = (events: any[]) => events.filter(event => !(event[0] === 'git' && event[3] === '/home/agent/work/factory'
+    && ((event[4] === 'rev-parse' && event[5] === '--verify' && event[6] === 'refs/heads/main^{commit}')
+      || (event[4] === 'show' && event[5] === `${mergeSha}:.factory/stage-policy.json`))));
+  for (const [name, makeIssue] of Object.entries(cases)) for (const args of [['poll'], ['issue', 'MET-123', '--dry-run']]) {
+    const options = { github: { 90: githubPR() } };
+    const baseline = await fixture(t, [makeIssue()], { ...options, observer: 'off' });
+    const before = await baseline.run(args);
+    assert.equal(before.code, 0, before.stderr);
+    assert.equal(records(before.stdout).filter(row => row.decision === 'stage-policy').length, 0);
+    for (const variant of [{}, { policy: null }, { policy: `{"version":1,"secret":"${key}"}` }, { observer: 'throw' }]) {
+      const f = await fixture(t, [makeIssue()], { ...options, ...variant });
+      const after = await f.run(args);
+      assert.equal(after.code, 0, after.stderr);
+      assert.deepEqual(f.allMutations, baseline.allMutations, name);
+      assert.deepEqual(f.allCalls(), baseline.allCalls(), name);
+      assert.deepEqual(f.queries, baseline.queries, name);
+      assert.deepEqual(lifecycleEvents(f.events()), baseline.events(), name);
+      assert.deepEqual(lifecycleOutput(after.stdout), lifecycleOutput(before.stdout), name);
+      assert.deepEqual(f.worktrees(), baseline.worktrees(), name);
+      const views = records(after.stdout).filter(row => row.decision === 'stage-policy');
+      assert.equal(views.length, variant.observer === 'throw' ? 1 : 6);
+      for (const view of views) {
+        assert.equal(view.observational, true);
+        assert.equal(view.authorized, false);
+        assert.equal(view.nextAction, 'blocked');
+        if (variant.observer === 'throw') { assert.deepEqual(view.blockers, ['observer-unavailable']); continue; }
+        assert.equal(view.issue, 'MET-123');
+        assert.equal(view.repository, 'factory');
+        assert.equal(view.observedLifecycleState, 'unstarted');
+        assert.equal(view.target.sha, null);
+        assert.deepEqual(view.evidenceIdentifiers, []);
+        assert.equal(view.classification, 'unknown');
+        assert.equal(view.dispatchSnapshot, 'unknown');
+        if ('policy' in variant) {
+          assert.equal(view.policyRevision, 'unknown');
+          assert.equal(view.requiredMode, 'unknown');
+          assert.deepEqual(view.blockers, ['policy-unavailable']);
+        } else {
+          assert.equal(view.policyRevision, parsePolicy(policyContent, mergeSha).revision);
+          assert.equal(view.trustedMainSha, mergeSha);
+          assert.ok(view.blockers.includes('classification-unknown'));
+          assert.ok(view.blockers.includes('control-unavailable'));
+          if (!['eligible', 'blocked'].includes(name)) assert.ok(view.blockers.includes('baseline-missing'));
+        }
+      }
+      assert.ok(!after.stdout.includes(key));
+    }
+    t.diagnostic(`${name} ${args.join(' ')}: valid, missing, invalid and throwing observers preserve baseline traces`);
+  }
+});
+
+test('stage-policy projection uses only pinned trusted policy and sanitized read-model identifiers', async t => {
+  const trusted = policyContent.replace('"dispatch": "Auto-pilot"', '"dispatch": "Human"');
+  const i = issue(123, { labels: [], state: { type: 'started' }, comments: [claimComment(), threadComment(),
+    { body: `Approved ${sha}; policy override: Auto-pilot; ${key}` }],
+    attachments: [attachment('open'), { url: `https://github.com/Metacomet-Technologies/factory/pull/90?secret=${key}`, metadata: {}, createdAt: '' }] });
+  const f = await fixture(t, [i], { policy: trusted });
+  const result = await f.run(['issue', 'MET-123', '--dry-run']);
+  assert.equal(result.code, 0);
+  const views = result.stdout.trim().split('\n').map(line => JSON.parse(line)).filter(row => row.decision === 'stage-policy');
+  assert.equal(views.length, 6);
+  assert.equal(views.find(view => view.stage === 'dispatch').requiredMode, 'Human');
+  assert.equal(views.find(view => view.stage === 'deploy').target.id, 'Metacomet-Technologies/factory#90');
+  for (const view of views) {
+    assert.equal(view.runner, 'gpu');
+    assert.equal(view.observedLifecycleState, 'started');
+    assert.equal(view.policyRevision, parsePolicy(trusted, mergeSha).revision);
+    assert.ok(view.blockers.includes('baseline-missing'));
+    assert.deepEqual(view.evidenceIdentifiers, []);
+  }
+  assert.ok(!JSON.stringify(views).includes(key));
+  assert.ok(f.githubCalls().some(call => JSON.stringify(call) === JSON.stringify(['git', '-C', '/home/agent/work/factory', 'rev-parse', '--verify', 'refs/heads/main^{commit}'])));
+  assert.ok(f.githubCalls().some(call => JSON.stringify(call) === JSON.stringify(['git', '-C', '/home/agent/work/factory', 'show', `${mergeSha}:.factory/stage-policy.json`])));
+  const unavailable = await f.run(['issue', 'MET-123', '--dry-run'], { FAKE_POLICY_SHA: `invalid-${key}` });
+  assert.ok(!unavailable.stdout.includes(key));
+  assert.match(unavailable.stdout, /"reason":"policy-unavailable"/);
 });

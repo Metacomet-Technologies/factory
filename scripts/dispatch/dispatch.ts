@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { reviewPRs, cleanupQAWorktrees, syncPlaybook, qaArchives, devonMention } from './qa.ts';
 import { repos, issueRepo } from './repos.ts';
+import { observeStagePolicy } from './policy.ts';
 
 export const mainCheckout = '/home/agent/work/factory';
 export function runnerCommand(runner: string, args: string[]) {
@@ -370,6 +371,23 @@ export async function run(command: string, identifier: string | undefined, dryRu
     issues.push(await hydrate((await query(`query OneIssue($id: String!) { issue(id: $id) { ${issueFields} } }`, { id: identifier })).issue));
   }
   if (identifier && !issues.some(issue => issue.identifier === identifier && issue.team.key === team)) throw new Error('Issue does not belong to DISPATCH_TEAM');
+  try {
+    observeStagePolicy(issues.map(issue => {
+      const match = thread(issue);
+      const claim = issue.comments.flatMap(c => commentMarkers(c.body)).map(line => line.match(claimPattern)).find(Boolean);
+      return { identifier: issue.identifier, repository: claimedRepo(issue)?.name,
+        runner: match?.[2] ?? claim?.[1], state: issue.state.type,
+        existing: !!(match || claim) || !['triage', 'backlog', 'unstarted'].includes(issue.state.type),
+        pullRequests: issue.attachments.map(attachment => attachment.url) };
+    }), log);
+  } catch {
+    // Observation must never become a lifecycle gate, even if its projection fails.
+    log('policy-diagnostic', { observational: true, reason: 'observer-unavailable' });
+    log('stage-policy', { observational: true, authorized: false, issue: 'unknown', repository: 'unknown', runner: 'unknown',
+      observedLifecycleState: 'unknown', stage: 'unknown', target: { id: null, sha: null }, evidenceIdentifiers: [],
+      classification: 'unknown', dispatchSnapshot: 'unknown', policyRevision: 'unknown', trustedMainSha: 'unknown',
+      requiredMode: 'unknown', mandatoryChecks: [], blockers: ['observer-unavailable'], nextAction: 'blocked' });
+  }
   const states = await pages(`query States($filter: WorkflowStateFilter!, $after: String) { workflowStates(filter: $filter, first: 100, after: $after) { nodes { id name type } ${page} } }`, { filter: { team: { key: { eq: team } }, name: { eq: 'In Progress' } } }, data => data.workflowStates);
   if (states.length !== 1 || states[0].type !== 'started') throw new Error('Team must have one In Progress state of type started');
 

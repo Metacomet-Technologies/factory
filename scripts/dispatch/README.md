@@ -12,6 +12,75 @@ node scripts/dispatch/dispatch.ts issue MET-123 --dry-run
 node --test scripts/dispatch
 ```
 
+## Observational stage policy (MET-194)
+
+Every issue/poll pass, including dry-run, emits six `stage-policy` JSON records
+per hydrated issue before lifecycle actions: `spec`, `dispatch`, `merge`,
+`deploy`, `verify`, and `recovery`. These are stage views, not inferred lifecycle
+transitions. **`observational: true` and `authorized: false` always apply.**
+`nextAction: blocked` describes missing policy prerequisites, not a new dispatcher
+gate. The existing dispatcher still performs exactly its existing actions.
+Even a fully evidenced synthetic decision says only `would-execute`; it cannot
+authorize an action, approve a PR, or report verified completion.
+
+Policy comes only from `.factory/stage-policy.json` at the pinned
+`refs/heads/main` commit in `/home/agent/work/factory`. The observer uses two
+read-only Git commands, never fetches, and never reads the working-tree policy,
+the proposed PR's tree, task text, or an environment policy override. This is
+the locally installed trusted main, not a claim that remote main is current.
+Each Git read has a five-second timeout and 64 KiB output limit. The revision is
+SHA-256 of the trusted-main SHA, a NUL byte, and the exact policy UTF-8 content;
+whitespace changes and unrelated main commits therefore change the revision.
+
+Version 1 requires exactly `version`, `defaults`, and `repositories`. Defaults
+must name all six stages: spec=`Human`, dispatch=`Auto-pilot`, and
+merge/deploy/verify/recovery=`Agent` initially. The committed `repositories` map
+is empty, so every known repo inherits. Explicit overrides use existing
+`repos.json` names, for example `"repositories": {"factory-access": {"merge": "Human"}}`.
+Unspecified stages inherit defaults; identities and routing still belong to
+`repos.ts`/`repos.json`. Unknown keys, stages, modes or repositories, duplicate
+keys (including escaped equivalents), and task-level overrides are rejected.
+
+The pure evaluator accepts trusted caller-supplied evidence and classification,
+bound to repository, stage, exact target ID/SHA, and policy revision. Security,
+authority, or irreversible actions require Human. Unknown classification blocks
+deployment (and conservatively blocks other stages too). Mandatory evidence
+checks cover specification; task validity/dependencies; CI/independent review;
+artifact/deployment plan; deployment receipt/independent verification; and
+reconciled outcome/safe recovery plan. Human adds `human-approval`, Agent adds
+`agent-review`. Missing, failed, mismatched or ambiguous evidence blocks.
+Executor and control availability are required; approval capability is required
+for Human/Agent and deployer capability for deploy.
+
+Supplied dispatch-snapshot fixtures retain the stricter stage mode, ordered
+Human > Agent > Auto-pilot. Tightening applies immediately; loosening cannot
+lower an existing snapshot. Missing legacy snapshots produce `baseline-missing`;
+only an explicitly new dispatch can evaluate without a baseline. No snapshots
+or authenticated approvals are captured or persisted in this slice.
+
+Output contains only allowlisted identifiers: issue, repository, recorded runner,
+observed Linear state type, stage, target, evidence identifiers, classification,
+snapshot status, trusted-main SHA/revision, required mode, mandatory checks,
+blocker codes, and next action. Unrecorded runners, exact target SHAs, evidence,
+classifications and snapshots remain unknown (`null` SHA, empty evidence list).
+PR identifiers are attachment observations only, not proof of a current head or
+merge. Done and QA/approval comments never establish verified completion or
+authenticated approval. Live views currently block because trusted evidence,
+classification and approval/control/deployer integrations are unavailable.
+
+Missing/invalid policy produces fixed `policy-diagnostic` / `policy-unavailable`
+output plus unavailable stage views. An observer exception produces a fixed
+`observer-unavailable` diagnostic/view; neither failure changes lifecycle actions.
+No database, endpoint, background process, control write, enforcement, live
+controls, or deployment is added. MET-160 retains these later capabilities;
+Devon owns protected/self-deploying review, merge, activation and verification.
+
+`node --test scripts/dispatch` discovers parser/evaluator tests and fake-server
+trace comparisons for eligible, blocked, claimed, QA and wrap-up issues. The
+comparisons run normal poll and dry-run issue with the observer off, valid,
+missing, malformed and throwing, checking identical mutations and Amp calls.
+No production issue/poll is used for development verification.
+
 `poll` handles team issues carrying `dispatch`, priority 1–4 then unprioritized
 (0), oldest first within a priority. `issue` ignores only the label requirement.
 Both also check QA, pending wrap-ups and archives. Blockers must be completed or canceled;
