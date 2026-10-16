@@ -49,14 +49,14 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ steps.versions.outputs.node }}
-      - name: Prepare user-space build tools
+      - name: Prepare build tools on the ephemeral runner
         run: |
           rustup toolchain install 1.99.0 --profile minimal
-          mkdir -p "$RUNNER_TEMP/bubblewrap"
-          cd "$RUNNER_TEMP/bubblewrap"
-          apt-get download bubblewrap
-          dpkg-deb -x ./*.deb unpacked
-          echo "$RUNNER_TEMP/bubblewrap/unpacked/usr/bin" >> "$GITHUB_PATH"
+          # Historical scripts/sandbox clears PATH to /usr/bin:/bin at runtime.
+          # Match sandbox CI provisioning; GITHUB_PATH alone cannot reach it.
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y bubblewrap
+          env -i PATH=/usr/bin:/bin bwrap --unshare-net --ro-bind / / true
       - name: Plan and build or verify (read-only)
         id: bundles
         env:
@@ -108,3 +108,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release/release.py publish --directory "$RUNNER_TEMP/release-build"
+
