@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 0077
 here=$(dirname "$(realpath "$0")")
 snapshot=/var/backups/factory-api-move/gpu
-hint() { echo "Rollback: factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh gpu'; then console-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh console'" >&2; }
+hint() { echo "Rollback: gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh gpu'; then console-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-move-factory-api.sh console'" >&2; }
 fail() { echo "ERROR: $*" >&2; hint; exit 1; }
 trap 'echo "GPU move failed at line $LINENO" >&2; hint' ERR
 dry=0
@@ -102,7 +102,7 @@ sudo -u factory-api curl -fsS --max-time 10 http://127.0.0.1:8080/version.json |
 touch "$snapshot/complete"
 cat <<'COMMANDS'
 API/static move verified locally. Complete backup configuration on both nodes BEFORE switching Serve. From Mac, after reviewing existing Serve status:
-factory-ssh 'sudo tailscale serve --bg --https=443 http://127.0.0.1:8080'
+gpu-ssh 'sudo tailscale serve --bg --https=443 http://127.0.0.1:8080'
 console-ssh 'sudo tailscale serve --bg --https=443 off'
 Then switch the kiosk Exec URL using the MET-114 move runbook. These commands were NOT run.
 COMMANDS

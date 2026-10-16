@@ -24,7 +24,7 @@ starts while that service is running. SSE still observes snapshots every 30 seco
 `factory-api:factory-api 0700` trigger directory before restarting its hardened unit;
 the usage installer preserves its inode and enables/verifies the path unit.
 After the clean merged build, install API, run
-`factory-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/install-usage.sh'`,
+`gpu-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/install-usage.sh'`,
 then build/install kiosk. Usage rollback disables/removes the path and timer/service
 but retains snapshots and the trigger directory. Restore kiosk and API using their
 printed installer snapshots; no database migration or Ollama restart is required.
@@ -157,11 +157,11 @@ Artifacts only; never run these during development. First complete the PLAYBOOK
 main-checkout handoff at `/home/agent/work/factory` on factory-gpu. Then, in order:
 
 ```sh
-factory-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && cargo build --release --locked -p factory-api"'
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api'
-factory-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/install-usage.sh'
+gpu-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && cargo build --release --locked -p factory-api"'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api'
+gpu-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/install-usage.sh'
 curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/agents | jq
-factory-ssh 'systemctl is-active factory-usage.timer; systemctl is-enabled factory-usage.timer; systemctl list-timers factory-usage.timer'
+gpu-ssh 'systemctl is-active factory-usage.timer; systemctl is-enabled factory-usage.timer; systemctl list-timers factory-usage.timer'
 ```
 
 The usage installer verifies all CLIs as agent from a readable directory (Node
@@ -176,8 +176,8 @@ permissions still require the administrator's actual installation verification.
 Rollback, from Mac (substitute the exact API snapshot printed by its installer):
 
 ```sh
-factory-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/rollback-usage.sh'
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/<printed-snapshot-directory>'
+gpu-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/rollback-usage.sh'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/<printed-snapshot-directory>'
 ```
 
 Usage rollback removes only collector units and retains usage.json/backups.
@@ -192,11 +192,11 @@ Until the API upgrade, the old API rejects the extra workspace balance or new
 diagnostic strings. After the clean main-checkout handoff, install in this order:
 
 ```sh
-factory-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && cargo build --release --locked -p factory-api"'
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api'
-factory-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory/kiosk && vp install --frozen-lockfile && VITE_API_BASE= vp build"'
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/install-kiosk.sh /home/agent/work/factory/kiosk/dist'
-factory-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && node scripts/usage/collect.ts --dry-run"'
+gpu-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && cargo build --release --locked -p factory-api"'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api'
+gpu-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory/kiosk && vp install --frozen-lockfile && VITE_API_BASE= vp build"'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-kiosk.sh /home/agent/work/factory/kiosk/dist'
+gpu-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && node scripts/usage/collect.ts --dry-run"'
 curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/agents | jq '.tools[] | select(.tool == "amp")'
 ```
 
@@ -211,8 +211,8 @@ new collector keeps writing unsupported balances. Then restore the exact
 snapshots printed by the installers, in reverse order:
 
 ```sh
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-kiosk.sh /var/backups/factory-kiosk/<printed-kiosk-snapshot>'
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/<printed-api-snapshot>'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-kiosk.sh /var/backups/factory-kiosk/<printed-kiosk-snapshot>'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/<printed-api-snapshot>'
 ```
 
 The prior collector cannot parse this CLI format, so rollback restores the
@@ -226,7 +226,7 @@ reinstall, service restart, console change, migration or deploy artifact is need
 After the wrap-up handoff, verify once:
 
 ```sh
-factory-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && node scripts/usage/collect.ts --dry-run"'
+gpu-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && node scripts/usage/collect.ts --dry-run"'
 ```
 
 Rollback requires a reviewed revert PR and its wrap-up pull, not a reset of main.

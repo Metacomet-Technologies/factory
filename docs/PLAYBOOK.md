@@ -60,7 +60,7 @@ Every prompt has these sections:
 5. **Tests:** AGENTS.md defaults plus task-specific checks.
 6. **Sandbox check:** evidence scaled to the task: one representative sandbox check, screenshots only where named. Use synthetic data/fake Ollama via `scripts/sandbox up`, capture relevant URLs/counts/timings, then `scripts/sandbox down`. Docs/prompt-only tasks may say none and use byte sizes instead. No production checks.
 7. **Deploy artifacts:** write, don't run.
-8. **Done means:** push, open the PR, reply with tests, deviations, unverified items, thread list and exact Mac deploy/rollback commands using factory-ssh/console-ssh and full `/home/agent/work/factory` paths.
+8. **Done means:** push, open the PR, reply with tests, deviations, unverified items, thread list and exact Mac deploy/rollback commands using gpu-ssh/console-ssh and full `/home/agent/work/factory` paths.
 
 **Linear MCP:** use connected `get_issue` and `save_comment` when needed, with no startup tool-listing step. If unavailable, stop and report; never change MCP settings or use another transport. The dispatcher owns the dispatch label, state moves and claim/thread/wrap-up/archive markers. Builder marker exceptions require the later wrap-up authorization below; QA's sole verdict exception is in §5. Markers count only as standalone exact-match lines after trimming, outside fences of three or more backticks/tildes. Quoted/inline markers never count.
 
@@ -100,7 +100,7 @@ Settings → Mode Dial → Tune Modes (web) changes what low/medium/high run for
 
 1. Merge (squash, delete branch).
 2. Send the thread the wrap-up prompt (§4); it builds in the main checkout and cleans up its worktree.
-3. From the Mac: `factory-ssh "sudo bash /home/agent/work/factory/deploy/install-*.sh <prebuilt path>"` (use **full paths**: admins can't `cd` into `/home/agent`).
+3. From the Mac: `gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-*.sh <prebuilt path>"` (use **full paths**: admins can't `cd` into `/home/agent`).
 4. Verify: `factory-status` (all green; usage/pricing < 2 s), kiosk self-reload, then mark the Linear issue Done. Then update Linear (status, Decided, Next) and, if `docs/PLAYBOOK.md` changed, re-sync the Linear playbook copy.
 
 ## 7. Operating the factory
@@ -111,13 +111,13 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 
 | Helper | Runs |
 |---|---|
-| `factory-ssh "…"` | factory-gpu, as `dgarbs51` |
+| `gpu-ssh "…"` | factory-gpu, as `dgarbs51` |
 | `console-ssh "…"` | factory-console |
-| `factory-desktop` / `console-desktop` | RDP desktop sessions |
+| `gpu-desktop` / `console-desktop` | RDP desktop sessions |
 | `factory-status` | full health check (Mac only) |
 | `opin …` | 1Password CLI on a node |
 
-- **Multi-line remote scripts:** `factory-ssh 'bash -s' <<'EOF'` … `EOF` (or `console-ssh` for factory-console; a heredoc after a plain `ssh host` runs on the Mac).
+- **Multi-line remote scripts:** `gpu-ssh 'bash -s' <<'EOF'` … `EOF` (or `console-ssh` for factory-console; a heredoc after a plain `ssh host` runs on the Mac).
 - **Same command on both nodes:** one labeled loop, not two copies:
   `for h in factory-gpu factory-console; do echo "== $h"; ssh dgarbs51@$h '…'; done`
   (or `ssh dgarbs51@$h 'bash -s' <<'EOF'` … `EOF` inside the loop).
@@ -147,14 +147,14 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 After [key setup and installer preflight](../scripts/dispatch/README.md#administrator-deployment-from-mac-after-merge), preview one issue or a complete pass. Remove `--dry-run` only to authorize real submissions and Linear mutations; manual `issue` ignores the label, not validation, blockers, capacity or claims.
 
 ```sh
-factory-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts issue MET-123 --dry-run'
-factory-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts poll --dry-run'
-factory-ssh 'systemctl list-timers factory-dispatch.timer'
-factory-ssh 'sudo journalctl -u factory-dispatch -f'
+gpu-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts issue MET-123 --dry-run'
+gpu-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts poll --dry-run'
+gpu-ssh 'systemctl list-timers factory-dispatch.timer'
+gpu-ssh 'sudo journalctl -u factory-dispatch -f'
 # Pause automatic dispatch before investigating an interrupted claim:
-factory-ssh 'sudo systemctl stop factory-dispatch.timer'
+gpu-ssh 'sudo systemctl stop factory-dispatch.timer'
 # Remove dispatcher units; keep the key and existing threads:
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
 ```
 
 ## 8. Gotchas we've already hit
@@ -177,11 +177,11 @@ factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
 **Shell / SSH**
 - `sudo` over `ssh host cmd` needs `ssh -t` (or NOPASSWD). Heredocs after `ssh host` run on the Mac; use `ssh host 'bash -s' <<'EOF'`.
 - In a Mac `bash <<'EOF'` script, every non-interactive `ssh` must use `ssh -n`; otherwise it consumes the remaining heredoc and the script silently ends.
-- sudo-rs needs `sudo -i` scripts on stdin: from Mac, `factory-ssh 'sudo -iu agent bash -s' <<'EOF'` (or console-ssh). Do not rely on a quoted `bash -c` surviving the login shell.
+- sudo-rs needs `sudo -i` scripts on stdin: from Mac, `gpu-ssh 'sudo -iu agent bash -s' <<'EOF'` (or console-ssh). Do not rely on a quoted `bash -c` surviving the login shell.
 - Mosh has no scrollback; use `ssh gpu` for long output.
 - With `set -o pipefail`, never pipe into `grep -q`: it can close early and cause SIGPIPE upstream. Capture output, then test it.
 - Never redact secrets with sed one-liners. Print only whitelisted fields; omit raw secret-bearing output.
-- The `factory-ssh`/`console-ssh` helpers run `_factory_ready` first, which can print or fail. For byte streams (tar transfers) use plain `ssh "$FACTORY_USER@$FACTORY_GPU"` (or `$FACTORY_CONSOLE`).
+- The `gpu-ssh`/`console-ssh` helpers run `_factory_ready` first, which can print or fail. For byte streams (tar transfers) use plain `ssh "$FACTORY_USER@$FACTORY_GPU"` (or `$FACTORY_CONSOLE`).
 - zsh doesn't expand `~` in `if=`; `curl -d "$big"` hits the arg limit (use `-d @-`).
 - `~/.hushlogin` silences the Ubuntu login banner (per user).
 

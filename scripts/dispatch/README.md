@@ -152,11 +152,7 @@ and quietly skips console cleanup. A later pass retries; there are no failure
 comments or Amp submissions. Failures after a successful preflight still retain
 the durable claim for manual inspection.
 
-**Console launches are paused until an operator sets up agent-to-console SSH,
-including the trusted host key.** QA observed `Host key verification failed`
-(exit 255) with the exact transport. Successful live console SSH remains
-**unverified**; fake tests cover failure, recovery, and post-preflight failures.
-Operator access setup is outside this change.
+Agent-to-console SSH is set up; the preflight passed and QA reviews launched on console on 2026-10-14; builder overflow to console is not yet exercised.
 
 QA gets `/home/agent/work/factory-qa-<pr>-<first-12-sha-characters>`, detached at
 freshly fetched `origin/main`, as both its initial directory and `QA_BASE`.
@@ -598,14 +594,14 @@ installer invocation or restart. The post-merge wrap-up's `pull --ff-only` in
 after confirming the merge and a clean main checkout:
 
 ```sh
-factory-ssh 'sudo -iu agent bash -s' <<'EOF'
+gpu-ssh 'sudo -iu agent bash -s' <<'EOF'
 set -e
 gh auth status
 test -z "$(git -C /home/agent/work/factory status --porcelain)"
 test "$(git -C /home/agent/work/factory branch --show-current)" = main
 git -C /home/agent/work/factory pull --ff-only origin main
 EOF
-factory-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts poll --dry-run'
+gpu-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts poll --dry-run'
 ```
 
 The preview does not delay the running timer or verify Amp quiet time. For an
@@ -624,7 +620,7 @@ stdin** instead of trying unauthorized GPU-to-console administrative SSH.
 First open an interactive GPU shell from Mac (so `opin` can prompt):
 
 ```sh
-factory-ssh
+gpu-ssh
 ```
 
 In that shell, replace the secret reference with Devon's **existing** Linear key
@@ -648,7 +644,7 @@ exit
 Back on Mac, first inspect an intended issue without dispatching (replace MET-123):
 
 ```sh
-factory-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts issue MET-123 --dry-run'
+gpu-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts issue MET-123 --dry-run'
 ```
 
 Before installation, verify the merge metadata convention above using a read-only
@@ -659,9 +655,9 @@ when the two-minute boot deadline has already passed. Then, from Mac:
 ```sh
 set -o pipefail
 console-ssh 'sudo -iu agent amp runner list --json' |
-  factory-ssh 'sudo bash /home/agent/work/factory/deploy/install-dispatch.sh'
-factory-ssh 'systemctl is-enabled factory-dispatch.timer; systemctl is-active factory-dispatch.timer; systemctl list-timers factory-dispatch.timer'
-factory-ssh 'sudo journalctl -u factory-dispatch -f'
+  gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-dispatch.sh'
+gpu-ssh 'systemctl is-enabled factory-dispatch.timer; systemctl is-active factory-dispatch.timer; systemctl list-timers factory-dispatch.timer'
+gpu-ssh 'sudo journalctl -u factory-dispatch -f'
 ```
 
 The pipe must transport JSON without a PTY or helper banner on stdout. If the Mac
@@ -677,8 +673,8 @@ oneshot has a one-hour ceiling. A timeout preserves claims for manual recovery.
 Rollback from Mac removes only the dispatcher units and stops its timer/service:
 
 ```sh
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
-factory-ssh 'systemctl is-active factory-dispatch.timer; systemctl is-enabled factory-dispatch.timer'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
+gpu-ssh 'systemctl is-active factory-dispatch.timer; systemctl is-enabled factory-dispatch.timer'
 ```
 
 Expect inactive/not-found and nonzero status after rollback. Key, snapshots,

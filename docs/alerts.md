@@ -114,14 +114,14 @@ disables and removes the timer, service, script and state. The API's
 
 From the Mac, after the MET-150 factory-api binary is deployed, install
 factory-gpu, then factory-console, then run the test alert. The token pipes over
-plain `ssh` (a byte stream with no PTY). The `factory-ssh` and `console-ssh`
+plain `ssh` (a byte stream with no PTY). The `gpu-ssh` and `console-ssh`
 helpers run `_factory_ready` first, which can print or fail (see the PLAYBOOK).
 `sudo` must not prompt, because stdin carries the token.
 
 ```sh
 op read 'op://Factory/Factory Alerts Slack bot token/credential' | ssh "$FACTORY_USER@$FACTORY_GPU" 'sudo bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-gpu'
 op read 'op://Factory/Factory Alerts Slack bot token/credential' | ssh "$FACTORY_USER@$FACTORY_CONSOLE" 'sudo bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-console'
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-gpu --test-alert'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-gpu --test-alert'
 ```
 
 Rollback: pass the snapshot path the installer printed to undo that run, or no
@@ -129,10 +129,10 @@ path to remove everything. Console first:
 
 ```sh
 console-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh --node factory-console /var/backups/factory-alerts/<printed-console-snapshot>'
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh --node factory-gpu /var/backups/factory-alerts/<printed-gpu-snapshot>'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh --node factory-gpu /var/backups/factory-alerts/<printed-gpu-snapshot>'
 # Full removal instead:
 console-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh --node factory-console'
-factory-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh --node factory-gpu'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh --node factory-gpu'
 ```
 
 ## Tests and sandbox check

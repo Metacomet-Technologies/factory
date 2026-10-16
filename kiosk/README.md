@@ -80,10 +80,10 @@ performed by the agent. Build/read `/home/agent` files as agent and stage outsid
 that directory for the root-only installer. Preserve its printed snapshot path.
 
 ```sh
-factory-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-168-ups-page-controls-typed/kiosk && VITE_API_BASE= vp build'"
-factory-ssh 'set -euo pipefail; stage=$(mktemp -d /tmp/met-168-kiosk.XXXXXX); trap '\''rm -rf -- "$stage"'\'' EXIT; sudo -u agent tar -C /home/agent/work/factory-met-168-ups-page-controls-typed/kiosk/dist -cf - . | tar -xf - -C "$stage"; sudo -u agent cat /home/agent/work/factory-met-168-ups-page-controls-typed/deploy/install-kiosk.sh | sudo bash -s -- "$stage"'
+gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-168-ups-page-controls-typed/kiosk && VITE_API_BASE= vp build'"
+gpu-ssh 'set -euo pipefail; stage=$(mktemp -d /tmp/met-168-kiosk.XXXXXX); trap '\''rm -rf -- "$stage"'\'' EXIT; sudo -u agent tar -C /home/agent/work/factory-met-168-ups-page-controls-typed/kiosk/dist -cf - . | tar -xf - -C "$stage"; sudo -u agent cat /home/agent/work/factory-met-168-ups-page-controls-typed/deploy/install-kiosk.sh | sudo bash -s -- "$stage"'
 # Immediate rollback to the latest complete kiosk snapshot:
-factory-ssh 'set -euo pipefail; sudo -u agent cat /home/agent/work/factory-met-168-ups-page-controls-typed/deploy/rollback-kiosk.sh | sudo bash -s'
+gpu-ssh 'set -euo pipefail; sudo -u agent cat /home/agent/work/factory-met-168-ups-page-controls-typed/deploy/rollback-kiosk.sh | sudo bash -s'
 ```
 
 If another installation intervened, append the preserved snapshot path to
@@ -154,10 +154,10 @@ the administrator stages a disposable copy outside `/home/agent` for the existin
 root-only installer. Preserve the printed rollback snapshot path.
 
 ```sh
-factory-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-167-ups-page-charts-power/kiosk && VITE_API_BASE= vp build'"
-factory-ssh 'set -euo pipefail; stage=$(mktemp -d /tmp/met-167-kiosk.XXXXXX); trap '\''rm -rf -- "$stage"'\'' EXIT; sudo -u agent tar -C /home/agent/work/factory-met-167-ups-page-charts-power/kiosk/dist -cf - . | tar -xf - -C "$stage"; sudo -u agent cat /home/agent/work/factory-met-167-ups-page-charts-power/deploy/install-kiosk.sh | sudo bash -s -- "$stage"'
+gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-167-ups-page-charts-power/kiosk && VITE_API_BASE= vp build'"
+gpu-ssh 'set -euo pipefail; stage=$(mktemp -d /tmp/met-167-kiosk.XXXXXX); trap '\''rm -rf -- "$stage"'\'' EXIT; sudo -u agent tar -C /home/agent/work/factory-met-167-ups-page-charts-power/kiosk/dist -cf - . | tar -xf - -C "$stage"; sudo -u agent cat /home/agent/work/factory-met-167-ups-page-charts-power/deploy/install-kiosk.sh | sudo bash -s -- "$stage"'
 # Immediate rollback to the latest complete kiosk snapshot:
-factory-ssh 'set -euo pipefail; sudo -u agent cat /home/agent/work/factory-met-167-ups-page-charts-power/deploy/rollback-kiosk.sh | sudo bash -s'
+gpu-ssh 'set -euo pipefail; sudo -u agent cat /home/agent/work/factory-met-167-ups-page-charts-power/deploy/rollback-kiosk.sh | sudo bash -s'
 ```
 
 If another installation has occurred since, pass the preserved snapshot path to

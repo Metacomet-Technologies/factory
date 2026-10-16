@@ -4,7 +4,7 @@ umask 0077
 root=$(dirname "$(dirname "$(realpath "$0")")")
 key=/etc/factory-dispatch/linear-api-key
 snapshot=
-rollback_hint() { printf 'Rollback: factory-ssh '\''sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'\''\n' >&2; }
+rollback_hint() { printf 'Rollback: gpu-ssh '\''sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'\''\n' >&2; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; rollback_hint; exit 1; }
 [[ $EUID -eq 0 ]] || fail 'Run this installer as root on factory-gpu.'
 trap 'printf "ERROR: dispatcher install failed at line %s; snapshot: %s\n" "$LINENO" "${snapshot:-none}" >&2; rollback_hint' ERR
@@ -20,7 +20,7 @@ getent passwd agent >/dev/null
 getent group agent >/dev/null
 if [[ ! -f "$key" || -L "$key" ]]; then
     cat >&2 <<'INSTRUCTIONS'
-From Mac, open factory-ssh. In that shell, substitute the existing 1Password
+From Mac, open gpu-ssh. In that shell, substitute the existing 1Password
 item/field below; do not create or print a credential. Resolve a symlink manually.
 set -euo pipefail
 set +x
@@ -100,4 +100,4 @@ systemctl enable --now factory-dispatch.timer
 systemctl is-active --quiet factory-dispatch.timer
 systemctl is-enabled --quiet factory-dispatch.timer
 printf '%s\n' 'Dispatcher timer enabled. No application service or Amp runner changed.' \
-    'Watch: factory-ssh '\''sudo journalctl -u factory-dispatch -f'\'''
+    'Watch: gpu-ssh '\''sudo journalctl -u factory-dispatch -f'\'''
