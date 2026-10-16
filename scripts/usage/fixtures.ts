@@ -44,6 +44,47 @@ Tier agent usage drawn in the selected range, by the model or feature that consu
 export const detailsNew = details.replace(amp.split('\n').slice(0, 3).join('\n'),
   ampNew.trimEnd().replace('Amp Gigawatt Tier:', '**Amp Gigawatt Tier:**').replace('Workspace metacomet:', '**Workspace metacomet:**'))
   .replace('\n## Amp Tier: Agent Usage Pool', '\nRange: 2026-10-10T04:03:59.039Z to 2026-10-13T06:33:04.226Z (end exclusive; current tier period so far)\n\n## How to Read Recorded Costs\n\nReport explanations are not quota pools.\n\n## Amp Tier: Agent Usage Pool');
+// MET-190 capture: auto-reload note is server-rendered and identity is redacted.
+export const ampAutoReload = `Signed in as redacted@example.invalid (redacted)
+**Amp Gigawatt Tier:** agent usage $170.29 of $200 remaining (85%), orb usage 997.2h of 1,000h a1.xxlarge orb hours remaining (100%) - period 2026-10-10 to 2026-11-10, resets upon renewal in 25 days
+**Individual credits:** $10 remaining (set up auto-reload to avoid running out) - https://ampcode.com/settings
+**Workspace metacomet:** $0 remaining - https://ampcode.com/workspaces/metacomet
+
+# Run \`amp usage --details\` for more detailed information.
+`;
+export const detailsAutoReload = `# Usage
+
+${ampAutoReload.split('\n').slice(0, 4).join('\n')}
+
+Range: 2026-10-10T04:03:59.039Z to 2026-10-16T04:40:00.000Z (end exclusive; current tier period so far)
+Total recorded cost: $29.71
+Total orb usage: 2.8h
+
+## How to Read Recorded Costs
+
+Recorded costs describe usage within the selected range and do not change quota balances.
+
+## Amp Tier: Agent Usage Pool
+
+Tier agent usage drawn in the selected range, by the model or feature that consumed it.
+
+| Source | Recorded cost |
+| --- | ---: |
+| **All sources** | **$29.71** |
+| Opus 5.5 | $28.60 |
+| Fable 5.1 | $0.92 |
+| Web Extract | $0.12 |
+| Web Search | $0.07 |
+
+## Amp Tier: Orb Usage Pool
+
+Orb hours used in the selected range.
+
+| Source | a1.xxlarge orb hours |
+| --- | ---: |
+| **All sources** | **2.8h** |
+| Orb | 2.8h |
+`;
 export const claude = [
   { type: 'assistant', usage_report: { rate_limits: { limits: [
     { kind: 'session', group: 'session', percent: 13, resets_at: '2026-10-12T03:10:00.988448+00:00', scope: null, severity: 'normal', is_active: true },
@@ -58,7 +99,7 @@ export const codex = { jsonrpc: '2.0', id: 2, result: {
   rateLimitResetCredits: { availableCount: 3, credits: [{ id: 'private-reset-credit-id' }] },
   accountId: 'private-account-id',
 } };
-export const versions = { amp: '0.0.1791763306-ged595a (released 2026-10-12T00:01:46.000Z, 1d ago)', claude: '2.1.296 (Claude Code)', codex: 'codex-cli 0.162.1' };
+export const versions = { amp: '0.0.1791763306-ged595a (released 2026-10-12T00:01:46.000Z, 1d ago)', ampAutoReload: '0.0.1792108872-gab0eb7 (released 2026-10-16T04:40:00.000Z, 1h ago)', claude: '2.1.296 (Claude Code)', codex: 'codex-cli 0.162.1' };
 export async function fixtureRun(program: string, args: string[]) {
   if (args[0] === '--version') return versions[program];
   if (program === 'amp') return args.includes('--details') ? details : amp;
