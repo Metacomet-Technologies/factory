@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -534,16 +535,29 @@ def package(root, output, plan):
 
 def build_exact(root, plan, output):
     # Clone only committed source into disposable state, never switch the caller's branch.
-    with tempfile.TemporaryDirectory(dir=output.parent) as temporary:
-        checkout = Path(temporary) / "source"
+    exclude = Path(git(root, "rev-parse", "--git-path", "info/exclude"))
+    if not exclude.is_absolute():
+        exclude = root / exclude
+    if "/.amp/in/" not in exclude.read_text().splitlines():
+        with exclude.open("a") as stream:
+            stream.write("\n/.amp/in/\n")
+    scratch = root / ".amp/in"
+    scratch.mkdir(parents=True, exist_ok=True)
+    # Keep the sandbox's Unix socket paths below Linux's 108-byte limit.
+    checkout = scratch / "release"
+    checkout.mkdir()  # Refuse a concurrent build or abandoned checkout; never erase it.
+    try:
+        require(len(str(checkout / ".sandbox/factory-api.sock").encode()) < 108, "checkout path too long for sandbox sockets")
         subprocess.run(["git", "clone", "--no-hardlinks", "--no-checkout", str(root), str(checkout)], check=True)
         subprocess.run(["git", "-C", str(checkout), "checkout", "--detach", plan["source_sha"]], check=True)
-        plan_path = Path(temporary) / "plan.json"
+        plan_path = output.parent / "plan.json"
         plan_path.write_bytes(canonical(plan))
         # Build scripts/dependencies cannot inherit the publication credential.
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "RUSTUP_HOME", "CARGO_HOME")}
         subprocess.run(["bash", str(checkout / "scripts/release/build.sh"), plan["source_sha"],
                         str(plan_path), str(output.resolve())], cwd=checkout, env=env, check=True)
+    finally:
+        shutil.rmtree(checkout)
 
 
 def main():

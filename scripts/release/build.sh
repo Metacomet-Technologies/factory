@@ -49,6 +49,10 @@ export PATH="$root/kiosk/node_modules/.bin:$PATH"
 cd "$root"
 cargo build --release --locked -p meter -p factory-api -p pricing -p factory-ups-control
 trap 'scripts/sandbox down; rm -rf -- "$tools"' EXIT
-scripts/sandbox up --rows 1k --kiosk
+if ! scripts/sandbox up --rows 1k --kiosk; then
+    for service in runtime seed meter factory-api; do scripts/sandbox logs "$service" || true; done
+    exit 1
+fi
+python3 scripts/sandbox-shims/smoke.py --kiosk
 python3 scripts/release/release.py package --root "$root" --plan-file "$plan" --directory "$output"
 [[ -z $(git status --porcelain) ]] || { echo 'Build dirtied source' >&2; exit 1; }
