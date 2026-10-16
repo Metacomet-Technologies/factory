@@ -217,6 +217,7 @@ class GitHub:
         self.tag_objects = {}
         self.release_ids = None
         self.create_reserved_releases = set()
+        self.resume_release_hints = {}
         self.anonymous = anonymous
         self.waiting_for_ci = False
 
@@ -350,7 +351,9 @@ def planned(api, root, inventory):
                     and reservation.get("repository") == REPO
                     and reservation.get("source_version") == floor,
                     f"{tag}: conflicting/unverifiable reservation; human investigation required")
-            release = release_for(api, tag)
+            # A read-only recovery hint is not authenticated release metadata.
+            # Defer this draft's ID/state/assets entirely to the publish job.
+            release = release_for(api, tag, published_only=tag in api.resume_release_hints)
             if not release or release["draft"]:
                 evidence = api.evidence(sha, source_inventory)
                 if evidence is None:
@@ -358,7 +361,7 @@ def planned(api, root, inventory):
                 require(reservation["bump"] == evidence["bump"]
                         and reservation["pull_request"] == evidence["pull_request"], "reservation intent changed")
                 if release is None:
-                    require(tag in api.create_reserved_releases,
+                    require(tag in api.create_reserved_releases or tag in api.resume_release_hints,
                             f"{tag}: reserved tag has no visible release; inspect existing drafts and use explicit recovery")
             else:
                 assets = [a for a in release["assets"] if a["name"] == "manifest.json"]
@@ -413,28 +416,40 @@ def remember_release(api, release, tag, release_id=None):
     api.release_ids[tag] = release["id"]
 
 
-def resume_release(api, identity):
-    """Read-only operator recovery hint; still require the API and annotated reservation."""
+def resume_release(api, identity, *, verify_release=True):
+    """Build may use an untrusted planning hint; only publish authenticates the draft."""
     match = re.fullmatch(r"(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))=([1-9][0-9]*)", identity)
     require(match is not None, "resume release must be vMAJOR.MINOR.PATCH=NUMERIC_ID")
     tag, release_id = match[1], int(match[2])
     version(tag[1:])
-    release = api.request(f"releases/{release_id}")
-    remember_release(api, release, tag, release_id)
     reservation = api.tags().get(tag)
     require(reservation is not None and isinstance(reservation.get("reservation"), dict)
             and reservation["reservation"].get("release_tag") == tag
             and reservation["reservation"].get("source_sha") == reservation["sha"]
             and reservation["reservation"].get("repository") == REPO,
             "recovery tag reservation conflict")
+    if verify_release:
+        release = api.request(f"releases/{release_id}")
+        remember_release(api, release, tag, release_id)
+    else:
+        # contents:read may not see drafts. Do not put this unverified ID in the
+        # direct-read cache, and never treat it as permission to create a release.
+        api.resume_release_hints[tag] = release_id
     # Planning and publication subsequently validate the complete plan, CI,
     # asset bytes and immutable receipt, including an already-completed retry.
 
 
-def release_for(api, tag):
-    if api.release_ids is None or tag not in api.release_ids:
+def release_for(api, tag, *, published_only=False):
+    if published_only or api.release_ids is None or tag not in api.release_ids:
         releases = api.pages("releases")
         require(len({r["tag_name"] for r in releases}) == len(releases), "duplicate release identity")
+        if published_only:
+            # A completed retry may be publicly verifiable. Never use a draft
+            # or an unlisted cached ID to authorize reads by the build token.
+            releases = [release for release in releases
+                        if release.get("tag_name") == tag and release.get("draft") is False]
+            if not releases:
+                return None
         for release in releases:
             remember_release(api, release, release["tag_name"])
     if api.release_ids is None or tag not in api.release_ids:
@@ -442,6 +457,7 @@ def release_for(api, tag):
     release_id = api.release_ids[tag]
     release = api.request(f"releases/{release_id}")
     remember_release(api, release, tag, release_id)
+    require(not published_only or release["draft"] is False, "public release became a draft")
     release["assets"] = api.pages(f"releases/{release_id}/assets")
     return release
 
@@ -694,7 +710,7 @@ def main():
             api.create_reserved_releases.add(tag)
     if args.resume_release:
         require(args.command in ("plan", "build", "publish"), "resume release requires plan, build or publish")
-        resume_release(api, args.resume_release)
+        resume_release(api, args.resume_release, verify_release=args.command == "publish")
     if args.command == "package":
         require(args.plan_file and args.directory, "package requires --plan-file and --directory")
         package(args.root, args.directory, json.loads(args.plan_file.read_bytes()))
