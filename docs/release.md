@@ -88,10 +88,58 @@ Its builder callback only copies those verified files, never executes them.
 Crash recovery is monotonic: build and verify, reserve tag, create draft, upload manifest and
 six assets, download and validate all assets, then publish with a manifest digest
 receipt. Every upload inspects existing assets first. Lost write acknowledgements
-stop the attempt; rerunning inspects remote state before another write. Identical
+stop the attempt; rerunning inspects remote state before another write. A reserved
+tag absent from release listings now requires explicit operator recovery, including
+a crash after tag reservation but before draft creation. Identical
 content is reused; conflicting, duplicate or starter/partial assets stop with the
 draft retained. Never delete a conflicting asset, use `--clobber`, force a tag,
 recycle a release version, or hide a failure by releasing the next SHA.
+
+### Recovering a draft omitted from release listings
+
+A successful create response supplies the release ID. The publisher validates its
+positive numeric ID, exact tag and draft state, retains that ID, and refreshes the
+release and its assets directly by ID before uploading. It never rediscovers a
+newly created draft through the release collection. Direct-read denial or an
+identity mismatch stops without another create or any upload. The acknowledged
+ID is printed for operator recovery; a lost POST response still requires inspection.
+
+For an existing draft that the collection omits, obtain its numeric ID from an
+owner-visible release/API record and confirm its intended tag. After approved
+activation, a manual workflow run may supply `resume_release` as
+`vMAJOR.MINOR.PATCH=NUMERIC_ID` (leave the verification-only `tag` input empty).
+An automatic event has no recovery intent and fails closed on any previously
+reserved tag whose release is absent from the collection. Therefore merging this
+fix does not race a manual recovery run into another create attempt for that tag.
+New tags reserved in the current publication call can still create their first draft.
+
+If owner inspection confirms a reserved tag genuinely has no release, including
+hidden drafts, `create_reserved_releases` accepts a comma-separated list of those
+exact tags. This is explicit creation intent, not a way to recover an existing
+draft. Each tag needs its own inspection and intent; never include a tag with a
+known draft. The equivalent CLI flag is `--create-reserved-release TAG`, repeated
+for each inspected reservation. Release-list access errors still stop the run,
+and all exact reservation checks remain mandatory. Collection absence alone
+cannot establish that creation is safe: owner inspection is a prerequisite.
+Without intent for every release-less reservation, planning stops before any
+build or publication, even when a prior draft's ID was supplied. This includes
+reservations left by a crash immediately after creating a tag reference.
+
+Both the read-only build job and the publish job independently read that ID using
+their existing workflow credentials, validate the exact tag and annotated
+reservation, and retain the ID across other collection reads. No new credential
+or permission is needed or requested by this mechanism. If either credential
+cannot read that release or its assets, recovery stops; owner-browser visibility
+alone is not proof that the workflow can access it.
+
+This hint selects an existing identity, not permission to change tags, replace
+assets or skip history. Full plan/CI, downloaded bundle, byte-for-byte existing
+asset and final immutable-receipt checks still apply. A completed release is
+verified without mutation on retry. Never guess an ID from a tag, infer creation
+time from the UI's drafted timestamp, delete the draft, or retry creation because
+a collection lookup did not show it. Recovery still reconciles all eligible
+history and may publish subsequent reserved versions; it is not a single-tag
+publication mode. Existing tags and drafts must be preserved while investigating.
 
 ## Build and consumer contracts
 
