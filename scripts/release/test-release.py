@@ -150,6 +150,38 @@ class FakeGitHub(r.GitHub):
         raise AssertionError(f"unexpected fake API request: {method} {path}")
 
 
+class TokenGitHub(FakeGitHub):
+    """Distinct read-only build and write-enabled publisher token capabilities."""
+    def __init__(self, shared, *, draft_reads, list_drafts=False):
+        super().__init__()
+        for name in ("refs", "objects", "releases", "blobs", "prs", "runs", "jobs"):
+            setattr(self, name, getattr(shared, name))
+        self.draft_reads = draft_reads
+        self.list_drafts = list_drafts
+
+    def request(self, path, method="GET", *args, **kwargs):
+        route = urlsplit(path).path
+        if not self.draft_reads:
+            if method != "GET":
+                raise AssertionError("read-only build attempted a remote write")
+            parts = route.split("/")
+            private_release = False
+            if len(parts) > 1 and parts[0] == "releases":
+                if parts[1] == "assets":
+                    private_release = any(release["draft"] and any(str(asset["id"]) == parts[2]
+                                          for asset in release["assets"]) for release in self.releases)
+                else:
+                    private_release = any(str(release["id"]) == parts[1] and release["draft"]
+                                          for release in self.releases)
+            if private_release:
+                self.requests.append((path, method, kwargs.get("api_version", r.API_VERSION)))
+                raise ValueError("HTTP 403: draft inaccessible to read token")
+        result = super().request(path, method, *args, **kwargs)
+        if route == "releases" and method == "GET" and not self.draft_reads and not self.list_drafts:
+            return [release for release in result if not release["draft"]]
+        return result
+
+
 class Releases(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -348,6 +380,111 @@ class Releases(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "list access denied"):
             r.publish_one(api, reservations[0], inventory, self.directory, fixture_build)
         self.assertEqual(api.writes, writes)
+
+    def test_read_token_build_hint_then_authoritative_write_token_recovery(self):
+        root, inventory, first, second = self.history()
+        for control in ("valid", "listed_draft", "denied", "wrong_id", "wrong_tag", "tampered_bundle"):
+            with self.subTest(control=control):
+                shared = FakeGitHub()
+                shared.eligible(first, 1)
+                shared.eligible(second, 2)
+                reservation = list(r.planned(shared, root, inventory))[0]
+                r.reserve(shared, reservation)
+                shared.request("releases", "POST", {"tag_name": "v0.2.1", "draft": True,
+                                                     "prerelease": False, "body": "incomplete"})
+                build_api = TokenGitHub(shared, draft_reads=False, list_drafts=control == "listed_draft")
+                # Prove this fake really denies draft reads, then check the build
+                # does not make that request rather than mocking it as readable.
+                with self.assertRaisesRegex(ValueError, "HTTP 403"):
+                    build_api.request("releases/1")
+                build_api.requests.clear()
+                handoff = self.directory / ("handoff-" + control)
+                argv = ["release.py", "build", "--root", str(root), "--directory", str(handoff),
+                        "--resume-release", "v0.2.1=1"]
+                with patch.object(r, "GitHub", return_value=build_api), patch.object(sys, "argv", argv), \
+                        patch.object(r, "build_exact", side_effect=lambda root, p, d: fixture_build(p, d, inventory)):
+                    r.main()
+                self.assertEqual(build_api.writes, 0)
+                self.assertFalse(any(urlsplit(path).path.startswith("releases/")
+                                     for path, _, _ in build_api.requests))
+                self.assertEqual(build_api.resume_release_hints, {"v0.2.1": 1})
+                self.assertNotIn("v0.2.1", build_api.release_ids or {})
+                self.assertEqual(build_api.create_reserved_releases, set())
+                self.assertEqual(len(json.loads((handoff / "plans.json").read_bytes())), 2)
+
+                publish_api = TokenGitHub(shared, draft_reads=control != "denied")
+                original = publish_api.request
+
+                def request(path, method="GET", *args, **kwargs):
+                    result = original(path, method, *args, **kwargs)
+                    if path == "releases/1" and method == "GET":
+                        if control == "wrong_id":
+                            result["id"] = 2
+                        elif control == "wrong_tag":
+                            result["tag_name"] = "v0.2.2"
+                    return result
+
+                if control == "tampered_bundle":
+                    (handoff / "bundles/v0.2.1/meter-linux-x86_64").write_bytes(b"tampered")
+                argv[1] = "publish"
+                with patch.object(r, "GitHub", return_value=publish_api), patch.object(sys, "argv", argv), \
+                        patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REF": "refs/heads/main"}), \
+                        patch.object(publish_api, "request", side_effect=request), \
+                        patch.object(r, "build_exact", side_effect=AssertionError("publisher built code")):
+                    if control in ("valid", "listed_draft"):
+                        r.main()
+                    else:
+                        with self.assertRaises(ValueError):
+                            r.main()
+                if control in ("valid", "listed_draft"):
+                    self.assertEqual(len(shared.releases), 2)
+                    self.assertTrue(all(not release["draft"] and release["immutable"]
+                                        for release in shared.releases))
+                    # Only the second, new reservation creates a release.
+                    self.assertEqual(sum(path == "releases" and method == "POST"
+                                         for path, method, _ in publish_api.requests), 1)
+                else:
+                    self.assertEqual(publish_api.writes, 0)
+                    self.assertEqual(len(shared.releases), 1)
+                    self.assertTrue(shared.releases[0]["draft"])
+                    self.assertEqual(shared.releases[0]["assets"], [])
+
+    def test_read_token_completed_recovery_retry_is_idempotent(self):
+        root, inventory, first, second = self.history()
+        shared = FakeGitHub()
+        shared.eligible(first, 1)
+        shared.eligible(second, 2)
+        first_plan = list(r.planned(shared, root, inventory))[0]
+        r.publish_one(shared, first_plan, inventory, self.directory / "completed",
+                      lambda p, d: fixture_build(p, d, inventory))
+        first_release = copy.deepcopy(shared.releases[0])
+        for run in ("pending-successor", "all-complete"):
+            build_api = TokenGitHub(shared, draft_reads=False)
+            r.resume_release(build_api, "v0.2.1=1", verify_release=False)
+            handoff = self.directory / run
+            with patch.object(r, "build_exact", side_effect=lambda root, p, d: fixture_build(p, d, inventory)):
+                r.build_pending(build_api, root, inventory, handoff)
+            self.assertEqual(build_api.writes, 0)
+            plans = json.loads((handoff / "plans.json").read_bytes())
+            self.assertEqual([p["release_tag"] for p in plans], ["v0.2.2"] if run == "pending-successor" else [])
+            publish_api = TokenGitHub(shared, draft_reads=True)
+            r.resume_release(publish_api, "v0.2.1=1")
+            with patch.object(r, "build_exact", side_effect=AssertionError("publisher built code")):
+                r.publish_downloaded(publish_api, root, inventory, handoff)
+            self.assertEqual(shared.releases[0], first_release)
+            if run == "all-complete":
+                self.assertEqual(publish_api.writes, 0)
+        self.assertEqual(len(shared.releases), 2)
+
+    def test_untrusted_resume_hint_does_not_authorize_creation(self):
+        api = FakeGitHub()
+        r.reserve(api, plan())
+        r.resume_release(api, "v0.2.1=123", verify_release=False)
+        writes = api.writes
+        with self.assertRaisesRegex(ValueError, "explicit recovery"):
+            r.publish_one(api, plan(), INVENTORY, self.directory, fixture_build)
+        self.assertEqual(api.writes, writes)
+        self.assertEqual(api.releases, [])
 
     def test_workflow_passes_same_recovery_hint_to_both_jobs(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
