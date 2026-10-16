@@ -1,4 +1,5 @@
-import { readFileSync, openSync, closeSync } from 'node:fs';
+import { readFileSync, openSync, closeSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { reviewPRs, cleanupQAWorktrees, syncPlaybook, qaArchives, devonMention } from './qa.ts';
@@ -250,6 +251,13 @@ async function listedThread(id: string, includeArchived: boolean) {
   }
 }
 
+async function searchThreads(args: string[], requireTitle: boolean) {
+  const entries = JSON.parse(await amp(args));
+  if (!Array.isArray(entries) || entries.some(entry => !/^T-[a-f0-9-]{36}$/.test(entry?.id)
+    || (requireTitle && typeof entry.title !== 'string'))) throw new Error('Amp search invalid');
+  return entries as { id: string; title: string }[];
+}
+
 export async function run(command: string, identifier: string | undefined, dryRun: boolean) {
   if (!supportedNode(process.versions.node)) throw new Error(`Use Node 24.x (>= 24.12.0); found ${process.versions.node}`);
   const team = process.env.DISPATCH_TEAM ?? 'MET';
@@ -333,9 +341,9 @@ export async function run(command: string, identifier: string | undefined, dryRu
   }
   const has = (issue: Issue, name: string) => issue.comments.some(comment => commentMarkers(comment.body).includes(marker(name)));
   const thread = (issue: Issue) => issue.comments.flatMap(comment => commentMarkers(comment.body)).map(line => line.match(threadPattern)).find(Boolean);
-  function showAmp(issue: Issue, args: string[]) {
+  function showAmp(issue: Issue | undefined, args: string[]) {
     // Exact argv except prompt text: printing full prompts would leak issue content.
-    log('would-run', { issue: issue.identifier, command: args.map(value => `'${value.replaceAll("'", "'\\''")}'`).join(' ') });
+    log('would-run', { issue: issue?.identifier, command: args.map(value => `'${value.replaceAll("'", "'\\''")}'`).join(' ') });
   }
   const labelAttempts = new Set<string>();
   async function labelThread(issue: Issue, id: string) {
@@ -549,6 +557,62 @@ export async function run(command: string, identifier: string | undefined, dryRu
   }
   let archives = 0;
   const archiveCandidates = [];
+  const sweepIssues = issues.filter(issue => {
+    const closedAt = Date.parse((issue.state.type === 'completed' ? issue.completedAt : issue.canceledAt) ?? '');
+    return ['completed', 'canceled'].includes(issue.state.type) && Number.isFinite(closedAt)
+      && Date.now() >= closedAt && Date.now() - closedAt <= 7 * 24 * 60 * 60_000;
+  });
+  const knownIds = new Set(issues.flatMap(issue => issue.comments.flatMap(c => commentMarkers(c.body)).flatMap(line => {
+    const id = line.match(threadPattern)?.[1]
+      ?? line.match(/^<!-- factory-dispatch:(?:archived|archive-claim) thread:(T-[a-f0-9-]{36}) -->$/)?.[1]
+      ?? line.match(/^<!-- factory-qa:review-claim pr:\d+ sha:[a-f0-9]{40}(?: round:2)? thread:(T-[a-f0-9-]{36}) -->$/)?.[1];
+    return id ? [id] : [];
+  })));
+  const stateDirectory = `${homedir()}/.local/state/factory-dispatch`;
+  const statePath = `${stateDirectory}/sweep.json`;
+  const openArgs = ['threads', 'search', 'author:me archived:false', '--json', '--limit', '500'];
+  if (dryRun) showAmp(undefined, ['amp', ...openArgs]);
+  let sweepKey: string | undefined;
+  let cachedCandidates: { issue: string; id: string }[] = [];
+  const discoveredCandidates: typeof cachedCandidates = [];
+  let skipSweep = false;
+  let unknownCount: number | null = null;
+  let openCount: number | null = null;
+  let reason = 'open search unreadable';
+  try {
+    const open = await searchThreads(openArgs, true);
+    openCount = open.length;
+    const unknownIds = [...new Set(open.map(entry => entry.id).filter(id => !knownIds.has(id)))].sort();
+    unknownCount = unknownIds.length;
+    reason = 'open search reached limit';
+    if (open.length < 500) {
+      reason = 'sweep state unreadable or invalid';
+      const currentKey = JSON.stringify({ unknownIds, issues: sweepIssues.map(issue => issue.identifier).sort() });
+      let previous;
+      try { previous = JSON.parse(readFileSync(statePath, 'utf8')); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        reason = 'sweep state missing';
+        sweepKey = currentKey;
+      }
+      if (previous !== undefined) {
+        if (!Array.isArray(previous?.unknownIds) || !previous.unknownIds.every(id => typeof id === 'string' && /^T-[a-f0-9-]{36}$/.test(id))
+          || !Array.isArray(previous.issues) || !previous.issues.every(id => typeof id === 'string' && /^[A-Z][A-Z0-9]*-\d+$/.test(id))
+          || !Array.isArray(previous.candidates) || previous.candidates.some(candidate => typeof candidate?.issue !== 'string'
+            || !/^[A-Z][A-Z0-9]*-\d+$/.test(candidate.issue) || typeof candidate.id !== 'string'
+            || !/^T-[a-f0-9-]{36}$/.test(candidate.id))) {
+          throw new Error('Invalid sweep state');
+        }
+        cachedCandidates = previous.candidates;
+        sweepKey = currentKey;
+        skipSweep = unknownIds.length === 0 || sweepKey === JSON.stringify({ unknownIds: previous.unknownIds, issues: previous.issues });
+        reason = unknownIds.length === 0 ? 'no unknown open threads' : skipSweep ? 'unchanged key' : 'changed key';
+      }
+    }
+  } catch { /* Unreadable discovery or state must preserve the full sweep without a cache write. */ }
+  log(skipSweep ? 'archive-sweep-skip' : 'archive-sweep', { reason, openCount, unknownCount, issueCount: sweepIssues.length });
+  let searchesParsed = true;
+  let factorySearch: Promise<{ id: string; title: string }[]> | undefined;
   for (const issue of issues) {
     const match = thread(issue);
     const dispatchClaim = issue.comments.find(c => commentMarkers(c.body).some(line => claimPattern.test(line)));
@@ -566,20 +630,19 @@ export async function run(command: string, identifier: string | undefined, dryRu
         const id = line.match(/^<!-- factory-dispatch:archive-claim thread:(T-[a-f0-9-]{36}) -->$/)?.[1];
         if (id && !(id === match?.[1] && (issue.state.type === 'canceled' || pendingWrapup))) candidates.push({ id });
       }
-      const closedAt = Date.parse((issue.state.type === 'completed' ? issue.completedAt : issue.canceledAt) ?? '');
-      if (Number.isFinite(closedAt) && Date.now() >= closedAt && Date.now() - closedAt <= 7 * 24 * 60 * 60_000) {
+      if (sweepIssues.includes(issue)) {
         // ponytail: Amp caps search at 500 without pagination. Drain open results across passes;
         // more than 500 active threads can defer older ones until Amp adds a paging API.
-        for (const label of ['factory', issue.identifier.toLowerCase()]) {
+        // Recheck cached discoveries even when quiet time or the attempt cap deferred them.
+        for (const label of skipSweep ? ['cached'] : ['factory', issue.identifier.toLowerCase()]) {
           const args = ['threads', 'search', `label:${label} author:me archived:false`, '--json', '--limit', '500'];
-          if (dryRun) showAmp(issue, ['amp', ...args]);
+          if (dryRun && !skipSweep) {
+            if (label !== 'factory' || issue === sweepIssues[0]) showAmp(issue, ['amp', ...args]);
+          }
           else {
             try {
-              const entries = JSON.parse(await amp(args));
-              if (!Array.isArray(entries) || entries.some(entry => !/^T-[a-f0-9-]{36}$/.test(entry?.id)
-                || (label === 'factory' && typeof entry.title !== 'string'))) {
-                throw new Error('Amp label search invalid');
-              }
+              const entries = label === 'cached' ? cachedCandidates.filter(candidate => candidate.issue === issue.identifier).map(({ id }) => ({ id, title: '' }))
+                : await (label === 'factory' ? factorySearch ??= searchThreads(args, true) : searchThreads(args, false));
               for (const { id, title } of entries) {
                 if (label === 'factory' && !title.startsWith(`${issue.identifier} `)) continue;
                 // Legacy builder/QA markers remain authoritative for their recorded IDs.
@@ -588,8 +651,12 @@ export async function run(command: string, identifier: string | undefined, dryRu
                 const reviewer = issue.comments.some(c => commentMarkers(c.body).some(line => line.endsWith(` thread:${id} -->`) && line.startsWith('<!-- factory-qa:review-claim ')));
                 if (reviewer) continue;
                 candidates.push({ id });
+                discoveredCandidates.push({ issue: issue.identifier, id });
               }
-            } catch { log('archive-pending', { issue: issue.identifier, reason: 'Amp label search unreadable' }); }
+            } catch {
+              searchesParsed = false;
+              log('archive-pending', { issue: issue.identifier, reason: 'Amp label search unreadable' });
+            }
           }
         }
       }
@@ -599,6 +666,15 @@ export async function run(command: string, identifier: string | undefined, dryRu
       if (!has(issue, `archived thread:${id}`)) archiveCandidates.push({ issue, id,
         claim: marker(`archive-claim thread:${id}`), done: marker(`archived thread:${id}`) });
     }
+  }
+  if (!dryRun && !skipSweep && sweepKey !== undefined && searchesParsed) {
+    const temporary = `${statePath}.${process.pid}.tmp`;
+    try {
+      mkdirSync(stateDirectory, { recursive: true, mode: 0o700 });
+      writeFileSync(temporary, `${JSON.stringify({ ...JSON.parse(sweepKey), candidates: discoveredCandidates })}\n`, { mode: 0o600, flag: 'wx' });
+      renameSync(temporary, statePath);
+    } catch { log('error', { action: 'sweep-state', message: 'Could not store successful sweep key' }); }
+    finally { rmSync(temporary, { force: true }); }
   }
   for (const { issue, id, claim, done } of archiveCandidates) {
     if (archives >= 5) break;
