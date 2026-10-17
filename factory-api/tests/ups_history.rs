@@ -39,7 +39,7 @@ fn migration_adopts_captured_schema_and_is_atomic_strict_and_repeatable() -> Res
             data::initialize(&mut db)?;
             assert_eq!(
                 db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
-                2
+                3
             );
             if legacy {
                 assert_eq!(
@@ -75,7 +75,7 @@ fn migration_adopts_captured_schema_and_is_atomic_strict_and_repeatable() -> Res
             ] {
                 assert!(db.execute(sql, []).is_err(), "{sql}");
             }
-            db.pragma_update(None, "user_version", 3)?;
+            db.pragma_update(None, "user_version", 4)?;
             assert!(data::initialize(&mut db).is_err());
         }
     }
