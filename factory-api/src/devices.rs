@@ -1785,7 +1785,11 @@ fn cpu_rates(
         let iowait = next.iowait - prev.iowait;
         let idle = next.idle - prev.idle;
         let total = busy + iowait + idle;
-        percent_delta(0, busy, total).zip(percent_delta(0, iowait, total))
+        if total == 0 {
+            Some((0.0, 0.0))
+        } else {
+            percent_delta(0, busy, total).zip(percent_delta(0, iowait, total))
+        }
     } else {
         None
     };
@@ -2307,6 +2311,20 @@ mod tests {
         assert_eq!(second.device.network.rx.value, Some(3000.0 / 15.0));
         assert_eq!(second.device.network.tx.value, Some(0.0));
         assert_eq!(second.device.health.status, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn unchanged_counters_are_idle_not_waiting() {
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path());
+        let mut sampler = Sampler::default();
+        let first = sample(root.path(), &mut sampler, &inputs(root.path(), 0));
+        assert_eq!(first.device.cpu.utilization.value, None);
+        let second = sample(root.path(), &mut sampler, &inputs(root.path(), 15_000));
+        assert_eq!(second.device.cpu.utilization.value, Some(0.0));
+        assert_eq!(second.device.cpu.iowait.value, Some(0.0));
+        assert_eq!(second.device.disk_io.read.value, Some(0.0));
+        assert_eq!(second.device.network.rx.value, Some(0.0));
     }
 
     #[test]
