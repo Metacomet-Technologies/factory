@@ -91,10 +91,12 @@ It is not in SQLite (the cache DB is due for its MET-92
 rebuild). An unreadable file is moved aside as `alerts.json.corrupt-<ms>`.
 
 Failed posts retry with backoff (30 s doubling to 15 min); recovery replies give
-up after 12 attempts, while shutdown notices keep retrying. Delivery waits until
-the local state write succeeds. Like existing alerts, an ambiguous Slack timeout
-or a crash after Slack accepts a post but before its acknowledgement is saved
-can cause a retry; the local state and Slack API do not share a transaction.
+up after 12 attempts, while shutdown notices keep retrying. Only unclean-shutdown
+notices wait until the local state write succeeds; normal alerts and threaded
+recovery replies still post when state cannot be written. Like existing alerts,
+an ambiguous Slack timeout or a crash after Slack accepts a post but before its
+acknowledgement is saved can cause a retry; the local state and Slack API do not
+share a transaction.
 Pending condition timers (5 min offline, 2 min hot) and
 consecutive-failure counts restart with the process.
 

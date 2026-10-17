@@ -176,16 +176,15 @@ Backup status that factory-api can read is
 
 ## Install and rollback
 
-Devon runs these from his Mac after reviewing the PR. No deploy runs in an
-agent session. Build and read worktree files as `agent`, then stage artifacts
-outside `/home/agent` for the root installers. Save each printed backup path
-and the staging directory. These commands install the helpers, API, and kiosk:
+After merge and the wrap-up thread's main-checkout builds, Devon runs these
+from his Mac. No deploy runs in an agent session. Save each printed backup
+path. These commands install the helpers, prebuilt API, and kiosk:
 
 ```sh
-gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-217-devices-node-maintenance-status && cargo build --release --locked -p factory-api && cd kiosk && VITE_API_BASE= vp build'"
-gpu-ssh 'set -euo pipefail; stage=$(mktemp -d /tmp/met-217.XXXXXX); sudo -u agent tar -C /home/agent/work/factory-met-217-devices-node-maintenance-status -cf - deploy target/release/factory-api kiosk/dist | tar -xf - -C "$stage"; printf "Keep staging directory for preflight/rollback: %s\n" "$stage"; sudo bash "$stage/deploy/devices/install-devices.sh"; sudo bash "$stage/deploy/install-factory-api.sh" "$stage/target/release/factory-api"; sudo bash "$stage/deploy/install-kiosk.sh" "$stage/kiosk/dist"'
-# Use the staging directory printed above:
-gpu-ssh 'sudo bash /tmp/met-217.XXXXXX/deploy/devices/install-devices.sh --preflight'
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/devices/install-devices.sh"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/devices/install-devices.sh --preflight"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-kiosk.sh /home/agent/work/factory/kiosk/dist"
 gpu-ssh 'sudo systemctl start factory-devices-maintenance.service factory-devices-smart.service; sudo python3 -m json.tool /var/lib/factory-devices/maintenance.json; sudo systemctl status factory-devices-maintenance.timer --no-pager'
 ```
 
@@ -197,16 +196,20 @@ Verify the new response-level `maintenance` object and the Maintenance card:
 ```sh
 gpu-ssh 'curl -fsS http://127.0.0.1:8080/v1/devices/factory-gpu | python3 -c '\''import json,sys; print(json.dumps(json.load(sys.stdin).get("maintenance"), indent=2))'\'''
 # Open https://factory-gpu.bearded-pompano.ts.net/devices/factory-gpu
-# Replace placeholders with the printed staging and component backup paths:
-gpu-ssh 'sudo bash /tmp/met-217.XXXXXX/deploy/rollback-kiosk.sh /var/backups/factory-kiosk/KIOSK_SNAPSHOT'
-gpu-ssh 'sudo bash /tmp/met-217.XXXXXX/deploy/rollback-factory-api.sh /var/backups/factory-api/API_SNAPSHOT'
-gpu-ssh 'sudo bash /tmp/met-217.XXXXXX/deploy/devices/rollback-devices.sh /var/backups/factory-devices/DEVICES_SNAPSHOT'
+# Replace placeholders with the printed component backup paths:
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/rollback-kiosk.sh /var/backups/factory-kiosk/KIOSK_SNAPSHOT"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/API_SNAPSHOT"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/devices/rollback-devices.sh /var/backups/factory-devices/DEVICES_SNAPSHOT"
 ```
 
 Rollback restores previous helpers and units, disabling the maintenance timer
 and stopping its service when those files were absent before install. The last
 maintenance snapshot can remain as historical data. Revert the API and kiosk
 through their own printed rollback snapshots.
+
+Before rolling factory-api back, let pending unclean-shutdown notices drain.
+The old binary cannot read outbox entries with `thread_ts: null` and moves
+`alerts.json` aside as corrupt if any remain, losing the loaded alert state.
 
 Unprivileged tests use `DEVICES_TEST_ROOT` and do not call host `smartctl`.
 

@@ -456,11 +456,8 @@ impl Engine {
     /// Evaluate, post due messages and persist changes.
     pub async fn tick(&mut self, now: i64, signals: &Signals) {
         self.evaluate(now, signals);
-        // Opens and clears (with their queued recoveries) are durable before any Slack call.
+        // Try to save state before delivery; only shutdown notices require success.
         self.persist();
-        if self.dirty {
-            return;
-        }
         self.deliver(now).await;
         self.persist();
     }
@@ -1229,7 +1226,7 @@ impl Engine {
         let mut index = 0;
         while index < self.stored.outbox.len() {
             let recovery = &self.stored.outbox[index];
-            if recovery.next_post_ms > now {
+            if recovery.next_post_ms > now || (recovery.thread_ts.is_none() && self.dirty) {
                 index += 1;
                 continue;
             }
@@ -1975,6 +1972,67 @@ mod tests {
         assert_eq!(view.recent.len(), 1);
         assert_eq!(view.recent[0].cleared_at_ms, back);
         assert_eq!(view.recent[0].opened_at_ms, open_at);
+    }
+
+    #[tokio::test]
+    async fn unwritable_state_blocks_only_shutdown_notices() {
+        use std::os::unix::fs::PermissionsExt;
+        let (slack, url) = fake_slack().await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alerts.json");
+        let cfg = config(&url, Some(path), true);
+        let signals = |at, ok, count| Signals {
+            devices: Some(crate::devices::DeviceAlertInput {
+                fast_success_ms: Some(at),
+                unsafe_shutdowns: BTreeMap::from([("wwn-a".into(), count)]),
+                ..Default::default()
+            }),
+            ..fleet(at, true, ok)
+        };
+        let mut engine = Engine::load(cfg.clone());
+        engine.tick(T0, &signals(T0, true, 129)).await;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        for check in 1..=3 {
+            let at = T0 + check * MIN;
+            engine.tick(at, &signals(at, false, 130)).await;
+        }
+        let blocked_posts = slack.posts.lock().unwrap().clone();
+        engine
+            .tick(T0 + 4 * MIN, &signals(T0 + 4 * MIN, true, 130))
+            .await;
+        let recovered_posts = slack.posts.lock().unwrap().clone();
+        // Only the baseline was saved, so restart must detect the increase again.
+        drop(engine);
+        let mut engine = Engine::load(cfg.clone());
+        engine
+            .tick(T0 + 5 * MIN, &signals(T0 + 5 * MIN, true, 130))
+            .await;
+        let restarted_posts = slack.posts.lock().unwrap().clone();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(blocked_posts.len(), 1);
+        assert!(
+            blocked_posts[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("ollama-http failing")
+        );
+        assert_eq!(recovered_posts.len(), 2);
+        assert_eq!(recovered_posts[1]["thread_ts"], posts_ts(1));
+        assert_eq!(restarted_posts, recovered_posts);
+        engine
+            .tick(T0 + 6 * MIN, &signals(T0 + 6 * MIN, true, 130))
+            .await;
+        drop(engine);
+        let mut engine = Engine::load(cfg);
+        engine
+            .tick(T0 + 7 * MIN, &signals(T0 + 7 * MIN, true, 130))
+            .await;
+        let posts = slack.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 3);
+        assert_eq!(
+            posts[2],
+            json!({"channel":"C-test", "text":"factory-gpu: unclean shutdown recorded on wwn-a (129 → 130)"})
+        );
     }
 
     #[tokio::test]
