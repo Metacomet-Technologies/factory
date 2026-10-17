@@ -615,6 +615,57 @@ export interface components {
       /** Format: int64 */
       ts_ms: number;
     };
+    /**
+     * @description Request body of `POST /v1/devices/{device_id}/samples`, schema version 1
+     *     (docs/devices-ingest.md, "Sample fields"). The handler validates the raw JSON
+     *     itself with the contract's error codes; this type documents the shape, and a
+     *     test proves the contract examples fit it. Unknown fields are ignored, and the
+     *     server-owned fields `health`, `gpus`, `generated_at_ms`, `warnings`,
+     *     `maintenance.services` and `maintenance.ups` are rejected.
+     */
+    DeviceSampleV1: {
+      agent: components["schemas"]["SampleAgent"];
+      collector: components["schemas"]["CollectorHealth"];
+      cooling: components["schemas"]["Cooling"];
+      cpu: components["schemas"]["Cpu"];
+      /** @description Must equal the path id and the credential's device. */
+      device_id: string;
+      disk_io: components["schemas"]["DiskIo"];
+      /** @description At most 16. */
+      drives: components["schemas"]["Drive"][];
+      /** @description At most 32. */
+      filesystems: components["schemas"]["Filesystem"][];
+      identity: components["schemas"]["HostIdentity"];
+      maintenance: components["schemas"]["SampleMaintenance"];
+      memory: components["schemas"]["Ram"];
+      network: components["schemas"]["Network"];
+      /**
+       * Format: int64
+       * @description Device wall clock (Unix ms) when the fast sample was taken.
+       */
+      observed_at_ms: number;
+      /**
+       * Format: int64
+       * @description Only `1` is accepted.
+       * @example 1
+       */
+      schema_version: number;
+      /**
+       * Format: int64
+       * @description Device wall clock (Unix ms) when this attempt was sent.
+       */
+      sent_at_ms: number;
+      /**
+       * Format: int64
+       * @description Per-session counter, 1 to 2^53 − 1.
+       */
+      seq: number;
+      /**
+       * Format: uuid
+       * @description Random UUID v4 per agent process start.
+       */
+      session_id: string;
+    };
     DeviceSummary: {
       device_id: string;
       health: components["schemas"]["HealthStatus"];
@@ -1232,6 +1283,18 @@ export interface components {
        */
       ts_ms: number;
     };
+    SampleAgent: {
+      /** @description `factory-devices-agent`, at most 64 bytes. */
+      name: string;
+      /** @description Agent semver, at most 64 bytes. */
+      version: string;
+    };
+    /** @description Only the device-reported parts of maintenance; services and UPS are server-owned. */
+    SampleMaintenance: {
+      backup: components["schemas"]["BackupView"];
+      clock: components["schemas"]["ClockView"];
+      reboot: components["schemas"]["RebootView"];
+    };
     Selection: {
       /** Format: int64 */
       effective_from_ms: number;
@@ -1694,7 +1757,7 @@ export interface operations {
     /** @description Schema version 1 sample; see docs/devices-ingest.md */
     requestBody: {
       content: {
-        "application/json": Record<string, never>;
+        "application/json": components["schemas"]["DeviceSampleV1"];
       };
     };
     responses: {

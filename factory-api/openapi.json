@@ -624,6 +624,107 @@
         ],
         "type": "object"
       },
+      "DeviceSampleV1": {
+        "description": "Request body of `POST /v1/devices/{device_id}/samples`, schema version 1\n(docs/devices-ingest.md, \"Sample fields\"). The handler validates the raw JSON\nitself with the contract's error codes; this type documents the shape, and a\ntest proves the contract examples fit it. Unknown fields are ignored, and the\nserver-owned fields `health`, `gpus`, `generated_at_ms`, `warnings`,\n`maintenance.services` and `maintenance.ups` are rejected.",
+        "properties": {
+          "agent": {
+            "$ref": "#/components/schemas/SampleAgent"
+          },
+          "collector": {
+            "$ref": "#/components/schemas/CollectorHealth"
+          },
+          "cooling": {
+            "$ref": "#/components/schemas/Cooling"
+          },
+          "cpu": {
+            "$ref": "#/components/schemas/Cpu"
+          },
+          "device_id": {
+            "description": "Must equal the path id and the credential's device.",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+            "type": "string"
+          },
+          "disk_io": {
+            "$ref": "#/components/schemas/DiskIo"
+          },
+          "drives": {
+            "description": "At most 16.",
+            "items": {
+              "$ref": "#/components/schemas/Drive"
+            },
+            "type": "array"
+          },
+          "filesystems": {
+            "description": "At most 32.",
+            "items": {
+              "$ref": "#/components/schemas/Filesystem"
+            },
+            "type": "array"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/HostIdentity"
+          },
+          "maintenance": {
+            "$ref": "#/components/schemas/SampleMaintenance"
+          },
+          "memory": {
+            "$ref": "#/components/schemas/Ram"
+          },
+          "network": {
+            "$ref": "#/components/schemas/Network"
+          },
+          "observed_at_ms": {
+            "description": "Device wall clock (Unix ms) when the fast sample was taken.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "schema_version": {
+            "description": "Only `1` is accepted.",
+            "example": 1,
+            "format": "int64",
+            "maximum": 1,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "sent_at_ms": {
+            "description": "Device wall clock (Unix ms) when this attempt was sent.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "seq": {
+            "description": "Per-session counter, 1 to 2^53 − 1.",
+            "format": "int64",
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "session_id": {
+            "description": "Random UUID v4 per agent process start.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "device_id",
+          "agent",
+          "session_id",
+          "seq",
+          "observed_at_ms",
+          "sent_at_ms",
+          "identity",
+          "cpu",
+          "memory",
+          "filesystems",
+          "drives",
+          "disk_io",
+          "network",
+          "cooling",
+          "maintenance",
+          "collector"
+        ],
+        "type": "object"
+      },
       "DeviceSummary": {
         "properties": {
           "device_id": {
@@ -2847,6 +2948,43 @@
           }
         ]
       },
+      "SampleAgent": {
+        "properties": {
+          "name": {
+            "description": "`factory-devices-agent`, at most 64 bytes.",
+            "type": "string"
+          },
+          "version": {
+            "description": "Agent semver, at most 64 bytes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version"
+        ],
+        "type": "object"
+      },
+      "SampleMaintenance": {
+        "description": "Only the device-reported parts of maintenance; services and UPS are server-owned.",
+        "properties": {
+          "backup": {
+            "$ref": "#/components/schemas/BackupView"
+          },
+          "clock": {
+            "$ref": "#/components/schemas/ClockView"
+          },
+          "reboot": {
+            "$ref": "#/components/schemas/RebootView"
+          }
+        },
+        "required": [
+          "backup",
+          "clock",
+          "reboot"
+        ],
+        "type": "object"
+      },
       "Selection": {
         "properties": {
           "effective_from_ms": {
@@ -3508,6 +3646,13 @@
         ],
         "type": "object"
       }
+    },
+    "securitySchemes": {
+      "device_bearer": {
+        "description": "Per-device token (fdv1_ plus 43 base64url characters); the server stores only its SHA-256.",
+        "scheme": "bearer",
+        "type": "http"
+      }
     }
   },
   "info": {
@@ -3843,7 +3988,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object"
+                "$ref": "#/components/schemas/DeviceSampleV1"
               }
             }
           },

@@ -174,6 +174,7 @@ function remotePage(data: DeviceView | null, now: number) {
 }
 
 beforeEach(() => {
+  vi.restoreAllMocks();
   window.history.replaceState(null, "", "/");
   document.documentElement.dataset.theme = "dark";
   vi.stubGlobal(
@@ -254,6 +255,91 @@ describe("remote devices", () => {
     expect(screen.queryByRole("link", { name: "UPS" })).not.toBeInTheDocument();
     expect(screen.queryByText(/Maintenance snapshot/)).not.toBeInTheDocument();
     expect(screen.queryByText(/GPU 0/)).not.toBeInTheDocument();
+  });
+
+  it("ages a cached pushed frame to stale and offline while GETs fail, then recovers", async () => {
+    const t = 1_792_238_415_000;
+    let clock = t + 1_000;
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
+    let source: (EventTarget & Record<string, unknown>) | undefined;
+    vi.stubGlobal(
+      "EventSource",
+      class extends EventTarget {
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onmessage: ((message: MessageEvent<string>) => void) | null = null;
+        readyState = 1;
+        constructor() {
+          super();
+          source = this as unknown as EventTarget & Record<string, unknown>;
+        }
+        close() {}
+      },
+    );
+    const push = (frame: DeviceView) =>
+      act(() => {
+        (source!.onmessage as (message: MessageEvent<string>) => void)(
+          new MessageEvent("message", {
+            data: JSON.stringify({ type: "devices.sample", ts_ms: clock, data: frame }),
+          }),
+        );
+      });
+    // Every device GET fails; only the stream delivers the remote frame.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((path: string) => {
+        const url = new URL(path, "http://localhost");
+        if (url.pathname.startsWith("/v1/devices"))
+          return Promise.resolve(new Response("{}", { status: 503 }));
+        const data = fixtures();
+        const routes: Record<string, unknown> = {
+          "/v1/health": data.health,
+          "/v1/fleet": data.fleet,
+          "/v1/llm/usage": data.usage,
+          "/v1/gpu": data.gpu,
+          "/v1/ups": { generated_at_ms: 1, current: null, warnings: [] },
+          "/v1/pricing": data.pricing,
+          "/v1/agents": data.agents,
+        };
+        return Promise.resolve(new Response(JSON.stringify(routes[url.pathname] ?? null)));
+      }),
+    );
+    window.history.replaceState(null, "", "/devices/factory-console");
+    render(<App />);
+    await waitFor(() => expect(source).toBeDefined());
+    act(() => (source!.onopen as () => void)());
+    const frame = remoteView(t);
+    frame.device.memory.used = { ...frame.device.memory.used, value: 5_368_709_120 };
+    push(frame);
+    const link = within(await screen.findByRole("region", { name: "Agent link" }));
+    const summary = screen.getByRole("region", { name: "Host summary" });
+    expect(link.getByText("Live")).toBeInTheDocument();
+    expect(summary).toHaveTextContent("Host summary · Live");
+    expect(screen.getByText("HTTP 503")).toBeInTheDocument();
+
+    // The agent stops. At 46 s the cached frame is stale, not Live, with no current readings.
+    clock = t + 46_000;
+    expect(await link.findByText("Stale", {}, { timeout: 2_000 })).toBeInTheDocument();
+    expect(summary).toHaveTextContent("Host summary · Stored");
+    expect(summary).not.toHaveTextContent("12.5");
+    expect(summary).not.toHaveTextContent("5 GiB");
+    expect(within(summary).getAllByText("stale").length).toBeGreaterThanOrEqual(3);
+
+    clock = t + 121_000;
+    expect(await link.findByText("Offline", {}, { timeout: 2_000 })).toBeInTheDocument();
+    expect(summary).toHaveTextContent("Host summary · Stored");
+    expect(summary).not.toHaveTextContent("12.5");
+
+    // A fresh push recovers the page.
+    clock = t + 130_000;
+    const fresh = remoteView(t + 129_500, t + 129_800);
+    fresh.ingest = { ...fresh.ingest!, seq: 43 };
+    push(fresh);
+    expect(await link.findByText("Live", {}, { timeout: 2_000 })).toBeInTheDocument();
+    expect(link.getByText(/^Recovered/)).toBeInTheDocument();
+    expect(link.getByText("6f1c2a9e · seq 43")).toBeInTheDocument();
+    expect(summary).toHaveTextContent("Host summary · Live");
+    expect(within(summary).queryAllByText("stale")).toHaveLength(0);
   });
 
   it("keeps remote pushes apart from factory-gpu and routes both device pages", async () => {

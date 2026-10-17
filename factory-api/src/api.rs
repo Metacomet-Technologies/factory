@@ -470,7 +470,7 @@ fn caller(request: &Request<Body>) -> (String, String) {
 /// JSON and schema, then rate. Errors use ApiError, adding `error.field` and, for
 /// `unsupported_schema_version`, `accepted_schema_versions`.
 #[utoipa::path(post, path="/v1/devices/{device_id}/samples", params(("device_id"=String, Path)),
-    request_body(content=Object, description="Schema version 1 sample; see docs/devices-ingest.md", content_type="application/json"),
+    request_body(content=crate::devices_ingest::DeviceSampleV1, description="Schema version 1 sample; see docs/devices-ingest.md", content_type="application/json"),
     security(("device_bearer"=[])),
     responses(
         (status=200, body=IngestResult),
@@ -1081,6 +1081,7 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         DeviceView,
         DeviceHistory,
         IngestResult,
+        crate::devices_ingest::DeviceSampleV1,
         NetworkStatus,
         NetworkSpeedTest,
         Sample,
@@ -1091,9 +1092,30 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         LlmRequest,
         FleetChange,
         PricingChanged
-    ))
+    )),
+    modifiers(&DeviceBearer)
 )]
 struct ApiDoc;
+
+/// `device_bearer`: the per-device `fdv1_` token sent as `Authorization: Bearer`.
+struct DeviceBearer;
+
+impl utoipa::Modify for DeviceBearer {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+        openapi.components.get_or_insert_with(Default::default).add_security_scheme(
+            "device_bearer",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .description(Some(
+                        "Per-device token (fdv1_ plus 43 base64url characters); the server stores only its SHA-256.",
+                    ))
+                    .build(),
+            ),
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

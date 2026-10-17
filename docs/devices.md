@@ -270,12 +270,25 @@ factory-console shows "Waiting for first sample" until an agent uploads.
 There is no DB migration. Remote samples use the existing `device_samples`
 table.
 
-### Deploy
+### Agent build and handoff
 
-After merge, the wrap-up thread fast-forwards `/home/agent/work/factory` on
-factory-gpu and builds `target/release/factory-api` and `kiosk/dist` as
-`agent` (docs/PLAYBOOK.md); `gpu-ssh` runs as `dgarbs51`, which cannot build in
-`/home/agent`. Then Devon runs these from the Mac:
+After merge, the wrap-up thread runs these on factory-gpu as `agent`, directly
+(no sudo), in the main checkout. `gpu-ssh` runs as `dgarbs51`, which cannot
+build in `/home/agent`:
+
+```sh
+cd /home/agent/work/factory
+git status --porcelain            # must print nothing
+git fetch origin
+git merge --ff-only origin/main
+cargo build --release -p factory-api
+cd kiosk && vp install && VITE_API_BASE= vp build
+```
+
+It hands Devon `target/release/factory-api` and `kiosk/dist` with the commands
+below. Nothing is installed by the agent.
+
+### Deploy (Devon, from the Mac)
 
 ```sh
 gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api --check-only"
@@ -302,10 +315,63 @@ the same device adds a second line (rotation); a third is refused until one
 is removed. The command prints the exact undo command with its snapshot path
 under `/var/backups/factory-api/enroll-*`. No restart is needed.
 
-Check through Serve from the Mac (a wrong token must be 401):
+### Checks through Serve (human only, from the Mac)
+
+These run on Devon's Mac against the real Serve mount. Agents never run them.
+The real token goes from `op read` through stdin into `curl -H @-`; it is never
+in an argument, environment variable, URL, file or log.
+
+No credential, then a wrong one; each prints `401`:
 
 ```sh
+curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "Content-Type: application/json" -d "{}" https://factory-gpu.bearded-pompano.ts.net/v1/devices/factory-console/samples
 curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "Authorization: Bearer fdv1_wrongwrongwrongwrongwrongwrongwrongwrongabc" -H "Content-Type: application/json" -d "{}" https://factory-gpu.bearded-pompano.ts.net/v1/devices/factory-console/samples
+```
+
+A fresh synthetic sample with the enrolled credential prints the JSON result
+and `200` (`"result":"stored"`). It is the contract's partial example with
+current timestamps and a new session, so factory-console shows those
+synthetic values (and one history row) until its agent uploads:
+
+```sh
+gh api -H 'Accept: application/vnd.github.raw' 'repos/Metacomet-Technologies/factory/contents/factory-api/tests/fixtures/devices-ingest/partial.json?ref=main' > /tmp/factory-console-partial.json
+python3 - /tmp/factory-console-partial.json > /tmp/factory-console-sample.json <<'PY'
+import json, sys, time, uuid
+sample = json.load(open(sys.argv[1]))
+now = int(time.time() * 1000)
+delta = now - sample["observed_at_ms"]
+def shift(value):
+    for key, item in (value.items() if isinstance(value, dict) else enumerate(value)):
+        if isinstance(item, (dict, list)):
+            shift(item)
+        elif isinstance(key, str) and key.endswith("_ms") and not key.endswith("interval_ms") and isinstance(item, int):
+            value[key] = item + delta
+shift(sample)
+sample.update(session_id=str(uuid.uuid4()), seq=1, sent_at_ms=now)
+print(json.dumps(sample))
+PY
+op read 'op://Factory/factory-console devices token/credential' | sed 's/^/Authorization: Bearer /' | curl -sS -w '\n%{http_code}\n' -H @- -H "Content-Type: application/json" --data-binary @/tmp/factory-console-sample.json https://factory-gpu.bearded-pompano.ts.net/v1/devices/factory-console/samples
+rm -f /tmp/factory-console-partial.json /tmp/factory-console-sample.json
+```
+
+Then open `https://factory-gpu.bearded-pompano.ts.net/devices/factory-console`:
+the Agent link is Live, then Stale after 45 s and Offline after 2 minutes,
+because no agent keeps uploading.
+
+### Sandbox
+
+`scripts/sandbox up` enrolls a synthetic factory-console token
+(`.sandbox/credentials/factory-console-device-token`, hash in
+`.sandbox/device-tokens`). The fake Serve `/` mount forwards every header except
+hop-by-hop ones, strips `Tailscale-*`, and records header names only in
+`.sandbox/serve-forwarded.jsonl`. That proves the emulation forwards
+`Authorization`, not that real Serve does.
+
+```sh
+scripts/sandbox up --rows 1k --kiosk
+python3 scripts/sandbox-shims/devices-smoke.py --kiosk           # evidence: .sandbox/devices-check.json
+python3 scripts/sandbox-shims/fake-device-agent.py --interval 5   # keeps factory-console live
+scripts/sandbox down
 ```
 
 ### Rollback

@@ -24,9 +24,6 @@ futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
-# Already in the tree through rustls; used for credential hashing and comparison.
-ring = "0.17"
-subtle = "2.6"
 
 [dev-dependencies]
 tempfile = "3"

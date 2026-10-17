@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remote device ingest against this worktree's sandbox (docs/sandbox.md, "Remote devices").
+"""Remote device ingest against this worktree's sandbox (docs/devices.md, "Sandbox").
 
 Checks the fake Serve "/" mount forwards Authorization and strips identity headers,
 both devices appear, factory-gpu stays fresh, SSE refetch, retries leave no duplicate

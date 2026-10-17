@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import type { DeviceHistory, DeviceRange, DeviceView, Metric } from "../api/types";
 import type { components } from "../api/generated";
-import { linkState, metricText, type LinkState } from "../lib/devices";
+import { freshenRemote, linkState, metricText, type LinkState } from "../lib/devices";
 import { ms, number, seen } from "../lib/format";
 import { KeyValue } from "./ui/key-value";
 import { MeterBar } from "./ui/meter-bar";
@@ -166,7 +166,7 @@ function AgentLink({ view, now }: { view: DeviceView; now: number }) {
 
 export default function DevicesPage({
   deviceId,
-  view,
+  view: received,
   history,
   range,
   setRange,
@@ -187,6 +187,9 @@ export default function DevicesPage({
   live: boolean;
   now: number;
 }) {
+  // factory-gpu views come freshened by the server; a remote frame is freshened here
+  // every second, because it may be a cached push while refetches fail.
+  const view = received?.ingest != null ? freshenRemote(received, now) : received;
   const host = view?.device;
   const temperature = host?.cpu.temperature.value;
   const maintenance = host?.maintenance;
@@ -195,8 +198,9 @@ export default function DevicesPage({
     posture?.availability === "available" || posture?.availability === "stale" ? posture : null;
   const remote = view?.ingest != null;
   const link = view && remote ? linkState(view, now) : null;
-  // A remote frame that aged past 45 s on screen is stale even before the next fetch says so.
-  const status = host && (link === "stale" || link === "offline") ? "stale" : host?.health.status;
+  const status = host?.health.status;
+  // A remote frame is labeled Live only while its agent link is live.
+  const current = live && (link == null || link === "live");
   return (
     <main id="main" className="dashboard devices-page">
       <PageHeader
@@ -220,7 +224,7 @@ export default function DevicesPage({
         <div className="device-grid">
           <Panel
             title={host.identity.hostname ?? host.device_id}
-            subtitle={`Host summary · ${live ? "Live" : "Stored"} · up ${metricText(host.identity.uptime)}`}
+            subtitle={`Host summary · ${current ? "Live" : "Stored"} · up ${metricText(host.identity.uptime)}`}
             icon={<HardDrive />}
             index={0}
             className="device-summary"
@@ -229,7 +233,7 @@ export default function DevicesPage({
               <StatusChip
                 tone={healthTone(status ?? host.health.status)}
                 dot
-                pulse={live && status === "critical"}
+                pulse={current && status === "critical"}
               >
                 {status}
               </StatusChip>

@@ -515,9 +515,15 @@ impl Reader {
         )?;
         let success = field(backup, &backup_path, "last_success_ms")?;
         let attempt = field(backup, &backup_path, "last_attempt_ms")?;
+        let error = field(backup, &backup_path, "error")?;
+        // BackupView has no `detail`, so `error` is one of the fields that must be null.
         null_unless_available(
             backup_availability == Availability::Available,
-            &[("last_success_ms", success), ("last_attempt_ms", attempt)],
+            &[
+                ("last_success_ms", success),
+                ("last_attempt_ms", attempt),
+                ("error", error),
+            ],
             &backup_path,
         )?;
         let backup_at = integer(
@@ -528,11 +534,7 @@ impl Reader {
             availability: backup_availability,
             last_success_ms: opt_integer(success, &join(&backup_path, "last_success_ms"))?,
             last_attempt_ms: opt_integer(attempt, &join(&backup_path, "last_attempt_ms"))?,
-            error: opt_text(
-                field(backup, &backup_path, "error")?,
-                &join(&backup_path, "error"),
-                MAX_TEXT,
-            )?,
+            error: opt_text(error, &join(&backup_path, "error"), MAX_TEXT)?,
             observed_at_ms: self.not_newer(backup_at, &backup_path)?,
         };
         let (clock, clock_path) = child(maintenance, &path, "clock")?;
@@ -890,6 +892,61 @@ pub fn decide(last: Option<&Last>, sample: &Sample, received_at_ms: i64) -> Outc
     Outcome::Stored {
         fresh: received_at_ms.saturating_sub(sample.observed_at_ms) <= REMOTE_STALE_MS,
     }
+}
+
+/// Request body of `POST /v1/devices/{device_id}/samples`, schema version 1
+/// (docs/devices-ingest.md, "Sample fields"). The handler validates the raw JSON
+/// itself with the contract's error codes; this type documents the shape, and a
+/// test proves the contract examples fit it. Unknown fields are ignored, and the
+/// server-owned fields `health`, `gpus`, `generated_at_ms`, `warnings`,
+/// `maintenance.services` and `maintenance.ups` are rejected.
+#[derive(Debug, Serialize, serde::Deserialize, ToSchema)]
+pub struct DeviceSampleV1 {
+    /// Only `1` is accepted.
+    #[schema(minimum = 1, maximum = 1, example = 1)]
+    pub schema_version: i64,
+    /// Must equal the path id and the credential's device.
+    #[schema(pattern = "^[a-z0-9][a-z0-9-]{0,62}$")]
+    pub device_id: String,
+    pub agent: SampleAgent,
+    /// Random UUID v4 per agent process start.
+    #[schema(format = "uuid")]
+    pub session_id: String,
+    /// Per-session counter, 1 to 2^53 − 1.
+    #[schema(minimum = 1, maximum = 9007199254740991_i64)]
+    pub seq: i64,
+    /// Device wall clock (Unix ms) when the fast sample was taken.
+    pub observed_at_ms: i64,
+    /// Device wall clock (Unix ms) when this attempt was sent.
+    pub sent_at_ms: i64,
+    pub identity: HostIdentity,
+    pub cpu: Cpu,
+    pub memory: Ram,
+    /// At most 32.
+    pub filesystems: Vec<Filesystem>,
+    /// At most 16.
+    pub drives: Vec<Drive>,
+    pub disk_io: DiskIo,
+    pub network: Network,
+    pub cooling: Cooling,
+    pub maintenance: SampleMaintenance,
+    pub collector: CollectorHealth,
+}
+
+#[derive(Debug, Serialize, serde::Deserialize, ToSchema)]
+pub struct SampleAgent {
+    /// `factory-devices-agent`, at most 64 bytes.
+    pub name: String,
+    /// Agent semver, at most 64 bytes.
+    pub version: String,
+}
+
+/// Only the device-reported parts of maintenance; services and UPS are server-owned.
+#[derive(Debug, Serialize, serde::Deserialize, ToSchema)]
+pub struct SampleMaintenance {
+    pub backup: BackupView,
+    pub clock: ClockView,
+    pub reboot: RebootView,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1349,6 +1406,53 @@ mod tests {
                 ("server_owned_field", Some(format!("maintenance.{key}")))
             );
         }
+    }
+
+    #[test]
+    fn contract_examples_fit_the_documented_request_schema() {
+        // Round-tripping through DeviceSampleV1 loses no field, so the OpenAPI body
+        // schema can represent every contract example.
+        // Numbers compare by value: 1800 in the example comes back as 1800.0.
+        fn numeric(value: Value) -> Value {
+            match value {
+                Value::Number(n) => serde_json::json!(n.as_f64().unwrap()),
+                Value::Array(items) => items.into_iter().map(numeric).collect(),
+                Value::Object(map) => map.into_iter().map(|(k, v)| (k, numeric(v))).collect(),
+                other => other,
+            }
+        }
+        for fixture in [COMPLETE, PARTIAL, UNSUPPORTED] {
+            let original: Value = serde_json::from_str(fixture).unwrap();
+            let typed: DeviceSampleV1 = serde_json::from_value(original.clone()).unwrap();
+            assert_eq!(
+                numeric(serde_json::to_value(&typed).unwrap()),
+                numeric(original)
+            );
+        }
+    }
+
+    #[test]
+    fn backup_fields_are_null_unless_available() {
+        // The partial example reports backup availability `error` with every field null.
+        for key in ["error", "last_success_ms", "last_attempt_ms"] {
+            let value: Value = if key == "error" {
+                "status file unreadable".into()
+            } else {
+                AT.into()
+            };
+            assert_eq!(
+                rejected(&edit(PARTIAL, |v| v["maintenance"]["backup"][key] = value.clone())),
+                ("invalid_metric", Some(format!("maintenance.backup.{key}"))),
+            );
+        }
+        let failed = edit(COMPLETE, |v| {
+            v["maintenance"]["backup"]["error"] = "last run exited 1".into()
+        });
+        let sample = parse(&failed, "factory-console", AT).unwrap();
+        assert_eq!(
+            sample.host.maintenance.backup.error.as_deref(),
+            Some("last run exited 1")
+        );
     }
 
     #[test]

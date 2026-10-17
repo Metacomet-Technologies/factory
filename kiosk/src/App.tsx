@@ -208,7 +208,9 @@ export default function App() {
           error={deviceCurrent.error}
           loading={deviceCurrent.loading}
           connected={live.connected}
-          live={remoteView != null && remoteView === remoteLive}
+          // A pushed frame triggers a refetch, so the newer GET is just as current; the
+          // page shows Live only while the agent link itself is live.
+          live={live.connected && remoteView != null}
           now={now}
         />
       ) : path === "/devices/factory-gpu" ? (

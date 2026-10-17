@@ -208,35 +208,6 @@ The API's usage snapshot and refresh trigger also point inside `.sandbox`.
 Without a synthetic `.sandbox/usage.json`, Frontier CLIs show unknown usage;
 the sandbox never displays the host's account quota snapshot.
 
-## Remote devices (MET-219)
-
-Every fake Serve path other than `/control` and `/slack` is the Serve `/`
-mount: it proxies to this worktree's factory-api with all headers except
-hop-by-hop ones, Authorization included, strips incoming `Tailscale-*` headers
-and sets `X-Forwarded-For`. It records header names only, never values, in
-`.sandbox/serve-forwarded.jsonl`. This proves the emulation forwards
-Authorization, not that real Serve does.
-
-`up` enrolls one synthetic device: a random token in
-`.sandbox/credentials/factory-console-device-token` (0600) and its hash line in
-`.sandbox/device-tokens`, which factory-api reads through `--device-tokens`.
-`fake-device-agent.py` builds schema-v1 samples from the contract fixtures in
-`factory-api/tests/fixtures/devices-ingest/` with current timestamps and
-uploads them through fake Serve, following the agent retry rules. It never
-prints the token. `devices-smoke.py` checks the 401 challenge, spoofed identity
-headers, 403 for factory-gpu, that Authorization is forwarded, both devices,
-factory-gpu freshness, SSE refetch, retries without duplicate history rows,
-stale after 45 s, unknown after a `down`/`up` restart and recovery. Evidence is
-saved at `.sandbox/devices-check.json`. It takes about three minutes plus the
-restart; `--no-restart` skips the restart step.
-
-```sh
-scripts/sandbox up --rows 1k --kiosk
-python3 scripts/sandbox-shims/devices-smoke.py --kiosk
-python3 scripts/sandbox-shims/fake-device-agent.py --interval 5   # keep factory-console live for screenshots
-scripts/sandbox down
-```
-
 ## Network fakes (MET-197)
 
 The namespace has no route out, so every network probe hits a fixture. Each file
