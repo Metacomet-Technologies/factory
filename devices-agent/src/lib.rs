@@ -282,8 +282,13 @@ fn visible(root: &Path, filesystems: Vec<Filesystem>) -> Vec<Filesystem> {
 }
 
 fn clip(text: &mut String) {
-    if text.len() > MAX_TEXT {
-        let mut end = MAX_TEXT;
+    clip_to(text, MAX_TEXT);
+}
+
+/// Truncate to at most `max` bytes on a char boundary.
+fn clip_to(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut end = max;
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -332,23 +337,23 @@ fn conform_metric(metric: &mut Metric, sample_at: i64) {
     }
 }
 
-/// Unique names: a repeated sensor name gets ` #2`, ` #3`, ...
+/// Unique names: a repeated sensor name gets ` #2`, ` #3`, ... The base is cut
+/// to leave room for the suffix, so a name at the 256-byte limit still gets a
+/// distinct candidate and the loop ends (at most one try per name already seen).
 fn unique_names(items: &mut [NamedMetric]) {
     let mut seen = BTreeSet::new();
     for item in items.iter_mut() {
         clip(&mut item.name);
-        if !seen.insert(item.name.clone()) {
-            let base = item.name.clone();
-            let mut n = 2;
-            loop {
-                let mut candidate = format!("{base} #{n}");
-                clip(&mut candidate);
-                if seen.insert(candidate.clone()) {
-                    item.name = candidate;
-                    break;
-                }
-                n += 1;
+        let mut n = 2;
+        while !seen.insert(item.name.clone()) {
+            let suffix = format!(" #{n}");
+            let mut candidate = item.name.clone();
+            clip_to(&mut candidate, MAX_TEXT - suffix.len());
+            candidate.push_str(&suffix);
+            if !seen.contains(&candidate) {
+                item.name = candidate;
             }
+            n += 1;
         }
     }
 }
@@ -450,6 +455,31 @@ pub fn conform(sample: &mut DeviceSampleV1) {
         conform_metric(metric, at);
     }
     let m = &mut sample.maintenance;
+    // The server accepts integers 0 to 2^53-1 only; anything else fails that
+    // source, not the whole sample.
+    let in_range = |values: &[Option<i64>]| {
+        values
+            .iter()
+            .flatten()
+            .all(|v| (0..=MAX_INT as i64).contains(v))
+    };
+    if m.backup.availability == Availability::Available
+        && !in_range(&[m.backup.last_success_ms, m.backup.last_attempt_ms])
+    {
+        m.backup.availability = Availability::Error;
+    }
+    let r = &m.reboot;
+    if r.availability == Availability::Available
+        && !in_range(&[
+            r.pending_since_ms,
+            r.days_pending,
+            r.consecutive_skips,
+            r.last_check_ms,
+        ])
+    {
+        m.reboot.availability = Availability::Error;
+        m.reboot.detail = Some("integer outside 0 to 2^53-1".into());
+    }
     m.backup.observed_at_ms = m.backup.observed_at_ms.min(at);
     clip_opt(&mut m.backup.error);
     if m.backup.availability != Availability::Available {
@@ -748,21 +778,26 @@ impl Uploader {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        match response.bytes().await {
-            Ok(bytes) => classify(
-                status,
-                retry_after.as_deref(),
-                &bytes[..bytes.len().min(65_536)],
-            ),
-            Err(error) if (200..300).contains(&status) => {
-                debug!(why = kind(&error), "accepted, response body unreadable");
-                classify(status, None, b"")
+        // Read at most 64 KiB. A truncated or timed-out body still has a status,
+        // and the status alone decides drop, hold or retry.
+        let mut response = response;
+        let mut body = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    body.extend_from_slice(&chunk[..chunk.len().min(65_536 - body.len())]);
+                    if body.len() >= 65_536 {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    debug!(status, why = kind(&error), "response body incomplete");
+                    break;
+                }
             }
-            Err(error) => Verdict::Retry {
-                why: kind(&error),
-                after: None,
-            },
         }
+        classify(status, retry_after.as_deref(), &body)
     }
 }
 

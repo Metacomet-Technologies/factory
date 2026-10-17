@@ -785,3 +785,215 @@ fn capabilities_name_every_source() {
     assert_eq!(find("cpu.temperature"), Some(Availability::Available));
     assert_eq!(find("cpu.utilization"), Some(Availability::Stale));
 }
+
+/// Run a sample on a thread so a non-terminating collector fails the test
+/// instead of hanging it.
+fn sample_within(root: &Path, limit: Duration) -> DeviceSampleV1 {
+    let root = root.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let sample = collector(&root, &new_session_id().unwrap()).sample(1_000_000);
+        let _ = tx.send(sample);
+    });
+    rx.recv_timeout(limit).expect("sample finished")
+}
+
+#[test]
+fn long_multibyte_sensor_collisions_stay_unique_and_terminate() {
+    let dir = tempfile::tempdir().unwrap();
+    console(dir.path());
+    // "a" + 130 two-byte chars: 261 bytes, so the 256-byte cut lands mid-char.
+    let chip = format!("a{}", "é".repeat(130));
+    for index in 1..=4 {
+        let base = format!("sys/class/hwmon/hwmon{index}");
+        write(dir.path(), &format!("{base}/name"), &format!("{chip}\n"));
+        write(
+            dir.path(),
+            &format!("{base}/temp1_input"),
+            &format!("{}000\n", 30 + index),
+        );
+        write(dir.path(), &format!("{base}/fan1_input"), "1200\n");
+    }
+    let sample = sample_within(dir.path(), Duration::from_secs(10));
+    assert_eq!(locally_valid(&sample), Ok(()));
+    let body = serde_json::to_vec(&sample).unwrap();
+    assert!(String::from_utf8(body).is_ok());
+    for list in [&sample.cooling.temperatures, &sample.cooling.fans] {
+        let long: Vec<_> = list.iter().filter(|t| t.name.starts_with("aé")).collect();
+        assert_eq!(long.len(), 4);
+        let names: std::collections::BTreeSet<_> = long.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names.len(), 4, "unique: {names:?}");
+        assert!(long.iter().all(|t| t.name.len() <= 256));
+        for n in 2..=4 {
+            assert!(
+                long.iter().any(|t| t.name.ends_with(&format!(" #{n}"))),
+                "#{n}"
+            );
+        }
+    }
+    let values: Vec<_> = sample
+        .cooling
+        .temperatures
+        .iter()
+        .filter(|t| t.name.starts_with("aé"))
+        .map(|t| t.metric.value)
+        .collect();
+    assert_eq!(values, [Some(31.0), Some(32.0), Some(33.0), Some(34.0)]);
+}
+
+#[test]
+fn maintenance_integers_outside_the_contract_fail_only_that_source() {
+    let max = 9_007_199_254_740_991_i64;
+    let reboot = |days: &str, since: &str| {
+        format!(
+            r#"{{"reboot_required":false,"pending_since_ms":{since},"days_pending":{days},"consecutive_skips":0,"alert_due":false,"last_check_ms":0,"last_decision":"not-needed"}}"#
+        )
+    };
+    let backup = |at: &str| {
+        format!(r#"{{"console":{{"last_success_ms":{at},"last_attempt_ms":0,"error":null}}}}"#)
+    };
+    let cases = [
+        (
+            reboot("0", &max.to_string()),
+            backup(&max.to_string()),
+            "available",
+            "available",
+        ),
+        (reboot("-1", "0"), backup("0"), "error", "available"),
+        (
+            reboot("0", &(max + 1).to_string()),
+            backup("-1"),
+            "error",
+            "error",
+        ),
+        (
+            reboot("0", "0"),
+            backup(&(max + 1).to_string()),
+            "available",
+            "error",
+        ),
+    ];
+    for (reboot_body, backup_body, reboot_state, backup_state) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        console(dir.path());
+        write(dir.path(), REBOOT_STATUS, &reboot_body);
+        write(dir.path(), BACKUP_STATUS, &backup_body);
+        let sample = collector(dir.path(), &new_session_id().unwrap()).sample(1_000_000);
+        assert_eq!(
+            locally_valid(&sample),
+            Ok(()),
+            "{reboot_body} {backup_body}"
+        );
+        let value = json_of(&sample);
+        let m = &value["maintenance"];
+        assert_eq!(availability(&m["reboot"]), reboot_state, "{reboot_body}");
+        assert_eq!(availability(&m["backup"]), backup_state, "{backup_body}");
+        if reboot_state == "available" {
+            assert_eq!(m["reboot"]["last_check_ms"], 0);
+        } else {
+            assert!(
+                m["reboot"]["days_pending"].is_null() && m["reboot"]["pending_since_ms"].is_null()
+            );
+            assert_eq!(m["reboot"]["detail"], "integer outside 0 to 2^53-1");
+        }
+        if backup_state == "error" {
+            assert!(m["backup"]["last_success_ms"].is_null());
+        }
+        // The rest of the sample is kept.
+        assert_eq!(value["cpu"]["load1"]["value"], 0.1);
+        assert_eq!(availability(&value["memory"]["total"]), "available");
+    }
+    // Boundary values themselves are sent as-is.
+    let dir = tempfile::tempdir().unwrap();
+    console(dir.path());
+    write(dir.path(), REBOOT_STATUS, &reboot("0", &max.to_string()));
+    write(dir.path(), BACKUP_STATUS, &backup(&max.to_string()));
+    let value = json_of(&collector(dir.path(), &new_session_id().unwrap()).sample(1_000_000));
+    assert_eq!(value["maintenance"]["reboot"]["pending_since_ms"], max);
+    assert_eq!(value["maintenance"]["backup"]["last_success_ms"], max);
+}
+
+/// A raw HTTP server that reads one full request, sends `head` with a larger
+/// Content-Length than the bytes it writes, then closes or stalls.
+async fn incomplete(head: String, stall: bool) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap();
+            request.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length: usize = text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map_or(0, |v| v.trim().parse().unwrap());
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            assert!(read > 0, "client closed early");
+        }
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(br#"{"error":{"code":"inv"#).await.unwrap();
+        socket.flush().await.unwrap();
+        if stall {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+    format!("http://{address}")
+}
+
+#[tokio::test]
+async fn incomplete_response_bodies_keep_the_status_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    console(dir.path());
+    let mut agent = collector(dir.path(), &new_session_id().unwrap());
+    let body = serde_json::to_vec(&agent.sample(now_ms())).unwrap();
+    type Expect = fn(&Verdict) -> bool;
+    let cases: [(u16, &str, Expect); 8] = [
+        (400, "", |v| {
+            matches!(v, Verdict::Rejected { status: 400, .. })
+        }),
+        (413, "", |v| {
+            matches!(v, Verdict::Rejected { status: 413, .. })
+        }),
+        (415, "", |v| {
+            matches!(v, Verdict::Rejected { status: 415, .. })
+        }),
+        (401, "", |v| matches!(v, Verdict::Hold { status: 401, .. })),
+        (403, "", |v| matches!(v, Verdict::Hold { status: 403, .. })),
+        (503, "", |v| matches!(v, Verdict::Retry { after: None, .. })),
+        (
+            429,
+            "Retry-After: 3\r\n",
+            |v| matches!(v, Verdict::Retry { after: Some(d), .. } if *d == Duration::from_secs(3)),
+        ),
+        (200, "", |v| matches!(v, Verdict::Accepted { .. })),
+    ];
+    for stall in [false, true] {
+        for (status, extra, expected) in cases {
+            let head = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n{extra}Connection: close\r\n\r\n"
+            );
+            let api = incomplete(head, stall).await;
+            let mut timing = quick();
+            timing.attempt_timeout = Duration::from_millis(300);
+            let uploader = Uploader::new(&api, Token::parse(TOKEN).unwrap(), timing).unwrap();
+            let started = Instant::now();
+            let verdict = uploader.send(body.clone()).await;
+            assert!(
+                expected(&verdict),
+                "status {status} stall {stall}: {verdict:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "bounded by the attempt timeout"
+            );
+        }
+    }
+}
