@@ -1,4 +1,4 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import App from "../App";
 import { fixtures } from "../../mock/fixtures";
@@ -180,5 +180,118 @@ describe("network card", () => {
     expect(region.queryByLabelText("Loading section")).not.toBeInTheDocument();
     await act(async () => release(new Response(JSON.stringify(down))));
     expect(await region.findByText("Down · WAN")).toBeInTheDocument();
+  });
+});
+
+describe("network page", () => {
+  const open = async () => {
+    window.history.replaceState(null, "", "/network");
+    render(<App />);
+    expect(
+      await screen.findByRole("heading", { name: "Network · Latency, loss & throughput" }),
+    ).toBeInTheDocument();
+  };
+  it("routes /network and fetches each range, charting 1 h with a day of speed tests", async () => {
+    const fetch = serve(networkFixtures("down"));
+    await open();
+    expect(
+      await within(screen.getByRole("region", { name: "Live network" })).findByText("Down · WAN"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Breadcrumb" })).toHaveTextContent("network");
+    for (const [range, speed] of [
+      ["1h", "24h"],
+      ["7d", "7d"],
+      ["30d", "30d"],
+      ["24h", "24h"],
+    ] as const) {
+      fireEvent.click(screen.getByRole("button", { name: range }));
+      await waitFor(() =>
+        expect(fetch).toHaveBeenCalledWith(`/v1/network/history?range=${range}`, expect.anything()),
+      );
+      expect(fetch).toHaveBeenCalledWith(
+        `/v1/network/speed-tests?range=${speed}`,
+        expect.anything(),
+      );
+      expect(screen.getByRole("button", { name: range })).toHaveAttribute("aria-pressed", "true");
+    }
+    expect(await screen.findByRole("region", { name: "WAN latency and loss" })).toHaveTextContent(
+      "1.1.1.1 solid · 8.8.8.8 dashed",
+    );
+  });
+  it("lists events with layer, duration and peak loss, including the open one", async () => {
+    serve(networkFixtures("down"));
+    await open();
+    const events = within(screen.getByRole("region", { name: "Network events" }));
+    const rows = await events.findAllByRole("row");
+    expect(rows[1]).toHaveTextContent(/DownWAN3 min · ongoing100%—Ongoing/);
+    expect(rows[2]).toHaveTextContent(/DownWAN5 min100%—Recovered/);
+    expect(rows[3]).toHaveTextContent(/Degraded · lossLAN20 min30%—Recovered/);
+    expect(rows[4]).toHaveTextContent(/Degraded · latencyDNS1 h0%312 msAPI restarted/);
+  });
+  it("lists the newest speed tests with failures and their errors", async () => {
+    serve(networkFixtures("healthy", false, "24h", "24h"));
+    await open();
+    const tests = within(screen.getByRole("region", { name: "Speed tests" }));
+    expect(await tests.findByText("Newest 8 of 8 in the last 24h")).toBeInTheDocument();
+    const rows = tests.getAllByRole("row");
+    expect(rows[1]).toHaveTextContent(/timeout——9.1 ms— \/ —test exceeded 60 s/);
+    expect(tests.getByText("HTTP 500 from speed endpoint").closest("tr")).toHaveTextContent(
+      /failed——/,
+    );
+    expect(tests.getAllByText("ok")).toHaveLength(6);
+  });
+  it("pages older events and returns to the newest page", async () => {
+    const network = networkFixtures();
+    const fetch = serve(network, (path) =>
+      path === "/v1/network/events?limit=20"
+        ? json({ events: network.events.slice(0, 1), next_before: 3 })
+        : null,
+    );
+    await open();
+    const events = within(screen.getByRole("region", { name: "Network events" }));
+    fireEvent.click(await events.findByRole("button", { name: "Older events" }));
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith("/v1/network/events?limit=20&before=3", expect.anything()),
+    );
+    fireEvent.click(await events.findByRole("button", { name: "Newest events" }));
+    expect(await events.findByRole("button", { name: "Older events" })).toBeInTheDocument();
+  });
+  it("shows loading text while history and events are pending", async () => {
+    serve(networkFixtures(), (path) =>
+      path.startsWith("/v1/network/history") || path === "/v1/network/events?limit=20"
+        ? new Promise(() => {})
+        : null,
+    );
+    await open();
+    expect(screen.getByText("Loading history…")).toBeInTheDocument();
+    expect(screen.getByText("Loading events…")).toBeInTheDocument();
+  });
+  it("shows empty states before any sample, test or event exists", async () => {
+    serve(networkFixtures("healthy", true));
+    await open();
+    expect(await screen.findAllByText("No samples in this range.")).toHaveLength(4);
+    expect(await screen.findByText("No network events.")).toBeInTheDocument();
+    expect(screen.getAllByText("No speed tests in this range.")).toHaveLength(2);
+    expect(screen.getAllByText("No sample yet")).toHaveLength(5);
+    expect(
+      within(screen.getByRole("region", { name: "Live network" })).getByText("No data"),
+    ).toBeInTheDocument();
+  });
+  it("keeps each failed request visible without hiding the rest of the page", async () => {
+    serve(networkFixtures("healthy", false, "24h", "24h"), (path) =>
+      path.startsWith("/v1/network/history") || path.startsWith("/v1/network/events")
+        ? json({}, 503)
+        : null,
+    );
+    await open();
+    expect(await screen.findByText("History: HTTP 503")).toBeInTheDocument();
+    expect(await screen.findByText("Event bands unavailable: HTTP 503")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("region", { name: "Network events" })).getByRole("alert"),
+    ).toHaveTextContent("HTTP 503");
+    expect(
+      within(screen.getByRole("region", { name: "Live network" })).getByText("Healthy"),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Newest 8 of 8 in the last 24h")).toBeInTheDocument();
   });
 });

@@ -21,6 +21,7 @@ import { NetworkSection } from "./components/network";
 import UpsPage from "./components/ups-page";
 import DevicesPage from "./components/devices-page";
 import LlmPage from "./components/llm-page";
+import NetworkPage from "./components/network-page";
 
 /** Same-origin links without a modifier key route in-app; everything else falls through. */
 function followLink(event: globalThis.MouseEvent) {
@@ -195,6 +196,8 @@ export default function App() {
         />
       ) : path === "/llm" ? (
         <LlmPage usage={usage} pricing={pricing} range={usageRange} setRange={setUsageRange} />
+      ) : path === "/network" ? (
+        <NetworkPage status={network} now={now} revision={live.snapshotRevision} />
       ) : path === "/ups" ? (
         <UpsPage
           current={upsCurrent}

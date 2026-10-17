@@ -11,6 +11,7 @@ import type {
 } from "../api/types";
 import { mbps } from "./format";
 import {
+  chartStart,
   eventBands,
   freshStatus,
   layerNow,
@@ -196,6 +197,11 @@ describe("network history shapes", () => {
       { id: 3, layer: "wan", tone: "fail", x1: since, x2: since + 60_000, open: false },
       { id: 7, layer: "wan", tone: "warn", x1: NOW - 300_000, x2: NOW - 240_000, open: false },
     ]);
+  });
+  it("starts a chart at the oldest point inside the window, or at the window start", () => {
+    expect(chartStart(1_000, [])).toBe(1_000);
+    expect(chartStart(1_000, [5_000, 3_000, 4_000])).toBe(3_000);
+    expect(chartStart(1_000, [500, 3_000])).toBe(1_000);
   });
   it("charts failed speed tests with null rates, never zero", () => {
     const [ok, failed] = speedRows([

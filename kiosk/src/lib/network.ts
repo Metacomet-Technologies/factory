@@ -45,7 +45,11 @@ export function linkLabel(link: NetworkLinkState): string {
 
 /** Episode text without the layer, for tables that show the layer in its own column. */
 export function episodeLabel(link: NetworkLinkState): string {
-  return link.state === "degraded" ? `Degraded · ${reasonLabel[link.reason]}` : linkLabel(link);
+  return link.state === "degraded"
+    ? `Degraded · ${reasonLabel[link.reason]}`
+    : link.state === "down"
+      ? "Down"
+      : "Healthy";
 }
 
 /** Three 30 s ticks without a sample: the kiosk no longer vouches for the stored state. */
@@ -148,6 +152,15 @@ export function eventBands(events: NetworkEvent[], since: number, now: number): 
     const tone = event.state === "down" ? "fail" : "warn";
     return [{ id: event.id, layer: event.layer, tone, x1, x2, open: event.ended_ms == null }];
   });
+}
+
+/**
+ * Left edge of a chart: the window start, or the oldest point when history is shorter,
+ * so a fresh install's few minutes of samples are not a sliver at the right edge.
+ */
+export function chartStart(since: number, times: number[]): number {
+  const first = times.reduce((oldest, time) => Math.min(oldest, time), Infinity);
+  return Number.isFinite(first) ? Math.max(since, first) : since;
 }
 
 export type SpeedRow = {
