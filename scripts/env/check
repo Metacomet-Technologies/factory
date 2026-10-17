@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Read-only check of the toolchain contract in docs/environments.md.
+
+Usage: scripts/env/check --env <name>
+
+Prints one JSON object: the environment name, overall `ok`, and every contract
+item with expected and actual values. Exits 1 when a required item fails, 2 on
+usage errors. Items the environment is exempt from are reported with
+`"required": false` and never fail the run.
+
+Versions resolve the way builds do: `rustc` and `cargo` run in the repository
+root (honoring rust-toolchain.toml), `node`, `pnpm` and `vp` run in `kiosk/`.
+rustup auto-install is off unless the caller sets RUSTUP_AUTO_INSTALL.
+The output never includes environment variables; command output is cut to its
+first line.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+REPO = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+KIOSK = os.path.join(REPO, "kiosk")
+
+# ponytail: Vite+ has no repo pin file yet; keep this in step with .agents/setup and ci.yml.
+VITE_PLUS = "1.1.0"
+LAYOUT_CHECKOUT = "/home/agent/work/factory"
+LAYOUT_VP_ENV = "/home/agent/.config/vite-plus/env"
+
+# (contract item, command that proves it) for system packages; requirements, not install paths.
+SYSTEM = [
+    ("build-essential", "cc"),
+    ("build-essential:make", "make"),
+    ("pkg-config", "pkg-config"),
+    ("curl", "curl"),
+    ("python3", "python3"),
+    ("util-linux", "flock"),
+    ("bubblewrap", "bwrap"),
+    ("shellcheck", "shellcheck"),
+    ("sqlite3", "sqlite3"),
+    ("zstd", "zstd"),
+    ("rsync", "rsync"),
+    ("xz-utils", "xz"),
+]
+
+EXEMPT = {
+    "orb": {"playwright", "layout:checkout", "layout:vite-plus-env"},
+    "cursor": set(),
+    "sandbox": {"playwright", "layout:checkout", "layout:vite-plus-env"},
+    "ci": {"playwright", "layout:checkout", "layout:vite-plus-env"},
+    "factory-gpu": set(),
+    "factory-console": set(),
+}
+
+
+def first_line(text):
+    lines = text.strip().splitlines()
+    return lines[0].strip()[:200] if lines else ""
+
+
+def run(argv, cwd):
+    env = dict(os.environ)
+    env.setdefault("RUSTUP_AUTO_INSTALL", "0")
+    try:
+        out = subprocess.run(
+            argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return first_line(out.stdout) or None
+
+
+def version(text, pattern=r"(\d+\.\d+\.\d+)"):
+    match = re.search(pattern, text or "")
+    return match.group(1) if match else None
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def pins():
+    toolchain = read(os.path.join(REPO, "rust-toolchain.toml")) or ""
+    channel = re.search(r'^\s*channel\s*=\s*"([^"]+)"', toolchain, re.M)
+    components = re.search(r"^\s*components\s*=\s*\[([^\]]*)\]", toolchain, re.M)
+    engines = json.loads(read(os.path.join(KIOSK, "package.json")) or "{}").get("devEngines", {})
+    return {
+        "rust": channel.group(1) if channel else None,
+        "components": re.findall(r'"([^"]+)"', components.group(1)) if components else [],
+        "node": engines.get("runtime", {}).get("version"),
+        "node-root": (read(os.path.join(REPO, ".node-version")) or "").strip().lstrip("v") or None,
+        "pnpm": engines.get("packageManager", {}).get("version"),
+    }
+
+
+def os_release(root):
+    fields = {}
+    for line in (read(os.path.join(root, "etc/os-release")) or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            fields[key] = value.strip().strip('"')
+    return fields
+
+
+def playwright_dirs(root):
+    candidates = []
+    if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        candidates.append(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
+    candidates.append(os.path.join(KIOSK, ".browsers"))
+    candidates.append(os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright"))
+    for base in candidates:
+        found = sorted(os.path.basename(p) for p in glob.glob(os.path.join(base, "chromium-*")))
+        if found:
+            return base, found
+    return None, []
+
+
+def items(root):
+    pin = pins()
+    result = []
+
+    def add(name, expected, actual, ok):
+        result.append({"name": name, "expected": expected, "actual": actual, "ok": bool(ok)})
+
+    release = os_release(root)
+    family = " ".join([release.get("ID", ""), release.get("ID_LIKE", "")]).split()
+    arch = run(["uname", "-m"], REPO)
+    add(
+        "os",
+        "ubuntu (or debian family) x86_64",
+        f"{release.get('PRETTY_NAME', 'unknown')} {arch or 'unknown'}",
+        ("ubuntu" in family or "debian" in family) and arch == "x86_64",
+    )
+
+    rustc = run(["rustc", "--version"], REPO)
+    add("rust", pin["rust"], rustc, pin["rust"] and version(rustc) == pin["rust"])
+    for component, argv in (("rustfmt", ["cargo", "fmt", "--version"]), ("clippy", ["cargo", "clippy", "--version"])):
+        out = run(argv, REPO)
+        add(f"rust:{component}", "installed", out, component in pin["components"] and out)
+
+    node = run(["node", "--version"], KIOSK)
+    add("node", pin["node"], node, pin["node"] and version(node) == pin["node"])
+    node_root = run(["node", "--version"], REPO)
+    add("node:repo-root", pin["node-root"], node_root, pin["node-root"] and version(node_root) == pin["node-root"])
+    pnpm = run(["pnpm", "--version"], KIOSK)
+    add("pnpm", pin["pnpm"], pnpm, pin["pnpm"] and version(pnpm) == pin["pnpm"])
+    vp = run(["vp", "--version"], KIOSK)
+    add("vite-plus", VITE_PLUS, vp, version(vp) == VITE_PLUS)
+
+    base, browsers = playwright_dirs(root)
+    add(
+        "playwright",
+        "chromium-* browser directory",
+        f"{base}: {', '.join(browsers)}" if browsers else None,
+        browsers,
+    )
+
+    certs = os.path.join(root, "etc/ssl/certs/ca-certificates.crt")
+    add("ca-certificates", certs, certs if os.path.isfile(certs) else None, os.path.isfile(certs))
+    for name, command in SYSTEM:
+        path = shutil.which(command)
+        add(name, f"{command} on PATH", path, path)
+
+    checkout = os.path.join(root, LAYOUT_CHECKOUT.lstrip("/"))
+    is_checkout = os.path.isfile(os.path.join(checkout, "kiosk", "package.json"))
+    add("layout:checkout", f"{LAYOUT_CHECKOUT} is a factory checkout", checkout if is_checkout else None, is_checkout)
+    vp_env = os.path.join(root, LAYOUT_VP_ENV.lstrip("/"))
+    add("layout:vite-plus-env", LAYOUT_VP_ENV, vp_env if os.path.isfile(vp_env) else None, os.path.isfile(vp_env))
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--env", required=True, choices=sorted(EXEMPT))
+    # Tests point host paths (/etc, /home/agent) at a fixture tree.
+    parser.add_argument("--root", default="/", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    exempt = EXEMPT[args.env]
+    report = items(args.root)
+    for item in report:
+        item["required"] = item["name"] not in exempt
+    ok = all(item["ok"] for item in report if item["required"])
+    json.dump({"env": args.env, "ok": ok, "items": report}, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

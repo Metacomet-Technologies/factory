@@ -1,0 +1,21 @@
+{
+  "uname": "x86_64",
+  "rustc": "rustc {rust} (b940084d7 2026-09-28)",
+  "cargo fmt": "rustfmt 1.10.0-stable (b940084d7e 2026-09-28)",
+  "cargo clippy": "clippy 0.1.99 (b940084d7e 2026-09-28)",
+  "node": "v{node}",
+  "pnpm": "{pnpm}",
+  "vp": "vp v{vp}",
+  "cc": "",
+  "make": "",
+  "pkg-config": "",
+  "curl": "",
+  "python3": "",
+  "flock": "",
+  "bwrap": "",
+  "shellcheck": "",
+  "sqlite3": "",
+  "zstd": "",
+  "rsync": "",
+  "xz": ""
+}

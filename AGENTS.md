@@ -6,15 +6,16 @@ merge or use main without an explicit dispatcher
 continuation. Never print or commit secrets or production data.
 GitHub auth is preconfigured; never set token environment variables or run gh auth commands.
 
-Before pushing: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test --workspace`. Kiosk: `vp check`, `vp test --run`, `vp build`.
-Dispatcher: `node --test scripts/dispatch` (not `node --check`).
-Live checks: `scripts/sandbox` (`docs/sandbox.md`), never production.
+Before pushing: `scripts/env/check` (`docs/environments.md`), `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`.
+Kiosk: `vp check`, `vp test --run`, `vp build`.
+Dispatcher: `node --test scripts/dispatch` (not `--check`).
+Live checks: `scripts/sandbox`, never production.
 Read `docs/agents/<area>.md` when Isolation touches it: `db.md` for DB work
 (incl. meter/API/pricing), `kiosk.md` for kiosk, `cloud.md`.
 
-Linear: read issues; comment/link PRs only on your issue; create related follow-ups
-in Backlog. Never edit other issues or existing status, labels, assignee or priority.
+Linear: comment/link PRs only on your issue; create related follow-ups in
+Backlog. Never edit other issues or existing status, labels, assignee or priority.
 Dispatcher owns control markers. Never write/delete `factory-dispatch` or
 `factory-qa` markers unless explicitly authorized. Only standalone unfenced
 exact-match lines count; quoted or inline markers do not.

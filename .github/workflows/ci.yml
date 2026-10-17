@@ -77,6 +77,14 @@ jobs:
         run: |
           npm install --prefix "$RUNNER_TEMP/kiosk-tools" --no-audit --no-fund vite-plus@1.1.0 "pnpm@$PNPM_VERSION"
           echo "$RUNNER_TEMP/kiosk-tools/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Check the toolchain contract (docs/environments.md)
+        working-directory: .
+        # The hosted image has rustup but not the pinned toolchain; let rust-toolchain.toml install it.
+        env:
+          RUSTUP_AUTO_INSTALL: '1'
+        run: |
+          python3 -B scripts/env/test_check.py
+          scripts/env/check --env ci
       - run: node --version && pnpm --version && vp --version
       - name: Install kiosk dependencies and select its local CLI
         run: |
