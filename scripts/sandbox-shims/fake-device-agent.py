@@ -45,11 +45,23 @@ def shift(value, delta):
             shift(item, delta)
 
 
-def build(variant, session, seq, observed_ms):
+def build(variant, session, seq, observed_ms, smart_failed=False, slow_at_ms=None):
     sample = json.loads((FIXTURES / f"{variant}.json").read_text())
     shift(sample, observed_ms - sample["observed_at_ms"])
     sample["session_id"] = session
     sample["seq"] = seq
+    if slow_at_ms is not None:
+        # Slow inventory frozen at one time, so its age grows while fast samples continue.
+        slow_at_ms = min(slow_at_ms, observed_ms)
+        sample["collector"]["last_slow_ms"] = slow_at_ms
+        sample["cpu"]["temperature"]["observed_at_ms"] = slow_at_ms
+        for fs in sample["filesystems"]:
+            for key in ("size", "used", "used_percent", "inodes_used_percent"):
+                fs[key]["observed_at_ms"] = slow_at_ms
+    if smart_failed:
+        for drive in sample["drives"]:
+            if drive["smart"]["availability"] == "available":
+                drive["smart"]["passed"] = False
     sample["cpu"]["utilization"]["value"] = round(8 + 6 * random.random(), 1) \
         if sample["cpu"]["utilization"]["availability"] == "available" else None
     return sample
@@ -79,7 +91,7 @@ def post(sample, *, device="factory-console", credential=None, headers=None, por
         return error.code, parsed, error.headers
 
 
-def run(interval, count, variant):
+def run(interval, count, variant, smart_failed=False, slow_at_ms=None):
     session = str(uuid.uuid4())
     credential = token()
     buffer, seq, dropped, backoff = [], 0, 0, 1.0
@@ -87,7 +99,7 @@ def run(interval, count, variant):
     while count is None or seq < count or buffer:
         if (count is None or seq < count) and time.monotonic() >= next_sample:
             seq += 1
-            buffer.append(build(variant, session, seq, int(time.time() * 1000)))
+            buffer.append(build(variant, session, seq, int(time.time() * 1000), smart_failed, slow_at_ms))
             if len(buffer) > BUFFER:
                 buffer.pop(0)
                 dropped += 1
@@ -128,9 +140,13 @@ def main():
     parser.add_argument("--interval", type=float, default=15.0)
     parser.add_argument("--count", type=int, help="stop after this many samples (default: run until killed)")
     parser.add_argument("--variant", choices=["complete", "unsupported", "partial"], default="complete")
+    parser.add_argument("--smart-failed", action="store_true", help="report SMART failed on every drive")
+    parser.add_argument("--slow-age-ms", type=int,
+                        help="freeze slow inventory this many ms before start, so it ages past 600000 ms")
     args = parser.parse_args()
+    slow_at_ms = None if args.slow_age_ms is None else int(time.time() * 1000) - args.slow_age_ms
     try:
-        run(args.interval, args.count, args.variant)
+        run(args.interval, args.count, args.variant, args.smart_failed, slow_at_ms)
     except KeyboardInterrupt:
         sys.exit(0)
 

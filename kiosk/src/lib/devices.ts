@@ -55,41 +55,139 @@ export function linkState(view: DeviceView, now: number): LinkState {
   return "live";
 }
 
+type HealthStatus = DeviceView["device"]["health"]["status"];
+
+/** devices.rs: slow inventory is stale once older than twice its 300 s interval. */
+export const SLOW_STALE_MS = 600_000;
+
+const RANK: Record<HealthStatus, number> = {
+  critical: 4,
+  warning: 3,
+  stale: 2,
+  unknown: 1,
+  healthy: 0,
+};
+
+/** Reasons `assess_within` derives from freshness and presence; recomputed here as of `now`. */
+const DERIVED = new Set([
+  "collector.fast",
+  "ingest.transport",
+  "cpu.utilization",
+  "memory.total",
+  "filesystem.size",
+]);
+
 /**
- * A remote view as of `now`. Once the link is stale or offline, the fast readings are
- * marked stale and health becomes stale, as the server's freshen does, so a cached
- * frame (for example a pushed frame while GETs fail) never shows them as current.
+ * A remote view as of `now`, following factory-api's `freshen_within` for remote
+ * devices: fast readings expire after 45 s of collection or transport age, CPU
+ * temperature and filesystems after slow inventory is older than 600000 ms, and health
+ * is reassessed from the remaining reasons. Critical and warning findings whose
+ * readings are still valid (SMART, spare, media, or fresh slow values) are kept, so a
+ * cached frame (for example a push while GETs fail) never shows expired readings as
+ * current and never hides a server finding. Transport state stays in `linkState`.
  */
 export function freshenRemote(view: DeviceView, now: number): DeviceView {
-  const state = linkState(view, now);
-  if (state !== "stale" && state !== "offline") return view;
-  const detail = `last sample at ${view.device.observed_at_ms}`;
-  const stale = (metric: Metric): Metric =>
-    metric.availability === "available"
-      ? { ...metric, value: null, availability: "stale", detail }
-      : metric;
-  const { cpu, memory, disk_io, network, health } = view.device;
+  if (linkState(view, now) === "waiting") return view;
+  const host = view.device;
+  const received = view.ingest?.last_received_at_ms;
+  const quiet = received != null && now - received > REMOTE_STALE_MS ? now - received : null;
+  const fastStale = now - host.observed_at_ms > REMOTE_STALE_MS || quiet != null;
+  const lastSlow = host.collector.last_slow_ms;
+  const slowStale = lastSlow == null || now - lastSlow > SLOW_STALE_MS;
+  if (!fastStale && !slowStale) return view;
+  const expire =
+    (detail: string) =>
+    (metric: Metric): Metric =>
+      metric.availability === "available"
+        ? { ...metric, value: null, availability: "stale", detail }
+        : metric;
+  let { cpu, memory, disk_io, network, filesystems } = host;
+  if (fastStale) {
+    const fast = expire(`last sample at ${host.observed_at_ms}`);
+    cpu = {
+      ...cpu,
+      utilization: fast(cpu.utilization),
+      iowait: fast(cpu.iowait),
+      load1: fast(cpu.load1),
+      load5: fast(cpu.load5),
+      load15: fast(cpu.load15),
+    };
+    memory = {
+      ...memory,
+      total: fast(memory.total),
+      available: fast(memory.available),
+      used: fast(memory.used),
+    };
+    disk_io = { read: fast(disk_io.read), write: fast(disk_io.write) };
+    network = { rx: fast(network.rx), tx: fast(network.tx) };
+  }
+  if (slowStale) {
+    const slow = expire("slow inventory is older than twice its interval");
+    cpu = { ...cpu, temperature: slow(cpu.temperature) };
+    filesystems = filesystems.map((fs) => ({
+      ...fs,
+      size: slow(fs.size),
+      used: slow(fs.used),
+      used_percent: slow(fs.used_percent),
+      inodes_used_percent: slow(fs.inodes_used_percent),
+    }));
+  }
+  // Findings from expired slow readings go; everything else the server found stays.
+  const reasons = host.health.reasons.filter(
+    (reason) =>
+      !DERIVED.has(reason.metric) &&
+      !(
+        slowStale &&
+        (reason.metric === "cpu.temperature" || reason.metric.startsWith("filesystem."))
+      ),
+  );
+  const add = (
+    status: HealthStatus,
+    metric: string,
+    threshold: string,
+    value: number | null,
+    detail: string,
+  ) => reasons.push({ status, metric, threshold, value, detail });
+  const lastFast = host.collector.last_fast_ms;
+  if (!host.collector.fast_ok || (lastFast != null && now - lastFast > REMOTE_STALE_MS))
+    add(
+      "stale",
+      "collector.fast",
+      "45 s",
+      lastFast == null ? null : now - lastFast,
+      host.collector.fast_ok ? "latest fast sample is older than 45 s" : "device collector failed",
+    );
+  if (cpu.utilization.availability !== "available")
+    add(
+      "unknown",
+      "cpu.utilization",
+      "present",
+      null,
+      cpu.utilization.detail ?? "CPU utilization is missing",
+    );
+  if (memory.total.availability !== "available")
+    add("unknown", "memory.total", "present", null, "memory total is missing");
+  if (!filesystems.some((fs) => fs.size.availability === "available"))
+    add("unknown", "filesystem.size", "present", null, "filesystem capacity is missing");
+  if (quiet != null)
+    add(
+      "stale",
+      "ingest.transport",
+      "45 s",
+      quiet,
+      `no sample received for ${Math.floor(quiet / 1000)} s`,
+    );
+  reasons.sort((a, b) => RANK[b.status] - RANK[a.status] || a.metric.localeCompare(b.metric));
   return {
     ...view,
     device: {
-      ...view.device,
-      cpu: {
-        ...cpu,
-        utilization: stale(cpu.utilization),
-        iowait: stale(cpu.iowait),
-        load1: stale(cpu.load1),
-        load5: stale(cpu.load5),
-        load15: stale(cpu.load15),
-      },
-      memory: {
-        ...memory,
-        total: stale(memory.total),
-        available: stale(memory.available),
-        used: stale(memory.used),
-      },
-      disk_io: { read: stale(disk_io.read), write: stale(disk_io.write) },
-      network: { rx: stale(network.rx), tx: stale(network.tx) },
-      health: { ...health, status: "stale" },
+      ...host,
+      cpu,
+      memory,
+      disk_io,
+      network,
+      filesystems,
+      health: { status: reasons[0]?.status ?? "healthy", reasons },
     },
   };
 }
