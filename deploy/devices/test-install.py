@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Unprivileged install, rollback, and SMART helper tests. No host smartctl."""
 
+import contextlib
+import grp
+import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -11,6 +15,20 @@ import tempfile
 import unittest
 
 here = pathlib.Path(__file__).resolve().parent
+
+
+def member_group():
+    extra = [group for group in os.getgroups() if group != os.getgid()]
+    if not extra:
+        raise AssertionError("need a supplementary group to prove snapshot chown")
+    return grp.getgrgid(extra[0])
+
+
+def load_helper():
+    spec = importlib.util.spec_from_file_location("smart_snapshot", here / "smart-snapshot.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class InstallerTest(unittest.TestCase):
@@ -59,6 +77,73 @@ class InstallerTest(unittest.TestCase):
         preflight = self.run_install("--preflight")
         self.assertEqual(preflight.returncode, 0, preflight.stderr)
         self.assertIn("group-readable copy", preflight.stdout)
+
+    def test_reinstall_restores_setgid_directory_and_snapshot_group(self):
+        group = member_group()
+        self.env["DEVICES_TEST_GROUP"] = group.gr_name
+        first = self.run_install()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        state = self.root / "var/lib/factory-devices"
+        snapshot = state / "smart.json"
+        self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o2750)
+        self.assertEqual(state.stat().st_gid, group.gr_gid)
+        snapshot.write_text('{"previous": true}\n')
+        os.chown(snapshot, -1, os.getgid())
+        os.chmod(snapshot, 0o600)
+        os.chown(state, -1, os.getgid())
+        os.chmod(state, 0o750)
+        second = self.run_install()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o2750)
+        self.assertEqual(state.stat().st_gid, group.gr_gid)
+        self.assertEqual(snapshot.stat().st_gid, group.gr_gid)
+        self.assertEqual(stat.S_IMODE(snapshot.stat().st_mode), 0o640)
+        self.assertEqual(snapshot.read_text(), '{"previous": true}\n')
+
+    def test_publish_assigns_group_before_replace(self):
+        module = load_helper()
+        directory = pathlib.Path(self.temp.name) / "publish"
+        directory.mkdir()
+        os.chmod(directory, 0o750)
+        destination = directory / "smart.json"
+        group = member_group()
+        module.write_snapshot(destination, {"drives": [], "tool": "absent"}, group.gr_gid)
+        self.assertEqual(destination.stat().st_gid, group.gr_gid)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o640)
+        module.write_snapshot(
+            destination, {"drives": [{"kernel": "nvme0n1"}], "observed_at_ms": 1}, group.gr_gid
+        )
+        self.assertEqual(destination.stat().st_gid, group.gr_gid)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o640)
+        self.assertEqual(json.loads(destination.read_text())["drives"][0]["kernel"], "nvme0n1")
+        self.assertEqual(list(directory.iterdir()), [destination])
+
+    def test_chown_failure_does_not_replace_the_live_snapshot(self):
+        module = load_helper()
+        directory = pathlib.Path(self.temp.name) / "publish-fail"
+        directory.mkdir()
+        destination = directory / "smart.json"
+        destination.write_text('{"previous": true}\n')
+        os.chmod(destination, 0o640)
+        with self.assertRaises(PermissionError):
+            module.write_snapshot(destination, {"drives": [], "tool": "absent"}, 0)
+        self.assertEqual(destination.read_text(), '{"previous": true}\n')
+        self.assertEqual(destination.stat().st_gid, os.getgid())
+        self.assertEqual(list(directory.iterdir()), [destination])
+        missing = directory / "fresh.json"
+        with self.assertRaises(PermissionError):
+            module.write_snapshot(missing, {"drives": []}, 0)
+        self.assertFalse(missing.exists())
+        self.assertEqual(list(directory.iterdir()), [destination])
+
+    def test_missing_publish_group_fails_before_a_root_snapshot(self):
+        module = load_helper()
+        self.assertIsNone(module.publish_group())
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error), self.assertRaises(SystemExit) as caught:
+            module.require_group("no-such-factory-api-group")
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("no-such-factory-api-group group is missing", error.getvalue())
 
     def test_rollback_restores_the_previous_helper(self):
         helper = self.root / "usr/local/lib/factory-devices/smart-snapshot.py"
