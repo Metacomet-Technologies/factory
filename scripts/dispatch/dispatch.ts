@@ -247,10 +247,11 @@ export function wrapupRunner(issue: Issue) {
 }
 // An unknown runner may be either checkout, so it conflicts with every runner.
 export const sharesCheckout = (a?: string, b?: string) => !a || !b || a === b;
-// Only wrapup-done ends a wrap-up, whatever the issue state; the dispatcher never releases one.
+// Only open issues count: Done/Canceled legacy wrap-ups predate wrapup-done. The dispatcher
+// never releases an open one.
 export function openWrapup(issue: Issue) {
   const lines = issue.comments.flatMap(comment => commentMarkers(comment.body));
-  return lines.includes(marker('wrapup')) && !lines.includes(marker('wrapup-done'));
+  return lines.includes(marker('wrapup')) && !lines.includes(marker('wrapup-done')) && !['completed', 'canceled'].includes(issue.state.type);
 }
 
 // ponytail: Linear documents metadata as arbitrary JSON, not GitHub's keys.

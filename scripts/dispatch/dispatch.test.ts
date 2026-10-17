@@ -1106,8 +1106,7 @@ test('updating threads stay pending regardless of wrap-up age; unreadable timest
     assert.equal(result.code, 0);
     assert.match(result.stdout, /"decision":"archive-pending"/);
   }
-  // The 2020 wrap-up never posted wrapup-done, so Devon gets its one stalled mention; nothing else is written.
-  assert.deepEqual(f.mutations.map(m => commentMarkers(m.input?.body ?? '')), [['<!-- factory-dispatch:wrapup-stalled -->']]);
+  assert.equal(f.mutations.length, 0);
   assert.equal(f.calls().filter(args => args[1] === 'archive').length, 0);
   f.setThreads([{ ...f.threads()[0], updated: quietUpdated }]);
   assert.equal((await f.run()).code, 0);
@@ -1898,9 +1897,8 @@ test('playbook sync pending more than 15 minutes after wrapup-done mentions Devo
 });
 
 test('one wrap-up per runner: a second merged issue waits for wrapup-done; other runners proceed', { timeout: 15_000 }, async t => {
-  const merged = (n: number, runner: string, pr: number, state = 'started') => issue(n, { labels: [], state: { type: state }, comments: [claimComment(), threadComment(runner)], attachments: [prAttachment(pr)] });
-  // A completed issue newly submitted for wrap-up holds gpu like any other.
-  const [first, second, other] = [merged(123, 'gpu', 90, 'completed'), merged(124, 'gpu', 91), merged(125, 'console', 92)];
+  const merged = (n: number, runner: string, pr: number) => issue(n, { labels: [], state: { type: 'started' }, comments: [claimComment(), threadComment(runner)], attachments: [prAttachment(pr)] });
+  const [first, second, other] = [merged(123, 'gpu', 90), merged(124, 'gpu', 91), merged(125, 'console', 92)];
   const f = await fixture(t, [first, second, other]);
   const continues = () => f.calls().filter(a => a[1] === 'continue').length;
   const result = await f.run();
@@ -1919,7 +1917,7 @@ test('one wrap-up per runner: a second merged issue waits for wrapup-done; other
 
 test('legacy runner-less threads take the runner from the claim; an unknown runner blocks every checkout', { timeout: 30_000 }, async t => {
   const claimed = (runner: string) => ({ body: `<!-- factory-dispatch:claim runner:${runner} -->`, createdAt: '2026-10-10T12:00:00.000Z' });
-  const legacy = (runner?: string) => issue(123, { labels: [], state: { type: 'completed' },
+  const legacy = (runner?: string) => issue(123, { labels: [], state: { type: 'started' },
     comments: [...(runner ? [claimed(runner)] : []), { body: `<!-- factory-dispatch:thread ${threadId} -->` }, { body: '<!-- factory-dispatch:wrapup -->' }] });
   const merged = (n: number, runner: string, pr: number) => issue(n, { labels: [], state: { type: 'started' }, comments: [claimed(runner), threadComment(runner)], attachments: [prAttachment(pr)] });
   for (const [runner, waits, ffWaits] of [['gpu', ['MET-124'], true], ['console', ['MET-125'], false], [undefined, ['MET-124', 'MET-125'], true]] as const) {
@@ -1936,30 +1934,31 @@ test('legacy runner-less threads take the runner from the claim; an unknown runn
   }
 });
 
-test('Done and Canceled issues with an unfinished wrap-up still block their runner, ping once at 60 minutes, and are never released', { timeout: 20_000 }, async t => {
+test('Done and Canceled issues with wrapup but no wrapup-done block neither wrap-ups nor the fast-forward, and get no mention', { timeout: 20_000 }, async t => {
   for (const state of ['completed', 'canceled']) {
-    const open = wrapped(123, 'gpu', null, 90, ago(60));
-    open.state = { type: state };
+    const legacy = wrapped(123, 'gpu', null, 90, ago(600));
+    legacy.state = { type: state };
     const waiting = issue(124, { labels: [], state: { type: 'started' }, comments: [claimComment(), threadComment('gpu')], attachments: [prAttachment(91)] });
-    const consoleIssue = issue(125, { labels: [], state: { type: 'started' }, comments: [claimComment(), threadComment('console')], attachments: [prAttachment(92)] });
     const behind = wrapped(126, 'console', ago(1), 93);
-    const f = await fixture(t, [open, waiting, consoleIssue, behind], { github: { 93: mergedPR() }, mainBehind: true });
-    const first = await f.run();
-    assert.equal(first.code, 0, first.stdout);
-    assert.deepEqual(decisions(first, 'wrapup-waiting').map(d => d.blocking), ['MET-123']);
-    assert.deepEqual(decisions(first, 'main-ff-waiting').map(d => d.blocking), ['MET-123']);
-    assert.deepEqual(mainWrites(f), []);
-    assert.equal(markerCount(consoleIssue, '<!-- factory-dispatch:wrapup -->'), 1, `${state}: console is independent`);
-    assert.equal(markerCount(open, '<!-- factory-dispatch:wrapup-stalled -->'), 0, `${state}: exactly 60 minutes does not alert`);
-    for (let poll = 0; poll < 2; poll++) assert.equal((await f.run(['poll'], { FAKE_NOW: String(now + 1) })).code, 0);
-    assert.equal(markerCount(open, '<!-- factory-dispatch:wrapup-stalled -->'), 1, state);
-    assert.equal(markerCount(waiting, '<!-- factory-dispatch:wrapup -->'), 0, `${state}: never released`);
-    assert.deepEqual(mainWrites(f), []);
-    assert.equal(open.state.type, state);
-    assert.ok(!f.mutations.some(m => m.operation === 'Move'));
+    // Separate fixtures: a newly submitted gpu wrap-up would itself hold the fast-forward.
+    const admission = await fixture(t, [legacy, waiting]);
+    const admitted = await admission.run();
+    assert.equal(admitted.code, 0, admitted.stdout);
+    assert.deepEqual(decisions(admitted, 'wrapup-waiting'), [], state);
+    assert.equal(markerCount(waiting, '<!-- factory-dispatch:wrapup -->'), 1, `${state}: gpu wrap-up submitted`);
+    const f = await fixture(t, [structuredClone(legacy), behind], { github: { 93: mergedPR() }, mainBehind: true });
+    const result = await f.run(['poll'], { FAKE_NOW: String(now + 1) });
+    assert.equal(result.code, 0, result.stdout);
+    assert.deepEqual(decisions(result, 'main-ff').map(d => d.issue), ['MET-126'], state);
+    assert.equal(mainWrites(f).length, 2);
+    assert.equal(f.mutations.filter(m => m.operation === 'SyncPlaybook').length, 1);
+    for (const copy of [legacy, f.issues[0]]) {
+      assert.equal(markerCount(copy, '<!-- factory-dispatch:wrapup-stalled -->'), 0, state);
+      // Archiving a Done builder is existing behavior; the legacy wrap-up itself never pings Devon.
+      assert.ok(!copy.comments.some((c: any) => c.body.includes(devon)), `${state}: no mention`);
+    }
   }
 });
-
 test('a wrap-up open more than 60 minutes mentions Devon exactly once and is never released', { timeout: 10_000 }, async t => {
   const open = wrapped(123, 'gpu', null, 90, ago(60));
   const waiting = issue(124, { labels: [], state: { type: 'started' }, comments: [claimComment(), threadComment('gpu')], attachments: [prAttachment(91)] });

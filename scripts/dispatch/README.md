@@ -662,25 +662,15 @@ Wrap-ups run after dispatch decisions; a freed slot is available next pass.
 **One wrap-up per runner (MET-214).** Each runner's wrap-ups share its main
 checkout; a cursor builder's wrap-up runs on gpu. A legacy thread marker without
 `runner:` takes the runner from the dispatch claim. With neither, the runner is
-unknown and conflicts with every runner. A wrap-up is open while its issue
-has `wrapup` without `wrapup-done`, whatever the issue state. A newly merged
+unknown and conflicts with every runner. A wrap-up is open while its issue is
+open (not Done or Canceled) and has `wrapup` without `wrapup-done`. Done and
+Canceled issues never block and get no mention, so legacy wrap-ups from before
+`wrapup-done` existed are ignored. A newly merged
 issue is not claimed while another issue's wrap-up is open on the same runner: it
 logs `wrapup-waiting` with the `blocking` issue and retries each poll. Known,
 different runners do not block each other. An open wrap-up older than 60 minutes (from its `wrapup`
 comment) gets one Devon mention with `<!-- factory-dispatch:wrapup-stalled -->`.
-The dispatcher never releases it, and Done or Canceled does not either: only
-`wrapup-done` ends it.
-
-**Rollout prerequisite (MET-214, blocked until reconciled).** A read-only
-`poll --dry-run` of this code on 2026-10-17 found 11 gpu issues with `wrapup`
-but no `wrapup-done`: MET-123, MET-124, MET-126, MET-127, MET-135, MET-138,
-MET-140, MET-157, MET-170, MET-192 (Done) and MET-211 (In Progress). Once
-deployed, each gets one `wrapup-stalled` mention, and every new gpu or Cursor
-wrap-up and the gpu fast-forward wait on them. Nothing releases them
-automatically, whether by Done/Canceled, age or archive state. Before merging,
-Devon must establish for each issue whether its wrap-up actually finished, and
-record `wrapup-done` only on actual completion evidence. Until then the rollout
-is blocked.
+The dispatcher never releases it; `wrapup-done` ends it.
 
 **Main checkout fast-forward (MET-214).** The dispatcher deploys from
 factory-gpu's `/home/agent/work/factory`, so each pass, after wrap-ups and before
