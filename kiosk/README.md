@@ -165,6 +165,63 @@ If another installation has occurred since, pass the preserved snapshot path to
 the latest-snapshot default. Then check `/ups` on the phone and confirm the console
 dashboard, including its model rows, fits above the footer without page scrolling.
 
+## Network (MET-197)
+
+The dashboard's Network card has its own row under the UPS card. It shows the
+link state badge, the latest speed test's download and upload rates, and 24 h
+sparklines for WAN latency and loss. The whole card links to `/network`. The
+badge reads `Healthy`, `Degraded · <layer> <reason>` or `Down · <layer>`, from
+the stored `state` in `GET /v1/network`. It reads `No data` when no target has a
+sample from the last 90 s, which covers the time before the first tick and a
+stalled collector. A failed or timed-out latest test shows unknown rates and its
+outcome, not the previous rates.
+
+The WAN values and sparklines reduce the two WAN targets to the healthiest one
+per bucket, meaning the lowest average RTT and the lowest loss. That follows the
+diagnosis rule that one resolver dropping ICMP does not blame the ISP.
+
+`network.sample`, every 30 s, and `network.speedtest` refetch `GET /v1/network`.
+`useHeld` keeps the previous snapshot on screen while that refetch runs, so the
+card never flashes its loading state. History refreshes with the normal 60 s poll.
+
+`/network` mirrors `/ups`. The Live panel lists every target's latest burst. The
+1h, 24h, 7d and 30d buttons switch a latency chart and a loss chart per layer.
+Each episode that overlaps the range is shaded on its own layer's charts, amber
+for degraded and red for down, and an open episode runs to now. The throughput
+chart plots download and upload in Mb/s, loaded latency on the right axis, and
+failed tests as red lines. Speed tests run every 3 h, so the 1h range charts the
+last 24 h of tests. The events table pages with `next_before`. The speed test
+table lists the newest 10 tests in range. Bands and the events table refetch
+when the open episode changes.
+
+The mock serves every network endpoint. Set `MOCK_NETWORK` to `healthy`,
+`degraded` or `down` to pick the open WAN episode. `MOCK_OUTAGE=1` serves no
+samples, tests or events.
+
+### Synthetic network check
+
+Start a fresh stack from the repository root, then run the check from `kiosk/`:
+
+```sh
+scripts/sandbox reset --rows 1k --kiosk
+# From kiosk/, with Playwright Chromium installed under this user:
+vp run network:check
+# From the repository root when finished:
+scripts/sandbox down
+```
+
+The check walks the `healthy`, `loss`, `wan-down` and `lan-down` ping fixtures
+and waits for the API to diagnose each one. It captures the dashboard in both
+themes at 1728×1117 and `/network` in every range. It asserts that neither the
+document nor the main area scrolls, that the grid ends above the footer, that no
+panel content leaves its panel, and that the faulting layer has a shaded band.
+It then runs the `ok`, `slow` and `fail` speed fixtures and checks the newest
+speed test row. It ends with `/network` at 390 px and restores the healthy
+fixtures. Screenshots and `network-check.json` go to `.amp/in/artifacts/`.
+`NETWORK_CHECK_ARTIFACTS` and `NETWORK_CHECK_PREFIX` change the directory and
+the file prefix. The run takes about 15 minutes. Its RTTs are shim fixtures and
+its rates are loopback measurements, not link speeds.
+
 ## Manual usage refresh (MET-139)
 
 The Frontier CLIs header has a keyboard-accessible refresh button on all layouts,
