@@ -67,6 +67,39 @@ output or exception text. The collector kills only its own probe process group.
   report zero turns, cost and token counts. Preserve session, weekly and known
   scoped weekly meters. Nullable resets stay null. The usage report does not
   identify Max versus Pro, so `plan` is null, not a guessed Max multiplier.
+* **Cursor:** `agent about --format json`. Record the plan only. There is no
+  headless usage command; interactive `/usage` is not scraped and dashboard
+  tokens are not extracted. Both a null email and a null tier mean
+  `not logged in`. An email with a null tier is `CLI failed`. Plans map
+  case-insensitively, with an optional `Cursor ` prefix: free, pro,
+  `Pro Plus`/`pro+` → `pro_plus`, ultra, team/teams, business, enterprise, edu.
+  Email, request id, OS and terminal fields are dropped. An ok row has a plan
+  and empty windows. Version shape is `YYYY.M.D-<hex>`, checked on CLI
+  `2026.10.16-e3cb207`. The signed-in plan fixture is synthetic; only the
+  logged-out JSON was captured.
+* **Kimi Code:** there is no `kimi usage` subcommand in 2.2.0. If
+  `127.0.0.1` and `FACTORY_KIMI_PORT` (default 58627) are already accepting
+  connections, `GET /api/v1/oauth/usage` uses the existing local server and
+  does not stop it. Otherwise the collector starts `kimi web --no-open --port`
+  with stdout discarded (the banner prints the bearer token), reads
+  `$KIMI_CODE_HOME/server.token` or `~/.kimi-code/server.token`, then kills
+  only that process group. The token file must be a regular non-symlink file,
+  mode `0600`, owned by the collector user, and a 16–128 character token.
+  The request stays on `127.0.0.1`, does not follow redirects, and caps the
+  body at 64 KiB. `limit5h` → `five_hour` (300), `limit7d` → `weekly`
+  (10080), `monthTotal` → `monthly`. `monthCode` is checked and not stored.
+  A USD `extraUsage` wallet becomes one balance from cent integers; other
+  currencies are omitted, never converted. The logged-out body
+  `No token for "kimi-code". Run /login to authenticate.` is `not logged in`
+  and the message is not stored. The ok fixture reconstructs the 2.2.0 schema;
+  this machine was not logged in, so a live ok body is still unverified.
+* **OpenCode:** `opencode stats` with no flags, verified on 1.19.3. This is
+  local session cost, not account remaining. The two box tables must be
+  present in order. Only `Total Cost` is stored, as USD `label: "session cost"`
+  with `total: null` and `amount` equal to `remaining`. Session, message and
+  token lines are shape checks and are not stored. An optional tool-usage box
+  is accepted and ignored. A model box or any other extra line is
+  `format changed`. v2 `--json` is not parsed.
 * **Codex:** JSON-RPC messages include `jsonrpc: "2.0"`.
   Wait for successful id 1 `initialize`, then send `initialized` and id 2
   `account/rateLimits/read`. Keep stdin open through the id 2 response; ignore
@@ -94,7 +127,7 @@ committed `collect.lock`; before deployment they use their local inode.
 `/var/lib/factory-usage/usage.json` contains `schema_version: 1`,
 `generated_at_ms`, private scheduling metadata `amp_details`, and `tools`.
 The API returns only `{tools}`. Entries stay ordered amp, cursor, claude-code,
-codex, kimi. Existing `tool`, `status`, `note` fields remain; note is null.
+codex, kimi, opencode. Existing `tool`, `status`, `note` fields remain; note is null.
 
 `FACTORY_USAGE_SNAPSHOT` overrides the collector's snapshot path for both reads
 and writes, including scheduling reads during `--dry-run`. The production default
@@ -104,8 +137,8 @@ Node 24.21.0 runtime: `node --test scripts/dispatch scripts/usage`.
 
 Each tracked entry adds `reason`, `observed_at_ms`, `source`, `cli_version`,
 nullable `plan`, `windows`, nullable `balance`, `balances`, and nullable
-`reset_credits_available`. Cursor and Kimi stay `not_tracked` even when the
-snapshot is missing; their added fields are null/empty.
+`reset_credits_available`. All six tools are tracked. A missing or invalid
+snapshot marks every tool `unknown`; `not_tracked` is no longer emitted.
 
 * A successful sample is `ok`. A failure clears its values, sets `unknown` with
   a fixed reason, and retains only its last-good `observed_at_ms`. More than
@@ -122,12 +155,14 @@ snapshot is missing; their added fields are null/empty.
   **decimal strings**, preserving precision without floating-point money storage.
   `balance` aliases the first member of `balances`, not an additional pool.
   `balances` resolves the ticket's singular-balance/two-Amp-pools ambiguity.
-  The additive nullable `label` identifies workspace pools; older snapshots
-  may omit it. Labels are bounded workspace slugs, not sign-in identities.
+  The additive nullable `label` identifies workspace pools or OpenCode's
+  exact `session cost`; older snapshots may omit it. Labels are bounded
+  workspace slugs or that one session-cost label, not sign-in identities.
   Amp has at most eight balances, including its two unlabeled summary pools;
   additional balances must be unique workspace USD pools with no total.
   Workspace slugs are 1–63 lowercase ASCII letters/digits/hyphens and start
-  with a letter or digit. Other tools retain the two-balance limit.
+  with a letter or digit. OpenCode's only balance is unlabeled except for
+  `session cost` and has no total. Other tools retain the two-balance limit.
   Never sum USD, orb hours and Codex credits. Codex credits are **not USD**.
 * Windows carry name, used percentage, UTC millisecond reset and nullable
   duration in minutes. Amp uses 100 minus the CLI's rounded remaining percentage;
@@ -167,11 +202,15 @@ gpu-ssh 'systemctl is-active factory-usage.timer; systemctl is-enabled factory-u
 ```
 
 The usage installer verifies all CLIs as agent from a readable directory (Node
-can be a Vite+ shim), prints one sanitized dry-run and requires all three tracked
-tools ok before changing anything. It snapshots units/state, sets directory
+can be a Vite+ shim), prints one sanitized dry-run and requires amp, cursor,
+claude-code, codex, kimi and opencode `ok` before changing anything. Cursor
+must already be logged in with a recognized plan, and Kimi must already be
+logged in; the installer does not log in. It snapshots units/state, sets directory
 permissions, installs units, starts one collection, checks file readability as
-both agent and factory-api, and requires all three tools ok through the running
-API before enabling the timer. It does not redeploy API,
+both agent and factory-api, and requires those six tools ok through the running
+API before enabling the timer. Install the API before this collector: a
+five-tool snapshot does not validate on the six-tool API, and the previous API
+rejects the six-tool snapshot. It does not redeploy API,
 touch databases or restart runners. CLI authentication/refresh and service-user
 permissions still require the administrator's actual installation verification.
 

@@ -99,11 +99,58 @@ export const codex = { jsonrpc: '2.0', id: 2, result: {
   rateLimitResetCredits: { availableCount: 3, credits: [{ id: 'private-reset-credit-id' }] },
   accountId: 'private-account-id',
 } };
-export const versions = { amp: '0.0.1791763306-ged595a (released 2026-10-12T00:01:46.000Z, 1d ago)', ampAutoReload: '0.0.1792108872-gab0eb7 (released 2026-10-16T04:40:00.000Z, 1h ago)', claude: '2.1.296 (Claude Code)', codex: 'codex-cli 0.162.1' };
+// Logged-out `agent about --format json` was captured from Cursor Agent 2026.10.16-e3cb207.
+// The signed-in tier below is synthetic; the email must never reach a snapshot.
+export const cursorAbout = {
+  cliVersion: '2026.10.16-e3cb207', latestStatus: 'up_to_date', latestVersion: '2026.10.16-e3cb207', model: 'Auto',
+  subscriptionTier: 'Pro', osPlatform: 'linux', osArch: 'x64', userEmail: 'redacted@example.invalid',
+  terminalProgram: 'unknown', shell: 'bash', lastRequestId: 'private-request-id',
+};
+export const cursorLoggedOut = { ...cursorAbout, subscriptionTier: null, userEmail: null, lastRequestId: null };
+// Kimi Code 2.2.0 schema. The ok body is reconstructed; only the logged-out error string was live.
+export const kimiUsage = { code: 0, msg: 'success', request_id: 'privateRequestId0123456789', data: { kind: 'ok', quota: {
+  usages: {
+    limit5h: { usedRatio: 0.2, resetAt: '2026-10-17T06:00:00Z' },
+    limit7d: { usedRatio: 0.08, resetAt: '2026-10-20T00:00:00Z' },
+    monthTotal: { usedRatio: 0.35, resetAt: '2026-11-01T00:00:00Z' },
+    monthCode: { usedRatio: 0.1, resetAt: '2026-11-01T00:00:00Z' },
+  },
+  extraUsage: { balanceCents: 1250, totalCents: 5000, monthlyChargeLimitEnabled: false, monthlyChargeLimitCents: 0, monthlyUsedCents: 100, currency: 'USD' },
+} } };
+export const kimiLoggedOut = { code: 0, msg: 'success', request_id: 'abcDEF1234567890abcdEF1234', data: { kind: 'error', message: 'No token for "kimi-code". Run /login to authenticate.' } };
+// OpenCode 1.19.3 `stats` text. Counts are shape checks only; the snapshot keeps Total Cost.
+export const opencodeStats = `┌────────────────────────────────────────────────────────┐
+│                       OVERVIEW                         │
+├────────────────────────────────────────────────────────┤
+│Sessions                                          1,234 │
+│Messages                                             56 │
+│Days                                                 12 │
+└────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────┐
+│                    COST & TOKENS                       │
+├────────────────────────────────────────────────────────┤
+│Total Cost                                       $12.50 │
+│Avg Cost/Day                                      $1.04 │
+│Avg Tokens/Session                                 1.2K │
+│Median Tokens/Session                               800 │
+│Input                                             12.5K │
+│Output                                             3.4K │
+│Cache Read                                         1.0M │
+│Cache Write                                           0 │
+└────────────────────────────────────────────────────────┘
+`;
+export const versions = {
+  amp: '0.0.1791763306-ged595a (released 2026-10-12T00:01:46.000Z, 1d ago)', ampAutoReload: '0.0.1792108872-gab0eb7 (released 2026-10-16T04:40:00.000Z, 1h ago)',
+  claude: '2.1.296 (Claude Code)', codex: 'codex-cli 0.162.1', agent: '2026.10.16-e3cb207', kimi: '2.2.0', opencode: '1.19.3',
+};
 export async function fixtureRun(program: string, args: string[]) {
   if (args[0] === '--version') return versions[program];
   if (program === 'amp') return args.includes('--details') ? details : amp;
   if (program === 'claude') return claude;
   if (program === 'codex') return JSON.stringify(codex);
+  if (program === 'agent') return JSON.stringify(cursorAbout);
+  if (program === 'kimi') return JSON.stringify(kimiUsage);
+  if (program === 'opencode') return opencodeStats;
   throw new Error('Unexpected probe');
 }

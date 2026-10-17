@@ -464,7 +464,9 @@ Endpoints:
 - `GET /v1/agents`: Amp, Claude Code and Codex usage from `--usage-snapshot` /
   `FACTORY_API_USAGE_SNAPSHOT` (default `/var/lib/factory-usage/usage.json`).
   Missing/invalid snapshots return 200 with unknown tracked tools and a reason.
-  Cursor and Kimi stay `not_tracked`.
+  Tracked tools are Amp, Cursor, Claude Code, Codex, Kimi and OpenCode.
+  Cursor reports plan only. OpenCode reports local session cost, not remaining
+  quota. Kimi reports local quota windows and a USD wallet when present.
 - `GET /v1/stream`: SSE events named `gpu.sample`, `llm.request`, `fleet.change`,
   `pricing.changed`, and `agents.usage`, with JSON `{type, ts_ms, data}`. Independent
   `: keepalive` comments run every 15 seconds, even during event traffic.

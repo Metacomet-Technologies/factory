@@ -6,12 +6,15 @@ use std::{os::unix::fs::MetadataExt, path::Path, time::Duration};
 use tokio::io::AsyncReadExt;
 
 pub(crate) const STALE_MS: i64 = 45 * 60 * 1000;
-const TOOLS: [&str; 5] = ["amp", "cursor", "claude-code", "codex", "kimi"];
+const TOOLS: [&str; 6] = ["amp", "cursor", "claude-code", "codex", "kimi", "opencode"];
 fn source(tool: &str) -> Option<&'static str> {
     match tool {
         "amp" => Some("amp-cli"),
+        "cursor" => Some("cursor-about"),
         "claude-code" => Some("claude-usage"),
         "codex" => Some("codex-app-server"),
+        "kimi" => Some("kimi-oauth-usage"),
+        "opencode" => Some("opencode-stats"),
         _ => None,
     }
 }
@@ -65,13 +68,14 @@ fn valid_balance(b: &AgentBalance) -> bool {
         && b.label.as_deref().is_none_or(|label| {
             b.unit == "usd"
                 && b.total.is_none()
-                && label.strip_prefix("workspace ").is_some_and(|slug| {
-                    (1..=63).contains(&slug.len())
-                        && slug.as_bytes()[0].is_ascii_alphanumeric()
-                        && slug
-                            .bytes()
-                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
-                })
+                && (label == "session cost"
+                    || label.strip_prefix("workspace ").is_some_and(|slug| {
+                        (1..=63).contains(&slug.len())
+                            && slug.as_bytes()[0].is_ascii_alphanumeric()
+                            && slug
+                                .bytes()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                    }))
         })
 }
 fn valid(t: &AgentTool, now: i64) -> bool {
@@ -88,6 +92,7 @@ fn valid(t: &AgentTool, now: i64) -> bool {
                     | "CLI failed"
                     | "CLI output too large"
                     | "last good reading older than 45 minutes"
+                    | "not logged in"
             )
         })
         && t.observed_at_ms.is_none_or(|at| at > 0 && at <= now)
@@ -100,7 +105,16 @@ fn valid(t: &AgentTool, now: i64) -> bool {
         && t.plan.as_deref().is_none_or(|p| {
             matches!(
                 p,
-                "Gigawatt" | "free" | "plus" | "pro" | "team" | "business" | "enterprise" | "edu"
+                "Gigawatt"
+                    | "free"
+                    | "plus"
+                    | "pro"
+                    | "pro_plus"
+                    | "ultra"
+                    | "team"
+                    | "business"
+                    | "enterprise"
+                    | "edu"
             )
         })
         && t.windows.len() <= 20
@@ -116,6 +130,7 @@ fn valid(t: &AgentTool, now: i64) -> bool {
                     | "weekly_sonnet"
                     | "primary"
                     | "secondary"
+                    | "monthly"
             ) && t.windows[..i].iter().all(|prior| prior.name != w.name)
                 && w.used_percent.is_finite()
                 && (0.0..=100.0).contains(&w.used_percent)
@@ -127,7 +142,8 @@ fn valid(t: &AgentTool, now: i64) -> bool {
         && t.balances.iter().enumerate().all(|(i, b)| {
             valid_balance(b)
                 && b.label.as_ref().is_none_or(|label| {
-                    t.tool == "amp"
+                    ((t.tool == "amp" && label != "session cost")
+                        || (t.tool == "opencode" && label == "session cost"))
                         && t.balances[..i]
                             .iter()
                             .all(|prior| prior.label.as_ref() != Some(label))
@@ -140,7 +156,18 @@ fn valid(t: &AgentTool, now: i64) -> bool {
                     && t.observed_at_ms.is_some()
                     && t.cli_version.is_some()
                     && t.reason.is_none()
-                    && !t.windows.is_empty()
+                    && match t.tool.as_str() {
+                        "cursor" => {
+                            t.plan.is_some() && t.windows.is_empty() && t.balances.is_empty()
+                        }
+                        "opencode" => {
+                            t.plan.is_none()
+                                && t.windows.is_empty()
+                                && t.balances.len() == 1
+                                && t.balances[0].label.as_deref() == Some("session cost")
+                        }
+                        _ => !t.windows.is_empty(),
+                    }
             }
             "unknown" | "stale" => source(&t.tool).is_some() && t.reason.is_some(),
             "not_tracked" => {
@@ -328,7 +355,45 @@ mod tests {
         let stale = parse(&bytes, at + STALE_MS + 1).unwrap();
         assert_eq!(stale.tools[0].status, "stale");
         assert_eq!(stale.tools[0].observed_at_ms, Some(at));
-        assert_eq!(stale.tools[1].status, "not_tracked");
+        assert_eq!(stale.tools[1].status, "unknown");
+        assert_eq!(stale.tools[1].reason.as_deref(), Some("CLI failed"));
+        let mut cursor = value.clone();
+        cursor["tools"][1] = json!({
+            "tool":"cursor", "status":"ok", "note":null, "reason":null,
+            "observed_at_ms":at, "source":"cursor-about", "cli_version":"2026.10.16-e3cb207", "plan":"pro_plus",
+            "windows":[], "balance":null, "balances":[], "reset_credits_available":null
+        });
+        assert!(parse(&serde_json::to_vec(&cursor).unwrap(), at).is_some());
+        cursor["tools"][1]["plan"] = json!("redacted@example.invalid");
+        assert!(parse(&serde_json::to_vec(&cursor).unwrap(), at).is_none());
+        cursor["tools"][1]["plan"] = json!("pro_plus");
+        cursor["tools"][1]["status"] = json!("unknown");
+        cursor["tools"][1]["reason"] = json!("not logged in");
+        cursor["tools"][1]["plan"] = json!(null);
+        assert!(parse(&serde_json::to_vec(&cursor).unwrap(), at).is_some());
+        let mut kimi = value.clone();
+        kimi["tools"][4] = json!({
+            "tool":"kimi", "status":"ok", "note":null, "reason":null,
+            "observed_at_ms":at, "source":"kimi-oauth-usage", "cli_version":"2.2.0", "plan":null,
+            "windows":[{"name":"monthly","used_percent":35.0,"resets_at_ms":1793491200000_i64,"window_minutes":null}],
+            "balance":{"amount":"12.5","remaining":"12.5","total":"50","unit":"usd"},
+            "balances":[{"amount":"12.5","remaining":"12.5","total":"50","unit":"usd"}],
+            "reset_credits_available":null
+        });
+        assert!(parse(&serde_json::to_vec(&kimi).unwrap(), at).is_some());
+        let mut opencode = value.clone();
+        opencode["tools"][5] = json!({
+            "tool":"opencode", "status":"ok", "note":null, "reason":null,
+            "observed_at_ms":at, "source":"opencode-stats", "cli_version":"1.19.3", "plan":null,
+            "windows":[],
+            "balance":{"amount":"12.50","remaining":"12.50","total":null,"unit":"usd","label":"session cost"},
+            "balances":[{"amount":"12.50","remaining":"12.50","total":null,"unit":"usd","label":"session cost"}],
+            "reset_credits_available":null
+        });
+        assert!(parse(&serde_json::to_vec(&opencode).unwrap(), at).is_some());
+        opencode["tools"][5]["balances"][0]["label"] = json!("workspace private");
+        opencode["tools"][5]["balance"]["label"] = json!("workspace private");
+        assert!(parse(&serde_json::to_vec(&opencode).unwrap(), at).is_none());
         for (field, bad) in [
             ("source", json!("private@email")),
             ("status", json!("new")),

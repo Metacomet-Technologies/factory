@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { collect, command, readPrevious, writeSnapshot, CLAUDE_ARGS, supportedNode } from './collect.ts';
-import { age, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, STALE_MS } from './parsers.ts';
-import { amp, ampAutoReload, ampNew, details, detailsAutoReload, detailsNew, claude, codex, fixtureRun, versions } from './fixtures.ts';
+import { age, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, parseCursor, parseKimi, parseOpencode, STALE_MS } from './parsers.ts';
+import { amp, ampAutoReload, ampNew, details, detailsAutoReload, detailsNew, claude, codex, cursorAbout, cursorLoggedOut, kimiLoggedOut, kimiUsage, opencodeStats, fixtureRun, versions } from './fixtures.ts';
 const now = 1791800000000;
 
 test('supported Node versions require Node 24.12.0 or newer', () => {
@@ -17,7 +17,13 @@ test('supported Node versions require Node 24.12.0 or newer', () => {
 
 test('verified projections preserve units, percentages, scope and UTC milliseconds', async () => {
   const snapshot = await collect(null, fixtureRun, now);
-  assert.deepEqual(snapshot.tools.map(t => t.status), ['ok', 'not_tracked', 'ok', 'ok', 'not_tracked']);
+  assert.deepEqual(snapshot.tools.map(t => t.status), ['ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
+  assert.deepEqual(snapshot.tools.map(t => t.tool), ['amp', 'cursor', 'claude-code', 'codex', 'kimi', 'opencode']);
+  const cursor = snapshot.tools[1], kimi = snapshot.tools[4], opencode = snapshot.tools[5];
+  assert.equal(cursor.plan, 'pro'); assert.deepEqual(cursor.windows, []); assert.deepEqual(cursor.balances, []);
+  assert.deepEqual(kimi.windows.map(w => [w.name, w.used_percent, w.window_minutes]), [['five_hour', 20, 300], ['weekly', 8, 10080], ['monthly', 35, null]]);
+  assert.equal(kimi.balance?.amount, '12.5'); assert.equal(kimi.balance?.total, '50');
+  assert.equal(opencode.balances[0].label, 'session cost'); assert.equal(opencode.balances[0].amount, '12.50'); assert.deepEqual(opencode.windows, []);
   const [a, , c, x] = snapshot.tools;
   assert.deepEqual(a.balances, [
     { amount: '171.27', remaining: '171.27', total: '200', unit: 'usd' },
@@ -30,7 +36,7 @@ test('verified projections preserve units, percentages, scope and UTC millisecon
   assert.equal(c.plan, null);
   assert.deepEqual(x.windows, [{ name: 'weekly', used_percent: 17, resets_at_ms: 1792299781000, window_minutes: 10080 }]);
   assert.equal(x.balance?.unit, 'codex_credits'); assert.equal(x.balance?.amount, '62500'); assert.equal(x.reset_credits_available, 3);
-  assert.doesNotMatch(JSON.stringify(snapshot), /redacted@|private-|tokens|prompt|accountId/);
+  assert.doesNotMatch(JSON.stringify(snapshot), /redacted@|private-|tokens|prompt|accountId|request_id|1,234|1\.2K|12\.5K|1\.0M|kimi-code/);
 });
 
 test('Amp plain summaries preserve workspace balance without identity or invented total', async () => {
@@ -134,7 +140,7 @@ test('one failure never blanks other sources; last-good timestamp ages strictly 
   const good = await collect(null, fixtureRun, now);
   const run = async (p, a) => { if (p === 'claude' && a[0] !== '--version') throw new Error('private-token@example.invalid'); return fixtureRun(p, a); };
   const failed = await collect(good, run, now + STALE_MS);
-  assert.deepEqual(failed.tools.map(t => t.status), ['ok', 'not_tracked', 'unknown', 'ok', 'not_tracked']);
+  assert.deepEqual(failed.tools.map(t => t.status), ['ok', 'ok', 'unknown', 'ok', 'ok', 'ok']);
   assert.equal(failed.tools[2].observed_at_ms, now);
   assert.deepEqual(failed.tools[2].windows, []);
   assert.equal(age(failed.tools[2], now + STALE_MS + 1).status, 'stale');
@@ -270,13 +276,17 @@ test('atomic replacement inherits the setgid directory group and preserves owner
 test('CLI dry-run writes nothing and logs only sanitized snapshot using fake binaries', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'usage-cli-'));
   try {
-    for (const program of ['amp', 'claude', 'codex']) {
-      const output = program === 'amp' ? { version: '0.0.1791763306-ged595a (released 2026-10-12T00:01:46.000Z, 1d ago)', summary: amp, details } : { version: '2.1.296 (Claude Code)', summary: claude };
-      const script = program === 'codex' ? `if(process.argv[2]==='--version') console.log('codex-cli 0.162.1'); else {require('node:readline').createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l); if(m.id===1) console.log(JSON.stringify({id:1,result:{}})); if(m.id===2) console.log(${JSON.stringify(JSON.stringify(codex))});});}` : `const o=${JSON.stringify(output)}; console.error('private-secret'); console.log(process.argv[2]==='--version'?o.version:process.argv.includes('--details')?o.details:o.summary);`;
-      await writeFile(join(dir, program), `#!${process.execPath}\n${script}\n`, { mode: 0o700 });
-    }
+    const scripts: Record<string, string> = {
+      amp: `const o=${JSON.stringify({ version: '0.0.1791763306-ged595a (released 2026-10-12T00:01:46.000Z, 1d ago)', summary: amp, details })}; console.error('private-secret'); console.log(process.argv[2]==='--version'?o.version:process.argv.includes('--details')?o.details:o.summary);`,
+      claude: `const o=${JSON.stringify({ version: '2.1.296 (Claude Code)', summary: claude })}; console.error('private-secret'); console.log(process.argv[2]==='--version'?o.version:o.summary);`,
+      codex: `if(process.argv[2]==='--version') console.log('codex-cli 0.162.1'); else {require('node:readline').createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l); if(m.id===1) console.log(JSON.stringify({id:1,result:{}})); if(m.id===2) console.log(${JSON.stringify(JSON.stringify(codex))});});}`,
+      agent: `const body=${JSON.stringify(JSON.stringify(cursorAbout))}; console.error('redacted@example.invalid'); console.log(process.argv[2]==='--version'?'2026.10.16-e3cb207':body);`,
+      opencode: `console.error('12.5K'); console.log(process.argv[2]==='--version'?'1.19.3':${JSON.stringify(opencodeStats)});`,
+      kimi: `const http=require('node:http'),fs=require('node:fs'),path=require('node:path'); if(process.argv[2]==='--version'){console.log('2.2.0');process.exit(0)} if(process.argv[2]!=='web'||process.argv[3]!=='--no-open'||process.argv[4]!=='--port') process.exit(1); const token='fixturetokenvalue0001'; const dir=path.join(process.env.HOME,'.kimi-code'); fs.mkdirSync(dir,{recursive:true}); fs.writeFileSync(path.join(dir,'server.token'),token,{mode:0o600}); fs.chmodSync(path.join(dir,'server.token'),0o600); console.log('Token: '+token); const body=${JSON.stringify(JSON.stringify(kimiUsage))}; http.createServer((req,res)=>{ if(req.url!=='/api/v1/oauth/usage'||req.headers.authorization!=='Bearer '+token){res.writeHead(401);res.end('denied');return} res.writeHead(200,{'content-type':'application/json'}); res.end(body); }).listen(Number(process.argv[5]),'127.0.0.1');`,
+    };
+    for (const [program, script] of Object.entries(scripts)) await writeFile(join(dir, program), `#!${process.execPath}\n${script}\n`, { mode: 0o700 });
     const path = join(dir, 'usage.json');
-    const env = { HOME: dir, PATH: `${dir}:/usr/bin:/bin`, FACTORY_USAGE_SNAPSHOT: path };
+    const env = { HOME: dir, PATH: `${dir}:/usr/bin:/bin`, FACTORY_USAGE_SNAPSHOT: path, FACTORY_KIMI_PORT: '58941' };
     const invoke = (args: string[]) => spawnSync(process.execPath, ['scripts/usage/collect.ts', ...args], { cwd: fileURLToPath(new URL('../..', import.meta.url)), env, encoding: 'utf8', timeout: 5000 });
     for (const cachedVersion of [null, '0.0.1791763306-ged595a', '0.0.1791849701-g1448da']) {
       if (cachedVersion) await writeFile(path, JSON.stringify({
@@ -286,17 +296,130 @@ test('CLI dry-run writes nothing and logs only sanitized snapshot using fake bin
       const before = cachedVersion ? await readFile(path, 'utf8') : null;
       const result = invoke(['--dry-run']);
       assert.equal(result.status, 0, result.stderr);
-      assert.equal(result.stderr, ''); assert.doesNotMatch(result.stdout, /private-|redacted@|tokens|prompt/);
-      assert.deepEqual(JSON.parse(result.stdout).tools.map(t => t.status), ['ok', 'not_tracked', 'ok', 'ok', 'not_tracked']);
-      if (before === null) assert.deepEqual((await readdir(dir)).sort(), ['amp', 'claude', 'codex']);
+      assert.equal(result.stderr, '');       assert.doesNotMatch(result.stdout, /private-|redacted@|tokens|prompt|fixturetokenvalue0001|1\.2K|request_id/);
+      assert.deepEqual(JSON.parse(result.stdout).tools.map(t => t.status), ['ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
+      if (before === null) assert.deepEqual((await readdir(dir)).filter(name => name !== '.kimi-code').sort(), ['agent', 'amp', 'claude', 'codex', 'kimi', 'opencode']);
       else assert.equal(await readFile(path, 'utf8'), before);
     }
     const written = invoke([]);
     assert.equal(written.status, 0, written.stderr);
     assert.equal(written.stdout, '');
     assert.equal(written.stderr, '');
-    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')).tools.map(t => t.status), ['ok', 'not_tracked', 'ok', 'ok', 'not_tracked']);
-    assert.deepEqual((await readdir(dir)).sort(), ['amp', 'claude', 'codex', 'usage.json']);
+    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')).tools.map(t => t.status), ['ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
+    assert.deepEqual((await readdir(dir)).filter(name => name !== '.kimi-code').sort(), ['agent', 'amp', 'claude', 'codex', 'kimi', 'opencode', 'usage.json']);
     assert.deepEqual(CLAUDE_ARGS, ['-p', '/usage', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '', '--no-session-persistence', '--output-format', 'stream-json', '--verbose', '--prompt-suggestions', 'false']);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('cursor, kimi and opencode fail closed and drop identity, tokens and wallets', async () => {
+  assert.equal(parseCursor(JSON.stringify(cursorAbout)).plan, 'pro');
+  assert.equal(parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: 'Pro Plus' })).plan, 'pro_plus');
+  assert.equal(parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: 'Cursor Ultra' })).plan, 'ultra');
+  assert.equal(parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: 'Teams' })).plan, 'team');
+  assert.throws(() => parseCursor(JSON.stringify(cursorLoggedOut)), { message: 'not logged in' });
+  assert.throws(() => parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: null })), { message: 'CLI failed' });
+  assert.throws(() => parseCursor(JSON.stringify({ ...cursorAbout, userEmail: null })), { message: FORMAT_CHANGED });
+  assert.throws(() => parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: 'Max' })), { message: FORMAT_CHANGED });
+  const loggedOut = await collect(null, async (program, args) => program === 'agent' && args[0] !== '--version' ? JSON.stringify(cursorLoggedOut) : fixtureRun(program, args), now);
+  assert.equal(loggedOut.tools[1].status, 'unknown');
+  assert.equal(loggedOut.tools[1].reason, 'not logged in');
+  assert.equal(loggedOut.tools[1].plan, null);
+  assert.doesNotMatch(JSON.stringify(loggedOut), /redacted@|private-request/);
+  const quota = parseKimi(JSON.stringify(kimiUsage));
+  assert.equal(quota.balance?.unit, 'usd');
+  assert.equal(quota.windows.some(window => window.name === 'monthly'), true);
+  assert.throws(() => parseKimi(JSON.stringify(kimiLoggedOut)), { message: 'not logged in' });
+  assert.throws(() => parseKimi(JSON.stringify({ ...kimiLoggedOut, data: { kind: 'error', message: 'upstream private-token failed' } })), { message: 'CLI failed' });
+  const rmb = parseKimi(JSON.stringify({ ...kimiUsage, data: { ...kimiUsage.data, quota: { ...kimiUsage.data.quota, extraUsage: { ...kimiUsage.data.quota.extraUsage, currency: 'CNY' } } } }));
+  assert.deepEqual(rmb.balances, []);
+  assert.throws(() => parseKimi(JSON.stringify({ ...kimiUsage, request_id: 'redacted@example.invalid' })), { message: FORMAT_CHANGED });
+  const session = parseOpencode(opencodeStats);
+  assert.deepEqual(session.balances, [{ amount: '12.50', remaining: '12.50', total: null, unit: 'usd', label: 'session cost' }]);
+  assert.throws(() => parseOpencode(opencodeStats.replace('Total Cost', 'Spend')), { message: FORMAT_CHANGED });
+  assert.throws(() => parseOpencode(`${opencodeStats}\n│ secret │\n`), { message: FORMAT_CHANGED });
+  const missing = await collect(null, async (program, args) => {
+    if (program === 'kimi') throw new Error('CLI missing');
+    return fixtureRun(program, args);
+  }, now);
+  assert.equal(missing.tools[4].status, 'unknown');
+  assert.equal(missing.tools[4].reason, 'CLI missing');
+  assert.equal(missing.tools[5].status, 'ok');
+});
+
+test('kimi loopback probe rejects loose tokens, redirects and foreign servers, and kills only its child', async () => {
+  const { createServer } = await import('node:http');
+  const { symlink } = await import('node:fs/promises');
+  const dir = await mkdtemp(join(tmpdir(), 'kimi-probe-'));
+  const previousHome = process.env.KIMI_CODE_HOME;
+  const previousPort = process.env.FACTORY_KIMI_PORT;
+  const token = 'fixturetokenvalue0001';
+  const body = JSON.stringify(kimiUsage);
+  const program = join(dir, 'kimi');
+  const serve = (port: number, status: number, payload: string, location?: string) => new Promise<import('node:http').Server>(resolve => {
+    const server = createServer((req, res) => {
+      if (req.headers.authorization !== `Bearer ${token}`) { res.writeHead(401); res.end('denied'); return; }
+      if (location) res.setHeader('location', location);
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(payload);
+    });
+    server.listen(port, '127.0.0.1', () => resolve(server));
+  });
+  const close = async (server: import('node:http').Server) => { await new Promise(resolve => server.close(resolve)); };
+  try {
+    process.env.KIMI_CODE_HOME = dir;
+    await writeFile(program, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(join(dir, 'spawned'))}, 'yes'); process.exit(1);\n`, { mode: 0o700 });
+    await writeFile(join(dir, 'server.token'), token, { mode: 0o644 });
+    await chmod(join(dir, 'server.token'), 0o644);
+    process.env.FACTORY_KIMI_PORT = '58951';
+    const loose = await serve(58951, 200, body);
+    await assert.rejects(command(program, ['usage'], 2000), { message: 'CLI failed' });
+    await assert.rejects(stat(join(dir, 'spawned')));
+    await close(loose);
+    await writeFile(join(dir, 'real.token'), token, { mode: 0o600 });
+    await chmod(join(dir, 'real.token'), 0o600);
+    await rm(join(dir, 'server.token'));
+    await symlink(join(dir, 'real.token'), join(dir, 'server.token'));
+    process.env.FACTORY_KIMI_PORT = '58952';
+    const linked = await serve(58952, 200, body);
+    await assert.rejects(command(program, ['usage'], 2000), { message: 'CLI failed' });
+    await close(linked);
+    await rm(join(dir, 'server.token'));
+    await writeFile(join(dir, 'server.token'), token, { mode: 0o600 });
+    await chmod(join(dir, 'server.token'), 0o600);
+    process.env.FACTORY_KIMI_PORT = '58953';
+    const redirect = await serve(58953, 302, '', 'http://169.254.169.254/latest');
+    await assert.rejects(command(program, ['usage'], 2000), { message: 'CLI failed' });
+    await close(redirect);
+    process.env.FACTORY_KIMI_PORT = '58954';
+    const huge = await serve(58954, 200, 'x'.repeat(70_000));
+    await assert.rejects(command(program, ['usage'], 2000), { message: 'CLI output too large' });
+    await close(huge);
+    process.env.FACTORY_KIMI_PORT = '58955';
+    let hits = 0;
+    const held = await new Promise<import('node:http').Server>(resolve => {
+      const server = createServer((_req, res) => { hits += 1; res.writeHead(200); res.end(body); });
+      server.listen(58955, '127.0.0.1', () => resolve(server));
+    });
+    const reused = await command(program, ['usage'], 2000);
+    assert.equal(hits, 1);
+    assert.doesNotMatch(reused, new RegExp(token));
+    await assert.rejects(stat(join(dir, 'spawned')));
+    await close(held);
+    await writeFile(program, `#!${process.execPath}\nconst fs=require('node:fs'); const http=require('node:http'); fs.writeFileSync(${JSON.stringify(join(dir, 'child.pid'))}, String(process.pid)); http.createServer((_req,res)=>{res.writeHead(200);res.end(${JSON.stringify(body)});}).listen(58956,'127.0.0.1'); console.log('Token: ${token}');\n`, { mode: 0o700 });
+    process.env.FACTORY_KIMI_PORT = '58956';
+    const spawned = await command(program, ['usage'], 3000);
+    assert.equal(JSON.parse(spawned).data.kind, 'ok');
+    assert.doesNotMatch(spawned, new RegExp(token));
+    const pid = Number(await readFile(join(dir, 'child.pid'), 'utf8'));
+    let gone = false;
+    for (let i = 0; i < 20; i++) {
+      try { process.kill(pid, 0); await new Promise(resolve => setTimeout(resolve, 25)); }
+      catch { gone = true; break; }
+    }
+    assert.equal(gone, true);
+  } finally {
+    if (previousHome === undefined) delete process.env.KIMI_CODE_HOME; else process.env.KIMI_CODE_HOME = previousHome;
+    if (previousPort === undefined) delete process.env.FACTORY_KIMI_PORT; else process.env.FACTORY_KIMI_PORT = previousPort;
+    await rm(dir, { recursive: true, force: true });
+  }
 });

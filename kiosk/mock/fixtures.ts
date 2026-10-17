@@ -44,6 +44,17 @@ export function agentFixtures(
       ],
     },
     {
+      tool: "cursor",
+      status,
+      plan: "pro",
+      source: "cursor-about",
+      cli_version: "2026.10.16-e3cb207",
+      observed_at_ms: now - 6 * 60_000,
+      windows: [],
+      balances: [],
+      balance: null,
+    },
+    {
       tool: "claude-code",
       status,
       plan: null,
@@ -97,6 +108,47 @@ export function agentFixtures(
         },
       ],
     },
+    {
+      tool: "kimi",
+      status,
+      plan: null,
+      source: "kimi-oauth-usage",
+      cli_version: "2.2.0",
+      observed_at_ms: now - 5 * 60_000,
+      windows: [
+        {
+          name: "five_hour",
+          used_percent: 20,
+          resets_at_ms: now + 3 * 60 * 60_000,
+          window_minutes: 300,
+        },
+        {
+          name: "weekly",
+          used_percent: 8,
+          resets_at_ms: now + 4 * 86_400_000,
+          window_minutes: 10080,
+        },
+        {
+          name: "monthly",
+          used_percent: 35,
+          resets_at_ms: now + 14 * 86_400_000,
+          window_minutes: null,
+        },
+      ],
+      balances: [{ amount: "12.5", remaining: "12.5", total: "50", unit: "usd" }],
+    },
+    {
+      tool: "opencode",
+      status,
+      plan: null,
+      source: "opencode-stats",
+      cli_version: "1.19.3",
+      observed_at_ms: now - 3 * 60_000,
+      windows: [],
+      balances: [
+        { amount: "1.25", remaining: "1.25", total: null, unit: "usd", label: "session cost" },
+      ],
+    },
   ];
   for (const tool of tools) {
     tool.balance = tool.balances[0] ?? null;
@@ -110,14 +162,6 @@ export function agentFixtures(
       tool.reason = status === "unknown" ? "usage source unavailable" : null;
     }
   }
-  tools.push(
-    ...["cursor", "kimi"].map((tool) => ({
-      tool,
-      status: "not_tracked",
-      windows: [],
-      balances: [],
-    })),
-  );
   return { tools };
 }
 

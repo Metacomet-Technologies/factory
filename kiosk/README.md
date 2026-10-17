@@ -196,8 +196,9 @@ the MET-139 API and usage path unit are already deployed.
 
 ## Frontier CLIs (MET-126)
 
-The existing card now shows Amp, Claude Code and ChatGPT account capacity from
-`/v1/agents`. It polls on load/every 60 seconds and refetches on `agents.usage`
+The existing card now shows Amp, Cursor, Claude Code, ChatGPT, Kimi and OpenCode
+from `/v1/agents`. Cursor is plan only. OpenCode's row is local session cost,
+labeled `session cost`, and is not remaining account quota. It polls on load/every 60 seconds and refetches on `agents.usage`
 and SSE reconnect, using the same snapshot invalidation pattern as Fleet/pricing.
 Amp's USD and orb-hour pools remain separate; Codex credits are never USD.
 Stale values use muted text/bars (not reduced opacity, preserving AA contrast);
@@ -207,7 +208,7 @@ the existing warning color, including stale rows. Observation age remains
 visible separately; an old reading never hides the collection failure.
 Reset labels have exact UTC native titles; a one-second clock keeps relative
 resets and minute ages current between snapshots. Rows are
-keyboard focusable. Cursor/Kimi remain a compact not-tracked line.
+keyboard focusable.
 
 Normal mock fixtures include all six windows. Set `MOCK_AGENTS_STATUS` to
 `ok`, `stale`, `unknown` or `not_tracked` with `vp run mock-dev` to inspect each
@@ -416,7 +417,7 @@ combined MET-92 release commit; a static-only install cannot update the placehol
 Normal fixtures distinguish local models from reference families: Claude Sonnet
 uses `anthropic/claude-sonnet-5.5`; ChatGPT mid-tier uses `openai/gpt-6.1-sol`.
 The pending Sonnet 5.6 model is synthetic fixture data, not a provider claim.
-Frontier tools are exactly `amp`, `cursor`, `claude-code`, `codex` and `kimi`.
+Frontier tools are exactly `amp`, `cursor`, `claude-code`, `codex`, `kimi` and `opencode`.
 Fixtures also include an offline node, a failing service, pending pricing,
 estimated pre-history spend and null prompt tps. Local models are `factory-assist`,
 `factory-code` and `factory-assist-max`; `/api/ps` may report `:latest` suffixes.

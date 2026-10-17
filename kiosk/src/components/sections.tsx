@@ -522,8 +522,11 @@ export function AgentsSection({
         {resource.data?.tools.length
           ? [
               ["amp", "Amp"],
+              ["cursor", "Cursor"],
               ["claude-code", "Claude Code"],
               ["codex", "ChatGPT"],
+              ["kimi", "Kimi"],
+              ["opencode", "OpenCode"],
             ].map(([id, label]) => {
               const tool = resource.data?.tools.find((tool) => tool.tool === id);
               const status = tool?.status ?? "unknown";
@@ -603,19 +606,6 @@ export function AgentsSection({
             })
           : null}
       </ul>
-      {resource.data?.tools.some(
-        (tool) => tool.status === "not_tracked" && ["cursor", "kimi"].includes(tool.tool),
-      ) && (
-        <p className="muted agent-untracked">
-          not tracked:{" "}
-          {resource.data.tools
-            .filter(
-              (tool) => tool.status === "not_tracked" && ["cursor", "kimi"].includes(tool.tool),
-            )
-            .map((tool) => (tool.tool === "cursor" ? "Cursor" : "Kimi"))
-            .join(", ")}
-        </p>
-      )}
     </Section>
   );
 }

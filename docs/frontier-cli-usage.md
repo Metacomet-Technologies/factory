@@ -1541,7 +1541,13 @@ probe captures are local scratch, not deployed or committed.
 ## Collector (MET-125)
 
 The [collector](../scripts/usage/README.md) implements the selected GPU sources
-at 15-minute cadence, with hourly Amp pool-table validation, independent errors,
+at 15-minute cadence, including Cursor plan (`agent about --format json`),
+OpenCode local session cost (`opencode stats` on 1.19.3), and Kimi Code quota
+from the existing or collector-started loopback `GET /api/v1/oauth/usage`.
+It does not scrape Cursor's interactive `/usage`, call provider dashboards
+with extracted tokens, or persist emails, bearer tokens, request ids or token
+counts. A logged-in Kimi ok body and a logged-in Cursor plan string are still
+unverified on this machine. Hourly Amp pool-table validation, independent errors,
 45-minute freshness, atomic sanitized snapshots and `/v1/agents` plus
 `agents.usage` SSE. Deployment remains Devon's gate. No new inference, auth,
 reset consumption, transcript harvesting or runner configuration is required.
