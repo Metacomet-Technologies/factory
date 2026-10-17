@@ -162,7 +162,9 @@ not of device hardware, so it does not go under `/v1/devices`.
   - Recent speed tests table.
 - **As built (MET-218).** The badge reads `Unknown` when no target has a sample
   newer than 2 minutes, because `healthy` only means no episode is open. The
-  card's 24 h sparklines draw each wan target as its own line. The speed-test
+  card's 24 h sparklines and the page's layer charts draw each target from its
+  own points, because raw buckets start at each target's first probe and need not
+  share timestamps; a null average RTT is a gap. The speed-test
   endpoint has no `1h` range, so the 1h view fetches `24h` and clips the chart.
   Event bands are at least 1/150 of the visible range wide so short episodes
   stay visible. `network.sample` refetches `/v1/network`; `network.speedtest`

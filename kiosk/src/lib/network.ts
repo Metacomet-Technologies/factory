@@ -46,19 +46,17 @@ export const mbps = (bps: number | null | undefined) =>
   bps == null ? "—" : number(bps / 1_000_000, "Mb/s");
 export const usMs = (us: number | null | undefined) => (us == null ? "—" : number(us / 1000, "ms"));
 
-/** One chart row per timestamp, with `latency<i>` and `loss<i>` for the i-th target. */
-export function layerRows(series: NetworkSeries[]) {
-  const rows = new Map<number, Record<string, number | null>>();
-  series.forEach((target, index) => {
-    for (const point of target.points) {
-      const row = rows.get(point.ts_ms) ?? { ts_ms: point.ts_ms };
-      row[`latency${index}`] = point.latency_ms.avg ?? null;
-      row[`loss${index}`] = point.loss_percent;
-      rows.set(point.ts_ms, row);
-    }
-  });
-  return [...rows.values()].sort((a, b) => a.ts_ms! - b.ts_ms!);
-}
+/**
+ * One target's chart points. Targets keep their own timestamps (raw buckets start at each
+ * target's first probe), so every target is drawn from its own array instead of merged rows.
+ * A null average RTT stays null so the line shows a gap there.
+ */
+export const targetPoints = (target: NetworkSeries) =>
+  target.points.map((point) => ({
+    ts_ms: point.ts_ms,
+    latency: point.latency_ms.avg ?? null,
+    loss: point.loss_percent,
+  }));
 
 /** Events of one layer that overlap [from, now], clipped to that window; open ones run to now. */
 export function eventBands(events: NetworkEvent[], layer: string, from: number, now: number) {

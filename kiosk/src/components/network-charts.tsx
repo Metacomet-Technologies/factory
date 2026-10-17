@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { CartesianGrid, Line, LineChart, ReferenceArea, XAxis, YAxis } from "recharts";
 import type { NetworkEvent, NetworkSeries, NetworkSpeedTest } from "../api/types";
 import { useReducedMotion } from "../lib/motion";
-import { eventBands, layerRows } from "../lib/network";
+import { eventBands, targetPoints } from "../lib/network";
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from "./ui/chart";
 import { Panel } from "./ui/panel";
 
@@ -33,7 +33,10 @@ export default function NetworkCharts({
     () =>
       LAYERS.map((layer) => {
         const targets = series.filter((target) => target.layer === layer);
-        return { layer, targets, rows: layerRows(targets) };
+        return {
+          layer,
+          targets: targets.map((target) => ({ ...target, data: targetPoints(target) })),
+        };
       }),
     [series],
   );
@@ -58,7 +61,7 @@ export default function NetworkCharts({
   );
   return (
     <div className="ups-chart-grid network-charts">
-      {layers.map(({ layer, targets, rows }, index) => {
+      {layers.map(({ layer, targets }, index) => {
         const config = Object.fromEntries(
           targets.flatMap((target, i) => [
             [`latency${i}`, { label: `${target.target} RTT (ms)`, color: color(i) }],
@@ -77,11 +80,7 @@ export default function NetworkCharts({
               className="ups-history-chart"
               aria-label={`${layer} latency and loss history`}
             >
-              <LineChart
-                data={rows}
-                accessibilityLayer
-                margin={{ left: 0, right: 0, top: 14, bottom: 0 }}
-              >
+              <LineChart accessibilityLayer margin={{ left: 0, right: 0, top: 14, bottom: 0 }}>
                 <CartesianGrid vertical={false} strokeDasharray="3 4" />
                 {xAxis}
                 <YAxis width={36} />
@@ -104,7 +103,9 @@ export default function NetworkCharts({
                 {targets.map((target, i) => (
                   <Line
                     key={`latency-${target.target}`}
-                    dataKey={`latency${i}`}
+                    data={target.data}
+                    dataKey="latency"
+                    name={`latency${i}`}
                     type="monotone"
                     stroke={color(i)}
                     strokeWidth={2}
@@ -116,7 +117,9 @@ export default function NetworkCharts({
                 {targets.map((target, i) => (
                   <Line
                     key={`loss-${target.target}`}
-                    dataKey={`loss${i}`}
+                    data={target.data}
+                    dataKey="loss"
+                    name={`loss${i}`}
                     yAxisId="loss"
                     type="stepAfter"
                     stroke={color(i)}
@@ -128,7 +131,9 @@ export default function NetworkCharts({
                 ))}
               </LineChart>
             </ChartContainer>
-            {!rows.length && <p className="empty">No {layer} samples in this range.</p>}
+            {!targets.some((target) => target.data.length) && (
+              <p className="empty">No {layer} samples in this range.</p>
+            )}
           </Panel>
         );
       })}

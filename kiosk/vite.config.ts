@@ -40,6 +40,7 @@ export default defineConfig({
       screenshots: { command: "node scripts/screenshots.ts", cache: false },
       "ups:check": { command: "node scripts/ups-check.ts", cache: false },
       "ups-controls:check": { command: "node scripts/ups-controls-check.ts", cache: false },
+      "network:check": { command: "node scripts/network-check.ts", cache: false },
       "api:types": { command: "node scripts/api-types.ts", cache: false },
       "api:types:check": { command: "node scripts/api-types.ts --check", cache: false },
       "screenshots:live": { command: "node scripts/live-check.ts", cache: false },
