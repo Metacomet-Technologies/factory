@@ -796,6 +796,8 @@ pub struct Summary {
     pub rejected: u64,
     pub evicted: u64,
     pub discarded_on_exit: usize,
+    /// The collector panicked; the process should exit non-zero so systemd restarts it.
+    pub collector_failed: bool,
 }
 
 async fn pause(duration: Duration, shutdown: &CancellationToken) -> bool {
@@ -829,7 +831,7 @@ pub async fn run(
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(fast);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let (mut sampled, mut rejected) = (0u64, 0u64);
+            let (mut sampled, mut rejected, mut failed) = (0u64, 0u64, false);
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
@@ -843,6 +845,7 @@ pub async fn run(
                 .await
                 else {
                     warn!("collector panicked; stopping");
+                    failed = true;
                     shutdown.cancel();
                     break;
                 };
@@ -879,7 +882,7 @@ pub async fn run(
                 }
                 ready.notify_one();
             }
-            (sampled, rejected)
+            (sampled, rejected, failed)
         })
     };
     let mut backoff = Backoff::new(seed);
@@ -962,7 +965,12 @@ pub async fn run(
         }
     }
     shutdown.cancel();
-    let (sampled, local_rejects) = sampling.await.unwrap_or_default();
+    // A probe stuck in the kernel must not hold shutdown past systemd's stop timeout.
+    let (sampled, local_rejects, collector_failed) =
+        match tokio::time::timeout(Duration::from_secs(2), sampling).await {
+            Ok(Ok(counts)) => counts,
+            _ => (0, 0, false),
+        };
     let buffer = buffer.lock().expect("buffer lock");
     Summary {
         sampled,
@@ -970,5 +978,6 @@ pub async fn run(
         rejected: rejected + local_rejects,
         evicted: buffer.evicted,
         discarded_on_exit: buffer.len(),
+        collector_failed,
     }
 }

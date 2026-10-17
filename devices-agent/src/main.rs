@@ -85,5 +85,6 @@ async fn main() -> Result<()> {
         discarded = summary.discarded_on_exit,
         "agent stopped; buffered samples are not kept across restarts"
     );
+    anyhow::ensure!(!summary.collector_failed, "collector failed");
     Ok(())
 }
