@@ -4,6 +4,7 @@
   "cargo fmt": "rustfmt 1.10.0-stable (b940084d7e 2026-09-28)",
   "cargo clippy": "clippy 0.1.99 (b940084d7e 2026-09-28)",
   "node": "v{node}",
+  "bun": "{bun}",
   "cc": "",
   "make": "",
   "pkg-config": "",

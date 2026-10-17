@@ -296,7 +296,7 @@ file names/content and transitive normal/build workspace path dependencies.
 Rust also includes workspace `Cargo.toml` and the locked normal/build Cargo tree;
 `--target all --no-dedupe` and repository-relative paths keep the tree
 machine-independent, including when Cargo has a configured build target.
-Kiosk includes its tracked pnpm lockfile and `factory-api/openapi.json`. All
+Kiosk includes its tracked `bun.lock` and `factory-api/openapi.json`. All
 fingerprints include `VERSION` and the fingerprint script itself. Unrelated
 lockfile entries do not stale Rust components; their resolved trees do.
 
@@ -318,8 +318,8 @@ Install Vite+ in user space with `curl -fsSL https://vite.plus | bash`, then loa
 `/home/agent/.config/vite-plus/env` in this runner's shell. From `kiosk/`:
 
 ```sh
-vp env install       # Node 24.21.0 and pnpm 12.11.2, pinned in package.json
-vp install
+vp env install       # Node 24.22.0, pinned in package.json devEngines.runtime
+vp install --frozen-lockfile  # Bun 1.4.2 (devEngines.packageManager), downloaded on demand
 vp run mock-dev     # Native Node TypeScript mock :4179 + vp dev :4181
 ```
 

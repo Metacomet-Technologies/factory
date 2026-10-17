@@ -43,6 +43,6 @@ cd "$root/kiosk"
 vp env install
 vp install --frozen-lockfile
 node --version
-pnpm --version
+bun --version
 vp --version
 echo "[${SECONDS}s] Setup complete; services and builds remain on demand"

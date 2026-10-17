@@ -24,7 +24,7 @@ def repo_pins():
     return {
         "rust": rust,
         "node": engines["runtime"]["version"],
-        "pnpm": engines["packageManager"]["version"],
+        "bun": engines["packageManager"]["version"],
         "vp": "1.1.0",
     }
 
@@ -60,21 +60,14 @@ class CheckTest(unittest.TestCase):
         os.makedirs(self.home, exist_ok=True)
         self.outputs = fixture_outputs()
         self.env = {"PLAYWRIGHT_BROWSERS_PATH": self.browsers}
-        self.pnpm_state = os.path.join(self.home, ".local", "share", "pnpm")
-        pins = repo_pins()
         modules = os.path.join(base, "tools", "node_modules")
-        self.link(self.package(os.path.join(modules, "pnpm"), "pnpm", pins["pnpm"], "pnpm.cjs"), "pnpm")
-        self.link(self.package(os.path.join(modules, "vite-plus"), "vite-plus", pins["vp"], "vp"), "vp")
+        self.link(self.package(os.path.join(modules, "vite-plus"), "vite-plus", repo_pins()["vp"], "vp"), "vp")
 
     def package(self, directory, name, version, binary):
-        """An npm-style package whose launcher, like pnpm 12's, runs node from PATH and writes state."""
+        """An npm-style package with a launcher; the checker reads only its manifest."""
         write(os.path.join(directory, "package.json"), json.dumps({"name": name, "version": version}))
         launcher = os.path.join(directory, "bin", binary)
-        write(launcher, f"""#!/bin/sh
-node --version >/dev/null
-/bin/mkdir -p '{self.pnpm_state}'
-printf '{version}\\n'
-""", 0o755)
+        write(launcher, "#!/bin/sh\nexit 1\n", 0o755)
         return launcher
 
     def link(self, target, tool):
@@ -88,24 +81,24 @@ printf '{version}\\n'
         write(os.path.join(base, "chromium-1248", "chrome-linux64", "chrome"), "#!/bin/sh\n", 0o755)
 
     def vite_plus_shims(self, installed):
-        """Replace node/pnpm/vp with Vite+ 1.1.0-style shims: links to one `vp` binary.
+        """Replace node/bun/vp with Vite+ 1.1.0-style shims: links to one `vp` binary.
 
-        Running a shim as node/pnpm records a mutation; `vp env current --json`
+        Running a shim as node/bun records a mutation; `vp env current --json`
         reports the pinned runtime and package manager like the real CLI.
         """
         pins = repo_pins()
         del self.outputs["node"]
+        del self.outputs["bun"]
         home = os.path.join(self.tmp.name, "vp-home")
         runtime = os.path.join(home, "js_runtime", "node", pins["node"], "bin", "node")
-        store = os.path.join(home, "package_manager", "pnpm", pins["pnpm"], "pnpm")
-        manager = os.path.join(store, "bin", "pnpm")
+        manager = os.path.join(home, "package_manager", "bun", pins["bun"], "bun", "bin", "bun")
         if installed:
             write(runtime, f"#!/bin/sh\nprintf 'v{pins['node']}\\n'\n", 0o755)
-            self.package(store, "pnpm", pins["pnpm"], "pnpm")
+            write(manager, f"#!/bin/sh\nprintf '{pins['bun']}\\n'\n", 0o755)
         current = {
             "node": {"version": pins["node"], "bin_path": runtime, "installed": installed, "mode": "managed"},
             "package_manager": {
-                "name": "pnpm", "version": pins["pnpm"], "bin_paths": {"pnpm": manager},
+                "name": "bun", "version": pins["bun"], "bin_paths": {"bun": manager},
                 "installed": installed, "mode": "managed",
             },
         }
@@ -121,7 +114,7 @@ case "${{0##*/}} $*" in
   *) : > '{self.mutated}'; printf 'v0.0.1\\n' ;;
 esac
 """, 0o755)
-        for tool in ("node", "pnpm", "vp"):
+        for tool in ("node", "bun", "vp"):
             self.link(os.path.join(home, "current", "bin", "vp"), tool)
 
     def run_check(self, env_name):
@@ -140,7 +133,6 @@ esac
             env=env, capture_output=True, text=True, check=False,
         )
         self.assertNotIn(SENTINEL, out.stdout + out.stderr)
-        self.assertFalse(os.path.exists(self.pnpm_state), "pnpm ran")
         report = json.loads(out.stdout)
         self.assertEqual(report["env"], env_name)
         return out.returncode, report, {item["name"]: item for item in report["items"]}
@@ -170,13 +162,20 @@ esac
         self.assertTrue(items["node"]["actual"].startswith("v24.21.0 ("))
         self.assertTrue(items["rust"]["ok"])
 
-    def test_pnpm_version_comes_from_its_manifest(self):
-        modules = os.path.join(self.tmp.name, "global", "node_modules")
-        self.link(self.package(os.path.join(modules, "pnpm"), "pnpm", "12.14.0", "pnpm.cjs"), "pnpm")
+    def test_bun_mismatch_fails(self):
+        self.outputs["bun"] = "1.4.3"
         code, _, items = self.run_check("ci")
         self.assertEqual(code, 1)
-        self.assertFalse(items["pnpm"]["ok"])
-        self.assertTrue(items["pnpm"]["actual"].startswith("12.14.0 ("))
+        self.assertFalse(items["bun"]["ok"])
+        self.assertTrue(items["bun"]["actual"].startswith("1.4.3 ("))
+        self.assertEqual(items["bun"]["expected"], repo_pins()["bun"])
+
+    def test_missing_bun_fails(self):
+        del self.outputs["bun"]
+        code, _, items = self.run_check("orb")
+        self.assertEqual(code, 1)
+        self.assertFalse(items["bun"]["ok"])
+        self.assertIsNone(items["bun"]["actual"])
 
     def test_missing_shellcheck_fails(self):
         del self.outputs["shellcheck"]
@@ -190,14 +189,14 @@ esac
         code, _, items = self.run_check("factory-gpu")
         self.assertEqual(code, 0, [i for i in items.values() if not i["ok"]])
         self.assertIn("js_runtime/node", items["node"]["actual"])
-        self.assertIn("package_manager/pnpm", items["pnpm"]["actual"])
+        self.assertIn("package_manager/bun", items["bun"]["actual"])
         self.assertFalse(os.path.exists(self.mutated), "a Vite+ shim ran")
 
     def test_vite_plus_missing_pins_fail_without_installing(self):
         self.vite_plus_shims(installed=False)
         code, _, items = self.run_check("ci")
         self.assertEqual(code, 1)
-        for name in ("node", "node:repo-root", "pnpm"):
+        for name in ("node", "node:repo-root", "bun"):
             self.assertFalse(items[name]["ok"], name)
             self.assertIn("not installed", items[name]["actual"])
         self.assertFalse(os.path.exists(self.mutated), "a Vite+ shim ran")

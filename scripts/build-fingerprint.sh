@@ -22,7 +22,7 @@ files = {"VERSION", "scripts/build-fingerprint.sh"}
 directories = {component}
 tree = b""
 if component == "kiosk":
-    # The pnpm lockfile is tracked inside kiosk/.
+    # The Bun lockfile (bun.lock) is tracked inside kiosk/.
     files.add("factory-api/openapi.json")
 else:
     files.add("Cargo.toml")
