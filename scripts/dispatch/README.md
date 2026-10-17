@@ -531,7 +531,8 @@ The main checkout must be on main, contain the merge and have clean PLAYBOOK
 content matching HEAD. The source-of-truth header includes checkout and merge
 SHAs. Document replacement safely repeats after a crash; its completion comment
 suppresses later syncs. Non-PLAYBOOK merges get a checked marker, saving quota.
-Each blocked attempt logs `qa-sync-pending` with a `reason`. Pending for more
+Non-PLAYBOOK merges also wait for the checkout to contain them before the
+checked marker. Each blocked attempt logs `qa-sync-pending` with a `reason`. Pending for more
 than 15 minutes after the `wrapup-done` comment posts one Devon mention naming
 the reason, with `<!-- factory-qa:sync-stalled pr:<n> -->`.
 The [Linear schema](https://github.com/linear/linear/blob/master/packages/sdk/src/schema.graphql)
@@ -660,21 +661,26 @@ Wrap-ups run after dispatch decisions; a freed slot is available next pass.
 
 **One wrap-up per runner (MET-214).** Each runner's wrap-ups share its main
 checkout; a cursor builder's wrap-up runs on gpu. A wrap-up is open while its issue
-has `wrapup` without `wrapup-done` and is not Done or Canceled. A newly merged
+has `wrapup` without `wrapup-done`, whatever the issue state. A newly merged
 issue is not claimed while another issue's wrap-up is open on the same runner: it
 logs `wrapup-waiting` with the `blocking` issue and retries each poll. Runners do
 not block each other. An open wrap-up older than 60 minutes (from its `wrapup`
 comment) gets one Devon mention with `<!-- factory-dispatch:wrapup-stalled -->`.
-The dispatcher never releases it: the thread posts `wrapup-done`, or Devon marks
-the issue Done or Canceled.
+The dispatcher never releases it, and Done or Canceled does not either: only
+`wrapup-done` ends it.
 
 **Main checkout fast-forward (MET-214).** The dispatcher deploys from
 factory-gpu's `/home/agent/work/factory`, so each pass, after wrap-ups and before
 the playbook sync, it reads the merge SHA of every merged factory PR on an issue
-with `wrapup-done` that is not Done or Canceled (later merges carry older ones).
-When a merge is not an ancestor of `HEAD`, it runs `git -C
+with `wrapup-done`, in any issue state, that has no `playbook-synced` or
+`playbook-checked` marker. Both markers are posted only once the checkout
+contains the merge (markers from before MET-214 predate that rule). When a merge
+is absent from the checkout's object database (real Git exits 128) or not an
+ancestor of `HEAD`, it runs `git -C
 /home/agent/work/factory fetch origin main` then `merge --ff-only origin/main`,
-at most once per pass. It never resets, rebases, stashes or force-checks-out.
+at most once per pass. A readable `HEAD` is checked first, so an unreadable
+checkout logs `main-ff-pending` and never fetches. It never resets, rebases,
+stashes or force-checks-out.
 Decisions:
 
 - `main-ff` with `issue`, `pr`, `sha`, `from` and `to`; dry-run logs it with

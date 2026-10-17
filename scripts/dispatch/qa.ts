@@ -353,15 +353,22 @@ function mergedPRs(issue: Issue) {
     return pr && attachment.metadata.status === 'merged' && Date.parse(attachment.createdAt) > Date.parse(claim?.createdAt ?? '') ? [pr] : [];
   });
 }
-const lacksMerge = (sha: string) => runWorktreeCommand('gpu', ['git', '-C', main, 'merge-base', '--is-ancestor', sha, 'HEAD'], [0, 1]).status === 1;
+// Real Git exits 128 both for an unreadable checkout and for a merge absent from its object
+// database. A readable HEAD rules out the first, so an absent object only needs a fetch.
+function lacksMerge(sha: string) {
+  command('git', ['-C', main, 'rev-parse', '--verify', 'HEAD^{commit}']);
+  if (runWorktreeCommand('gpu', ['git', '-C', main, 'cat-file', '-e', `${sha}^{commit}`], [0, 128]).status === 128) return true;
+  return runWorktreeCommand('gpu', ['git', '-C', main, 'merge-base', '--is-ancestor', sha, 'HEAD'], [0, 1]).status === 1;
+}
 
 // The dispatcher runs from gpu's main checkout, so it fast-forwards that checkout to merges
 // wrapped up on any runner. It never resets, rebases, stashes or force-checks-out.
 export async function fastForwardMain(ctx: Context) {
   const behind: { issue: Issue; pr: string; sha: string }[] = [];
-  // Done/Canceled issues are skipped to bound GitHub reads; any later merge carries their commits.
-  for (const issue of ctx.issues.filter(i => lines(i).includes(wrapupDone) && !['completed', 'canceled'].includes(i.state.type))) {
+  for (const issue of ctx.issues.filter(i => lines(i).includes(wrapupDone))) {
     for (const pr of mergedPRs(issue)) {
+      // Either marker proves the checkout contained this merge, which bounds GitHub reads.
+      if (has(issue, `playbook-synced pr:${pr}`) || has(issue, `playbook-checked pr:${pr}`)) continue;
       try {
         const data = await info(pr, true);
         const sha = data.mergeCommit?.oid;
@@ -421,21 +428,16 @@ export async function syncPlaybook(ctx: Context) {
           await ctx.comment(issue, `${devonMention}: the Linear playbook sync for PR ${pr} has been pending for more than 15 minutes since wrap-up: ${reason}. The dispatcher retries each poll.\n\n${qa(`sync-stalled pr:${pr}`)}`);
         }
       };
-      let changed: boolean;
-      try { changed = (await files(pr, true)).includes('docs/PLAYBOOK.md'); }
-      catch { await pending('PR files unavailable'); continue; }
-      if (!changed) {
-        await ctx.comment(issue, `PR ${pr} did not change the playbook; no document sync needed.\n\n${qa(`playbook-checked pr:${pr}`)}`);
-        continue;
-      }
-      let content = '', sha = '', reason: string | undefined;
+      // Both markers require the checkout to contain the merge, so either one ends fast-forward reads.
+      let content = '', sha = '', reason: string | undefined, changed = false;
       try {
         const data = await info(pr, true);
         sha = data.mergeCommit?.oid;
         if (data.state !== 'MERGED' || !shaPattern.test(sha ?? '')) reason = 'PR not merged on GitHub';
         else if (command('git', ['-C', main, 'branch', '--show-current']) !== 'main') reason = 'checkout not on main';
-        else if (command('git', ['-C', main, 'status', '--porcelain', '--', 'docs/PLAYBOOK.md'])) reason = 'docs/PLAYBOOK.md modified in checkout';
         else if (lacksMerge(sha)) reason = `checkout lacks merge ${sha}`;
+        else if (!(changed = (await files(pr, true)).includes('docs/PLAYBOOK.md'))) { /* checked below */ }
+        else if (command('git', ['-C', main, 'status', '--porcelain', '--', 'docs/PLAYBOOK.md'])) reason = 'docs/PLAYBOOK.md modified in checkout';
         else {
           const checkout = command('git', ['-C', main, 'rev-parse', 'HEAD']);
           const playbook = readFileSync(`${main}/docs/PLAYBOOK.md`, 'utf8');
@@ -445,6 +447,10 @@ export async function syncPlaybook(ctx: Context) {
         }
       } catch { reason = 'GitHub or checkout read failed'; }
       if (reason) { await pending(reason); continue; }
+      if (!changed) {
+        await ctx.comment(issue, `PR ${pr} did not change the playbook; no document sync needed.\n\n${qa(`playbook-checked pr:${pr}`)}`);
+        continue;
+      }
       // Replacing the same document is safe to repeat after an unknown response.
       await ctx.mutate(issue, 'mutation SyncPlaybook($id: String!, $input: DocumentUpdateInput!) { documentUpdate(id: $id, input: $input) { success } }', { id: config.playbookDocumentId, input: { content } });
       await ctx.comment(issue, `Linear playbook synced after merge ${sha}.\n\n${qa(`playbook-synced pr:${pr}`)}`);

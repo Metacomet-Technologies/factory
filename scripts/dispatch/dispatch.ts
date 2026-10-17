@@ -243,10 +243,10 @@ export function wrapupRunner(issue: Issue) {
   const runner = issue.comments.flatMap(comment => commentMarkers(comment.body)).map(line => line.match(threadPattern)).find(Boolean)?.[2];
   return runner === 'cursor' ? 'gpu' : runner;
 }
-// Done or Canceled is Devon's manual release; the dispatcher never releases an open wrap-up.
+// Only wrapup-done ends a wrap-up, whatever the issue state; the dispatcher never releases one.
 export function openWrapup(issue: Issue) {
   const lines = issue.comments.flatMap(comment => commentMarkers(comment.body));
-  return lines.includes(marker('wrapup')) && !lines.includes(marker('wrapup-done')) && !['completed', 'canceled'].includes(issue.state.type);
+  return lines.includes(marker('wrapup')) && !lines.includes(marker('wrapup-done'));
 }
 
 // ponytail: Linear documents metadata as arbitrary JSON, not GitHub's keys.
@@ -736,7 +736,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
     if (has(issue, 'wrapup')) {
       const submitted = Date.parse(issue.comments.find(c => commentMarkers(c.body).includes(marker('wrapup')))?.createdAt ?? '');
       if (openWrapup(issue) && Date.now() - submitted > 60 * 60_000 && !has(issue, 'wrapup-stalled')) {
-        await comment(issue, `${devonMention}: this wrap-up has run for more than 60 minutes without \`wrapup-done\`, so new wrap-ups on ${wrapupRunner(issue)} wait. The dispatcher never releases it; inspect the wrap-up thread, then let it finish or mark the issue Done or Canceled.\n\n${marker('wrapup-stalled')}`);
+        await comment(issue, `${devonMention}: this wrap-up has run for more than 60 minutes without \`wrapup-done\`, so new wrap-ups on ${wrapupRunner(issue)} wait. The dispatcher never releases it; inspect the wrap-up thread.\n\n${marker('wrapup-stalled')}`);
         log('wrapup-stalled', { issue: issue.identifier, runner: wrapupRunner(issue) });
       }
       if (has(issue, `cursor-usage-pending ${match[1]}`) && !has(issue, `cursor-usage ${match[1]}`)) {

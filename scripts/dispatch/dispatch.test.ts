@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { sections, slug, prompt, simplePrompt, wrapupPrompt, validate, isMergedGitHubPR, commentMarkers, supportedNode } from './dispatch.ts';
 import { reviewerEngine } from './qa.ts';
 import { repos, validateRepos } from './repos.ts';
@@ -140,6 +140,10 @@ const state = JSON.parse(fs.readFileSync(process.env.FAKE_GITHUB, 'utf8'));
 fs.appendFileSync(process.env.FAKE_GITHUB + '-calls', JSON.stringify(['${program}', ...args]) + '\\n');
 fs.appendFileSync(process.env.FAKE_EVENTS, JSON.stringify(['${program}', process.env.FAKE_RUNNER ?? 'gpu', ...args]) + '\\n');
 if (process.env.FAKE_GITHUB_FAIL) process.exit(7);
+// Real Git for the main checkout reproduces its exit codes, e.g. 128 for an absent object.
+if ('${program}' === 'git' && process.env.FAKE_REAL_MAIN && args[0] === '-C' && args[1] === '/home/agent/work/factory') {
+  process.exit(require('node:child_process').spawnSync('/usr/bin/git', ['-C', process.env.FAKE_REAL_MAIN, ...args.slice(2)], { stdio: 'inherit' }).status ?? 1);
+}
 if ('${program}' === 'gh' && args[0] === 'api' && !args.includes('--paginate')) {
   if (process.env.GH_TOKEN || args[2] !== '--hostname' || args[3] !== 'github.com') process.exit(9);
   // Exercise the production gh argv without contacting GitHub or reading real credentials.
@@ -184,6 +188,7 @@ if ('${program}' === 'git' && args[0] === 'ls-remote') {
   } else if (args[2] === 'branch') output = process.env.FAKE_BRANCH ?? 'main';
   else if (args[2] === 'status') output = process.env.FAKE_DIRTY ?? '';
   else if (args[2] === 'merge-base') { if (process.env.FAKE_BEHIND || fs.existsSync(process.env.FAKE_MAIN_BEHIND)) process.exit(1); output = ''; }
+  else if (args[2] === 'cat-file') output = '';
   // A behind checkout sits at oldSha until a fast-forward reaches the merge.
   else if (args[2] === 'merge') {
     if (args.slice(3).join(' ') !== '--ff-only origin/main' || process.env.FAKE_FF_FAIL) process.exit(1);
@@ -1100,7 +1105,8 @@ test('updating threads stay pending regardless of wrap-up age; unreadable timest
     assert.equal(result.code, 0);
     assert.match(result.stdout, /"decision":"archive-pending"/);
   }
-  assert.equal(f.mutations.length, 0);
+  // The 2020 wrap-up never posted wrapup-done, so Devon gets its one stalled mention; nothing else is written.
+  assert.deepEqual(f.mutations.map(m => commentMarkers(m.input?.body ?? '')), [['<!-- factory-dispatch:wrapup-stalled -->']]);
   assert.equal(f.calls().filter(args => args[1] === 'archive').length, 0);
   f.setThreads([{ ...f.threads()[0], updated: quietUpdated }]);
   assert.equal((await f.run()).code, 0);
@@ -1739,6 +1745,61 @@ test('console wrap-up fast-forwards the gpu checkout, then syncs the playbook in
   assert.deepEqual(decisions(again, 'main-ff'), []);
 });
 
+test('Done and Canceled issues with wrapup-done still fast-forward a behind checkout and sync the playbook in the same poll', { timeout: 15_000 }, async t => {
+  for (const state of ['completed', 'canceled']) {
+    const i = wrapped(123, 'console');
+    i.state = { type: state };
+    const f = await fixture(t, [i], { github: { 90: mergedPR() }, mainBehind: true });
+    const result = await f.run();
+    assert.equal(result.code, 0, result.stdout);
+    assert.deepEqual(decisions(result, 'main-ff').map(d => d.issue), ['MET-123'], state);
+    assert.equal(mainWrites(f).length, 2);
+    assert.equal(f.mutations.filter(m => m.operation === 'SyncPlaybook').length, 1, state);
+  }
+});
+
+test('a merge present only on the remote is fetched once and fast-forwarded with real Git, then synced; an unreadable checkout never fetches', { timeout: 20_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), 'factory-dispatch-git-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const git = (cwd: string, ...args: string[]) => execFileSync('/usr/bin/git', ['-c', 'user.name=Synthetic', '-c', 'user.email=synthetic@example.invalid',
+    '-c', 'init.defaultBranch=main', ...args], { cwd, encoding: 'utf8', env: { PATH: '/usr/bin:/bin', HOME: root }, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const checkout = join(root, 'main'), other = join(root, 'other');
+  git(root, 'init', '-q', '--bare', 'remote.git');
+  git(root, 'clone', '-q', 'remote.git', 'main');
+  mkdirSync(join(checkout, 'docs'));
+  writeFileSync(join(checkout, 'docs/PLAYBOOK.md'), playbook);
+  git(checkout, 'add', '.'); git(checkout, 'commit', '-qm', 'base'); git(checkout, 'push', '-q', 'origin', 'main');
+  const from = git(checkout, 'rev-parse', 'HEAD');
+  git(root, 'clone', '-q', 'remote.git', 'other');
+  writeFileSync(join(other, 'widget.txt'), 'merged\n');
+  git(other, 'add', '.'); git(other, 'commit', '-qm', 'merge'); git(other, 'push', '-q', 'origin', 'main');
+  const merge = git(other, 'rev-parse', 'HEAD');
+  // The case real Git reports with exit 128, not 1.
+  assert.throws(() => git(checkout, 'merge-base', '--is-ancestor', merge, 'HEAD'), (error: any) => error.status === 128);
+  const i = wrapped(123, 'console');
+  const f = await fixture(t, [i], { github: { 90: githubPR({ state: 'MERGED', mergeCommit: { oid: merge }, files: [{ filename: 'docs/PLAYBOOK.md' }] }) } });
+  const unreadable = await f.run(['poll'], { FAKE_REAL_MAIN: join(root, 'missing') });
+  assert.equal(unreadable.code, 0, unreadable.stdout);
+  assert.deepEqual(decisions(unreadable, 'main-ff-pending').map(d => d.reason), ['merge SHA or checkout unreadable']);
+  assert.deepEqual(mainWrites(f), []);
+  const environment = { FAKE_REAL_MAIN: checkout };
+  const preview = await f.run(['poll', '--dry-run'], environment);
+  assert.deepEqual(decisions(preview, 'main-ff').map(({ dryRun, sha, from }) => ({ dryRun, sha, from })), [{ dryRun: true, sha: merge, from }]);
+  assert.match(preview.stdout, /'git' '-C' '\/home\/agent\/work\/factory' 'fetch' 'origin' 'main'/);
+  assert.deepEqual(mainWrites(f), []);
+  assert.throws(() => git(checkout, 'cat-file', '-e', `${merge}^{commit}`), 'dry-run fetched nothing');
+  const result = await f.run(['poll'], environment);
+  assert.equal(result.code, 0, result.stdout);
+  assert.deepEqual(mainWrites(f).map((e: any) => e.slice(4)), [['fetch', 'origin', 'main'], ['merge', '--ff-only', 'origin/main']]);
+  assert.deepEqual(decisions(result, 'main-ff').map(({ from: a, to }) => ({ from: a, to })), [{ from, to: merge }]);
+  assert.equal(git(checkout, 'rev-parse', 'HEAD'), merge);
+  const syncs = f.mutations.filter(m => m.operation === 'SyncPlaybook');
+  assert.equal(syncs.length, 1);
+  assert.ok(syncs[0].input.content.includes(`main\` at ${merge} after PR 90`));
+  await f.run(['poll'], environment);
+  assert.equal(mainWrites(f).length, 2, 'current checkout performs no Git writes');
+});
+
 test('up-to-date checkout reads the merge but never fetches or merges', { timeout: 10_000 }, async t => {
   const f = await fixture(t, [wrapped(123, 'console')], { github: { 90: mergedPR([{ filename: 'widgets/widget.rs' }]) } });
   const result = await f.run();
@@ -1800,12 +1861,10 @@ test('playbook sync pending more than 15 minutes after wrapup-done mentions Devo
 });
 
 test('one wrap-up per runner: a second merged issue waits for wrapup-done; other runners proceed', { timeout: 15_000 }, async t => {
-  const merged = (n: number, runner: string, pr: number) => issue(n, { labels: [], state: { type: 'started' }, comments: [claimComment(), threadComment(runner)], attachments: [prAttachment(pr)] });
-  const [first, second, other] = [merged(123, 'gpu', 90), merged(124, 'gpu', 91), merged(125, 'console', 92)];
-  // A Done issue's unfinished legacy wrap-up never blocks its runner.
-  const legacy = wrapped(126, 'gpu', null, 93, ago(600));
-  legacy.state = { type: 'completed' };
-  const f = await fixture(t, [first, second, other, legacy]);
+  const merged = (n: number, runner: string, pr: number, state = 'started') => issue(n, { labels: [], state: { type: state }, comments: [claimComment(), threadComment(runner)], attachments: [prAttachment(pr)] });
+  // A completed issue newly submitted for wrap-up holds gpu like any other.
+  const [first, second, other] = [merged(123, 'gpu', 90, 'completed'), merged(124, 'gpu', 91), merged(125, 'console', 92)];
+  const f = await fixture(t, [first, second, other]);
   const continues = () => f.calls().filter(a => a[1] === 'continue').length;
   const result = await f.run();
   assert.equal(result.code, 0, result.stdout);
@@ -1819,7 +1878,30 @@ test('one wrap-up per runner: a second merged issue waits for wrapup-done; other
   await f.run();
   assert.equal(continues(), 3);
   assert.equal(markerCount(second, '<!-- factory-dispatch:wrapup -->'), 1);
-  assert.equal(markerCount(legacy, '<!-- factory-dispatch:wrapup-stalled -->'), 0);
+});
+
+test('Done and Canceled issues with an unfinished wrap-up still block their runner, ping once at 60 minutes, and are never released', { timeout: 20_000 }, async t => {
+  for (const state of ['completed', 'canceled']) {
+    const open = wrapped(123, 'gpu', null, 90, ago(60));
+    open.state = { type: state };
+    const waiting = issue(124, { labels: [], state: { type: 'started' }, comments: [claimComment(), threadComment('gpu')], attachments: [prAttachment(91)] });
+    const consoleIssue = issue(125, { labels: [], state: { type: 'started' }, comments: [claimComment(), threadComment('console')], attachments: [prAttachment(92)] });
+    const behind = wrapped(126, 'console', ago(1), 93);
+    const f = await fixture(t, [open, waiting, consoleIssue, behind], { github: { 93: mergedPR() }, mainBehind: true });
+    const first = await f.run();
+    assert.equal(first.code, 0, first.stdout);
+    assert.deepEqual(decisions(first, 'wrapup-waiting').map(d => d.blocking), ['MET-123']);
+    assert.deepEqual(decisions(first, 'main-ff-waiting').map(d => d.blocking), ['MET-123']);
+    assert.deepEqual(mainWrites(f), []);
+    assert.equal(markerCount(consoleIssue, '<!-- factory-dispatch:wrapup -->'), 1, `${state}: console is independent`);
+    assert.equal(markerCount(open, '<!-- factory-dispatch:wrapup-stalled -->'), 0, `${state}: exactly 60 minutes does not alert`);
+    for (let poll = 0; poll < 2; poll++) assert.equal((await f.run(['poll'], { FAKE_NOW: String(now + 1) })).code, 0);
+    assert.equal(markerCount(open, '<!-- factory-dispatch:wrapup-stalled -->'), 1, state);
+    assert.equal(markerCount(waiting, '<!-- factory-dispatch:wrapup -->'), 0, `${state}: never released`);
+    assert.deepEqual(mainWrites(f), []);
+    assert.equal(open.state.type, state);
+    assert.ok(!f.mutations.some(m => m.operation === 'Move'));
+  }
 });
 
 test('a wrap-up open more than 60 minutes mentions Devon exactly once and is never released', { timeout: 10_000 }, async t => {
