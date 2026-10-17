@@ -48,6 +48,54 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v1/devices": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["devices_list"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/devices/factory-gpu": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["device_current"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/devices/factory-gpu/history": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["device_history"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v1/fleet": {
     parameters: {
       query?: never;
@@ -336,6 +384,18 @@ export interface components {
     ApiError: {
       error: components["schemas"]["ErrorDetail"];
     };
+    /** @enum {string} */
+    Availability: "available" | "unsupported" | "permission_denied" | "stale" | "error";
+    BackupView: {
+      availability: components["schemas"]["Availability"];
+      error?: string | null;
+      /** Format: int64 */
+      last_attempt_ms?: number | null;
+      /** Format: int64 */
+      last_success_ms?: number | null;
+      /** Format: int64 */
+      observed_at_ms: number;
+    };
     ClearedAlert: {
       /** Format: int64 */
       cleared_at_ms: number;
@@ -344,6 +404,103 @@ export interface components {
       opened_at_ms: number;
       severity: components["schemas"]["AlertSeverity"];
       summary: string;
+    };
+    ClockView: {
+      availability: components["schemas"]["Availability"];
+      /** Format: int64 */
+      observed_at_ms: number;
+      synchronized?: boolean | null;
+    };
+    CollectorHealth: {
+      detail?: string | null;
+      drives: components["schemas"]["Availability"];
+      /** Format: int64 */
+      fast_interval_ms: number;
+      fast_ok: boolean;
+      filesystems: components["schemas"]["Availability"];
+      /** Format: int64 */
+      last_fast_ms?: number | null;
+      /** Format: int64 */
+      last_slow_ms?: number | null;
+      /** Format: int64 */
+      slow_interval_ms: number;
+      smart: components["schemas"]["Availability"];
+    };
+    Cooling: {
+      fans: components["schemas"]["NamedMetric"][];
+      fans_availability: components["schemas"]["Availability"];
+      temperatures: components["schemas"]["NamedMetric"][];
+      temperatures_availability: components["schemas"]["Availability"];
+    };
+    Cpu: {
+      iowait: components["schemas"]["Metric"];
+      load1: components["schemas"]["Metric"];
+      load15: components["schemas"]["Metric"];
+      load5: components["schemas"]["Metric"];
+      temperature: components["schemas"]["Metric"];
+      utilization: components["schemas"]["Metric"];
+    };
+    DeviceHistory: {
+      device_id: string;
+      /** Format: int64 */
+      generated_at_ms: number;
+      points: components["schemas"]["DevicePoint"][];
+      range: string;
+    };
+    DeviceList: {
+      devices: components["schemas"]["DeviceSummary"][];
+      /** Format: int64 */
+      generated_at_ms: number;
+    };
+    DeviceMetric: {
+      /** Format: double */
+      avg?: number | null;
+      /** Format: double */
+      max?: number | null;
+      /** Format: double */
+      min?: number | null;
+    };
+    DevicePoint: {
+      cpu_percent: components["schemas"]["DeviceMetric"];
+      cpu_temp_c: components["schemas"]["DeviceMetric"];
+      disk_read_bps: components["schemas"]["DeviceMetric"];
+      disk_write_bps: components["schemas"]["DeviceMetric"];
+      load1: components["schemas"]["DeviceMetric"];
+      memory_used_bytes: components["schemas"]["DeviceMetric"];
+      net_rx_bps: components["schemas"]["DeviceMetric"];
+      net_tx_bps: components["schemas"]["DeviceMetric"];
+      /** Format: int64 */
+      sample_count: number;
+      /** Format: int64 */
+      ts_ms: number;
+    };
+    DeviceSummary: {
+      device_id: string;
+      health: components["schemas"]["HealthStatus"];
+      href: string;
+    };
+    DeviceView: {
+      device: components["schemas"]["HostSnapshot"];
+      /** Format: int64 */
+      generated_at_ms: number;
+      warnings: string[];
+    };
+    DiskIo: {
+      read: components["schemas"]["Metric"];
+      write: components["schemas"]["Metric"];
+    };
+    Drive: {
+      available_spare: components["schemas"]["Metric"];
+      id: string;
+      kernel: string;
+      media_critical: boolean;
+      media_errors: components["schemas"]["Metric"];
+      model?: string | null;
+      size: components["schemas"]["Metric"];
+      smart: components["schemas"]["SmartStatus"];
+      /** Format: double */
+      spare_threshold_percent?: number | null;
+      temperature: components["schemas"]["Metric"];
     };
     ErrorDetail: {
       code: string;
@@ -354,6 +511,16 @@ export interface components {
       pending?: null | components["schemas"]["Selection"];
       rates?: null | components["schemas"]["Rates"];
       selected?: null | components["schemas"]["Selection"];
+    };
+    Filesystem: {
+      fstype: string;
+      id: string;
+      inodes_used_percent: components["schemas"]["Metric"];
+      mountpoint: string;
+      size: components["schemas"]["Metric"];
+      source: string;
+      used: components["schemas"]["Metric"];
+      used_percent: components["schemas"]["Metric"];
     };
     Fleet: {
       /** Format: int64 */
@@ -396,6 +563,15 @@ export interface components {
       /** Format: double */
       utilization_percent: number;
     };
+    GpuSlot: {
+      /** Format: int64 */
+      index: number;
+      memory_total: components["schemas"]["Metric"];
+      memory_used: components["schemas"]["Metric"];
+      power: components["schemas"]["Metric"];
+      temperature: components["schemas"]["Metric"];
+      utilization: components["schemas"]["Metric"];
+    };
     Health: {
       /** Format: int64 */
       built_at_ms: number;
@@ -407,6 +583,42 @@ export interface components {
       uptime_ms: number;
       version: string;
     };
+    HealthReason: {
+      detail: string;
+      metric: string;
+      status: components["schemas"]["HealthStatus"];
+      threshold: string;
+      /** Format: double */
+      value?: number | null;
+    };
+    HealthReport: {
+      reasons: components["schemas"]["HealthReason"][];
+      status: components["schemas"]["HealthStatus"];
+    };
+    /** @enum {string} */
+    HealthStatus: "critical" | "warning" | "healthy" | "unknown" | "stale";
+    HostIdentity: {
+      boot_id?: string | null;
+      hostname?: string | null;
+      uptime: components["schemas"]["Metric"];
+    };
+    HostSnapshot: {
+      collector: components["schemas"]["CollectorHealth"];
+      cooling: components["schemas"]["Cooling"];
+      cpu: components["schemas"]["Cpu"];
+      device_id: string;
+      disk_io: components["schemas"]["DiskIo"];
+      drives: components["schemas"]["Drive"][];
+      filesystems: components["schemas"]["Filesystem"][];
+      gpus: components["schemas"]["GpuSlot"][];
+      health: components["schemas"]["HealthReport"];
+      identity: components["schemas"]["HostIdentity"];
+      maintenance: components["schemas"]["Maintenance"];
+      memory: components["schemas"]["Ram"];
+      network: components["schemas"]["Network"];
+      /** Format: int64 */
+      observed_at_ms: number;
+    };
     LlmRequest: {
       client_hostname: string;
       /** Format: double */
@@ -416,6 +628,22 @@ export interface components {
       output_tokens?: number | null;
       /** Format: int64 */
       prompt_tokens?: number | null;
+    };
+    Maintenance: {
+      backup: components["schemas"]["BackupView"];
+      clock: components["schemas"]["ClockView"];
+      reboot: components["schemas"]["RebootView"];
+      services: components["schemas"]["Service"][];
+      ups: components["schemas"]["UpsSummary"];
+    };
+    Metric: {
+      availability: components["schemas"]["Availability"];
+      detail?: string | null;
+      /** Format: int64 */
+      observed_at_ms: number;
+      unit: string;
+      /** Format: double */
+      value?: number | null;
     };
     ModelUsage: {
       /** Format: double */
@@ -435,6 +663,14 @@ export interface components {
       /** Format: double */
       total_load_ms: number;
     };
+    NamedMetric: {
+      metric: components["schemas"]["Metric"];
+      name: string;
+    };
+    Network: {
+      rx: components["schemas"]["Metric"];
+      tx: components["schemas"]["Metric"];
+    };
     Node: {
       /** Format: int64 */
       last_seen_ms?: number | null;
@@ -452,6 +688,13 @@ export interface components {
       family: string;
       pending_model_id?: string | null;
     };
+    Ram: {
+      available: components["schemas"]["Metric"];
+      swap_free: components["schemas"]["Metric"];
+      swap_total: components["schemas"]["Metric"];
+      total: components["schemas"]["Metric"];
+      used: components["schemas"]["Metric"];
+    };
     Rates: {
       /** Format: int64 */
       fetched_at_ms: number;
@@ -460,6 +703,21 @@ export interface components {
       /** Format: double */
       output_per_mtok: number;
       source: string;
+    };
+    RebootView: {
+      alert_due?: boolean | null;
+      availability: components["schemas"]["Availability"];
+      /** Format: int64 */
+      consecutive_skips?: number | null;
+      /** Format: int64 */
+      days_pending?: number | null;
+      detail?: string | null;
+      /** Format: int64 */
+      last_check_ms?: number | null;
+      last_decision?: string | null;
+      /** Format: int64 */
+      pending_since_ms?: number | null;
+      reboot_required?: boolean | null;
     };
     Selection: {
       /** Format: int64 */
@@ -485,6 +743,13 @@ export interface components {
     };
     /** @enum {string} */
     ServiceKind: "http" | "tcp" | "systemd";
+    SmartStatus: {
+      availability: components["schemas"]["Availability"];
+      detail?: string | null;
+      /** Format: int64 */
+      observed_at_ms: number;
+      passed?: boolean | null;
+    };
     SpendAvoided: {
       /** Format: double */
       estimated_usd: number;
@@ -500,7 +765,9 @@ export interface components {
       ts_ms: number;
       /**
        * @description Named SSE event: gpu.sample, ups.sample, ups.event, llm.request, fleet.change,
-       *     pricing.changed, or agents.usage. ups.sample data is UpsCurrent or null on failure.
+       *     pricing.changed, agents.usage, or devices.sample. ups.sample data is UpsCurrent or null
+       *     on failure. devices.sample data is a device view, or null when the collector fails.
+       *     History is not in the event.
        *     ups.event data is UpsEvent, sent once when an event opens and once when it closes.
        *     Zero-length self_test events send both an open frame and a closed frame.
        */
@@ -615,6 +882,16 @@ export interface components {
       /** Format: int64 */
       electricity_rate_micro_usd_per_kwh: number | null;
     };
+    UpsSummary: {
+      availability: components["schemas"]["Availability"];
+      /** Format: double */
+      charge_percent?: number | null;
+      detail?: string | null;
+      href: string;
+      /** Format: int64 */
+      observed_at_ms: number;
+      status?: string | null;
+    };
     Usage: {
       /** Format: int64 */
       generated_at_ms: number;
@@ -728,6 +1005,90 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["Alerts"];
+        };
+      };
+    };
+  };
+  devices_list: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DeviceList"];
+        };
+      };
+    };
+  };
+  device_current: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DeviceView"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  device_history: {
+    parameters: {
+      query?: {
+        /** @description 1h (default), 24h, or 7d */
+        range?: string;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DeviceHistory"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
         };
       };
     };

@@ -119,6 +119,14 @@ so synthetic ingestion can run; it does not assert host clock synchronization.
 Background traffic sends one request every two seconds through meter. API SSE
 and the kiosk ticker advance on the existing 30-second sync cadence.
 
+## Devices fixture
+
+`inside()` writes `.sandbox/devices-root` and sets `FACTORY_DEVICES_ROOT` before
+factory-api starts. The collector reads that tree instead of the host `/proc`,
+`/sys`, backup status, or reboot status. The fixture does not call `nvidia-smi`,
+`tailscale`, or `smartctl`. The fleet node stays named `sandbox`, so the
+factory-gpu service list on the devices page is empty in the sandbox.
+
 ## UPS fake (MET-162)
 
 The namespace also runs `fake-upsd` on its private `127.0.0.1:3493`; the API's

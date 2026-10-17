@@ -508,6 +508,9 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
         "/v1/fleet",
         "/v1/llm/usage",
         "/v1/gpu",
+        "/v1/devices",
+        "/v1/devices/factory-gpu",
+        "/v1/devices/factory-gpu/history",
         "/v1/pricing",
         "/v1/pricing/refresh",
         "/v1/pricing/confirm/{family}",
@@ -1146,7 +1149,7 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
     const CONFIRM: usize = 29;
     const NO_DATABASE: usize = 0;
     // Includes the requests v1 migration manifest and runner validation.
-    const REQUESTS_SETUP: usize = 85;
+    const REQUESTS_SETUP: usize = 88;
     const PRICING_SETUP: usize = 74;
     for n in [3usize, 1001] {
         let temp = tempfile::tempdir()?;
@@ -1273,6 +1276,9 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
             ("/v1/agents", NO_DATABASE),
             ("/v1/alerts", NO_DATABASE),
             ("/v1/gpu", NO_DATABASE),
+            ("/v1/devices", NO_DATABASE),
+            ("/v1/devices/factory-gpu", NO_DATABASE),
+            ("/v1/devices/factory-gpu/history", 1),
             ("/v1/stream", NO_DATABASE),
             ("/", NO_DATABASE),
             ("/openapi.json", NO_DATABASE),

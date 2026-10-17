@@ -1,3 +1,5 @@
+use crate::devices::{self, DeviceList, DeviceView};
+use crate::devices_history::{self, DeviceHistory};
 use crate::types::*;
 use crate::ups::{Ups, UpsCurrent};
 use crate::ups_history::{self, UpsEnergy, UpsEvents, UpsPoint, UpsSettings};
@@ -111,6 +113,27 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
         );
     }
     let path = request.uri().path();
+    if let Some(route) = device_route(path) {
+        if request.method() != Method::GET {
+            let mut response = error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "endpoint requires GET",
+            );
+            response
+                .headers_mut()
+                .insert("allow", "GET".parse().unwrap());
+            return response;
+        }
+        return match route {
+            DeviceRoute::List => devices_list(&state).await.into_response(),
+            DeviceRoute::Current => device_current(&state).await.into_response(),
+            DeviceRoute::History => device_history(&state, request).await,
+            DeviceRoute::Unknown => {
+                error(StatusCode::NOT_FOUND, "unknown_device", "unknown device")
+            }
+        };
+    }
     let confirm = path
         .strip_prefix("/v1/pricing/confirm/")
         .filter(|family| !family.is_empty() && !family.contains('/'));
@@ -268,6 +291,94 @@ async fn fleet(state: &AppState) -> Json<Fleet> {
     }
     Json(state.fleet.read().await.clone())
 }
+#[derive(Clone, Copy)]
+enum DeviceRoute {
+    List,
+    Current,
+    History,
+    Unknown,
+}
+
+fn device_route(path: &str) -> Option<DeviceRoute> {
+    let rest = path.strip_prefix("/v1/devices")?;
+    if rest.is_empty() {
+        return Some(DeviceRoute::List);
+    }
+    let rest = rest.strip_prefix('/')?;
+    let (id, history) = match rest.strip_suffix("/history") {
+        Some(id) => (id.strip_suffix('/').unwrap_or(id), true),
+        None => (rest, false),
+    };
+    if id.is_empty() || id.contains('/') {
+        return Some(DeviceRoute::Unknown);
+    }
+    if !crate::devices::known_device(id) {
+        return Some(DeviceRoute::Unknown);
+    }
+    Some(if history {
+        DeviceRoute::History
+    } else {
+        DeviceRoute::Current
+    })
+}
+
+#[utoipa::path(get, path="/v1/devices", responses((status=200, body=DeviceList)))]
+async fn devices_list(state: &AppState) -> Json<DeviceList> {
+    let view = state.devices_view().await;
+    Json(crate::devices::DeviceList {
+        generated_at_ms: view.generated_at_ms,
+        devices: vec![view.summary()],
+    })
+}
+
+#[utoipa::path(get, path="/v1/devices/factory-gpu", responses((status=200, body=DeviceView),(status=404, body=ApiError)))]
+async fn device_current(state: &AppState) -> Json<DeviceView> {
+    Json(state.devices_view().await)
+}
+
+fn device_range(request: &Request<Body>) -> Result<(String, i64, i64, bool), String> {
+    let Query(query) =
+        Query::<RangeQuery>::try_from_uri(request.uri()).map_err(|e| e.to_string())?;
+    let range = query.range.unwrap_or_else(|| "1h".into());
+    let (hours, raw) = match range.as_str() {
+        "1h" => (1, true),
+        "24h" => (24, false),
+        "7d" => (168, false),
+        _ => return Err("range must be 1h, 24h, or 7d".into()),
+    };
+    let now = now_ms();
+    Ok((range, now - hours * devices_history::HOUR_MS, now, raw))
+}
+
+#[utoipa::path(get, path="/v1/devices/factory-gpu/history", params(("range"=Option<String>, Query, description="1h (default), 24h, or 7d")), responses((status=200, body=DeviceHistory),(status=400, body=ApiError),(status=404, body=ApiError)))]
+async fn device_history(state: &AppState, request: Request<Body>) -> Response {
+    let (range, since, now, raw) = match device_range(&request) {
+        Ok(value) => value,
+        Err(message) => return error(StatusCode::BAD_REQUEST, "invalid_range", message),
+    };
+    let points = state
+        .db
+        .requests
+        .read(&state.query_scope, move |db| {
+            devices_history::history(db, devices::DEVICE_ID, since, now, raw)
+        })
+        .await;
+    match points {
+        Ok(points) => Json(DeviceHistory {
+            device_id: devices::DEVICE_ID.into(),
+            range,
+            generated_at_ms: now,
+            points,
+        })
+        .into_response(),
+        Err(failure) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            failure.to_string(),
+        ),
+    }
+}
+
 #[utoipa::path(get, path="/v1/ups", responses((status=200, body=Ups)))]
 async fn ups(state: &AppState) -> Json<Ups> {
     Json(state.ups().await)
@@ -608,6 +719,9 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         stream,
         usage,
         gpu,
+        devices_list,
+        device_current,
+        device_history,
         ups,
         ups_history,
         ups_events,
@@ -626,6 +740,9 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         Gpu,
         Ups,
         UpsCurrent,
+        DeviceList,
+        DeviceView,
+        DeviceHistory,
         Pricing,
         Agents,
         Alerts,
@@ -636,3 +753,84 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
     ))
 )]
 struct ApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::devices::{self, Availability};
+    use axum::http::StatusCode;
+
+    async fn state() -> AppState {
+        let directory = tempfile::tempdir().unwrap();
+        pricing::migrate(directory.path().join("pricing.db")).unwrap();
+        AppState::new(
+            "http://127.0.0.1:1".into(),
+            directory.path().join("requests.db"),
+            directory.path().join("pricing.db"),
+            crate::fleet::Config { nodes: vec![] },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_is_not_served_as_live() {
+        let state = state().await;
+        let now = now_ms();
+        let old = now - 60_000;
+        let mut view = devices::unavailable(old);
+        view.device.observed_at_ms = old;
+        view.device.collector.fast_ok = true;
+        view.device.collector.last_fast_ms = Some(old);
+        view.device.cpu.utilization =
+            devices::metric("%", old, Availability::Available, Some(12.0), None);
+        *state.devices_latest.write().await = Some(view);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let body: serde_json::Value = reqwest::get(format!("{url}/v1/devices/factory-gpu"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            body["device"]["cpu"]["utilization"]["value"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            body["device"]["cpu"]["utilization"]["availability"],
+            "stale"
+        );
+        assert_eq!(body["device"]["health"]["status"], "stale");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_device_and_range_use_the_error_envelope() {
+        let state = state().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let client = reqwest::Client::new();
+        let missing = client
+            .get(format!("{url}/v1/devices/other"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = missing.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "unknown_device");
+        let range = client
+            .get(format!("{url}/v1/devices/factory-gpu/history?range=30d"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(range.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = range.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "range must be 1h, 24h, or 7d");
+        server.abort();
+    }
+}

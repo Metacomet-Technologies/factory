@@ -121,6 +121,33 @@ def listeners(inside):
         raise
 
 
+def write_devices_fixture(root):
+    """Synthetic /proc and /sys so the device collector never reads the host."""
+    files = {
+        "proc/stat": "cpu  100 0 100 800 0 0 0 0 0 0\n",
+        "proc/meminfo": "MemTotal:       1000000 kB\nMemAvailable:    250000 kB\nSwapTotal:        0 kB\nSwapFree:         0 kB\n",
+        "proc/uptime": "1000.0 800.0\n",
+        "proc/loadavg": "0.1 0.1 0.1 1/10 1\n",
+        "proc/diskstats": " 259 0 nvme0n1 1 0 100 0 1 0 50 0 0 0 0 0\n",
+        "proc/net/dev": "  eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n",
+        "proc/sys/kernel/hostname": "sandbox\n",
+        "proc/sys/kernel/random/boot_id": "sandbox-boot\n",
+        "proc/self/mountinfo": "36 35 98:0 / / rw - ext4 /dev/nvme0n1p2 rw\n",
+        "sys/fs/factory-mountstat": "/\t1000\t400\t100\t20\n",
+        "sys/block/nvme0n1/size": "2048\n",
+        "sys/block/nvme0n1/device/wwid": "wwn-sandbox\n",
+        "sys/class/hwmon/hwmon0/name": "k10temp\n",
+        "sys/class/hwmon/hwmon0/temp1_input": "45000\n",
+        "var/lib/factory-devices/smart.json": '{"tool":"absent","drives":[]}\n',
+        "var/lib/factory-backup-status/status.json": '{"meter":{"last_success_ms":10,"last_attempt_ms":10,"error":null}}\n',
+        "var/lib/factory-reboot/status.json": '{"reboot_required":false,"pending_since_ms":null,"days_pending":null,"consecutive_skips":0,"alert_due":false,"last_check_ms":10,"last_decision":"not-needed"}\n',
+    }
+    for rel, body in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+
+
 def inside():
     rows, seed, kiosk = sys.argv[3:]
     children = []
@@ -242,6 +269,9 @@ def inside():
         if migration.returncode != 0:
             raise RuntimeError(f"Pricing migration failed (exit {migration.returncode}); see factory-api.log")
         os.environ["FACTORY_API_UPS_ADDR"] = "127.0.0.1:3493"
+        devices_root = STATE / "devices-root"
+        write_devices_fixture(devices_root)
+        os.environ["FACTORY_DEVICES_ROOT"] = str(devices_root)
         start("factory-api", [binary / "factory-api", "--listen", f"127.0.0.1:{BASE+2}",
                               "--meter-url", f"http://127.0.0.1:{BASE+1}", "--db-path", STATE / "requests.db",
                               "--pricing-db-path", STATE / "pricing.db", "--services-config", STATE / "fleet.toml",

@@ -263,6 +263,52 @@
         ],
         "type": "object"
       },
+      "Availability": {
+        "enum": [
+          "available",
+          "unsupported",
+          "permission_denied",
+          "stale",
+          "error"
+        ],
+        "type": "string"
+      },
+      "BackupView": {
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_attempt_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_success_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "observed_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "availability",
+          "observed_at_ms"
+        ],
+        "type": "object"
+      },
       "ClearedAlert": {
         "properties": {
           "cleared_at_ms": {
@@ -289,6 +335,371 @@
           "summary",
           "opened_at_ms",
           "cleared_at_ms"
+        ],
+        "type": "object"
+      },
+      "ClockView": {
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "observed_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "synchronized": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "availability",
+          "observed_at_ms"
+        ],
+        "type": "object"
+      },
+      "CollectorHealth": {
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "drives": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "fast_interval_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "fast_ok": {
+            "type": "boolean"
+          },
+          "filesystems": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "last_fast_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_slow_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "slow_interval_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "smart": {
+            "$ref": "#/components/schemas/Availability"
+          }
+        },
+        "required": [
+          "fast_interval_ms",
+          "slow_interval_ms",
+          "fast_ok",
+          "filesystems",
+          "drives",
+          "smart"
+        ],
+        "type": "object"
+      },
+      "Cooling": {
+        "properties": {
+          "fans": {
+            "items": {
+              "$ref": "#/components/schemas/NamedMetric"
+            },
+            "type": "array"
+          },
+          "fans_availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "temperatures": {
+            "items": {
+              "$ref": "#/components/schemas/NamedMetric"
+            },
+            "type": "array"
+          },
+          "temperatures_availability": {
+            "$ref": "#/components/schemas/Availability"
+          }
+        },
+        "required": [
+          "temperatures",
+          "fans",
+          "temperatures_availability",
+          "fans_availability"
+        ],
+        "type": "object"
+      },
+      "Cpu": {
+        "properties": {
+          "iowait": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "load1": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "load15": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "load5": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "temperature": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "utilization": {
+            "$ref": "#/components/schemas/Metric"
+          }
+        },
+        "required": [
+          "utilization",
+          "iowait",
+          "load1",
+          "load5",
+          "load15",
+          "temperature"
+        ],
+        "type": "object"
+      },
+      "DeviceHistory": {
+        "properties": {
+          "device_id": {
+            "type": "string"
+          },
+          "generated_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "points": {
+            "items": {
+              "$ref": "#/components/schemas/DevicePoint"
+            },
+            "type": "array"
+          },
+          "range": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "range",
+          "generated_at_ms",
+          "points"
+        ],
+        "type": "object"
+      },
+      "DeviceList": {
+        "properties": {
+          "devices": {
+            "items": {
+              "$ref": "#/components/schemas/DeviceSummary"
+            },
+            "type": "array"
+          },
+          "generated_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generated_at_ms",
+          "devices"
+        ],
+        "type": "object"
+      },
+      "DeviceMetric": {
+        "properties": {
+          "avg": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "min": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "DevicePoint": {
+        "properties": {
+          "cpu_percent": {
+            "$ref": "#/components/schemas/DeviceMetric"
+          },
+          "cpu_temp_c": {
+            "$ref": "#/components/schemas/DeviceMetric"
+          },
+          "disk_read_bps": {
+            "$ref": "#/components/schemas/DeviceMetric"
+          },
+          "disk_write_bps": {
+            "$ref": "#/components/schemas/DeviceMetric"
+          },
+          "load1": {
+            "$ref": "#/components/schemas/DeviceMetric"
+          },
+          "memory_used_bytes": {
+            "$ref": "#/components/schemas/DeviceMetric"
+          },
+          "net_rx_bps": {
+            "$ref": "#/components/schemas/DeviceMetric"
+          },
+          "net_tx_bps": {
+            "$ref": "#/components/schemas/DeviceMetric"
+          },
+          "sample_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "ts_ms": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ts_ms",
+          "sample_count",
+          "cpu_percent",
+          "memory_used_bytes",
+          "load1",
+          "disk_read_bps",
+          "disk_write_bps",
+          "net_rx_bps",
+          "net_tx_bps",
+          "cpu_temp_c"
+        ],
+        "type": "object"
+      },
+      "DeviceSummary": {
+        "properties": {
+          "device_id": {
+            "type": "string"
+          },
+          "health": {
+            "$ref": "#/components/schemas/HealthStatus"
+          },
+          "href": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "device_id",
+          "health",
+          "href"
+        ],
+        "type": "object"
+      },
+      "DeviceView": {
+        "properties": {
+          "device": {
+            "$ref": "#/components/schemas/HostSnapshot"
+          },
+          "generated_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "generated_at_ms",
+          "warnings",
+          "device"
+        ],
+        "type": "object"
+      },
+      "DiskIo": {
+        "properties": {
+          "read": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "write": {
+            "$ref": "#/components/schemas/Metric"
+          }
+        },
+        "required": [
+          "read",
+          "write"
+        ],
+        "type": "object"
+      },
+      "Drive": {
+        "properties": {
+          "available_spare": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kernel": {
+            "type": "string"
+          },
+          "media_critical": {
+            "type": "boolean"
+          },
+          "media_errors": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "size": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "smart": {
+            "$ref": "#/components/schemas/SmartStatus"
+          },
+          "spare_threshold_percent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "temperature": {
+            "$ref": "#/components/schemas/Metric"
+          }
+        },
+        "required": [
+          "id",
+          "kernel",
+          "size",
+          "smart",
+          "available_spare",
+          "media_errors",
+          "media_critical",
+          "temperature"
         ],
         "type": "object"
       },
@@ -345,6 +756,45 @@
         },
         "required": [
           "family"
+        ],
+        "type": "object"
+      },
+      "Filesystem": {
+        "properties": {
+          "fstype": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "inodes_used_percent": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "mountpoint": {
+            "type": "string"
+          },
+          "size": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "source": {
+            "type": "string"
+          },
+          "used": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "used_percent": {
+            "$ref": "#/components/schemas/Metric"
+          }
+        },
+        "required": [
+          "id",
+          "source",
+          "mountpoint",
+          "fstype",
+          "size",
+          "used",
+          "used_percent",
+          "inodes_used_percent"
         ],
         "type": "object"
       },
@@ -486,6 +936,38 @@
         ],
         "type": "object"
       },
+      "GpuSlot": {
+        "properties": {
+          "index": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "memory_total": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "memory_used": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "power": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "temperature": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "utilization": {
+            "$ref": "#/components/schemas/Metric"
+          }
+        },
+        "required": [
+          "index",
+          "memory_used",
+          "memory_total",
+          "utilization",
+          "temperature",
+          "power"
+        ],
+        "type": "object"
+      },
       "Health": {
         "properties": {
           "built_at_ms": {
@@ -525,6 +1007,160 @@
         ],
         "type": "object"
       },
+      "HealthReason": {
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "metric": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/HealthStatus"
+          },
+          "threshold": {
+            "type": "string"
+          },
+          "value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "status",
+          "metric",
+          "threshold",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "HealthReport": {
+        "properties": {
+          "reasons": {
+            "items": {
+              "$ref": "#/components/schemas/HealthReason"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/HealthStatus"
+          }
+        },
+        "required": [
+          "status",
+          "reasons"
+        ],
+        "type": "object"
+      },
+      "HealthStatus": {
+        "enum": [
+          "critical",
+          "warning",
+          "healthy",
+          "unknown",
+          "stale"
+        ],
+        "type": "string"
+      },
+      "HostIdentity": {
+        "properties": {
+          "boot_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hostname": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "uptime": {
+            "$ref": "#/components/schemas/Metric"
+          }
+        },
+        "required": [
+          "uptime"
+        ],
+        "type": "object"
+      },
+      "HostSnapshot": {
+        "properties": {
+          "collector": {
+            "$ref": "#/components/schemas/CollectorHealth"
+          },
+          "cooling": {
+            "$ref": "#/components/schemas/Cooling"
+          },
+          "cpu": {
+            "$ref": "#/components/schemas/Cpu"
+          },
+          "device_id": {
+            "type": "string"
+          },
+          "disk_io": {
+            "$ref": "#/components/schemas/DiskIo"
+          },
+          "drives": {
+            "items": {
+              "$ref": "#/components/schemas/Drive"
+            },
+            "type": "array"
+          },
+          "filesystems": {
+            "items": {
+              "$ref": "#/components/schemas/Filesystem"
+            },
+            "type": "array"
+          },
+          "gpus": {
+            "items": {
+              "$ref": "#/components/schemas/GpuSlot"
+            },
+            "type": "array"
+          },
+          "health": {
+            "$ref": "#/components/schemas/HealthReport"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/HostIdentity"
+          },
+          "maintenance": {
+            "$ref": "#/components/schemas/Maintenance"
+          },
+          "memory": {
+            "$ref": "#/components/schemas/Ram"
+          },
+          "network": {
+            "$ref": "#/components/schemas/Network"
+          },
+          "observed_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "device_id",
+          "observed_at_ms",
+          "identity",
+          "cpu",
+          "memory",
+          "gpus",
+          "filesystems",
+          "drives",
+          "disk_io",
+          "network",
+          "cooling",
+          "maintenance",
+          "collector",
+          "health"
+        ],
+        "type": "object"
+      },
       "LlmRequest": {
         "properties": {
           "client_hostname": {
@@ -560,6 +1196,69 @@
         "required": [
           "latency_ms",
           "client_hostname"
+        ],
+        "type": "object"
+      },
+      "Maintenance": {
+        "properties": {
+          "backup": {
+            "$ref": "#/components/schemas/BackupView"
+          },
+          "clock": {
+            "$ref": "#/components/schemas/ClockView"
+          },
+          "reboot": {
+            "$ref": "#/components/schemas/RebootView"
+          },
+          "services": {
+            "items": {
+              "$ref": "#/components/schemas/Service"
+            },
+            "type": "array"
+          },
+          "ups": {
+            "$ref": "#/components/schemas/UpsSummary"
+          }
+        },
+        "required": [
+          "services",
+          "backup",
+          "clock",
+          "reboot",
+          "ups"
+        ],
+        "type": "object"
+      },
+      "Metric": {
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "observed_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "unit": {
+            "type": "string"
+          },
+          "value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "unit",
+          "observed_at_ms",
+          "availability"
         ],
         "type": "object"
       },
@@ -623,6 +1322,36 @@
           "prompt_tokens",
           "output_tokens",
           "total_load_ms"
+        ],
+        "type": "object"
+      },
+      "NamedMetric": {
+        "properties": {
+          "metric": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "metric"
+        ],
+        "type": "object"
+      },
+      "Network": {
+        "properties": {
+          "rx": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "tx": {
+            "$ref": "#/components/schemas/Metric"
+          }
+        },
+        "required": [
+          "rx",
+          "tx"
         ],
         "type": "object"
       },
@@ -705,6 +1434,33 @@
         ],
         "type": "object"
       },
+      "Ram": {
+        "properties": {
+          "available": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "swap_free": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "swap_total": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "total": {
+            "$ref": "#/components/schemas/Metric"
+          },
+          "used": {
+            "$ref": "#/components/schemas/Metric"
+          }
+        },
+        "required": [
+          "total",
+          "available",
+          "used",
+          "swap_total",
+          "swap_free"
+        ],
+        "type": "object"
+      },
       "Rates": {
         "properties": {
           "fetched_at_ms": {
@@ -728,6 +1484,69 @@
           "output_per_mtok",
           "source",
           "fetched_at_ms"
+        ],
+        "type": "object"
+      },
+      "RebootView": {
+        "properties": {
+          "alert_due": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "consecutive_skips": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "days_pending": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_check_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_decision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_since_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reboot_required": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "availability"
         ],
         "type": "object"
       },
@@ -828,6 +1647,34 @@
         ],
         "type": "string"
       },
+      "SmartStatus": {
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "observed_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "passed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "availability",
+          "observed_at_ms"
+        ],
+        "type": "object"
+      },
       "SpendAvoided": {
         "properties": {
           "estimated_usd": {
@@ -868,7 +1715,7 @@
             "type": "integer"
           },
           "type": {
-            "description": "Named SSE event: gpu.sample, ups.sample, ups.event, llm.request, fleet.change,\npricing.changed, or agents.usage. ups.sample data is UpsCurrent or null on failure.\nups.event data is UpsEvent, sent once when an event opens and once when it closes.\nZero-length self_test events send both an open frame and a closed frame.",
+            "description": "Named SSE event: gpu.sample, ups.sample, ups.event, llm.request, fleet.change,\npricing.changed, agents.usage, or devices.sample. ups.sample data is UpsCurrent or null\non failure. devices.sample data is a device view, or null when the collector fails.\nHistory is not in the event.\nups.event data is UpsEvent, sent once when an event opens and once when it closes.\nZero-length self_test events send both an open frame and a closed frame.",
             "type": "string"
           }
         },
@@ -1280,6 +2127,45 @@
         ],
         "type": "object"
       },
+      "UpsSummary": {
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "charge_percent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "href": {
+            "type": "string"
+          },
+          "observed_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "href",
+          "availability",
+          "observed_at_ms"
+        ],
+        "type": "object"
+      },
       "Usage": {
         "properties": {
           "generated_at_ms": {
@@ -1445,6 +2331,101 @@
           }
         },
         "summary": "Active alerts and the last 20 cleared ones, as posted to Slack `#factory-alerts`.",
+        "tags": []
+      }
+    },
+    "/v1/devices": {
+      "get": {
+        "operationId": "devices_list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceList"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
+    "/v1/devices/factory-gpu": {
+      "get": {
+        "operationId": "device_current",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceView"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
+    "/v1/devices/factory-gpu/history": {
+      "get": {
+        "operationId": "device_history",
+        "parameters": [
+          {
+            "description": "1h (default), 24h, or 7d",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceHistory"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
         "tags": []
       }
     },

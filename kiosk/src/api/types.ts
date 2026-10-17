@@ -15,6 +15,11 @@ export type UpsEvent = components["schemas"]["UpsEvent"];
 export type UpsPoint = components["schemas"]["UpsPoint"];
 export type UpsSettings = components["schemas"]["UpsSettings"];
 export type UpsRange = "1h" | "24h" | "7d" | "30d" | "365d";
+export type DeviceRange = "1h" | "24h" | "7d";
+export type DeviceView = components["schemas"]["DeviceView"];
+export type DeviceList = components["schemas"]["DeviceList"];
+export type DeviceHistory = components["schemas"]["DeviceHistory"];
+export type Metric = components["schemas"]["Metric"];
 export type Pricing = components["schemas"]["Pricing"];
 export type Agents = components["schemas"]["Agents"];
 export type LlmRequest = components["schemas"]["LlmRequest"];
@@ -30,6 +35,7 @@ export type StreamEvent = Omit<components["schemas"]["StreamEvent"], "type" | "d
     | { type: "fleet.change"; data: components["schemas"]["FleetChange"] }
     | { type: "pricing.changed"; data: components["schemas"]["PricingChanged"] }
     | { type: "agents.usage"; data: Agents }
+    | { type: "devices.sample"; data: DeviceView | null }
   );
 export type Endpoints = {
   [
