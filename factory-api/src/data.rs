@@ -255,29 +255,90 @@ pub fn pricing_view(
             .filter(|i| i.kind == "warning")
             .map(|i| format!("{}: {}", i.family, i.message)),
     );
-    let families = store
-        .show(references, crate::now_ms())?
-        .into_iter()
-        .map(|s| Family {
-            family: s.family,
-            selected: s.selected.map(|s| Selection {
-                model_id: s.model_id,
-                effective_from_ms: s.effective_from_ms,
-            }),
-            pending: s.pending.map(|s| Selection {
-                model_id: s.model_id,
-                effective_from_ms: s.effective_from_ms,
-            }),
-            rates: s.rates.map(|r| Rates {
-                input_per_mtok: r.model.input_micro_usd_per_mtok as f64 / 1_000_000.0,
-                output_per_mtok: r.model.output_micro_usd_per_mtok as f64 / 1_000_000.0,
-                source: r.source,
-                fetched_at_ms: r.fetched_at_ms,
-            }),
-        })
-        .collect();
+    let families = families(store, references, crate::now_ms())?;
     Ok(Pricing { families, warnings })
 }
+/// One row per family: parameters ?1..?n are family names, ?n+1 the instant.
+fn families_sql(n: usize) -> String {
+    let at = n + 1;
+    (1..=n)
+        .map(|i| {
+            format!(
+                "SELECT {i},s.model_id,s.effective_from_ms,r.fetched_at_ms,r.source,
+                        r.input_micro_usd_per_mtok,r.output_micro_usd_per_mtok,p.model_id,p.effective_from_ms
+                 FROM (SELECT 1) one
+                 LEFT JOIN reference_selection s ON s.id=(SELECT id FROM reference_selection
+                     WHERE family=?{i} AND confirmed=1 AND effective_from_ms<=?{at}
+                     ORDER BY effective_from_ms DESC,id DESC LIMIT 1)
+                 LEFT JOIN price_snapshots r ON r.id=(SELECT id FROM price_snapshots INDEXED BY snapshot_lookup
+                     WHERE model_id=s.model_id AND fetched_at_ms<=?{at}
+                     ORDER BY fetched_at_ms DESC,refresh_id DESC,(source='openrouter') DESC,id DESC LIMIT 1)
+                 LEFT JOIN reference_selection p ON p.id=(SELECT id FROM reference_selection INDEXED BY selection_pending
+                     WHERE family=?{i} AND confirmed=0 AND refresh_id=(SELECT MAX(id) FROM refreshes)
+                       AND id>COALESCE((SELECT MAX(id) FROM reference_selection INDEXED BY selection_confirmed_id
+                                        WHERE family=?{i} AND confirmed=1),0)
+                     ORDER BY effective_from_ms DESC,id DESC LIMIT 1)"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
+/// Every family's selection, its rates and its pending change in one statement:
+/// `pricing::Store::show` semantics without its four reads per family.
+fn families(
+    store: &pricing::Store,
+    references: &[pricing::Reference],
+    at_ms: i64,
+) -> Result<Vec<Family>> {
+    if references.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut values: Vec<rusqlite::types::Value> =
+        references.iter().map(|r| r.name.clone().into()).collect();
+    values.push(at_ms.into());
+    let mut rows = store
+        .connection()
+        .prepare(&families_sql(references.len()))?
+        .query_map(rusqlite::params_from_iter(values), |r| {
+            let selection = |model: usize| -> rusqlite::Result<Option<Selection>> {
+                Ok(match r.get::<_, Option<String>>(model)? {
+                    Some(model_id) => Some(Selection {
+                        model_id,
+                        effective_from_ms: r.get(model + 1)?,
+                    }),
+                    None => None,
+                })
+            };
+            let rates = match r.get::<_, Option<i64>>(3)? {
+                Some(fetched_at_ms) => Some(Rates {
+                    input_per_mtok: r.get::<_, i64>(5)? as f64 / 1_000_000.0,
+                    output_per_mtok: r.get::<_, i64>(6)? as f64 / 1_000_000.0,
+                    source: r.get(4)?,
+                    fetched_at_ms,
+                }),
+                None => None,
+            };
+            Ok((
+                r.get::<_, i64>(0)? as usize,
+                selection(1)?,
+                rates,
+                selection(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.sort_by_key(|(i, ..)| *i);
+    Ok(rows
+        .into_iter()
+        .map(|(i, selected, rates, pending)| Family {
+            family: references[i - 1].name.clone(),
+            selected,
+            pending,
+            rates,
+        })
+        .collect())
+}
+
 /// Frozen spend for one family over a usage range, summed with checked arithmetic.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FrozenSpend {
@@ -832,8 +893,10 @@ mod tests {
             if requests {
                 // Window bounds: since, then hour/day boundaries.
                 parameters.extend((0..count).map(|_| 0.into()));
-            } else if sql.starts_with("SELECT 1,(SELECT model_id") {
-                // Selected models: every family, then the instant.
+            } else if sql.starts_with("SELECT 1,(SELECT model_id")
+                || sql.starts_with("SELECT 1,s.model_id")
+            {
+                // Selected models or pricing families: every family, then the instant.
                 parameters.extend((1..count).map(|_| "Claude Sonnet".to_owned().into()));
                 parameters.push(60.into());
             } else if count > 0 {
@@ -845,7 +908,11 @@ mod tests {
                     "Claude Sonnet".to_owned().into()
                 });
             }
-            if count > 1 && !requests && !sql.starts_with("SELECT 1,(SELECT model_id") {
+            if count > 1
+                && !requests
+                && !sql.starts_with("SELECT 1,(SELECT model_id")
+                && !sql.starts_with("SELECT 1,s.model_id")
+            {
                 parameters.push(60.into());
             }
             let plan =
@@ -895,6 +962,28 @@ mod tests {
                     table: "cost_backfill",
                     reason: "one state row per configured reference family",
                 });
+            } else if sql.starts_with("SELECT 1,s.model_id") {
+                for index in [
+                    "selection_lookup",
+                    "selection_pending",
+                    "selection_confirmed_id",
+                ] {
+                    required.push(RequiredSearch {
+                        table: "reference_selection",
+                        index: Some(index),
+                    });
+                }
+                required.push(RequiredSearch {
+                    table: "price_snapshots",
+                    index: Some("snapshot_lookup"),
+                });
+                for table in ["one", "CONSTANT"] {
+                    exceptions.push(Exception {
+                        kind: ExceptionKind::SmallWholeSetRead,
+                        table,
+                        reason: "one constant row per configured reference family",
+                    });
+                }
             } else if sql.contains("FROM price_snapshots") {
                 required.push(RequiredSearch {
                     table: "price_snapshots",
@@ -947,6 +1036,198 @@ mod tests {
             }
         }
         eprintln!("one-selected-family usage: {counts:?}");
+        Ok(())
+    }
+
+    /// The batched view matches `pricing::Store::show` at every instant, for small
+    /// and large histories with selected and pending rates, in one indexed read.
+    #[test]
+    fn pricing_families_match_store_show_in_one_read() -> Result<()> {
+        use factory_db::explain::{self, Exception, ExceptionKind, RequiredSearch};
+        let references = pricing::parse_references(pricing::DEFAULT_CONFIG)?;
+        let model = |model_id: &str, input: i64, released: i64| pricing::Model {
+            model_id: model_id.into(),
+            input_micro_usd_per_mtok: input,
+            output_micro_usd_per_mtok: 3 * input,
+            released_at_ms: Some(released),
+        };
+        for noise in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let path = temp.path().join("pricing.db");
+            pricing::migrate(&path)?;
+            let mut store = pricing::Store::open(&path)?;
+            let old = [
+                model("anthropic/claude-sonnet-5.5", 2_000_000, 1),
+                model("openai/gpt-5.6-sol", 1_000_000, 1),
+            ];
+            store.refresh(&references, &old, &[], 10, vec![])?;
+            store.confirm("Claude Sonnet", 20)?;
+            store.confirm("ChatGPT mid-tier", 21)?;
+            // Same-millisecond source and refresh ties: the newest refresh's primary wins.
+            let cheaper = [
+                model("anthropic/claude-sonnet-5.5", 1_500_000, 1),
+                old[1].clone(),
+            ];
+            store.refresh(
+                &references,
+                &cheaper,
+                &[model("anthropic/claude-sonnet-5.5", 9_000_000, 1)],
+                30,
+                vec![],
+            )?;
+            store.refresh(
+                &references,
+                &old,
+                &[model("openai/gpt-5.6-sol", 8_000_000, 1)],
+                30,
+                vec![],
+            )?;
+            let newer = [
+                model("anthropic/claude-sonnet-6", 5_000_000, 2),
+                model("openai/gpt-6-sol", 4_000_000, 2),
+            ];
+            store.refresh(&references, &newer, &[], 40, vec![])?;
+            store.confirm("Claude Sonnet", 50)?;
+            store.refresh(
+                &references,
+                &[
+                    newer[0].clone(),
+                    model("openai/gpt-6-sol", 4_500_000, 2),
+                    model("anthropic/claude-sonnet-7", 6_000_000, 3),
+                ],
+                &[],
+                60,
+                vec![],
+            )?;
+            if noise {
+                store.connection().execute_batch(
+                    "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000)
+                     INSERT INTO price_snapshots(fetched_at_ms,source,model_id,input_micro_usd_per_mtok,output_micro_usd_per_mtok,released_at_ms,refresh_id) SELECT x,'openrouter','noise-'||(x%101),2,7,1,1 FROM n;
+                     WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<3000)
+                     INSERT INTO reference_selection(family,model_id,effective_from_ms,confirmed,refresh_id) SELECT 'noise-'||(x%37),'noise-'||(x%101),x,x%2,1 FROM n;
+                     ANALYZE;",
+                )?;
+            }
+            let reader = pricing::Store::reader(Connection::open(&path)?)?;
+            let mut pending = 0;
+            for at in [0, 10, 19, 20, 21, 29, 30, 31, 45, 50, 59, 60, 70] {
+                let expected: Vec<_> = reader
+                    .show(&references, at)?
+                    .into_iter()
+                    .map(|s| {
+                        let selection = |s: pricing::Selection| (s.model_id, s.effective_from_ms);
+                        let rates = s.rates.map(|r| {
+                            (
+                                r.model.input_micro_usd_per_mtok,
+                                r.model.output_micro_usd_per_mtok,
+                                r.source,
+                                r.fetched_at_ms,
+                            )
+                        });
+                        (
+                            s.family,
+                            s.selected.map(selection),
+                            rates,
+                            s.pending.map(selection),
+                        )
+                    })
+                    .collect();
+                let actual: Vec<_> = families(&reader, &references, at)?
+                    .into_iter()
+                    .map(|f| {
+                        let selection = |s: Selection| (s.model_id, s.effective_from_ms);
+                        let rates = f.rates.map(|r| {
+                            (
+                                (r.input_per_mtok * 1e6) as i64,
+                                (r.output_per_mtok * 1e6) as i64,
+                                r.source,
+                                r.fetched_at_ms,
+                            )
+                        });
+                        (
+                            f.family,
+                            f.selected.map(selection),
+                            rates,
+                            f.pending.map(selection),
+                        )
+                    })
+                    .collect();
+                assert_eq!(actual, expected, "at {at}");
+                pending += actual.iter().filter(|f| f.3.is_some()).count();
+            }
+            assert!(pending > 0);
+            // Observable rates independent of `show`: tie-broken primary, then the newest refresh.
+            let at_35 = families(&reader, &references, 35)?;
+            assert_eq!(
+                at_35[0]
+                    .rates
+                    .as_ref()
+                    .map(|r| (r.input_per_mtok, r.source.as_str())),
+                Some((2.0, "openrouter"))
+            );
+            let at_70 = families(&reader, &references, 70)?;
+            assert_eq!(
+                at_70[0].selected.as_ref().map(|s| s.model_id.as_str()),
+                Some("anthropic/claude-sonnet-6")
+            );
+            assert_eq!(
+                at_70[0].pending.as_ref().map(|s| s.model_id.as_str()),
+                Some("anthropic/claude-sonnet-7")
+            );
+            assert_eq!(
+                at_70[1].pending.as_ref().map(|s| s.model_id.as_str()),
+                Some("openai/gpt-6-sol")
+            );
+            let sql = families_sql(references.len());
+            let mut values: Vec<rusqlite::types::Value> =
+                references.iter().map(|r| r.name.clone().into()).collect();
+            values.push(70.into());
+            let plan = explain::query_plan(
+                reader.connection(),
+                &sql,
+                rusqlite::params_from_iter(values),
+            )?;
+            explain::validate(
+                &plan,
+                &[
+                    RequiredSearch {
+                        table: "reference_selection",
+                        index: Some("selection_lookup"),
+                    },
+                    RequiredSearch {
+                        table: "reference_selection",
+                        index: Some("selection_pending"),
+                    },
+                    RequiredSearch {
+                        table: "reference_selection",
+                        index: Some("selection_confirmed_id"),
+                    },
+                    RequiredSearch {
+                        table: "price_snapshots",
+                        index: Some("snapshot_lookup"),
+                    },
+                    RequiredSearch {
+                        table: "s",
+                        index: None,
+                    },
+                    RequiredSearch {
+                        table: "r",
+                        index: None,
+                    },
+                    RequiredSearch {
+                        table: "p",
+                        index: None,
+                    },
+                ],
+                &["one", "CONSTANT"].map(|table| Exception {
+                    kind: ExceptionKind::SmallWholeSetRead,
+                    table,
+                    reason: "one constant row per configured reference family",
+                }),
+            )
+            .with_context(|| format!("{plan:#?}"))?;
+            assert!(!plan.iter().any(|d| d.contains("TEMP B-TREE")), "{plan:#?}");
+        }
         Ok(())
     }
 }

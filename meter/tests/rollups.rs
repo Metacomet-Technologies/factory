@@ -299,7 +299,7 @@ async fn gpu_hourly_summaries_history_and_gated_pruning() {
     let db = open(&path);
     db.import(vec![], samples.clone()).await.unwrap();
     // Unverified: nothing older than seven days is pruned, history is raw.
-    let unrolled = db.history(now - 30 * DAY).await.unwrap();
+    let unrolled = db.history_at(now - 30 * DAY, now).await.unwrap();
     assert_eq!(unrolled.len(), samples.len());
     assert!(unrolled.iter().all(|p| p.samples.is_none()));
     let progress = db.rollups().await.unwrap();
@@ -383,7 +383,7 @@ async fn gpu_hourly_summaries_history_and_gated_pruning() {
     // raw samples from it, plus the unrolled old sample; nothing twice.
     let db = Db::open(&path).unwrap();
     let since = now - 30 * DAY;
-    let history = db.history(since).await.unwrap();
+    let history = db.history_at(since, now).await.unwrap();
     let boundary = rollup_ceil(now - 7 * DAY);
     let first = rollup_floor(since);
     let hours = want
@@ -416,6 +416,66 @@ async fn gpu_hourly_summaries_history_and_gated_pruning() {
         raw_points.iter().filter(|p| p.sample.ts < boundary).count(),
         1
     );
+    db.close().await.unwrap();
+}
+
+/// A 7d history request resolves from its own request time: it stays raw even
+/// after the clock has moved past the seven-day boundary before the read.
+#[tokio::test]
+async fn seven_day_history_uses_the_request_time_not_the_read_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meter.db");
+    // Request time 5 s in the past, with a cutoff that is not hour-aligned.
+    let mut now = meter::now_ms() - 5_000;
+    if (now - 7 * DAY) % HOUR == 0 {
+        now -= 7;
+    }
+    let cutoff = now - 7 * DAY;
+    assert_ne!(cutoff % HOUR, 0);
+    let at = |ts: i64, power_w: f64| GpuSample {
+        ts,
+        power_w,
+        ..sample(5, now)
+    };
+    let samples = vec![
+        at(now - 10 * DAY, 10.0),
+        at(cutoff - 1, 20.0),
+        at(cutoff, 30.0),
+        at(cutoff + 1, 40.0),
+    ];
+    let mut db = open(&path);
+    db.import(vec![], samples).await.unwrap();
+    let progress = db.rollups().await.unwrap();
+    assert!(progress.caught_up && progress.verified, "{progress:?}");
+    // The read happens after the boundary moved past `cutoff`; resolving from the
+    // read time would return the hour as a rollup instead of raw samples.
+    assert!(meter::now_ms() - 7 * DAY > cutoff);
+    let scope = factory_db::Scope::recording();
+    db.scope = Some(scope.clone());
+    let week = db.history_at(cutoff, now).await.unwrap();
+    assert_eq!(scope.counts().data, 1);
+    let points: Vec<_> = week
+        .iter()
+        .map(|p| (p.sample.ts, p.samples, p.sample.power_w))
+        .collect();
+    assert_eq!(points, [(cutoff, None, 30.0), (cutoff + 1, None, 40.0)]);
+    // Longer ranges keep hourly means before the first whole raw hour, and
+    // every sample appears exactly once.
+    let scope = factory_db::Scope::recording();
+    db.scope = Some(scope.clone());
+    let month = db.history_at(now - 30 * DAY, now).await.unwrap();
+    assert_eq!(scope.counts().data, 2);
+    let boundary = rollup_ceil(cutoff);
+    let points: Vec<_> = month.iter().map(|p| (p.sample.ts, p.samples)).collect();
+    assert_eq!(
+        points,
+        [
+            (rollup_floor(now - 10 * DAY), Some(1)),
+            (rollup_floor(cutoff), Some(3)),
+        ]
+    );
+    assert!(month.iter().all(|p| p.sample.ts < boundary));
+    assert_eq!(month[1].sample.power_w, 30.0);
     db.close().await.unwrap();
 }
 

@@ -295,7 +295,8 @@ mod api {
         maintenance: db::Maintenance,
     }
 
-    fn since(range: Option<&str>) -> Result<i64, String> {
+    /// Range start relative to the request time `now`, which later reads reuse.
+    fn since(range: Option<&str>, now: i64) -> Result<i64, String> {
         let days = match range.unwrap_or("24h") {
             "24h" => 1,
             "7d" => 7,
@@ -303,7 +304,7 @@ mod api {
             "365d" => 365,
             _ => return Err("range must be 24h, 7d, 30d, or 365d".into()),
         };
-        Ok(now_ms() - days * 86_400_000)
+        Ok(now - days * 86_400_000)
     }
 
     pub fn error(status: StatusCode, message: String) -> Response<Body> {
@@ -351,12 +352,14 @@ mod api {
                 };
             }
             "/meter/stats" | "/meter/gpu/history" => {
-                let since = match since(parameters.range.as_deref()) {
+                // One request time: a 7d range stays raw however long the read waits.
+                let now = now_ms();
+                let since = match since(parameters.range.as_deref(), now) {
                     Ok(since) => since,
                     Err(message) => return error(StatusCode::BAD_REQUEST, message),
                 };
                 if path == "/meter/gpu/history" {
-                    history_doc(state, since).await
+                    history_doc(state, since, now).await
                 } else {
                     // Exact raw percentiles through 30 days; longer ranges are flagged.
                     let exact = parameters.range.as_deref() != Some("365d");
@@ -452,8 +455,16 @@ mod api {
         Ok(response)
     }
     #[utoipa::path(get, path = "/meter/gpu/history", params(("range" = Option<String>, Query, description = "24h (default), 7d, 30d, 365d. Raw samples are retained 7 days; longer ranges return hourly means (with samples) before that.")), responses((status = 200, body = [rollup::GpuPoint]), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
-    async fn history_doc(state: &AppState, since: i64) -> Result<serde_json::Value, String> {
-        let samples = state.db.history(since).await.map_err(|e| e.to_string())?;
+    async fn history_doc(
+        state: &AppState,
+        since: i64,
+        now: i64,
+    ) -> Result<serde_json::Value, String> {
+        let samples = state
+            .db
+            .history_at(since, now)
+            .await
+            .map_err(|e| e.to_string())?;
         serde_json::to_value(samples).map_err(|e| e.to_string())
     }
     #[utoipa::path(get, path = "/meter/openapi.json", responses((status = 200, description = "OpenAPI 3.1 document")))]

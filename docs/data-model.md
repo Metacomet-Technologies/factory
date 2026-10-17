@@ -181,7 +181,9 @@ days from the first day boundary, hourly rows the hours before it, and raw rows 
 partial first hour plus every row above the verified checkpoint. The intervals are
 disjoint by time and ID. Ranges ≤30d keep exact nearest-rank percentiles from the
 covering index. New `365d` ranges (meter stats, API usage) merge histograms and
-set additive `percentiles_approximate`. GPU history up to seven days stays raw.
+set additive `percentiles_approximate`. GPU history up to seven days stays raw;
+the resolution is chosen from the request time the range was parsed at, so a
+slow read cannot turn a 7d request into hourly means.
 Longer ranges return hourly means (`samples` set; ts is the hour start) before
 the first whole raw hour, then raw samples. Meter's existing seven-day GPU
 deletion now removes only verified, rolled-up IDs. No other pruning exists; that is MET-206.
@@ -197,8 +199,13 @@ cursor is at least every cached ID, so no lower ID can appear at or below the
 rollup checkpoint. Rows are plain inserts, so a known ID is never rewritten.
 
 Measured budgets (enforced in tests): API usage **6** reads for every range,
-replacing 11; pricing, confirm and sync are unchanged. Meter stats **3**, GPU
-history **≤2**, health/requests 1. A full 5,000-row API rollup batch is **≤16**.
+replacing 11. Meter stats **3**, GPU history **≤2**, health/requests 1. A full
+5,000-row API rollup batch is **≤16**. The pricing view reads each family's
+selection, rates and pending change in one batched statement, checked against
+`pricing::Store::show` and EXPLAIN. That meets the step-5 targets: pricing **2**
+(≤3, was 9), confirm **9** including the HTTP preflight (≤12, was 29), refresh
+view reads **4** (≤6, was 17). Refresh totals are **13 / 33** at 3 / 1,001 source
+models. Sync pages keep MET-204's budget; the step-5 sync target is not adopted.
 A rewinding cost page adds at most one status read and three rewrite statements
 when its rows are already rolled up. Requests setup is 132 statements (116).
 
@@ -212,7 +219,9 @@ Sandbox (100k seeded rows): baseline v1/v5 data from the merge-base binaries was
 stopped, copied and migrated offline. Meter v1→v2 backfilled 100,520 rows
 (requests plus GPU) in 935 ms; API v5→v6 backfilled 100,150 rows in 1,350 ms.
 All existing table counts were unchanged and both comparisons were equal. Old and
-new code on the same files at a fixed instant gave byte-identical results.
+new code on the same files at a fixed instant gave equal JSON values after
+normalization: `generated_at_ms` removed and the new `percentiles_approximate:
+false` stripped. That is not literal byte equality.
 That covers usage and spend (24h/7d/30d), meter stats (with and without a model
 filter) and GPU history sample totals. The branch stack then ran on the migrated
 files with `maintenance` ok and advanced on its five-minute tick.
@@ -228,8 +237,10 @@ rollups through the latest ID. Rollbacks restore those verified v1/v5 snapshots
 (**all telemetry returns to backup time**). Reruns on v2/v6 restore no DB. No
 production migration, deployment or production read has been run.
 
-Known follow-up: `scripts/sandbox-shims/runtime.py` (outside this change) still
-starts meter only from v1, so a reused sandbox needs it to accept v2.
+Open deviation: `scripts/sandbox-shims/runtime.py` (outside this change's scope)
+still starts meter only from v1. Fresh sandboxes work; `down`/`up` on a v2
+database and reuse of a v1 database stop at its guard until that file is
+approved for change.
 
 ## Scope, evidence, and decisions
 

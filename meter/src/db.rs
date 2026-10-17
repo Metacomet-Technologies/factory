@@ -252,7 +252,12 @@ impl Db {
     /// Raw samples within the seven-day raw retention. Older ranges add hourly
     /// means for hours before the raw boundary: at most two statements.
     pub async fn history(&self, since: i64) -> Result<Vec<rollup::GpuPoint>> {
-        let now = crate::now_ms();
+        self.history_at(since, crate::now_ms()).await
+    }
+
+    /// History resolved at `now`, the request time `since` was derived from, so
+    /// the resolution never depends on how long the read waited.
+    pub async fn history_at(&self, since: i64, now: i64) -> Result<Vec<rollup::GpuPoint>> {
         self.read(move |db| history(db, since, now)).await
     }
 
