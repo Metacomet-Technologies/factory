@@ -48,7 +48,9 @@ function moot(issue: Issue, key: string) {
   const text = result?.value === 'changes' ? followupText(result.body) : undefined;
   if (!text) return false;
   const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-  return lines.every(line => /\bevidence\b|diff comment|file list/i.test(line))
+  // Conservative: every line must open with an evidence request and name no other work.
+  return lines.every(line => /^(?:[-*]\s*)?(?:please\s+)?(?:re-?post|post|update|provide|add)\s+(?:the\s+)?(?:updated\s+)?(?:linear\s+)?(?:evidence|diff)\s+comment\b/i.test(line)
+    && !/\b(?:fix|run|tests?|change|implement|remove|rename|refactor|rewrite|edit|revert|code|handling)\b/i.test(line))
     && new RegExp(`\\b${sha}\\b`).test(text) && (text.match(/\b[a-f0-9]{40}\b/g) ?? []).every(value => value === sha)
     && new RegExp(`(?:/pull/|PR #?)${pr}\\b`).test(text) && [...text.matchAll(/(?:\/pull\/|PR #?)(\d+)\b/g)].every(m => m[1] === pr)
     && issue.comments.some(c => evidence(c.body, pr, sha));
@@ -216,8 +218,12 @@ export async function reviewPRs(ctx: Context) {
     if (!builder || !claim?.createdAt || ['completed', 'canceled'].includes(issue.state.type)) continue;
     // A failed Cursor agent gets no new review or follow-up until Devon recovers it by hand.
     if (lines(issue).includes(`<!-- factory-dispatch:cursor-failed ${builder} -->`)) { log('qa-skipped', { issue: issue.identifier, reason: 'Cursor agent failed' }); continue; }
+    // A Cursor builder's recorded original PR is the only one QA acts on; replacements get
+    // the dispatcher's one Devon mention and nothing else.
+    const original = builder.startsWith('bc-') ? lines(issue).map(line => line.match(/^<!-- factory-dispatch:cursor-pr pr:(\d+) -->$/)?.[1]).find(Boolean) : undefined;
     const attachments = issue.attachments.filter(a => Date.parse(a.createdAt) > Date.parse(claim.createdAt!)
-      && new RegExp(`^https://github.com/${config.repository}/pull/\\d+/?$`).test(a.url));
+      && new RegExp(`^https://github.com/${config.repository}/pull/\\d+/?$`).test(a.url)
+      && (!original || a.url.match(/\/pull\/(\d+)/)![1] === original));
     for (const attachment of attachments) {
       const pr = attachment.url.match(/\/pull\/(\d+)/)![1];
       if (attachment.metadata.status !== 'open') continue;

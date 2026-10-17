@@ -310,16 +310,19 @@ continuation still goes to the local reviewer.
 - Any other failure or unknown outcome keeps the claim and is never retried, as
   for Amp.
 - A changes verdict whose follow-up only asks for evidence for its own PR and
-  head (every line mentions evidence, a diff comment or file list; no other PR or
-  SHA) is moot once matching evidence exists: nothing is sent, `followup-moot` is
+  head is moot. Recognition is conservative: every line must open with a
+  post/update/provide evidence (or diff) comment request and name no other work
+  (no fix, run, test, change, code, …), and no other PR or SHA may appear. It is moot once matching evidence exists: nothing is sent, `followup-moot` is
   logged, no round is consumed and a fresh review starts at the same head. Mixed
   findings and stale or wrong-PR evidence are delivered as usual.
 
-Original PR: the first PR the dispatcher sees for the issue (a linked PR after
-the claim, an evidence marker, or the first run-reported URL, recorded at once as
-`<!-- factory-dispatch:cursor-pr pr:<n> -->`) stays the issue's PR, even if its
-first normalization failed. Later runs reporting another URL get the one Devon
-mention and no writes.
+Original PR: the first PR the dispatcher sees for the issue (an evidence marker,
+the earliest post-claim linked PR by attachment time, or the first run-reported
+URL) is recorded before any write as `<!-- factory-dispatch:cursor-pr pr:<n> -->`
+and stays the issue's PR, even if its first normalization failed. Later runs
+reporting another URL get the one Devon mention and no writes. QA for a Cursor
+builder with that marker reviews, follows up and merges only the recorded PR;
+other linked PRs are ignored.
 
 Wrap-up: a cloud agent cannot update factory-gpu's main checkout. After merge,
 the same `wrapup-claim` precedes a **new local Amp thread** on gpu:

@@ -453,10 +453,15 @@ export async function run(command: string, identifier: string | undefined, dryRu
     // The first PR seen (recorded, evidenced or linked after the claim) stays the issue's PR;
     // QA and follow-ups stay on it even if a later run reports another.
     const claim = issue.comments.find(c => commentMarkers(c.body).some(line => claimPattern.test(line)));
-    const known = issue.comments.flatMap(c => commentMarkers(c.body)).map(line => line.match(originalPattern)?.[1] ?? line.match(evidencePattern)?.[1]).find(Boolean)
-      ?? issue.attachments.filter(a => Date.parse(a.createdAt) > Date.parse(claim?.createdAt ?? '')).map(a => a.url.match(new RegExp(`^${base.replaceAll('.', '\\.')}(\\d+)/?$`, 'i'))?.[1]).find(Boolean);
-    const pr = known ?? reported[0];
-    if (pr && !known) await comment(issue, `Cursor opened ${base}${pr}; the dispatcher normalizes it.\n\n${marker(`cursor-pr pr:${pr}`)}`);
+    const markers = issue.comments.flatMap(c => commentMarkers(c.body));
+    const recorded = markers.map(line => line.match(originalPattern)?.[1]).find(Boolean);
+    // Earliest post-claim attachment, by time: Linear's attachment order is not identity.
+    const linked = issue.attachments.filter(a => Date.parse(a.createdAt) > Date.parse(claim?.createdAt ?? ''))
+      .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
+      .map(a => a.url.match(new RegExp(`^${base.replaceAll('.', '\\.')}(\\d+)/?$`, 'i'))?.[1]).find(Boolean);
+    const pr = recorded ?? markers.map(line => line.match(evidencePattern)?.[1]).find(Boolean) ?? linked ?? reported[0];
+    // Recorded before any write, so a failed first normalization cannot lose the identity.
+    if (pr && !recorded) await comment(issue, `Cursor opened ${base}${pr}; the dispatcher normalizes it.\n\n${marker(`cursor-pr pr:${pr}`)}`);
     for (const other of reported.filter(n => n !== pr)) {
       log('cursor-pr-other', { issue: issue.identifier, pr: other, kept: pr });
       if (!has(issue, `cursor-pr-other pr:${other}`)) await comment(issue, `${devonMention}: Cursor reported another PR, ${base}${other}, besides ${base}${pr}. The dispatcher does not act on it; inspect before manual recovery.\n\n${marker(`cursor-pr-other pr:${other}`)}`);

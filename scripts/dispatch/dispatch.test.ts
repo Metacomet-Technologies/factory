@@ -2780,6 +2780,7 @@ test('evidence-only findings are moot once matching evidence exists; mixed, stal
     ['stale evidence', ask, proof(90, nextSha), false],
     ['wrong-PR evidence', ask, proof(91), false],
     ['finding for another head', ask.replace(sha, nextSha), proof(), false],
+    ['same-line mixed', `Fix widgets/widget.rs boundary handling, run widget tests, and post the Linear evidence comment for PR 90 at ${sha}: PR URL, head SHA and complete file list.`, proof(), false],
   ] as const) {
     // An Amp builder isolates QA: a cursor poll would post fresh dispatcher evidence first.
     const i = reviewable();
@@ -2790,7 +2791,11 @@ test('evidence-only findings are moot once matching evidence exists; mixed, stal
     assert.equal(result.code, 0, result.stdout);
     assert.equal(f.calls().filter((a: any) => a[1] === 'continue').length, moot ? 0 : 1, label);
     assert.equal(result.stdout.includes('"decision":"followup-moot"'), moot, label);
-    assert.equal(i.comments.some((c: any) => /factory-qa:(?:followup-claim|round) /.test(c.body)), !moot, label);
+    assert.equal(i.comments.filter((c: any) => /factory-qa:round /.test(c.body)).length, moot ? 0 : 1, label);
+    if (!moot) {
+      await f.run();
+      assert.equal(f.calls().filter((a: any) => a[1] === 'continue').length, 1, `${label}: delivered exactly once`);
+    }
     if (moot) {
       const launches = f.calls().filter((a: any) => a[0] === '-x');
       assert.equal(launches.length, 1, 'a fresh same-head review follows');
@@ -2837,4 +2842,44 @@ test('cursor initial and follow-up prompts assign PR creation to Cursor and evid
   const text = runPosts(f)[0].body.prompt.text;
   assert.ok(text.includes('fix what remains, verify, and push your branch. Cursor updates the PR; the dispatcher posts the Linear evidence comment. Do not open a PR. Never deploy or merge.'));
   assert.doesNotMatch(text, /post the updated Linear diff comment/);
+});
+
+test('a linked original PR is recorded before a failed evidence read; a newer PR 95 listed first never replaces it', { timeout: 20_000 }, async t => {
+  const pr90 = { url: prURL(90), metadata: { status: 'open' }, createdAt: '2026-10-10T12:00:00.001Z' };
+  const pr95 = { url: prURL(95), metadata: { status: 'open' }, createdAt: '2026-10-11T12:00:00.000Z' };
+  const i = cursorBuilder(123, cursorAgent, { attachments: [pr90] });
+  const f = await fixture(t, [i], { agents: { [cursorAgent]: {} }, github: { 90: cursorPR(90, { files: [] }), 95: cursorPR(95) }, submissionsOnly: true });
+  assert.equal((await f.run()).code, 0);
+  assert.ok(i.comments.some((c: any) => commentMarkers(c.body).includes('<!-- factory-dispatch:cursor-pr pr:90 -->')), 'linked PR recorded');
+  assert.ok(i.comments.some((c: any) => c.body.includes('cursor-pr-failed pr:90 step:evidence')));
+  i.attachments.unshift(pr95);
+  reportPR(f, cursorAgent, prURL(95));
+  for (let pass = 0; pass < 2; pass++) assert.equal((await f.run()).code, 0);
+  assert.equal(i.comments.filter((c: any) => c.body.includes('cursor-pr-other pr:95')).length, 1);
+  assert.ok(!f.githubCalls().some((a: any) => a[0] === 'gh' && (a.includes('95') || a.some((v: string) => v.includes('/pulls/95/')))), 'no normalization reads or writes on PR 95');
+  assert.equal(f.githubCalls().filter((a: any) => a[0] === 'gh' && a[2] === 'view' && a[3] === '90').length, 3, 'PR 90 normalization retries');
+  assert.equal(evidence(i).length, 0);
+  assert.ok(!i.comments.some((c: any) => c.body.includes('cursor-pr pr:95')));
+});
+
+test('Cursor QA acts only on the recorded original PR; a linked replacement gets no review, follow-up or merge', { timeout: 20_000 }, async t => {
+  const pr95 = { url: prURL(95), metadata: { status: 'open' }, createdAt: '2026-10-11T12:00:00.000Z' };
+  const i = cursorBuilder(123, cursorAgent, { attachments: [pr95, attachment('open')] });
+  i.comments.push({ body: 'Cursor opened PR 90.\n\n<!-- factory-dispatch:cursor-pr pr:90 -->' });
+  const f = await fixture(t, [i], { agents: { [cursorAgent]: {} }, submissionsOnly: true,
+    github: { 90: githubPR({ title: 'MET-123 — x', body: 'Contributes MET-123' }), 95: githubPR({ title: 'MET-123 — y', body: 'Contributes MET-123' }) } });
+  reportPR(f, cursorAgent, prURL(95));
+  for (let pass = 0; pass < 2; pass++) assert.equal((await f.run()).code, 0);
+  const launches = f.calls().filter((a: any) => a[0] === '-x');
+  assert.equal(launches.length, 1);
+  assert.match(launches[0][1], /QA PR 90|pr:90 sha:/);
+  assert.ok(!launches[0].join(' ').includes('QA PR 95'));
+  assert.ok(!i.comments.some((c: any) => /factory-qa:[\w-]+ pr:95 /.test(c.body)), 'PR 95 never enters QA');
+  // A changes verdict and a ready verdict on PR 95 are both ignored.
+  i.comments.push(qaMarker(`start pr:95 sha:${sha} runner:gpu`), qaMarker(`review-claim pr:95 sha:${sha} thread:${reviewId}`),
+    { body: `<!-- factory-qa:review pr:95 sha:${sha} thread:${reviewId} verdict:changes -->\n\n## Builder follow-up\nFix it.` });
+  for (let pass = 0; pass < 2; pass++) assert.equal((await f.run()).code, 0);
+  assert.equal(runPosts(f).length, 0, 'no follow-up for PR 95');
+  assert.ok(!i.comments.some((c: any) => /factory-qa:(?:followup-claim|round|merge-claim|human) pr:95 /.test(c.body)));
+  assert.equal(i.comments.filter((c: any) => c.body.includes('cursor-pr-other pr:95')).length, 1, 'other-PR warning once');
 });
