@@ -1,7 +1,8 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { commentMarkers, cursorId, engineArgs, prepareWorktree, runnerCommand, runWorktreeCommand, type Issue } from './dispatch.ts';
+import { commentMarkers, cursorId, engineArgs, openWrapup, prepareWorktree, runnerCommand, runWorktreeCommand, sharesCheckout, wrapupRunner, type Issue } from './dispatch.ts';
 import { repos } from './repos.ts';
 
 const config = JSON.parse(readFileSync(new URL('qa-config.json', import.meta.url), 'utf8'));
@@ -344,35 +345,138 @@ export async function reviewPRs(ctx: Context) {
   }
 }
 
+const wrapupDone = '<!-- factory-dispatch:wrapup-done -->';
+// Merged factory PRs linked after this dispatch's claim; older ones belong to earlier work.
+function mergedPRs(issue: Issue) {
+  const claim = issue.comments.find(c => commentMarkers(c.body).some(line => /^<!-- factory-dispatch:claim runner:(gpu|console|cursor) -->$/.test(line)));
+  return issue.attachments.flatMap(attachment => {
+    const pr = attachment.url.match(new RegExp(`^https://github.com/${config.repository}/pull/(\\d+)/?$`))?.[1];
+    return pr && attachment.metadata.status === 'merged' && Date.parse(attachment.createdAt) > Date.parse(claim?.createdAt ?? '') ? [pr] : [];
+  });
+}
+// Real Git exits 128 both for an unreadable checkout and for a merge absent from its object
+// database. A readable HEAD rules out the first, so an absent object only needs a fetch.
+function lacksMerge(sha: string) {
+  command('git', ['-C', main, 'rev-parse', '--verify', 'HEAD^{commit}']);
+  if (runWorktreeCommand('gpu', ['git', '-C', main, 'cat-file', '-e', `${sha}^{commit}`], [0, 128]).status === 128) return true;
+  return runWorktreeCommand('gpu', ['git', '-C', main, 'merge-base', '--is-ancestor', sha, 'HEAD'], [0, 1]).status === 1;
+}
+
+// PR -> merge SHA verified in the checkout. Only these skip the GitHub read, so unverified
+// merges, historical ones included, are always checked; a lost file only costs reads.
+const containsPath = () => `${homedir()}/.local/state/factory-dispatch/main-contains.json`;
+function readContains(): Record<string, string> {
+  try {
+    const value = JSON.parse(readFileSync(containsPath(), 'utf8'));
+    if (value && typeof value === 'object' && !Array.isArray(value)
+      && Object.entries(value).every(([pr, sha]) => /^\d+$/.test(pr) && typeof sha === 'string' && shaPattern.test(sha))) return value;
+  } catch { /* Missing or unreadable: verify every merge. */ }
+  return {};
+}
+function writeContains(ctx: Context, value: Record<string, string>) {
+  const path = containsPath(), temporary = `${path}.${process.pid}.tmp`;
+  try {
+    mkdirSync(path.slice(0, path.lastIndexOf('/')), { recursive: true, mode: 0o700 });
+    writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temporary, path);
+  } catch { ctx.log('error', { action: 'main-contains', message: 'Could not store verified merges' }); }
+  finally { rmSync(temporary, { force: true }); }
+}
+
+// The dispatcher runs from gpu's main checkout, so it fast-forwards that checkout to merges
+// wrapped up on any runner. It never resets, rebases, stashes or force-checks-out.
+export async function fastForwardMain(ctx: Context) {
+  const behind: { issue: Issue; pr: string; sha: string }[] = [];
+  const contains = readContains();
+  let verified = false;
+  for (const issue of ctx.issues.filter(i => lines(i).includes(wrapupDone))) {
+    for (const pr of mergedPRs(issue)) {
+      // Document markers are not containment proof: historical playbook-checked never required it.
+      if (contains[pr]) continue;
+      try {
+        const data = await info(pr, true);
+        const sha = data.mergeCommit?.oid;
+        if (data.state !== 'MERGED' || !shaPattern.test(sha ?? '')) throw new Error('PR not merged on GitHub');
+        if (lacksMerge(sha)) behind.push({ issue, pr, sha });
+        else { contains[pr] = sha; verified = true; }
+      } catch { ctx.log('main-ff-pending', { issue: issue.identifier, pr, reason: 'merge SHA or checkout unreadable' }); }
+    }
+  }
+  if (verified && !ctx.dryRun) writeContains(ctx, contains);
+  if (!behind.length) return;
+  const issues = behind.map(({ issue }) => issue.identifier);
+  // A gpu wrap-up builds in this checkout; moving it underneath would break that build.
+  const blocking = ctx.issues.find(issue => openWrapup(issue) && sharesCheckout(wrapupRunner(issue), 'gpu'));
+  if (blocking) { ctx.log('main-ff-waiting', { issues, blocking: blocking.identifier }); return; }
+  let from: string, reason: string | undefined;
+  try {
+    from = command('git', ['-C', main, 'rev-parse', 'HEAD']);
+    reason = command('git', ['-C', main, 'branch', '--show-current']) !== 'main' ? 'checkout not on main'
+      : command('git', ['-C', main, 'status', '--porcelain']) ? 'checkout has uncommitted or untracked files' : undefined;
+  } catch { ctx.log('main-ff-pending', { issues, reason: 'checkout unreadable' }); return; }
+  if (!reason) {
+    if (ctx.dryRun) {
+      ctx.showAmp(behind[0].issue, ['git', '-C', main, 'fetch', 'origin', 'main']);
+      ctx.showAmp(behind[0].issue, ['git', '-C', main, 'merge', '--ff-only', 'origin/main']);
+      for (const { issue, pr, sha } of behind) ctx.log('main-ff', { dryRun: true, issue: issue.identifier, pr, sha, from });
+      return;
+    }
+    try { command('git', ['-C', main, 'fetch', 'origin', 'main']); }
+    catch { ctx.log('main-ff-pending', { issues, reason: 'fetch failed' }); return; }
+    // At most one attempt per poll: a failure is reported, never retried in a loop.
+    let to: string | undefined;
+    try {
+      command('git', ['-C', main, 'merge', '--ff-only', 'origin/main']);
+      try { to = command('git', ['-C', main, 'rev-parse', 'HEAD']); } catch { to = 'unknown'; }
+    } catch { reason = 'merge --ff-only origin/main failed; the checkout may have diverged'; }
+    if (to) {
+      for (const { issue, pr, sha } of behind) ctx.log('main-ff', { issue: issue.identifier, pr, sha, from, to });
+      return;
+    }
+  }
+  for (const { issue, pr, sha } of behind) {
+    ctx.log('main-ff-refused', { issue: issue.identifier, pr, sha, reason });
+    const refused = `<!-- factory-dispatch:main-ff-refused sha:${sha} -->`;
+    if (!lines(issue).includes(refused)) await ctx.comment(issue, `${devonMention}: factory-gpu's main checkout (${main}) lacks merge ${sha} of PR ${pr}, and the dispatcher did not fast-forward it: ${reason}. It never resets, stashes or force-checks-out; once the checkout is clean on main and can fast-forward, a later poll does it.\n\n${refused}`);
+  }
+}
+
 export async function syncPlaybook(ctx: Context) {
   for (const issue of ctx.issues) {
-    if (!lines(issue).includes('<!-- factory-dispatch:wrapup-done -->')) continue;
-    const claim = issue.comments.find(c => commentMarkers(c.body).some(line => /^<!-- factory-dispatch:claim runner:(gpu|console|cursor) -->$/.test(line)));
-    for (const attachment of issue.attachments) {
-      const pr = attachment.url.match(new RegExp(`^https://github.com/${config.repository}/pull/(\\d+)/?$`))?.[1];
-      if (!pr || attachment.metadata.status !== 'merged' || !(Date.parse(attachment.createdAt) > Date.parse(claim?.createdAt ?? ''))
-        || has(issue, `playbook-synced pr:${pr}`) || has(issue, `playbook-checked pr:${pr}`)) continue;
-      let content: string, sha: string;
-      let changed: boolean;
-      try { changed = (await files(pr, true)).includes('docs/PLAYBOOK.md'); }
-      catch { ctx.log('qa-sync-pending', { issue: issue.identifier, pr }); continue; }
+    if (!lines(issue).includes(wrapupDone)) continue;
+    const finishedAt = Date.parse(issue.comments.find(c => commentMarkers(c.body).includes(wrapupDone))?.createdAt ?? '');
+    for (const pr of mergedPRs(issue)) {
+      if (has(issue, `playbook-synced pr:${pr}`) || has(issue, `playbook-checked pr:${pr}`)) continue;
+      // Measured from wrap-up completion; an unknown time never alerts.
+      const pending = async (reason: string) => {
+        ctx.log('qa-sync-pending', { issue: issue.identifier, pr, reason });
+        if (Date.now() - finishedAt > 15 * 60_000 && !has(issue, `sync-stalled pr:${pr}`)) {
+          await ctx.comment(issue, `${devonMention}: the Linear playbook sync for PR ${pr} has been pending for more than 15 minutes since wrap-up: ${reason}. The dispatcher retries each poll.\n\n${qa(`sync-stalled pr:${pr}`)}`);
+        }
+      };
+      // Non-PLAYBOOK merges also wait for the checkout, so a stuck checkout alerts for any merge.
+      let content = '', sha = '', reason: string | undefined, changed = false;
+      try {
+        const data = await info(pr, true);
+        sha = data.mergeCommit?.oid;
+        if (data.state !== 'MERGED' || !shaPattern.test(sha ?? '')) reason = 'PR not merged on GitHub';
+        else if (command('git', ['-C', main, 'branch', '--show-current']) !== 'main') reason = 'checkout not on main';
+        else if (lacksMerge(sha)) reason = `checkout lacks merge ${sha}`;
+        else if (!(changed = (await files(pr, true)).includes('docs/PLAYBOOK.md'))) { /* checked below */ }
+        else if (command('git', ['-C', main, 'status', '--porcelain', '--', 'docs/PLAYBOOK.md'])) reason = 'docs/PLAYBOOK.md modified in checkout';
+        else {
+          const checkout = command('git', ['-C', main, 'rev-parse', 'HEAD']);
+          const playbook = readFileSync(`${main}/docs/PLAYBOOK.md`, 'utf8');
+          if (playbook.trim() !== command('git', ['-C', main, 'show', 'HEAD:docs/PLAYBOOK.md'])
+            || command('git', ['-C', main, 'rev-parse', 'HEAD']) !== checkout) reason = 'checkout changed during read';
+          else content = `> **Source of truth:** \`docs/PLAYBOOK.md\` in \`${config.repository}\`. This Linear copy is for reference only; edit the repo file via a PR. Last synced from \`main\` at ${checkout} after PR ${pr} (merge ${sha}).\n\n${playbook}`;
+        }
+      } catch { reason = 'GitHub or checkout read failed'; }
+      if (reason) { await pending(reason); continue; }
       if (!changed) {
         await ctx.comment(issue, `PR ${pr} did not change the playbook; no document sync needed.\n\n${qa(`playbook-checked pr:${pr}`)}`);
         continue;
       }
-      try {
-        const data = await info(pr, true);
-        sha = data.mergeCommit?.oid;
-        if (data.state !== 'MERGED' || !shaPattern.test(sha ?? '')) continue;
-        if (command('git', ['-C', main, 'branch', '--show-current']) !== 'main'
-          || command('git', ['-C', main, 'status', '--porcelain', '--', 'docs/PLAYBOOK.md'])) continue;
-        command('git', ['-C', main, 'merge-base', '--is-ancestor', sha, 'HEAD']);
-        const checkout = command('git', ['-C', main, 'rev-parse', 'HEAD']);
-        const playbook = readFileSync(`${main}/docs/PLAYBOOK.md`, 'utf8');
-        if (playbook.trim() !== command('git', ['-C', main, 'show', 'HEAD:docs/PLAYBOOK.md'])
-          || command('git', ['-C', main, 'rev-parse', 'HEAD']) !== checkout) continue;
-        content = `> **Source of truth:** \`docs/PLAYBOOK.md\` in \`${config.repository}\`. This Linear copy is for reference only; edit the repo file via a PR. Last synced from \`main\` at ${checkout} after PR ${pr} (merge ${sha}).\n\n${playbook}`;
-      } catch { ctx.log('qa-sync-pending', { issue: issue.identifier, pr }); continue; }
       // Replacing the same document is safe to repeat after an unknown response.
       await ctx.mutate(issue, 'mutation SyncPlaybook($id: String!, $input: DocumentUpdateInput!) { documentUpdate(id: $id, input: $input) { success } }', { id: config.playbookDocumentId, input: { content } });
       await ctx.comment(issue, `Linear playbook synced after merge ${sha}.\n\n${qa(`playbook-synced pr:${pr}`)}`);

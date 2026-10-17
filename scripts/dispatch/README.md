@@ -531,6 +531,10 @@ The main checkout must be on main, contain the merge and have clean PLAYBOOK
 content matching HEAD. The source-of-truth header includes checkout and merge
 SHAs. Document replacement safely repeats after a crash; its completion comment
 suppresses later syncs. Non-PLAYBOOK merges get a checked marker, saving quota.
+Non-PLAYBOOK merges also wait for the checkout to contain them before the
+checked marker. Each blocked attempt logs `qa-sync-pending` with a `reason`. Pending for more
+than 15 minutes after the `wrapup-done` comment posts one Devon mention naming
+the reason, with `<!-- factory-qa:sync-stalled pr:<n> -->`.
 The [Linear schema](https://github.com/linear/linear/blob/master/packages/sdk/src/schema.graphql)
 defines `documentUpdate(id: String!, input: DocumentUpdateInput!)` and `content`.
 Devon mentions use a plain profile URL, per [Linear's Markdown mention contract](https://linear.app/developers/graphql#adding-mentions-in-markdown).
@@ -654,6 +658,45 @@ send `amp threads continue <id> -ox <prompt>`, then post
 `<!-- factory-dispatch:wrapup -->`. An interrupted/failed send does not retry.
 The completion marker means submitted, not that the build or deployment passed.
 Wrap-ups run after dispatch decisions; a freed slot is available next pass.
+
+**One wrap-up per runner (MET-214).** Each runner's wrap-ups share its main
+checkout; a cursor builder's wrap-up runs on gpu. A legacy thread marker without
+`runner:` takes the runner from the dispatch claim. With neither, the runner is
+unknown and conflicts with every runner. A wrap-up is open while its issue is
+open (not Done or Canceled) and has `wrapup` without `wrapup-done`. Done and
+Canceled issues never block and get no mention, so legacy wrap-ups from before
+`wrapup-done` existed are ignored. A newly merged
+issue is not claimed while another issue's wrap-up is open on the same runner: it
+logs `wrapup-waiting` with the `blocking` issue and retries each poll. Known,
+different runners do not block each other. An open wrap-up older than 60 minutes (from its `wrapup`
+comment) gets one Devon mention with `<!-- factory-dispatch:wrapup-stalled -->`.
+The dispatcher never releases it; `wrapup-done` ends it.
+
+**Main checkout fast-forward (MET-214).** The dispatcher deploys from
+factory-gpu's `/home/agent/work/factory`, so each pass, after wrap-ups and before
+the playbook sync, it reads the merge SHA of every merged factory PR on an issue
+with `wrapup-done`, in any issue state. Linear document markers are never
+containment proof: historical `playbook-checked` comments never required it. Only
+merges this step verified in the checkout skip later GitHub reads, recorded per PR
+in `~/.local/state/factory-dispatch/main-contains.json` (never written by
+dry-run). A missing or invalid file only re-reads every merge, once. When a merge
+is absent from the checkout's object database (real Git exits 128) or not an
+ancestor of `HEAD`, it runs `git -C
+/home/agent/work/factory fetch origin main` then `merge --ff-only origin/main`,
+at most once per pass. A readable `HEAD` is checked first, so an unreadable
+checkout logs `main-ff-pending` and never fetches. It never resets, rebases,
+stashes or force-checks-out.
+Decisions:
+
+- `main-ff` with `issue`, `pr`, `sha`, `from` and `to`; dry-run logs it with
+  `dryRun: true` and the planned git argv, without running them.
+- `main-ff-waiting` with `blocking`: an open gpu (or unknown-runner) wrap-up
+  builds in that checkout, so nothing moves until its `wrapup-done`. No mention.
+- `main-ff-refused` with `reason`: off `main`, `git status --porcelain` not empty,
+  or the `--ff-only` merge failed (diverged). One Devon mention per issue and merge
+  SHA with `<!-- factory-dispatch:main-ff-refused sha:<sha> -->`; a later pass
+  retries once the checkout is fixed.
+- `main-ff-pending`: GitHub, fetch or checkout read failed; retried next pass.
 
 Linear and Amp have no shared transaction or submission idempotency key here.
 Thus **exactly-once delivery is not promised**: a crash can strand work, but cannot
@@ -844,21 +887,16 @@ The AGENTS.md contract owns auth restrictions without naming token variables.
 Each generated prompt checks `gh auth status` exactly once. Issue sections pass
 through unchanged; their text is not counted against the fixed prompt budget.
 
-For an already-installed dispatcher, MET-128 adds no deployment artifact, build,
-installer invocation or restart. The post-merge wrap-up's `pull --ff-only` in
-`/home/agent/work/factory` on factory-gpu deploys the code; the next existing
-60-second timer pass uses it. Merge and that pull remain Devon's gates. From Mac,
-after confirming the merge and a clean main checkout:
+For an already-installed dispatcher, a merge needs no deployment artifact, build,
+installer invocation or restart. After any wrap-up posts `wrapup-done`, wherever it
+ran, the dispatcher fast-forwards `/home/agent/work/factory` on factory-gpu itself
+(see "Main checkout fast-forward" above); the next existing 60-second timer pass
+uses the new code. Merge remains Devon's gate. From Mac, read-only verification:
 
 ```sh
-gpu-ssh 'sudo -iu agent bash -s' <<'EOF'
-set -e
-gh auth status
-test -z "$(git -C /home/agent/work/factory status --porcelain)"
-test "$(git -C /home/agent/work/factory branch --show-current)" = main
-git -C /home/agent/work/factory pull --ff-only origin main
-EOF
-gpu-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts poll --dry-run'
+gpu-ssh 'sudo -iu agent git -C /home/agent/work/factory log -1 --format=%H'
+gpu-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts poll --dry-run' | grep -E 'main-ff|sync'
+gpu-ssh 'journalctl -u factory-dispatch --since -15min' | grep -E 'main-ff|sync'
 ```
 
 The preview does not delay the running timer or verify Amp quiet time. For an
