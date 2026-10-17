@@ -3,6 +3,7 @@ set -Eeuo pipefail
 umask 0077
 root=$(dirname "$(dirname "$(realpath "$0")")")
 key=/etc/factory-dispatch/linear-api-key
+cursor_key=/etc/factory-dispatch/cursor-api-key
 snapshot=
 rollback_hint() { printf 'Rollback: gpu-ssh '\''sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'\''\n' >&2; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; rollback_hint; exit 1; }
@@ -40,6 +41,18 @@ fi
 [[ $(stat -c '%U:%G %a' "$key") == 'root:agent 640' ]] || fail 'Require root:agent 0640: sudo chown root:agent /etc/factory-dispatch/linear-api-key; sudo chmod 0640 /etc/factory-dispatch/linear-api-key.'
 sudo -u agent test -r "$key"
 [[ -s "$key" ]] || fail 'The existing Linear key file is empty.'
+# Optional: only engine/cursor issues need it. Absence never fails; a present key must be safe.
+if [[ -L "$cursor_key" ]]; then
+    fail "Resolve the $cursor_key symlink manually; engine/cursor needs a regular root:agent 0640 file."
+elif [[ -f "$cursor_key" ]]; then
+    cursor_mode=$(stat -c '%U:%G %a' "$cursor_key")
+    printf 'Cursor key: present (%s)\n' "$cursor_mode"
+    [[ $cursor_mode == 'root:agent 640' ]] || fail "Require root:agent 0640: sudo chown root:agent $cursor_key; sudo chmod 0640 $cursor_key."
+    sudo -u agent test -r "$cursor_key"
+    [[ -s "$cursor_key" ]] || fail 'The existing Cursor key file is empty.'
+else
+    printf 'Cursor key: absent (optional; engine/cursor issues are refused until it is provisioned)\n'
+fi
 for file in scripts/dispatch/dispatch.ts scripts/dispatch/dispatch.lock scripts/dispatch/.node-version deploy/factory-dispatch.service deploy/factory-dispatch.timer; do
     [[ -f "$root/$file" && ! -L "$root/$file" ]] || fail "Missing/unsafe artifact: $file"
 done
