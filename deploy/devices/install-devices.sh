@@ -52,10 +52,23 @@ done
 install -m 0755 "$here/smart-snapshot.py" "$helper"
 install -m 0644 "$here/factory-devices-smart.service" "$units/factory-devices-smart.service"
 install -m 0644 "$here/factory-devices-smart.timer" "$units/factory-devices-smart.timer"
-chmod 0750 "$state"
-if [[ -z $root ]] && getent group factory-api >/dev/null; then
-    chgrp factory-api "$state"
-    [[ -e $state/smart.json ]] && chmod 0640 "$state/smart.json" && chgrp factory-api "$state/smart.json"
+# Root installs use factory-api. Unprivileged tests supply DEVICES_TEST_GROUP.
+group=
+if [[ -n $root && -n ${DEVICES_TEST_GROUP:-} ]]; then
+    group=$DEVICES_TEST_GROUP
+elif [[ -z $root ]] && getent group factory-api >/dev/null; then
+    group=factory-api
+fi
+if [[ -n $group ]]; then
+    getent group "$group" >/dev/null || { echo "ERROR: group $group is missing." >&2; exit 1; }
+    chgrp -- "$group" "$state"
+    chmod 2750 "$state"
+    if [[ -f $state/smart.json && ! -L $state/smart.json ]]; then
+        chgrp -- "$group" "$state/smart.json"
+        chmod 0640 "$state/smart.json"
+    fi
+else
+    chmod 0750 "$state"
 fi
 systemctl daemon-reload
 systemctl enable --now factory-devices-smart.timer

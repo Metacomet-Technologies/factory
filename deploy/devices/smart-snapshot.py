@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Write a sanitized SMART snapshot. Read-only. No self-tests."""
 
+import grp
 import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -98,30 +100,64 @@ def entry(name: str, parsed: dict | None) -> dict:
     return body
 
 
-def write_snapshot(destination: Path, payload: dict) -> None:
+def require_group(name: str) -> int:
+    try:
+        return grp.getgrnam(name).gr_gid
+    except KeyError:
+        print(f"{name} group is missing", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+def publish_group() -> int | None:
+    if os.geteuid() != 0:
+        return None
+    return require_group("factory-api")
+
+
+def write_snapshot(destination: Path, payload: dict, group: int | None = None) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".json.tmp")
     data = json.dumps(payload, sort_keys=True).encode()
-    with temporary.open("wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.chmod(temporary, 0o640)
-    os.replace(temporary, destination)
+    published = False
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o640)
+        if group is not None:
+            os.chown(temporary, -1, group)
+        os.replace(temporary, destination)
+        published = True
+    finally:
+        if not published:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def main() -> None:
     base = root()
     destination = base / "var/lib/factory-devices/smart.json"
+    group = publish_group()
     names = physical(base / "sys/block")
     if shutil_which("smartctl") is None:
-        write_snapshot(destination, {"tool": "absent", "drives": [], "observed_at_ms": int(time.time() * 1000)})
+        write_snapshot(
+            destination,
+            {"tool": "absent", "drives": [], "observed_at_ms": int(time.time() * 1000)},
+            group,
+        )
         return
     drives = []
     for name in names:
         parsed = smartctl(name)
         drives.append(entry(name, parsed))
-    write_snapshot(destination, {"observed_at_ms": int(time.time() * 1000), "drives": drives})
+    write_snapshot(
+        destination,
+        {"observed_at_ms": int(time.time() * 1000), "drives": drives},
+        group,
+    )
 
 
 def shutil_which(name: str) -> str | None:
