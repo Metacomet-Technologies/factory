@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     net::{SocketAddr, TcpListener},
+    os::fd::OwnedFd,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -113,12 +114,29 @@ impl Drop for Harness {
         }
     }
 }
-fn port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+fn shim(script: PathBuf) -> (Command, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut command = Command::new("python3");
+    // Pass the bound listener as stdin so no other harness can claim its port.
+    command
+        .arg("-c")
+        .arg(
+            r#"import runpy, socket, socketserver, sys
+def server_bind(self):
+    self.socket.close()
+    self.socket = socket.socket(fileno=0)
+    self.server_address = self.socket.getsockname()
+socketserver.TCPServer.server_bind = server_bind
+runpy.run_path(sys.argv.pop(1), run_name="__main__")
+"#,
+        )
+        .arg(script)
+        .arg(port.to_string())
+        .stdin(Stdio::from(OwnedFd::from(listener)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    (command, port)
 }
 
 impl Harness {
@@ -140,43 +158,17 @@ impl Harness {
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen = listener.local_addr().unwrap();
-        let (nut, slack) = (port(), port());
         let shims = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/sandbox-shims");
+        let (mut nut_shim, nut) = shim(shims.join("fake-upsd.py"));
+        let (mut slack_shim, slack) = shim(shims.join("fake-serve.py"));
         let children = vec![
-            Command::new("python3")
-                .arg(shims.join("fake-upsd.py"))
-                .arg(nut.to_string())
-                .arg(root.join("ups-status"))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-            Command::new("python3")
-                .arg(shims.join("fake-serve.py"))
-                .arg(slack.to_string())
+            nut_shim.arg(root.join("ups-status")).spawn().unwrap(),
+            slack_shim
                 .arg(listen.port().to_string())
                 .arg(root)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
                 .spawn()
                 .unwrap(),
         ];
-        for p in [nut, slack] {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                if tokio::net::TcpStream::connect(("127.0.0.1", p))
-                    .await
-                    .is_ok()
-                {
-                    break;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "fake failed to start"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
         let db_path = root.join("audit.db");
         Store::open(db_path.clone(), true)
             .await
