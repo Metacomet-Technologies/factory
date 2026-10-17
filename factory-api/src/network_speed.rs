@@ -549,8 +549,12 @@ mod tests {
         else {
             unreachable!()
         };
-        // 1000 bytes over at least 600 ms is at most 13.3 kb/s.
-        assert!(download_bps <= 13_334 && upload_bps <= 13_334, "{slow:?}");
+        // Upload timing spans the server's whole 600 ms sleep: at most 13.3 kb/s.
+        assert!(upload_bps <= 13_334, "{slow:?}");
+        // Download timing starts when the headers reach the runner, after the
+        // fixture's sleep has begun. Only the 500 ms slow_request bound that
+        // stopped the direction holds: under 16 kb/s.
+        assert!(download_bps < 16_000, "{slow:?}");
 
         let Verdict::Failed(error) = &fail.verdict else {
             panic!("{fail:?}")
