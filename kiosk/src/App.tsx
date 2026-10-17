@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Activity, Cpu, Moon, Server, Sun, Terminal, Info } from "lucide-react";
-import { useApi } from "./api/client";
+import { useApi, useHeld } from "./api/client";
 import { useStream } from "./api/stream";
 import { useBuildUpdate } from "./api/build-update";
 import type { UsageRange, GpuRange, DeviceRange } from "./api/types";
@@ -17,6 +17,7 @@ import { LiveIndicator } from "./components/ui/live-indicator";
 import { PageHeader } from "./components/ui/page-header";
 import { VersionFooter } from "./components/version-footer";
 import { UpsBadge, UpsSection } from "./components/ups";
+import { NetworkSection } from "./components/network";
 import UpsPage from "./components/ups-page";
 import DevicesPage from "./components/devices-page";
 import LlmPage from "./components/llm-page";
@@ -92,6 +93,8 @@ export default function App() {
   }, []);
   const upsCurrent = live.upsAt > (ups.data?.generated_at_ms ?? 0) ? live.ups : ups.data?.current;
   const upsWarnings = ups.data?.warnings ?? (ups.error ? [ups.error] : []);
+  const network = useHeld(useApi("/v1/network", "", live.networkRevision + live.snapshotRevision));
+  const networkTrend = useApi("/v1/network/history", "?range=24h", live.snapshotRevision);
   const pricing = useApi("/v1/pricing", "", live.pricingRevision + live.snapshotRevision);
   const agents = useApi("/v1/agents", "", live.agentsRevision + live.snapshotRevision);
   const deviceRevision = live.devicesRevision + live.snapshotRevision;
@@ -223,12 +226,13 @@ export default function App() {
               index={1}
             />
             <UpsSection current={upsCurrent} now={now} warnings={upsWarnings} index={2} />
+            <NetworkSection status={network} trend={networkTrend} now={now} index={3} />
             <UsageSection
               resource={usage}
               pricing={pricing}
               range={usageRange}
               icon={<Activity />}
-              index={3}
+              index={4}
             />
             <aside className="sidebar" aria-label="Frontier tools and live requests">
               <AgentsSection
@@ -239,9 +243,9 @@ export default function App() {
                 }
                 icon={<Terminal />}
                 revision={live.agentsRevision}
-                index={4}
+                index={5}
               />
-              <TickerSection requests={live.requests} connected={live.connected} index={5} />
+              <TickerSection requests={live.requests} connected={live.connected} index={6} />
             </aside>
           </div>
         </main>

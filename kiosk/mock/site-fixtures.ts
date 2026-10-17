@@ -4,6 +4,11 @@ import type {
   DeviceRange,
   DeviceView,
   Endpoints,
+  NetworkEvent,
+  NetworkLinkState,
+  NetworkRange,
+  NetworkSample,
+  NetworkSpeedTest,
   UpsCurrent,
   UpsRange,
 } from "../src/api/types.ts";
@@ -262,4 +267,186 @@ export function siteFixtures(
     deviceHistory,
     control,
   };
+}
+
+export type NetworkMode = "healthy" | "degraded" | "down";
+const registry = [
+  { layer: "lan", target: "gateway", address: "192.168.4.1", probe: "icmp", rtt_ms: 0.4 },
+  { layer: "wan", target: "1.1.1.1", address: "1.1.1.1", probe: "icmp", rtt_ms: 9 },
+  { layer: "wan", target: "8.8.8.8", address: "8.8.8.8", probe: "icmp", rtt_ms: 11 },
+  { layer: "dns", target: "dns", address: "cloudflare.com", probe: "resolve", rtt_ms: 14 },
+  {
+    layer: "tailnet",
+    target: "tailnet",
+    address: "100.91.20.11:22",
+    probe: "tcp_connect",
+    rtt_ms: 4,
+  },
+] as const;
+
+/**
+ * Network fixtures for the mock API. `mode` picks the open episode on the wan layer; closed
+ * episodes on every layer sit 6 h, 30 h and 5 d back. Outage means no sample has arrived yet.
+ */
+export function networkFixtures(
+  mode: NetworkMode = "healthy",
+  outage = false,
+  range: NetworkRange = "24h",
+  speedRange: Exclude<NetworkRange, "1h"> = "7d",
+  now = Date.now(),
+) {
+  const episode = (
+    id: number,
+    link: Pick<NetworkEvent, "state"> & Partial<NetworkEvent>,
+    started_ms: number,
+    ended_ms: number | null,
+  ) =>
+    ({
+      id,
+      started_ms,
+      ended_ms,
+      end_reason: ended_ms == null ? null : "recovered",
+      peak_loss_percent: link.state === "down" ? 100 : 0,
+      peak_rtt_us: null,
+      peak_mdev_us: null,
+      ...link,
+    }) as NetworkEvent;
+  const link: NetworkLinkState =
+    mode === "down"
+      ? { state: "down", layer: "wan" }
+      : mode === "degraded"
+        ? { state: "degraded", layer: "wan", reason: "latency" }
+        : { state: "healthy" };
+  const open =
+    link.state === "healthy"
+      ? null
+      : episode(
+          4,
+          { ...link, peak_rtt_us: link.state === "down" ? null : 241_000 },
+          now - 180_000,
+          null,
+        );
+  const closed = [
+    episode(3, { state: "down", layer: "wan" }, now - 6 * 3_600_000, now - 6 * 3_600_000 + 300_000),
+    episode(
+      2,
+      { state: "degraded", layer: "lan", reason: "loss", peak_loss_percent: 30 },
+      now - 30 * 3_600_000,
+      now - 30 * 3_600_000 + 1_200_000,
+    ),
+    {
+      ...episode(
+        1,
+        { state: "degraded", layer: "dns", reason: "latency", peak_rtt_us: 312_000 },
+        now - 5 * 86_400_000,
+        now - 5 * 86_400_000 + 3_600_000,
+      ),
+      end_reason: "restart",
+    } as NetworkEvent,
+  ];
+  const events = outage ? [] : [...(open ? [open] : []), ...closed];
+  const during = (ts_ms: number, layer: string) =>
+    events.find(
+      (event) =>
+        event.state !== "healthy" &&
+        event.layer === layer &&
+        event.started_ms <= ts_ms &&
+        ts_ms <= (event.ended_ms ?? now),
+    );
+  const reading = (entry: (typeof registry)[number], ts_ms: number, index: number) => {
+    const event = during(ts_ms, entry.layer);
+    const rtt_ms = entry.rtt_ms * (1 + 0.15 * Math.sin(index / 4 + entry.rtt_ms));
+    if (event?.state === "down") return { loss: 100, rtt_ms: null };
+    if (event?.state === "degraded" && event.reason === "loss") return { loss: 30, rtt_ms };
+    if (event?.state === "degraded") return { loss: 0, rtt_ms: (event.peak_rtt_us ?? 0) / 1000 };
+    return { loss: index % 41 === 19 ? 10 : 0, rtt_ms };
+  };
+  const tick = now - 4_000;
+  const status: Endpoints["/v1/network"] = {
+    generated_at_ms: now,
+    device_id: "factory-gpu",
+    state: outage ? { state: "healthy" } : link,
+    open_event: open,
+    targets: registry.map((entry) => {
+      const { loss, rtt_ms } = reading(entry, tick, -1);
+      const received = 10 - loss / 10;
+      const latest: NetworkSample = {
+        ts_ms: tick,
+        layer: entry.layer,
+        target: entry.target,
+        address: entry.address,
+        sent: 10,
+        received,
+        rtt:
+          rtt_ms == null
+            ? null
+            : {
+                min_us: Math.round(rtt_ms * 800),
+                avg_us: Math.round(rtt_ms * 1000),
+                max_us: Math.round(rtt_ms * 1300),
+                mdev_us: Math.round(rtt_ms * 90),
+              },
+      };
+      return {
+        layer: entry.layer,
+        target: entry.target,
+        probe: entry.probe,
+        latest: outage ? null : latest,
+      };
+    }),
+    latest_speed_test: null,
+    warnings: outage ? ["network: ping: connect: Network is unreachable"] : [],
+  };
+  const window = windows[range];
+  const history: Endpoints["/v1/network/history"] = {
+    range,
+    resolution: range === "1h" || range === "24h" ? "raw" : "hourly",
+    series: outage
+      ? []
+      : registry.map((entry) => ({
+          layer: entry.layer,
+          target: entry.target,
+          points: Array.from({ length: window.buckets }, (_, index) => {
+            const ts_ms = Math.round(
+              now - window.span_ms + ((index + 1) * window.span_ms) / window.buckets,
+            );
+            const { loss, rtt_ms } = reading(entry, ts_ms, index);
+            return {
+              ts_ms,
+              sample_count: 4,
+              loss_percent: loss,
+              latency_ms:
+                rtt_ms == null
+                  ? { min: null, avg: null, max: null }
+                  : { min: rtt_ms * 0.8, avg: rtt_ms, max: rtt_ms * 1.3 },
+              jitter_ms: rtt_ms == null ? null : rtt_ms * 0.09,
+            };
+          }),
+        })),
+  };
+  const count = outage ? 0 : Math.floor(windows[speedRange].span_ms / 10_800_000);
+  const tests: NetworkSpeedTest[] = Array.from({ length: count }, (_, index) => {
+    const started_ms = now - (count - index) * 10_800_000 + 600_000;
+    const failed = index % 9 === 4;
+    const timeout = index % 13 === 7;
+    const ok = !failed && !timeout;
+    return {
+      id: 1_000 + index,
+      started_ms,
+      ended_ms: started_ms + (timeout ? 60_000 : ok ? 11_000 : 400),
+      outcome: failed ? "failed" : timeout ? "timeout" : "ok",
+      download_bps: ok ? Math.round(930e6 + 12e6 * Math.sin(index)) : null,
+      upload_bps: ok ? Math.round(912e6 + 9e6 * Math.cos(index)) : null,
+      download_bytes: ok ? 440_000_000 : timeout ? 25_000_000 : 0,
+      upload_bytes: ok ? 290_000_000 : 0,
+      idle_latency_ms: ok || timeout ? 9.1 : null,
+      download_loaded_latency_ms: ok ? 14 + (index % 5) : null,
+      upload_loaded_latency_ms: ok ? 19 + (index % 3) : null,
+      colo: ok || timeout ? "IAD" : null,
+      error: failed ? "HTTP 500 from speed endpoint" : timeout ? "test exceeded 60 s" : null,
+    };
+  });
+  status.latest_speed_test = tests.at(-1) ?? null;
+  const speedTests: Endpoints["/v1/network/speed-tests"] = { range: speedRange, tests };
+  return { status, history, speedTests, events };
 }
