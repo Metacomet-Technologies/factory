@@ -147,7 +147,12 @@ export default function DevicesPage({
             <h3>Maintenance</h3>
             <p>
               Backup {seen(host.maintenance.backup.last_success_ms, now)}. Reboot{" "}
-              {host.maintenance.reboot.availability}. Clock{" "}
+              {host.maintenance.reboot.availability === "available"
+                ? host.maintenance.reboot.reboot_required
+                  ? "required"
+                  : "not required"
+                : host.maintenance.reboot.availability.replaceAll("_", " ")}
+              . Clock{" "}
               {host.maintenance.clock.synchronized == null
                 ? "—"
                 : host.maintenance.clock.synchronized

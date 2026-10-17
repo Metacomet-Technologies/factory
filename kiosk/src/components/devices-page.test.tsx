@@ -166,6 +166,7 @@ describe("devices page", () => {
     expect(screen.queryByText("0 %")).not.toBeInTheDocument();
     expect(screen.getByText(/Unsupported SMART is not evidence/)).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "UPS" })).toHaveAttribute("href", "/ups");
+    expect(screen.getByText(/Reboot permission denied/)).toBeInTheDocument();
   });
 
   it("keeps chart gaps null instead of zero", () => {
