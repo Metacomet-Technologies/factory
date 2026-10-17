@@ -22,25 +22,24 @@ The checker never installs or caches anything:
   toolchain is reported, not downloaded.
 * The only JavaScript-toolchain programs it executes are
   `vp env current --json` and a real Node binary with `--version`. It never
-  executes a Vite+ shim (running `node` or `pnpm` through one writes
-  `resolve_cache.json` under the Vite+ cache and installs a missing pin), pnpm
-  (MET-223 QA saw its launcher run `node` from PATH and create state under
-  `HOME`), or `vp --version`.
-* When `node` or `pnpm` on PATH links to `vp`, `vp env current --json` (in
+  executes a Vite+ shim (running `node` or `bun` through one writes
+  `resolve_cache.json` under the Vite+ cache and installs a missing pin) or
+  `vp --version`. It runs a real Bun binary only with `--version`, which
+  writes nothing (verified 2026-10-17 with Bun 1.4.2 and a fresh `HOME`).
+* When `node` or `bun` on PATH links to `vp`, `vp env current --json` (in
   `kiosk/`, or the repo root for `.node-version`) names the project's pinned
   versions and binaries. A pin Vite+ has not installed fails as "not
-  installed"; the checker never falls back to another Node on PATH. Node's
-  version comes from running the resolved binary. pnpm's comes from the Vite+
-  store entry, which Vite+ keys by version, after checking the binary exists
-  and is executable.
-* Other installs: a `node` that is not a Vite+ shim runs with `--version`;
-  pnpm and Vite+ versions come from the nearest `package.json` named `pnpm`,
+  installed"; the checker never falls back to another Node or Bun on PATH.
+  Both versions come from running the resolved binary with `--version`.
+* Other installs: a `node` or `bun` that is not a Vite+ shim runs with
+  `--version`; the Vite+ version comes from the nearest `package.json` named
   `vite-plus` or `vp-global` (a global Vite+ install) above the resolved
   executable.
-* Verified 2026-10-17 in an offline Bubblewrap probe with real Vite+ 1.1.0,
-  Node 24.22.0 and pnpm 12.11.2 and fresh `HOME`, `VP_HOME` and
-  `XDG_CACHE_HOME`: no path, content or metadata changed with pins installed
-  (cold and warm Vite+ state) or missing.
+* Verified 2026-10-17 (MET-223) in an offline Bubblewrap probe with real
+  Vite+ 1.1.0, Node 24.22.0 and the then-pinned pnpm 12.11.2 and fresh `HOME`,
+  `VP_HOME` and `XDG_CACHE_HOME`: no path, content or metadata changed with
+  pins installed (cold and warm Vite+ state) or missing. Rechecked for Bun
+  1.4.2 (MET-224) on factory-console: no file under `HOME` changed.
 * Provisioning stays outside the checker. CI installs the pinned Rust with an
   explicit `rustup toolchain install` before it runs the checker.
 
@@ -51,7 +50,7 @@ The checker never installs or caches anything:
 | OS | Ubuntu (Debian family) LTS, x86_64 | — |
 | Rust | 1.99.0 with `rustfmt` and `clippy`, as `rustc` resolves inside the repo | `rust-toolchain.toml` |
 | Node | 24.22.0, as `node` resolves in `kiosk/` and the repo root | `kiosk/package.json` `devEngines.runtime`, `.node-version` |
-| Package manager | pnpm 12.11.2 in `kiosk/` (Bun after MET-224) | `kiosk/package.json` `devEngines.packageManager` |
+| Package manager | Bun 1.4.2 in `kiosk/` (package manager only; Node stays the runtime) | `kiosk/package.json` `devEngines.packageManager` |
 | Vite+ | `vp` v1.1.0 on PATH in `kiosk/` | `scripts/env/check`, `.agents/setup`, `ci.yml` |
 | Playwright | an installed Chromium executable (`chromium-*/chrome-linux*/chrome` with `INSTALLATION_COMPLETE`) in Playwright's effective location: `PLAYWRIGHT_BROWSERS_PATH` when set (no fallback), otherwise `~/.cache/ms-playwright`; required where kiosk UI checks run | — |
 | System packages | build-essential (`cc`, `make`), pkg-config, ca-certificates, curl, python3, util-linux (`flock`), bubblewrap (`bwrap`), shellcheck, sqlite3, zstd, rsync, xz-utils (`xz`) | `.agents/setup` |
@@ -67,7 +66,7 @@ Where kiosk UI checks run (the `verify-kiosk` skill):
 * `/home/agent/work/factory` is the factory checkout. In cloud VMs it is a
   symlink to the workspace checkout.
 * `/home/agent/.config/vite-plus/env` is the Vite+ env file that `verify-kiosk`
-  sources to put `vp`, `node` and `pnpm` on PATH.
+  sources to put `vp`, `node` and `bun` on PATH.
 
 ## Environments
 

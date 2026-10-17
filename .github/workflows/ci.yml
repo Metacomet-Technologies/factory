@@ -65,17 +65,17 @@ jobs:
       - name: Read pinned runtime versions
         id: versions
         run: |
-          node -e 'const p = require("./package.json"); console.log("node=" + p.devEngines.runtime.version); console.log("pnpm=" + p.devEngines.packageManager.version)' >> "$GITHUB_OUTPUT"
+          node -e 'const p = require("./package.json"); console.log("node=" + p.devEngines.runtime.version); console.log("bun=" + p.devEngines.packageManager.version)' >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ steps.versions.outputs.node }}
-      - name: Install pinned Vite+ and pnpm via npm
+      - name: Install pinned Vite+ and Bun via npm
         env:
-          PNPM_VERSION: ${{ steps.versions.outputs.pnpm }}
+          BUN_VERSION: ${{ steps.versions.outputs.bun }}
         # https://viteplus.dev/guide/local-cli: npm CLI supports package-manager commands.
         # Install outside the checkout so bootstrapping cannot change its manifests.
         run: |
-          npm install --prefix "$RUNNER_TEMP/kiosk-tools" --no-audit --no-fund vite-plus@1.1.0 "pnpm@$PNPM_VERSION"
+          npm install --prefix "$RUNNER_TEMP/kiosk-tools" --no-audit --no-fund vite-plus@1.1.0 "bun@$BUN_VERSION"
           echo "$RUNNER_TEMP/kiosk-tools/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Check the toolchain contract (docs/environments.md)
         working-directory: .
@@ -84,10 +84,10 @@ jobs:
           rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" --profile minimal --component rustfmt --component clippy
           python3 -B scripts/env/test_check.py
           scripts/env/check --env ci
-      - run: node --version && pnpm --version && vp --version
+      - run: node --version && bun --version && vp --version
       - name: Install kiosk dependencies and select its local CLI
         run: |
-          vp install
+          vp install --frozen-lockfile
           echo "$GITHUB_WORKSPACE/kiosk/node_modules/.bin" >> "$GITHUB_PATH"
       - run: vp check
         env:

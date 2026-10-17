@@ -32,17 +32,17 @@ cd "$root/kiosk"
 tools=$(mktemp -d "$(dirname "$output")/release-tools.XXXXXX")
 trap 'rm -rf -- "$tools"' EXIT
 node_version=$(node -p 'require("./package.json").devEngines.runtime.version')
-pnpm_version=$(node -p 'require("./package.json").devEngines.packageManager.version')
-[[ $node_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $pnpm_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+bun_version=$(node -p 'require("./package.json").devEngines.packageManager.version')
+[[ $node_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $bun_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
     echo 'Exact kiosk runtime pins required' >&2; exit 1;
 }
-npm install --prefix "$tools" --no-audit --no-fund "node@$node_version" "pnpm@$pnpm_version" vite-plus@1.1.0
+npm install --prefix "$tools" --no-audit --no-fund "node@$node_version" "bun@$bun_version" vite-plus@1.1.0
 export PATH="$tools/node_modules/.bin:$PATH"
 [[ $(node --version) == "v$(node -p 'require("./package.json").devEngines.runtime.version')" ]] || {
     echo 'Activate the pinned kiosk Node runtime before building' >&2; exit 1;
 }
-[[ $(pnpm --version) == "$(node -p 'require("./package.json").devEngines.packageManager.version')" ]] || {
-    echo 'Activate the pinned kiosk pnpm before building' >&2; exit 1;
+[[ $(bun --version) == "$(node -p 'require("./package.json").devEngines.packageManager.version')" ]] || {
+    echo 'Activate the pinned kiosk Bun before building' >&2; exit 1;
 }
 vp install --frozen-lockfile
 export PATH="$root/kiosk/node_modules/.bin:$PATH"

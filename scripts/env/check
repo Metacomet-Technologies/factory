@@ -9,14 +9,13 @@ usage errors. Items the environment is exempt from are reported with
 `"required": false` and never fail the run.
 
 Versions resolve the way builds do: `rustc` and `cargo` run in the repository
-root (honoring rust-toolchain.toml), `node`, `pnpm` and `vp` resolve in `kiosk/`.
-The check never installs or caches anything: rustup auto-install is forced off,
-Vite+ shims are never executed (running one writes its resolve cache and
-installs a missing pin), and pnpm is never executed (its launcher runs `node`
-from PATH and creates state under HOME). For a shim, `vp env current --json`
-names the project's pinned versions and binaries; only a real Node binary runs,
-with `--version`. pnpm and Vite+ versions come from their package manifests or
-the Vite+ store. The output never includes environment variables; command
+root (honoring rust-toolchain.toml), `node`, `bun` and `vp` resolve in `kiosk/`.
+The check never installs or caches anything: rustup auto-install is forced off
+and Vite+ shims are never executed (running one writes its resolve cache and
+installs a missing pin). For a shim, `vp env current --json` names the
+project's pinned versions and binaries; only real Node and Bun binaries run,
+with `--version`, which writes no state. The Vite+ version comes from its
+package manifest. The output never includes environment variables; command
 output is cut to its first line.
 """
 
@@ -100,12 +99,13 @@ def pins():
     channel = re.search(r'^\s*channel\s*=\s*"([^"]+)"', toolchain, re.M)
     components = re.search(r"^\s*components\s*=\s*\[([^\]]*)\]", toolchain, re.M)
     engines = json.loads(read(os.path.join(KIOSK, "package.json")) or "{}").get("devEngines", {})
+    manager = engines.get("packageManager", {})
     return {
         "rust": channel.group(1) if channel else None,
         "components": re.findall(r'"([^"]+)"', components.group(1)) if components else [],
         "node": engines.get("runtime", {}).get("version"),
         "node-root": (read(os.path.join(REPO, ".node-version")) or "").strip().lstrip("v") or None,
-        "pnpm": engines.get("packageManager", {}).get("version"),
+        "bun": manager.get("version") if manager.get("name") == "bun" else None,
     }
 
 
@@ -133,16 +133,13 @@ def package_version(binary, names):
 
 
 def js_tool(tool, cwd):
-    """Return (version or None, detail) for node/pnpm as `cwd` resolves them, running only Node."""
+    """Return (version or None, detail) for node/bun as `cwd` resolves them, running only `--version`."""
     path = shutil.which(tool)
     if not path:
         return None, None
     real = os.path.realpath(path)
     if os.path.basename(real) != "vp":
-        if tool == "node":
-            return run([path, "--version"], cwd), path
-        found = package_version(real, {tool})
-        return found, path if found else f"{path}: no {tool} package.json"
+        return run([path, "--version"], cwd), path
     # Vite+ shim: ask Vite+ for the project's resolution instead of running it.
     try:
         current = json.loads(run([real, "env", "current", "--json"], cwd, whole=True) or "")
@@ -154,10 +151,7 @@ def js_tool(tool, cwd):
     binary = entry.get("bin_path") if tool == "node" else (entry.get("bin_paths") or {}).get(tool)
     if not entry.get("installed") or not binary or not os.access(binary, os.X_OK):
         return None, f"Vite+ pins {entry.get('version')}, not installed"
-    if tool == "node":
-        return run([binary, "--version"], cwd), binary
-    # The Vite+ store keys installs by version; running pnpm would write state.
-    return entry.get("version"), binary
+    return run([binary, "--version"], cwd), binary
 
 
 def playwright(root):
@@ -205,7 +199,7 @@ def items(root):
     for name, tool, cwd, expected in (
         ("node", "node", KIOSK, pin["node"]),
         ("node:repo-root", "node", REPO, pin["node-root"]),
-        ("pnpm", "pnpm", KIOSK, pin["pnpm"]),
+        ("bun", "bun", KIOSK, pin["bun"]),
     ):
         out, detail = js_tool(tool, cwd)
         add(name, expected, f"{out} ({detail})" if out else detail, expected and version(out) == expected)

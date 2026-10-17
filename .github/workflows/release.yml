@@ -55,7 +55,7 @@ jobs:
       - name: Read pinned kiosk versions
         id: versions
         run: |
-          node -e 'const p = require("./kiosk/package.json"); console.log("node=" + p.devEngines.runtime.version); console.log("pnpm=" + p.devEngines.packageManager.version)' >> "$GITHUB_OUTPUT"
+          node -e 'const p = require("./kiosk/package.json"); console.log("node=" + p.devEngines.runtime.version); console.log("bun=" + p.devEngines.packageManager.version)' >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ steps.versions.outputs.node }}

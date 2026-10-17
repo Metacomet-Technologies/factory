@@ -157,7 +157,7 @@ publication mode. Existing tags and drafts must be preserved while investigating
 `scripts/release/build.sh FULL_SHA PLAN_JSON OUTPUT_DIRECTORY` requires a clean,
 fresh disposable checkout at the exact SHA. The publisher clones committed source
 without changing its own checkout. Rust 1.99.0 uses locked dependencies; each SHA's
-exact Node/pnpm pins and Vite+ 1.1.0 are installed outside source. Rust paths and
+exact Node/Bun pins and Vite+ 1.1.0 are installed outside source. Rust paths and
 archive metadata are normalized. Any byte difference on retry fails rather than
 replacing an uploaded asset; OS/compiler system-library changes may require human
 recovery. The source is never rewritten or bumped. Builds require Linux x86_64

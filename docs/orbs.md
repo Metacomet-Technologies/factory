@@ -8,7 +8,7 @@ does not compile, test, start services, download Playwright browsers, or log in.
 No resume hook is needed.
 
 The setup uses Rust 1.99.0 with rustfmt/clippy, matching the observed factory
-runners, and Vite+ 1.1.0. Vite+ selects Node/pnpm from the kiosk's `devEngines`
+runners, and Vite+ 1.1.0. Vite+ selects Node and Bun from the kiosk's `devEngines`
 and the scripts' `.node-version` files. System packages provide the C compiler,
 Python 3, flock, Bubblewrap, shellcheck, SQLite CLI, zstd, and rsync. SQLite used
 by Rust is bundled; it does not depend on the host SQLite CLI version.
