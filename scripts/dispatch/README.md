@@ -319,8 +319,8 @@ State transitions under the existing exclusive dispatcher lock:
    and required branch checks guard the final race. Isolation and substantive
    review remain agent judgments; comments alone cannot establish green CI.
 6. Existing merged-attachment wrap-up follows. Deploy steps get a Devon mention;
-   otherwise no deploy ping. Linear closes-links handle completion on merge;
-   contributes-issues remain open. QA never changes issue status.
+   otherwise no deploy ping. Linear takes no action on merge; Done comes from the
+   dispatcher for simple flows or from Devon. QA never changes issue status.
 
 The service runs as agent with `HOME=/home/agent` and uses that user's
 preconfigured `gh` login (5,000 authenticated requests/hour). The dispatcher
@@ -484,10 +484,10 @@ issues with `state.type === "completed"`. A builder with a GitHub PR attachment
 newer than its dispatch claim requires the wrap-up marker before archiving;
 unknown attachment/claim chronology also waits. Done builders without such a PR
 need no wrap-up marker. Pending archive claims cannot bypass this gate.
-Canceled issues archive QA/probe threads but never their recorded builder. Done is the human-controlled
-merge/deploy-verification gate: closes PRs mark Done at merge, while contributes
-PRs remain open until deployment verification. The wrap-up marker alone does not
-prove deployment or task completion.
+Canceled issues archive QA/probe threads but never their recorded builder. Done is the
+human-controlled merge/deploy-verification gate: Linear takes no action on merge,
+and Done comes from the dispatcher for simple flows or from Devon. The wrap-up
+marker alone does not prove deployment or task completion.
 
 The thread's `updated` timestamp from `amp threads list --json` must be at least
 five minutes old relative to the dispatcher clock. Each pass rereads it; new

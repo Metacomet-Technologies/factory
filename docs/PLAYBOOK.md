@@ -89,7 +89,7 @@ Settings → Mode Dial → Tune Modes (web) changes what low/medium/high run for
 - Use the agent's short Linear diff comment (§4) as evidence: its head SHA and complete file list must match the PR. A missing or stale evidence comment is a `changes` finding only when its SHA or file list is missing or wrong. Never request pasted diffs or file contents; read the actual diff and full deploy/migration/script files with git. The comment does not replace tests or CI.
 - Tests pass, the sandbox check has real evidence (timings, row counts), and deviations are understood. Run `gh pr checks <n>` against the current head; require successful `rust`, `kiosk`, `scripts` and no other non-passing checks. Missing/skipped checks are not success. Subscriptions pin a SHA and may not roll over, so they never authorize a merge.
 - Read install/rollback scripts in full. Irreversible production actions stay human.
-- **PR ↔ Linear link type:** a "closes" link auto-closes the issue on merge. Use **contributes** for research, partial work, or fixes whose install hasn't been verified; reopen issues that auto-closed early.
+- **PR ↔ Linear link type:** Link type is informational: Linear's on-merge → Done automation is off for the Metacomet team (2026-10-17). Prefer **contributes** for partial or unverified work; Done comes from the dispatcher or Devon.
 - The reviewer fixes wrong or missing link types with Linear `update_diff`, using the issue's explicit contributes/closes choice. It never changes issue status, labels, assignee or priority.
 - Post one Linear verdict with findings and, for changes, an exact `## Builder follow-up` prompt. The review prompt alone authorizes a standalone unfenced `factory-qa:review` marker with PR, SHA, the reviewer's own thread ID and ready/changes. No other control markers are allowed. The dispatcher accepts only a verdict matching its recorded review-claim thread for that PR/SHA; quoted, inline, duplicate or conflicting verdicts do not count. Thread IDs correlate reviews but do not authenticate authors sharing Devon's Linear identity.
 - Post findings as a GitHub PR comment for the record, not an approval/change request. The dispatcher sends changes directly to the builder, records each round, and stops with a Devon mention after two rounds without ready. Same-account listener delivery is unverified and never relied on.
@@ -161,7 +161,7 @@ gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
 
 **Process**
 - Tests that pass locally can hang on GitHub runners: every CI job sets `timeout-minutes`, and async tests wrap their waits in an explicit timeout so a hang fails fast with a message.
-- Linear sets the link type from the branch name (`met-<n>`), not from "Contributes" in the PR body. QA fixes it for factory PRs, and the dispatcher fixes it for simple-flow PRs.
+- Linear links PRs as closes from the branch name (`met-<n>`), and the public API cannot change an existing link's kind. Merges no longer move issues (team setting, 2026-10-17), so a wrong link type is cosmetic; fix it with the Linear MCP `update_diff` only for accuracy.
 - A manual `dispatch.ts poll --dry-run` waits on `dispatch.lock` while a live poll runs, so a slow dry run usually means a slow poll.
 - `rg` is not installed on factory nodes. Use `grep -R` or `git grep`; the MET-165 wrap-up stopped on `rg: command not found` (2026-10-14).
 - Repo Actions options greyed out means the org setting is off; enable it at org → Settings → Actions first (the default token stays read-only).
