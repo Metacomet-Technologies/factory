@@ -8,6 +8,7 @@ destination=/usr/local/bin/factory-api
 installed_unit=/etc/systemd/system/factory-api.service
 pricing_db=/var/lib/factory-api/pricing.db
 legacy_db=/var/lib/factory-api/pricing.v0.db
+requests_db=/var/lib/factory-api/requests.db
 snapshot=
 
 rollback_hint() {
@@ -33,7 +34,7 @@ wait_ready() {
 trap 'printf "ERROR: factory-api install failed at line %s.\n" "$LINENO" >&2; rollback_hint' ERR
 
 # Complete preflight before creating the account or changing deployment files.
-for command in systemctl curl sudo tailscale useradd getent id install cp touch date mktemp realpath ss sqlite3 mv jq flock stat df awk sha256sum cmp find; do
+for command in systemctl curl sudo tailscale useradd getent id install cp touch date mktemp realpath ss sqlite3 mv jq flock stat df awk sha256sum cmp find rm rmdir; do
     command -v "$command" >/dev/null || fail "Required command missing: $command"
 done
 [[ -f "$binary" && -x "$binary" ]] || fail "Prebuilt binary missing or not executable: $binary"
@@ -87,7 +88,7 @@ fi
 [[ $(systemctl show "$clock_wait" --property=LoadState --value) == loaded ]] || fail "Install $clock_wait before installing factory-api."
 
 # Read-only version check: never create a DB during preflight.
-for path in /var/lib/factory-api "$pricing_db" "$legacy_db" "$pricing_db-wal" "$pricing_db-shm" "$legacy_db-wal" "$legacy_db-shm"; do
+for path in /var/lib/factory-api "$pricing_db" "$legacy_db" "$pricing_db-wal" "$pricing_db-shm" "$legacy_db-wal" "$legacy_db-shm" "$requests_db" "$requests_db-wal" "$requests_db-shm"; do
     [[ ! -L "$path" ]] || fail "Refusing symlink: $path"
     if [[ "$path" == /var/lib/factory-api ]]; then
         [[ ! -e "$path" || -d "$path" ]] || fail "Not a directory: $path"
@@ -95,6 +96,17 @@ for path in /var/lib/factory-api "$pricing_db" "$legacy_db" "$pricing_db-wal" "$
         [[ ! -e "$path" || -f "$path" ]] || fail "Not a regular file: $path"
     fi
 done
+requests_mode=fresh
+if [[ -f "$requests_db" ]]; then
+    requests_version=$(sudo -u factory-api sqlite3 -readonly "$requests_db" 'PRAGMA user_version;')
+    case "$requests_version" in
+        0|1|2|3) requests_mode=legacy ;;
+        4) requests_mode=v4 ;;
+        *) fail "Unsupported requests user_version: $requests_version" ;;
+    esac
+else
+    [[ ! -e "$requests_db-wal" && ! -e "$requests_db-shm" ]] || fail 'Orphan requests WAL/SHM; recover before installing.'
+fi
 pricing_mode=fresh
 if [[ -f "$pricing_db" ]]; then
     pricing_version=$(sqlite3 -readonly "$pricing_db" 'PRAGMA user_version;')
@@ -112,12 +124,12 @@ fi
 if [[ "$pricing_mode" == fresh ]]; then
     [[ ! -e "$pricing_db-wal" && ! -e "$pricing_db-shm" ]] || fail 'Orphan pricing WAL/SHM; recover before installing.'
 fi
-if [[ "$pricing_mode" == legacy ]]; then
-    [[ -f "$destination" && -f "$installed_unit" ]] || fail 'Legacy pricing requires a previous binary and unit for rollback.'
+if [[ "$pricing_mode" == legacy || "$requests_mode" == legacy ]]; then
+    [[ -f "$destination" && -f "$installed_unit" ]] || fail 'Legacy databases require a previous binary and unit for rollback.'
 fi
 [[ -d /var/backups/factory-db && ! -L /var/backups/factory-db/.backup.lock ]] || fail 'Install/review MET-74 backups before deploying.'
 bytes=$(stat -c %s "$binary")
-for path in "$destination" "$pricing_db" "$pricing_db-wal" "$pricing_db-shm"; do
+for path in "$destination" "$pricing_db" "$pricing_db-wal" "$pricing_db-shm" "$requests_db" "$requests_db-wal" "$requests_db-shm"; do
     if [[ -f "$path" ]]; then bytes=$((bytes + $(stat -c %s "$path"))); fi
 done
 required=$((3 * bytes + 16777216))
@@ -139,6 +151,8 @@ snapshot=$(mktemp -d "/var/backups/factory-api/$(date -u +%Y%m%dT%H%M%S.%NZ).XXX
 printf '%s\n' "$enabled" > "$snapshot/enabled"
 printf '%s\n' "$active" > "$snapshot/active"
 printf '%s\n' "$pricing_mode" > "$snapshot/pricing-mode"
+printf '%s\n' "$requests_mode" > "$snapshot/requests-mode"
+if [[ "$requests_mode" == legacy ]]; then printf '%s\n' "$requests_version" > "$snapshot/requests-version"; fi
 if [[ -e "$destination" ]]; then cp -p -- "$destination" "$snapshot/binary"; else touch "$snapshot/binary.missing"; fi
 if [[ -e "$installed_unit" ]]; then cp -p -- "$installed_unit" "$snapshot/unit"; else touch "$snapshot/unit.missing"; fi
 if [[ -d /var/lib/factory-usage-trigger ]]; then
@@ -162,6 +176,28 @@ install -d -m 0755 /usr/local/bin
 # Stop before replacing files, including on systems running the old binary.
 if [[ $(systemctl show factory-api.service --property=LoadState --value) != not-found ]]; then
     systemctl stop factory-api.service
+fi
+if [[ "$requests_mode" == fresh ]]; then
+    [[ ! -e "$requests_db" && ! -e "$requests_db-wal" && ! -e "$requests_db-shm" ]] || fail 'Requests database appeared since preflight; refusing an unbacked migration.'
+else
+    [[ $(sudo -u factory-api sqlite3 -readonly "$requests_db" 'PRAGMA user_version;') == "$requests_version" ]] || fail 'Requests version changed since preflight.'
+fi
+if [[ "$requests_mode" == legacy ]]; then
+    # Open as the owner: read-only WAL opens can still create sidecar files.
+    scratch=$(sudo -u factory-api mktemp -d /var/lib/factory-api/.requests-backup.XXXXXX)
+    sudo -u factory-api sqlite3 -readonly "$requests_db" ".backup '$scratch/requests.db'"
+    [[ $(sudo -u factory-api sqlite3 -readonly "$scratch/requests.db" 'PRAGMA integrity_check;') == ok ]] || fail 'Requests backup integrity failed.'
+    [[ $(sudo -u factory-api sqlite3 -readonly "$scratch/requests.db" 'PRAGMA user_version;') == "$requests_version" ]] || fail 'Requests backup version failed.'
+    cp -p -- "$scratch/requests.db" "$snapshot/requests.db"
+    sha256sum "$snapshot/requests.db" > "$snapshot/requests.db.sha256"
+    preservation_sql="SELECT 'preservation',1;$(sudo -u factory-api sqlite3 -readonly "$requests_db" "SELECT 'SELECT '||quote(name)||',COUNT(*) FROM '||quote(name)||';' FROM sqlite_schema WHERE type='table' AND name NOT IN ('requests','warnings') AND name NOT LIKE 'sqlite_%' ORDER BY name;")"
+    # Root owns the rollback metadata; only SQLite runs as factory-api.
+    # shellcheck disable=SC2024
+    sudo -u factory-api sqlite3 -readonly "$requests_db" "$preservation_sql" > "$snapshot/telemetry-counts.before"
+    # The verified snapshot and old request table remain available for rollback.
+    printf '%s\n' "$requests_version" > "$snapshot/requests-version"
+    sudo -u factory-api rm -f -- "$scratch/requests.db" "$scratch/requests.db-wal" "$scratch/requests.db-shm"
+    sudo -u factory-api rmdir -- "$scratch"
 fi
 if [[ "$pricing_mode" == legacy ]]; then
     [[ $(sqlite3 -readonly "$pricing_db" 'PRAGMA user_version;') == 0 ]] || fail 'Pricing version changed since preflight.'
@@ -188,6 +224,15 @@ if [[ "$pricing_mode" != v1 ]]; then
     sudo -u factory-api sh -c 'umask 077; exec "$1" migrate --pricing-db "$2"' sh "$destination" "$pricing_db"
 fi
 [[ $(sqlite3 -readonly "$pricing_db" 'PRAGMA user_version;') == 1 ]] || fail 'Pricing migration did not produce user_version=1.'
+if [[ "$requests_mode" != v4 ]]; then
+    sudo -u factory-api sh -c 'umask 077; exec "$1" migrate --requests-db "$2"' sh "$destination" "$requests_db"
+fi
+[[ $(sudo -u factory-api sqlite3 -readonly "$requests_db" 'PRAGMA user_version;') == 4 ]] || fail 'Requests migration did not produce user_version=4.'
+if [[ "$requests_mode" == legacy ]]; then
+    # shellcheck disable=SC2024
+    sudo -u factory-api sqlite3 -readonly "$requests_db" "$preservation_sql" > "$snapshot/telemetry-counts.after"
+    cmp -s "$snapshot/telemetry-counts.before" "$snapshot/telemetry-counts.after" || fail 'Requests migration changed telemetry row counts.'
+fi
 systemctl daemon-reload
 systemctl enable --now "$clock_wait"
 systemctl enable factory-api.service

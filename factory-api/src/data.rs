@@ -15,13 +15,32 @@ pub fn tps(tokens: Option<u64>, ns: Option<u64>) -> Option<f64> {
     }
 }
 pub fn open(path: &Path) -> Result<Connection> {
+    verify_path(path)?;
     let mut db = Connection::open(path)?;
     factory_db::settings::apply(&db, false, 65_536)?;
     initialize(&mut db)?;
     Ok(db)
 }
+
+/// Check before pool settings can write to an existing database.
+pub fn verify_path(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let empty = factory_db::migrations::schema_fingerprint(&db)?.is_empty();
+    anyhow::ensure!(
+        version == 4 || (version == 0 && empty),
+        "requests requires user_version=4, found {version}; stop factory-api, take a verified backup, then run factory-api migrate --requests-db <path>"
+    );
+    Ok(())
+}
+
+/// Offline only for existing databases. Runtime may initialize a fresh file.
 pub fn initialize(db: &mut Connection) -> Result<()> {
     use factory_db::migrations::{LegacySchema, Migration, run, schema_fingerprint};
+    let from: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let legacy = Connection::open_in_memory()?;
     legacy.execute_batch(include_str!("requests_legacy.sql"))?;
     // PRAGMA optimize on the deployed cache may already have created sqlite_stat1.
@@ -50,60 +69,153 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
                 sql: include_str!("network_schema.sql"),
                 checksum: 0xeafe4295b7f9e60f,
             },
+            Migration {
+                version: 4,
+                sql: include_str!("requests_v4.sql"),
+                checksum: 0x27c842b5b0708030,
+            },
         ],
         Some(LegacySchema {
             fingerprint: &schema_fingerprint(&legacy)?,
             version: 0,
         }),
         |_, _| Ok(()),
-        |_, _| Ok(()),
+        |tx, _| {
+            if from < 4 {
+                let messages = tx
+                    .prepare("SELECT message FROM warnings_before_v4")?
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let now = crate::now_ms();
+                for message in messages {
+                    let range = message
+                        .strip_prefix("gap: meter ids ")
+                        .and_then(|s| s.split_once(' '))
+                        .and_then(|(s, _)| s.split_once(".."))
+                        .and_then(|(a, b)| Some((a.parse::<i64>().ok()?, b.parse::<i64>().ok()?)))
+                        .filter(|(a, b)| *a > 0 && b >= a);
+                    tx.execute(
+                        "INSERT INTO warnings VALUES (?1,?2,?2,NULL,?3,?4)",
+                        rusqlite::params![message, now, range.map(|r| r.0), range.map(|r| r.1)],
+                    )?;
+                }
+            }
+            Ok(())
+        },
     )?;
     Ok(())
 }
+
+pub const REQUEST_COLUMNS: &str = "id,ts_ms,endpoint,model,prompt_eval_count,eval_count,load_duration_ns,prompt_eval_duration_ns,eval_duration_ns,total_duration_ns,usage_json,latency_ms,status,stream,error,client_ip,client_hostname,user_key,actor_kind";
+
 pub fn sync(db: &mut Connection, records: Vec<RequestRecord>) -> Result<Vec<RequestRecord>> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let watermark: i64 =
-        tx.query_row("SELECT COALESCE(MAX(id),0) FROM requests", [], |r| r.get(0))?;
+    let (watermark, rebuilding, replay_through): (i64, bool, i64) = tx.query_row(
+        "SELECT last_after_id,rebuilding,replay_through_id FROM sync_state WHERE id=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let now = crate::now_ms();
     let mut previous = watermark;
     let mut warnings = Vec::new();
     for record in &records {
-        anyhow::ensure!(record.id > 0, "invalid meter id");
+        anyhow::ensure!(
+            record.id > previous && record.latency_ms.is_finite(),
+            "invalid meter record"
+        );
         if record.id > previous.saturating_add(1) {
-            warnings.push(format!(
-                "gap: meter ids {}..{} are absent from cursor history",
+            warnings.push((
+                format!(
+                    "gap: meter ids {}..{} are absent from cursor history",
+                    previous + 1,
+                    record.id - 1
+                ),
                 previous + 1,
-                record.id - 1
+                record.id - 1,
             ));
         }
-        previous = previous.max(record.id);
+        previous = record.id;
     }
     for chunk in warnings.chunks(100) {
-        let values = std::iter::repeat_n("(?)", chunk.len())
+        let values = std::iter::repeat_n("(?,?,?,?,?)", chunk.len())
             .collect::<Vec<_>>()
             .join(",");
+        let parameters: Vec<rusqlite::types::Value> = chunk
+            .iter()
+            .flat_map(|(message, a, b)| {
+                [
+                    message.clone().into(),
+                    now.into(),
+                    now.into(),
+                    (*a).into(),
+                    (*b).into(),
+                ]
+            })
+            .collect();
         tx.execute(
-            &format!("INSERT OR IGNORE INTO warnings VALUES {values}"),
-            rusqlite::params_from_iter(chunk),
+            &format!("INSERT OR IGNORE INTO warnings(message,first_seen_ms,last_seen_ms,first_id,last_id) VALUES {values}"),
+            rusqlite::params_from_iter(parameters),
         )?;
     }
     for chunk in records.chunks(100) {
-        let values = std::iter::repeat_n("(?,?,?)", chunk.len())
+        let values = std::iter::repeat_n("(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", chunk.len())
             .collect::<Vec<_>>()
             .join(",");
-        let mut parameters = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() * 3);
-        for record in chunk {
+        let mut parameters = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() * 19);
+        let integer = |v: Option<u64>| -> Result<rusqlite::types::Value> {
+            Ok(v.map(i64::try_from).transpose()?.into())
+        };
+        for r in chunk {
             parameters.extend([
-                record.id.into(),
-                record.ts.into(),
-                serde_json::to_string(record)?.into(),
+                r.id.into(),
+                r.ts.into(),
+                r.endpoint.clone().into(),
+                r.model.clone().into(),
+                integer(r.prompt_eval_count)?,
+                integer(r.eval_count)?,
+                integer(r.load_duration)?,
+                integer(r.prompt_eval_duration)?,
+                integer(r.eval_duration)?,
+                integer(r.total_duration)?,
+                r.usage
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?
+                    .into(),
+                r.latency_ms.into(),
+                i64::from(r.status).into(),
+                i64::from(r.stream).into(),
+                r.error.clone().into(),
+                r.client_ip.clone().into(),
+                r.client_hostname.clone().into(),
+                r.user_key.clone().into(),
+                r.actor_kind
+                    .as_deref()
+                    .unwrap_or("unattributed")
+                    .to_owned()
+                    .into(),
             ]);
         }
-        tx.execute(&format!("INSERT INTO requests VALUES {values} ON CONFLICT(id) DO UPDATE SET ts_ms=excluded.ts_ms, record=excluded.record"), rusqlite::params_from_iter(parameters))?;
+        tx.execute(
+            &format!("INSERT INTO requests({REQUEST_COLUMNS}) VALUES {values}"),
+            rusqlite::params_from_iter(parameters),
+        )?;
     }
+    if records.is_empty() {
+        // A successful new poll alone is not recovery: every ID must be present.
+        tx.execute("UPDATE warnings SET resolved_at_ms=?1,last_seen_ms=?1 WHERE resolved_at_ms IS NULL AND first_id IS NOT NULL AND (SELECT COUNT(*) FROM requests WHERE id BETWEEN first_id AND last_id)=last_id-first_id+1", [now])?;
+        if rebuilding {
+            let missing: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM requests_before_v4 old LEFT JOIN requests new ON new.id=old.id WHERE new.id IS NULL)", [], |r| r.get(0))?;
+            if missing {
+                tx.execute("INSERT OR IGNORE INTO warnings(message,first_seen_ms,last_seen_ms) VALUES('gap: previously cached meter requests are absent from replay',?1,?1)", [now])?;
+            }
+        }
+    }
+    tx.execute("UPDATE sync_state SET last_after_id=?1,synced_at_ms=?2,rebuilding=CASE WHEN ?3 THEN 0 ELSE rebuilding END WHERE id=1", rusqlite::params![previous,now,records.is_empty()])?;
     tx.commit()?;
     let mut new: Vec<_> = records
         .into_iter()
-        .filter(|record| record.id > watermark)
+        .filter(|record| !rebuilding && record.id > watermark.max(replay_through))
         .collect();
     new.sort_by_key(|r| r.id);
     Ok(new)
@@ -198,21 +310,52 @@ pub fn usage_records(
     since: i64,
     mut warnings: Vec<String>,
 ) -> Result<(Vec<RequestRecord>, Vec<String>)> {
-    let mut statement =
-        db.prepare("SELECT record FROM requests WHERE ts_ms>=?1 ORDER BY ts_ms,id")?;
+    let mut statement = db.prepare(&format!(
+        "SELECT {REQUEST_COLUMNS} FROM requests WHERE ts_ms>=?1 ORDER BY ts_ms,id"
+    ))?;
     let mut rows = statement.query([since])?;
     let mut records = Vec::new();
     while let Some(row) = rows.next()? {
-        let record: RequestRecord = serde_json::from_str(row.get_ref(0)?.as_str()?)?;
+        let unsigned = |column| -> Result<Option<u64>> {
+            Ok(row
+                .get::<_, Option<i64>>(column)?
+                .map(u64::try_from)
+                .transpose()?)
+        };
+        let record = RequestRecord {
+            id: row.get(0)?,
+            ts: row.get(1)?,
+            endpoint: row.get(2)?,
+            model: row.get(3)?,
+            prompt_eval_count: unsigned(4)?,
+            eval_count: unsigned(5)?,
+            load_duration: unsigned(6)?,
+            prompt_eval_duration: unsigned(7)?,
+            eval_duration: unsigned(8)?,
+            total_duration: unsigned(9)?,
+            usage: row
+                .get::<_, Option<String>>(10)?
+                .map(|s| serde_json::from_str(&s))
+                .transpose()?,
+            latency_ms: row.get(11)?,
+            status: row.get(12)?,
+            stream: row.get(13)?,
+            error: row.get(14)?,
+            client_ip: row.get(15)?,
+            client_hostname: row.get(16)?,
+            user_key: row.get(17)?,
+            actor_kind: row.get(18)?,
+        };
         if crate::INFERENCE_ENDPOINTS.contains(&record.endpoint.as_str()) {
             records.push(record);
         }
     }
     warnings.extend(
-        db.prepare("SELECT message FROM warnings ORDER BY message")?
+        db.prepare("SELECT message FROM warnings WHERE resolved_at_ms IS NULL UNION ALL SELECT 'meter: rebuilding request history; usage is incomplete' FROM sync_state WHERE id=1 AND rebuilding=1")?
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?,
     );
+    warnings.sort();
     Ok((records, warnings))
 }
 
@@ -491,14 +634,17 @@ mod tests {
             endpoint: "/api/chat".into(),
             prompt_eval_count: Some(1_000_000),
             eval_count: Some(2_000_000),
+            status: 200,
             ..Default::default()
         };
         let mut counts = vec![];
         let mut queries = Vec::new();
+        let mut after = 0;
         for count in [1, 1000] {
             db.run(&Scope::default(), Category::Setup, |db| {
-                sync(db, (1..=count).map(row).collect())
+                sync(db, (after + 1..=count).map(row).collect())
             })?;
+            after = count;
             let scope = Scope::recording();
             let (records, warnings) =
                 db.run(&scope, Category::Data, |db| usage_records(db, 0, vec![]))?;

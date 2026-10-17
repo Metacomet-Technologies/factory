@@ -1,10 +1,68 @@
 # Factory data model: audit and migration design
 
 Contributes to [MET-92](https://linear.app/metacomet/issue/MET-92/data-model-audit-enforced-db-standards-migrations-indexes-no-n1),
-steps 1–2 only. Audited on factory-gpu, 2026-10-11, against main after PR #13.
-This document specifies later implementation; **no migrations, shared DB crate,
-retention changes, or new enforcement tests ship in this PR**. The Database rules
-in `AGENTS.md` are requirements for that implementation, not a claim of existing CI coverage.
+starting with the steps 1–2 audit on factory-gpu, 2026-10-11, against main after
+PR #13. The audit and target contracts below describe that historical baseline
+and subsequent decisions. Implementation status is recorded separately; the
+Database rules remain requirements, not a claim that every planned check exists.
+
+## Cache recovery implementation (MET-203)
+
+The version numbers in the original migration sequence below are design-era
+names, not the current database versions. On 2026-10-17, main has API
+`requests.db` v3 (v1 UPS, v2 devices, v3 network), meter v1, and pricing v1.
+MET-203 adds **API v4**; it changes neither meter nor pricing. Allocate subsequent
+schema versions from the then-current manifests, never from the original table.
+
+After stopping factory-api and taking a fresh verified backup, run
+`factory-api migrate --requests-db <path>`. The shared migration runner upgrades
+versions 0–3 transactionally, preserving all UPS/device/network tables. It renames
+the legacy cache and warnings to `requests_before_v4` and `warnings_before_v4`,
+creates the typed STRICT request replica and timestamped warnings, and initializes
+`sync_state.last_after_id` to zero. It does not convert legacy request JSON or
+replace the database file. Archived legacy tables keep their original schema and
+are not read as live facts. They remain until explicitly approved cleanup.
+Runtime refuses an existing pre-v4 or future-version file; only a new empty
+database may be initialized without the offline command.
+
+The installer holds the MET-74 backup lock, stops the service, makes and verifies
+a SQLite backup including committed WAL frames, records the old schema version,
+and compares telemetry row counts before/after migration. Database opens in the
+new request-backup path run as the service user to avoid root-owned WAL sidecars.
+The installer never starts the new binary against an old request schema.
+
+Replay uses ascending pages of at most 500 rows, at most 20 pages per poll.
+Each transaction inserts immutable typed facts and advances the singleton cursor;
+interruptions resume from that cursor, not `MAX(id)`. Invalid IDs, ordering,
+signed-integer overflow, nonfinite latency and schema constraints fail the page
+without advancing progress. Historical replay does not emit live `llm.request`
+events. Usage carries a rebuilding warning until an empty cursor page confirms
+catch-up; reaching the work bound leaves a transient catch-up warning.
+
+Legacy warning strings retain their exact message and get migration-time
+first/last observation times. Recognized ID ranges, including 340–421, resolve
+only after every ID is present in the new cache. A successful poll is not enough.
+Unavailable source IDs remain warnings. Missing previously cached rows also
+produce a coverage warning. `sync_state.replay_through_id` records the legacy
+maximum for replay/event suppression; `rebuilding` persists across restarts.
+
+Normal sync budgets are one initial cursor read, then
+`2 + ceil(rows/100) + ceil(gaps/100)` data statements per nonempty page and three
+on the final empty page. Migration replay additionally compares retained legacy
+IDs once at catch-up. The current usage/pricing read budgets remain 16/9.
+
+Rollback uses the installer's verified pre-migration `requests.db` snapshot and
+compatible binary. **This restores all telemetry to the backup time**, not just
+request history. The rollback script preserves displaced database/WAL/SHM files
+for recovery; it does not merge later telemetry automatically. Pricing is
+preserved unless its own migration is being rolled back. No production migration
+or recovery has been verified by the synthetic tests.
+
+Remaining approved MET-92 stages are tracked separately: frozen costs
+[MET-204](https://linear.app/metacomet/issue/MET-204), rollups
+[MET-205](https://linear.app/metacomet/issue/MET-205), then gated retention,
+snapshots and runtime query-counter alerts
+[MET-206](https://linear.app/metacomet/issue/MET-206). MET-203 adds no pruning.
 
 ## Scope, evidence, and decisions
 
