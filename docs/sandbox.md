@@ -235,14 +235,27 @@ printf '%s\n' down > .sandbox/network-tailnet
 python3 scripts/sandbox-shims/network-smoke.py
 printf '%s\n' slow > .sandbox/network-speed
 python3 scripts/sandbox-shims/speed-smoke.py
+python3 scripts/sandbox-shims/speed-alerts-smoke.py
 ```
 
 The check walks every scenario, waits for a tick that started after each fixture
 change, and asserts each target's `sent`, `received` and RTT in `GET /v1/network`.
-It also checks `GET /v1/network/history` at raw and hourly resolution and a
-`network.sample` frame on `/v1/stream`, then restores the healthy fixtures. It
-takes about six minutes and prints its evidence as JSON. The shim's RTTs are
-fixtures; only loopback DNS and TCP timings are measured.
+After a second such tick it asserts the diagnosed `state`: healthy, `loss` and
+`latency` as degraded wan, `wan-down` as down wan, `lan-down`, `unreachable` and
+`no-default-route` as one continuing down lan episode, `dns-failure` as down dns
+and `tailnet-down` as down tailnet. Broken ping must stay healthy, because the
+unknown icmp layers name no fault. `GET /v1/network/events` must show at most
+one open episode matching that state, with the fixture's peaks, and every
+episode since the run began must end as `changed` exactly when the next one
+starts and as `recovered` otherwise. The run waits for `network:wan_down` in
+`GET /v1/alerts` at least 2 min after its event opened, then recovers and waits
+for it to clear. It does the same for `network:lan_down`, which clears when DNS
+fails. Paging every episode two at a time with `before` must return what
+pages of 200 do, newest first, and an unknown `before` must be a 400. It also
+checks `GET /v1/network/history` at raw and hourly resolution
+and a `network.sample` frame on `/v1/stream`, then restores the healthy
+fixtures. It takes about fifteen minutes and prints its evidence as JSON. The
+shim's RTTs are fixtures; only loopback DNS and TCP timings are measured.
 
 `speed-smoke.py` sets each speed mode in turn and waits for a test that started
 after the change. `ok` must move the full 440 MB and 290 MB with colo `SBX` and
@@ -253,6 +266,14 @@ byte. Each stored row must match its `network.speedtest` frame on `/v1/stream`,
 `latest_speed_test` in `GET /v1/network` and `GET /v1/network/speed-tests`. It
 restores `ok`, takes up to ten minutes and prints the rows as JSON. Rates and
 loaded latency are loopback measurements, not link speeds.
+
+`speed-alerts-smoke.py` drives the speed alerts. It first waits for an `ok`
+test and for both alerts to be clear, since earlier unfinished or slow tests
+count toward their streaks. Three `fail` tests must open
+`network:speedtest_failing`, after two did not. The first `slow` test clears it,
+and three must open `network:throughput_low`, because about 50 Mb/s is under
+the 500 Mb/s default. The next `ok` test clears that. It restores `ok`, takes
+about fifteen minutes and prints the tests and alerts as JSON.
 
 ## Pricing hooks (MET-111)
 
