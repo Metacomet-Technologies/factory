@@ -16,7 +16,7 @@ use utoipa::ToSchema;
 pub const DEVICE_ID: &str = "factory-gpu";
 pub const FAST_INTERVAL_MS: i64 = 15_000;
 pub const SLOW_INTERVAL_MS: i64 = 300_000;
-pub const DEFAULT_REBOOT_STATUS: &str = "/var/lib/factory-reboot/status.json";
+pub const DEFAULT_REBOOT_STATUS: &str = "/var/lib/factory-reboot-status/status.json";
 pub const READ_CAP: usize = 1_048_576;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 

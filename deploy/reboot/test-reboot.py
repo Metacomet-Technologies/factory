@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """No-root contract checks with fake filesystems and commands, never host reboots."""
 
+import contextlib
 import concurrent.futures
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 NOW = 1_791_799_200_000  # 2026-10-12 10:00 UTC (06:00 New York)
@@ -85,6 +89,88 @@ if name == 'systemctl':
         sys.exit(0 if state == 'active' else 3)
 '''
 
+
+def check_published_status():
+    spec = importlib.util.spec_from_file_location("reboot_policy", HERE / "reboot-policy.py")
+    policy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy)
+    allowlist = (
+        "reboot_required", "pending_since_ms", "days_pending", "consecutive_skips",
+        "alert_due", "last_check_ms", "last_decision",
+    )
+    with tempfile.TemporaryDirectory(prefix="factory-reboot-publish ") as temporary:
+        root = Path(temporary)
+        private_dir = root / "var/lib/factory-reboot"
+        private_dir.mkdir(parents=True, mode=0o700)
+        private = private_dir / "status.json"
+        published = root / "var/lib/factory-reboot-status/status.json"
+        published.parent.mkdir(parents=True, mode=0o750)
+        state = {
+            "mode": "observe", "reboot_required": True, "pending_since_ms": 10,
+            "days_pending": 4, "consecutive_skips": 3, "alert_due": True,
+            "last_check_ms": 20, "last_decision": "skipped", "last_reason": "agent-busy",
+            "last_busy_reason": "agent-busy", "last_boot_ms": 1,
+            "postboot": {"services": {"factory-api.service": "active"}},
+            "environment": "SECRET=token", "args": ["--password", "hunter2"],
+        }
+        owners = {}
+
+        def chown(path, *, user, group):
+            owners[Path(path)] = (user, group)
+
+        with patch.dict(os.environ, REBOOT_ROOT=str(root)), patch("shutil.chown", chown):
+            policy.write_status(private, state)
+        assert published.is_file(), "private write did not publish a readable copy"
+        assert list(json.loads(published.read_text())) == list(allowlist), published.read_text()
+        assert published.stat().st_mode & 0o777 == 0o640
+        assert list(owners.values()) == [("root", "factory-api")]
+        assert next(iter(owners)).parent == published.parent
+        assert "SECRET" not in published.read_text() and "hunter2" not in published.read_text()
+        assert "last_reason" not in published.read_text() and "postboot" not in published.read_text()
+        assert private_dir.stat().st_mode & 0o777 == 0o700
+        assert private.stat().st_mode & 0o777 == 0o600
+        assert json.loads(private.read_text())["environment"] == "SECRET=token"
+        previous = published.read_bytes()
+        state["last_decision"] = "would-reboot"
+        warning = io.StringIO()
+        real_replace = os.replace
+
+        def failed_replace(source, destination):
+            if Path(destination) == published:
+                raise OSError("test publication failure")
+            real_replace(source, destination)
+
+        with patch.dict(os.environ, REBOOT_ROOT=str(root)), patch("shutil.chown", chown), \
+                patch.object(policy.os, "replace", failed_replace), \
+                contextlib.redirect_stderr(warning):
+            policy.write_status(private, state)
+        assert "WARNING: could not publish reboot status" in warning.getvalue()
+        assert published.read_bytes() == previous
+        assert json.loads(private.read_text())["last_decision"] == "would-reboot"
+        assert list(published.parent.iterdir()) == [published]
+        outside = root / "outside"
+        outside.mkdir()
+        published.unlink()
+        published.parent.rmdir()
+        link = root / "var/lib/factory-reboot-status"
+        link.symlink_to(outside, target_is_directory=True)
+        warning = io.StringIO()
+        with patch.dict(os.environ, REBOOT_ROOT=str(root)), patch("shutil.chown", chown), \
+                contextlib.redirect_stderr(warning):
+            policy.write_status(private, state)
+        assert "WARNING: could not publish reboot status" in warning.getvalue()
+        assert not (outside / "status.json").exists()
+        assert json.loads(private.read_text())["reboot_required"] is True
+        link.unlink()
+        warning = io.StringIO()
+        with patch.dict(os.environ, REBOOT_ROOT=str(root)), contextlib.redirect_stderr(warning):
+            policy.write_status(private, state)
+        assert warning.getvalue() == ""
+        assert json.loads(private.read_text())["last_decision"] == "would-reboot"
+    print("PASS: published reboot status is an atomic 0640 root:factory-api allowlist; failures keep the private file")
+
+
+check_published_status()
 
 with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
     fixture = Path(temporary)
@@ -422,6 +508,8 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
                     mounts += ["--ro-bind", str(bin_dir), "/usr/sbin"]
                 else:
                     raise AssertionError(f"Missing namespace command: {name}")
+            if not Path("/var/run").is_symlink():
+                mounts += ["--bind", str(isolated / "run"), "/var/run"]
             commands.update(node=node, ps="", meter="[]", meter_code=0, ups="OL", ups_code=0)
             (fixture / "commands.json").write_text(json.dumps(commands))
             calls.write_text("")
@@ -437,7 +525,9 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             other = "factory-console" if node == "factory-gpu" else "factory-gpu"
             installer("install-reboot-policy.sh", "--node", other, success=False)
             assert not list((isolated / "var/backups/factory-reboot").iterdir())
-            installer("install-reboot-policy.sh", "--node", node)
+            skipped = installer("install-reboot-policy.sh", "--node", node)
+            assert "Skipping published reboot status: factory-api group is missing." in skipped.stdout
+            assert not (isolated / "var/lib/factory-reboot-status").exists()
             installed_config = isolated / "etc/factory-reboot/node.conf"
             installed_status = isolated / "var/lib/factory-reboot/status.json"
             installed_timer = isolated / "etc/systemd/system/factory-reboot.timer"
@@ -482,3 +572,101 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             assert installed_status.exists() and not installed_timer.exists() and not installed_config.exists()
             assert not (isolated / "usr/local/lib/factory-reboot").exists()
         print("PASS: both isolated installers; preserved/replaced config, snapshots, mode-only reruns, overrides and rollback")
+
+        publish_root = fixture / "publish-gpu"
+        for relative in ("etc/systemd/system", "usr/local/lib", "var/lib", "var/backups/factory-reboot", "run/systemd/system"):
+            (publish_root / relative).mkdir(parents=True)
+        (publish_root / "run/reboot-required").touch()
+        shutil.copy2(shutil.which("getent"), fixture / "getent-real")
+        shutil.copy2(shutil.which("install"), fixture / "install-real")
+        policy_copy = artifacts / "reboot-policy.py"
+        policy_text = policy_copy.read_text()
+        chown_call = 'shutil.chown(temp, user="root", group="factory-api")'
+        assert chown_call in policy_text
+        policy_copy.write_text(policy_text.replace(chown_call,
+            'open(os.environ["REBOOT_FIXTURE"] + "/owners", "a").write(f"root\\tfactory-api\\t{temp}\\n")', 1))
+        (fixture / "getent").write_text(
+            "#!/bin/bash\n"
+            "if [[ $1 == group && $2 == factory-api ]]; then\n"
+            "  [[ -f \"$REBOOT_FIXTURE/factory-api-group\" ]]\n"
+            "  exit\n"
+            "fi\n"
+            "exec \"$REBOOT_FIXTURE/getent-real\" \"$@\"\n")
+        (fixture / "install").write_text(
+            "#!/bin/bash\n"
+            "user=root\n"
+            "group=\n"
+            "args=()\n"
+            "while [[ $# -gt 0 ]]; do\n"
+            "  case $1 in\n"
+            "    -o) user=$2; shift 2 ;;\n"
+            "    -g) group=$2; shift 2 ;;\n"
+            "    *) args+=(\"$1\"); shift ;;\n"
+            "  esac\n"
+            "done\n"
+            "if [[ -n $group ]]; then\n"
+            "  printf '%s\\t%s\\t%s\\n' \"$user\" \"$group\" \"${args[-1]}\" >> \"$REBOOT_FIXTURE/owners\"\n"
+            "fi\n"
+            "exec \"$REBOOT_FIXTURE/install-real\" \"${args[@]}\"\n")
+        for name in ("getent", "install"):
+            (fixture / name).chmod(0o755)
+        (fixture / "factory-api-group").write_text("present\n")
+        (fixture / "owners").write_text("")
+        publish_mounts = [bwrap, "--ro-bind", "/", "/", "--unshare-user", "--uid", "0", "--gid", "0",
+                          "--unshare-uts", "--hostname", "factory-gpu", "--dev", "/dev", "--tmpfs", "/tmp",
+                          "--tmpfs", "/home", "--bind", str(fixture), str(fixture)]
+        for relative in ("etc", "usr/local/lib", "var/lib", "var/backups", "run"):
+            publish_mounts += ["--bind", str(publish_root / relative), "/" + relative]
+        for name in ("ps", "curl", "upsc", "systemctl", "timedatectl", "cp", "getent", "install"):
+            destination = shutil.which(name, path="/usr/sbin:/usr/bin:/sbin:/bin")
+            source = bin_dir / name if name in ("ps", "curl", "upsc", "systemctl", "timedatectl", "cp") else fixture / name
+            if destination:
+                publish_mounts += ["--ro-bind", str(source), destination]
+            elif name == "upsc":
+                publish_mounts += ["--ro-bind", str(bin_dir), "/usr/sbin"]
+            else:
+                raise AssertionError(f"Missing namespace command: {name}")
+        if not Path("/var/run").is_symlink():
+            publish_mounts += ["--bind", str(publish_root / "run"), "/var/run"]
+        commands.update(node="factory-gpu", ps="", meter="[]", meter_code=0, ups="OL", ups_code=0)
+        (fixture / "commands.json").write_text(json.dumps(commands))
+        calls.write_text("")
+
+        def publish_installer(script, *args, success=True):
+            result = subprocess.run(publish_mounts + ["--", "bash", str(artifacts / script), *args],
+                                    env=poisoned, text=True, capture_output=True, timeout=60)
+            assert (result.returncode == 0) == success, str(result.returncode) + result.stdout + result.stderr
+            return result
+
+        publish_installer("install-reboot-policy.sh", "--node", "factory-gpu")
+        published = publish_root / "var/lib/factory-reboot-status/status.json"
+        private = publish_root / "var/lib/factory-reboot/status.json"
+        allowlist = {"reboot_required", "pending_since_ms", "days_pending", "consecutive_skips",
+                     "alert_due", "last_check_ms", "last_decision"}
+        assert set(json.loads(published.read_text())) == allowlist
+        assert published.stat().st_mode & 0o777 == 0o640
+        assert published.parent.stat().st_mode & 0o777 == 0o750
+        assert (published.parent / ".created-by-install").is_file()
+        assert private.stat().st_mode & 0o777 == 0o600
+        assert private.parent.stat().st_mode & 0o777 == 0o700
+        assert "root\tfactory-api\t" in (fixture / "owners").read_text()
+        publish_installer("rollback-reboot-policy.sh")
+        assert not published.parent.exists()
+        assert private.is_file() and private.stat().st_mode & 0o777 == 0o600
+        published.parent.mkdir()
+        (published.parent / "keep").write_text("administrator file")
+        publish_installer("install-reboot-policy.sh", "--node", "factory-gpu")
+        assert not (published.parent / ".created-by-install").exists()
+        assert (published.parent / "keep").read_text() == "administrator file"
+        assert published.is_file()
+        publish_installer("rollback-reboot-policy.sh")
+        assert published.parent.is_dir()
+        assert (published.parent / "keep").read_text() == "administrator file"
+        shutil.rmtree(published.parent)
+        link_target = publish_root / "link-target"
+        link_target.mkdir()
+        published.parent.symlink_to(link_target, target_is_directory=True)
+        refused = publish_installer("install-reboot-policy.sh", "--node", "factory-gpu", success=False)
+        assert "Refusing symlink destination" in refused.stdout + refused.stderr
+        assert not (link_target / "status.json").exists()
+        print("PASS: installer publishes 0640 root:factory-api copy; rollback removes only a directory it created")

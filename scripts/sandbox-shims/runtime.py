@@ -145,7 +145,7 @@ def write_devices_fixture(root):
         "sys/class/hwmon/hwmon0/temp1_input": "45000\n",
         "var/lib/factory-devices/smart.json": '{"tool":"absent","drives":[]}\n',
         "var/lib/factory-backup-status/status.json": '{"meter":{"last_success_ms":10,"last_attempt_ms":10,"error":null}}\n',
-        "var/lib/factory-reboot/status.json": '{"reboot_required":false,"pending_since_ms":null,"days_pending":null,"consecutive_skips":0,"alert_due":false,"last_check_ms":10,"last_decision":"not-needed"}\n',
+        "var/lib/factory-reboot-status/status.json": '{"reboot_required":false,"pending_since_ms":null,"days_pending":null,"consecutive_skips":0,"alert_due":false,"last_check_ms":10,"last_decision":"not-needed"}\n',
     }
     for rel, body in files.items():
         path = root / rel

@@ -26,7 +26,7 @@ lib=$root/usr/local/lib/factory-devices
 state=$root/var/lib/factory-devices
 units=$root/etc/systemd/system
 helper=$lib/smart-snapshot.py
-reboot=$root/var/lib/factory-reboot/status.json
+reboot=$root/var/lib/factory-reboot-status/status.json
 
 if $preflight; then
     [[ -f $helper && -f $units/factory-devices-smart.service && -f $units/factory-devices-smart.timer ]] || { echo 'ERROR: devices helper is not installed.' >&2; exit 1; }

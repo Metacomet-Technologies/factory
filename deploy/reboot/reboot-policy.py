@@ -2,6 +2,7 @@
 """Needs-only reboot decisions and post-boot observations; no forced reboots."""
 
 import argparse
+import sys
 import concurrent.futures
 import datetime as dt
 import fcntl
@@ -9,10 +10,17 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import time
 from zoneinfo import ZoneInfo
+
+# factory-api reads only this allowlist. Private status keeps the rest.
+PUBLISHED_FIELDS = (
+    "reboot_required", "pending_since_ms", "days_pending", "consecutive_skips",
+    "alert_due", "last_check_ms", "last_decision",
+)
 
 
 # factory-api/src/data.rs usage_records uses factory-api/src/lib.rs INFERENCE_ENDPOINTS.
@@ -155,6 +163,48 @@ def postboot_observations(config):
                     clock_synced=synced.result())
 
 
+def published_status(root):
+    return root / "var/lib/factory-reboot-status/status.json"
+
+
+def publish_status(path, root):
+    """Atomically publish an allowlisted copy. Failures warn and do not raise."""
+    destination = published_status(root)
+    parent = destination.parent
+    if not parent.exists() and not parent.is_symlink():
+        return
+    temp = None
+    try:
+        current = destination
+        while True:
+            if current.is_symlink():
+                raise OSError(f"Refusing symlink destination: {current}")
+            if current == current.parent:
+                break
+            current = current.parent
+        if path.is_symlink() or not path.is_file():
+            raise OSError(f"Refusing unreadable private status: {path}")
+        if not parent.is_dir():
+            raise OSError(f"Not a directory: {parent}")
+        state = json.loads(path.read_text())
+        payload = {key: state[key] for key in PUBLISHED_FIELDS if key in state}
+        with tempfile.NamedTemporaryFile(mode="w", dir=parent, delete=False) as out:
+            temp = out.name
+            json.dump(payload, out, indent=2)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(temp, 0o640)
+        shutil.chown(temp, user="root", group="factory-api")
+        os.replace(temp, destination)
+        temp = None
+    except Exception as error:
+        print(f"WARNING: could not publish reboot status to {destination}: {error}", file=sys.stderr)
+    finally:
+        if temp and os.path.exists(temp):
+            os.unlink(temp)
+
+
 def write_status(path, state):
     temp = None
     try:
@@ -173,15 +223,21 @@ def write_status(path, state):
     finally:
         if temp and os.path.exists(temp):
             os.unlink(temp)
+    publish_status(path, Path(os.environ.get("REBOOT_ROOT", "/")))
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=("check", "postboot"))
+    parser.add_argument("operation", choices=("check", "postboot", "publish"))
     parser.add_argument("--mode", choices=("observe",))
     args = parser.parse_args()
     # Overrides are for the no-root harness only; the installer removes them.
     root = Path(os.environ.get("REBOOT_ROOT", "/"))
+    if args.operation == "publish":
+        path = root / "var/lib/factory-reboot/status.json"
+        if path.is_file() and not path.is_symlink():
+            publish_status(path, root)
+        return
     config = json.loads(Path(os.environ.get(
         "REBOOT_CONFIG", root / "etc/factory-reboot/node.conf")).read_text())
     if config["node"] not in ("factory-gpu", "factory-console") or config["mode"] not in (

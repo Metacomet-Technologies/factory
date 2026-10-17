@@ -26,7 +26,7 @@ done
 
 # Read-only preflight, before any deployment changes.
 for tool in python3 systemctl systemd-analyze ps timedatectl install realpath dirname \
-    hostname cp cmp mktemp mv rm date chmod; do
+    hostname cp cmp mktemp mv rm date chmod getent; do
     command -v "$tool" >/dev/null || fail "Missing tool: $tool"
 done
 if [[ $node == factory-gpu ]]; then
@@ -53,6 +53,20 @@ done
 for file in reboot-policy.py reboot-check.sh postboot-check.sh; do
     [[ ! -L $lib/$file ]] || fail "Refusing symlink destination: $lib/$file"
 done
+published=/var/lib/factory-reboot-status
+published_status=$published/status.json
+publish=false
+if getent group factory-api >/dev/null; then
+    parent=$published_status
+    while [[ $parent != / ]]; do
+        [[ ! -L $parent ]] || fail "Refusing symlink destination: $parent"
+        parent=$(dirname "$parent")
+    done
+    [[ ! -e $published || -d $published ]] || fail "Not a directory: $published"
+    publish=true
+else
+    echo 'Skipping published reboot status: factory-api group is missing.'
+fi
 for unit in factory-reboot.service factory-reboot.timer factory-postboot.service; do
     [[ -z $(systemctl show "$unit" --property=DropInPaths --value) ]] || fail "Review $unit drop-ins first."
     enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
@@ -130,7 +144,16 @@ PY
 if [[ $unchanged == false ]]; then systemctl daemon-reload; fi
 systemctl enable --now factory-reboot.timer
 systemctl enable factory-postboot.service
+if [[ $publish == true ]]; then
+    create_marker=false
+    if [[ ! -e $published ]]; then create_marker=true; fi
+    install -d -o root -g factory-api -m 0750 "$published"
+    if [[ $create_marker == true ]]; then : > "$published/.created-by-install"; fi
+fi
 # Even an enforce installation must never reboot during its immediate probe.
 "$lib/reboot-check.sh" --mode observe
+if [[ $publish == true && -f /var/lib/factory-reboot/status.json ]]; then
+    python3 "$lib/reboot-policy.py" publish
+fi
 python3 -m json.tool /var/lib/factory-reboot/status.json
 printf 'Configured mode: %s. Immediate probe used observe; timer uses configured mode.\n' "$mode"
