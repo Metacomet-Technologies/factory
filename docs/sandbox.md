@@ -74,13 +74,26 @@ failed seeds require `reset`, rather than appending to a partial database.
 ## Fakes and deterministic data
 
 `fake-ollama --port N --seed N` binds loopback and implements `/api/version`,
-`/api/ps`, `/api/tags`, `/api/chat`, `/api/generate`, and
+`/api/ps`, `/api/tags`, `/api/show`, `/api/chat`, `/api/generate`, and
 `/v1/chat/completions`. Chat/generate default to NDJSON; OpenAI defaults to JSON.
 Explicit `stream` supports JSON and NDJSON/SSE respectively. The final frames
 include Ollama token counts/nanosecond durations or OpenAI `usage`; SSE ends
 with `[DONE]`. All three factory presets (also `:latest`) are accepted.
-OpenAI requests with tools return the first tool name and synthetic `{}` arguments;
-this is transport testing, not schema-aware tool planning or real inference.
+`POST /api/show` returns fixed `details`, `model_info` (with
+`<family>.context_length`), `parameters`, `template` and `capabilities` per preset;
+`factory-code` lacks `tools`, and unknown models get 404 `{"error":"model '…' not found"}`.
+Native `/api/chat` with a non-empty `tools` array, for a tools-capable preset,
+returns one `message.tool_calls` entry: the first offered tool, with arguments for
+only its required fields (first enum value, integer minimum or 1, else `"synthetic"`).
+It does so on every turn, including after tool results. OpenAI requests with tools
+return the first tool name and synthetic `{}` arguments. This is transport testing,
+not schema-aware tool planning or real inference.
+
+`node evals/ask/sandbox.ts` runs the eval harness's `fleet-health` case against a
+running sandbox. It reads the meter and factory-api URLs from `scripts/sandbox status`,
+refuses any non-loopback URL, and writes results to a new temporary directory.
+Every trial is expected to fail scoring: the fake keeps calling tools until the
+harness's budget ends, and its text is not grounded. It checks transport, not quality.
 
 A fixed FNV-1a hash of seed, endpoint and canonical JSON determines response text,
 counts and reported timings. Identical requests are byte-identical; measured
