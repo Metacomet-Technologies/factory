@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -55,9 +56,49 @@ class CheckTest(unittest.TestCase):
         write(os.path.join(self.root, "etc/ssl/certs/ca-certificates.crt"), "")
         write(os.path.join(self.root, "home/agent/work/factory/kiosk/package.json"), "{}")
         write(os.path.join(self.root, "home/agent/.config/vite-plus/env"), "")
-        os.makedirs(os.path.join(self.browsers, "chromium-1248"))
-        os.makedirs(self.home)
+        self.install_chromium(self.browsers)
+        os.makedirs(self.home, exist_ok=True)
         self.outputs = fixture_outputs()
+        self.env = {"PLAYWRIGHT_BROWSERS_PATH": self.browsers}
+
+    def install_chromium(self, base):
+        write(os.path.join(base, "chromium-1248", "INSTALLATION_COMPLETE"), "")
+        write(os.path.join(base, "chromium-1248", "chrome-linux64", "chrome"), "#!/bin/sh\n", 0o755)
+
+    def vite_plus_shims(self, installed):
+        """Replace node/pnpm/vp with Vite+ 1.1.0-style shims: links to one `vp` binary.
+
+        Running a shim as node/pnpm records a mutation; `vp env current --json`
+        reports the pinned runtime and package manager like the real CLI.
+        """
+        pins = repo_pins()
+        for tool in ("node", "pnpm", "vp"):
+            del self.outputs[tool]
+        runtime = os.path.join(self.tmp.name, "vp-home", "js_runtime", "node", pins["node"], "bin", "node")
+        manager = os.path.join(self.tmp.name, "vp-home", "package_manager", "pnpm", pins["pnpm"], "bin", "pnpm")
+        if installed:
+            write(runtime, f"#!/bin/sh\nprintf 'v{pins['node']}\\n'\n", 0o755)
+            write(manager, f"#!/bin/sh\nprintf '{pins['pnpm']}\\n'\n", 0o755)
+        current = {
+            "node": {"version": pins["node"], "bin_path": runtime, "installed": installed, "mode": "managed"},
+            "package_manager": {
+                "name": "pnpm", "version": pins["pnpm"], "bin_paths": {"pnpm": manager},
+                "installed": installed, "mode": "managed",
+            },
+        }
+        self.mutated = os.path.join(self.tmp.name, "shim-ran")
+        vp = os.path.join(self.tmp.name, "vp-home", "current", "bin", "vp")
+        write(vp, f"""#!/bin/sh
+# Only shell builtins: PATH holds nothing but these stubs.
+case "${{0##*/}} $*" in
+  "vp env current --json") printf '%s\\n' '{json.dumps(current)}' ;;
+  "vp --version") printf 'vp v{pins['vp']}\\n' ;;
+  *) : > '{self.mutated}'; printf 'v0.0.1\\n' ;;
+esac
+""", 0o755)
+        os.makedirs(self.bin, exist_ok=True)
+        for tool in ("node", "pnpm", "vp"):
+            os.symlink(vp, os.path.join(self.bin, tool))
 
     def run_check(self, env_name):
         stubs = {}
@@ -69,12 +110,7 @@ class CheckTest(unittest.TestCase):
             if "" not in by_sub:
                 cases += "  *) exit 1 ;;\n"
             write(os.path.join(self.bin, name), f'#!/bin/sh\ncase "$1" in\n{cases}esac\n', 0o755)
-        env = {
-            "PATH": self.bin,
-            "HOME": self.home,
-            "PLAYWRIGHT_BROWSERS_PATH": self.browsers,
-            "FACTORY_TEST_TOKEN": SENTINEL,
-        }
+        env = {"PATH": self.bin, "HOME": self.home, "FACTORY_TEST_TOKEN": SENTINEL, **self.env}
         out = subprocess.run(
             [sys.executable, CHECK, "--env", env_name, "--root", self.root],
             env=env, capture_output=True, text=True, check=False,
@@ -106,7 +142,7 @@ class CheckTest(unittest.TestCase):
         code, _, items = self.run_check("orb")
         self.assertEqual(code, 1)
         self.assertFalse(items["node"]["ok"])
-        self.assertEqual(items["node"]["actual"], "v24.21.0")
+        self.assertTrue(items["node"]["actual"].startswith("v24.21.0 ("))
         self.assertTrue(items["rust"]["ok"])
 
     def test_missing_shellcheck_fails(self):
@@ -116,8 +152,57 @@ class CheckTest(unittest.TestCase):
         self.assertFalse(items["shellcheck"]["ok"])
         self.assertIsNone(items["shellcheck"]["actual"])
 
+    def test_vite_plus_shims_resolve_the_pin_without_running(self):
+        self.vite_plus_shims(installed=True)
+        code, _, items = self.run_check("factory-gpu")
+        self.assertEqual(code, 0, [i for i in items.values() if not i["ok"]])
+        self.assertIn("js_runtime/node", items["node"]["actual"])
+        self.assertIn("package_manager/pnpm", items["pnpm"]["actual"])
+        self.assertFalse(os.path.exists(self.mutated), "a Vite+ shim ran")
+
+    def test_vite_plus_missing_pins_fail_without_installing(self):
+        self.vite_plus_shims(installed=False)
+        code, _, items = self.run_check("ci")
+        self.assertEqual(code, 1)
+        for name in ("node", "node:repo-root", "pnpm"):
+            self.assertFalse(items[name]["ok"], name)
+            self.assertIn("not installed", items[name]["actual"])
+        self.assertFalse(os.path.exists(self.mutated), "a Vite+ shim ran")
+
+    def test_playwright_in_default_cache_counts(self):
+        del self.env["PLAYWRIGHT_BROWSERS_PATH"]
+        self.install_chromium(os.path.join(self.home, ".cache", "ms-playwright"))
+        code, _, items = self.run_check("factory-gpu")
+        self.assertEqual(code, 0)
+        self.assertIn("chromium-1248/chrome-linux64/chrome", items["playwright"]["actual"])
+
+    def test_playwright_without_a_chromium_executable_fails(self):
+        chromium = os.path.join(self.browsers, "chromium-1248")
+        for broken in ("empty directory", "regular file", "not executable"):
+            shutil.rmtree(chromium, ignore_errors=True)
+            if os.path.isfile(chromium):
+                os.remove(chromium)
+            if broken == "empty directory":
+                os.makedirs(chromium)
+            elif broken == "regular file":
+                write(chromium, "")
+            else:
+                self.install_chromium(self.browsers)
+                os.chmod(os.path.join(chromium, "chrome-linux64", "chrome"), 0o644)
+            for env_name in ("factory-console", "factory-gpu"):
+                code, _, items = self.run_check(env_name)
+                self.assertEqual(code, 1, (broken, env_name))
+                self.assertFalse(items["playwright"]["ok"], (broken, env_name))
+
+    def test_missing_explicit_browsers_path_is_not_rescued(self):
+        self.env["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(self.tmp.name, "absent")
+        self.install_chromium(os.path.join(self.home, ".cache", "ms-playwright"))
+        code, _, items = self.run_check("factory-console")
+        self.assertEqual(code, 1)
+        self.assertFalse(items["playwright"]["ok"])
+
     def test_missing_playwright_fails_only_where_required(self):
-        os.rmdir(os.path.join(self.browsers, "chromium-1248"))
+        shutil.rmtree(os.path.join(self.browsers, "chromium-1248"))
         code, _, items = self.run_check("factory-console")
         self.assertEqual(code, 1)
         self.assertFalse(items["playwright"]["ok"])

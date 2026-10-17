@@ -13,9 +13,22 @@ Run it from the repository root. It is read-only, needs only `python3`, prints
 one JSON object (`env`, `ok`, and every item with `expected`, `actual`, `ok`,
 `required`) and exits 1 when a required item fails. Exempt items are reported
 with `"required": false` and never fail. It never prints environment
-variables; command output is cut to its first line. rustup auto-install is off
-unless the caller sets `RUSTUP_AUTO_INSTALL` (CI does). Tests:
+variables; command output is cut to its first line. Tests:
 `python3 -B scripts/env/test_check.py`.
+
+The checker never installs or caches anything:
+
+* `rustc` and `cargo` run with `RUSTUP_AUTO_INSTALL=0`, so a missing pinned
+  toolchain is reported, not downloaded.
+* Vite+ shims are never executed. Running `node` or `pnpm` through a Vite+ 1.1.0
+  shim writes `~/.cache/vite-plus/resolve_cache.json` and installs a missing
+  pin. When `node` or `pnpm` on PATH links to `vp`, the checker asks
+  `vp env current --json` (in `kiosk/`, or the repo root for `.node-version`)
+  for the project's pinned version and binary, and runs only that binary. A
+  pin Vite+ has not installed fails as "not installed"; it never falls back to
+  another Node on PATH. Other `node`/`pnpm` binaries run directly.
+* Provisioning stays outside the checker. CI installs the pinned Rust with an
+  explicit `rustup toolchain install` before it runs the checker.
 
 ## Contract
 
@@ -26,7 +39,7 @@ unless the caller sets `RUSTUP_AUTO_INSTALL` (CI does). Tests:
 | Node | 24.22.0, as `node` resolves in `kiosk/` and the repo root | `kiosk/package.json` `devEngines.runtime`, `.node-version` |
 | Package manager | pnpm 12.11.2 in `kiosk/` (Bun after MET-224) | `kiosk/package.json` `devEngines.packageManager` |
 | Vite+ | `vp` v1.1.0 on PATH in `kiosk/` | `scripts/env/check`, `.agents/setup`, `ci.yml` |
-| Playwright | a Chromium browser (`chromium-*`) in `PLAYWRIGHT_BROWSERS_PATH`, `kiosk/.browsers` or `~/.cache/ms-playwright`; required where kiosk UI checks run | — |
+| Playwright | an installed Chromium executable (`chromium-*/chrome-linux*/chrome` with `INSTALLATION_COMPLETE`) in Playwright's effective location: `PLAYWRIGHT_BROWSERS_PATH` when set (no fallback), otherwise `~/.cache/ms-playwright`; required where kiosk UI checks run | — |
 | System packages | build-essential (`cc`, `make`), pkg-config, ca-certificates, curl, python3, util-linux (`flock`), bubblewrap (`bwrap`), shellcheck, sqlite3, zstd, rsync, xz-utils (`xz`) | `.agents/setup` |
 
 System packages are checked by the command each provides, not by package
@@ -47,13 +60,27 @@ Where kiosk UI checks run (the `verify-kiosk` skill):
 | Environment | Provisioned by | Exempt from |
 | -- | -- | -- |
 | `orb` (Amp) | `.agents/setup` on orb creation | Playwright (setup downloads no browsers), layout |
-| `cursor` (Cursor Cloud) | Team environment in the Cursor dashboard: `metacomet-technologies/factory`, id `d36f659b…`, snapshot `snapshot-20261016-…`. Install script there; no repo `.cursor/environment.json`, which would override it | nothing |
+| `cursor` (Cursor Cloud) | Team environment in the Cursor dashboard: `metacomet-technologies/factory`, id `d36f659b…`, snapshot `snapshot-20261016-…`. Install script there; no repo `.cursor/environment.json`, which would override it. Its browsers in `kiosk/.browsers` count only with `PLAYWRIGHT_BROWSERS_PATH` pointing there | nothing |
 | `sandbox` (`scripts/sandbox` host) | The host it runs on (orb, Cursor or runner); CI's `sandbox` job installs its own prerequisites | Playwright, layout |
-| `ci` (GitHub Actions `kiosk` job, ubuntu-24.04) | `.github/workflows/ci.yml`: `setup-node` and npm from the pins, rustup from `rust-toolchain.toml` | Playwright, layout, bubblewrap (the `sandbox` job installs it) |
+| `ci` (GitHub Actions `kiosk` job, ubuntu-24.04) | `.github/workflows/ci.yml`: `setup-node` and npm from the pins, an explicit `rustup toolchain install` of the `rust-toolchain.toml` channel | Playwright, layout, bubblewrap (the `sandbox` job installs it) |
 | `factory-gpu` | By hand (admin), converging through MET-225 | nothing |
 | `factory-console` | By hand (admin), converging through MET-225 | nothing |
 
 Exemptions live in `EXEMPT` in `scripts/env/check`.
+
+## Checking the runners
+
+Read-only, from an administrator Mac. The checker runs as `agent` in a login
+shell, from the `/home/agent/work/factory` checkout:
+
+```sh
+for node in gpu console; do
+  echo "== factory-$node"
+  "$node-ssh" "sudo -iu agent bash -lc 'cd /home/agent/work/factory && scripts/env/check --env factory-$node'"
+done
+```
+
+Record both JSON results on MET-222.
 
 ## Prod baseline (MET-222, 2026-10-17)
 

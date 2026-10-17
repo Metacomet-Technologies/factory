@@ -9,10 +9,12 @@ usage errors. Items the environment is exempt from are reported with
 `"required": false` and never fail the run.
 
 Versions resolve the way builds do: `rustc` and `cargo` run in the repository
-root (honoring rust-toolchain.toml), `node`, `pnpm` and `vp` run in `kiosk/`.
-rustup auto-install is off unless the caller sets RUSTUP_AUTO_INSTALL.
-The output never includes environment variables; command output is cut to its
-first line.
+root (honoring rust-toolchain.toml), `node`, `pnpm` and `vp` resolve in `kiosk/`.
+The check never installs or caches anything: rustup auto-install is forced off,
+and Vite+ shims are never executed (running one writes its resolve cache and
+installs a missing pin). For a shim, `vp env current --json` names the project's
+pinned version and binary, and only that real binary runs. The output never
+includes environment variables; command output is cut to its first line.
 """
 
 import argparse
@@ -64,9 +66,8 @@ def first_line(text):
     return lines[0].strip()[:200] if lines else ""
 
 
-def run(argv, cwd):
-    env = dict(os.environ)
-    env.setdefault("RUSTUP_AUTO_INSTALL", "0")
+def run(argv, cwd, whole=False):
+    env = dict(os.environ, RUSTUP_AUTO_INSTALL="0")
     try:
         out = subprocess.run(
             argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60
@@ -75,7 +76,7 @@ def run(argv, cwd):
         return None
     if out.returncode != 0:
         return None
-    return first_line(out.stdout) or None
+    return out.stdout if whole else first_line(out.stdout) or None
 
 
 def version(text, pattern=r"(\d+\.\d+\.\d+)"):
@@ -114,17 +115,45 @@ def os_release(root):
     return fields
 
 
-def playwright_dirs(root):
-    candidates = []
-    if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
-        candidates.append(os.environ["PLAYWRIGHT_BROWSERS_PATH"])
-    candidates.append(os.path.join(KIOSK, ".browsers"))
-    candidates.append(os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright"))
-    for base in candidates:
-        found = sorted(os.path.basename(p) for p in glob.glob(os.path.join(base, "chromium-*")))
-        if found:
-            return base, found
-    return None, []
+def js_tool(tool, cwd):
+    """Return (version output or None, detail) for node/pnpm as `cwd` resolves them."""
+    path = shutil.which(tool)
+    if not path:
+        return None, None
+    real = os.path.realpath(path)
+    if os.path.basename(real) != "vp":
+        return run([path, "--version"], cwd), path
+    # Vite+ shim: ask Vite+ for the project's resolution instead of running it.
+    try:
+        current = json.loads(run([real, "env", "current", "--json"], cwd, whole=True) or "")
+    except ValueError:
+        return None, "Vite+ could not resolve the environment"
+    entry = current.get("node" if tool == "node" else "package_manager") or {}
+    if tool != "node" and entry.get("name") != tool:
+        return None, f"Vite+ resolves no {tool} here"
+    binary = entry.get("bin_path") if tool == "node" else (entry.get("bin_paths") or {}).get(tool)
+    if not entry.get("installed") or not binary or not os.access(binary, os.X_OK):
+        return None, f"Vite+ pins {entry.get('version')}, not installed"
+    return run([binary, "--version"], cwd), binary
+
+
+def playwright(root):
+    """Return (location, installed chromium executables) where Playwright looks."""
+    configured = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if configured == "0":
+        base = os.path.join(KIOSK, "node_modules", "playwright-core", ".local-browsers")
+    elif configured:
+        base = configured
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
+    found = []
+    for directory in sorted(glob.glob(os.path.join(base, "chromium-*"))):
+        if not os.path.isfile(os.path.join(directory, "INSTALLATION_COMPLETE")):
+            continue
+        for binary in glob.glob(os.path.join(directory, "chrome-linux*", "chrome")):
+            if os.path.isfile(binary) and os.access(binary, os.X_OK):
+                found.append(os.path.relpath(binary, base))
+    return base, found
 
 
 def items(root):
@@ -150,20 +179,21 @@ def items(root):
         out = run(argv, REPO)
         add(f"rust:{component}", "installed", out, component in pin["components"] and out)
 
-    node = run(["node", "--version"], KIOSK)
-    add("node", pin["node"], node, pin["node"] and version(node) == pin["node"])
-    node_root = run(["node", "--version"], REPO)
-    add("node:repo-root", pin["node-root"], node_root, pin["node-root"] and version(node_root) == pin["node-root"])
-    pnpm = run(["pnpm", "--version"], KIOSK)
-    add("pnpm", pin["pnpm"], pnpm, pin["pnpm"] and version(pnpm) == pin["pnpm"])
+    for name, tool, cwd, expected in (
+        ("node", "node", KIOSK, pin["node"]),
+        ("node:repo-root", "node", REPO, pin["node-root"]),
+        ("pnpm", "pnpm", KIOSK, pin["pnpm"]),
+    ):
+        out, detail = js_tool(tool, cwd)
+        add(name, expected, f"{out} ({detail})" if out else detail, expected and version(out) == expected)
     vp = run(["vp", "--version"], KIOSK)
     add("vite-plus", VITE_PLUS, vp, version(vp) == VITE_PLUS)
 
-    base, browsers = playwright_dirs(root)
+    base, browsers = playwright(root)
     add(
         "playwright",
-        "chromium-* browser directory",
-        f"{base}: {', '.join(browsers)}" if browsers else None,
+        "installed chromium-*/chrome-linux*/chrome",
+        f"{base}: {', '.join(browsers) or 'none installed'}",
         browsers,
     )
 

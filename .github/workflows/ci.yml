@@ -79,10 +79,9 @@ jobs:
           echo "$RUNNER_TEMP/kiosk-tools/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Check the toolchain contract (docs/environments.md)
         working-directory: .
-        # The hosted image has rustup but not the pinned toolchain; let rust-toolchain.toml install it.
-        env:
-          RUSTUP_AUTO_INSTALL: '1'
+        # The hosted image lacks the pinned Rust; provision it explicitly, since the checker is read-only.
         run: |
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" --profile minimal --component rustfmt --component clippy
           python3 -B scripts/env/test_check.py
           scripts/env/check --env ci
       - run: node --version && pnpm --version && vp --version
