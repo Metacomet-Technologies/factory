@@ -20,13 +20,27 @@ The checker never installs or caches anything:
 
 * `rustc` and `cargo` run with `RUSTUP_AUTO_INSTALL=0`, so a missing pinned
   toolchain is reported, not downloaded.
-* Vite+ shims are never executed. Running `node` or `pnpm` through a Vite+ 1.1.0
-  shim writes `~/.cache/vite-plus/resolve_cache.json` and installs a missing
-  pin. When `node` or `pnpm` on PATH links to `vp`, the checker asks
-  `vp env current --json` (in `kiosk/`, or the repo root for `.node-version`)
-  for the project's pinned version and binary, and runs only that binary. A
-  pin Vite+ has not installed fails as "not installed"; it never falls back to
-  another Node on PATH. Other `node`/`pnpm` binaries run directly.
+* The only JavaScript-toolchain programs it executes are
+  `vp env current --json` and a real Node binary with `--version`. It never
+  executes a Vite+ shim (running `node` or `pnpm` through one writes
+  `resolve_cache.json` under the Vite+ cache and installs a missing pin), pnpm
+  (MET-223 QA saw its launcher run `node` from PATH and create state under
+  `HOME`), or `vp --version`.
+* When `node` or `pnpm` on PATH links to `vp`, `vp env current --json` (in
+  `kiosk/`, or the repo root for `.node-version`) names the project's pinned
+  versions and binaries. A pin Vite+ has not installed fails as "not
+  installed"; the checker never falls back to another Node on PATH. Node's
+  version comes from running the resolved binary. pnpm's comes from the Vite+
+  store entry, which Vite+ keys by version, after checking the binary exists
+  and is executable.
+* Other installs: a `node` that is not a Vite+ shim runs with `--version`;
+  pnpm and Vite+ versions come from the nearest `package.json` named `pnpm`,
+  `vite-plus` or `vp-global` (a global Vite+ install) above the resolved
+  executable.
+* Verified 2026-10-17 in an offline Bubblewrap probe with real Vite+ 1.1.0,
+  Node 24.22.0 and pnpm 12.11.2 and fresh `HOME`, `VP_HOME` and
+  `XDG_CACHE_HOME`: no path, content or metadata changed with pins installed
+  (cold and warm Vite+ state) or missing.
 * Provisioning stays outside the checker. CI installs the pinned Rust with an
   explicit `rustup toolchain install` before it runs the checker.
 
