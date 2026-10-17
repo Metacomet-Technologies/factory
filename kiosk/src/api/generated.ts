@@ -565,6 +565,7 @@ export interface components {
       device: components["schemas"]["HostSnapshot"];
       /** Format: int64 */
       generated_at_ms: number;
+      maintenance?: null | components["schemas"]["NodeMaintenance"];
       warnings: string[];
     };
     DiskIo: {
@@ -583,6 +584,8 @@ export interface components {
       /** Format: double */
       spare_threshold_percent?: number | null;
       temperature: components["schemas"]["Metric"];
+      /** Format: int64 */
+      unsafe_shutdowns?: number | null;
     };
     ErrorDetail: {
       code: string;
@@ -722,6 +725,117 @@ export interface components {
       reboot: components["schemas"]["RebootView"];
       services: components["schemas"]["Service"][];
       ups: components["schemas"]["UpsSummary"];
+    };
+    MaintenanceProbe_AutoUpdate:
+      | ({
+          apply: boolean;
+          check: boolean;
+        } & {
+          /** @enum {string} */
+          availability: "available";
+        })
+      | {
+          /** @enum {string} */
+          availability: "unsupported";
+          error?: string | null;
+        }
+      | {
+          /** @enum {string} */
+          availability: "error";
+          error?: string | null;
+        };
+    MaintenanceProbe_HeldPackages:
+      | ({
+          packages: string[];
+        } & {
+          /** @enum {string} */
+          availability: "available";
+        })
+      | {
+          /** @enum {string} */
+          availability: "unsupported";
+          error?: string | null;
+        }
+      | {
+          /** @enum {string} */
+          availability: "error";
+          error?: string | null;
+        };
+    MaintenanceProbe_JournalSize:
+      | ({
+          /** Format: int64 */
+          value: number;
+        } & {
+          /** @enum {string} */
+          availability: "available";
+        })
+      | {
+          /** @enum {string} */
+          availability: "unsupported";
+          error?: string | null;
+        }
+      | {
+          /** @enum {string} */
+          availability: "error";
+          error?: string | null;
+        };
+    MaintenanceProbe_RebootSetting:
+      | ({
+          value: boolean;
+        } & {
+          /** @enum {string} */
+          availability: "available";
+        })
+      | {
+          /** @enum {string} */
+          availability: "unsupported";
+          error?: string | null;
+        }
+      | {
+          /** @enum {string} */
+          availability: "error";
+          error?: string | null;
+        };
+    MaintenanceProbe_UpdateCounts:
+      | ({
+          /** Format: int64 */
+          other: number;
+          /** Format: int64 */
+          security: number;
+        } & {
+          /** @enum {string} */
+          availability: "available";
+        })
+      | {
+          /** @enum {string} */
+          availability: "unsupported";
+          error?: string | null;
+        }
+      | {
+          /** @enum {string} */
+          availability: "error";
+          error?: string | null;
+        };
+    /** @enum {string} */
+    MaintenanceServiceState: "enabled" | "disabled" | "absent" | "unknown";
+    MaintenanceServices: {
+      availability: components["schemas"]["ProbeAvailability"];
+      error?: string | null;
+      fstrim_timer: components["schemas"]["MaintenanceServiceState"];
+      smartd: components["schemas"]["MaintenanceServiceState"];
+      unattended_upgrades: components["schemas"]["MaintenanceServiceState"];
+    };
+    MaintenanceSnapshot: {
+      held: components["schemas"]["MaintenanceProbe_HeldPackages"];
+      journal_bytes: components["schemas"]["MaintenanceProbe_JournalSize"];
+      /** Format: int64 */
+      observed_at_ms: number;
+      /** Format: int32 */
+      schema: number;
+      services: components["schemas"]["MaintenanceServices"];
+      tailscale_auto_update: components["schemas"]["MaintenanceProbe_AutoUpdate"];
+      unattended_auto_reboot: components["schemas"]["MaintenanceProbe_RebootSetting"];
+      updates: components["schemas"]["MaintenanceProbe_UpdateCounts"];
     };
     Metric: {
       availability: components["schemas"]["Availability"];
@@ -922,6 +1036,30 @@ export interface components {
       services: components["schemas"]["Service"][];
       tailscale_ip?: string | null;
     };
+    NodeMaintenance:
+      | (components["schemas"]["MaintenanceSnapshot"] & {
+          /** @enum {string} */
+          availability: "available";
+        })
+      | (components["schemas"]["MaintenanceSnapshot"] & {
+          /** @enum {string} */
+          availability: "stale";
+        })
+      | {
+          /** @enum {string} */
+          availability: "permission_denied";
+          error: string;
+        }
+      | {
+          /** @enum {string} */
+          availability: "unsupported";
+          error: string;
+        }
+      | {
+          /** @enum {string} */
+          availability: "error";
+          error: string;
+        };
     Pricing: {
       families: components["schemas"]["Family"][];
       warnings: string[];
@@ -930,6 +1068,8 @@ export interface components {
       family: string;
       pending_model_id?: string | null;
     };
+    /** @enum {string} */
+    ProbeAvailability: "available" | "unsupported" | "error";
     /** @enum {string} */
     ProbeKind: "icmp" | "resolve" | "tcp_connect";
     Ram: {

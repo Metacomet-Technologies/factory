@@ -13,6 +13,8 @@ The working agreement and hard-won lessons for building and operating the factor
 
 ## 2. The system
 
+- **Node maintenance:** unattended-upgrades (security only; its Automatic-Reboot stays off, the MET-75 reboot policy handles reboots), fstrim.timer, smartd and Tailscale auto-update on both nodes; journald capped at 500M (`/etc/systemd/journald.conf.d/50-factory.conf`). Monthly: `apt full-upgrade`, `nvidia-smi` on factory-gpu after kernel updates, review the Devices Maintenance card, `restore-check.sh all`. factory-console holds `linux-t2`; upgrade only with physical access.
+
 | Node | Hardware / location | Runs |
 |---|---|---|
 | factory-gpu | Ryzen 7 3700X, 32 GB, RTX 3060 12 GB, 1.8 TB at `/srv/factory`, Ubuntu 26.04. **Wired (1 Gb/s) to the main eero**, on the **CyberPower CP1000PFCLCDa UPS** (battery outlets; USB to the PC) | Ollama (127.0.0.1:11435), **meter** proxy (:11434), **factory-api** (127.0.0.1:8080, behind Tailscale Serve) with the requests/pricing DBs and kiosk static files, **factory-dispatch** timer, NUT (UPS monitor, localhost), **factory-ups-control** (127.0.0.1:8090, Serve `/control`, dedicated user and audit DB) and monthly self-test timer, Amp runner |

@@ -13,7 +13,8 @@ Factory problems post to Slack `#factory-alerts` (`C0C9N9HCRG8`) as the
   can show them too.
 
 Each message is one line followed by the dashboard link
-`https://factory-gpu.bearded-pompano.ts.net`.
+`https://factory-gpu.bearded-pompano.ts.net`, except the one-shot unclean-shutdown
+notice below, which uses the exact counter-transition text.
 
 ## Alerts
 
@@ -34,6 +35,25 @@ Each message is one line followed by the dashboard link
 | `network:throughput_low` | the 3 most recent `ok` speed tests are all below `--network-throughput-low-mbps` (500 Mb/s) in either direction, skipping failed and timed-out tests between them; clears when the newest `ok` test is at or above it both ways | warning | `net_speed_tests` |
 | `network:speedtest_failing` | the 3 most recent speed tests all failed or timed out; clears on the next `ok` test | warning | `net_speed_tests` |
 | watchdog | factory-gpu health fails 5 consecutive minutes | — | factory-console |
+
+### Unclean shutdown notice (MET-217)
+
+Each drive's first `unsafe_shutdowns` observation records a baseline without
+posting. A later increase queues one top-level message in `#factory-alerts`:
+
+```text
+factory-gpu: unclean shutdown recorded on <drive> (N → M)
+```
+
+`<drive>` is the existing stable drive ID, preferring WWN or serial over the
+kernel name. Baselines and queued notices share `alerts.json`, so a normal
+factory-api restart does not post the same increase again. A lower counter
+resets that drive's baseline without posting. Missing counters leave baselines
+unchanged. A replacement with a new ID gets a new baseline.
+
+This notice has no recovery, does not become an active health condition, and
+does not duplicate SMART failure, spare, or media-error alerts. No update,
+service, or maintenance-freshness alerts are added.
 
 The condition stays open until it is actually gone. A node offline for 3 min after
 a restart, or a service with only one failed check after a restart, therefore
@@ -65,12 +85,17 @@ factory-api logs the backup source as unavailable. Making the file readable by
 
 State lives in `/var/lib/factory-api/alerts.json` (0600, written atomically with
 fsync + rename, in the service's `StateDirectory`). It holds open alerts with
-their Slack `ts`, the last 20 cleared alerts and any recovery replies not yet
-accepted by Slack. It is not in SQLite (the cache DB is due for its MET-92
+their Slack `ts`, the last 20 cleared alerts, per-drive unsafe-shutdown baselines,
+and recovery replies or shutdown notices not yet accepted by Slack.
+It is not in SQLite (the cache DB is due for its MET-92
 rebuild). An unreadable file is moved aside as `alerts.json.corrupt-<ms>`.
 
 Failed posts retry with backoff (30 s doubling to 15 min); recovery replies give
-up after 12 attempts. Pending condition timers (5 min offline, 2 min hot) and
+up after 12 attempts, while shutdown notices keep retrying. Delivery waits until
+the local state write succeeds. Like existing alerts, an ambiguous Slack timeout
+or a crash after Slack accepts a post but before its acknowledgement is saved
+can cause a retry; the local state and Slack API do not share a transaction.
+Pending condition timers (5 min offline, 2 min hot) and
 consecutive-failure counts restart with the process.
 
 | Setting | Default |

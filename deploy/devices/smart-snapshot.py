@@ -88,6 +88,9 @@ def entry(name: str, parsed: dict | None) -> dict:
         if isinstance(nvme.get("temperature"), (int, float)):
             temperature = float(nvme["temperature"])
     body = {"kernel": name, "passed": passed if isinstance(passed, bool) else None}
+    unsafe = nvme.get("unsafe_shutdowns") if isinstance(nvme, dict) else None
+    if type(unsafe) is int and unsafe >= 0:
+        body["unsafe_shutdowns"] = unsafe
     if spare is not None:
         body["available_spare_percent"] = spare
     if threshold is not None:
