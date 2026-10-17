@@ -2,7 +2,9 @@
 set -Eeuo pipefail
 umask 0077
 root=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+check_only=0
 binary=${1:-}
+if [[ "$binary" == --check-only ]]; then check_only=1; binary=${2:-}; fi
 destination=/usr/local/bin/meter
 installed_unit=/etc/systemd/system/meter.service
 db=/srv/factory/meter/meter.db
@@ -33,6 +35,13 @@ meter_sqlite() {
 }
 counts() {
     meter_sqlite "$1" 'SELECT COUNT(*) FROM requests; SELECT COUNT(*) FROM gpu_samples;'
+}
+# v1+ telemetry tables that the in-place v2 upgrade must leave unchanged.
+telemetry_counts() {
+    meter_sqlite "$1" 'SELECT COUNT(*) FROM requests; SELECT COUNT(*) FROM gpu_samples; SELECT COUNT(*) FROM drop_episodes;'
+}
+rollup_state() {
+    meter_sqlite "$1" "SELECT job||'|'||last_id||'|'||COALESCE(verified_at_ms,'unverified') FROM rollup_state ORDER BY job;"
 }
 checkpoint_meter_db() {
     local path=$1 result sidecar
@@ -69,8 +78,8 @@ assert_meter_ready() {
 }
 # Source only the DB helpers for non-root shell regression tests.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
-[[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-meter.sh <prebuilt-binary>.'
-[[ $# -eq 1 ]] || fail 'Supply exactly one prebuilt binary path.'
+[[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-meter.sh [--check-only] <prebuilt-binary>.'
+[[ $# -eq $((1 + check_only)) ]] || fail 'Supply exactly one prebuilt binary path, optionally after --check-only.'
 trap 'printf "ERROR: meter install failed at line %s.\n" "$LINENO" >&2; rollback_hint' ERR
 
 # Read-only preflight: no accounts, DBs or deployment files are created here.
@@ -125,7 +134,9 @@ if [[ -f "$db" ]]; then
     version=$(meter_sqlite "$db" 'PRAGMA user_version;')
     case "$version" in
         0) mode=legacy; sudo -u meter "$stage/meter" migrate --legacy "$db" --check-only ;;
-        1) mode=v1 ;;
+        # v1 upgrades in place to v2 (MET-205 rollups); v2 is a rerun.
+        1) mode=v1; sudo -u meter "$stage/meter" migrate --check-only --db "$db" ;;
+        2) mode=v2; sudo -u meter "$stage/meter" migrate --check-only --db "$db" ;;
         *) fail "Unsupported meter user_version: $version" ;;
     esac
 else
@@ -145,6 +156,14 @@ for path in /srv/factory /var/backups /usr/local/bin; do
     available=$(df -Pk "$path" | awk 'NR==2 {print $4}')
     (( available * 1024 >= required )) || fail "Insufficient disk space at $path: need $required bytes."
 done
+if (( check_only )); then
+    printf 'Check only: mode=%s user_version=%s; no service, DB or deployment file changed.\n' "$mode" "${version:-none}"
+    if [[ "$mode" == v1 || "$mode" == v2 ]]; then
+        printf 'Telemetry rows (requests, gpu_samples, drop_episodes):\n%s\n' "$(telemetry_counts "$db")"
+    fi
+    trap - ERR
+    exit 0
+fi
 
 # --snapshot and restore-check local do not acquire the lock again. FD 9 stays
 # open in this parent through verification; never invoke the locking backup job.
@@ -155,6 +174,7 @@ snapshot=$(mktemp -d "/var/backups/meter/$(date -u +%Y%m%dT%H%M%S.%NZ).XXXXXX")
 printf '%s\n' "$enabled" > "$snapshot/enabled"
 printf '%s\n' "$active" > "$snapshot/active"
 printf '%s\n' "$mode" > "$snapshot/mode"
+printf '%s\n' "${version:-none}" > "$snapshot/version"
 for entry in binary unit; do
     path=$destination
     [[ "$entry" != unit ]] || path=$installed_unit
@@ -203,7 +223,7 @@ if ! id meter >/dev/null 2>&1; then
 fi
 install -d -o meter -g meter -m 0750 /srv/factory/meter
 started=$(date +%s%3N)
-if [[ "$mode" != v1 ]]; then
+if [[ "$mode" == fresh || "$mode" == legacy ]]; then
     migration_dir=$(mktemp -d /srv/factory/meter/.migrate.XXXXXX)
     chown meter:meter "$migration_dir"
     if [[ "$mode" == legacy ]]; then
@@ -213,8 +233,16 @@ if [[ "$mode" != v1 ]]; then
         sudo -u meter "$stage/meter" migrate --db "$migration_dir/meter.db"
     fi
 fi
+# A v2 rerun changes no schema; the runtime job resumes any rollup work.
+[[ "$mode" == v2 ]] || touch "$snapshot/db-changing"
+if [[ "$mode" == v1 ]]; then
+    # In place on the stopped, backed-up file: add v2 tables, then the
+    # batched backfill and raw comparison. The file is never replaced.
+    telemetry_counts "$db" > "$snapshot/telemetry-counts"
+    sudo -u meter "$stage/meter" migrate --db "$db" | tee "$snapshot/upgrade.json"
+    [[ $(telemetry_counts "$db") == "$(cat "$snapshot/telemetry-counts")" ]] || fail 'Upgrade changed telemetry row counts.'
+fi
 printf 'Migration elapsed ms: %s (mode: %s)\n' "$(( $(date +%s%3N) - started ))" "$mode"
-touch "$snapshot/db-changing"
 if [[ "$mode" == legacy ]]; then
     for suffix in -wal -shm ''; do
         [[ ! -e "$legacy$suffix" ]] || fail "Preserved v0 collision: $legacy$suffix"
@@ -222,13 +250,13 @@ if [[ "$mode" == legacy ]]; then
     done
     touch "$snapshot/legacy-preserved"
 fi
-if [[ "$mode" != v1 ]]; then
+if [[ "$mode" == fresh || "$mode" == legacy ]]; then
     [[ ! -e "$db" && ! -e "$db-wal" && ! -e "$db-shm" ]] || fail 'DB appeared before swap.'
     for suffix in -wal -shm ''; do
         if [[ -e "$migration_dir/meter.db$suffix" ]]; then mv -- "$migration_dir/meter.db$suffix" "$db$suffix"; fi
     done
 fi
-[[ $(meter_sqlite "$db" 'PRAGMA user_version;') == 1 ]] || fail 'Expected meter schema v1.'
+[[ $(meter_sqlite "$db" 'PRAGMA user_version;') == 2 ]] || fail 'Expected meter schema v2.'
 [[ $(meter_sqlite "$db" 'PRAGMA integrity_check;') == ok ]] || fail 'Meter DB integrity failed.'
 if [[ "$mode" == legacy ]]; then
     [[ $(counts "$db") == "$(cat "$snapshot/counts")" ]] || fail 'Migration row counts differ.'
@@ -265,4 +293,8 @@ if not data.get("gpus") or any(gpu.get(field) is None for gpu in data["gpus"] fo
 print(json.dumps(data, indent=2))
 '
 systemctl is-active --quiet meter.service
-printf '\nMeter v1 installed; service-user NVIDIA/Tailscale and live GPU checks passed.\n'
+printf 'Rollup state (job|last_id|verified_at_ms):\n%s\n' "$(rollup_state "$db")"
+if [[ "$mode" == v1 || "$mode" == v2 ]]; then
+    [[ $(meter_sqlite "$db" 'SELECT COUNT(*) FROM rollup_state WHERE verified_at_ms IS NOT NULL;') == 2 ]] || fail 'Meter rollups are not verified.'
+fi
+printf '\nMeter v2 installed; service-user NVIDIA/Tailscale and live GPU checks passed.\n'

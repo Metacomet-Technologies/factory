@@ -68,7 +68,7 @@ fn offline_migration_preserves_telemetry_reruns_and_restores_backup() -> Result<
     db.execute_batch(&format!("VACUUM INTO '{}'", backup.display()))?;
     data::initialize(&mut db)?;
     data::initialize(&mut db)?;
-    assert_eq!(scalar(&db, "PRAGMA user_version"), 5);
+    assert_eq!(scalar(&db, "PRAGMA user_version"), 6);
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM requests_before_v4"), 1125);
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM requests"), 0);
     assert_eq!(
@@ -99,8 +99,8 @@ fn offline_migration_preserves_telemetry_reruns_and_restores_backup() -> Result<
     );
     assert_eq!(scalar(&db, "SELECT last_after_id FROM sync_state"), 0);
     assert!(
-        data::usage_records(&db, 0, vec![])?
-            .1
+        data::usage_records(&db, 0, false, vec![])?
+            .warnings
             .iter()
             .any(|w| w.contains("rebuilding"))
     );
@@ -139,8 +139,8 @@ fn offline_migration_preserves_telemetry_reruns_and_restores_backup() -> Result<
         );
     }
     let db = data::open(&path)?;
-    assert_eq!(scalar(&db, "PRAGMA user_version"), 5);
-    db.pragma_update(None, "user_version", 6)?;
+    assert_eq!(scalar(&db, "PRAGMA user_version"), 6);
+    db.pragma_update(None, "user_version", 7)?;
     drop(db);
     assert!(data::open(&path).is_err());
     Ok(())

@@ -5,9 +5,9 @@ use axum::{Json, Router, extract::Query, routing::get};
 use factory_api::{
     AppState,
     costs::{self, Status},
-    data, fleet, now_ms,
+    data, fleet, now_ms, rollups,
 };
-use factory_db::{Category, Scope, Tracked};
+use factory_db::{Category, Scope, Tracked, rollup};
 use rusqlite::Connection;
 use shared::RequestRecord;
 use std::{
@@ -221,7 +221,7 @@ fn freeze_refuses_i64_overflow_and_stops_at_that_request() -> Result<()> {
 fn strict_types_constraints_and_only_unpriced_to_estimated() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let db = data::open(&temp.path().join("requests.db"))?;
-    assert_eq!(scalar(&db, "PRAGMA user_version"), 5);
+    assert_eq!(scalar(&db, "PRAGMA user_version"), 6);
     for table in ["request_costs", "cost_backfill"] {
         let strict: i64 = db.query_row(
             "SELECT strict FROM pragma_table_list WHERE name=?1",
@@ -517,6 +517,13 @@ async fn unpriced_rows_become_estimated_only_after_a_reference_price() -> Result
     // Without any reference price, the fill-in has nothing to apply.
     state.backfill_costs().await?;
     assert!(statuses().iter().all(|(_, _, s)| s == "unpriced"));
+    // Roll the unpriced rows up, so the fill-in must rewrite their spend buckets.
+    let rolled = state.roll_up().await?;
+    assert!(rolled.caught_up && rolled.verified, "{rolled:?}");
+    assert_eq!(
+        scalar(&db, "SELECT SUM(unpriced_requests) FROM spend_daily"),
+        8
+    );
     let before: i64 = scalar(&db, "SELECT MAX(priced_at_ms) FROM request_costs");
     price(&state, at - 1000, (3_000_000, 15_000_000), true).await?;
     // A request after confirmation is priced at ingestion.
@@ -557,6 +564,27 @@ async fn unpriced_rows_become_estimated_only_after_a_reference_price() -> Result
     let usage = state.usage("30d".into(), 0).await?;
     assert_eq!(spend(&usage, SONNET), (114_000.0 / 1e9, 228_000.0 / 1e9, 1));
     assert!(usage.warnings.is_empty(), "{:?}", usage.warnings);
+    // Rolled buckets were rewritten in the fill-in transactions: hourly and
+    // daily spend match the frozen rows exactly, and usage is unchanged once
+    // request 5 is rolled up too.
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT SUM(estimated_requests)*1000+SUM(unpriced_requests) FROM spend_daily WHERE family='Claude Sonnet'"
+        ),
+        3001
+    );
+    let rolled = state.roll_up().await?;
+    assert!(
+        rolled.caught_up && rolled.verified && rolled.rows == 1,
+        "{rolled:?}"
+    );
+    let verified = factory_api::rollups::verify(&db, 5)?;
+    assert_eq!(verified.families[SONNET].estimated_requests, 3);
+    assert_eq!(verified.families[SONNET].priced_requests, 1);
+    let after = state.usage("30d".into(), 0).await?;
+    assert_eq!(spend(&after, SONNET), spend(&usage, SONNET));
+    assert_eq!(spend(&after, GPT), spend(&usage, GPT));
     state.db.close().await?;
     server.abort();
     Ok(())
@@ -757,7 +785,7 @@ async fn v4_fixture_migrates_resumes_backfill_and_rolls_back_from_backup() -> Re
     }
     // Runtime refuses v4; only the offline command migrates, after a backup.
     let error = data::open(&path).unwrap_err().to_string();
-    assert!(error.contains("user_version=5, found 4"), "{error}");
+    assert!(error.contains("user_version=6, found 4"), "{error}");
     let backup = temp.path().join("backup.db");
     Connection::open(&path)?.execute_batch(&format!("VACUUM INTO '{}'", backup.display()))?;
     for _ in 0..2 {
@@ -770,7 +798,7 @@ async fn v4_fixture_migrates_resumes_backfill_and_rolls_back_from_backup() -> Re
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(String::from_utf8(output.stdout)?.starts_with("requests user_version=5;"));
+        assert!(String::from_utf8(output.stdout)?.starts_with("requests user_version=6;"));
     }
     let after = table_counts(&path)?;
     for (table, count) in &before {
@@ -778,7 +806,7 @@ async fn v4_fixture_migrates_resumes_backfill_and_rolls_back_from_backup() -> Re
     }
     assert_eq!((after["request_costs"], after["cost_backfill"]), (0, 2));
     let db = Connection::open(&path)?;
-    assert_eq!(scalar(&db, "PRAGMA user_version"), 5);
+    assert_eq!(scalar(&db, "PRAGMA user_version"), 6);
     assert_eq!(
         scalar(
             &db,
@@ -1024,25 +1052,45 @@ fn backfill_statement_budgets_and_query_plans() -> Result<()> {
             (f * n) as i64
         );
         if n == 20_000 {
-            // A pending fill-in adds one rewind statement per family to the next page.
+            // Rollups: four full batches within the ≤16 per-batch job budget,
+            // then the one-time verification (a reviewed scan, not traced here).
+            const ROLLUP_BATCH: usize = 16;
+            for _ in 0..4 {
+                let scope = Scope::recording();
+                let step = db.run(&scope, Category::Data, |db| rollups::batch(db, 11))?;
+                assert_eq!(step, rollups::Step::Rolled(rollup::BATCH));
+                assert!(scope.counts().data <= ROLLUP_BATCH, "{:?}", scope.counts());
+                statements.extend(scope.statements());
+            }
+            let published = db.run(&Scope::default(), Category::Setup, |db| {
+                rollups::run(db, 11, 1)
+            })?;
+            assert!(published.caught_up && published.verified);
+            // A pending fill-in adds one rewind statement per family to the next
+            // page, plus one existing-status read because its rows are rolled up.
             check.execute_batch("UPDATE cost_backfill SET unpriced_from_id=19000")?;
             let scope = Scope::recording();
             db.run(&scope, Category::Data, |db| {
                 costs::backfill_page(db, &histories, 11)
             })?;
+            assert!(
+                scope.counts().data <= page(costs::PAGE) + f + 1,
+                "{:?}",
+                scope.counts()
+            );
             statements.extend(scope.statements());
             db.run(&Scope::default(), Category::Setup, |db| {
                 db.execute_batch("ANALYZE")
             })?;
             let usage = Scope::recording();
             db.run(&usage, Category::Data, |db| {
-                data::usage_records(db, 0, vec![])
+                data::usage_records(db, 0, false, vec![])
             })?;
             statements.extend(usage.statements());
             statements.sort();
             statements.dedup();
             // State, page, cost batch, cursor, rewind and completion updates,
-            // verification, usage rows with frozen costs, and warnings.
+            // verification, rollup batches, the rolled fill-in read, and usage.
             assert!(statements.len() >= 10, "{statements:#?}");
             for sql in statements
                 .iter()
@@ -1073,70 +1121,173 @@ fn backfill_statement_budgets_and_query_plans() -> Result<()> {
                     table: "warnings",
                     reason: "complete warning set is part of the API response",
                 };
-                let (required, exceptions) =
-                    if sql.starts_with("SELECT COUNT(*) FROM requests r LEFT JOIN") {
-                        // Reviewed one-time completion check: walks requests once, probing
-                        // each classification by primary key; never on a request path.
-                        assert!(plan.iter().any(|p| p.starts_with("SCAN r")), "{plan:?}");
-                        (
-                            vec![RequiredSearch {
+                let (required, exceptions) = if sql
+                    .starts_with("SELECT COUNT(*) FROM requests r LEFT JOIN")
+                {
+                    // Reviewed one-time completion check: walks requests once, probing
+                    // each classification by primary key; never on a request path.
+                    assert!(plan.iter().any(|p| p.starts_with("SCAN r")), "{plan:?}");
+                    (
+                        vec![RequiredSearch {
+                            table: "c",
+                            index: None,
+                        }],
+                        vec![Exception {
+                            kind: ExceptionKind::BoundedRowidWalk,
+                            table: "r",
+                            reason: "one-time backfill completion verification",
+                        }],
+                    )
+                } else if sql.contains("WHERE id>?1 AND id<=?2") {
+                    (
+                        vec![RequiredSearch {
+                            table: "requests",
+                            index: None,
+                        }],
+                        vec![],
+                    )
+                } else if sql.starts_with("UPDATE cost_backfill") {
+                    (
+                        vec![RequiredSearch {
+                            table: "cost_backfill",
+                            index: Some("sqlite_autoindex_cost_backfill_1"),
+                        }],
+                        vec![],
+                    )
+                } else if sql.contains("FROM warnings") {
+                    (vec![], vec![warnings, small])
+                } else if sql.contains("FROM cost_backfill") {
+                    (vec![], vec![small])
+                } else if sql.starts_with("INSERT INTO request_costs") {
+                    // Direct VALUES write; the conflict target is the primary key.
+                    assert!(
+                        plan.iter().all(|p| p.ends_with("-ROW VALUES CLAUSE")),
+                        "{plan:?}"
+                    );
+                    continue;
+                } else if sql.starts_with("WITH d(day) AS (VALUES") {
+                    // Recompute each affected day from its hours.
+                    (
+                        vec![RequiredSearch {
+                            table: "h",
+                            index: None,
+                        }],
+                        vec![
+                            Exception {
+                                kind: ExceptionKind::SmallWholeSetRead,
+                                table: "d",
+                                reason: "affected days of one bounded batch",
+                            },
+                            Exception {
+                                kind: ExceptionKind::SmallWholeSetRead,
+                                table: "CONSTANT",
+                                reason: "affected days of one bounded batch",
+                            },
+                            Exception {
+                                kind: ExceptionKind::BoundedBatchSort,
+                                table: "",
+                                reason: "groups the hours of the affected days",
+                            },
+                        ],
+                    )
+                } else if sql.starts_with("INSERT INTO request_hourly")
+                    || sql.starts_with("INSERT INTO request_latency_hourly")
+                {
+                    // Batch aggregates as bound VALUES rows; upserts probe the key.
+                    let values = [
+                        Exception {
+                            kind: ExceptionKind::SmallWholeSetRead,
+                            table: "CONSTANT",
+                            reason: "pre-aggregated rows of one ≤5,000-row batch",
+                        },
+                        Exception {
+                            kind: ExceptionKind::SmallWholeSetRead,
+                            table: "(subquery-1)",
+                            reason: "pre-aggregated rows of one ≤5,000-row batch",
+                        },
+                    ];
+                    (vec![], values.into())
+                } else if sql.starts_with("INSERT INTO spend_hourly") {
+                    // One batch's id range, grouped per bucket/family/dimension.
+                    (
+                        vec![
+                            RequiredSearch {
                                 table: "c",
                                 index: None,
-                            }],
-                            vec![Exception {
-                                kind: ExceptionKind::BoundedRowidWalk,
+                            },
+                            RequiredSearch {
                                 table: "r",
-                                reason: "one-time backfill completion verification",
-                            }],
-                        )
-                    } else if sql.contains("FROM requests WHERE ts_ms>=?1") {
-                        // Usage rows by time range.
-                        (
-                            vec![RequiredSearch {
-                                table: "requests",
+                                index: None,
+                            },
+                        ],
+                        vec![Exception {
+                            kind: ExceptionKind::BoundedBatchSort,
+                            table: "",
+                            reason: "groups one ≤5,000-row batch",
+                        }],
+                    )
+                } else if sql.starts_with("INSERT INTO rollup_state") {
+                    assert!(plan.is_empty(), "{plan:?}");
+                    continue;
+                } else if sql.contains("FROM rollup_state WHERE job=?1") {
+                    (
+                        vec![RequiredSearch {
+                            table: "rollup_state",
+                            index: None,
+                        }],
+                        vec![],
+                    )
+                } else if sql.contains("FROM request_hourly") {
+                    // Usage rollups: hourly remainder and daily interior.
+                    (
+                        ["request_hourly", "request_daily", "rollup_state"]
+                            .map(|table| RequiredSearch { table, index: None })
+                            .into(),
+                        vec![],
+                    )
+                } else if sql.contains("FROM spend_hourly") {
+                    (
+                        ["spend_hourly", "spend_daily", "rollup_state"]
+                            .map(|table| RequiredSearch { table, index: None })
+                            .into(),
+                        vec![],
+                    )
+                } else if sql.contains("INDEXED BY requests_ts_latency") {
+                    // Exact percentiles: covering index range, no table lookups.
+                    (
+                        vec![RequiredSearch {
+                            table: "requests",
+                            index: Some("requests_ts_latency"),
+                        }],
+                        vec![],
+                    )
+                } else if sql.contains("FROM requests r LEFT JOIN request_costs c") {
+                    // Raw edge: the partial first hour by time, unrolled ids by key.
+                    (
+                        vec![
+                            RequiredSearch {
+                                table: "r",
                                 index: Some("requests_ts"),
-                            }],
-                            vec![],
-                        )
-                    } else if sql.contains("FROM request_costs WHERE request_id>=?1") {
-                        // Usage frozen costs: one primary-key range over the window's ids.
-                        (
-                            vec![RequiredSearch {
-                                table: "request_costs",
+                            },
+                            RequiredSearch {
+                                table: "c",
                                 index: None,
-                            }],
-                            vec![],
-                        )
-                    } else if sql.contains("WHERE id>?1 AND id<=?2") {
-                        (
-                            vec![RequiredSearch {
-                                table: "requests",
-                                index: None,
-                            }],
-                            vec![],
-                        )
-                    } else if sql.starts_with("UPDATE cost_backfill") {
-                        (
-                            vec![RequiredSearch {
-                                table: "cost_backfill",
-                                index: Some("sqlite_autoindex_cost_backfill_1"),
-                            }],
-                            vec![],
-                        )
-                    } else if sql.contains("FROM warnings") {
-                        (vec![], vec![warnings, small])
-                    } else if sql.contains("FROM cost_backfill") {
-                        (vec![], vec![small])
-                    } else if sql.starts_with("INSERT INTO request_costs") {
-                        // Direct VALUES write; the conflict target is the primary key.
-                        assert!(
-                            plan.iter().all(|p| p.ends_with("-ROW VALUES CLAUSE")),
-                            "{plan:?}"
-                        );
-                        continue;
-                    } else {
-                        panic!("unreviewed statement: {sql}");
-                    };
+                            },
+                        ],
+                        vec![],
+                    )
+                } else if sql.contains("FROM request_costs WHERE request_id>?1 AND request_id<=?2")
+                {
+                    (
+                        vec![RequiredSearch {
+                            table: "request_costs",
+                            index: None,
+                        }],
+                        vec![],
+                    )
+                } else {
+                    panic!("unreviewed statement: {sql}");
+                };
                 explain::validate(&plan, &required, &exceptions)
                     .map_err(|e| e.context(format!("{sql}\n{plan:?}")))?;
             }

@@ -33,13 +33,14 @@ pricing_mode=$(cat "$snapshot/pricing-mode")
 case "$pricing_mode" in legacy|fresh|v1) ;; *) fail "Invalid pricing mode: $pricing_mode" ;; esac
 [[ -f "$snapshot/requests-mode" ]] || fail 'Use the rollback script matching this snapshot; requests mode is missing.'
 requests_mode=$(cat "$snapshot/requests-mode")
-case "$requests_mode" in legacy|fresh|v4|v5) ;; *) fail "Invalid requests mode: $requests_mode" ;; esac
-# legacy/v4 snapshots record their version and a verified backup before migration.
-# Pre-MET-204 installers recorded v4 without a version when no migration ran.
+case "$requests_mode" in legacy|fresh|v4|v5|v6) ;; *) fail "Invalid requests mode: $requests_mode" ;; esac
+# legacy/v4/v5 snapshots record their version and a verified backup before migration.
+# Earlier installers recorded v4 (pre-MET-204) or v5 (pre-MET-205) without a
+# version when no migration ran; v6 never migrates the requests DB.
 restore_requests=true
 case "$requests_mode" in
-    v5) restore_requests=false ;;
-    v4) [[ -f "$snapshot/requests-version" ]] || restore_requests=false ;;
+    v6) restore_requests=false ;;
+    v4|v5) [[ -f "$snapshot/requests-version" ]] || restore_requests=false ;;
 esac
 requests_db=/var/lib/factory-api/requests.db
 for path in "$requests_db" "$requests_db-wal" "$requests_db-shm" "$snapshot/requests.db"; do

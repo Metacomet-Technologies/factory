@@ -331,6 +331,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             "spend_avoided",
             "models",
             "warnings",
+            "percentiles_approximate",
         ],
     );
     assert_eq!(
@@ -1152,15 +1153,16 @@ async fn cursor_sync_recovers_multiple_pages_and_restarts_without_false_gaps() -
 #[tokio::test]
 async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
-    // Records, frozen costs and warnings (3) plus pricing show (8); was 16
-    // with live history reads before MET-204.
-    const USAGE: usize = 11;
+    // Rollups, spend rollups, raw edge with frozen costs, latencies and
+    // warnings (5) plus one selected-model read; was 11 before MET-205 and
+    // 16 with live history reads before MET-204.
+    const USAGE: usize = 6;
     const PRICING: usize = 9;
     const CONFIRM: usize = 29;
     const NO_DATABASE: usize = 0;
-    // Includes v1–v5 manifests, legacy warning adoption, cost-backfill seeding
+    // Includes v1–v6 manifests, legacy warning adoption, cost-backfill seeding
     // (one row per family) and runner validation.
-    const REQUESTS_SETUP: usize = 116;
+    const REQUESTS_SETUP: usize = 132;
     const PRICING_SETUP: usize = 74;
     for n in [3usize, 1001] {
         let temp = tempfile::tempdir()?;
@@ -1289,6 +1291,7 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
             ("/v1/llm/usage?range=24h", USAGE),
             ("/v1/llm/usage?range=7d", USAGE),
             ("/v1/llm/usage?range=30d", USAGE),
+            ("/v1/llm/usage?range=365d", USAGE),
             ("/v1/pricing", PRICING),
             ("/v1/health", NO_DATABASE),
             ("/v1/fleet", NO_DATABASE),
@@ -1761,7 +1764,23 @@ async fn benchmark_100k() -> Result<()> {
         .await?;
     let (url, task) = serve(router(state.clone())).await;
     let client = reqwest::Client::new();
-    for path in ["/v1/llm/usage?range=30d", "/v1/pricing"] {
+    // Before the first rollup job every row is read raw; the service runs the
+    // job at startup, so the bound applies to the rolled-up steady state.
+    for (phase, path) in [
+        ("unrolled", "/v1/llm/usage?range=30d"),
+        ("rolled", "/v1/llm/usage?range=30d"),
+        ("rolled", "/v1/llm/usage?range=365d"),
+        ("rolled", "/v1/pricing"),
+    ] {
+        if phase == "rolled" && path.contains("30d") {
+            // 100k rows take one bounded run of 20 batches, then verification.
+            for _ in 0..2 {
+                let started = std::time::Instant::now();
+                let progress = state.roll_up().await?;
+                eprintln!("rollup job: {progress:?} in {:?}", started.elapsed());
+            }
+            assert!(state.roll_up().await?.verified);
+        }
         let mut samples = vec![];
         for _ in 0..40 {
             let started = std::time::Instant::now();
@@ -1792,10 +1811,12 @@ async fn benchmark_100k() -> Result<()> {
         samples.sort();
         let p95 = samples[37];
         eprintln!(
-            "100k cached rows, 40 HTTP samples, {path}: p95={p95:?}, max={:?}",
+            "100k cached rows, 40 HTTP samples, {phase} {path}: p95={p95:?}, max={:?}",
             samples[39]
         );
-        assert!(p95 < Duration::from_millis(200), "{path}: p95 {p95:?}");
+        if phase == "rolled" {
+            assert!(p95 < Duration::from_millis(200), "{path}: p95 {p95:?}");
+        }
     }
     state.db.close().await?;
     task.abort();

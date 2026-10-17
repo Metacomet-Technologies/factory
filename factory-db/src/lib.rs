@@ -4,6 +4,7 @@ pub mod explain;
 pub mod migrations;
 pub mod money;
 pub mod pool;
+pub mod rollup;
 pub mod settings;
 
 pub use counter::{Category, Counts, Scope, Tracked};

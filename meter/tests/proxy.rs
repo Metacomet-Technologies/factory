@@ -539,17 +539,38 @@ async fn arbitrary_endpoints_errors_openai_and_internal_contract() {
     };
     let mut expired = sample.clone();
     expired.ts -= 8 * 86_400_000;
-    db.send(Event::Gpu(vec![expired, sample]));
-    let history: Value = client
-        .get(format!("{proxy}/meter/gpu/history?range=30d"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(history.as_array().unwrap().len(), 1);
+    db.send(Event::Gpu(vec![expired.clone(), sample.clone()]));
+    let history_url = format!("{proxy}/meter/gpu/history?range=30d");
+    let history = |client: reqwest::Client| {
+        let url = history_url.clone();
+        async move {
+        client
+            .get(url)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+        }
+    };
+    // Expired raw samples are deleted only after a verified rollup includes them.
+    let unrolled = (history)(client.clone()).await;
+    assert_eq!(unrolled.as_array().unwrap().len(), 2);
+    assert!(unrolled.as_array().unwrap().iter().all(|p| p.get("samples").is_none()));
+    let progress = db.rollups().await.unwrap();
+    assert!(progress.caught_up && progress.verified);
+    db.send(Event::Gpu(vec![]));
+    let history = (history)(client.clone()).await;
+    // One hourly mean for the pruned day, then the raw sample: never both.
+    assert_eq!(history.as_array().unwrap().len(), 2);
+    assert_eq!(history[0]["samples"], 1);
+    assert_eq!(history[0]["ts"], expired.ts - expired.ts % 3_600_000);
     assert_eq!(history[0]["utilization_percent"], 37.0);
+    assert!(history[1].get("samples").is_none());
+    assert_eq!(history[1]["ts"], sample.ts);
+    let health: Value = client.get(format!("{proxy}/meter/health")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(health["maintenance"]["status"], "ok");
     // A storage failure must be visible without changing the upstream response.
     let connection = rusqlite::Connection::open(directory.path().join("meter.db")).unwrap();
     connection.execute_batch("CREATE TRIGGER fail_requests BEFORE INSERT ON requests BEGIN SELECT RAISE(FAIL, 'test storage failure'); END;").unwrap();
@@ -746,50 +767,55 @@ async fn endpoint_budgets_plans_settings_and_openapi() {
                 assert_eq!(settings.wal_autocheckpoint, 1000);
                 assert_eq!(settings.query_only, i64::from(index > 0));
             }
-            for (endpoint, index, exception, params) in [
-                (
-                    "/meter/health",
-                    None,
-                    Some(ExceptionKind::LimitZero),
-                    vec![],
-                ),
+            assert!(db.rollups().await.unwrap().caught_up);
+            let progress = db.rollups().await.unwrap();
+            assert!(progress.caught_up && progress.verified);
+            // Late rows: higher IDs with old timestamps land in old buckets and,
+            // until the next run, in the raw edge (never both).
+            let late: Vec<_> = (size + 1..=size + 3)
+                .map(|id| RequestRecord {
+                    id,
+                    ts: now - 200 * 86_400_000,
+                    status: 200,
+                    endpoint: "/api/chat".into(),
+                    model: Some("model".into()),
+                    prompt_eval_count: Some(13),
+                    ..Default::default()
+                })
+                .collect();
+            db.import(late, vec![]).await.unwrap();
+            db.pool
+                .write(&Scope::default(), |c| {
+                    c.execute_batch("ANALYZE")?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let total = |value: &Value| -> u64 {
+                value
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["requests"].as_u64().unwrap())
+                    .sum()
+            };
+            let mut before_rollup = None;
+            for (endpoint, budget, exception) in [
+                ("/meter/health", 1, Some(ExceptionKind::LimitZero)),
                 (
                     "/meter/requests?limit=3",
-                    None,
+                    1,
                     Some(ExceptionKind::BoundedRowidWalk),
-                    vec![rusqlite::types::Value::Integer(3)],
                 ),
-                (
-                    "/meter/requests?after_id=1&limit=3",
-                    None,
-                    None,
-                    vec![3.into(), 1.into()],
-                ),
-                (
-                    "/meter/stats?range=24h",
-                    Some("requests_ts"),
-                    None,
-                    vec![(now - 86_400_000).into()],
-                ),
-                (
-                    "/meter/stats?range=7d&model=model",
-                    Some("requests_model_ts"),
-                    None,
-                    vec![(now - 7 * 86_400_000).into(), "model".to_string().into()],
-                ),
-                (
-                    "/meter/stats?range=30d",
-                    Some("requests_ts"),
-                    None,
-                    vec![(now - 30 * 86_400_000).into()],
-                ),
-                (
-                    "/meter/gpu/history?range=7d",
-                    Some("gpu_ts"),
-                    None,
-                    vec![(now - 7 * 86_400_000).into()],
-                ),
-                ("/meter/openapi.json", None, None, vec![]),
+                ("/meter/requests?after_id=1&limit=3", 1, None),
+                ("/meter/stats?range=24h", 3, None),
+                ("/meter/stats?range=7d&model=model", 3, None),
+                ("/meter/stats?range=30d", 3, None),
+                ("/meter/stats?range=365d", 3, None),
+                ("/meter/stats?range=365d&model=model", 3, None),
+                ("/meter/gpu/history?range=7d", 1, None),
+                ("/meter/gpu/history?range=30d", 2, None),
+                ("/meter/openapi.json", 0, None),
             ] {
                 let scope = Scope::recording();
                 let mut scoped = db.clone();
@@ -809,7 +835,7 @@ async fn endpoint_budgets_plans_settings_and_openapi() {
                     .unwrap();
                 let counts = scope.counts();
                 let schema = endpoint == "/meter/openapi.json";
-                assert_eq!(counts.data, usize::from(!schema), "{endpoint}: {counts:?}");
+                assert_eq!(counts.data, budget, "{endpoint}: {counts:?}");
                 assert_eq!((counts.setup, counts.maintenance), (0, 0));
                 assert_eq!(counts.transaction, if schema { 0 } else { 2 });
                 if schema {
@@ -823,12 +849,7 @@ async fn endpoint_budgets_plans_settings_and_openapi() {
                         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
                     assert_eq!(value, golden);
                 } else if endpoint.contains("stats") {
-                    let total: u64 = value
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|r| r["requests"].as_u64().unwrap())
-                        .sum();
+                    let total = total(&value);
                     assert!(total > 0);
                     assert_eq!(
                         value
@@ -839,42 +860,126 @@ async fn endpoint_budgets_plans_settings_and_openapi() {
                             .sum::<u64>(),
                         total * 13
                     );
+                    let approximate = endpoint.contains("365d");
+                    assert!(
+                        value
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|r| r["percentiles_approximate"] == approximate)
+                    );
+                    if endpoint == "/meter/stats?range=365d" {
+                        // Every row once: rolled history plus three unrolled late rows.
+                        assert_eq!(total, size as u64 + 3);
+                        before_rollup = Some(value.clone());
+                    }
                 } else if endpoint != "/meter/health" {
                     assert!(!value.as_array().unwrap().is_empty());
                 }
                 // Small fixtures can rationally scan. Require indexed plans on
-                // the analyzed large fixture using the actual traced endpoint SQL.
+                // the analyzed large fixture for every traced endpoint statement.
                 if size > 3 && !schema {
                     let conn = rusqlite::Connection::open(&path).unwrap();
-                    let sql = scope
-                        .statements()
-                        .into_iter()
-                        .find(|sql| sql.starts_with("SELECT"))
-                        .unwrap();
-                    let table = if endpoint.contains("gpu/history") {
-                        "gpu_samples"
-                    } else {
-                        "requests"
-                    };
-                    let plan = explain::query_plan(&conn, &sql, rusqlite::params_from_iter(params))
-                        .unwrap();
-                    let required = if exception.is_none() {
-                        vec![RequiredSearch { table, index }]
-                    } else {
-                        vec![]
-                    };
-                    let exceptions = exception
-                        .map(|kind| Exception {
-                            kind,
-                            table,
-                            reason: "metadata-only LIMIT 0 or bounded newest-ID walk",
-                        })
-                        .into_iter()
-                        .collect::<Vec<_>>();
-                    explain::validate(&plan, &required, &exceptions).unwrap();
+                    for sql in scope.statements() {
+                        let mut required = Vec::new();
+                        let tables: &[(&str, Option<&str>)] = if sql.contains("FROM request_hourly")
+                        {
+                            &[("request_hourly", None), ("request_daily", None)]
+                        } else if sql.contains("FROM request_latency_hourly") {
+                            &[
+                                ("request_latency_hourly", None),
+                                ("request_latency_daily", None),
+                            ]
+                        } else if sql.contains("INDEXED BY requests_ts_latency") {
+                            &[("requests", Some("requests_ts_latency"))]
+                        } else if sql.contains("FROM gpu_hourly") {
+                            &[("gpu_hourly", None)]
+                        } else if sql.contains("FROM gpu_samples") {
+                            &[("gpu_samples", None)]
+                        } else if sql.contains("FROM requests r") {
+                            &[("r", None)]
+                        } else {
+                            &[]
+                        };
+                        if exception.is_none() {
+                            required.extend(tables.iter().map(|(table, index)| RequiredSearch {
+                                table,
+                                index: *index,
+                            }));
+                        }
+                        let count = conn.prepare(&sql).unwrap().parameter_count();
+                        let mut params: Vec<rusqlite::types::Value> =
+                            if sql.contains("LIMIT ?1") && sql.contains("id > ?2") {
+                                vec![3.into(), 1.into()]
+                            } else if sql.contains("LIMIT ?1") {
+                                vec![3.into()]
+                            } else if sql.contains("gpu_") {
+                                // The production boundary: first whole hour of raw retention.
+                                let boundary = now - 7 * 86_400_000;
+                                let boundary = boundary - boundary % 3_600_000 + 3_600_000;
+                                vec![(now - 30 * 86_400_000).into(), boundary.into()]
+                            } else {
+                                let since = now - 30 * 86_400_000 + 1;
+                                let hour = since - since % 3_600_000 + 3_600_000;
+                                vec![since.into(), hour.into()]
+                            };
+                        if count == 3 {
+                            params.push("model".to_string().into());
+                        }
+                        if count == 2 && sql.contains("model=?2") {
+                            params[1] = "model".to_string().into();
+                        }
+                        params.truncate(count);
+                        let plan =
+                            explain::query_plan(&conn, &sql, rusqlite::params_from_iter(params))
+                                .unwrap();
+                        let exceptions = exception
+                            .map(|kind| Exception {
+                                kind,
+                                table: "requests",
+                                reason: "metadata-only LIMIT 0 or bounded newest-ID walk",
+                            })
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        explain::validate(&plan, &required, &exceptions)
+                            .unwrap_or_else(|e| panic!("{endpoint}: {sql}: {e}: {plan:?}"));
+                    }
                 }
                 task.abort();
             }
+            // Rolling the late rows up moves them from the raw edge into their
+            // old buckets without changing any total.
+            assert_eq!(db.rollups().await.unwrap().rows, 3);
+            let (url, task) = serve(meter::router(AppState::new(
+                "http://127.0.0.1:1".into(),
+                db.clone(),
+            )))
+            .await;
+            let after: Value = reqwest::get(format!("{url}/meter/stats?range=365d"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let before = before_rollup.unwrap();
+            for (a, b) in after
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(before.as_array().unwrap())
+            {
+                for field in [
+                    "model",
+                    "requests",
+                    "input_tokens",
+                    "output_tokens",
+                    "p50_total_latency_ms",
+                    "p95_total_latency_ms",
+                ] {
+                    assert_eq!(a[field], b[field], "{field}");
+                }
+            }
+            task.abort();
             db.close().await.unwrap();
         }
     })

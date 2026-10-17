@@ -51,10 +51,10 @@ fn version_one_database_upgrades_to_current_and_reruns_are_noops() -> Result<()>
     )?;
     assert_eq!(version(&db)?, 1);
     data::initialize(&mut db)?;
-    assert_eq!(version(&db)?, 5);
+    assert_eq!(version(&db)?, 6);
     let upgraded = schema_fingerprint(&db)?;
     data::initialize(&mut db)?;
-    assert_eq!(version(&db)?, 5);
+    assert_eq!(version(&db)?, 6);
     assert_eq!(schema_fingerprint(&db)?, upgraded);
     assert_eq!(
         db.query_row(

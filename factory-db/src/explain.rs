@@ -25,6 +25,8 @@ pub enum ExceptionKind {
     BoundedRowidWalk,
     SmallWholeSetRead,
     ReviewedLegacySort,
+    /// GROUP BY over one bounded rollup batch or its affected buckets.
+    BoundedBatchSort,
 }
 
 pub struct Exception<'a> {
@@ -47,7 +49,10 @@ pub fn validate(
             !exception.reason.trim().is_empty(),
             "EQP exception requires a review reason"
         );
-        if !matches!(exception.kind, ExceptionKind::ReviewedLegacySort) {
+        if !matches!(
+            exception.kind,
+            ExceptionKind::ReviewedLegacySort | ExceptionKind::BoundedBatchSort
+        ) {
             ensure!(
                 !exception.table.trim().is_empty(),
                 "scan exception requires a table"
@@ -75,17 +80,20 @@ pub fn validate(
         if words.first() == Some(&"SCAN") {
             ensure!(
                 exceptions.iter().any(|exception| {
-                    !matches!(exception.kind, ExceptionKind::ReviewedLegacySort)
-                        && words.get(1) == Some(&exception.table)
+                    !matches!(
+                        exception.kind,
+                        ExceptionKind::ReviewedLegacySort | ExceptionKind::BoundedBatchSort
+                    ) && words.get(1) == Some(&exception.table)
                 }),
                 "unrestricted scan: {detail}"
             );
         }
         if detail.contains("TEMP B-TREE") {
             ensure!(
-                exceptions
-                    .iter()
-                    .any(|exception| matches!(exception.kind, ExceptionKind::ReviewedLegacySort)),
+                exceptions.iter().any(|exception| matches!(
+                    exception.kind,
+                    ExceptionKind::ReviewedLegacySort | ExceptionKind::BoundedBatchSort
+                )),
                 "temporary B-tree: {detail}"
             );
         }

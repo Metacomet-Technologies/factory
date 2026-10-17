@@ -154,8 +154,11 @@ async fn main() -> anyhow::Result<()> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         println!(
-            "requests user_version=5; replay resumes from sync_state; cost backfill pending for {requests} cached requests across {families} families"
+            "requests user_version=6; replay resumes from sync_state; {requests} cached requests across {families} cost families"
         );
+        // Batched, resumable rollup backfill; each batch commits with its checkpoint.
+        let report = factory_api::rollups::backfill(&mut db)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
     if let Some(Command::Migrate {

@@ -1311,6 +1311,11 @@ export interface components {
       /** Format: int64 */
       generated_at_ms: number;
       models: components["schemas"]["ModelUsage"][];
+      /**
+       * @description True when percentiles come from merged fixed-bucket latency histograms
+       *     (ranges beyond 30 days); otherwise they are exact nearest-rank values.
+       */
+      percentiles_approximate?: boolean;
       range: string;
       spend_avoided: components["schemas"]["SpendAvoided"][];
       totals: components["schemas"]["Totals"];
@@ -1579,7 +1584,7 @@ export interface operations {
   usage: {
     parameters: {
       query?: {
-        /** @description 24h (default), 7d, 30d */
+        /** @description 24h (default), 7d, 30d, 365d. Percentiles are exact nearest-rank values through 30d; 365d percentiles come from merged latency histograms and set percentiles_approximate. */
         range?: string;
       };
       header?: never;

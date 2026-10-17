@@ -90,11 +90,12 @@ fn range(request: &Request<Body>, gpu: bool) -> Result<(String, i64), String> {
         (_, "24h") => 24,
         (_, "7d") => 168,
         (false, "30d") => 720,
+        (false, "365d") => 8760,
         _ => {
             return Err(if gpu {
                 "range must be 1h, 24h, or 7d"
             } else {
-                "range must be 24h, 7d, or 30d"
+                "range must be 24h, 7d, 30d, or 365d"
             }
             .into());
         }
@@ -828,7 +829,7 @@ fn stream(
     );
     Sse::new(events)
 }
-#[utoipa::path(get, path="/v1/llm/usage", params(("range"=Option<String>, Query, description="24h (default), 7d, 30d")), responses((status=200, body=Usage),(status=400, body=ApiError)))]
+#[utoipa::path(get, path="/v1/llm/usage", params(("range"=Option<String>, Query, description="24h (default), 7d, 30d, 365d. Percentiles are exact nearest-rank values through 30d; 365d percentiles come from merged latency histograms and set percentiles_approximate.")), responses((status=200, body=Usage),(status=400, body=ApiError)))]
 async fn usage(state: &AppState, range: String, since: i64) -> Response {
     response(state.usage(range, since).await)
 }

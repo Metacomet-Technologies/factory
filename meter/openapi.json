@@ -12,6 +12,28 @@
         ],
         "type": "object"
       },
+      "GpuPoint": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/GpuSample"
+          },
+          {
+            "properties": {
+              "samples": {
+                "description": "Hourly rollup only: measurements averaged into this point; `ts` is the\nUTC hour start. Absent for raw samples.",
+                "format": "int64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        ],
+        "description": "A GPU history point: a raw sample, or an hourly mean when `samples` is set."
+      },
       "GpuResponse": {
         "properties": {
           "gpus": {
@@ -104,6 +126,32 @@
         ],
         "type": "object"
       },
+      "Maintenance": {
+        "description": "Last rollup job outcome. A failed or lagging job is unhealthy maintenance;\nthe next five-minute run resumes from the committed checkpoint.",
+        "properties": {
+          "checked_at_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "\"ok\", \"unhealthy\", or \"pending\" before the first rollup run.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
       "MeterHealth": {
         "allOf": [
           {
@@ -111,6 +159,18 @@
           },
           {
             "$ref": "#/components/schemas/QueueStatus"
+          },
+          {
+            "properties": {
+              "maintenance": {
+                "$ref": "#/components/schemas/Maintenance",
+                "description": "Rollup job health; status stays \"ok\" so inference health is unchanged."
+              }
+            },
+            "required": [
+              "maintenance"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -196,6 +256,10 @@
           "p95_total_latency_ms": {
             "format": "double",
             "type": "number"
+          },
+          "percentiles_approximate": {
+            "description": "True when percentiles come from merged fixed-bucket histograms (ranges\nbeyond 30 days); otherwise they are exact nearest-rank raw values.",
+            "type": "boolean"
           },
           "requests": {
             "minimum": 0,
@@ -401,7 +465,7 @@
         "operationId": "history_doc",
         "parameters": [
           {
-            "description": "24h (default), 7d, 30d; retained for 7 days",
+            "description": "24h (default), 7d, 30d, 365d. Raw samples are retained 7 days; longer ranges return hourly means (with samples) before that.",
             "in": "query",
             "name": "range",
             "required": false,
@@ -416,7 +480,7 @@
               "application/json": {
                 "schema": {
                   "items": {
-                    "$ref": "#/components/schemas/GpuSample"
+                    "$ref": "#/components/schemas/GpuPoint"
                   },
                   "type": "array"
                 }
@@ -564,7 +628,7 @@
         "operationId": "stats_doc",
         "parameters": [
           {
-            "description": "24h (default), 7d, 30d",
+            "description": "24h (default), 7d, 30d, 365d. Percentiles are exact through 30d and approximate (flagged) beyond.",
             "in": "query",
             "name": "range",
             "required": false,
