@@ -1,0 +1,1349 @@
+# Devices ingestion (phase 2 design)
+
+Status: design for review, MET-196 Build items 1–4. Nothing in this document is
+implemented or deployed. No credential, tailnet policy, firewall, or Serve
+configuration has been created or changed. Implementation (items 5–8) starts
+only after Devon approves the "Open for Devon" list at the end.
+
+Phase 1 ([devices.md](devices.md)) collects factory-gpu inside factory-api.
+Phase 2 lets another factory node, first factory-console, push its own host
+telemetry to that same factory-api. factory-console is an Ubuntu T2 MacBook
+(kiosk, backups, overflow Amp runner, watchdog). It has no NVIDIA GPU, and its
+sensors must be discovered, not assumed.
+
+The base types are the merged phase-1 types in `factory-api/src/devices.rs`
+(`Metric`, `Availability`, `HostIdentity`, `Cpu`, `Ram`, `Filesystem`, `Drive`,
+`SmartStatus`, `DiskIo`, `Network`, `Cooling`, `BackupView`, `ClockView`,
+`RebootView`, `CollectorHealth`) and the storage in `devices_history.rs` and
+`devices_schema.sql`. Everything below is additive within API v1.
+
+## 1. Contract
+
+### Endpoint
+
+```
+POST /v1/devices/{device_id}/samples
+Host: factory-gpu.bearded-pompano.ts.net   (existing Serve "/" mount -> 127.0.0.1:8080)
+Authorization: Bearer fdv1_<43 base64url characters>
+Content-Type: application/json
+```
+
+One request carries exactly one sample. There is no batch form in v1. Any
+other method on this path returns 405 with `Allow: POST`. The existing
+`GET /v1/devices`, `GET /v1/devices/{device_id}` and
+`GET /v1/devices/{device_id}/history` stay GET-only.
+
+`device_id` matches `^[a-z0-9][a-z0-9-]{0,62}$`. `factory-gpu` is reserved for
+the local phase-1 collector and can never be written through this endpoint.
+
+### Schema version
+
+`schema_version` is a required integer. The only accepted value is `1`. The
+server lists what it accepts in `accepted_schema_versions` on the
+`unsupported_schema_version` error.
+
+- Additive changes stay at version 1: a new optional field, a new array
+  element type the server can ignore, or a new `Availability` value. Clients
+  must not depend on new fields being honored by an older server.
+- The server ignores unknown fields at any level, except the server-owned
+  names listed below, which it rejects. A newer client therefore works
+  against an older server.
+- A breaking change (removed or renamed field, changed unit, changed meaning)
+  needs version 2. The server then accepts both 1 and 2 for at least 30 days.
+  Version 1 is deprecated by documenting the end date here and returning a
+  `Deprecation` response header with that date. Removal returns
+  `unsupported_schema_version`.
+
+### Sample fields
+
+All timestamps are integer Unix milliseconds UTC. All integers fit in
+2^53 − 1 so JavaScript clients do not lose precision.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `schema_version` | integer | yes | `1` |
+| `device_id` | string | yes | Must equal the path id and the credential's device |
+| `agent.name` | string ≤ 64 | yes | `factory-devices-agent` |
+| `agent.version` | string ≤ 64 | yes | Agent semver, informational |
+| `session_id` | UUID string | yes | Random v4 per agent process start |
+| `seq` | integer ≥ 1 | yes | Per-session sample counter, see below |
+| `observed_at_ms` | integer | yes | Device wall clock when the fast sample was taken |
+| `sent_at_ms` | integer | yes | Device wall clock when this attempt was sent |
+| `identity` | `HostIdentity` | yes | `hostname`, `boot_id` (Linux `/proc/sys/kernel/random/boot_id`), `uptime` |
+| `cpu` | `Cpu` | yes | All six metrics |
+| `memory` | `Ram` | yes | All five metrics |
+| `filesystems` | `Filesystem[]` | yes, may be `[]` | Same exclusions as phase 1 |
+| `drives` | `Drive[]` | yes, may be `[]` | Same shape as phase 1 |
+| `disk_io` | `DiskIo` | yes | Summed over whole disks, skipping the phase-1 virtual names (`loop`, `ram`, `fd`, `dm-`, `md`, `zram`, `nbd`, `sr`, `zd`) |
+| `network` | `Network` | yes | Summed over every interface except `lo`, as phase 1 |
+| `cooling` | `Cooling` | yes | Temperatures and fans |
+| `maintenance.backup` | `BackupView` | yes | From the node's published backup status |
+| `maintenance.clock` | `ClockView` | yes | From `timedatectl`-equivalent sync state |
+| `maintenance.reboot` | `RebootView` | yes | Read-only copy of the published reboot status (MET-178), mapped field for field; reboot policy is not changed |
+| `collector` | `CollectorHealth` | yes | The agent's own fast/slow schedule and probe state |
+
+Server-owned fields are rejected with `400 server_owned_field` when present:
+`health`, `gpus`, `generated_at_ms`, `warnings`, `maintenance.services`,
+`maintenance.ups`. The server computes health with the phase-1 rules, takes
+services from fleet, and reports `gpus: []` and UPS `unsupported` for every
+remote device. A remote device cannot claim a GPU.
+
+Every `Metric` object has all five fields: `value`, `unit`, `observed_at_ms`,
+`availability`, `detail`. `detail` is a string ≤ 256 bytes or null.
+
+- `availability` is one of `available`, `unsupported`, `permission_denied`,
+  `stale`, `error`.
+- `available` requires a finite numeric `value`. Every other availability
+  requires `value: null`. Either mismatch is `400 invalid_metric`. Unknown is
+  never sent as zero.
+- A rate has no value on the first sample of a session. Send it as
+  `stale` with detail `waiting for a second sample`, as phase 1 does.
+- A counter reset or `boot_id` change restarts rate windows. A gap over 30 s
+  between fast samples also restarts them. Rates are not interpolated.
+- `observed_at_ms` on a metric may be older than the sample's
+  `observed_at_ms` (slow inventory), never newer.
+
+`SmartStatus`, `BackupView`, `ClockView` and `RebootView` follow the same rule:
+fields other than `availability`, `observed_at_ms` and `detail` are null unless
+`availability` is `available`.
+
+### Units and ranges
+
+Each field has one fixed unit string. A different unit is
+`400 invalid_metric`. Values outside the range are `400 invalid_metric`.
+
+| Unit | Fields | Range |
+| --- | --- | --- |
+| `%` | `cpu.utilization`, `cpu.iowait`, filesystem `used_percent`, `inodes_used_percent`, drive `available_spare` | 0–100 |
+| `load` | `cpu.load1`, `load5`, `load15` | ≥ 0 |
+| `C` | `cpu.temperature`, drive `temperature`, `cooling.temperatures[]` | −40 to 150 |
+| `bytes` | `memory.*`, filesystem `size`, `used`, drive `size` | integer, 0 to 2^53 − 1 |
+| `B/s` | `disk_io.*`, `network.*` | ≥ 0, ≤ 1e12 |
+| `s` | `identity.uptime` | ≥ 0 |
+| `count` | drive `media_errors` | integer ≥ 0 |
+| `rpm` | `cooling.fans[]` | 0–30000 |
+
+`spare_threshold_percent` is 0–100 or null.
+
+### Identity
+
+- **Device:** `device_id`. It is bound to the credential (section 3), not to
+  `hostname`. `hostname` is display and collision evidence only.
+- **Boot:** `identity.boot_id`. A change means the host rebooted.
+- **Session:** `session_id`. A new UUID on every agent process start.
+- **Sample:** `(device_id, session_id, seq)`. `seq` starts at 1 and increases
+  by exactly 1 for each fast sample the agent creates. A retry resends the
+  same sample with the same `session_id`, `seq` and `observed_at_ms`; only
+  `sent_at_ms` changes. A gap in `seq` means the agent dropped samples from
+  its buffer.
+
+### Capability and error states
+
+The agent reports what it found on this host, per source:
+
+| Situation | Encoding |
+| --- | --- |
+| Sensor or tool does not exist (no fan controller, no `smartctl`, T2 drive SMART not exposed) | `unsupported`, detail names the missing piece |
+| Source exists but the unprivileged agent cannot read it | `permission_denied` |
+| Read failed, timed out or parsed badly | `error` |
+| Value not yet computable (first rate) | `stale` |
+| Whole category empty and unsupported | `[]` plus `cooling.fans_availability: "unsupported"` or `collector.smart: "unsupported"` |
+
+Phase-1 health rules apply: unsupported fans and unsupported SMART do not
+fail the host, and unsupported SMART is not shown as healthy.
+
+### Freshness
+
+The server stamps `received_at_ms` from its own clock when the request is
+accepted. Two ages are shown for a remote device:
+
+- **Transport age:** `now − last received_at_ms`.
+- **Collection age:** `now − observed_at_ms` of the current sample.
+
+The device is `stale` when transport age exceeds 45 s (three 15 s intervals)
+or collection age exceeds 45 s. A remote device that has not sent a sample
+since factory-api started is `unknown` with warning `waiting for first sample`.
+The next accepted fresh sample recovers it. A connected agent is not proof
+any metric is healthy.
+
+`GET /v1/devices/{device_id}` gains one additive nullable field on
+`DeviceView`, `ingest`. It is null for `factory-gpu`:
+
+```json
+{
+  "source": "remote",
+  "last_received_at_ms": 1792238415180,
+  "session_id": "6f1c2a9e-3b4d-4e8f-9a01-2c3d4e5f6a7b",
+  "seq": 42,
+  "agent_version": "0.1.0",
+  "clock_skew_ms": -180,
+  "dropped_samples": 0,
+  "identity_conflict": false
+}
+```
+
+`clock_skew_ms` is `sent_at_ms − received_at_ms` of the last accepted request.
+It includes network latency.
+
+### Limits
+
+| Limit | Value | Error |
+| --- | --- | --- |
+| Request body | 64 KiB | 413 `body_too_large` |
+| `filesystems` | 32 | 400 `too_many_items` |
+| `drives` | 16 | 400 `too_many_items` |
+| `cooling.temperatures` | 64 | 400 `too_many_items` |
+| `cooling.fans` | 16 | 400 `too_many_items` |
+| Any id, name, source, mountpoint, model, fstype | 256 bytes | 400 `invalid_field` |
+| Any `detail` or `error` string | 256 bytes | 400 `invalid_field` |
+| Duplicate filesystem or drive `id`, or duplicate sensor `name` | none allowed | 400 `invalid_field` |
+| Requests per device | 4 per second, burst 8 | 429 `rate_limited` with `Retry-After` |
+| Request time | 4 s (existing layer) | 504 `request_timeout` |
+
+The complete example below is about 4.5 KiB compact.
+
+### Example: complete sample
+
+All sources available.
+
+```json
+{
+  "schema_version": 1,
+  "device_id": "factory-console",
+  "agent": {
+    "name": "factory-devices-agent",
+    "version": "0.1.0"
+  },
+  "session_id": "6f1c2a9e-3b4d-4e8f-9a01-2c3d4e5f6a7b",
+  "seq": 42,
+  "observed_at_ms": 1792238415000,
+  "sent_at_ms": 1792238415180,
+  "identity": {
+    "hostname": "factory-console",
+    "boot_id": "0b7d6c1e-8f2a-4c3b-9d4e-5f6a7b8c9d0e",
+    "uptime": {
+      "value": 86400.5,
+      "unit": "s",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "cpu": {
+    "utilization": {
+      "value": 12.5,
+      "unit": "%",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "iowait": {
+      "value": 0.4,
+      "unit": "%",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "load1": {
+      "value": 0.62,
+      "unit": "load",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "load5": {
+      "value": 0.55,
+      "unit": "load",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "load15": {
+      "value": 0.48,
+      "unit": "load",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "temperature": {
+      "value": 51.0,
+      "unit": "C",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "memory": {
+    "total": {
+      "value": 17179869184,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "available": {
+      "value": 11811160064,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "used": {
+      "value": 5368709120,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "swap_total": {
+      "value": 2147483648,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "swap_free": {
+      "value": 2147483648,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "filesystems": [
+    {
+      "id": "/dev/nvme0n1p2\t/",
+      "source": "/dev/nvme0n1p2",
+      "mountpoint": "/",
+      "fstype": "ext4",
+      "size": {
+        "value": 245107195904,
+        "unit": "bytes",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "used": {
+        "value": 61276798976,
+        "unit": "bytes",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "used_percent": {
+        "value": 25.0,
+        "unit": "%",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "inodes_used_percent": {
+        "value": 4.1,
+        "unit": "%",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      }
+    }
+  ],
+  "drives": [
+    {
+      "id": "eui.0025388b91b2c3d4",
+      "kernel": "nvme0n1",
+      "model": "APPLE SSD AP0256M",
+      "size": {
+        "value": 251000193024,
+        "unit": "bytes",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "smart": {
+        "availability": "available",
+        "passed": true,
+        "observed_at_ms": 1792238300000,
+        "detail": null
+      },
+      "available_spare": {
+        "value": 100,
+        "unit": "%",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "spare_threshold_percent": 2,
+      "media_errors": {
+        "value": 0,
+        "unit": "count",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "media_critical": false,
+      "temperature": {
+        "value": 38,
+        "unit": "C",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      }
+    }
+  ],
+  "disk_io": {
+    "read": {
+      "value": 4096.0,
+      "unit": "B/s",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "write": {
+      "value": 81920.0,
+      "unit": "B/s",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "network": {
+    "rx": {
+      "value": 2048.0,
+      "unit": "B/s",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "tx": {
+      "value": 1536.0,
+      "unit": "B/s",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "cooling": {
+    "temperatures": [
+      {
+        "name": "coretemp Package id 0",
+        "metric": {
+          "value": 51.0,
+          "unit": "C",
+          "observed_at_ms": 1792238415000,
+          "availability": "available",
+          "detail": null
+        }
+      }
+    ],
+    "fans": [
+      {
+        "name": "applesmc fan1",
+        "metric": {
+          "value": 1800,
+          "unit": "rpm",
+          "observed_at_ms": 1792238415000,
+          "availability": "available",
+          "detail": null
+        }
+      }
+    ],
+    "temperatures_availability": "available",
+    "fans_availability": "available"
+  },
+  "maintenance": {
+    "backup": {
+      "availability": "available",
+      "last_success_ms": 1792234815000,
+      "last_attempt_ms": 1792234815000,
+      "error": null,
+      "observed_at_ms": 1792238415000
+    },
+    "clock": {
+      "synchronized": true,
+      "availability": "available",
+      "observed_at_ms": 1792238415000
+    },
+    "reboot": {
+      "availability": "available",
+      "reboot_required": false,
+      "pending_since_ms": null,
+      "days_pending": 0,
+      "consecutive_skips": 0,
+      "alert_due": false,
+      "last_check_ms": 1792231215000,
+      "last_decision": "not-needed",
+      "detail": null
+    }
+  },
+  "collector": {
+    "fast_interval_ms": 15000,
+    "slow_interval_ms": 300000,
+    "last_fast_ms": 1792238415000,
+    "last_slow_ms": 1792238300000,
+    "fast_ok": true,
+    "filesystems": "available",
+    "drives": "available",
+    "smart": "available",
+    "detail": null
+  }
+}
+```
+
+### Example: partial sample
+
+First sample after an agent restart. Rates wait for a second sample, the
+filesystem capacity probe failed, backup status could not be parsed, and the
+reboot status file is unreadable. Good readings stay.
+
+```json
+{
+  "schema_version": 1,
+  "device_id": "factory-console",
+  "agent": {
+    "name": "factory-devices-agent",
+    "version": "0.1.0"
+  },
+  "session_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+  "seq": 1,
+  "observed_at_ms": 1792238415000,
+  "sent_at_ms": 1792238415095,
+  "identity": {
+    "hostname": "factory-console",
+    "boot_id": "0b7d6c1e-8f2a-4c3b-9d4e-5f6a7b8c9d0e",
+    "uptime": {
+      "value": 31.2,
+      "unit": "s",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "cpu": {
+    "utilization": {
+      "value": null,
+      "unit": "%",
+      "observed_at_ms": 1792238415000,
+      "availability": "stale",
+      "detail": "waiting for a second sample"
+    },
+    "iowait": {
+      "value": null,
+      "unit": "%",
+      "observed_at_ms": 1792238415000,
+      "availability": "stale",
+      "detail": "waiting for a second sample"
+    },
+    "load1": {
+      "value": 0.62,
+      "unit": "load",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "load5": {
+      "value": 0.55,
+      "unit": "load",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "load15": {
+      "value": 0.48,
+      "unit": "load",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "temperature": {
+      "value": 51.0,
+      "unit": "C",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "memory": {
+    "total": {
+      "value": 17179869184,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "available": {
+      "value": 11811160064,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "used": {
+      "value": 5368709120,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "swap_total": {
+      "value": 2147483648,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "swap_free": {
+      "value": 2147483648,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "filesystems": [
+    {
+      "id": "/dev/nvme0n1p2\t/",
+      "source": "/dev/nvme0n1p2",
+      "mountpoint": "/",
+      "fstype": "ext4",
+      "size": {
+        "value": null,
+        "unit": "bytes",
+        "observed_at_ms": 1792238415000,
+        "availability": "error",
+        "detail": "capacity missing"
+      },
+      "used": {
+        "value": null,
+        "unit": "bytes",
+        "observed_at_ms": 1792238415000,
+        "availability": "error",
+        "detail": "capacity missing"
+      },
+      "used_percent": {
+        "value": null,
+        "unit": "%",
+        "observed_at_ms": 1792238415000,
+        "availability": "error",
+        "detail": "capacity missing"
+      },
+      "inodes_used_percent": {
+        "value": null,
+        "unit": "%",
+        "observed_at_ms": 1792238415000,
+        "availability": "error",
+        "detail": "capacity missing"
+      }
+    }
+  ],
+  "drives": [
+    {
+      "id": "eui.0025388b91b2c3d4",
+      "kernel": "nvme0n1",
+      "model": "APPLE SSD AP0256M",
+      "size": {
+        "value": 251000193024,
+        "unit": "bytes",
+        "observed_at_ms": 1792238415000,
+        "availability": "available",
+        "detail": null
+      },
+      "smart": {
+        "availability": "available",
+        "passed": true,
+        "observed_at_ms": 1792238415000,
+        "detail": null
+      },
+      "available_spare": {
+        "value": 100,
+        "unit": "%",
+        "observed_at_ms": 1792238415000,
+        "availability": "available",
+        "detail": null
+      },
+      "spare_threshold_percent": 2,
+      "media_errors": {
+        "value": 0,
+        "unit": "count",
+        "observed_at_ms": 1792238415000,
+        "availability": "available",
+        "detail": null
+      },
+      "media_critical": false,
+      "temperature": {
+        "value": 38,
+        "unit": "C",
+        "observed_at_ms": 1792238415000,
+        "availability": "available",
+        "detail": null
+      }
+    }
+  ],
+  "disk_io": {
+    "read": {
+      "value": null,
+      "unit": "B/s",
+      "observed_at_ms": 1792238415000,
+      "availability": "stale",
+      "detail": "waiting for a second sample"
+    },
+    "write": {
+      "value": null,
+      "unit": "B/s",
+      "observed_at_ms": 1792238415000,
+      "availability": "stale",
+      "detail": "waiting for a second sample"
+    }
+  },
+  "network": {
+    "rx": {
+      "value": null,
+      "unit": "B/s",
+      "observed_at_ms": 1792238415000,
+      "availability": "stale",
+      "detail": "waiting for a second sample"
+    },
+    "tx": {
+      "value": null,
+      "unit": "B/s",
+      "observed_at_ms": 1792238415000,
+      "availability": "stale",
+      "detail": "waiting for a second sample"
+    }
+  },
+  "cooling": {
+    "temperatures": [
+      {
+        "name": "coretemp Package id 0",
+        "metric": {
+          "value": 51.0,
+          "unit": "C",
+          "observed_at_ms": 1792238415000,
+          "availability": "available",
+          "detail": null
+        }
+      }
+    ],
+    "fans": [
+      {
+        "name": "applesmc fan1",
+        "metric": {
+          "value": 1800,
+          "unit": "rpm",
+          "observed_at_ms": 1792238415000,
+          "availability": "available",
+          "detail": null
+        }
+      }
+    ],
+    "temperatures_availability": "available",
+    "fans_availability": "available"
+  },
+  "maintenance": {
+    "backup": {
+      "availability": "error",
+      "last_success_ms": null,
+      "last_attempt_ms": null,
+      "error": null,
+      "observed_at_ms": 1792238415000
+    },
+    "clock": {
+      "synchronized": true,
+      "availability": "available",
+      "observed_at_ms": 1792238415000
+    },
+    "reboot": {
+      "availability": "permission_denied",
+      "reboot_required": null,
+      "pending_since_ms": null,
+      "days_pending": null,
+      "consecutive_skips": null,
+      "alert_due": null,
+      "last_check_ms": null,
+      "last_decision": null,
+      "detail": "status file unreadable"
+    }
+  },
+  "collector": {
+    "fast_interval_ms": 15000,
+    "slow_interval_ms": 300000,
+    "last_fast_ms": 1792238415000,
+    "last_slow_ms": 1792238415000,
+    "fast_ok": true,
+    "filesystems": "error",
+    "drives": "available",
+    "smart": "available",
+    "detail": "filesystem capacity probe failed"
+  }
+}
+```
+
+### Example: unsupported SMART and sensors
+
+The next sample on a host where `smartctl` is absent and no CPU temperature
+or fan sensor is exposed, which is possible on the T2 MacBook. It is not
+evidence the drive is healthy.
+
+```json
+{
+  "schema_version": 1,
+  "device_id": "factory-console",
+  "agent": {
+    "name": "factory-devices-agent",
+    "version": "0.1.0"
+  },
+  "session_id": "6f1c2a9e-3b4d-4e8f-9a01-2c3d4e5f6a7b",
+  "seq": 43,
+  "observed_at_ms": 1792238430000,
+  "sent_at_ms": 1792238430210,
+  "identity": {
+    "hostname": "factory-console",
+    "boot_id": "0b7d6c1e-8f2a-4c3b-9d4e-5f6a7b8c9d0e",
+    "uptime": {
+      "value": 86400.5,
+      "unit": "s",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "cpu": {
+    "utilization": {
+      "value": 12.5,
+      "unit": "%",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "iowait": {
+      "value": 0.4,
+      "unit": "%",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "load1": {
+      "value": 0.62,
+      "unit": "load",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "load5": {
+      "value": 0.55,
+      "unit": "load",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "load15": {
+      "value": 0.48,
+      "unit": "load",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "temperature": {
+      "value": null,
+      "unit": "C",
+      "observed_at_ms": 1792238430000,
+      "availability": "unsupported",
+      "detail": "no CPU temperature sensor"
+    }
+  },
+  "memory": {
+    "total": {
+      "value": 17179869184,
+      "unit": "bytes",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "available": {
+      "value": 11811160064,
+      "unit": "bytes",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "used": {
+      "value": 5368709120,
+      "unit": "bytes",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "swap_total": {
+      "value": 2147483648,
+      "unit": "bytes",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "swap_free": {
+      "value": 2147483648,
+      "unit": "bytes",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "filesystems": [
+    {
+      "id": "/dev/nvme0n1p2\t/",
+      "source": "/dev/nvme0n1p2",
+      "mountpoint": "/",
+      "fstype": "ext4",
+      "size": {
+        "value": 245107195904,
+        "unit": "bytes",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "used": {
+        "value": 61276798976,
+        "unit": "bytes",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "used_percent": {
+        "value": 25.0,
+        "unit": "%",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "inodes_used_percent": {
+        "value": 4.1,
+        "unit": "%",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      }
+    }
+  ],
+  "drives": [
+    {
+      "id": "eui.0025388b91b2c3d4",
+      "kernel": "nvme0n1",
+      "model": "APPLE SSD AP0256M",
+      "size": {
+        "value": 251000193024,
+        "unit": "bytes",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "smart": {
+        "availability": "unsupported",
+        "passed": null,
+        "observed_at_ms": 1792238300000,
+        "detail": "smartctl absent"
+      },
+      "available_spare": {
+        "value": null,
+        "unit": "%",
+        "observed_at_ms": 1792238300000,
+        "availability": "unsupported",
+        "detail": "SMART unsupported"
+      },
+      "spare_threshold_percent": null,
+      "media_errors": {
+        "value": null,
+        "unit": "count",
+        "observed_at_ms": 1792238300000,
+        "availability": "unsupported",
+        "detail": "SMART unsupported"
+      },
+      "media_critical": false,
+      "temperature": {
+        "value": null,
+        "unit": "C",
+        "observed_at_ms": 1792238300000,
+        "availability": "unsupported",
+        "detail": "SMART unsupported"
+      }
+    }
+  ],
+  "disk_io": {
+    "read": {
+      "value": 4096.0,
+      "unit": "B/s",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "write": {
+      "value": 81920.0,
+      "unit": "B/s",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "network": {
+    "rx": {
+      "value": 2048.0,
+      "unit": "B/s",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "tx": {
+      "value": 1536.0,
+      "unit": "B/s",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "cooling": {
+    "temperatures": [],
+    "fans": [],
+    "temperatures_availability": "unsupported",
+    "fans_availability": "unsupported"
+  },
+  "maintenance": {
+    "backup": {
+      "availability": "available",
+      "last_success_ms": 1792234815000,
+      "last_attempt_ms": 1792234815000,
+      "error": null,
+      "observed_at_ms": 1792238430000
+    },
+    "clock": {
+      "synchronized": true,
+      "availability": "available",
+      "observed_at_ms": 1792238430000
+    },
+    "reboot": {
+      "availability": "available",
+      "reboot_required": false,
+      "pending_since_ms": null,
+      "days_pending": 0,
+      "consecutive_skips": 0,
+      "alert_due": false,
+      "last_check_ms": 1792231215000,
+      "last_decision": "not-needed",
+      "detail": null
+    }
+  },
+  "collector": {
+    "fast_interval_ms": 15000,
+    "slow_interval_ms": 300000,
+    "last_fast_ms": 1792238430000,
+    "last_slow_ms": 1792238300000,
+    "fast_ok": true,
+    "filesystems": "available",
+    "drives": "available",
+    "smart": "unsupported",
+    "detail": null
+  }
+}
+```
+
+### Responses
+
+Success is always 200. Both results tell the agent to drop the sample from
+its buffer.
+
+Stored:
+
+```json
+{
+  "result": "stored",
+  "device_id": "factory-console",
+  "session_id": "6f1c2a9e-3b4d-4e8f-9a01-2c3d4e5f6a7b",
+  "seq": 42,
+  "observed_at_ms": 1792238415000,
+  "received_at_ms": 1792238415180,
+  "current_updated": true,
+  "history_written": true,
+  "reason": null
+}
+```
+
+Ignored (duplicate retry, older than current, or too old):
+
+```json
+{
+  "result": "ignored",
+  "device_id": "factory-console",
+  "session_id": "6f1c2a9e-3b4d-4e8f-9a01-2c3d4e5f6a7b",
+  "seq": 42,
+  "observed_at_ms": 1792238415000,
+  "received_at_ms": 1792238416020,
+  "current_updated": false,
+  "history_written": false,
+  "reason": "duplicate"
+}
+```
+
+`reason` is null on `stored`. On `ignored` it is `duplicate`, `out_of_order`
+or `expired`. A `stored` result with `history_written: false` has reason
+`clock_unsynchronized`: the server clock or the sample's
+`maintenance.clock.synchronized` is not true.
+
+Errors use the existing `ApiError` body. Some add fields, which is additive.
+
+```json
+{ "error": { "code": "unsupported_schema_version", "message": "schema_version 2 is not accepted" }, "accepted_schema_versions": [1] }
+```
+
+```json
+{ "error": { "code": "invalid_metric", "message": "cpu.utilization: value 140 outside 0-100", "field": "cpu.utilization" } }
+```
+
+| Status | Code | Retry? | When |
+| --- | --- | --- | --- |
+| 400 | `invalid_json` | no | Body is not JSON, or a number is not representable (`NaN`, `Infinity`, `1e400` are not valid JSON numbers or overflow) |
+| 400 | `unsupported_schema_version` | no | `schema_version` missing or not accepted |
+| 400 | `missing_field` | no | A required field is absent |
+| 400 | `invalid_field` | no | Wrong type, bad id format, string too long, duplicate id |
+| 400 | `invalid_metric` | no | Unit, range, or availability/value mismatch |
+| 400 | `too_many_items` | no | An array exceeds its limit |
+| 400 | `server_owned_field` | no | A server-owned field is present |
+| 400 | `clock_skew` | no | `observed_at_ms` or `sent_at_ms` more than 60 s ahead of `received_at_ms` |
+| 400 | `device_mismatch` | no | Body `device_id` differs from the path |
+| 401 | `unauthorized` | after operator fix | Missing, malformed, unknown or revoked credential. Includes `WWW-Authenticate: Bearer` |
+| 403 | `forbidden_device` | after operator fix | Valid credential for another device, or path is `factory-gpu` |
+| 403 | `cross_site` | no | `Sec-Fetch-Site: cross-site`, as the other write endpoints |
+| 405 | `method_not_allowed` | no | Not POST |
+| 413 | `body_too_large` | no | Over 64 KiB |
+| 415 | `unsupported_media_type` | no | Not `application/json` |
+| 429 | `rate_limited` | yes, after `Retry-After` | Over the per-device rate |
+| 500 | `internal` | yes | Storage failure; nothing was half-written |
+| 503 | `shutting_down`, `overloaded` | yes | Existing behavior |
+| 504 | `request_timeout` | yes | Existing 4 s layer |
+
+Checks run in this order, so a client without a valid credential learns
+nothing about payload rules: method, `Sec-Fetch-Site`, credential (401),
+device binding (403), content type (415), body size (413), JSON and schema
+(400), rate (429).
+
+### Agent upload rules
+
+- Take a fast sample every 15 s and slow inventory every 5 min, as phase 1.
+- Send samples oldest first, one request at a time.
+- Per-attempt timeout 5 s.
+- Retry network errors, 429, 500, 503 and 504 with full-jitter exponential
+  backoff from 1 s to 60 s, and honor `Retry-After`.
+- Never retry 400, 405, 413 or 415. Log the code and field, and drop that
+  sample.
+- On 401 or 403, keep sampling into the buffer, retry every 5 min, and log
+  once per hour. The operator fixes the credential.
+- Buffer at most 240 samples (1 hour) in memory. When full, drop the oldest
+  and count it. No disk buffer in v1.
+- Logs never contain the token, the `Authorization` header, or the request
+  body.
+
+## 2. Ingest semantics
+
+The server keeps, per remote device, the current sample and the last accepted
+sample identity `(observed_at_ms, session_id, seq)` in memory, and history
+in the existing `device_samples` / `device_rollup_hourly` tables, keyed
+`(device_id, ts_ms)` with `ts_ms = observed_at_ms`. No schema change is needed
+for history. Retention and rollups are the phase-1 rules, applied per device.
+
+Rules, in order, after validation:
+
+1. **Future timestamps.** `observed_at_ms` or `sent_at_ms` more than 60 s
+   after `received_at_ms` is rejected with `400 clock_skew`. The agent drops it.
+2. **Expired.** `observed_at_ms` more than 2 h before `received_at_ms` is
+   `ignored / expired`. This bounds a replay of old captured requests.
+3. **Duplicate.** Same `session_id` as the last accepted sample and
+   `seq ≤` its `seq` is `ignored / duplicate`. Retries after a lost
+   response land here.
+4. **Out of order.** `observed_at_ms ≤` the last accepted `observed_at_ms`
+   (any session) is `ignored / out_of_order`. Current state never moves
+   backward. Every sample that passes this rule becomes the last accepted
+   sample, whether or not it updates current.
+5. **Current state.** Otherwise, the sample replaces the current sample only
+   if it is fresh: `received_at_ms − observed_at_ms ≤ 45 s`. A drained backlog
+   sample older than that writes history but leaves current alone, so the
+   view stays honestly stale until a fresh sample arrives.
+6. **History.** The existing `devices_history::record` inserts the row only if
+   `ts_ms` is newer than the device's latest row, inside one immediate
+   transaction with the hourly rollup. Rules 3 and 4 already drop retries;
+   this check is the backstop, so a replayed sample cannot add a second row. History is skipped while the server clock or the
+   sample's `maintenance.clock.synchronized` is not true, the same as phase 1.
+7. **SSE.** A sample that updates current publishes the existing
+   `devices.sample` event with that device's view. Clients tell devices apart
+   by `device.device_id`. History-only writes publish nothing. A null event
+   payload keeps its phase-1 meaning (the factory-gpu collector failed); a
+   remote device never produces one.
+
+Situations:
+
+- **Clock skew.** The agent's wall clock is trusted for ordering within ±60 s
+  in the future. Skew is shown as `ingest.clock_skew_ms`. Larger forward skew
+  is rejected. Backward skew shows as collection age, and the device goes
+  stale.
+- **Device clock steps backward** (NTP correction). Samples older than the
+  current one are `out_of_order` until the clock passes the last accepted
+  time. The view goes stale in the meantime. History is never rewritten.
+- **Retries and interrupted uploads.** The server commits current and history
+  before responding. A lost response leads to a retry that returns
+  `ignored / duplicate` or `out_of_order`. The agent drops it either way.
+- **Agent restart.** New `session_id`, `seq` restarts at 1. Accepted, because
+  ordering is by `observed_at_ms`, not `seq`.
+- **Host reboot.** New `boot_id` and new session. Rate windows restart on the
+  agent. The server shows the boot change through `identity.boot_id` and uptime.
+- **Server restart.** Current state is lost and the device is `unknown` until
+  the next fresh sample (≤ 15 s). The last accepted `observed_at_ms` is
+  reloaded from the device's latest `device_samples` row (one indexed query
+  per device), so a retry after restart is still `out_of_order`, and rule 6
+  still blocks a duplicate row. Session and `seq` are unknown until the first
+  sample, so the first retry reports `out_of_order`, not `duplicate`.
+- **Sequence gaps.** A gap within one session adds to `ingest.dropped_samples`.
+  It is not an error.
+- **Identity collision.** Two agents sending under one device credential
+  produce interleaved sessions or `boot_id`s. If the current session changes
+  more than twice in 5 minutes, or two sessions alternate, the server sets
+  `ingest.identity_conflict: true` and adds a warning naming both hostnames.
+  It keeps accepting by the ordering rules, because blocking would hide the
+  real host too. The fix is to revoke and reissue the credential.
+- **Stale clients.** An agent with an old schema version gets
+  `unsupported_schema_version` with the accepted list. An agent that stops
+  sending makes the device stale after 45 s. It never shows its last frame as
+  live.
+- **Unknown devices.** A device exists only when a credential is enrolled for
+  it. No credential matches an unenrolled id, so it gets 401 or 403. There is
+  no auto-registration.
+- **factory-gpu.** Always 403 on ingest. The phase-1 local flow is unchanged and
+  keeps working when no remote device is enrolled or the console is broken.
+
+Rejected values: nonfinite numbers cannot be encoded in JSON and fail as
+`invalid_json`. Out-of-range or wrong-unit values, value/availability
+mismatches, oversized strings, too many items and duplicate ids are rejected
+as a whole request. The server never stores part of a rejected sample.
+
+## 3. Authentication and transport
+
+Facts checked on 2026-10-17:
+
+- [Serve, Identity headers](https://tailscale.com/kb/1312/serve#identity-headers):
+  "These identity headers are not populated for traffic originating from
+  tagged devices." Serve strips incoming identity headers to prevent spoofing.
+  Both factory nodes are `tag:factory`, so `Tailscale-User-Login` cannot
+  identify factory-console.
+- [Serve, App capabilities header](https://tailscale.com/kb/1312/serve):
+  Serve can forward granted app capabilities, for users or tagged nodes, in a
+  `Tailscale-App-Capabilities` header when started with `--accept-app-caps`.
+  It strips an incoming copy. The page says this needs Tailscale v1.92 or later.
+- [Application capabilities](https://tailscale.com/kb/1537/grants-app-capabilities):
+  capabilities are set in the `app` map of a grant, named `{domain}/{path}`.
+- [Tags](https://tailscale.com/kb/1068/tags): "Applying a tag to a device
+  removes any user-based authentication."
+- Serve's documentation recommends the backend listen only on localhost,
+  because a direct caller could forge headers. factory-api already listens on
+  127.0.0.1:8080, but any local process on factory-gpu, including `agent`, can
+  still reach it directly. A header-only identity check is not enough there.
+  `docs/ups.md` solves the same problem for ups-control with a socket UID check.
+- Existing policy (docs/PLAYBOOK.md): factory → factory on tcp
+  22/443/3389/11434. factory-console already reaches
+  `https://factory-gpu.bearded-pompano.ts.net` on 443. The Serve `/` mount
+  proxies every path to 127.0.0.1:8080.
+
+Tailnet reachability alone is not authorization. Admin devices and both
+factory nodes can reach Serve today, and factory-api write endpoints have no
+authentication beyond the cross-site check.
+
+| Option | Security | Ops cost | Rotation / revocation | Network change |
+| --- | --- | --- | --- | --- |
+| **A. Serve + per-device bearer token** | Token is 256 random bits, sent only inside tailnet TLS. Server stores only its SHA-256 next to the one `device_id` it may write. A stolen console token can only write console telemetry. Works the same for Serve and loopback callers. | One secret per device in 1Password. One root-owned file on each side. | Add a second hash for the device, roll the console, remove the old hash. Revoke by deleting the line; factory-api rereads the file when its mtime changes. | None. Existing 443 and Serve `/` mount. |
+| B. Serve + Tailscale app capability | No secret. Identity comes from the tailnet. Needs a per-device tag or host-specific grant, because a grant to `tag:factory` would also cover factory-gpu. A local process on factory-gpu can forge the header on 127.0.0.1:8080, so it also needs the ups-control UID check. | Policy grant, Serve restart with `--accept-app-caps`, Tailscale ≥ 1.92 on factory-gpu (not verified), header parsing incl. RFC 2047 encoding. | Edit the grant. Immediate, but every change is a tailnet policy change. | Policy change. Possibly a new tag on factory-console, which touches every existing `tag:factory` rule. |
+| C. mTLS | Strong device keys. | Serve terminates TLS, and its documentation describes no client-certificate passthrough (not verified beyond the page). Needs a second TLS listener and a private CA. | Reissue certs, CRL or short lifetimes. | New port on factory-gpu, policy and ufw change. |
+| D. factory-gpu pulls over SSH as `factory-backup` | No write endpoint. The server chooses the host, so identity is bound by Tailscale SSH. | Couples telemetry to the backup principal. SSH every 15 s or a long-lived stream. Console must publish a file readable by `factory-backup`. Adds a second transport beside the API the ticket asks for. | Stop the timer or edit the SSH rule. | None for SSH, but widens how the backup principal is used. |
+| E. Tailscale user identity headers | Not available for tagged nodes (see above). | — | — | Rejected. |
+
+**Recommendation: A.** It needs no new port, no second API on the console, no
+tailnet policy change, no Serve change and no Tailscale version dependency.
+The credential is bound to exactly one `device_id` on the server, so the
+console cannot write as factory-gpu or as another device. The plaintext token
+exists only on the console and in 1Password; factory-gpu holds only the hash.
+It also covers the loopback bypass that header-based options must handle
+separately. Option B is the upgrade path if Devon prefers no shared secret and
+accepts a policy change.
+
+Design of A:
+
+- Token format `fdv1_` plus 43 base64url characters (32 random bytes). The
+  prefix makes leaks greppable.
+- factory-gpu: `/etc/factory-api/device-tokens`, `root:factory-api` mode 0640.
+  One line per credential: `<device_id> <sha256 hex> <label>`. At most two
+  lines per device. factory-api compares hashes in constant time. A missing
+  file means no remote devices and the endpoint returns 401.
+- factory-console: the agent runs as a dedicated unprivileged user and gets
+  the token through systemd `LoadCredential=` from
+  `/etc/factory-devices-agent/token`, `root:root` mode 0600. The token is
+  never in the unit file, environment, arguments or logs.
+- Enrollment: Devon generates the token on the Mac, stores it in 1Password,
+  and pipes it to the installers with `op read … | ssh … sudo …`, as
+  `docs/alerts.md` does for the Slack token. The gpu installer writes only
+  the hash.
+- Agents never put the token in a URL. Failed authentication is logged on the
+  server with the claimed device and remote address, never the token.
+
+## 4. Review list
+
+### Decided
+
+- One endpoint, `POST /v1/devices/{device_id}/samples`, one sample per
+  request, on the existing factory-api behind the existing Serve mount.
+- `schema_version: 1`, additive rules, unknown fields ignored, server-owned
+  fields rejected, 30-day overlap for any future version 2.
+- Payload reuses phase-1 types and units. No GPU or UPS for remote devices.
+  Health is computed by the server.
+- Sample identity `(device_id, session_id, seq)`. Ordering and dedupe by
+  `observed_at_ms` against the last accepted sample, which is also the
+  history key.
+- `received_at_ms` is server-stamped. Stale after 45 s. `unknown` until the
+  first sample after a server restart.
+- Current state never moves backward. History never gets a duplicate row and
+  is written only when both clocks are synchronized.
+- Limits: 64 KiB body, item caps, 4 req/s per device, ±60 s future skew,
+  2 h expiry, 240-sample in-memory agent buffer.
+- `factory-gpu` cannot be written remotely. The phase-1 local flow is
+  unchanged.
+- Recommended authentication: per-device bearer token, hash-only on the
+  server.
+- Battery, T2-specific sensors and anything not in phase-1 types are out of
+  v1.0. They can be added later as optional fields.
+
+### Open for Devon
+
+1. Approve option A (per-device bearer token over the existing Serve mount),
+   or choose B (app capability grant, policy change) instead.
+2. Principals: the enrolled device id `factory-console`, and a new
+   unprivileged system user on factory-console for the agent
+   (proposed `factory-devices`). Any group memberships it needs to read the
+   published backup and reboot status there.
+3. Credential handling: token generated by Devon, stored in 1Password at a
+   name you choose (proposed `op://Factory/factory-console devices token/credential`),
+   piped to both installers. Hash-only file on factory-gpu, mode 0600 token
+   file on the console.
+4. Rotation and revocation: overlap of two hashes per device and reread on
+   mtime change, without restarting factory-api. Is a rotation schedule
+   wanted, or rotate only on suspicion?
+5. Confirm no tailnet policy, ufw or Serve change is wanted. Option A needs
+   none.
+6. SMART on factory-console: the agent is unprivileged and phase 1 relies on a
+   root helper. Reuse the phase-1 allowlisted read-only SMART helper on the
+   console (root timer, group-readable snapshot), or accept `unsupported` /
+   `permission_denied`?
+7. Alerts: phase 1 has `devices:telemetry` and temperature, filesystem and
+   SMART alerts for factory-gpu. Should the same keys fire for
+   factory-console, or should the console only show on Devices? Fleet
+   already alerts when the node itself is offline.
+8. Thresholds: stale after 45 s for remote devices (phase 1 uses 30 s locally).
+
+### Not verified
+
+- The Tailscale version on factory-gpu, and whether app capabilities work for
+  tagged nodes in this tailnet (only matters for option B).
+- That Serve forwards the `Authorization` header unchanged. The docs list only
+  identity and capability headers as stripped. The sandbox Serve emulation
+  must test it before implementation is accepted.
+- Which sensors factory-console exposes (CPU temperature, fans, T2 NVMe SMART,
+  battery). The examples show plausible values, not readings from the host.
