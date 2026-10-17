@@ -99,9 +99,14 @@ those stale numbers.
 
 The SMART helper in `deploy/devices/` is allowlisted and read-only. It writes
 `/var/lib/factory-devices/smart.json` by rename, mode 0640, and does not put
-secrets, file contents, environment, or process arguments in the file. The
-directory is mode 0750. The installer does not run `smartctl` and does not
-install packages.
+secrets, file contents, environment, or process arguments in the file. When
+the `factory-api` group exists, the directory is `root:factory-api` mode
+`2750`, and re-running the installer keeps that group and the setgid bit.
+The helper runs as root and chowns the temporary file to `factory-api` before
+rename, so the live snapshot stays `root:factory-api` mode `0640` after every
+timer run. A failed chown removes the temporary file, leaves the previous
+snapshot in place, and fails the service. The installer does not run
+`smartctl` and does not install packages.
 
 Reboot status at `/var/lib/factory-reboot/status.json` is root mode 0600 under
 a mode 0700 directory. factory-api cannot read it. A missing or unreadable
@@ -142,7 +147,10 @@ Unprivileged tests use `DEVICES_TEST_ROOT` and do not call host `smartctl`.
 1. `GET /v1/devices` lists `factory-gpu`.
 2. CPU rate is null on the first sample and a number on the next.
 3. Memory, filesystem, and uptime values are null where the probe failed, never `0` standing in for unknown.
-4. SMART is `permission_denied` until the timer writes a snapshot, or `unsupported` when `smartctl` is absent.
+4. SMART is `permission_denied` until the timer writes a snapshot, or `unsupported`
+   when `smartctl` is absent. After that write, the directory is mode `2750`,
+   `smart.json` is group `factory-api`, and `collector.smart` is `available`
+   or `unsupported`.
 5. Reboot age stays `permission_denied` until a group-readable status file exists.
 6. `GET /v1/devices/factory-gpu/history?range=30d` returns 400.
 7. The kiosk links `/devices` and `/devices/factory-gpu` render, and a stream disconnect stops showing the last sample as live.
