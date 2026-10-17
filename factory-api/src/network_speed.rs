@@ -208,23 +208,25 @@ async fn measure(config: &SpeedConfig, partial: &Mutex<Partial>) -> Result<[i64;
     }
     Ok(rates)
 }
-/// Bursts run while the direction transfers. The burst in flight when it ends
-/// is kept, so even a sub-second transfer gets one loaded sample.
+/// Bursts run while the direction transfers. The first starts at once and the
+/// one in flight when it ends is kept, so even a direction that fails at once
+/// gets one loaded sample.
 async fn loaded_latency(
     target: IpAddr,
     done: &CancellationToken,
     direction: Direction,
     partial: &Mutex<Partial>,
 ) {
-    let mut timer = tokio::time::interval(LOADED_SPACING);
+    let mut timer =
+        tokio::time::interval_at(tokio::time::Instant::now() + LOADED_SPACING, LOADED_SPACING);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        if let Ok(burst) = network::ping(target).await {
+            update(partial, |p| p.loaded[direction as usize].push(burst));
+        }
         tokio::select! { biased;
             _ = done.cancelled() => return,
             _ = timer.tick() => (),
-        }
-        if let Ok(burst) = network::ping(target).await {
-            update(partial, |p| p.loaded[direction as usize].push(burst));
         }
     }
 }
@@ -547,8 +549,12 @@ mod tests {
         else {
             unreachable!()
         };
-        // 1000 bytes over at least 600 ms is at most 13.3 kb/s.
-        assert!(download_bps <= 13_334 && upload_bps <= 13_334, "{slow:?}");
+        // Upload timing spans the server's whole 600 ms sleep: at most 13.3 kb/s.
+        assert!(upload_bps <= 13_334, "{slow:?}");
+        // Download timing starts when the headers reach the runner, after the
+        // fixture's sleep has begun. Only the 500 ms slow_request bound that
+        // stopped the direction holds: under 16 kb/s.
+        assert!(download_bps < 16_000, "{slow:?}");
 
         let Verdict::Failed(error) = &fail.verdict else {
             panic!("{fail:?}")

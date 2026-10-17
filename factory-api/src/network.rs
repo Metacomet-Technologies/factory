@@ -34,6 +34,8 @@ pub enum Layer {
     Tailnet,
 }
 impl Layer {
+    /// Registry order. `layer as usize` indexes per-layer arrays.
+    pub const ALL: [Self; 4] = [Self::Lan, Self::Wan, Self::Dns, Self::Tailnet];
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Lan => "lan",
@@ -43,9 +45,7 @@ impl Layer {
         }
     }
     pub fn parse(text: &str) -> Option<Self> {
-        [Self::Lan, Self::Wan, Self::Dns, Self::Tailnet]
-            .into_iter()
-            .find(|layer| layer.as_str() == text)
+        Self::ALL.into_iter().find(|layer| layer.as_str() == text)
     }
 }
 
@@ -256,6 +256,10 @@ pub struct NetworkTarget {
 pub struct NetworkStatus {
     pub generated_at_ms: i64,
     pub device_id: String,
+    /// The stored open event's state; healthy when none is open.
+    pub state: crate::network_diagnosis::LinkState,
+    /// The open degraded or down episode; null when healthy.
+    pub open_event: Option<crate::network_history::NetworkEvent>,
     /// Registry order: lan, wan, dns, tailnet.
     pub targets: Vec<NetworkTarget>,
     /// Null before the first stored test.

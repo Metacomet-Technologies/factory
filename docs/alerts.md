@@ -28,6 +28,11 @@ Each message is one line followed by the dashboard link
 | `clock:ntp` | `timedatectl show -p NTPSynchronized --value` is `no` | warning | timedatectl |
 | `dispatch:timer` | `factory-dispatch.timer` last fired more than 5 min ago, or never | warning | `systemctl show --timestamp=unix -p LastTriggerUSec` |
 | `usage:stale` | a collected tool's `observed_at_ms` is older than 45 min (3 collector intervals) | warning | `/var/lib/factory-usage/usage.json` |
+| `network:lan_down` | the open network event is `Down { lan }` and started 2 min or more ago; clears when that event closes or changes | critical | `net_events` (network collector, 30 s) |
+| `network:wan_down` | the same for `Down { wan }`, an ISP outage | critical | `net_events` |
+| `network:dns_down` | the same for `Down { dns }` | critical | `net_events` |
+| `network:throughput_low` | the 3 most recent `ok` speed tests are all below `--network-throughput-low-mbps` (500 Mb/s) in either direction, skipping failed and timed-out tests between them; clears when the newest `ok` test is at or above it both ways | warning | `net_speed_tests` |
+| `network:speedtest_failing` | the 3 most recent speed tests all failed or timed out; clears on the next `ok` test | warning | `net_speed_tests` |
 | watchdog | factory-gpu health fails 5 consecutive minutes | — | factory-console |
 
 The condition stays open until it is actually gone. A node offline for 3 min after
@@ -35,6 +40,16 @@ a restart, or a service with only one failed check after a restart, therefore
 **keeps** an existing alert open rather than clearing it. Services on a node that
 Tailscale reports offline are covered by the node alert. Info alerts (pricing)
 clear without a recovery message once the pending selection is confirmed.
+
+Network alerts follow `net_events` and `net_speed_tests` (docs/network.md). The
+2 minutes count from the stored event's start, not from an engine timer. A down
+event younger than 2 min holds a down alert that is already open. A factory-api
+restart during an outage closes the event as `restart`, and the first tick after
+it is only degraded by loss, so the down alert clears and opens again 2 min after
+the next down tick. A newest `ok` test that is still slow, or a newest test that
+still failed, holds its open alert. A tailnet outage has no alert in v1.
+
+Production note: the one manual production test measured 404 Mb/s upload against the 500 Mb/s default, so throughput_low will open unless the threshold is set at deploy.
 
 **Unavailable sources.** A source that cannot be read (missing file, permission
 denied, `tailscale status` failing, a stale GPU sample, a timer that is not
@@ -65,6 +80,7 @@ consecutive-failure counts restart with the process.
 | `FACTORY_ALERTS_SLACK_URL` / `--alerts-slack-url` | `https://slack.com/api` |
 | `FACTORY_API_ALERTS_STATE` / `--alerts-state` | `/var/lib/factory-api/alerts.json` |
 | `FACTORY_API_BACKUP_STATUS` / `--backup-status` | `/var/lib/factory-backup/status.json` |
+| `FACTORY_API_NETWORK_THROUGHPUT_LOW_MBPS` / `--network-throughput-low-mbps` | `500` (1 to 100000) |
 
 The token is never logged. Startup logs only `alerts: Slack token loaded; posting
 enabled` or `alerts: Slack token absent; ...`.

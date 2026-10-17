@@ -180,6 +180,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v1/network/events": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Degraded and down episodes, newest first by started_ms then id, the open one included. */
+    get: operations["network_events"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v1/network/history": {
     parameters: {
       query?: never;
@@ -741,6 +758,45 @@ export interface components {
       rx: components["schemas"]["Metric"];
       tx: components["schemas"]["Metric"];
     };
+    /** @enum {string} */
+    NetworkEndReason: "recovered" | "changed" | "restart";
+    /**
+     * @description One degraded or down episode. `state`, `layer` and `reason` are the link
+     *     state it records; it is never healthy.
+     */
+    NetworkEvent: components["schemas"]["NetworkLinkState"] & {
+      end_reason?: null | components["schemas"]["NetworkEndReason"];
+      /**
+       * Format: int64
+       * @description Null while the episode is open.
+       */
+      ended_ms?: number | null;
+      /** Format: int64 */
+      id: number;
+      /**
+       * Format: double
+       * @description Peaks over the faulting layer's chosen targets while the episode lasted.
+       */
+      peak_loss_percent?: number | null;
+      /** Format: int64 */
+      peak_mdev_us?: number | null;
+      /**
+       * Format: int64
+       * @description Average RTT; null while nothing came back.
+       */
+      peak_rtt_us?: number | null;
+      /** Format: int64 */
+      started_ms: number;
+    };
+    NetworkEvents: {
+      /** @description Newest first: started_ms descending, then id descending. */
+      events: components["schemas"]["NetworkEvent"][];
+      /**
+       * Format: int64
+       * @description The last event's id, to pass as `before` for the next page; null on the last page.
+       */
+      next_before?: number | null;
+    };
     NetworkHistory: {
       range: string;
       resolution: components["schemas"]["Resolution"];
@@ -754,6 +810,22 @@ export interface components {
       /** Format: double */
       min?: number | null;
     };
+    NetworkLinkState:
+      | {
+          /** @enum {string} */
+          state: "healthy";
+        }
+      | {
+          layer: components["schemas"]["Layer"];
+          reason: components["schemas"]["NetworkReason"];
+          /** @enum {string} */
+          state: "degraded";
+        }
+      | {
+          layer: components["schemas"]["Layer"];
+          /** @enum {string} */
+          state: "down";
+        };
     NetworkPoint: {
       /**
        * Format: double
@@ -769,6 +841,8 @@ export interface components {
       /** Format: int64 */
       ts_ms: number;
     };
+    /** @enum {string} */
+    NetworkReason: "loss" | "latency" | "jitter";
     NetworkSeries: {
       layer: components["schemas"]["Layer"];
       points: components["schemas"]["NetworkPoint"][];
@@ -826,6 +900,9 @@ export interface components {
       /** Format: int64 */
       generated_at_ms: number;
       latest_speed_test?: null | components["schemas"]["NetworkSpeedTest"];
+      open_event?: null | components["schemas"]["NetworkEvent"];
+      /** @description The stored open event's state; healthy when none is open. */
+      state: components["schemas"]["NetworkLinkState"];
       /** @description Registry order: lan, wan, dns, tailnet. */
       targets: components["schemas"]["NetworkTarget"][];
       warnings: string[];
@@ -1404,6 +1481,46 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["NetworkStatus"];
+        };
+      };
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  network_events: {
+    parameters: {
+      query?: {
+        /** @description 1–200; default 50 */
+        limit?: number;
+        /** @description Exclusive cursor: an event id, such as the previous page's next_before. The page continues after that event in (started_ms, id) descending order; an unknown id is a 400. */
+        before?: number;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["NetworkEvents"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
         };
       };
       500: {

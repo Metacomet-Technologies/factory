@@ -1,6 +1,7 @@
-//! Network storage. Raw bursts and their hourly rollups commit together;
-//! throughput tests are one row each.
+//! Network storage. Raw bursts, their hourly rollups and the diagnosed
+//! episodes commit together; throughput tests are one row each.
 use crate::network::{Burst, Layer, Rtt, Sample};
+use crate::network_diagnosis::{self, Diagnosis, LinkState, Peak, Reason, Thresholds};
 use crate::network_speed::{SpeedTest, Verdict};
 use crate::ups_history::{DAY_MS, HOUR_MS};
 use anyhow::{Result, ensure};
@@ -20,6 +21,16 @@ impl ToSql for Layer {
 impl FromSql for Layer {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         Layer::parse(value.as_str()?).ok_or(FromSqlError::InvalidType)
+    }
+}
+impl ToSql for Reason {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+impl FromSql for Reason {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        Reason::parse(value.as_str()?).ok_or(FromSqlError::InvalidType)
     }
 }
 
@@ -93,11 +104,17 @@ pub const HOUR_SQL: &str = concat!(
     columns!(),
     " FROM net_probe_samples WHERE device_id=?1 AND target=?2 AND ts_ms>=?3 AND ts_ms<?4"
 );
-/// Write one tick in one transaction: the raw rows plus every touched hourly
-/// rollup, recomputed from that hour's raw rows (at most 120 per target).
-/// Replaying an already committed tick is a no-op; an older or conflicting
-/// timestamp for a target is rejected.
-pub fn record(db: &mut Connection, device_id: &str, samples: &[Sample]) -> Result<()> {
+/// Write one tick in one transaction: the raw rows, every touched hourly
+/// rollup, recomputed from that hour's raw rows (at most 120 per target), and
+/// the episode the tick's diagnosis implies. Returns the events it closed or
+/// opened. Replaying an already committed tick is a no-op; an older or
+/// conflicting timestamp for a target is rejected.
+pub fn record(
+    db: &mut Connection,
+    device_id: &str,
+    samples: &[Sample],
+    diagnosed: Option<&Diagnosed>,
+) -> Result<Vec<NetworkEvent>> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     {
         let mut previous = tx.prepare_cached(PREVIOUS_SQL)?;
@@ -160,8 +177,293 @@ pub fn record(db: &mut Connection, device_id: &str, samples: &[Sample]) -> Resul
             ])?;
         }
     }
+    let events = match diagnosed {
+        Some(tick) => record_event(&tx, device_id, tick)?,
+        None => Vec::new(),
+    };
     tx.commit()?;
-    Ok(())
+    Ok(events)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkEndReason {
+    Recovered,
+    /// The link moved straight to another degraded or down state.
+    Changed,
+    /// factory-api restarted, so the episode's continuity is unknown.
+    Restart,
+}
+impl NetworkEndReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recovered => "recovered",
+            Self::Changed => "changed",
+            Self::Restart => "restart",
+        }
+    }
+}
+impl ToSql for NetworkEndReason {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+impl FromSql for NetworkEndReason {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let text = value.as_str()?;
+        [Self::Recovered, Self::Changed, Self::Restart]
+            .into_iter()
+            .find(|r| r.as_str() == text)
+            .ok_or(FromSqlError::InvalidType)
+    }
+}
+/// One degraded or down episode. `state`, `layer` and `reason` are the link
+/// state it records; it is never healthy.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct NetworkEvent {
+    pub id: i64,
+    #[serde(flatten)]
+    pub state: LinkState,
+    pub started_ms: i64,
+    /// Null while the episode is open.
+    pub ended_ms: Option<i64>,
+    pub end_reason: Option<NetworkEndReason>,
+    /// Peaks over the faulting layer's chosen targets while the episode lasted.
+    pub peak_loss_percent: Option<f64>,
+    /// Average RTT; null while nothing came back.
+    pub peak_rtt_us: Option<i64>,
+    pub peak_mdev_us: Option<i64>,
+}
+macro_rules! event_columns {
+    () => {
+        "id,state,layer,reason,started_ms,ended_ms,end_reason,peak_loss_percent,peak_rtt_us,peak_mdev_us"
+    };
+}
+fn event(row: &Row<'_>) -> rusqlite::Result<NetworkEvent> {
+    let layer = row.get(2)?;
+    let state = match (row.get_ref(1)?.as_str()?, row.get(3)?) {
+        ("down", None) => LinkState::Down { layer },
+        ("degraded", Some(reason)) => LinkState::Degraded { layer, reason },
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                "network event state and reason disagree".into(),
+            ));
+        }
+    };
+    Ok(NetworkEvent {
+        id: row.get(0)?,
+        state,
+        started_ms: row.get(4)?,
+        ended_ms: row.get(5)?,
+        end_reason: row.get(6)?,
+        peak_loss_percent: row.get(7)?,
+        peak_rtt_us: row.get(8)?,
+        peak_mdev_us: row.get(9)?,
+    })
+}
+
+/// What one tick concluded about the link, stored with its samples.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Diagnosed {
+    pub ts_ms: i64,
+    pub state: LinkState,
+    /// The faulting layer's peak this tick; null when healthy.
+    pub peak: Option<Peak>,
+    /// Set until this process commits a tick: an open event that started
+    /// earlier was left by a previous process.
+    pub restart: bool,
+}
+/// The network collector's memory between ticks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Collector {
+    diagnosis: Diagnosis,
+    committed: bool,
+}
+impl Collector {
+    /// Diagnose one tick. Streaks follow the probes even when the write then
+    /// fails; the next committed tick reconciles the stored episode.
+    pub fn diagnose(
+        &mut self,
+        ts_ms: i64,
+        samples: &[Sample],
+        thresholds: &Thresholds,
+    ) -> Diagnosed {
+        let readings = network_diagnosis::assess(samples, thresholds);
+        self.diagnosis = network_diagnosis::step(&self.diagnosis, &readings.map(|r| r.health));
+        let state = self.diagnosis.state;
+        Diagnosed {
+            ts_ms,
+            state,
+            peak: state
+                .layer()
+                .and_then(|layer| readings[layer as usize].peak),
+            restart: !self.committed,
+        }
+    }
+    pub fn committed(&mut self) {
+        self.committed = true;
+    }
+}
+
+pub const OPEN_EVENT_SQL: &str = concat!(
+    "SELECT ",
+    event_columns!(),
+    " FROM net_events WHERE device_id=?1 AND ended_ms IS NULL"
+);
+pub fn open_event(db: &Connection, device_id: &str) -> Result<Option<NetworkEvent>> {
+    Ok(db
+        .prepare_cached(OPEN_EVENT_SQL)?
+        .query_row([device_id], event)
+        .optional()?)
+}
+fn close_event(
+    tx: &Connection,
+    open: NetworkEvent,
+    ts_ms: i64,
+    reason: NetworkEndReason,
+) -> Result<NetworkEvent> {
+    tx.prepare_cached("UPDATE net_events SET ended_ms=?2,end_reason=?3 WHERE id=?1")?
+        .execute(params![open.id, ts_ms, reason])?;
+    Ok(NetworkEvent {
+        ended_ms: Some(ts_ms),
+        end_reason: Some(reason),
+        ..open
+    })
+}
+/// Bring the stored open episode in line with this tick's state, judged
+/// against what is stored rather than the previous tick, so a replay changes
+/// nothing and a tick after failed writes still converges.
+fn record_event(tx: &Connection, device_id: &str, tick: &Diagnosed) -> Result<Vec<NetworkEvent>> {
+    let mut changed = Vec::new();
+    let mut open = open_event(tx, device_id)?;
+    if let Some(event) = &open {
+        ensure!(
+            tick.ts_ms >= event.started_ms,
+            "network event did not advance"
+        );
+    }
+    if tick.restart
+        && let Some(event) = open.take_if(|e| e.started_ms < tick.ts_ms)
+    {
+        changed.push(close_event(
+            tx,
+            event,
+            tick.ts_ms,
+            NetworkEndReason::Restart,
+        )?);
+    }
+    match open {
+        Some(event) if event.state == tick.state => {
+            let Some(peak) = tick.peak else {
+                return Ok(changed);
+            };
+            let loss = event
+                .peak_loss_percent
+                .map_or(peak.loss_percent, |l| l.max(peak.loss_percent));
+            let (rtt, mdev) = (
+                event.peak_rtt_us.max(peak.rtt_us),
+                event.peak_mdev_us.max(peak.mdev_us),
+            );
+            if (Some(loss), rtt, mdev)
+                != (
+                    event.peak_loss_percent,
+                    event.peak_rtt_us,
+                    event.peak_mdev_us,
+                )
+            {
+                tx.prepare_cached("UPDATE net_events SET peak_loss_percent=?2,peak_rtt_us=?3,peak_mdev_us=?4 WHERE id=?1")?
+                    .execute(params![event.id, loss, rtt, mdev])?;
+            }
+            return Ok(changed);
+        }
+        Some(event) => {
+            let reason = if tick.state == LinkState::Healthy {
+                NetworkEndReason::Recovered
+            } else {
+                NetworkEndReason::Changed
+            };
+            changed.push(close_event(tx, event, tick.ts_ms, reason)?);
+        }
+        None => {}
+    }
+    let (state, layer, reason) = match tick.state {
+        LinkState::Healthy => return Ok(changed),
+        LinkState::Degraded { layer, reason } => ("degraded", layer, Some(reason)),
+        LinkState::Down { layer } => ("down", layer, None),
+    };
+    let peak = tick.peak;
+    changed.push(
+        tx.prepare_cached(concat!(
+            "INSERT INTO net_events(device_id,state,layer,reason,started_ms,peak_loss_percent,peak_rtt_us,peak_mdev_us) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) RETURNING ",
+            event_columns!()
+        ))?
+        .query_row(
+            params![
+                device_id,
+                state,
+                layer,
+                reason,
+                tick.ts_ms,
+                peak.map(|p| p.loss_percent),
+                peak.and_then(|p| p.rtt_us),
+                peak.and_then(|p| p.mdev_us),
+            ],
+            event,
+        )?,
+    );
+    Ok(changed)
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NetworkEvents {
+    /// Newest first: started_ms descending, then id descending.
+    pub events: Vec<NetworkEvent>,
+    /// The last event's id, to pass as `before` for the next page; null on the last page.
+    pub next_before: Option<i64>,
+}
+pub const EVENT_CURSOR_SQL: &str = "SELECT started_ms FROM net_events WHERE id=?1 AND device_id=?2";
+pub const EVENTS_SQL: &str = concat!(
+    "SELECT ",
+    event_columns!(),
+    " FROM net_events WHERE device_id=?1 AND (started_ms,id)<(?2,?3) ORDER BY started_ms DESC,id DESC LIMIT ?4"
+);
+/// A newest-first page by (started_ms, id) that starts after the `before`
+/// event, or at the newest without one. None when `before` names no event of
+/// this device.
+pub fn events(
+    db: &Connection,
+    device_id: &str,
+    limit: u32,
+    before: Option<i64>,
+) -> Result<Option<NetworkEvents>> {
+    ensure!((1..=200).contains(&limit), "limit must be 1–200");
+    let (before_ms, before_id) = match before {
+        None => (i64::MAX, i64::MAX),
+        Some(id) => {
+            let started_ms = db
+                .prepare_cached(EVENT_CURSOR_SQL)?
+                .query_row(params![id, device_id], |r| r.get(0))
+                .optional()?;
+            let Some(started_ms) = started_ms else {
+                return Ok(None);
+            };
+            (started_ms, id)
+        }
+    };
+    let events = db
+        .prepare_cached(EVENTS_SQL)?
+        .query_map(params![device_id, before_ms, before_id, limit], event)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let next_before = events
+        .last()
+        .filter(|_| events.len() == limit as usize)
+        .map(|e| e.id);
+    Ok(Some(NetworkEvents {
+        events,
+        next_before,
+    }))
 }
 
 pub const RETAIN_SQL: &str = "DELETE FROM net_probe_samples WHERE rowid IN (SELECT rowid FROM net_probe_samples WHERE ts_ms<?1 ORDER BY ts_ms LIMIT 1000) AND EXISTS(SELECT 1 FROM net_probe_rollup_hourly r WHERE r.device_id=net_probe_samples.device_id AND r.ts_ms=net_probe_samples.ts_ms/3600000*3600000 AND r.target=net_probe_samples.target)";
@@ -394,16 +696,49 @@ pub const SPEED_RETAIN_SQL: &str = "DELETE FROM net_speed_tests WHERE id IN (WIT
 pub fn retain_speed_tests(db: &mut Connection, now: i64) -> Result<usize> {
     Ok(db.execute(SPEED_RETAIN_SQL, [(now - SPEED_RETENTION_MS).max(0)])?)
 }
-pub const LATEST_SPEED_SQL: &str = concat!(
+pub const RECENT_SPEED_SQL: &str = concat!(
     "SELECT ",
     speed_columns!(),
-    " FROM net_speed_tests WHERE device_id=?1 ORDER BY started_ms DESC, id DESC LIMIT 1"
+    " FROM net_speed_tests WHERE device_id=?1 ORDER BY started_ms DESC, id DESC LIMIT ?2"
 );
-pub fn latest_speed_test(db: &Connection, device_id: &str) -> Result<Option<NetworkSpeedTest>> {
+/// Walks the started index past failed and timed-out tests, which retention
+/// bounds to 365 days of them.
+pub const RECENT_OK_SPEED_SQL: &str = concat!(
+    "SELECT ",
+    speed_columns!(),
+    " FROM net_speed_tests WHERE device_id=?1 AND outcome='ok' ORDER BY started_ms DESC, id DESC LIMIT ?2"
+);
+fn recent_speed_tests(
+    db: &Connection,
+    sql: &str,
+    device_id: &str,
+    limit: u32,
+) -> Result<Vec<NetworkSpeedTest>> {
     Ok(db
-        .prepare_cached(LATEST_SPEED_SQL)?
-        .query_row([device_id], speed_test)
-        .optional()?)
+        .prepare_cached(sql)?
+        .query_map(params![device_id, limit], speed_test)?
+        .collect::<rusqlite::Result<_>>()?)
+}
+pub fn latest_speed_test(db: &Connection, device_id: &str) -> Result<Option<NetworkSpeedTest>> {
+    Ok(recent_speed_tests(db, RECENT_SPEED_SQL, device_id, 1)?.pop())
+}
+/// What the alert engine needs from network storage.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkAlertInput {
+    pub open_event: Option<NetworkEvent>,
+    /// The newest tests, newest first, at most ALERT_SPEED_TESTS.
+    pub recent_tests: Vec<NetworkSpeedTest>,
+    /// The newest ok tests, newest first, at most ALERT_SPEED_TESTS; failed
+    /// and timed-out tests between them are skipped.
+    pub recent_ok_tests: Vec<NetworkSpeedTest>,
+}
+pub const ALERT_SPEED_TESTS: u32 = 3;
+pub fn alert_input(db: &Connection, device_id: &str) -> Result<NetworkAlertInput> {
+    Ok(NetworkAlertInput {
+        open_event: open_event(db, device_id)?,
+        recent_tests: recent_speed_tests(db, RECENT_SPEED_SQL, device_id, ALERT_SPEED_TESTS)?,
+        recent_ok_tests: recent_speed_tests(db, RECENT_OK_SPEED_SQL, device_id, ALERT_SPEED_TESTS)?,
+    })
 }
 pub const SPEED_TESTS_SQL: &str = concat!(
     "SELECT ",

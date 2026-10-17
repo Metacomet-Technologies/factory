@@ -242,6 +242,7 @@ fn hourly_rollup_weights_latency_by_replies_and_takes_p95_jitter() -> Result<()>
         &mut db,
         DEVICE_ID,
         &[sample(hour, "gateway", 10, Some((100, 200, 300, 10)))],
+        None,
     )?;
     record(
         &mut db,
@@ -252,16 +253,19 @@ fn hourly_rollup_weights_latency_by_replies_and_takes_p95_jitter() -> Result<()>
             5,
             Some((50, 400, 900, 30)),
         )],
+        None,
     )?;
     record(
         &mut db,
         DEVICE_ID,
         &[sample(hour + 60_000, "gateway", 0, None)],
+        None,
     )?;
     record(
         &mut db,
         DEVICE_ID,
         &[sample(hour + HOUR_MS, "gateway", 10, Some((7, 8, 9, 1)))],
+        None,
     )?;
     let hourly = serde_json::to_value(history(&db, DEVICE_ID, hour, hour + 2 * HOUR_MS, false)?)?;
     // (10 x 200 + 5 x 400) / 15 replies = 266.67 us, rounded half-up.
@@ -290,8 +294,8 @@ fn hourly_rollup_weights_latency_by_replies_and_takes_p95_jitter() -> Result<()>
 #[test]
 fn record_is_atomic_rejects_stale_ticks_and_replays_as_a_noop() -> Result<()> {
     let mut db = database()?;
-    record(&mut db, DEVICE_ID, &tick(30_000))?;
-    record(&mut db, DEVICE_ID, &tick(30_000))?;
+    record(&mut db, DEVICE_ID, &tick(30_000), None)?;
+    record(&mut db, DEVICE_ID, &tick(30_000), None)?;
     assert_eq!(count(&db, "net_probe_samples")?, 5);
     let stored = latest(
         &db,
@@ -311,20 +315,21 @@ fn record_is_atomic_rejects_stale_ticks_and_replays_as_a_noop() -> Result<()> {
             record(
                 &mut db,
                 DEVICE_ID,
-                &[sample(60_000, "gateway", 0, None), stale]
+                &[sample(60_000, "gateway", 0, None), stale],
+                None
             )
             .is_err()
         );
     }
     assert_eq!(count(&db, "net_probe_samples")?, 5);
     db.execute_batch("CREATE TRIGGER fail_rollup BEFORE INSERT ON net_probe_rollup_hourly BEGIN SELECT RAISE(ABORT,'rollup failure'); END;")?;
-    assert!(record(&mut db, DEVICE_ID, &tick(60_000)).is_err());
+    assert!(record(&mut db, DEVICE_ID, &tick(60_000), None).is_err());
     assert_eq!(count(&db, "net_probe_samples")?, 5);
     db.execute_batch("DROP TRIGGER fail_rollup")?;
-    record(&mut db, DEVICE_ID, &tick(60_000))?;
+    record(&mut db, DEVICE_ID, &tick(60_000), None)?;
     assert_eq!(count(&db, "net_probe_samples")?, 10);
     // Devices are independent streams.
-    record(&mut db, "factory-console", &tick(30_000))?;
+    record(&mut db, "factory-console", &tick(30_000), None)?;
     assert_eq!(
         latest(&db, "factory-console", &["gateway".into()])?[0].ts_ms,
         30_000
@@ -344,6 +349,7 @@ fn retention_waits_for_rollups_is_bounded_and_rerun_idempotent() -> Result<()> {
             &mut db,
             DEVICE_ID,
             &[sample(ts, "gateway", 10, Some((1, 2, 3, 0)))],
+            None,
         )?;
     }
     let now = 7 * DAY_MS + HOUR_MS;
@@ -495,7 +501,7 @@ fn record_and_reads_use_constant_statement_counts() -> Result<()> {
         let now = (ticks + 1) * 30_000;
         let write = Scope::default();
         db.run(&write, Category::Data, |db| {
-            record(db, DEVICE_ID, &tick(now))
+            record(db, DEVICE_ID, &tick(now), None)
         })?;
         let read = Scope::default();
         db.run(&read, Category::Data, |db| -> Result<()> {
@@ -547,7 +553,7 @@ async fn endpoints_return_registry_history_and_constant_query_budgets() -> Resul
             .db
             .write(&Scope::default(), move |db| {
                 for i in (0..n).rev() {
-                    record(db, DEVICE_ID, &tick(now - i * 30_000)[..4])?;
+                    record(db, DEVICE_ID, &tick(now - i * 30_000)[..4], None)?;
                 }
                 Ok(())
             })
@@ -562,9 +568,11 @@ async fn endpoints_return_registry_history_and_constant_query_budgets() -> Resul
             .error_for_status()?
             .json()
             .await?;
-        // Latest sample per target, then the latest speed test.
-        assert_eq!(scope.counts().data, 2, "/v1/network n={n}");
+        // Latest sample per target, the latest speed test, then the open event.
+        assert_eq!(scope.counts().data, 3, "/v1/network n={n}");
         assert_eq!(body["device_id"], DEVICE_ID);
+        assert_eq!(body["state"], json!({"state": "healthy"}));
+        assert!(body["open_event"].is_null());
         let targets = body["targets"].as_array().unwrap();
         assert_eq!(
             targets
@@ -689,7 +697,8 @@ async fn collector_streams_stores_and_warns_without_faking_samples() -> Result<(
     let (url, task) = serve(&state, &Scope::default()).await?;
     let client = reqwest::Client::new();
     let mut stream = client.get(format!("{url}/v1/stream")).send().await?;
-    state.collect_network().await;
+    let mut collector = Collector::default();
+    state.collect_network(&mut collector).await;
     let mut frames = String::new();
     let data = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -733,7 +742,7 @@ async fn collector_streams_stores_and_warns_without_faking_samples() -> Result<(
     );
     // An unreadable route table is a monitoring error: no lan sample is invented.
     std::fs::remove_file(&route)?;
-    state.collect_network().await;
+    state.collect_network(&mut collector).await;
     let body = view(state.clone()).await?;
     assert_eq!(body["targets"][0]["latest"]["ts_ms"], first);
     assert_ne!(body["targets"][1]["latest"]["ts_ms"], first);
@@ -748,7 +757,7 @@ async fn collector_streams_stores_and_warns_without_faking_samples() -> Result<(
     // Writes pause with the clock; probing and streaming continue.
     let before = body["targets"][1]["latest"]["ts_ms"].clone();
     state.db.clock_synchronized.store(false, Ordering::Release);
-    state.collect_network().await;
+    state.collect_network(&mut collector).await;
     let body = view(state.clone()).await?;
     assert_eq!(body["targets"][1]["latest"]["ts_ms"], before);
     let warnings: Vec<_> = body["warnings"]
