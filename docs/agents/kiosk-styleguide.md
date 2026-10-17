@@ -102,11 +102,12 @@ Formatting helpers live in `kiosk/src/lib/format.ts` (`count`, `usd`, `ms`,
   the Fleet grid.
 - Dashboard overview (`/`): the `.dashboard-grid`. Sections that have a
   details page render as a `<a className="panel-link">` wrapping a compact
-  `Panel` with KPIs only (see `UsageSection`, `UpsSection`). Put tables,
+  `Panel` with KPIs only (see `UsageSection`, `UpsSection`, `NetworkSection`). Put tables,
   charts with controls and long lists on the details page, not the overview.
-- Details pages (`/ups`, `/llm`, `/devices/<id>`): `PageHeader` then stacked
-  Panels. Add `className="<name>-page"` and extend the
-  `.ups-page, .devices-page, .llm-page` rule when you need page-level spacing.
+- Details pages (`/ups`, `/llm`, `/network`, `/devices/<id>`): `PageHeader` then
+  stacked Panels. Add `className="<name>-page"` and extend the
+  `.ups-page, .devices-page, .llm-page, .network-page` rule when you need
+  page-level spacing.
 - Fleet node tiles that match a device from `/v1/devices` render as
   `<a className="tile-link">` to the device page. There is no separate
   devices list page.
@@ -132,6 +133,10 @@ Formatting helpers live in `kiosk/src/lib/format.ts` (`count`, `usd`, `ms`,
   changes; `useStream()` owns the SSE connection and returns `status`
   (`connecting | live | reconnecting`), revision counters and the latest
   samples.
+- `useApi` returns the loading state while a revision refetch runs. When a
+  frequent stream event bumps the revision, wrap the resource in `useHeld` so
+  the last response stays on screen (see the `/v1/network` snapshot in
+  `App.tsx`).
 - The stream reconnects on `error`, after 45 s of silence, and on
   `online` / `visibilitychange` / `pageshow`, with jittered backoff from 1 s
   to 30 s. Do not add a second EventSource; bump a revision in

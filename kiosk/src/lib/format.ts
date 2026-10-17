@@ -20,6 +20,11 @@ export const ms = (value: number | null | undefined) =>
           : value < 86_400_000
             ? `${number(value / 3_600_000)} h`
             : `${number(value / 86_400_000)} d`;
+/** Bits per second as Mb/s: whole numbers from 100 Mb/s, one decimal below. */
+export const mbps = (bps: number | null | undefined) =>
+  bps == null
+    ? "—"
+    : `${new Intl.NumberFormat("en-US", { maximumFractionDigits: bps >= 100e6 ? 0 : 1 }).format(bps / 1e6)} Mb/s`;
 export const seen = (value: number | null | undefined, now = Date.now()) =>
   value == null ? "—" : `${ms(Math.max(0, now - value))} ago`;
 export const time = (value: number) =>

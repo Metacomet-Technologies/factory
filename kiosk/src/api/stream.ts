@@ -17,6 +17,7 @@ export interface LiveState {
   devices: DeviceView | null | undefined;
   devicesAt: number;
   devicesRevision: number;
+  networkRevision: number;
 }
 export const initialLiveState: LiveState = {
   gpu: undefined,
@@ -33,6 +34,7 @@ export const initialLiveState: LiveState = {
   devices: undefined,
   devicesAt: 0,
   devicesRevision: 0,
+  networkRevision: 0,
 };
 export function streamReducer(state: LiveState, event: StreamEvent): LiveState {
   switch (event.type) {
@@ -71,6 +73,9 @@ export function streamReducer(state: LiveState, event: StreamEvent): LiveState {
         devicesAt: event.ts_ms,
         devicesRevision: state.devicesRevision + 1,
       };
+    case "network.sample":
+    case "network.speedtest":
+      return { ...state, networkRevision: state.networkRevision + 1 };
   }
 }
 
@@ -212,6 +217,28 @@ export function parseEvent(value: unknown): StreamEvent | null {
         return value as StreamEvent;
       break;
     }
+    case "network.sample":
+      if (
+        Array.isArray(data) &&
+        data.every(
+          (sample: unknown) =>
+            !!sample &&
+            typeof sample === "object" &&
+            "ts_ms" in sample &&
+            Number.isFinite(sample.ts_ms) &&
+            "target" in sample &&
+            typeof sample.target === "string",
+        )
+      )
+        return value as StreamEvent;
+      break;
+    case "network.speedtest":
+      if (
+        numbers(["id", "started_ms", "ended_ms"]) &&
+        ["ok", "failed", "timeout"].includes(String(fields.outcome))
+      )
+        return value as StreamEvent;
+      break;
     case "agents.usage":
       if (
         Array.isArray(fields.tools) &&
@@ -266,6 +293,8 @@ const EVENT_TYPES = [
   "pricing.changed",
   "agents.usage",
   "devices.sample",
+  "network.sample",
+  "network.speedtest",
 ];
 /** factory-api emits gpu.sample every 15 s even without a GPU, so 45 s of silence means a dead socket. */
 export const STREAM_SILENCE_MS = 45_000;

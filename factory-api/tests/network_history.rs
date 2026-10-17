@@ -548,7 +548,10 @@ async fn endpoints_return_registry_history_and_constant_query_budgets() -> Resul
     for n in [3, 1001] {
         let dir = tempfile::tempdir()?;
         let state = state(&dir, &config).await?;
-        let now = now_ms() / 30_000 * 30_000;
+        // The API reads its own clock for each window, so the newest sample sits
+        // just before it: a 1 h window then holds exactly 120 ticks as long as the
+        // requests start within 29 s.
+        let now = now_ms() - 1_000;
         state
             .db
             .write(&Scope::default(), move |db| {

@@ -720,8 +720,14 @@
   width: 100%;
   aspect-ratio: auto;
 }
+.network-chart {
+  height: 130px;
+  width: 100%;
+  aspect-ratio: auto;
+}
 .trend-chart-tall,
-.ups-history-chart {
+.ups-history-chart,
+.network-chart-tall {
   height: 220px;
   width: 100%;
   aspect-ratio: auto;
@@ -923,14 +929,16 @@
 /* ---- UPS ----------------------------------------------------------------- */
 .ups-page,
 .devices-page,
-.llm-page {
+.llm-page,
+.network-page {
   display: grid;
   align-content: start;
   gap: 16px;
 }
 .ups-page .page-header,
 .devices-page .page-header,
-.llm-page .page-header {
+.llm-page .page-header,
+.network-page .page-header {
   margin: 0;
 }
 .llm-page .page-aside {
@@ -940,6 +948,7 @@
   flex-wrap: wrap;
 }
 .ups-chart-grid,
+.network-chart-grid,
 .ups-energy {
   display: grid;
   gap: 16px;
@@ -964,7 +973,8 @@
 .section-head h3 {
   font-size: 15px;
 }
-.ups-history {
+.ups-history,
+.network-history {
   display: grid;
   gap: 12px;
 }
@@ -1154,6 +1164,21 @@
   margin-top: 6px;
 }
 
+/* ---- Network ------------------------------------------------------------ */
+.network-readings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 16px;
+}
+.network-trend {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.network-throughput {
+  grid-column: 1 / -1;
+}
+
 /* ---- Devices ------------------------------------------------------------ */
 .device-list {
   display: grid;
@@ -1250,13 +1275,15 @@
 
 /* ---- Breakpoints --------------------------------------------------------- */
 @media (min-width: 640px) {
-  .ups-chart-grid {
+  .ups-chart-grid,
+  .network-chart-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .ups-energy {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .ups-readings {
+  .ups-readings,
+  .network-readings {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
   .ups-live-grid {
@@ -1269,7 +1296,8 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .usage,
-  .ups {
+  .ups,
+  .network {
     grid-column: 1 / -1;
   }
   .sidebar {
@@ -1330,7 +1358,7 @@
   }
   .sidebar {
     grid-column: 3;
-    grid-row: 2 / 4;
+    grid-row: 2 / 5;
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto 1fr;
     gap: 12px;
@@ -1341,9 +1369,8 @@
   .gpu {
     grid-column: 3;
   }
-  .ups {
-    grid-column: 1 / 3;
-  }
+  .ups,
+  .network,
   .usage {
     grid-column: 1 / 3;
   }

@@ -288,6 +288,11 @@ and three must open `network:throughput_low`, because about 50 Mb/s is under
 the 500 Mb/s default. The next `ok` test clears that. It restores `ok`, takes
 about fifteen minutes and prints the tests and alerts as JSON.
 
+`vp run network:check` from `kiosk/` drives the same ping and speed fixtures
+through the built kiosk in Chromium, so start the stack with `--kiosk`. The
+"Synthetic network check" section of `kiosk/README.md` lists what it captures
+and asserts.
+
 ## Pricing hooks (MET-111)
 
 `up` passes `--openrouter-feed-url` and `--litellm-feed-url` pointing to the

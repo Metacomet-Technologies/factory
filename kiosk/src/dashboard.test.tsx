@@ -2,6 +2,7 @@ import { render, screen, within, fireEvent, waitFor, act } from "@testing-librar
 import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
 import App from "./App";
 import { agentFixtures, fixtures } from "../mock/fixtures";
+import { networkFixtures } from "../mock/site-fixtures";
 import { streamReducer, initialLiveState, parseEvent, STREAM_SILENCE_MS } from "./api/stream";
 import type { StreamEvent, UpsCurrent } from "./api/types";
 import { UpsBadge, UpsSection } from "./components/ups";
@@ -67,11 +68,14 @@ function api(outage = false, failing = "", empty = false) {
       data.agents.tools = [];
       data.pricing.families = [];
     }
+    const network = networkFixtures("healthy", outage);
     const routes: Record<string, unknown> = {
       "/v1/health": data.health,
       "/v1/fleet": data.fleet,
       "/v1/llm/usage": data.usage,
       "/v1/gpu": data.gpu,
+      "/v1/network": network.status,
+      "/v1/network/history": network.history,
       "/v1/ups": { generated_at_ms: Date.now(), current: null, warnings: [] },
       "/v1/devices": {
         generated_at_ms: Date.now(),

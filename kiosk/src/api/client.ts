@@ -57,3 +57,13 @@ export function useApi<K extends keyof Endpoints>(
   }, [path, query, key]);
   return resource.key === key ? resource : { data: null, error: null, loading: true };
 }
+
+/**
+ * Keeps the last response on screen while a revision bump refetches it, so a refresh
+ * triggered every 30 s by the stream never flashes the loading state. Errors still show.
+ */
+export function useHeld<T>(resource: Resource<T>): Resource<T> {
+  const [held, setHeld] = useState<T | null>(null);
+  if (resource.data !== null && resource.data !== held) setHeld(resource.data);
+  return resource.loading && held !== null ? { data: held, error: null, loading: false } : resource;
+}
