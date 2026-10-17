@@ -652,6 +652,16 @@
             "format": "int64",
             "type": "integer"
           },
+          "maintenance": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NodeMaintenance"
+              }
+            ]
+          },
           "warnings": {
             "items": {
               "type": "string"
@@ -719,6 +729,14 @@
           },
           "temperature": {
             "$ref": "#/components/schemas/Metric"
+          },
+          "unsafe_shutdowns": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1266,6 +1284,468 @@
           "clock",
           "reboot",
           "ups"
+        ],
+        "type": "object"
+      },
+      "MaintenanceProbe_AutoUpdate": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "properties": {
+                  "apply": {
+                    "type": "boolean"
+                  },
+                  "check": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "check",
+                  "apply"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "availability": {
+                    "enum": [
+                      "available"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "availability"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "unsupported"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "availability"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "error"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "availability"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "MaintenanceProbe_HeldPackages": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "properties": {
+                  "packages": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "packages"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "availability": {
+                    "enum": [
+                      "available"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "availability"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "unsupported"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "availability"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "error"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "availability"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "MaintenanceProbe_JournalSize": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "properties": {
+                  "value": {
+                    "format": "int64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "value"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "availability": {
+                    "enum": [
+                      "available"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "availability"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "unsupported"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "availability"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "error"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "availability"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "MaintenanceProbe_RebootSetting": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "properties": {
+                  "value": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "value"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "availability": {
+                    "enum": [
+                      "available"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "availability"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "unsupported"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "availability"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "error"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "availability"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "MaintenanceProbe_UpdateCounts": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "properties": {
+                  "other": {
+                    "format": "int64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "security": {
+                    "format": "int64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "security",
+                  "other"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "availability": {
+                    "enum": [
+                      "available"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "availability"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "unsupported"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "availability"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "error"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "availability"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "MaintenanceServiceState": {
+        "enum": [
+          "enabled",
+          "disabled",
+          "absent",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "MaintenanceServices": {
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/ProbeAvailability"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fstrim_timer": {
+            "$ref": "#/components/schemas/MaintenanceServiceState"
+          },
+          "smartd": {
+            "$ref": "#/components/schemas/MaintenanceServiceState"
+          },
+          "unattended_upgrades": {
+            "$ref": "#/components/schemas/MaintenanceServiceState"
+          }
+        },
+        "required": [
+          "availability",
+          "unattended_upgrades",
+          "fstrim_timer",
+          "smartd"
+        ],
+        "type": "object"
+      },
+      "MaintenanceSnapshot": {
+        "properties": {
+          "held": {
+            "$ref": "#/components/schemas/MaintenanceProbe_HeldPackages"
+          },
+          "journal_bytes": {
+            "$ref": "#/components/schemas/MaintenanceProbe_JournalSize"
+          },
+          "observed_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "schema": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "services": {
+            "$ref": "#/components/schemas/MaintenanceServices"
+          },
+          "tailscale_auto_update": {
+            "$ref": "#/components/schemas/MaintenanceProbe_AutoUpdate"
+          },
+          "unattended_auto_reboot": {
+            "$ref": "#/components/schemas/MaintenanceProbe_RebootSetting"
+          },
+          "updates": {
+            "$ref": "#/components/schemas/MaintenanceProbe_UpdateCounts"
+          }
+        },
+        "required": [
+          "schema",
+          "observed_at_ms",
+          "updates",
+          "held",
+          "services",
+          "unattended_auto_reboot",
+          "tailscale_auto_update",
+          "journal_bytes"
         ],
         "type": "object"
       },
@@ -1909,6 +2389,106 @@
         ],
         "type": "object"
       },
+      "NodeMaintenance": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/MaintenanceSnapshot"
+              },
+              {
+                "properties": {
+                  "availability": {
+                    "enum": [
+                      "available"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "availability"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/MaintenanceSnapshot"
+              },
+              {
+                "properties": {
+                  "availability": {
+                    "enum": [
+                      "stale"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "availability"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "permission_denied"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "error",
+              "availability"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "unsupported"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "error",
+              "availability"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
+                  "error"
+                ],
+                "type": "string"
+              },
+              "error": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "error",
+              "availability"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "Pricing": {
         "properties": {
           "families": {
@@ -1946,6 +2526,14 @@
           "family"
         ],
         "type": "object"
+      },
+      "ProbeAvailability": {
+        "enum": [
+          "available",
+          "unsupported",
+          "error"
+        ],
+        "type": "string"
       },
       "ProbeKind": {
         "enum": [

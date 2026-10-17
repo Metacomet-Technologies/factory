@@ -17,6 +17,12 @@ Phase 2 remote ingestion design (for review): [devices-ingest.md](devices-ingest
 | Backup | `/var/lib/factory-backup-status/status.json` |
 | Clock | `require_clock` |
 | SMART | `{root}/var/lib/factory-devices/smart.json` |
+| Unsafe shutdown count per drive | NVMe `unsafe_shutdowns` in the same SMART snapshot; omitted when absent |
+| Pending updates, held packages | `apt list --upgradable`, `apt-mark showhold`, published in `{root}/var/lib/factory-devices/maintenance.json` |
+| Maintenance services | `systemctl is-enabled unattended-upgrades.service`, `fstrim.timer`, `smartmontools.service` |
+| Unattended auto-reboot | exact `Unattended-Upgrade::Automatic-Reboot` key from `apt-config dump` |
+| Tailscale auto-update | only `AutoUpdate.Check` and `AutoUpdate.Apply` from `tailscale debug prefs` |
+| Journal size | total file bytes under `/var/log/journal` |
 | Reboot age | `/var/lib/factory-reboot-status/status.json` |
 | Fleet services | the factory-gpu node already collected by fleet |
 
@@ -32,6 +38,14 @@ new window. History is not interpolated across that gap.
 
 A fast sample older than 30 seconds, or a failed fast collection, makes the
 host `stale`. Alerting uses a separate 2 minute stale threshold.
+
+The root `factory-devices-maintenance.timer` publishes hourly with
+`Persistent=true`. The API reads that file on the existing 5-minute slow
+inventory. A maintenance observation older than 2 hours is `stale`, including
+when a served cached observation crosses that boundary. Stale values remain
+visible with their observation time. Maintenance does not change host health.
+Update counts reflect the existing apt cache. The helper never refreshes that
+cache, installs packages, or changes settings.
 
 ## Retention
 
@@ -51,6 +65,34 @@ milliseconds. Version 1 is unchanged.
 
 Live readings are served from memory when the clock is not synchronized.
 History writes wait for the clock, the same way UPS history does.
+
+### Maintenance snapshot v1
+
+`maintenance.json` contains `schema: 1`, UTC `observed_at_ms`, and these sections:
+
+| Section | Fields when available |
+| --- | --- |
+| `updates` | integer `security`, `other`; security means an origin contains `-security` |
+| `held` | `packages`, a sorted list of held package names |
+| `services` | `unattended_upgrades`, `fstrim_timer`, `smartd`, each `enabled`, `disabled`, `absent`, or `unknown` |
+| `unattended_auto_reboot` | boolean `value`; an unset apt key defaults to false |
+| `tailscale_auto_update` | boolean `check`, `apply`; no other preference fields are retained |
+| `journal_bytes` | integer `value`, without following symbolic links |
+
+Each section has `availability` (`available`, `unsupported`, or `error`) and an
+optional sanitized `error`. An unavailable section omits its values, except
+`services`, which retains each independent service state. A failed probe does
+not blank successful probes. Missing commands are `unsupported`.
+
+`GET /v1/devices/factory-gpu` adds optional response-level `maintenance` with
+these fields and overall `availability`. The existing `device.maintenance`
+still holds backup, reboot, clock, power, and fleet service readings unchanged.
+A missing or unreadable file returns `maintenance.availability: permission_denied`.
+Malformed content is `error`; an unsupported schema is `unsupported`. File
+failure omits snapshot fields rather than inventing zero counts.
+
+Each `device.drives[]` optionally includes integer `unsafe_shutdowns`. A drive
+without an NVMe counter omits that field. It is not a SMART health threshold.
 
 ## API
 
@@ -92,6 +134,7 @@ These keys are new. Fleet already covers the other host alerts.
 | `devices:fs:{id}:space:critical` and `:inodes:critical` | 95% for 10 minutes | below 90% |
 | `devices:smart:{id}` | unhealthy for 60 seconds | healthy for 2 minutes |
 | `devices:telemetry` | no fast sample for 2 minutes | a fresh fast sample |
+| `devices:unsafe_shutdowns:{id}:{count}` | one notice per counter increase after the first baseline | one-shot, no recovery |
 
 An unreadable source holds open alerts. It does not clear them. A fast sample
 older than 2 minutes does not open a new temperature or filesystem alert from
@@ -109,6 +152,11 @@ rename, so the live snapshot stays `root:factory-api` mode `0640` after every
 timer run. A failed chown removes the temporary file, leaves the previous
 snapshot in place, and fails the service. The installer does not run
 `smartctl` and does not install packages.
+
+The maintenance helper uses the same atomic writer, directory, group, and mode
+for `maintenance.json`. It publishes only the fields listed above, never raw
+command output or Tailscale preferences. Its service runs as root so apt,
+systemd, and journal observations do not need extra API permissions.
 
 Private reboot status at `/var/lib/factory-reboot/status.json` stays root mode
 0600 under a mode 0700 directory. factory-api cannot read that file. The reboot
@@ -128,23 +176,40 @@ Backup status that factory-api can read is
 
 ## Install and rollback
 
-Run this on factory-gpu. Do not run it from an agent session:
+After merge and the wrap-up thread's main-checkout builds, Devon runs these
+from his Mac. No deploy runs in an agent session. Save each printed backup
+path. These commands install the helpers, prebuilt API, and kiosk:
 
 ```sh
 gpu-ssh "sudo bash /home/agent/work/factory/deploy/devices/install-devices.sh"
-```
-
-Preflight, after install:
-
-```sh
 gpu-ssh "sudo bash /home/agent/work/factory/deploy/devices/install-devices.sh --preflight"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-kiosk.sh /home/agent/work/factory/kiosk/dist"
+gpu-ssh 'sudo systemctl start factory-devices-maintenance.service factory-devices-smart.service; sudo python3 -m json.tool /var/lib/factory-devices/maintenance.json; sudo systemctl status factory-devices-maintenance.timer --no-pager'
 ```
 
-The installer prints the snapshot path. Roll back with the printed command, or:
+There is no DB migration for MET-217. The existing API installer's backup and
+schema preflight gates still apply. Do not restart Ollama or change factory-console.
+
+Verify the new response-level `maintenance` object and the Maintenance card:
 
 ```sh
-gpu-ssh "sudo bash /home/agent/work/factory/deploy/devices/rollback-devices.sh SNAPSHOT"
+gpu-ssh 'curl -fsS http://127.0.0.1:8080/v1/devices/factory-gpu | python3 -c '\''import json,sys; print(json.dumps(json.load(sys.stdin).get("maintenance"), indent=2))'\'''
+# Open https://factory-gpu.bearded-pompano.ts.net/devices/factory-gpu
+# Replace placeholders with the printed component backup paths:
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/rollback-kiosk.sh /var/backups/factory-kiosk/KIOSK_SNAPSHOT"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/API_SNAPSHOT"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/devices/rollback-devices.sh /var/backups/factory-devices/DEVICES_SNAPSHOT"
 ```
+
+Rollback restores previous helpers and units, disabling the maintenance timer
+and stopping its service when those files were absent before install. The last
+maintenance snapshot can remain as historical data. Revert the API and kiosk
+through their own printed rollback snapshots.
+
+Before rolling factory-api back, let pending unclean-shutdown notices drain.
+The old binary cannot read outbox entries with `thread_ts: null` and moves
+`alerts.json` aside as corrupt if any remain, losing the loaded alert state.
 
 Unprivileged tests use `DEVICES_TEST_ROOT` and do not call host `smartctl`.
 

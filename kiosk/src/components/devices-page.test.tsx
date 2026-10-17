@@ -144,6 +144,79 @@ beforeEach(() => {
 });
 
 describe("devices page", () => {
+  it("renders maintenance counts, services and warnings without changing host health", () => {
+    const data = view();
+    data.device.health = { status: "healthy", reasons: [] };
+    data.device.drives[0]!.unsafe_shutdowns = 129;
+    data.maintenance = {
+      availability: "available",
+      schema: 1,
+      observed_at_ms: 1_000,
+      updates: { availability: "available", security: 2, other: 7 },
+      held: { availability: "available", packages: ["linux-t2", "example"] },
+      services: {
+        availability: "available",
+        unattended_upgrades: "enabled",
+        fstrim_timer: "disabled",
+        smartd: "absent",
+      },
+      unattended_auto_reboot: { availability: "available", value: true },
+      tailscale_auto_update: { availability: "available", check: true, apply: false },
+      journal_bytes: { availability: "available", value: 104857600 },
+    };
+    const page = () => (
+      <DevicesPage
+        view={data}
+        history={null}
+        range="1h"
+        setRange={() => {}}
+        error={null}
+        loading={false}
+        connected
+        live
+        now={2_000}
+      />
+    );
+    const { rerender } = render(page());
+    const card = within(screen.getByRole("region", { name: "Maintenance" }));
+    expect(card.getByText("2 security · 7 other")).toBeInTheDocument();
+    expect(card.getByText("linux-t2, example")).toBeInTheDocument();
+    expect(card.getByText("Check on · apply off")).toBeInTheDocument();
+    expect(card.getByText("100 MiB")).toBeInTheDocument();
+    expect(card.getByText("129")).toBeInTheDocument();
+    expect(card.getByText(/Maintenance snapshot: available/)).toBeInTheDocument();
+    expect(card.getByLabelText("Warning: fstrim.timer disabled")).toBeInTheDocument();
+    expect(card.getByLabelText("Warning: smartd absent")).toBeInTheDocument();
+    expect(card.getByLabelText("Warning: unattended auto-reboot enabled")).toBeInTheDocument();
+    expect(screen.getByText("healthy")).toBeInTheDocument();
+
+    data.maintenance = {
+      ...data.maintenance,
+      availability: "stale",
+      updates: { availability: "error", error: "probe failed" },
+      held: { availability: "available", packages: [] },
+      services: { ...data.maintenance.services, smartd: "unknown", availability: "error" },
+      unattended_auto_reboot: { availability: "unsupported" },
+    };
+    rerender(page());
+    expect(card.getByText(/Maintenance snapshot: stale/)).toBeInTheDocument();
+    expect(card.queryByText("2 security · 7 other")).not.toBeInTheDocument();
+    expect(card.getByText("None")).toBeInTheDocument();
+    expect(card.getByText("Check on · apply off")).toBeInTheDocument();
+    expect(card.getByLabelText("Warning: smartd unknown")).toBeInTheDocument();
+    expect(
+      card.queryByLabelText("Warning: unattended auto-reboot enabled"),
+    ).not.toBeInTheDocument();
+    data.maintenance = { availability: "permission_denied", error: "snapshot not readable" };
+    rerender(page());
+    expect(card.getByText(/Maintenance snapshot: permission denied/)).toBeInTheDocument();
+    expect(card.getByText("129")).toBeInTheDocument();
+    expect(card.queryByText("100 MiB")).not.toBeInTheDocument();
+    data.maintenance = null;
+    rerender(page());
+    expect(card.getByText(/no readable snapshot/)).toBeInTheDocument();
+  });
+
   it("renders health reasons and an em dash for unknown readings", () => {
     expect(metricText(metric(null))).toBe("—");
     expect(metricText(metric(null))).not.toBe("0");

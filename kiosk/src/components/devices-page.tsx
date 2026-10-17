@@ -89,6 +89,9 @@ export default function DevicesPage({
   const host = view?.device;
   const temperature = host?.cpu.temperature.value;
   const maintenance = host?.maintenance;
+  const posture = view?.maintenance;
+  const node =
+    posture?.availability === "available" || posture?.availability === "stale" ? posture : null;
   return (
     <main id="main" className="dashboard devices-page">
       <PageHeader
@@ -330,10 +333,89 @@ export default function DevicesPage({
           {maintenance && (
             <Panel
               title="Maintenance"
-              subtitle="Backup, reboot, clock, power"
+              subtitle="Node posture · backup, reboot, clock, power"
               icon={<Wrench />}
               index={7}
+              className="max-sm:col-span-full"
             >
+              <p className="muted">
+                Maintenance snapshot: {availabilityText(posture?.availability ?? "unsupported")}
+                {node ? ` · observed ${seen(node.observed_at_ms, now)}` : " · no readable snapshot"}
+                {posture && "error" in posture ? ` · ${posture.error}` : ""}
+              </p>
+              <KeyValue
+                className={node?.availability === "stale" ? "muted" : undefined}
+                rows={[
+                  [
+                    "Pending updates",
+                    node?.updates.availability === "available"
+                      ? `${node.updates.security} security · ${node.updates.other} other`
+                      : (node?.updates.availability ?? "unavailable"),
+                  ],
+                  [
+                    "Held packages",
+                    node?.held.availability === "available"
+                      ? node.held.packages.join(", ") || "None"
+                      : (node?.held.availability ?? "unavailable"),
+                  ],
+                  ...(
+                    [
+                      ["unattended_upgrades", "unattended-upgrades"],
+                      ["fstrim_timer", "fstrim.timer"],
+                      ["smartd", "smartd"],
+                    ] as const
+                  ).map(([key, label]) => {
+                    const state = node?.services[key] ?? "unknown";
+                    return [
+                      label,
+                      <StatusChip
+                        key={key}
+                        tone={state === "enabled" ? "ok" : "warn"}
+                        aria-label={state === "enabled" ? undefined : `Warning: ${label} ${state}`}
+                      >
+                        {state}
+                      </StatusChip>,
+                    ] as const;
+                  }),
+                  [
+                    "Unattended auto-reboot",
+                    node?.unattended_auto_reboot.availability === "available" ? (
+                      <StatusChip
+                        key="unattended-auto-reboot"
+                        tone={node.unattended_auto_reboot.value ? "warn" : "neutral"}
+                        aria-label={
+                          node.unattended_auto_reboot.value
+                            ? "Warning: unattended auto-reboot enabled"
+                            : undefined
+                        }
+                      >
+                        {node.unattended_auto_reboot.value ? "On" : "Off"}
+                      </StatusChip>
+                    ) : (
+                      (node?.unattended_auto_reboot.availability ?? "unavailable")
+                    ),
+                  ],
+                  [
+                    "Tailscale auto-update",
+                    node?.tailscale_auto_update.availability === "available"
+                      ? `Check ${node.tailscale_auto_update.check ? "on" : "off"} · apply ${node.tailscale_auto_update.apply ? "on" : "off"}`
+                      : (node?.tailscale_auto_update.availability ?? "unavailable"),
+                  ],
+                  [
+                    "Journal size",
+                    node?.journal_bytes.availability === "available"
+                      ? number(node.journal_bytes.value / 1024 ** 2, "MiB")
+                      : (node?.journal_bytes.availability ?? "unavailable"),
+                  ],
+                  ...host.drives.map(
+                    (drive) =>
+                      [
+                        `${drive.kernel} unsafe shutdowns`,
+                        drive.unsafe_shutdowns == null ? "—" : number(drive.unsafe_shutdowns),
+                      ] as const,
+                  ),
+                ]}
+              />
               <p>
                 Backup {seen(maintenance.backup.last_success_ms, now)}. Reboot{" "}
                 {maintenance.reboot.availability === "available"

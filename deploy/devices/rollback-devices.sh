@@ -24,5 +24,12 @@ restore() {
 restore smart-snapshot.py "$lib/smart-snapshot.py"
 restore factory-devices-smart.service "$units/factory-devices-smart.service"
 restore factory-devices-smart.timer "$units/factory-devices-smart.timer"
+if [[ -f $snapshot/factory-devices-maintenance.timer.absent ]]; then
+    systemctl disable --now factory-devices-maintenance.timer
+    systemctl stop factory-devices-maintenance.service
+fi
+restore maintenance-snapshot.py "$lib/maintenance-snapshot.py"
+restore factory-devices-maintenance.service "$units/factory-devices-maintenance.service"
+restore factory-devices-maintenance.timer "$units/factory-devices-maintenance.timer"
 systemctl daemon-reload
 echo "Restored device helper files from $snapshot"

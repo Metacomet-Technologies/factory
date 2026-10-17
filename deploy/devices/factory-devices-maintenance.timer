@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh the factory maintenance snapshot hourly
+[Timer]
+OnCalendar=hourly
+AccuracySec=1min
+Persistent=true
+[Install]
+WantedBy=timers.target

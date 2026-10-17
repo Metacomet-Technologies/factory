@@ -1,0 +1,10 @@
+[Unit]
+Description=Write a read-only maintenance snapshot for factory-api
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/lib/factory-devices/maintenance-snapshot.py
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/factory-devices
+PrivateTmp=yes
+UMask=0027

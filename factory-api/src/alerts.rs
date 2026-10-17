@@ -220,7 +220,7 @@ struct UpsOutage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Recovery {
     key: String,
-    thread_ts: String,
+    thread_ts: Option<String>,
     text: String,
     attempts: u32,
     next_post_ms: i64,
@@ -231,9 +231,10 @@ struct Stored {
     version: u32,
     active: Vec<Open>,
     recent: Vec<ClearedAlert>,
-    /// Recovery replies not yet accepted by Slack.
+    /// Recovery replies and one-shot device notices not yet accepted by Slack.
     outbox: Vec<Recovery>,
     ups_test_result: Option<String>,
+    unsafe_shutdowns: BTreeMap<String, u64>,
 }
 
 pub struct Engine {
@@ -455,13 +456,35 @@ impl Engine {
     /// Evaluate, post due messages and persist changes.
     pub async fn tick(&mut self, now: i64, signals: &Signals) {
         self.evaluate(now, signals);
-        // Opens and clears (with their queued recoveries) are durable before any Slack call.
+        // Try to save state before delivery; only shutdown notices require success.
         self.persist();
         self.deliver(now).await;
         self.persist();
     }
     /// Applies one evaluation; returns sources newly reported unavailable.
     pub fn evaluate(&mut self, now: i64, signals: &Signals) -> Vec<&'static str> {
+        if let Some(input) = &signals.devices {
+            for (drive, &count) in &input.unsafe_shutdowns {
+                if self.stored.unsafe_shutdowns.get(drive) == Some(&count) {
+                    continue;
+                }
+                if let Some(previous) = self.stored.unsafe_shutdowns.insert(drive.clone(), count)
+                    && count > previous
+                {
+                    self.stored.outbox.push(Recovery {
+                        key: format!("devices:unsafe_shutdowns:{drive}:{count}"),
+                        thread_ts: None,
+                        text: format!(
+                            "factory-gpu: unclean shutdown recorded on {} ({previous} → {count})",
+                            one_line(drive, 160)
+                        ),
+                        attempts: 0,
+                        next_post_ms: now,
+                    });
+                }
+                self.dirty = true;
+            }
+        }
         for open in &mut self.stored.active {
             if let Some(outage) = &mut open.ups {
                 if let Some(sample) = signals.ups.as_ref().and_then(|u| u.current.as_ref()) {
@@ -1153,7 +1176,7 @@ impl Engine {
             };
             self.stored.outbox.push(Recovery {
                 key: open.key.clone(),
-                thread_ts,
+                thread_ts: Some(thread_ts),
                 text,
                 attempts: 0,
                 next_post_ms: now,
@@ -1203,12 +1226,19 @@ impl Engine {
         let mut index = 0;
         while index < self.stored.outbox.len() {
             let recovery = &self.stored.outbox[index];
-            if recovery.next_post_ms > now {
+            if recovery.next_post_ms > now || (recovery.thread_ts.is_none() && self.dirty) {
                 index += 1;
                 continue;
             }
             let (thread_ts, text) = (recovery.thread_ts.clone(), recovery.text.clone());
-            let result = post(&self.client, &self.config, &token, Some(&thread_ts), &text).await;
+            let result = post(
+                &self.client,
+                &self.config,
+                &token,
+                thread_ts.as_deref(),
+                &text,
+            )
+            .await;
             let recovery = &mut self.stored.outbox[index];
             match result {
                 Ok(_) => {
@@ -1216,7 +1246,7 @@ impl Engine {
                 }
                 Err(error) => {
                     recovery.attempts += 1;
-                    if recovery.attempts >= MAX_RECOVERY_ATTEMPTS {
+                    if recovery.thread_ts.is_some() && recovery.attempts >= MAX_RECOVERY_ATTEMPTS {
                         tracing::error!(key = %recovery.key, %error, "Slack recovery post failed; giving up");
                         self.stored.outbox.remove(index);
                     } else {
@@ -1945,6 +1975,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unwritable_state_blocks_only_shutdown_notices() {
+        use std::os::unix::fs::PermissionsExt;
+        let (slack, url) = fake_slack().await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alerts.json");
+        let cfg = config(&url, Some(path), true);
+        let signals = |at, ok, count| Signals {
+            devices: Some(crate::devices::DeviceAlertInput {
+                fast_success_ms: Some(at),
+                unsafe_shutdowns: BTreeMap::from([("wwn-a".into(), count)]),
+                ..Default::default()
+            }),
+            ..fleet(at, true, ok)
+        };
+        let mut engine = Engine::load(cfg.clone());
+        engine.tick(T0, &signals(T0, true, 129)).await;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        for check in 1..=3 {
+            let at = T0 + check * MIN;
+            engine.tick(at, &signals(at, false, 130)).await;
+        }
+        let blocked_posts = slack.posts.lock().unwrap().clone();
+        engine
+            .tick(T0 + 4 * MIN, &signals(T0 + 4 * MIN, true, 130))
+            .await;
+        let recovered_posts = slack.posts.lock().unwrap().clone();
+        // Only the baseline was saved, so restart must detect the increase again.
+        drop(engine);
+        let mut engine = Engine::load(cfg.clone());
+        engine
+            .tick(T0 + 5 * MIN, &signals(T0 + 5 * MIN, true, 130))
+            .await;
+        let restarted_posts = slack.posts.lock().unwrap().clone();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(blocked_posts.len(), 1);
+        assert!(
+            blocked_posts[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("ollama-http failing")
+        );
+        assert_eq!(recovered_posts.len(), 2);
+        assert_eq!(recovered_posts[1]["thread_ts"], posts_ts(1));
+        assert_eq!(restarted_posts, recovered_posts);
+        engine
+            .tick(T0 + 6 * MIN, &signals(T0 + 6 * MIN, true, 130))
+            .await;
+        drop(engine);
+        let mut engine = Engine::load(cfg);
+        engine
+            .tick(T0 + 7 * MIN, &signals(T0 + 7 * MIN, true, 130))
+            .await;
+        let posts = slack.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 3);
+        assert_eq!(
+            posts[2],
+            json!({"channel":"C-test", "text":"factory-gpu: unclean shutdown recorded on wwn-a (129 → 130)"})
+        );
+    }
+
+    #[tokio::test]
+    async fn unsafe_shutdown_increases_survive_restarts_per_drive() {
+        let (slack, url) = fake_slack().await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alerts.json");
+        let signals = |a, b| Signals {
+            devices: Some(crate::devices::DeviceAlertInput {
+                fast_success_ms: Some(T0),
+                unsafe_shutdowns: BTreeMap::from([("wwn-a".into(), a), ("wwn-b".into(), b)]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = config(&url, Some(path), true);
+        let mut engine = Engine::load(cfg.clone());
+        engine.tick(T0, &signals(129, 4)).await;
+        assert!(slack.posts.lock().unwrap().is_empty());
+        drop(engine);
+        let mut engine = Engine::load(cfg.clone());
+        engine.tick(T0 + 1, &signals(129, 4)).await;
+        assert!(slack.posts.lock().unwrap().is_empty());
+        engine.tick(T0 + 2, &signals(130, 4)).await;
+        engine.tick(T0 + 3, &signals(130, 4)).await;
+        let posts = slack.posts.lock().unwrap().clone();
+        assert_eq!(
+            posts,
+            vec![
+                json!({"channel":"C-test", "text":"factory-gpu: unclean shutdown recorded on wwn-a (129 → 130)"})
+            ]
+        );
+        drop(engine);
+        let mut engine = Engine::load(cfg.clone());
+        engine.tick(T0 + 4, &signals(130, 4)).await;
+        assert_eq!(slack.posts.lock().unwrap().len(), 1);
+        // Persist a failed delivery, then retry it after restart without losing the increase.
+        *slack.fail.lock().unwrap() = 1;
+        engine.tick(T0 + 5, &signals(130, 7)).await;
+        drop(engine);
+        let mut engine = Engine::load(cfg);
+        engine.tick(T0 + 30_005, &signals(130, 7)).await;
+        engine.tick(T0 + 30_006, &signals(130, 7)).await;
+        let posts = slack.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(
+            posts[1]["text"],
+            "factory-gpu: unclean shutdown recorded on wwn-b (4 → 7)"
+        );
+        assert!(engine.view().active.is_empty());
+    }
+
+    #[tokio::test]
     async fn restart_keeps_state_without_reposting() {
         use std::os::unix::fs::PermissionsExt;
         let (slack, url) = fake_slack().await;
@@ -2072,7 +2213,7 @@ mod tests {
         let mut restarted = Engine::load(config(&url, Some(path), true));
         assert!(restarted.stored.active.is_empty());
         assert_eq!(restarted.stored.outbox.len(), 1);
-        assert_eq!(restarted.stored.outbox[0].thread_ts, posts_ts(2));
+        assert_eq!(restarted.stored.outbox[0].thread_ts, Some(posts_ts(2)));
         restarted.tick(T0 + 2 * MIN, &cleared).await;
         restarted.tick(T0 + 3 * MIN, &cleared).await;
         let posts = slack.posts.lock().unwrap().clone();
@@ -2387,6 +2528,7 @@ mod tests {
             cpu_temp_c: cpu,
             filesystems,
             smart,
+            unsafe_shutdowns: BTreeMap::new(),
         };
         let quiet_fs = Some(vec![FsPressure {
             id: "root".into(),

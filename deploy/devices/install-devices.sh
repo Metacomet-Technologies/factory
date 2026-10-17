@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the read-only SMART snapshot helper. Does not run smartctl.
+# Install read-only device snapshot helpers. Does not run probes.
 set -Eeuo pipefail
 umask 0027
 here=$(dirname "$(realpath "$0")")
@@ -25,12 +25,19 @@ done
 lib=$root/usr/local/lib/factory-devices
 state=$root/var/lib/factory-devices
 units=$root/etc/systemd/system
-helper=$lib/smart-snapshot.py
 reboot=$root/var/lib/factory-reboot-status/status.json
+artifacts=(smart-snapshot.py maintenance-snapshot.py factory-devices-smart.service factory-devices-smart.timer factory-devices-maintenance.service factory-devices-maintenance.timer)
+
+for name in "${artifacts[@]}"; do
+    [[ -f $here/$name && -r $here/$name ]] || { echo "ERROR: missing artifact: $name" >&2; exit 1; }
+done
 
 if $preflight; then
-    [[ -f $helper && -f $units/factory-devices-smart.service && -f $units/factory-devices-smart.timer ]] || { echo 'ERROR: devices helper is not installed.' >&2; exit 1; }
-    cmp -s "$here/smart-snapshot.py" "$helper" || { echo 'ERROR: installed helper does not match this tree.' >&2; exit 1; }
+    for name in "${artifacts[@]}"; do
+        destination=$units/$name
+        [[ $name != *.py ]] || destination=$lib/$name
+        cmp -s "$here/$name" "$destination" || { echo "ERROR: installed $name is missing or does not match this tree." >&2; exit 1; }
+    done
     if [[ -r $reboot ]]; then
         echo 'Reboot status is readable.'
     else
@@ -40,18 +47,24 @@ if $preflight; then
 fi
 
 stamp=$(date +%Y%m%d%H%M%S)
-snapshot=$root/var/backups/factory-devices/$stamp
-mkdir -p "$snapshot" "$lib" "$state" "$units"
-for path in "$helper" "$units/factory-devices-smart.service" "$units/factory-devices-smart.timer"; do
+mkdir -p "$root/var/backups/factory-devices" "$lib" "$state" "$units"
+snapshot=$(mktemp -d "$root/var/backups/factory-devices/$stamp.XXXXXX")
+trap 'printf "ERROR: install failed at line %s. Rollback: sudo bash %q %q\n" "$LINENO" "$here/rollback-devices.sh" "$snapshot" >&2' ERR
+for name in "${artifacts[@]}"; do
+    path=$units/$name
+    [[ $name != *.py ]] || path=$lib/$name
     if [[ -f $path ]]; then
         cp -a "$path" "$snapshot/$(basename "$path")"
     else
         : > "$snapshot/$(basename "$path").absent"
     fi
 done
-install -m 0755 "$here/smart-snapshot.py" "$helper"
-install -m 0644 "$here/factory-devices-smart.service" "$units/factory-devices-smart.service"
-install -m 0644 "$here/factory-devices-smart.timer" "$units/factory-devices-smart.timer"
+for name in "${artifacts[@]}"; do
+    path=$units/$name
+    mode=0644
+    if [[ $name == *.py ]]; then path=$lib/$name; mode=0755; fi
+    install -m "$mode" "$here/$name" "$path"
+done
 # Root installs use factory-api. Unprivileged tests supply DEVICES_TEST_GROUP.
 group=
 if [[ -n $root && -n ${DEVICES_TEST_GROUP:-} ]]; then
@@ -63,14 +76,17 @@ if [[ -n $group ]]; then
     getent group "$group" >/dev/null || { echo "ERROR: group $group is missing." >&2; exit 1; }
     chgrp -- "$group" "$state"
     chmod 2750 "$state"
-    if [[ -f $state/smart.json && ! -L $state/smart.json ]]; then
-        chgrp -- "$group" "$state/smart.json"
-        chmod 0640 "$state/smart.json"
-    fi
+    for file in smart.json maintenance.json; do
+        if [[ -f $state/$file && ! -L $state/$file ]]; then
+            chgrp -- "$group" "$state/$file"
+            chmod 0640 "$state/$file"
+        fi
+    done
 else
     chmod 0750 "$state"
 fi
 systemctl daemon-reload
 systemctl enable --now factory-devices-smart.timer
-echo "Installed factory device SMART helper. Snapshot directory $state"
+systemctl enable --now factory-devices-maintenance.timer
+echo "Installed factory device snapshot helpers. Snapshot directory $state"
 echo "Rollback: sudo bash $here/rollback-devices.sh $snapshot"

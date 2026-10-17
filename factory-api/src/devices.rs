@@ -16,6 +16,7 @@ use utoipa::ToSchema;
 pub const DEVICE_ID: &str = "factory-gpu";
 pub const FAST_INTERVAL_MS: i64 = 15_000;
 pub const SLOW_INTERVAL_MS: i64 = 300_000;
+pub const MAINTENANCE_STALE_MS: i64 = 2 * 3_600_000;
 pub const DEFAULT_REBOOT_STATUS: &str = "/var/lib/factory-reboot-status/status.json";
 pub const READ_CAP: usize = 1_048_576;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -155,6 +156,8 @@ pub struct Drive {
     pub media_errors: Metric,
     pub media_critical: bool,
     pub temperature: Metric,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsafe_shutdowns: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -267,6 +270,91 @@ pub struct DeviceView {
     pub generated_at_ms: i64,
     pub warnings: Vec<String>,
     pub device: HostSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<NodeMaintenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum MaintenanceProbe<T> {
+    Available(T),
+    Unsupported { error: Option<String> },
+    Error { error: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct UpdateCounts {
+    pub security: u64,
+    pub other: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct HeldPackages {
+    pub packages: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct RebootSetting {
+    pub value: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct JournalSize {
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct AutoUpdate {
+    pub check: bool,
+    pub apply: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceServiceState {
+    Enabled,
+    Disabled,
+    Absent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeAvailability {
+    Available,
+    Unsupported,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct MaintenanceServices {
+    pub availability: ProbeAvailability,
+    pub unattended_upgrades: MaintenanceServiceState,
+    pub fstrim_timer: MaintenanceServiceState,
+    pub smartd: MaintenanceServiceState,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct MaintenanceSnapshot {
+    pub schema: u8,
+    pub observed_at_ms: i64,
+    pub updates: MaintenanceProbe<UpdateCounts>,
+    pub held: MaintenanceProbe<HeldPackages>,
+    pub services: MaintenanceServices,
+    pub unattended_auto_reboot: MaintenanceProbe<RebootSetting>,
+    pub tailscale_auto_update: MaintenanceProbe<AutoUpdate>,
+    pub journal_bytes: MaintenanceProbe<JournalSize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum NodeMaintenance {
+    Available(MaintenanceSnapshot),
+    Stale(MaintenanceSnapshot),
+    PermissionDenied { error: String },
+    Unsupported { error: String },
+    Error { error: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -303,6 +391,7 @@ pub struct DeviceAlertInput {
     pub cpu_temp_c: Option<Option<f64>>,
     pub filesystems: Option<Vec<FsPressure>>,
     pub smart: Option<Vec<SmartPressure>>,
+    pub unsafe_shutdowns: BTreeMap<String, u64>,
 }
 
 fn rank(status: HealthStatus) -> u8 {
@@ -615,6 +704,7 @@ pub fn unavailable(now: i64) -> DeviceView {
         generated_at_ms: now,
         warnings: vec![waiting.into()],
         device: host,
+        maintenance: None,
     };
     view.device.health = assess(&view.device, now);
     view
@@ -632,6 +722,11 @@ fn mark_stale(metric: &mut Metric, detail: String) {
 pub fn freshen(view: &DeviceView, now: i64) -> DeviceView {
     let mut copy = view.clone();
     copy.generated_at_ms = now;
+    if let Some(NodeMaintenance::Available(snapshot)) = &copy.maintenance
+        && now.saturating_sub(snapshot.observed_at_ms) > MAINTENANCE_STALE_MS
+    {
+        copy.maintenance = Some(NodeMaintenance::Stale(snapshot.clone()));
+    }
     let age = now.saturating_sub(copy.device.observed_at_ms);
     if age > FAST_INTERVAL_MS * 2 {
         let detail = format!("last sample at {}", copy.device.observed_at_ms);
@@ -740,6 +835,16 @@ impl DeviceView {
             cpu_temp_c,
             filesystems,
             smart,
+            unsafe_shutdowns: self
+                .device
+                .drives
+                .iter()
+                .filter_map(|drive| {
+                    drive
+                        .unsafe_shutdowns
+                        .map(|count| (drive.id.clone(), count))
+                })
+                .collect(),
         }
     }
 
@@ -907,6 +1012,7 @@ struct Slow {
     smart: Availability,
     cooling: Cooling,
     cpu_temp: Metric,
+    maintenance: NodeMaintenance,
 }
 
 #[derive(Default)]
@@ -1333,6 +1439,7 @@ fn load_drives(root: &Path, at: i64, timeout: Duration) -> (Vec<Drive>, Availabi
                     "SMART snapshot missing",
                 ),
                 media_critical: false,
+                unsafe_shutdowns: None,
                 temperature: blank_metric(
                     "C",
                     at,
@@ -1375,6 +1482,8 @@ struct SmartEntry {
     media_critical: Option<bool>,
     #[serde(default)]
     temperature_c: Option<f64>,
+    #[serde(default)]
+    unsafe_shutdowns: Option<u64>,
 }
 
 fn apply_smart(drives: &mut [Drive], root: &Path, at: i64, timeout: Duration) -> Availability {
@@ -1409,6 +1518,7 @@ fn apply_smart(drives: &mut [Drive], root: &Path, at: i64, timeout: Duration) ->
                 unsupported_smart(drive, observed)
             }
             Some(entry) => {
+                drive.unsafe_shutdowns = entry.unsafe_shutdowns;
                 drive.smart = SmartStatus {
                     availability: Availability::Available,
                     passed: entry.passed,
@@ -1659,6 +1769,49 @@ fn load_slow(root: &Path, at: i64, timeout: Duration) -> Slow {
             fans_availability,
         },
         cpu_temp,
+        maintenance: load_maintenance(root, at, timeout),
+    }
+}
+
+fn load_maintenance(root: &Path, at: i64, timeout: Duration) -> NodeMaintenance {
+    let text = match read_text(
+        &child_path(root, "var/lib/factory-devices/maintenance.json"),
+        timeout,
+    ) {
+        Ok(text) => text,
+        Err(ProbeError::Missing | ProbeError::Denied) => {
+            return NodeMaintenance::PermissionDenied {
+                error: "snapshot not readable".into(),
+            };
+        }
+        Err(error) => {
+            return NodeMaintenance::Error {
+                error: detail_of(&error),
+            };
+        }
+    };
+    let snapshot: MaintenanceSnapshot = match serde_json::from_str(&text) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return NodeMaintenance::Error {
+                error: "malformed".into(),
+            };
+        }
+    };
+    if snapshot.schema != 1 {
+        return NodeMaintenance::Unsupported {
+            error: "unsupported schema".into(),
+        };
+    }
+    if snapshot.observed_at_ms < 0 {
+        return NodeMaintenance::Error {
+            error: "invalid observation time".into(),
+        };
+    }
+    if at.saturating_sub(snapshot.observed_at_ms) > MAINTENANCE_STALE_MS {
+        NodeMaintenance::Stale(snapshot)
+    } else {
+        NodeMaintenance::Available(snapshot)
     }
 }
 
@@ -2145,6 +2298,7 @@ pub fn sample_timeout(
         generated_at_ms: at,
         warnings,
         device: host,
+        maintenance: Some(slow.maintenance.clone()),
     }
 }
 
@@ -2252,6 +2406,125 @@ mod tests {
             &root,
             "proc/net/dev",
             "  lo: 9 0 0 0 0 0 0 0 9 0 0 0 0 0 0 0\n  eth0: 4000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0\n",
+        );
+    }
+
+    #[test]
+    fn maintenance_file_states_cache_and_health_are_independent() {
+        use serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path());
+        let at = 10_000;
+        let read = |now| {
+            sample(
+                root.path(),
+                &mut Sampler::default(),
+                &inputs(root.path(), now),
+            )
+        };
+        let path = "var/lib/factory-devices/maintenance.json";
+        let missing = read(at);
+        assert!(matches!(
+            missing.maintenance,
+            Some(NodeMaintenance::PermissionDenied { .. })
+        ));
+        let payload = json!({
+            "schema": 1, "observed_at_ms": at,
+            "updates": {"availability":"available", "security":2, "other":7},
+            "held": {"availability":"available", "packages":["linux-image"]},
+            "services": {"availability":"error", "unattended_upgrades":"enabled", "fstrim_timer":"disabled", "smartd":"unknown"},
+            "unattended_auto_reboot": {"availability":"available", "value":true},
+            "tailscale_auto_update": {"availability":"unsupported"},
+            "journal_bytes": {"availability":"available", "value":1234}
+        });
+        write(root.path(), path, &payload.to_string());
+        let mut sampler = Sampler::default();
+        let available = sample(root.path(), &mut sampler, &inputs(root.path(), at));
+        let Some(NodeMaintenance::Available(snapshot)) = &available.maintenance else {
+            panic!("available snapshot")
+        };
+        assert!(matches!(
+            snapshot.updates,
+            MaintenanceProbe::Available(UpdateCounts {
+                security: 2,
+                other: 7
+            })
+        ));
+        assert_eq!(
+            snapshot.services.fstrim_timer,
+            MaintenanceServiceState::Disabled
+        );
+        assert_eq!(available.device.health, missing.device.health);
+        assert!(matches!(
+            freshen(&available, at + MAINTENANCE_STALE_MS).maintenance,
+            Some(NodeMaintenance::Available(_))
+        ));
+        assert!(matches!(
+            freshen(&available, at + MAINTENANCE_STALE_MS + 1).maintenance,
+            Some(NodeMaintenance::Stale(_))
+        ));
+        assert!(matches!(
+            read(at + MAINTENANCE_STALE_MS + 1).maintenance,
+            Some(NodeMaintenance::Stale(_))
+        ));
+        write(root.path(), path, "bad-json");
+        let cached = sample(
+            root.path(),
+            &mut sampler,
+            &inputs(root.path(), at + SLOW_INTERVAL_MS - 1),
+        );
+        assert_eq!(cached.maintenance, available.maintenance);
+        let malformed = sample(
+            root.path(),
+            &mut sampler,
+            &inputs(root.path(), at + SLOW_INTERVAL_MS),
+        );
+        assert!(matches!(
+            malformed.maintenance,
+            Some(NodeMaintenance::Error { .. })
+        ));
+        write(root.path(), path, &payload.to_string());
+        let fullpath = root.path().join(path);
+        fs::set_permissions(&fullpath, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(matches!(
+            read(at).maintenance,
+            Some(NodeMaintenance::PermissionDenied { .. })
+        ));
+        fs::set_permissions(&fullpath, fs::Permissions::from_mode(0o640)).unwrap();
+        let mut unsupported = payload.clone();
+        unsupported["schema"] = json!(2);
+        write(root.path(), path, &unsupported.to_string());
+        assert!(matches!(
+            read(at).maintenance,
+            Some(NodeMaintenance::Unsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn unsafe_shutdowns_are_optional_and_use_stable_drive_identity() {
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path());
+        let before = sample(
+            root.path(),
+            &mut Sampler::default(),
+            &inputs(root.path(), 100),
+        );
+        assert!(before.device.drives[0].unsafe_shutdowns.is_none());
+        assert!(before.alert_input(100).unsafe_shutdowns.is_empty());
+        write(
+            root.path(),
+            "var/lib/factory-devices/smart.json",
+            r#"{"drives":[{"kernel":"nvme0n1","passed":true,"unsafe_shutdowns":129}]}"#,
+        );
+        let after = sample(
+            root.path(),
+            &mut Sampler::default(),
+            &inputs(root.path(), 100),
+        );
+        assert_eq!(after.device.drives[0].unsafe_shutdowns, Some(129));
+        assert_eq!(
+            after.alert_input(100).unsafe_shutdowns.get("wwn-abc"),
+            Some(&129)
         );
     }
 
