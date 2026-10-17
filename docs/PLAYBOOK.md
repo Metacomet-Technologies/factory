@@ -167,6 +167,7 @@ gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
 ## 8. Gotchas we've already hit
 
 **Process**
+- Interactive `su agent` / `sudo -iu agent` sessions count as agent work and block the reboot policy indefinitely; exit them when done. `opencode serve --service` started by interactive opencode survives logout and is allowlisted. Check with `ps -u agent -ww -o pid=,ppid=,etime=,args=`.
 - Tests that pass locally can hang on GitHub runners: every CI job sets `timeout-minutes`, and async tests wrap their waits in an explicit timeout so a hang fails fast with a message.
 - Linear links PRs as closes from the branch name (`met-<n>`), and the public API cannot change an existing link's kind. Merges no longer move issues (team setting, 2026-10-17), so a wrong link type is cosmetic; fix it with the Linear MCP `update_diff` only for accuracy.
 - A manual `dispatch.ts poll --dry-run` waits on `dispatch.lock` while a live poll runs, so a slow dry run usually means a slow poll.
