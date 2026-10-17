@@ -234,7 +234,8 @@ export async function reviewPRs(ctx: Context) {
         const newerEvidence = issue.comments.some(c => Date.parse(c.createdAt ?? '') > Date.parse(deliveredAt ?? '')
           && new RegExp(`https://github.com/${config.repository}/pull/${pr}(?:\\s|[)/]|$)`).test(c.body)
           && new RegExp(`\\b${sha}\\b`).test(c.body) && /(?:`{3,}|~{3,})(?:diff|text|rust|typescript|ts|sh)\b|^\s*[-*]\s+\S+/m.test(c.body)
-          && commentMarkers(c.body).length === 0);
+          // The dispatcher's own Cursor evidence comment carries only its marker for this head.
+          && commentMarkers(c.body).every(line => line === `<!-- factory-dispatch:cursor-evidence pr:${pr} sha:${sha} -->`));
         if (!newerEvidence) continue;
         key += ' round:2';
       }

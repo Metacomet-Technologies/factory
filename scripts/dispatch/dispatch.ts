@@ -165,8 +165,7 @@ export function prompt(issue: Issue, runner = validate(issue).runner) {
 3. Read \`AGENTS.md\`, \`docs/agents/cloud.md\` and the README of each Isolation directory.
 4. Confirm \`get_issue\` works through the Linear MCP; otherwise stop and report.
 5. Never deploy, never touch production, never write dispatch or QA markers.
-Push your branch, then open the PR yourself; Cursor will not open it. Stop and report if you cannot.
-PR title starts with \`${issue.identifier} — \`; body says "${link === 'closes' ? 'Closes' : 'Contributes'} ${issue.identifier}".` : `Runner: factory-${runner}. Directory: /home/agent/work/factory-${branch}. Effort: ${effort}.
+Push your branch. Do not open a PR; Cursor opens it when your run ends. Do not post the Linear evidence comment; the dispatcher posts it. Title your work \`${issue.identifier} — ${issue.title}\`. End your reply with tests run and counts, deviations and unverified items.` : `Runner: factory-${runner}. Directory: /home/agent/work/factory-${branch}. Effort: ${effort}.
 
 ## 1. Start fresh
 The dispatcher already created branch ${branch} from origin/main in the directory above. Do not recreate it.
@@ -252,6 +251,12 @@ function githubJSON(args: string[]) {
   try { return JSON.parse(result.stdout); }
   catch { throw new Error('GitHub returned invalid JSON; retry next poll'); }
 }
+
+function github(args: string[], input?: string) {
+  const result = spawnSync('gh', args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 8_000_000, input });
+  if (result.status !== 0) throw new Error('GitHub write failed; retry next poll');
+}
+const evidencePattern = /^<!-- factory-dispatch:cursor-evidence pr:(\d+) sha:[a-f0-9]{40} -->$/;
 
 const page = 'pageInfo { hasNextPage endCursor }';
 const fields = {
@@ -435,6 +440,86 @@ export async function run(command: string, identifier: string | undefined, dryRu
     await comment(issue, `Thread labeled factory.\n\n${marker(`labeled ${id} factory`)}`);
   }
 
+  // Brings the PR Cursor opened (autoCreatePR) to the factory standard. Each step is
+  // idempotent: it reads the PR first and acts only when something is missing.
+  async function normalizeCursorPR(issue: Issue, run: any) {
+    const { slug: repoSlug } = claimedRepo(issue)!;
+    const base = `https://github.com/${repoSlug}/pull/`;
+    const urls: string[] = (Array.isArray(run?.git?.branches) ? run.git.branches : []).flatMap((branch: any) => typeof branch?.prUrl === 'string' ? [branch.prUrl] : []);
+    const reported = [...new Set(urls.flatMap(url => url.match(new RegExp(`^${base.replaceAll('.', '\\.')}(\\d+)/?$`, 'i'))?.[1] ?? []))];
+    if (urls.length > reported.length) log('cursor-pr-foreign', { issue: issue.identifier, count: urls.length - reported.length });
+    // The first PR with evidence is the issue's PR; QA and follow-ups stay on it.
+    const known = issue.comments.flatMap(c => commentMarkers(c.body)).map(line => line.match(evidencePattern)?.[1]).find(Boolean);
+    const pr = known ?? reported[0];
+    for (const other of reported.filter(n => n !== pr)) {
+      log('cursor-pr-other', { issue: issue.identifier, pr: other, kept: pr });
+      if (!has(issue, `cursor-pr-other pr:${other}`)) await comment(issue, `${devonMention}: Cursor reported another PR, ${base}${other}, besides ${base}${pr}. The dispatcher does not act on it; inspect before manual recovery.\n\n${marker(`cursor-pr-other pr:${other}`)}`);
+    }
+    if (!pr) return;
+    let step = 'read';
+    try {
+      const view = () => githubJSON(['pr', 'view', pr, '--repo', repoSlug, '--json', 'state,isDraft,title,body,headRefOid,baseRefName']);
+      const data = view();
+      if (data.state !== 'OPEN' || data.baseRefName !== 'main' || !/^[a-f0-9]{40}$/.test(data.headRefOid ?? '')) {
+        log('cursor-pr-skipped', { issue: issue.identifier, pr, state: data.state, base: data.baseRefName }); return;
+      }
+      step = 'title';
+      if (!String(data.title ?? '').startsWith(`${issue.identifier} — `)) {
+        github(['pr', 'edit', pr, '--repo', repoSlug, '--title', `${issue.identifier} — ${issue.title}`]);
+        log('cursor-pr', { issue: issue.identifier, pr, action: 'title' });
+      }
+      step = 'link';
+      const link = `${validate(issue).link === 'closes' ? 'Closes' : 'Contributes'} ${issue.identifier}`;
+      const body = String(data.body ?? '');
+      if (!body.split(/\r?\n/).some(line => line.trim() === link)) {
+        github(['pr', 'edit', pr, '--repo', repoSlug, '--body-file', '-'], body.trim() ? `${link}\n\n${body}` : link);
+        log('cursor-pr', { issue: issue.identifier, pr, action: 'link' });
+      }
+      step = 'ready';
+      if (data.isDraft !== false) {
+        github(['pr', 'ready', pr, '--repo', repoSlug]);
+        log('cursor-pr', { issue: issue.identifier, pr, action: 'ready' });
+      }
+      step = 'evidence';
+      const sha = data.headRefOid;
+      if (has(issue, `cursor-evidence pr:${pr} sha:${sha}`)) return;
+      const pagesRead = githubJSON(['api', `repos/${repoSlug}/pulls/${pr}/files?per_page=100`, '--paginate', '--slurp']);
+      const files = Array.isArray(pagesRead) && pagesRead.every(Array.isArray) ? pagesRead.flat() : [];
+      // GitHub caps this list at 3,000 files; never post a possibly truncated list.
+      if (!files.length || files.length >= 3000 || files.some(file => typeof file?.filename !== 'string'
+        || (file.status === 'renamed' && typeof file.previous_filename !== 'string'))) throw new Error('files unavailable');
+      // A push during the read would mislabel the list; the next poll retries.
+      if (view().headRefOid !== sha) { log('cursor-pr-pending', { issue: issue.identifier, pr, reason: 'head moved' }); return; }
+      const list = files.map(file => `- \`${file.filename}\`${file.status === 'removed' ? ' (deleted)' : file.status === 'renamed' ? ` (renamed from \`${file.previous_filename}\`)` : ''}`);
+      await comment(issue, `${base}${pr}\nHead: ${sha}\nFiles (\`git diff --name-only origin/main...${sha}\`):\n${list.join('\n')}\n\n${marker(`cursor-evidence pr:${pr} sha:${sha}`)}`);
+      log('cursor-pr', { issue: issue.identifier, pr, action: 'evidence', sha });
+    } catch (error) {
+      log('cursor-pr-failed', { issue: issue.identifier, pr, step, message: (error as Error).message });
+      if (!has(issue, `cursor-pr-failed pr:${pr} step:${step}`)) {
+        await comment(issue, `${devonMention}: Cursor PR normalization failed at step "${step}" for ${base}${pr}. The dispatcher retries each poll.\n\n${marker(`cursor-pr-failed pr:${pr} step:${step}`)}`);
+      }
+    }
+  }
+  // Usage can lag a finished run: a zero or failed first read is re-read once on a later poll.
+  async function cursorUsage(issue: Issue, id: string, final: boolean) {
+    let text;
+    try {
+      const data = await cursor('GET', `/v1/agents/${id}/usage`);
+      const usage = data?.totalUsage;
+      const tokens = usage?.totalTokens ?? ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'].reduce((sum, name) => sum + usage?.[name], 0);
+      if (!Number.isSafeInteger(tokens) || tokens < 0) throw new Error('Cursor usage unreadable');
+      const cents = data?.cost?.chargedCents;
+      text = `Cursor usage: ${tokens} tokens, ${typeof cents === 'number' ? `$${(cents / 100).toFixed(2)}` : '$unknown'} charged (0 = plan-included)`;
+      if (tokens === 0 && !final) text = undefined;
+    } catch (error) {
+      log('cursor-usage-failed', { issue: issue.identifier, agent: id, message: (error as Error).message });
+      if (final) text = `Cursor usage unavailable: ${(error as Error).message}.`;
+    }
+    if (text) await comment(issue, `${text}\n\n${marker(`cursor-usage ${id}`)}`);
+    else await comment(issue, `Cursor usage not reported yet; re-reading once on a later poll.\n\n${marker(`cursor-usage-pending ${id}`)}`);
+    log('cursor-usage', { issue: issue.identifier, agent: id, final: !!text });
+  }
+
   const raw = await pages(`query Queue($filter: IssueFilter!, $after: String) { issues(filter: $filter, first: 20, after: $after, includeArchived: true) { nodes { ${issueFields} } ${page} } }`, {
     filter: { team: { key: { eq: team } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }, { comments: { some: { body: { contains: '<!-- factory-qa:' } } } }] },
   }, data => data.issues);
@@ -512,10 +597,10 @@ export async function run(command: string, identifier: string | undefined, dryRu
     if (runner === 'cursor') {
       await comment(issue, `Dispatch claimed on cursor. If submission is interrupted, inspect Cursor before manual recovery; do not delete this claim to retry blindly.\nEngine cursor: bills Cursor usage (Ultra plan).\n\n${marker('claim runner:cursor')}`);
       active.cursor++;
-      // autoCreatePR stays off: Cursor would open its PR only after the run, with its
-      // own title and body. The builder prompt makes the agent open it instead.
+      // Cursor opens the PR when the run ends, as Devon (user-key default), with its own
+      // title and body; normalizeCursorPR brings it to the factory standard.
       const payload = { name: Array.from(`${issue.identifier} — ${issue.title}`).slice(0, 100).join(''), prompt: { text: prompt(issue, 'cursor') },
-        repos: [{ url: `https://github.com/${repo!.slug}`, startingRef: 'main' }], autoCreatePR: false };
+        repos: [{ url: `https://github.com/${repo!.slug}`, startingRef: 'main' }], autoCreatePR: true, skipReviewerRequest: true };
       let id = 'bc-00000000-0000-0000-0000-000000000000';
       if (dryRun) showCursor(issue, 'POST', '/v1/agents', { ...payload, prompt: { text: '$PROMPT' } });
       else {
@@ -567,27 +652,30 @@ export async function run(command: string, identifier: string | undefined, dryRu
     log('dispatched', { issue: issue.identifier, thread: dryRun ? '<new-thread-id>' : id, runner });
     await labelThread(issue, id);
   }
-  // v1 has no webhooks: poll active cursor builders until a PR appears. Agent status is only
-  // ACTIVE/ARCHIVED; execution failures live on the latest run.
+  // v1 has no webhooks: poll active cursor builders. Agent status is only ACTIVE/ARCHIVED;
+  // execution failures and the PR Cursor opened live on the latest run.
   for (const issue of issues) {
     const match = thread(issue);
     const claim = issue.comments.find(c => commentMarkers(c.body).some(line => claimPattern.test(line)));
+    const linked = (status: string) => issue.attachments.some(a => isGitHubPR(a) && a.metadata?.status === status
+      && !(Date.parse(a.createdAt) <= Date.parse(claim?.createdAt ?? '')));
     if (match?.[2] !== 'cursor' || has(issue, 'wrapup') || has(issue, `cursor-failed ${match[1]}`)
-      || ['completed', 'canceled'].includes(issue.state.type) || issue.attachments.some(a => isGitHubPR(a)
-        && ['open', 'merged'].includes(a.metadata?.status as string) && !(Date.parse(a.createdAt) <= Date.parse(claim?.createdAt ?? '')))) continue;
+      || ['completed', 'canceled'].includes(issue.state.type) || linked('merged')) continue;
     const id = match[1];
     if (dryRun) { showCursor(issue, 'GET', `/v1/agents/${id}`); continue; }
-    let status;
+    let status, run;
     try {
       const agent = await cursor('GET', `/v1/agents/${id}`);
-      status = agent?.status === 'ARCHIVED' ? 'ARCHIVED'
-        : typeof agent?.latestRunId === 'string' && /^run-[\w-]+$/.test(agent.latestRunId)
-          ? (await cursor('GET', `/v1/agents/${id}/runs/${agent.latestRunId}`))?.status : undefined;
+      if (agent?.status !== 'ARCHIVED' && typeof agent?.latestRunId === 'string' && /^run-[\w-]+$/.test(agent.latestRunId)) run = await cursor('GET', `/v1/agents/${id}/runs/${agent.latestRunId}`);
+      status = agent?.status === 'ARCHIVED' ? 'ARCHIVED' : run?.status;
     } catch (error) {
       log('cursor-status-pending', { issue: issue.identifier, agent: id, message: (error as Error).message });
       continue;
     }
-    if (status !== 'ARCHIVED' && !cursorFailures.includes(status)) continue;
+    // Cursor opens or updates the PR when a run ends; an active follow-up is re-checked after it.
+    if (status === 'FINISHED') await normalizeCursorPR(issue, run);
+    // Failures are reported only until a PR links, as before autoCreatePR.
+    if (linked('open') || (status !== 'ARCHIVED' && !cursorFailures.includes(status))) continue;
     await comment(issue, `${devonMention}: Cursor agent ${status}: https://cursor.com/agents/${id}. The dispatcher stops acting on it; inspect before manual recovery.\n\n${marker(`cursor-failed ${id}`)}`);
     log('cursor-terminal', { issue: issue.identifier, agent: id, status });
   }
@@ -612,7 +700,14 @@ export async function run(command: string, identifier: string | undefined, dryRu
   }
   for (const issue of qaContext.issues) {
     const match = thread(issue);
-    if (!match || has(issue, 'wrapup')) continue;
+    if (!match) continue;
+    if (has(issue, 'wrapup')) {
+      if (has(issue, `cursor-usage-pending ${match[1]}`) && !has(issue, `cursor-usage ${match[1]}`)) {
+        if (dryRun) showCursor(issue, 'GET', `/v1/agents/${match[1]}/usage`);
+        else await cursorUsage(issue, match[1], true);
+      }
+      continue;
+    }
     if (has(issue, 'wrapup-claim')) { log('wrapup-claimed', { issue: issue.identifier }); continue; }
     const claim = issue.comments.find(comment => commentMarkers(comment.body).some(line => claimPattern.test(line)));
     if (!issue.attachments.some(attachment => isMergedGitHubPR(attachment)
@@ -643,6 +738,9 @@ export async function run(command: string, identifier: string | undefined, dryRu
     await comment(issue, `Wrap-up submitted to https://ampcode.com/threads/${id}. Devon still owns deployment and verification.\n\n${marker('wrapup')}${cloud ? `\n${marker(`wrapup-thread ${id}`)}` : ''}`);
     log('wrapup', { issue: issue.identifier });
     if (cloud) await labelThread(issue, id);
+    // Usage never blocks wrap-up: it is read after the wrap-up marker exists.
+    if (cloud && dryRun) showCursor(issue, 'GET', `/v1/agents/${match[1]}/usage`);
+    else if (cloud) await cursorUsage(issue, match[1], false);
   }
   await syncPlaybook(qaContext);
   for (const issue of issues) {
