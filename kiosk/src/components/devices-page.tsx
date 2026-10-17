@@ -1,9 +1,18 @@
-import { lazy, Suspense } from "react";
-import { Activity, Cpu, HardDrive, MemoryStick, Network, Thermometer, Wrench } from "lucide-react";
+import { lazy, Suspense, useState } from "react";
+import {
+  Activity,
+  Cpu,
+  HardDrive,
+  MemoryStick,
+  Network,
+  RadioTower,
+  Thermometer,
+  Wrench,
+} from "lucide-react";
 import type { DeviceHistory, DeviceRange, DeviceView, Metric } from "../api/types";
 import type { components } from "../api/generated";
-import { metricText } from "../lib/devices";
-import { number, seen } from "../lib/format";
+import { freshenRemote, linkState, metricText, type LinkState } from "../lib/devices";
+import { ms, number, seen } from "../lib/format";
 import { KeyValue } from "./ui/key-value";
 import { MeterBar } from "./ui/meter-bar";
 import { PageHeader } from "./ui/page-header";
@@ -65,8 +74,99 @@ function MetricStat({
   );
 }
 
+const linkText: Record<LinkState, string> = {
+  waiting: "Waiting for first sample",
+  live: "Live",
+  stale: "Stale",
+  offline: "Offline",
+};
+const linkTone: Record<LinkState, Tone> = {
+  waiting: "neutral",
+  live: "ok",
+  stale: "warn",
+  offline: "fail",
+};
+
+/** Transport and collection freshness for a remote device's agent, plus its capability limits. */
+function AgentLink({ view, now }: { view: DeviceView; now: number }) {
+  const ingest = view.ingest!;
+  const host = view.device;
+  const state = linkState(view, now);
+  // Remember the last time the link came back, so recovery is visible, not silent.
+  const [previous, setPrevious] = useState(state);
+  const [recoveredAt, setRecoveredAt] = useState<number | null>(null);
+  if (previous !== state) {
+    setPrevious(state);
+    setRecoveredAt(
+      state === "live" && (previous === "stale" || previous === "offline") ? now : null,
+    );
+  }
+  const waiting = state === "waiting";
+  const skew = ingest.clock_skew_ms;
+  return (
+    <Panel
+      title="Agent link"
+      subtitle={`Remote push · ${ingest.agent_version ? `agent ${ingest.agent_version}` : "no agent yet"}`}
+      icon={<RadioTower />}
+      index={1}
+      className="max-sm:col-span-full"
+      tone={state === "offline" ? "fail" : state === "stale" ? "warn" : undefined}
+      action={
+        <StatusChip tone={linkTone[state]} dot>
+          {linkText[state]}
+        </StatusChip>
+      }
+    >
+      <KeyValue
+        rows={[
+          [
+            "Transport",
+            ingest.last_received_at_ms == null
+              ? "No sample since factory-api started"
+              : `Received ${seen(ingest.last_received_at_ms, now)}`,
+          ],
+          ["Collection", waiting ? "—" : `Observed ${seen(host.observed_at_ms, now)}`],
+          [
+            "Session",
+            ingest.session_id ? `${ingest.session_id.slice(0, 8)} · seq ${ingest.seq ?? "—"}` : "—",
+          ],
+          [
+            "Clock skew",
+            skew == null ? "—" : `${skew > 0 ? "+" : skew < 0 ? "−" : ""}${ms(Math.abs(skew))}`,
+          ],
+          ["Dropped samples", number(ingest.dropped_samples)],
+          [
+            "Capabilities",
+            waiting
+              ? "—"
+              : `filesystems ${availabilityText(host.collector.filesystems)} · drives ${availabilityText(host.collector.drives)} · SMART ${availabilityText(host.collector.smart)} · fans ${availabilityText(host.cooling.fans_availability)}`,
+          ],
+        ]}
+      />
+      {recoveredAt != null && state === "live" && (
+        <p className="status-ok">Recovered {seen(recoveredAt, now)}.</p>
+      )}
+      {ingest.identity_conflict && (
+        <p role="alert" className="status-fail">
+          Identity conflict: two agents are using this credential.
+        </p>
+      )}
+      {view.warnings.map((warning) => (
+        <p key={warning} className="status-warn">
+          {warning}
+        </p>
+      ))}
+      <p className="muted">
+        Stale after 45 s without a received or observed sample. A live link does not prove every
+        metric is healthy; unsupported and permission-denied readings are shown as such.
+      </p>
+    </Panel>
+  );
+}
+
 export default function DevicesPage({
-  view,
+  deviceId,
+  view: received,
   history,
   range,
   setRange,
@@ -76,6 +176,7 @@ export default function DevicesPage({
   live,
   now,
 }: {
+  deviceId: string;
   view: DeviceView | null;
   history: DeviceHistory | null;
   range: DeviceRange;
@@ -86,16 +187,24 @@ export default function DevicesPage({
   live: boolean;
   now: number;
 }) {
+  // factory-gpu views come freshened by the server; a remote frame is freshened here
+  // every second, because it may be a cached push while refetches fail.
+  const view = received?.ingest != null ? freshenRemote(received, now) : received;
   const host = view?.device;
   const temperature = host?.cpu.temperature.value;
   const maintenance = host?.maintenance;
   const posture = view?.maintenance;
   const node =
     posture?.availability === "available" || posture?.availability === "stale" ? posture : null;
+  const remote = view?.ingest != null;
+  const link = view && remote ? linkState(view, now) : null;
+  const status = host?.health.status;
+  // A remote frame is labeled Live only while its agent link is live.
+  const current = live && (link == null || link === "live");
   return (
     <main id="main" className="dashboard devices-page">
       <PageHeader
-        eyebrow="factory-gpu"
+        eyebrow={deviceId}
         title="Host health"
         aside={
           <>
@@ -115,24 +224,18 @@ export default function DevicesPage({
         <div className="device-grid">
           <Panel
             title={host.identity.hostname ?? host.device_id}
-            subtitle={`Host summary · ${live ? "Live" : "Stored"} · up ${metricText(host.identity.uptime)}`}
+            subtitle={`Host summary · ${current ? "Live" : "Stored"} · up ${metricText(host.identity.uptime)}`}
             icon={<HardDrive />}
             index={0}
             className="device-summary"
-            tone={
-              host.health.status === "critical"
-                ? "fail"
-                : host.health.status === "warning"
-                  ? "warn"
-                  : undefined
-            }
+            tone={status === "critical" ? "fail" : status === "warning" ? "warn" : undefined}
             action={
               <StatusChip
-                tone={healthTone(host.health.status)}
+                tone={healthTone(status ?? host.health.status)}
                 dot
-                pulse={live && host.health.status === "critical"}
+                pulse={current && status === "critical"}
               >
-                {host.health.status}
+                {status}
               </StatusChip>
             }
             aria-label="Host summary"
@@ -175,6 +278,8 @@ export default function DevicesPage({
               </ul>
             )}
           </Panel>
+
+          {remote && view && <AgentLink view={view} now={now} />}
 
           <Panel
             title="CPU history"
@@ -333,89 +438,99 @@ export default function DevicesPage({
           {maintenance && (
             <Panel
               title="Maintenance"
-              subtitle="Node posture · backup, reboot, clock, power"
+              subtitle={
+                remote ? "Backup, reboot, clock" : "Node posture · backup, reboot, clock, power"
+              }
               icon={<Wrench />}
               index={7}
               className="max-sm:col-span-full"
             >
-              <p className="muted">
-                Maintenance snapshot: {availabilityText(posture?.availability ?? "unsupported")}
-                {node ? ` · observed ${seen(node.observed_at_ms, now)}` : " · no readable snapshot"}
-                {posture && "error" in posture ? ` · ${posture.error}` : ""}
-              </p>
-              <KeyValue
-                className={node?.availability === "stale" ? "muted" : undefined}
-                rows={[
-                  [
-                    "Pending updates",
-                    node?.updates.availability === "available"
-                      ? `${node.updates.security} security · ${node.updates.other} other`
-                      : (node?.updates.availability ?? "unavailable"),
-                  ],
-                  [
-                    "Held packages",
-                    node?.held.availability === "available"
-                      ? node.held.packages.join(", ") || "None"
-                      : (node?.held.availability ?? "unavailable"),
-                  ],
-                  ...(
-                    [
-                      ["unattended_upgrades", "unattended-upgrades"],
-                      ["fstrim_timer", "fstrim.timer"],
-                      ["smartd", "smartd"],
-                    ] as const
-                  ).map(([key, label]) => {
-                    const state = node?.services[key] ?? "unknown";
-                    return [
-                      label,
-                      <StatusChip
-                        key={key}
-                        tone={state === "enabled" ? "ok" : "warn"}
-                        aria-label={state === "enabled" ? undefined : `Warning: ${label} ${state}`}
-                      >
-                        {state}
-                      </StatusChip>,
-                    ] as const;
-                  }),
-                  [
-                    "Unattended auto-reboot",
-                    node?.unattended_auto_reboot.availability === "available" ? (
-                      <StatusChip
-                        key="unattended-auto-reboot"
-                        tone={node.unattended_auto_reboot.value ? "warn" : "neutral"}
-                        aria-label={
-                          node.unattended_auto_reboot.value
-                            ? "Warning: unattended auto-reboot enabled"
-                            : undefined
-                        }
-                      >
-                        {node.unattended_auto_reboot.value ? "On" : "Off"}
-                      </StatusChip>
-                    ) : (
-                      (node?.unattended_auto_reboot.availability ?? "unavailable")
-                    ),
-                  ],
-                  [
-                    "Tailscale auto-update",
-                    node?.tailscale_auto_update.availability === "available"
-                      ? `Check ${node.tailscale_auto_update.check ? "on" : "off"} · apply ${node.tailscale_auto_update.apply ? "on" : "off"}`
-                      : (node?.tailscale_auto_update.availability ?? "unavailable"),
-                  ],
-                  [
-                    "Journal size",
-                    node?.journal_bytes.availability === "available"
-                      ? number(node.journal_bytes.value / 1024 ** 2, "MiB")
-                      : (node?.journal_bytes.availability ?? "unavailable"),
-                  ],
-                  ...host.drives.map(
-                    (drive) =>
+              {!remote && (
+                <>
+                  <p className="muted">
+                    Maintenance snapshot: {availabilityText(posture?.availability ?? "unsupported")}
+                    {node
+                      ? ` · observed ${seen(node.observed_at_ms, now)}`
+                      : " · no readable snapshot"}
+                    {posture && "error" in posture ? ` · ${posture.error}` : ""}
+                  </p>
+                  <KeyValue
+                    className={node?.availability === "stale" ? "muted" : undefined}
+                    rows={[
                       [
-                        `${drive.kernel} unsafe shutdowns`,
-                        drive.unsafe_shutdowns == null ? "—" : number(drive.unsafe_shutdowns),
-                      ] as const,
-                  ),
-                ]}
-              />
+                        "Pending updates",
+                        node?.updates.availability === "available"
+                          ? `${node.updates.security} security · ${node.updates.other} other`
+                          : (node?.updates.availability ?? "unavailable"),
+                      ],
+                      [
+                        "Held packages",
+                        node?.held.availability === "available"
+                          ? node.held.packages.join(", ") || "None"
+                          : (node?.held.availability ?? "unavailable"),
+                      ],
+                      ...(
+                        [
+                          ["unattended_upgrades", "unattended-upgrades"],
+                          ["fstrim_timer", "fstrim.timer"],
+                          ["smartd", "smartd"],
+                        ] as const
+                      ).map(([key, label]) => {
+                        const state = node?.services[key] ?? "unknown";
+                        return [
+                          label,
+                          <StatusChip
+                            key={key}
+                            tone={state === "enabled" ? "ok" : "warn"}
+                            aria-label={
+                              state === "enabled" ? undefined : `Warning: ${label} ${state}`
+                            }
+                          >
+                            {state}
+                          </StatusChip>,
+                        ] as const;
+                      }),
+                      [
+                        "Unattended auto-reboot",
+                        node?.unattended_auto_reboot.availability === "available" ? (
+                          <StatusChip
+                            key="unattended-auto-reboot"
+                            tone={node.unattended_auto_reboot.value ? "warn" : "neutral"}
+                            aria-label={
+                              node.unattended_auto_reboot.value
+                                ? "Warning: unattended auto-reboot enabled"
+                                : undefined
+                            }
+                          >
+                            {node.unattended_auto_reboot.value ? "On" : "Off"}
+                          </StatusChip>
+                        ) : (
+                          (node?.unattended_auto_reboot.availability ?? "unavailable")
+                        ),
+                      ],
+                      [
+                        "Tailscale auto-update",
+                        node?.tailscale_auto_update.availability === "available"
+                          ? `Check ${node.tailscale_auto_update.check ? "on" : "off"} · apply ${node.tailscale_auto_update.apply ? "on" : "off"}`
+                          : (node?.tailscale_auto_update.availability ?? "unavailable"),
+                      ],
+                      [
+                        "Journal size",
+                        node?.journal_bytes.availability === "available"
+                          ? number(node.journal_bytes.value / 1024 ** 2, "MiB")
+                          : (node?.journal_bytes.availability ?? "unavailable"),
+                      ],
+                      ...host.drives.map(
+                        (drive) =>
+                          [
+                            `${drive.kernel} unsafe shutdowns`,
+                            drive.unsafe_shutdowns == null ? "—" : number(drive.unsafe_shutdowns),
+                          ] as const,
+                      ),
+                    ]}
+                  />
+                </>
+              )}
               <p>
                 Backup {seen(maintenance.backup.last_success_ms, now)}. Reboot{" "}
                 {maintenance.reboot.availability === "available"
@@ -429,11 +544,18 @@ export default function DevicesPage({
                   : maintenance.clock.synchronized
                     ? "synchronized"
                     : "not synchronized"}
-                . <a href={maintenance.ups.href}>UPS</a>
-                {maintenance.ups.status ? ` ${maintenance.ups.status}` : ""}
-                {maintenance.ups.charge_percent == null
-                  ? ""
-                  : ` · ${number(maintenance.ups.charge_percent)}%`}
+                .{" "}
+                {remote ? (
+                  "UPS is reported only for factory-gpu."
+                ) : (
+                  <>
+                    <a href={maintenance.ups.href}>UPS</a>
+                    {maintenance.ups.status ? ` ${maintenance.ups.status}` : ""}
+                    {maintenance.ups.charge_percent == null
+                      ? ""
+                      : ` · ${number(maintenance.ups.charge_percent)}%`}
+                  </>
+                )}
               </p>
               {maintenance.backup.error && (
                 <p className="status-warn">{maintenance.backup.error}</p>

@@ -183,6 +183,8 @@ pub struct Signals {
     pub ups_events: Vec<crate::ups_history::UpsEvent>,
     /// None means the device collector cannot be evaluated. Open device alerts stay open.
     pub devices: Option<crate::devices::DeviceAlertInput>,
+    /// Enrolled remote devices, keyed `devices:{device_id}:…` with the phase-1 thresholds.
+    pub remote_devices: Vec<(String, crate::devices::DeviceAlertInput)>,
     /// None when network storage cannot be read.
     pub network: Option<NetworkAlertInput>,
 }
@@ -605,35 +607,51 @@ impl Engine {
             self.pending_since.remove(&warn_key);
         }
     }
-    fn device_findings(&mut self, now: i64, input: &crate::devices::DeviceAlertInput) -> Findings {
+    /// factory-gpu uses prefix `devices:` and no label, as in phase 1. A remote device
+    /// uses `devices:{id}:` and names itself in each summary. `node_offline` defers
+    /// its telemetry alert to the fleet node alert, which already covers that case.
+    fn device_findings(
+        &mut self,
+        now: i64,
+        prefix: &str,
+        label: &str,
+        node_offline: bool,
+        input: &crate::devices::DeviceAlertInput,
+    ) -> Findings {
         let mut out = Findings::new();
-        let stale_key = "devices:telemetry";
+        let stale_key = format!("{prefix}telemetry");
         match input.fast_success_ms {
+            _ if node_offline => {
+                self.pending_since.remove(&stale_key);
+                if self.alert_open(&stale_key) {
+                    out.insert(stale_key, Verdict::Hold);
+                }
+            }
             Some(at) if now.saturating_sub(at) >= DEVICE_STALE_MS => {
-                self.pending_since.remove(stale_key);
+                self.pending_since.remove(&stale_key);
                 out.insert(
-                    stale_key.into(),
+                    stale_key,
                     Verdict::Fire(
                         AlertSeverity::Warning,
                         format!(
-                            "device telemetry stale: no fast sample for {}",
+                            "{label}device telemetry stale: no fast sample for {}",
                             duration(now - at)
                         ),
                     ),
                 );
             }
             Some(_) => {
-                self.pending_since.remove(stale_key);
+                self.pending_since.remove(&stale_key);
             }
             None => {
-                if self.alert_open(stale_key) {
-                    out.insert(stale_key.into(), Verdict::Hold);
-                } else if self.held(stale_key, now, DEVICE_STALE_MS) {
+                if self.alert_open(&stale_key) {
+                    out.insert(stale_key, Verdict::Hold);
+                } else if self.held(&stale_key, now, DEVICE_STALE_MS) {
                     out.insert(
-                        stale_key.into(),
+                        stale_key,
                         Verdict::Fire(
                             AlertSeverity::Warning,
-                            "device telemetry stale: no fast sample for 2 min".into(),
+                            format!("{label}device telemetry stale: no fast sample for 2 min"),
                         ),
                     );
                 }
@@ -642,15 +660,16 @@ impl Engine {
         self.device_level(
             &mut out,
             now,
-            "devices:cpu:temperature",
+            &format!("{prefix}cpu:temperature"),
             input.cpu_temp_c,
             &CPU_BAND,
-            "CPU temperature",
+            &format!("{label}CPU temperature"),
         );
+        let fs_prefix = format!("{prefix}fs:");
         match &input.filesystems {
             None => {
                 for open in &self.stored.active {
-                    if open.key.starts_with("devices:fs:") {
+                    if open.key.starts_with(&fs_prefix) {
                         out.insert(open.key.clone(), Verdict::Hold);
                     }
                 }
@@ -661,33 +680,34 @@ impl Engine {
                     self.device_level(
                         &mut out,
                         now,
-                        &format!("devices:fs:{id}:space"),
+                        &format!("{fs_prefix}{id}:space"),
                         fs.space_percent.map(Some),
                         &FS_BAND,
-                        &format!("filesystem {id} space"),
+                        &format!("{label}filesystem {id} space"),
                     );
                     self.device_level(
                         &mut out,
                         now,
-                        &format!("devices:fs:{id}:inodes"),
+                        &format!("{fs_prefix}{id}:inodes"),
                         fs.inode_percent.map(Some),
                         &FS_BAND,
-                        &format!("filesystem {id} inodes"),
+                        &format!("{label}filesystem {id} inodes"),
                     );
                 }
             }
         }
+        let smart_prefix = format!("{prefix}smart:");
         match &input.smart {
             None => {
                 for open in &self.stored.active {
-                    if open.key.starts_with("devices:smart:") {
+                    if open.key.starts_with(&smart_prefix) {
                         out.insert(open.key.clone(), Verdict::Hold);
                     }
                 }
             }
             Some(drives) => {
                 for drive in drives {
-                    let key = format!("devices:smart:{}", one_line(&drive.id, 160));
+                    let key = format!("{smart_prefix}{}", one_line(&drive.id, 160));
                     let open = self.alert_open(&key);
                     let clear = format!("{key}:clear");
                     match drive.unhealthy {
@@ -698,7 +718,10 @@ impl Engine {
                                     key,
                                     Verdict::Fire(
                                         AlertSeverity::Critical,
-                                        format!("SMART unhealthy for {}", one_line(&drive.id, 160)),
+                                        format!(
+                                            "{label}SMART unhealthy for {}",
+                                            one_line(&drive.id, 160)
+                                        ),
                                     ),
                                 );
                             } else if open {
@@ -815,7 +838,24 @@ impl Engine {
             }
             "devices" => {
                 let input = signals.devices.as_ref()?;
-                out = self.device_findings(now, input);
+                out = self.device_findings(now, "devices:", "", false, input);
+                for (id, input) in &signals.remote_devices {
+                    let offline = signals.fleet_discovered
+                        && signals.fleet.as_ref().is_some_and(|fleet| {
+                            fleet
+                                .nodes
+                                .iter()
+                                .any(|node| node.name == *id && !node.online)
+                        });
+                    let findings = self.device_findings(
+                        now,
+                        &format!("devices:{id}:"),
+                        &format!("{id}: "),
+                        offline,
+                        input,
+                    );
+                    out.extend(findings);
+                }
             }
             "ups" => {
                 let read = signals.ups.as_ref()?;
@@ -1413,6 +1453,7 @@ impl AppState {
                 .unwrap_or_else(|| crate::devices::unavailable(now))
                 .alert_input(now),
         );
+        let remote_devices = self.remote_alert_inputs(now).await;
         Signals {
             fleet: (fleet.generated_at_ms != 0).then_some(fleet),
             fleet_discovered: self.fleet_discovered.load(Ordering::Acquire),
@@ -1426,6 +1467,7 @@ impl AppState {
             ups,
             ups_events: vec![],
             devices,
+            remote_devices,
             network,
         }
     }
@@ -2506,6 +2548,137 @@ mod tests {
         assert_eq!(
             slack_url("http://127.0.0.1:9/api/").unwrap(),
             "http://127.0.0.1:9/api"
+        );
+    }
+
+    #[test]
+    fn remote_device_alerts_are_per_device_and_defer_to_the_node_alert() {
+        use crate::devices::{DeviceAlertInput, FsPressure};
+        let mut engine = Engine::load(Config {
+            state_path: None,
+            channel: "C-test".into(),
+            slack_url: "http://127.0.0.1:1/api".into(),
+            token: None,
+            ..Config::default()
+        });
+        let input = |at: i64, cpu: f64, space: f64| DeviceAlertInput {
+            fast_success_ms: Some(at),
+            cpu_temp_c: Some(Some(cpu)),
+            filesystems: Some(vec![FsPressure {
+                id: "root".into(),
+                space_percent: Some(space),
+                inode_percent: Some(10.0),
+            }]),
+            smart: Some(vec![]),
+            unsafe_shutdowns: BTreeMap::new(),
+        };
+        let signals = |gpu: DeviceAlertInput,
+                       console: DeviceAlertInput,
+                       console_online: bool,
+                       at: i64| Signals {
+            devices: Some(gpu),
+            remote_devices: vec![("factory-console".into(), console)],
+            ..fleet(at, console_online, true)
+        };
+        let keys = |engine: &Engine| {
+            let mut keys: Vec<_> = engine
+                .view()
+                .active
+                .iter()
+                .map(|open| (open.key.clone(), open.summary.clone()))
+                .collect();
+            keys.sort();
+            keys
+        };
+        // A hot console does not touch factory-gpu keys, and the reverse.
+        for at in [T0, T0 + 120_000] {
+            engine.evaluate(
+                at,
+                &signals(input(at, 50.0, 10.0), input(at, 96.0, 96.0), true, at),
+            );
+        }
+        assert_eq!(
+            keys(&engine),
+            vec![(
+                "devices:factory-console:cpu:temperature:critical".to_string(),
+                "factory-console: CPU temperature 96 C (critical 95 C)".to_string()
+            )]
+        );
+        let at = T0 + 600_000;
+        engine.evaluate(
+            at,
+            &signals(input(at, 50.0, 10.0), input(at, 50.0, 96.0), true, at),
+        );
+        let open: Vec<_> = keys(&engine).into_iter().map(|(key, _)| key).collect();
+        assert_eq!(open, ["devices:factory-console:fs:root:space:critical",]);
+        // The console stops sending: telemetry fires after 2 minutes for that device only.
+        let last = at;
+        let at = last + 120_000;
+        engine.evaluate(
+            at,
+            &signals(input(at, 50.0, 10.0), input(last, 50.0, 10.0), true, at),
+        );
+        let open: Vec<_> = keys(&engine).into_iter().map(|(key, _)| key).collect();
+        assert!(open.contains(&"devices:factory-console:telemetry".to_string()));
+        assert!(!open.contains(&"devices:telemetry".to_string()));
+        // Fleet reports the node offline: the node alert owns it, the open one holds.
+        engine.evaluate(
+            at + 30_000,
+            &signals(
+                input(at, 50.0, 10.0),
+                input(last, 50.0, 10.0),
+                false,
+                at + 30_000,
+            ),
+        );
+        let open: Vec<_> = keys(&engine).into_iter().map(|(key, _)| key).collect();
+        assert!(open.contains(&"devices:factory-console:telemetry".to_string()));
+        // Recovery clears it.
+        let back = at + 60_000;
+        engine.evaluate(
+            back,
+            &signals(input(back, 50.0, 10.0), input(back, 50.0, 10.0), true, back),
+        );
+        assert!(
+            !keys(&engine)
+                .iter()
+                .any(|(key, _)| key.ends_with("telemetry"))
+        );
+
+        // A never-seen remote device that stays offline does not open telemetry beside node:… .
+        let mut quiet = Engine::load(Config {
+            state_path: None,
+            channel: "C-test".into(),
+            slack_url: "http://127.0.0.1:1/api".into(),
+            token: None,
+            ..Config::default()
+        });
+        for at in [T0, T0 + 130_000] {
+            quiet.evaluate(
+                at,
+                &signals(
+                    input(at, 50.0, 10.0),
+                    DeviceAlertInput::default(),
+                    false,
+                    at,
+                ),
+            );
+        }
+        assert!(
+            !keys(&quiet)
+                .iter()
+                .any(|(key, _)| key.starts_with("devices:"))
+        );
+        for at in [T0 + 140_000, T0 + 270_000] {
+            quiet.evaluate(
+                at,
+                &signals(input(at, 50.0, 10.0), DeviceAlertInput::default(), true, at),
+            );
+        }
+        assert!(
+            keys(&quiet)
+                .iter()
+                .any(|(key, _)| key == "devices:factory-console:telemetry")
         );
     }
 

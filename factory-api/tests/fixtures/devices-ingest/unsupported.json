@@ -1,0 +1,257 @@
+{
+  "schema_version": 1,
+  "device_id": "factory-console",
+  "agent": {
+    "name": "factory-devices-agent",
+    "version": "0.1.0"
+  },
+  "session_id": "6f1c2a9e-3b4d-4e8f-9a01-2c3d4e5f6a7b",
+  "seq": 43,
+  "observed_at_ms": 1792238430000,
+  "sent_at_ms": 1792238430210,
+  "identity": {
+    "hostname": "factory-console",
+    "boot_id": "0b7d6c1e-8f2a-4c3b-9d4e-5f6a7b8c9d0e",
+    "uptime": {
+      "value": 86400.5,
+      "unit": "s",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "cpu": {
+    "utilization": {
+      "value": 12.5,
+      "unit": "%",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "iowait": {
+      "value": 0.4,
+      "unit": "%",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "load1": {
+      "value": 0.62,
+      "unit": "load",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "load5": {
+      "value": 0.55,
+      "unit": "load",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "load15": {
+      "value": 0.48,
+      "unit": "load",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "temperature": {
+      "value": null,
+      "unit": "C",
+      "observed_at_ms": 1792238430000,
+      "availability": "unsupported",
+      "detail": "no CPU temperature sensor"
+    }
+  },
+  "memory": {
+    "total": {
+      "value": 17179869184,
+      "unit": "bytes",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "available": {
+      "value": 11811160064,
+      "unit": "bytes",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "used": {
+      "value": 5368709120,
+      "unit": "bytes",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "swap_total": {
+      "value": 2147483648,
+      "unit": "bytes",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "swap_free": {
+      "value": 2147483648,
+      "unit": "bytes",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "filesystems": [
+    {
+      "id": "/dev/nvme0n1p2\t/",
+      "source": "/dev/nvme0n1p2",
+      "mountpoint": "/",
+      "fstype": "ext4",
+      "size": {
+        "value": 245107195904,
+        "unit": "bytes",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "used": {
+        "value": 61276798976,
+        "unit": "bytes",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "used_percent": {
+        "value": 25.0,
+        "unit": "%",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "inodes_used_percent": {
+        "value": 4.1,
+        "unit": "%",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      }
+    }
+  ],
+  "drives": [
+    {
+      "id": "eui.0025388b91b2c3d4",
+      "kernel": "nvme0n1",
+      "model": "APPLE SSD AP0256M",
+      "size": {
+        "value": 251000193024,
+        "unit": "bytes",
+        "observed_at_ms": 1792238300000,
+        "availability": "available",
+        "detail": null
+      },
+      "smart": {
+        "availability": "unsupported",
+        "passed": null,
+        "observed_at_ms": 1792238300000,
+        "detail": "smartctl absent"
+      },
+      "available_spare": {
+        "value": null,
+        "unit": "%",
+        "observed_at_ms": 1792238300000,
+        "availability": "unsupported",
+        "detail": "SMART unsupported"
+      },
+      "spare_threshold_percent": null,
+      "media_errors": {
+        "value": null,
+        "unit": "count",
+        "observed_at_ms": 1792238300000,
+        "availability": "unsupported",
+        "detail": "SMART unsupported"
+      },
+      "media_critical": false,
+      "temperature": {
+        "value": null,
+        "unit": "C",
+        "observed_at_ms": 1792238300000,
+        "availability": "unsupported",
+        "detail": "SMART unsupported"
+      }
+    }
+  ],
+  "disk_io": {
+    "read": {
+      "value": 4096.0,
+      "unit": "B/s",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "write": {
+      "value": 81920.0,
+      "unit": "B/s",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "network": {
+    "rx": {
+      "value": 2048.0,
+      "unit": "B/s",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    },
+    "tx": {
+      "value": 1536.0,
+      "unit": "B/s",
+      "observed_at_ms": 1792238430000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "cooling": {
+    "temperatures": [],
+    "fans": [],
+    "temperatures_availability": "unsupported",
+    "fans_availability": "unsupported"
+  },
+  "maintenance": {
+    "backup": {
+      "availability": "available",
+      "last_success_ms": 1792234815000,
+      "last_attempt_ms": 1792234815000,
+      "error": null,
+      "observed_at_ms": 1792238430000
+    },
+    "clock": {
+      "synchronized": true,
+      "availability": "available",
+      "observed_at_ms": 1792238430000
+    },
+    "reboot": {
+      "availability": "available",
+      "reboot_required": false,
+      "pending_since_ms": null,
+      "days_pending": 0,
+      "consecutive_skips": 0,
+      "alert_due": false,
+      "last_check_ms": 1792231215000,
+      "last_decision": "not-needed",
+      "detail": null
+    }
+  },
+  "collector": {
+    "fast_interval_ms": 15000,
+    "slow_interval_ms": 300000,
+    "last_fast_ms": 1792238430000,
+    "last_slow_ms": 1792238300000,
+    "fast_ok": true,
+    "filesystems": "available",
+    "drives": "available",
+    "smart": "unsupported",
+    "detail": null
+  }
+}

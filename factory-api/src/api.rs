@@ -1,5 +1,6 @@
 use crate::devices::{self, DeviceList, DeviceView};
 use crate::devices_history::{self, DeviceHistory};
+use crate::devices_ingest::{self, IngestResult};
 use crate::network::{NetworkStatus, Sample};
 use crate::network_history::{self, NetworkEvents, NetworkSeries, NetworkSpeedTest};
 use crate::types::*;
@@ -117,24 +118,38 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
     }
     let path = request.uri().path();
     if let Some(route) = device_route(path) {
-        if request.method() != Method::GET {
+        let allowed = if matches!(route, DeviceRoute::Samples(_)) {
+            Method::POST
+        } else {
+            Method::GET
+        };
+        if request.method() != allowed {
             let mut response = error(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "method_not_allowed",
-                "endpoint requires GET",
+                format!("endpoint requires {allowed}"),
             );
             response
                 .headers_mut()
-                .insert("allow", "GET".parse().unwrap());
+                .insert("allow", allowed.as_str().parse().unwrap());
             return response;
         }
         return match route {
+            DeviceRoute::Samples(id) => ingest_sample(&state, &id, request).await,
             DeviceRoute::List => devices_list(&state).await.into_response(),
-            DeviceRoute::Current => device_current(&state).await.into_response(),
-            DeviceRoute::History => device_history(&state, request).await,
-            DeviceRoute::Unknown => {
-                error(StatusCode::NOT_FOUND, "unknown_device", "unknown device")
+            DeviceRoute::Current(id) if id == devices::DEVICE_ID => {
+                device_current(&state).await.into_response()
             }
+            DeviceRoute::History(id) if id == devices::DEVICE_ID => {
+                device_history(&state, request).await
+            }
+            DeviceRoute::Current(id) if state.known_device(&id) => {
+                remote_device_current(&state, &id).await.into_response()
+            }
+            DeviceRoute::History(id) if state.known_device(&id) => {
+                remote_device_history(&state, &id, request).await
+            }
+            _ => error(StatusCode::NOT_FOUND, "unknown_device", "unknown device"),
         };
     }
     let confirm = path
@@ -302,11 +317,11 @@ async fn fleet(state: &AppState) -> Json<Fleet> {
     }
     Json(state.fleet.read().await.clone())
 }
-#[derive(Clone, Copy)]
 enum DeviceRoute {
     List,
-    Current,
-    History,
+    Current(String),
+    History(String),
+    Samples(String),
     Unknown,
 }
 
@@ -316,35 +331,44 @@ fn device_route(path: &str) -> Option<DeviceRoute> {
         return Some(DeviceRoute::List);
     }
     let rest = rest.strip_prefix('/')?;
-    let (id, history) = match rest.strip_suffix("/history") {
-        Some(id) => (id.strip_suffix('/').unwrap_or(id), true),
-        None => (rest, false),
-    };
+    let (id, kind): (&str, fn(String) -> DeviceRoute) =
+        if let Some(id) = rest.strip_suffix("/samples") {
+            (id, DeviceRoute::Samples)
+        } else if let Some(id) = rest.strip_suffix("/history") {
+            (id.strip_suffix('/').unwrap_or(id), DeviceRoute::History)
+        } else {
+            (rest, DeviceRoute::Current)
+        };
     if id.is_empty() || id.contains('/') {
         return Some(DeviceRoute::Unknown);
     }
-    if !crate::devices::known_device(id) {
-        return Some(DeviceRoute::Unknown);
-    }
-    Some(if history {
-        DeviceRoute::History
-    } else {
-        DeviceRoute::Current
-    })
+    Some(kind(id.into()))
 }
 
 #[utoipa::path(get, path="/v1/devices", responses((status=200, body=DeviceList)))]
 async fn devices_list(state: &AppState) -> Json<DeviceList> {
     let view = state.devices_view().await;
+    let mut devices = vec![view.summary()];
+    for remote in state.remote_views(view.generated_at_ms).await {
+        devices.push(remote.summary());
+    }
     Json(crate::devices::DeviceList {
         generated_at_ms: view.generated_at_ms,
-        devices: vec![view.summary()],
+        devices,
     })
 }
 
 #[utoipa::path(get, path="/v1/devices/factory-gpu", responses((status=200, body=DeviceView),(status=404, body=ApiError)))]
 async fn device_current(state: &AppState) -> Json<DeviceView> {
     Json(state.devices_view().await)
+}
+
+/// An enrolled remote device: stale after 45 s of transport or collection age, and
+/// `unknown` until its first fresh sample since factory-api started. `factory-gpu`
+/// is served the same way at its literal path.
+#[utoipa::path(get, path="/v1/devices/{device_id}", params(("device_id"=String, Path)), responses((status=200, body=DeviceView),(status=404, body=ApiError)))]
+async fn remote_device_current(state: &AppState, device_id: &str) -> Json<DeviceView> {
+    Json(state.remote.view(device_id, now_ms()).await)
 }
 
 fn device_range(request: &Request<Body>) -> Result<(String, i64, i64, bool), String> {
@@ -363,20 +387,34 @@ fn device_range(request: &Request<Body>) -> Result<(String, i64, i64, bool), Str
 
 #[utoipa::path(get, path="/v1/devices/factory-gpu/history", params(("range"=Option<String>, Query, description="1h (default), 24h, or 7d")), responses((status=200, body=DeviceHistory),(status=400, body=ApiError),(status=404, body=ApiError)))]
 async fn device_history(state: &AppState, request: Request<Body>) -> Response {
+    history_for(state, devices::DEVICE_ID, request).await
+}
+
+#[utoipa::path(get, path="/v1/devices/{device_id}/history", params(("device_id"=String, Path), ("range"=Option<String>, Query, description="1h (default), 24h, or 7d")), responses((status=200, body=DeviceHistory),(status=400, body=ApiError),(status=404, body=ApiError)))]
+async fn remote_device_history(
+    state: &AppState,
+    device_id: &str,
+    request: Request<Body>,
+) -> Response {
+    history_for(state, device_id, request).await
+}
+
+async fn history_for(state: &AppState, device_id: &str, request: Request<Body>) -> Response {
     let (range, since, now, raw) = match device_range(&request) {
         Ok(value) => value,
         Err(message) => return error(StatusCode::BAD_REQUEST, "invalid_range", message),
     };
+    let id = device_id.to_string();
     let points = state
         .db
         .requests
         .read(&state.query_scope, move |db| {
-            devices_history::history(db, devices::DEVICE_ID, since, now, raw)
+            devices_history::history(db, &id, since, now, raw)
         })
         .await;
     match points {
         Ok(points) => Json(DeviceHistory {
-            device_id: devices::DEVICE_ID.into(),
+            device_id: device_id.into(),
             range,
             generated_at_ms: now,
             points,
@@ -387,6 +425,152 @@ async fn device_history(state: &AppState, request: Request<Body>) -> Response {
             "storage_error",
             failure.to_string(),
         ),
+    }
+}
+
+fn ingest_error(rejection: devices_ingest::Rejection) -> Response {
+    let mut detail = serde_json::json!({
+        "code": rejection.code,
+        "message": rejection.message,
+    });
+    if let Some(field) = rejection.field {
+        detail["field"] = field.into();
+    }
+    let mut body = serde_json::json!({ "error": detail });
+    if rejection.code == "unsupported_schema_version" {
+        body["accepted_schema_versions"] = devices_ingest::SCHEMA_VERSIONS.to_vec().into();
+    }
+    (rejection.status, Json(body)).into_response()
+}
+
+/// Claimed device and caller for failed-credential logs. Never the token.
+fn caller(request: &Request<Body>) -> (String, String) {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let forwarded = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .chars()
+                .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                .take(100)
+                .collect()
+        })
+        .unwrap_or_else(|| "-".into());
+    (peer, forwarded)
+}
+
+/// One remote sample (docs/devices-ingest.md). Checks run in the contract's order:
+/// method, Sec-Fetch-Site, credential, device binding, content type, body size,
+/// JSON and schema, then rate. Errors use ApiError, adding `error.field` and, for
+/// `unsupported_schema_version`, `accepted_schema_versions`.
+#[utoipa::path(post, path="/v1/devices/{device_id}/samples", params(("device_id"=String, Path)),
+    request_body(content=crate::devices_ingest::DeviceSampleV1, description="Schema version 1 sample; see docs/devices-ingest.md", content_type="application/json"),
+    security(("device_bearer"=[])),
+    responses(
+        (status=200, body=IngestResult),
+        (status=400, body=ApiError), (status=401, body=ApiError), (status=403, body=ApiError),
+        (status=405, body=ApiError), (status=413, body=ApiError), (status=415, body=ApiError),
+        (status=429, body=ApiError, headers(("Retry-After"=u64, description="Seconds before retrying"))),
+        (status=500, body=ApiError)
+    ))]
+async fn ingest_sample(state: &AppState, device_id: &str, request: Request<Body>) -> Response {
+    let claimed = if crate::device_auth::valid_device_id(device_id) {
+        device_id.to_string()
+    } else {
+        "<invalid>".into()
+    };
+    if request
+        .headers()
+        .get("sec-fetch-site")
+        .is_some_and(|v| v == "cross-site")
+    {
+        return error(
+            StatusCode::FORBIDDEN,
+            "cross_site",
+            "cross-site sample refused",
+        );
+    }
+    let Some(credential) = state
+        .remote
+        .tokens
+        .verify(request.headers().get(axum::http::header::AUTHORIZATION))
+    else {
+        let (peer, forwarded) = caller(&request);
+        tracing::warn!(device = %claimed, %peer, %forwarded, "device ingest refused: missing or unknown credential");
+        let mut response = error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing, malformed, unknown or revoked device credential",
+        );
+        response
+            .headers_mut()
+            .insert("www-authenticate", "Bearer".parse().unwrap());
+        return response;
+    };
+    if device_id == devices::DEVICE_ID || credential != device_id {
+        let (peer, forwarded) = caller(&request);
+        tracing::warn!(device = %claimed, credential = %credential, %peer, %forwarded, "device ingest refused: credential is for another device");
+        return error(
+            StatusCode::FORBIDDEN,
+            "forbidden_device",
+            "credential may not write this device",
+        );
+    }
+    let json = request
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"));
+    if !json {
+        return error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            "Content-Type must be application/json",
+        );
+    }
+    let body = match axum::body::to_bytes(request.into_body(), devices_ingest::MAX_BODY).await {
+        Ok(body) => body,
+        Err(_) => {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body_too_large",
+                "body exceeds 64 KiB",
+            );
+        }
+    };
+    let received_at_ms = now_ms();
+    let sample = match devices_ingest::parse(&body, device_id, received_at_ms) {
+        Ok(sample) => sample,
+        Err(rejection) => return ingest_error(rejection),
+    };
+    if let Err(seconds) = state.remote.admit(device_id, received_at_ms) {
+        let mut response = error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "more than 4 samples per second for this device",
+        );
+        response
+            .headers_mut()
+            .insert("retry-after", seconds.to_string().parse().unwrap());
+        return response;
+    }
+    match state.ingest_sample(sample, received_at_ms).await {
+        Ok(result) => Json(result).into_response(),
+        Err(failure) => {
+            tracing::error!(device = %claimed, error = %failure, "device ingest storage failed");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "storage failed; nothing was written",
+            )
+        }
     }
 }
 
@@ -868,6 +1052,9 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         devices_list,
         device_current,
         device_history,
+        remote_device_current,
+        remote_device_history,
+        ingest_sample,
         ups,
         ups_history,
         ups_events,
@@ -893,6 +1080,8 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         DeviceList,
         DeviceView,
         DeviceHistory,
+        IngestResult,
+        crate::devices_ingest::DeviceSampleV1,
         NetworkStatus,
         NetworkSpeedTest,
         Sample,
@@ -903,9 +1092,30 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         LlmRequest,
         FleetChange,
         PricingChanged
-    ))
+    )),
+    modifiers(&DeviceBearer)
 )]
 struct ApiDoc;
+
+/// `device_bearer`: the per-device `fdv1_` token sent as `Authorization: Bearer`.
+struct DeviceBearer;
+
+impl utoipa::Modify for DeviceBearer {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+        openapi.components.get_or_insert_with(Default::default).add_security_scheme(
+            "device_bearer",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .description(Some(
+                        "Per-device token (fdv1_ plus 43 base64url characters); the server stores only its SHA-256.",
+                    ))
+                    .build(),
+            ),
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

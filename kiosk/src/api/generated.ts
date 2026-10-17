@@ -96,6 +96,65 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v1/devices/{device_id}": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * An enrolled remote device: stale after 45 s of transport or collection age, and
+     *     `unknown` until its first fresh sample since factory-api started. `factory-gpu`
+     *     is served the same way at its literal path.
+     */
+    get: operations["remote_device_current"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/devices/{device_id}/history": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["remote_device_history"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/devices/{device_id}/samples": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * One remote sample (docs/devices-ingest.md). Checks run in the contract's order:
+     *     method, Sec-Fetch-Site, credential, device binding, content type, body size,
+     *     JSON and schema, then rate. Errors use ApiError, adding `error.field` and, for
+     *     `unsupported_schema_version`, `accepted_schema_versions`.
+     */
+    post: operations["ingest_sample"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v1/fleet": {
     parameters: {
       query?: never;
@@ -556,6 +615,57 @@ export interface components {
       /** Format: int64 */
       ts_ms: number;
     };
+    /**
+     * @description Request body of `POST /v1/devices/{device_id}/samples`, schema version 1
+     *     (docs/devices-ingest.md, "Sample fields"). The handler validates the raw JSON
+     *     itself with the contract's error codes; this type documents the shape, and a
+     *     test proves the contract examples fit it. Unknown fields are ignored, and the
+     *     server-owned fields `health`, `gpus`, `generated_at_ms`, `warnings`,
+     *     `maintenance.services` and `maintenance.ups` are rejected.
+     */
+    DeviceSampleV1: {
+      agent: components["schemas"]["SampleAgent"];
+      collector: components["schemas"]["CollectorHealth"];
+      cooling: components["schemas"]["Cooling"];
+      cpu: components["schemas"]["Cpu"];
+      /** @description Must equal the path id and the credential's device. */
+      device_id: string;
+      disk_io: components["schemas"]["DiskIo"];
+      /** @description At most 16. */
+      drives: components["schemas"]["Drive"][];
+      /** @description At most 32. */
+      filesystems: components["schemas"]["Filesystem"][];
+      identity: components["schemas"]["HostIdentity"];
+      maintenance: components["schemas"]["SampleMaintenance"];
+      memory: components["schemas"]["Ram"];
+      network: components["schemas"]["Network"];
+      /**
+       * Format: int64
+       * @description Device wall clock (Unix ms) when the fast sample was taken.
+       */
+      observed_at_ms: number;
+      /**
+       * Format: int64
+       * @description Only `1` is accepted.
+       * @example 1
+       */
+      schema_version: number;
+      /**
+       * Format: int64
+       * @description Device wall clock (Unix ms) when this attempt was sent.
+       */
+      sent_at_ms: number;
+      /**
+       * Format: int64
+       * @description Per-session counter, 1 to 2^53 − 1.
+       */
+      seq: number;
+      /**
+       * Format: uuid
+       * @description Random UUID v4 per agent process start.
+       */
+      session_id: string;
+    };
     DeviceSummary: {
       device_id: string;
       health: components["schemas"]["HealthStatus"];
@@ -565,6 +675,7 @@ export interface components {
       device: components["schemas"]["HostSnapshot"];
       /** Format: int64 */
       generated_at_ms: number;
+      ingest?: null | components["schemas"]["IngestView"];
       maintenance?: null | components["schemas"]["NodeMaintenance"];
       warnings: string[];
     };
@@ -703,6 +814,46 @@ export interface components {
       network: components["schemas"]["Network"];
       /** Format: int64 */
       observed_at_ms: number;
+    };
+    IngestResult: {
+      current_updated: boolean;
+      device_id: string;
+      history_written: boolean;
+      /** Format: int64 */
+      observed_at_ms: number;
+      /** @description Null on stored, except `clock_unsynchronized`; `duplicate`, `out_of_order` or `expired` on ignored. */
+      reason?: string | null;
+      /** Format: int64 */
+      received_at_ms: number;
+      /** @description `stored` or `ignored`. */
+      result: string;
+      /** Format: int64 */
+      seq: number;
+      session_id: string;
+    };
+    IngestView: {
+      agent_version?: string | null;
+      /**
+       * Format: int64
+       * @description `sent_at_ms - received_at_ms` of the last accepted request, including latency.
+       */
+      clock_skew_ms?: number | null;
+      /**
+       * Format: int64
+       * @description Sequence gaps within a session since factory-api started.
+       */
+      dropped_samples: number;
+      identity_conflict: boolean;
+      /**
+       * Format: int64
+       * @description Server clock when the last accepted sample arrived; null before the first one.
+       */
+      last_received_at_ms?: number | null;
+      /** Format: int64 */
+      seq?: number | null;
+      session_id?: string | null;
+      /** @description Always `remote`. */
+      source: string;
     };
     /**
      * @description Declaration order is registry order; diagnosis blames the first failing layer.
@@ -1132,6 +1283,18 @@ export interface components {
        */
       ts_ms: number;
     };
+    SampleAgent: {
+      /** @description `factory-devices-agent`, at most 64 bytes. */
+      name: string;
+      /** @description Agent semver, at most 64 bytes. */
+      version: string;
+    };
+    /** @description Only the device-reported parts of maintenance; services and UPS are server-owned. */
+    SampleMaintenance: {
+      backup: components["schemas"]["BackupView"];
+      clock: components["schemas"]["ClockView"];
+      reboot: components["schemas"]["RebootView"];
+    };
     Selection: {
       /** Format: int64 */
       effective_from_ms: number;
@@ -1504,6 +1667,167 @@ export interface operations {
         };
       };
       404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  remote_device_current: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        device_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DeviceView"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  remote_device_history: {
+    parameters: {
+      query?: {
+        /** @description 1h (default), 24h, or 7d */
+        range?: string;
+      };
+      header?: never;
+      path: {
+        device_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DeviceHistory"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  ingest_sample: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        device_id: string;
+      };
+      cookie?: never;
+    };
+    /** @description Schema version 1 sample; see docs/devices-ingest.md */
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["DeviceSampleV1"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["IngestResult"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      405: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      429: {
+        headers: {
+          /** @description Seconds before retrying */
+          "Retry-After"?: number;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      500: {
         headers: {
           [name: string]: unknown;
         };

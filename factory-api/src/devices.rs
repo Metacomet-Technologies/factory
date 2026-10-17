@@ -272,6 +272,25 @@ pub struct DeviceView {
     pub device: HostSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<NodeMaintenance>,
+    /// Remote ingest state (docs/devices-ingest.md). Null for factory-gpu.
+    #[serde(default)]
+    pub ingest: Option<IngestView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct IngestView {
+    /// Always `remote`.
+    pub source: String,
+    /// Server clock when the last accepted sample arrived; null before the first one.
+    pub last_received_at_ms: Option<i64>,
+    pub session_id: Option<String>,
+    pub seq: Option<i64>,
+    pub agent_version: Option<String>,
+    /// `sent_at_ms - received_at_ms` of the last accepted request, including latency.
+    pub clock_skew_ms: Option<i64>,
+    /// Sequence gaps within a session since factory-api started.
+    pub dropped_samples: i64,
+    pub identity_conflict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -433,11 +452,16 @@ fn worse(level: f64, warn: f64, crit: f64) -> Option<HealthStatus> {
 /// Pure health report. Missing essential readings are not healthy.
 /// Unsupported fans and unsupported SMART do not fail the host.
 pub fn assess(host: &HostSnapshot, now: i64) -> HealthReport {
+    assess_within(host, now, FAST_INTERVAL_MS * 2)
+}
+
+/// `assess` with a caller's stale threshold: 30 s locally, 45 s for remote devices.
+pub fn assess_within(host: &HostSnapshot, now: i64, stale_ms: i64) -> HealthReport {
     let mut reasons = Vec::new();
     let aged = host
         .collector
         .last_fast_ms
-        .is_none_or(|at| now.saturating_sub(at) > FAST_INTERVAL_MS * 2);
+        .is_none_or(|at| now.saturating_sub(at) > stale_ms);
     if !host.collector.fast_ok || aged && host.collector.last_fast_ms.is_some() {
         let age = host
             .collector
@@ -446,12 +470,14 @@ pub fn assess(host: &HostSnapshot, now: i64) -> HealthReport {
         reasons.push(reason(
             HealthStatus::Stale,
             "collector.fast",
-            "30 s",
+            &format!("{} s", stale_ms / 1000),
             age,
-            if host.collector.fast_ok {
-                "latest fast sample is older than twice its 15 s interval"
+            if !host.collector.fast_ok {
+                "device collector failed".to_string()
+            } else if stale_ms == FAST_INTERVAL_MS * 2 {
+                "latest fast sample is older than twice its 15 s interval".to_string()
             } else {
-                "device collector failed"
+                format!("latest fast sample is older than {} s", stale_ms / 1000)
             },
         ));
     }
@@ -591,6 +617,10 @@ pub fn assess(host: &HostSnapshot, now: i64) -> HealthReport {
             ));
         }
     }
+    report(reasons)
+}
+
+fn report(mut reasons: Vec<HealthReason>) -> HealthReport {
     reasons.sort_by(|a, b| {
         rank(b.status)
             .cmp(&rank(a.status))
@@ -705,6 +735,7 @@ pub fn unavailable(now: i64) -> DeviceView {
         warnings: vec![waiting.into()],
         device: host,
         maintenance: None,
+        ingest: None,
     };
     view.device.health = assess(&view.device, now);
     view
@@ -720,6 +751,17 @@ fn mark_stale(metric: &mut Metric, detail: String) {
 
 /// A served copy. Fast numbers older than two intervals are not presented as current.
 pub fn freshen(view: &DeviceView, now: i64) -> DeviceView {
+    freshen_within(view, now, FAST_INTERVAL_MS * 2, None)
+}
+
+/// `freshen` with a caller's stale threshold. A remote device also goes stale when
+/// its transport is quiet: `received_at_ms` is the server clock of its last accepted sample.
+pub fn freshen_within(
+    view: &DeviceView,
+    now: i64,
+    stale_ms: i64,
+    received_at_ms: Option<i64>,
+) -> DeviceView {
     let mut copy = view.clone();
     copy.generated_at_ms = now;
     if let Some(NodeMaintenance::Available(snapshot)) = &copy.maintenance
@@ -728,7 +770,10 @@ pub fn freshen(view: &DeviceView, now: i64) -> DeviceView {
         copy.maintenance = Some(NodeMaintenance::Stale(snapshot.clone()));
     }
     let age = now.saturating_sub(copy.device.observed_at_ms);
-    if age > FAST_INTERVAL_MS * 2 {
+    let quiet = received_at_ms
+        .map(|at| now.saturating_sub(at))
+        .filter(|quiet| *quiet > stale_ms);
+    if age > stale_ms || quiet.is_some() {
         let detail = format!("last sample at {}", copy.device.observed_at_ms);
         mark_stale(&mut copy.device.cpu.utilization, detail.clone());
         mark_stale(&mut copy.device.cpu.iowait, detail.clone());
@@ -753,7 +798,18 @@ pub fn freshen(view: &DeviceView, now: i64) -> DeviceView {
             mark_stale(&mut fs.inodes_used_percent, detail.clone());
         }
     }
-    copy.device.health = assess(&copy.device, now);
+    copy.device.health = assess_within(&copy.device, now, stale_ms);
+    if let Some(quiet) = quiet {
+        let mut reasons = std::mem::take(&mut copy.device.health.reasons);
+        reasons.push(reason(
+            HealthStatus::Stale,
+            "ingest.transport",
+            &format!("{} s", stale_ms / 1000),
+            Some(quiet as f64),
+            format!("no sample received for {} s", quiet / 1000),
+        ));
+        copy.device.health = report(reasons);
+    }
     copy
 }
 
@@ -2299,6 +2355,7 @@ pub fn sample_timeout(
         warnings,
         device: host,
         maintenance: Some(slow.maintenance.clone()),
+        ingest: None,
     }
 }
 

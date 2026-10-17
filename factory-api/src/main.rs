@@ -78,6 +78,9 @@ struct Args {
     devices_root: PathBuf,
     #[arg(long, env = "FACTORY_API_REBOOT_STATUS", default_value = devices::DEFAULT_REBOOT_STATUS)]
     reboot_status: PathBuf,
+    /// Remote device credential hashes, reread when the file changes (docs/devices-ingest.md).
+    #[arg(long, env = "FACTORY_API_DEVICE_TOKENS", default_value = factory_api::device_auth::DEFAULT_PATH)]
+    device_tokens: PathBuf,
     #[arg(long, env = "FACTORY_API_NETWORK_WAN_TARGETS", value_delimiter = ',', default_value = network::DEFAULT_WAN_TARGETS)]
     network_wan_targets: Vec<IpAddr>,
     #[arg(long, env = "FACTORY_API_NETWORK_DNS_NAME", default_value = network::DEFAULT_DNS_NAME)]
@@ -231,6 +234,9 @@ async fn main() -> anyhow::Result<()> {
     state.backup_status = args.backup_status;
     state.devices_root = args.devices_root;
     state.reboot_status = args.reboot_status;
+    state.remote = std::sync::Arc::new(factory_api::devices_ingest::Registry::new(
+        factory_api::device_auth::Tokens::new(args.device_tokens),
+    ));
     if state.devices_root != std::path::Path::new("/") {
         if state.backup_status == std::path::Path::new(alerts::DEFAULT_BACKUP_STATUS) {
             state.backup_status = state
@@ -268,8 +274,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(listen=%args.listen, "factory-api listening");
     let shutdown = state.shutdown.clone();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let server = axum::serve(listener, router(state.clone()))
-        .with_graceful_shutdown(shutdown.clone().cancelled_owned());
+    let server = axum::serve(
+        listener,
+        router(state.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown.clone().cancelled_owned());
     let server = std::future::IntoFuture::into_future(server);
     tokio::pin!(server);
     let finished = tokio::select! {

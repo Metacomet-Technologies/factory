@@ -100,9 +100,18 @@ export default function App() {
   const agents = useApi("/v1/agents", "", live.agentsRevision + live.snapshotRevision);
   const deviceRevision = live.devicesRevision + live.snapshotRevision;
   const devices = useApi("/v1/devices", "", deviceRevision);
-  const deviceCurrent = useApi("/v1/devices/factory-gpu", "", deviceRevision);
+  // Remote devices use the templated OpenAPI paths; factory-gpu keeps its literal ones.
+  const remoteId = /^\/devices\/([a-z0-9][a-z0-9-]{0,62})$/.exec(path)?.[1];
+  const remote = remoteId !== undefined && remoteId !== "factory-gpu" ? remoteId : null;
+  const deviceCurrent = useApi(
+    remote ? (`/v1/devices/${remote}` as "/v1/devices/{device_id}") : "/v1/devices/factory-gpu",
+    "",
+    deviceRevision,
+  );
   const deviceHistory = useApi(
-    "/v1/devices/factory-gpu/history",
+    remote
+      ? (`/v1/devices/${remote}/history` as "/v1/devices/{device_id}/history")
+      : "/v1/devices/factory-gpu/history",
     `?range=${deviceRange}`,
     deviceRevision,
   );
@@ -113,6 +122,13 @@ export default function App() {
       ? live.devices
       : deviceCurrent.data;
   const deviceError = collectorDown ? "Device collector unavailable" : deviceCurrent.error;
+  // A pushed remote view wins only while it is newer than the last fetch, so a fetched
+  // stale view is never replaced by an older live frame.
+  const remoteLive = remote && live.connected ? live.remoteDevices[remote] : undefined;
+  const remoteView =
+    remoteLive && remoteLive.generated_at_ms > (deviceCurrent.data?.generated_at_ms ?? 0)
+      ? remoteLive
+      : deviceCurrent.data;
   useBuildUpdate(live.snapshotRevision, usage.loading || gpu.loading);
   return (
     <TooltipProvider>
@@ -182,8 +198,24 @@ export default function App() {
           </Button>
         </div>
       </header>
-      {path === "/devices/factory-gpu" ? (
+      {remote ? (
         <DevicesPage
+          deviceId={remote}
+          view={remoteView}
+          history={deviceHistory.data}
+          range={deviceRange}
+          setRange={setDeviceRange}
+          error={deviceCurrent.error}
+          loading={deviceCurrent.loading}
+          connected={live.connected}
+          // A pushed frame triggers a refetch, so the newer GET is just as current; the
+          // page shows Live only while the agent link itself is live.
+          live={live.connected && remoteView != null}
+          now={now}
+        />
+      ) : path === "/devices/factory-gpu" ? (
+        <DevicesPage
+          deviceId="factory-gpu"
           view={deviceView}
           history={deviceHistory.data}
           range={deviceRange}

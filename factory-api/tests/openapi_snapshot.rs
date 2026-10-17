@@ -23,6 +23,30 @@ async fn openapi_snapshot() -> Result<()> {
         .await;
     server.abort();
     let spec = response?;
+    // Every security requirement names a defined scheme; the device ingest one is bearer.
+    let schemes = &spec["components"]["securitySchemes"];
+    let mut required = 0;
+    for operations in spec["paths"].as_object().unwrap().values() {
+        for operation in operations.as_object().unwrap().values() {
+            for requirement in operation["security"].as_array().into_iter().flatten() {
+                for name in requirement.as_object().unwrap().keys() {
+                    assert!(
+                        schemes[name].is_object(),
+                        "undefined security scheme {name}"
+                    );
+                    required += 1;
+                }
+            }
+        }
+    }
+    assert!(required >= 1);
+    assert_eq!(schemes["device_bearer"]["type"], "http");
+    assert_eq!(schemes["device_bearer"]["scheme"], "bearer");
+    let samples = &spec["paths"]["/v1/devices/{device_id}/samples"]["post"];
+    assert_eq!(
+        samples["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/DeviceSampleV1"
+    );
     let snapshot = format!("{}\n", serde_json::to_string_pretty(&spec)?);
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi.json");
     if std::env::var("UPDATE_OPENAPI").as_deref() == Ok("1") {
