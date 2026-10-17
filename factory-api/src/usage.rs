@@ -39,6 +39,7 @@ fn unavailable(reason: &str) -> Agents {
                 windows: vec![],
                 balance: None,
                 balances: vec![],
+                breakdown: vec![],
                 reset_credits_available: None,
             })
             .collect(),
@@ -69,6 +70,7 @@ fn valid_balance(b: &AgentBalance) -> bool {
             b.unit == "usd"
                 && b.total.is_none()
                 && (label == "session cost"
+                    || label == "cycle spend"
                     || label.strip_prefix("workspace ").is_some_and(|slug| {
                         (1..=63).contains(&slug.len())
                             && slug.as_bytes()[0].is_ascii_alphanumeric()
@@ -93,6 +95,7 @@ fn valid(t: &AgentTool, now: i64) -> bool {
                     | "CLI output too large"
                     | "last good reading older than 45 minutes"
                     | "not logged in"
+                    | "admin key rejected"
             )
         })
         && t.observed_at_ms.is_none_or(|at| at > 0 && at <= now)
@@ -142,14 +145,38 @@ fn valid(t: &AgentTool, now: i64) -> bool {
         && t.balances.iter().enumerate().all(|(i, b)| {
             valid_balance(b)
                 && b.label.as_ref().is_none_or(|label| {
-                    ((t.tool == "amp" && label != "session cost")
-                        || (t.tool == "opencode" && label == "session cost"))
+                    ((t.tool == "amp" && label != "session cost" && label != "cycle spend")
+                        || (t.tool == "opencode" && label == "session cost")
+                        || (t.tool == "cursor" && label == "cycle spend"))
                         && t.balances[..i]
                             .iter()
                             .all(|prior| prior.label.as_ref() != Some(label))
                 })
         })
         && t.balance.as_ref() == t.balances.first()
+        && (t.tool != "cursor"
+            || (t.balances.len() <= 1
+                && t.balances
+                    .iter()
+                    .all(|b| b.label.as_deref() == Some("cycle spend"))
+                && t.windows.len() <= 1
+                && t.windows
+                    .iter()
+                    .all(|w| w.name == "monthly" && w.resets_at_ms.is_some())))
+        && (t.tool == "cursor" || t.breakdown.is_empty())
+        && t.breakdown.len() <= 20
+        && t.breakdown.iter().enumerate().all(|(i, item)| {
+            (1..=64).contains(&item.label.len())
+                && item.label.bytes().all(|b| {
+                    b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || matches!(b, b'.' | b'_' | b' ' | b'-')
+                })
+                && t.breakdown[..i]
+                    .iter()
+                    .all(|prior| prior.label != item.label)
+                && decimal(&item.amount)
+        })
         && match t.status.as_str() {
             "ok" => {
                 source(&t.tool).is_some()
@@ -157,9 +184,7 @@ fn valid(t: &AgentTool, now: i64) -> bool {
                     && t.cli_version.is_some()
                     && t.reason.is_none()
                     && match t.tool.as_str() {
-                        "cursor" => {
-                            t.plan.is_some() && t.windows.is_empty() && t.balances.is_empty()
-                        }
+                        "cursor" => t.plan.is_some(),
                         "opencode" => {
                             t.plan.is_none()
                                 && t.windows.is_empty()
@@ -337,6 +362,7 @@ mod tests {
             "balance":{"amount":"171.27","remaining":"171.27","total":"200","unit":"usd"},
             "balances":[{"amount":"171.27","remaining":"171.27","total":"200","unit":"usd"},
                 {"amount":"998.1","remaining":"998.1","total":"1000","unit":"orb_hours"}],
+            "breakdown":[],
             "reset_credits_available":null
         });
         json!({"schema_version":1,"generated_at_ms":at,"tools":tools})
@@ -404,6 +430,146 @@ mod tests {
             invalid["tools"][0][field] = bad;
             assert!(parse(&serde_json::to_vec(&invalid).unwrap(), at).is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn http_cursor_spend_contract() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        pricing::migrate(dir.path().join("pricing.db"))?;
+        let mut state = AppState::new(
+            "http://127.0.0.1:1".into(),
+            dir.path().join("requests.db"),
+            dir.path().join("pricing.db"),
+            crate::fleet::Config { nodes: vec![] },
+        )
+        .await?;
+        state.usage_snapshot = dir.path().join("usage.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/v1/agents", listener.local_addr()?);
+        let server =
+            tokio::spawn(axum::serve(listener, crate::router(state.clone())).into_future());
+        let client = reqwest::Client::new();
+        let mut sample = fixture(now_ms());
+        sample["tools"][2]
+            .as_object_mut()
+            .unwrap()
+            .remove("breakdown");
+        sample["tools"][1] = json!({
+            "tool":"cursor", "status":"ok", "note":null, "reason":null,
+            "observed_at_ms":now_ms(), "source":"cursor-about", "cli_version":"2026.10.16-e3cb207", "plan":"team",
+            "windows":[{"name":"monthly","used_percent":37.5,"resets_at_ms":now_ms()+86400000,"window_minutes":null}],
+            "balance":{"amount":"12.50","remaining":"12.50","total":null,"unit":"usd","label":"cycle spend"},
+            "balances":[{"amount":"12.50","remaining":"12.50","total":null,"unit":"usd","label":"cycle spend"}],
+            "breakdown":[{"label":"model-1.5_pro","amount":"9.25"},{"label":"headless","amount":"3.25"}],
+            "reset_credits_available":null
+        });
+        tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&sample)?).await?;
+        let served = client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        assert_eq!(served["tools"][1], sample["tools"][1]);
+        assert_eq!(served["tools"][0]["status"], "ok");
+        assert_eq!(served["tools"][2]["breakdown"], json!([]));
+
+        for (path, replacement) in [
+            ("/tools/0/balances", sample["tools"][1]["balances"].clone()),
+            ("/tools/5/balances", sample["tools"][1]["balances"].clone()),
+            (
+                "/tools/1/balances",
+                json!([sample["tools"][1]["balance"], sample["tools"][1]["balance"]]),
+            ),
+            ("/tools/1/balances/0/label", json!("session cost")),
+            ("/tools/1/balances/0/label", json!("workspace private")),
+            ("/tools/1/balances/0/label", Value::Null),
+            ("/tools/1/balances/0/unit", json!("orb_hours")),
+            ("/tools/1/balances/0/total", json!("100")),
+            ("/tools/1/balances/0/remaining", json!("2")),
+            ("/tools/1/windows/0/name", json!("weekly")),
+            ("/tools/1/windows/0/resets_at_ms", Value::Null),
+            ("/tools/1/windows/0/used_percent", json!(100.1)),
+            ("/tools/1/windows/0/used_percent", json!(-0.1)),
+            ("/tools/1/plan", Value::Null),
+            (
+                "/tools/1/breakdown",
+                json!(
+                    (0..21)
+                        .map(|i| json!({"label":format!("model-{i}"),"amount":"1"}))
+                        .collect::<Vec<_>>()
+                ),
+            ),
+            ("/tools/1/breakdown/1/label", json!("model-1.5_pro")),
+            ("/tools/1/breakdown/0/label", json!("Model/email@private")),
+            ("/tools/1/breakdown/0/label", json!("")),
+            ("/tools/1/breakdown/0/label", json!("a".repeat(65))),
+            ("/tools/1/breakdown/0/amount", json!("-1")),
+            ("/tools/1/breakdown/0/amount", json!("01.5")),
+            ("/tools/1/breakdown/0/amount", json!("1e2")),
+            (
+                "/tools/0/breakdown",
+                sample["tools"][1]["breakdown"].clone(),
+            ),
+        ] {
+            let mut invalid = sample.clone();
+            *invalid.pointer_mut(path).unwrap() = replacement;
+            for tool in invalid["tools"].as_array_mut().unwrap() {
+                tool["balance"] = tool["balances"][0].clone();
+            }
+            tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&invalid)?).await?;
+            let rejected = client
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<Value>()
+                .await?;
+            assert!(
+                rejected["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|t| t["status"] == "unknown" && t["reason"] == "usage snapshot invalid"),
+                "accepted {path}"
+            );
+        }
+        for (percent, count) in [(0.0, 0), (100.0, 20)] {
+            let mut boundary = sample.clone();
+            boundary["tools"][1]["windows"][0]["used_percent"] = json!(percent);
+            boundary["tools"][1]["breakdown"] = json!(
+                (0..count)
+                    .map(|i| json!({"label":format!("{i:064}"),"amount":"0.0001"}))
+                    .collect::<Vec<_>>()
+            );
+            tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&boundary)?).await?;
+            let served = client
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<Value>()
+                .await?;
+            assert_eq!(served["tools"][1], boundary["tools"][1]);
+        }
+        for status in ["unknown", "stale"] {
+            let mut rejected_key = sample.clone();
+            rejected_key["tools"][1]["status"] = json!(status);
+            rejected_key["tools"][1]["reason"] = json!("admin key rejected");
+            tokio::fs::write(&state.usage_snapshot, serde_json::to_vec(&rejected_key)?).await?;
+            let served = client
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<Value>()
+                .await?;
+            assert_eq!(served["tools"][1], rejected_key["tools"][1]);
+        }
+        server.abort();
+        state.db.close().await?;
+        Ok(())
     }
 
     #[tokio::test]

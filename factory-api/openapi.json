@@ -58,6 +58,23 @@
         ],
         "type": "object"
       },
+      "AgentSpendItem": {
+        "properties": {
+          "amount": {
+            "description": "USD decimal string with the same precision rules as balance amounts.",
+            "type": "string"
+          },
+          "label": {
+            "description": "Unique within the tool: 1–64 characters from [a-z0-9._ -].",
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "amount"
+        ],
+        "type": "object"
+      },
       "AgentTool": {
         "properties": {
           "balance": {
@@ -75,6 +92,13 @@
             "description": "Amp has independent USD and normalized orb-hour pools. Never sum units.",
             "items": {
               "$ref": "#/components/schemas/AgentBalance"
+            },
+            "type": "array"
+          },
+          "breakdown": {
+            "description": "Cursor cycle spend details in USD; empty for every other tool.",
+            "items": {
+              "$ref": "#/components/schemas/AgentSpendItem"
             },
             "type": "array"
           },
