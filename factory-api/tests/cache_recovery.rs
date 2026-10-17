@@ -68,7 +68,7 @@ fn offline_migration_preserves_telemetry_reruns_and_restores_backup() -> Result<
     db.execute_batch(&format!("VACUUM INTO '{}'", backup.display()))?;
     data::initialize(&mut db)?;
     data::initialize(&mut db)?;
-    assert_eq!(scalar(&db, "PRAGMA user_version"), 4);
+    assert_eq!(scalar(&db, "PRAGMA user_version"), 5);
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM requests_before_v4"), 1125);
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM requests"), 0);
     assert_eq!(
@@ -139,8 +139,8 @@ fn offline_migration_preserves_telemetry_reruns_and_restores_backup() -> Result<
         );
     }
     let db = data::open(&path)?;
-    assert_eq!(scalar(&db, "PRAGMA user_version"), 4);
-    db.pragma_update(None, "user_version", 5)?;
+    assert_eq!(scalar(&db, "PRAGMA user_version"), 5);
+    db.pragma_update(None, "user_version", 6)?;
     drop(db);
     assert!(data::open(&path).is_err());
     Ok(())
@@ -317,7 +317,7 @@ async fn catch_up_is_bounded_and_resumes_on_the_next_poll() -> Result<()> {
 fn invalid_page_rolls_back_rows_warnings_and_cursor() -> Result<()> {
     let mut db = Connection::open_in_memory()?;
     data::initialize(&mut db)?;
-    data::sync(&mut db, vec![record(1)])?;
+    data::sync(&mut db, vec![record(1)], &[])?;
     for invalid in [
         record(1),
         record(2),
@@ -334,14 +334,14 @@ fn invalid_page_rolls_back_rows_warnings_and_cursor() -> Result<()> {
             ..record(5)
         },
     ] {
-        assert!(data::sync(&mut db, vec![record(2), invalid]).is_err());
+        assert!(data::sync(&mut db, vec![record(2), invalid], &[]).is_err());
         assert_eq!(scalar(&db, "SELECT COUNT(*) FROM requests"), 1);
         assert_eq!(scalar(&db, "SELECT last_after_id FROM sync_state"), 1);
         assert_eq!(scalar(&db, "SELECT COUNT(*) FROM warnings"), 0);
     }
     // A deleted cache row must never regress the durable cursor or create a false gap.
     db.execute("DELETE FROM requests", [])?;
-    data::sync(&mut db, vec![record(2)])?;
+    data::sync(&mut db, vec![record(2)], &[])?;
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM warnings"), 0);
     assert_eq!(scalar(&db, "SELECT last_after_id FROM sync_state"), 2);
     Ok(())

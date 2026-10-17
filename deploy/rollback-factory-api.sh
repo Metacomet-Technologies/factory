@@ -33,12 +33,19 @@ pricing_mode=$(cat "$snapshot/pricing-mode")
 case "$pricing_mode" in legacy|fresh|v1) ;; *) fail "Invalid pricing mode: $pricing_mode" ;; esac
 [[ -f "$snapshot/requests-mode" ]] || fail 'Use the rollback script matching this snapshot; requests mode is missing.'
 requests_mode=$(cat "$snapshot/requests-mode")
-case "$requests_mode" in legacy|fresh|v4) ;; *) fail "Invalid requests mode: $requests_mode" ;; esac
+case "$requests_mode" in legacy|fresh|v4|v5) ;; *) fail "Invalid requests mode: $requests_mode" ;; esac
+# legacy/v4 snapshots record their version and a verified backup before migration.
+# Pre-MET-204 installers recorded v4 without a version when no migration ran.
+restore_requests=true
+case "$requests_mode" in
+    v5) restore_requests=false ;;
+    v4) [[ -f "$snapshot/requests-version" ]] || restore_requests=false ;;
+esac
 requests_db=/var/lib/factory-api/requests.db
 for path in "$requests_db" "$requests_db-wal" "$requests_db-shm" "$snapshot/requests.db"; do
     [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || fail "Unsafe requests file: $path"
 done
-if [[ "$requests_mode" == legacy && -f "$snapshot/requests.db.sha256" ]]; then
+if [[ "$restore_requests" == true && "$requests_mode" != fresh && -f "$snapshot/requests.db.sha256" ]]; then
     sha256sum -c "$snapshot/requests.db.sha256"
     [[ $(sqlite3 "file:$snapshot/requests.db?immutable=1" 'PRAGMA integrity_check;') == ok ]] || fail 'Requests snapshot integrity failed.'
 fi
@@ -70,8 +77,8 @@ if [[ $(systemctl show factory-api.service --property=LoadState --value) != not-
     systemctl stop factory-api.service
     systemctl disable factory-api.service
 fi
-if [[ "$requests_mode" != v4 && ! -f "$snapshot/requests-restored" ]]; then
-    if [[ "$requests_mode" == legacy && ! -f "$snapshot/requests.db.sha256" ]]; then
+if [[ "$restore_requests" == true && ! -f "$snapshot/requests-restored" ]]; then
+    if [[ "$requests_mode" != fresh && ! -f "$snapshot/requests.db.sha256" ]]; then
         [[ -f "$snapshot/requests-version" && -f "$requests_db" ]] || fail 'Requests backup is missing; refusing to restore the old binary.'
         [[ $(sudo -u factory-api sqlite3 -readonly "$requests_db" 'PRAGMA user_version;') == "$(cat "$snapshot/requests-version")" ]] || fail 'Requests schema changed without a verified backup; service remains stopped.'
     else
@@ -79,7 +86,7 @@ if [[ "$requests_mode" != v4 && ! -f "$snapshot/requests-restored" ]]; then
         for suffix in -wal -shm ''; do
             if [[ -e "$requests_db$suffix" ]]; then mv -- "$requests_db$suffix" "$aside/requests.db$suffix"; fi
         done
-        if [[ "$requests_mode" == legacy ]]; then
+        if [[ "$requests_mode" != fresh ]]; then
             install -o factory-api -g factory-api -m 0600 "$snapshot/requests.db" "$requests_db"
             [[ $(sudo -u factory-api sqlite3 -readonly "$requests_db" 'PRAGMA user_version;') == "$(cat "$snapshot/requests-version")" ]] || fail 'Requests restore version failed; service remains stopped.'
         fi
@@ -138,4 +145,4 @@ if [[ "$active" == active ]]; then
     sudo -u factory-api curl -fsS --max-time 2 http://127.0.0.1:8080/v1/health | jq -e '.status == "ok"' >/dev/null
     systemctl is-active --quiet factory-api.service
 fi
-printf '\nFactory API snapshot restored: %s\nPrior enabled state: %s; prior active state: %s (failed/unknown restored as stopped).\nPricing mode: %s; all pricing data and factory-api account preserved.\n' "$snapshot" "$enabled" "$active" "$pricing_mode"
+printf '\nFactory API snapshot restored: %s\nPrior enabled state: %s; prior active state: %s (failed/unknown restored as stopped).\nPricing mode: %s; requests mode: %s; all pricing data and factory-api account preserved.\n' "$snapshot" "$enabled" "$active" "$pricing_mode" "$requests_mode"

@@ -1,5 +1,6 @@
 pub mod alerts;
 mod api;
+pub mod costs;
 pub mod data;
 pub mod devices;
 pub mod devices_history;
@@ -256,10 +257,33 @@ impl AppState {
                     "invalid meter cursor page"
                 );
                 let finished = records.is_empty();
-                let new = self
-                    .db
-                    .write(&self.query_scope, move |db| data::sync(db, records))
-                    .await?;
+                let mut records = records;
+                // Read pricing in its own snapshot before the cache write transaction.
+                let histories = if records.iter().any(|r| costs::inference(&r.endpoint)) {
+                    let families = costs::families()?;
+                    self.db
+                        .pricing
+                        .read(&self.query_scope, move |store| {
+                            costs::load(store, &families)
+                        })
+                        .await
+                } else {
+                    Ok(vec![])
+                };
+                let (frozen, stopped) = costs::freeze(&histories, &mut records);
+                // A page stopped at its first record is not an empty (caught-up) page.
+                let new = if records.is_empty() && !finished {
+                    vec![]
+                } else {
+                    self.db
+                        .write(&self.query_scope, move |db| {
+                            data::sync(db, records, &frozen)
+                        })
+                        .await?
+                };
+                if let Some(error) = stopped {
+                    return Err(error);
+                }
                 if finished {
                     return Ok(());
                 }
@@ -292,6 +316,54 @@ impl AppState {
         self.warning(
             "meter",
             result.as_ref().err().map(|e: &anyhow::Error| e.to_string()),
+        )
+        .await;
+        result
+    }
+    /// Freeze costs for requests cached before MET-204, and fill in estimates
+    /// once a reference price exists. Bounded per poll; resumes from cost_backfill.
+    pub async fn backfill_costs(&self) -> Result<()> {
+        let result = async {
+            self.require_clock()?;
+            let families = costs::families()?;
+            let states = self
+                .db
+                .requests
+                .read(&self.query_scope, costs::states)
+                .await?;
+            if costs::idle(&states, &families) {
+                return Ok(());
+            }
+            let histories = Arc::new(
+                self.db
+                    .pricing
+                    .read(&self.query_scope, move |store| {
+                        costs::load(store, &families)
+                    })
+                    .await
+                    .map_err(|e| e.context("pricing history unavailable; cost backfill paused"))?,
+            );
+            for _ in 0..costs::PAGES_PER_POLL {
+                let histories = histories.clone();
+                if !self
+                    .db
+                    .write(&self.query_scope, move |db| {
+                        costs::backfill_page(db, &histories, now_ms())
+                    })
+                    .await?
+                {
+                    return Ok(());
+                }
+            }
+            anyhow::bail!("backfill incomplete; continuing on next poll")
+        }
+        .await;
+        self.warning(
+            "costs",
+            result
+                .as_ref()
+                .err()
+                .map(|e: &anyhow::Error| format!("{e:#}")),
         )
         .await;
         result
@@ -517,7 +589,7 @@ impl AppState {
     }
     pub async fn usage(&self, range: String, since: i64) -> Result<Usage> {
         let warnings = self.read_warnings().await;
-        let (records, warnings) = self
+        let (records, warnings, spend) = self
             .db
             .requests
             .read(&self.query_scope, move |db| {
@@ -527,7 +599,7 @@ impl AppState {
         self.db
             .pricing
             .read(&self.query_scope, move |db| {
-                data::usage(db, range, records, warnings)
+                data::usage(db, range, records, warnings, spend)
             })
             .await
     }
@@ -786,6 +858,8 @@ impl AppState {
                         match kind {
                             "meter" => {
                                 let _ = state.sync_meter().await;
+                                // Independent of meter reachability; needs only local data.
+                                let _ = state.backfill_costs().await;
                             }
                             "fleet" => state.collect_fleet().await,
                             "network" => state.collect_network(&mut network_collector).await,

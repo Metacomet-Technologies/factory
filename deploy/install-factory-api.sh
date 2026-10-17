@@ -101,7 +101,9 @@ if [[ -f "$requests_db" ]]; then
     requests_version=$(sudo -u factory-api sqlite3 -readonly "$requests_db" 'PRAGMA user_version;')
     case "$requests_version" in
         0|1|2|3) requests_mode=legacy ;;
+        # MET-204 adds frozen request costs (v5) in place; backup-gated like legacy.
         4) requests_mode=v4 ;;
+        5) requests_mode=v5 ;;
         *) fail "Unsupported requests user_version: $requests_version" ;;
     esac
 else
@@ -124,7 +126,7 @@ fi
 if [[ "$pricing_mode" == fresh ]]; then
     [[ ! -e "$pricing_db-wal" && ! -e "$pricing_db-shm" ]] || fail 'Orphan pricing WAL/SHM; recover before installing.'
 fi
-if [[ "$pricing_mode" == legacy || "$requests_mode" == legacy ]]; then
+if [[ "$pricing_mode" == legacy || "$requests_mode" == legacy || "$requests_mode" == v4 ]]; then
     [[ -f "$destination" && -f "$installed_unit" ]] || fail 'Legacy databases require a previous binary and unit for rollback.'
 fi
 [[ -d /var/backups/factory-db && ! -L /var/backups/factory-db/.backup.lock ]] || fail 'Install/review MET-74 backups before deploying.'
@@ -152,7 +154,7 @@ printf '%s\n' "$enabled" > "$snapshot/enabled"
 printf '%s\n' "$active" > "$snapshot/active"
 printf '%s\n' "$pricing_mode" > "$snapshot/pricing-mode"
 printf '%s\n' "$requests_mode" > "$snapshot/requests-mode"
-if [[ "$requests_mode" == legacy ]]; then printf '%s\n' "$requests_version" > "$snapshot/requests-version"; fi
+if [[ "$requests_mode" == legacy || "$requests_mode" == v4 ]]; then printf '%s\n' "$requests_version" > "$snapshot/requests-version"; fi
 if [[ -e "$destination" ]]; then cp -p -- "$destination" "$snapshot/binary"; else touch "$snapshot/binary.missing"; fi
 if [[ -e "$installed_unit" ]]; then cp -p -- "$installed_unit" "$snapshot/unit"; else touch "$snapshot/unit.missing"; fi
 if [[ -d /var/lib/factory-usage-trigger ]]; then
@@ -182,7 +184,7 @@ if [[ "$requests_mode" == fresh ]]; then
 else
     [[ $(sudo -u factory-api sqlite3 -readonly "$requests_db" 'PRAGMA user_version;') == "$requests_version" ]] || fail 'Requests version changed since preflight.'
 fi
-if [[ "$requests_mode" == legacy ]]; then
+if [[ "$requests_mode" == legacy || "$requests_mode" == v4 ]]; then
     # Open as the owner: read-only WAL opens can still create sidecar files.
     scratch=$(sudo -u factory-api mktemp -d /var/lib/factory-api/.requests-backup.XXXXXX)
     sudo -u factory-api sqlite3 -readonly "$requests_db" ".backup '$scratch/requests.db'"
@@ -190,7 +192,9 @@ if [[ "$requests_mode" == legacy ]]; then
     [[ $(sudo -u factory-api sqlite3 -readonly "$scratch/requests.db" 'PRAGMA user_version;') == "$requests_version" ]] || fail 'Requests backup version failed.'
     cp -p -- "$scratch/requests.db" "$snapshot/requests.db"
     sha256sum "$snapshot/requests.db" > "$snapshot/requests.db.sha256"
-    preservation_sql="SELECT 'preservation',1;$(sudo -u factory-api sqlite3 -readonly "$requests_db" "SELECT 'SELECT '||quote(name)||',COUNT(*) FROM '||quote(name)||';' FROM sqlite_schema WHERE type='table' AND name NOT IN ('requests','warnings') AND name NOT LIKE 'sqlite_%' ORDER BY name;")"
+    # Legacy request/warning tables are renamed by v4; v4 to v5 only adds tables.
+    if [[ "$requests_mode" == legacy ]]; then replaced="'requests','warnings'"; else replaced="''"; fi
+    preservation_sql="SELECT 'preservation',1;$(sudo -u factory-api sqlite3 -readonly "$requests_db" "SELECT 'SELECT '||quote(name)||',COUNT(*) FROM '||quote(name)||';' FROM sqlite_schema WHERE type='table' AND name NOT IN ($replaced) AND name NOT LIKE 'sqlite_%' ORDER BY name;")"
     # Root owns the rollback metadata; only SQLite runs as factory-api.
     # shellcheck disable=SC2024
     sudo -u factory-api sqlite3 -readonly "$requests_db" "$preservation_sql" > "$snapshot/telemetry-counts.before"
@@ -224,11 +228,11 @@ if [[ "$pricing_mode" != v1 ]]; then
     sudo -u factory-api sh -c 'umask 077; exec "$1" migrate --pricing-db "$2"' sh "$destination" "$pricing_db"
 fi
 [[ $(sqlite3 -readonly "$pricing_db" 'PRAGMA user_version;') == 1 ]] || fail 'Pricing migration did not produce user_version=1.'
-if [[ "$requests_mode" != v4 ]]; then
+if [[ "$requests_mode" != v5 ]]; then
     sudo -u factory-api sh -c 'umask 077; exec "$1" migrate --requests-db "$2"' sh "$destination" "$requests_db"
 fi
-[[ $(sudo -u factory-api sqlite3 -readonly "$requests_db" 'PRAGMA user_version;') == 4 ]] || fail 'Requests migration did not produce user_version=4.'
-if [[ "$requests_mode" == legacy ]]; then
+[[ $(sudo -u factory-api sqlite3 -readonly "$requests_db" 'PRAGMA user_version;') == 5 ]] || fail 'Requests migration did not produce user_version=5.'
+if [[ "$requests_mode" == legacy || "$requests_mode" == v4 ]]; then
     # shellcheck disable=SC2024
     sudo -u factory-api sqlite3 -readonly "$requests_db" "$preservation_sql" > "$snapshot/telemetry-counts.after"
     cmp -s "$snapshot/telemetry-counts.before" "$snapshot/telemetry-counts.after" || fail 'Requests migration changed telemetry row counts.'
@@ -245,8 +249,11 @@ tailscale_status=$(sudo -u factory-api tailscale status --json)
 [[ -n "$tailscale_status" ]] || fail 'Tailscale returned empty status for factory-api.'
 sudo -u factory-api systemctl is-active amp-runner.service
 systemctl is-active --quiet factory-api.service
+# Costs for cached requests are frozen by the running service in bounded batches.
+sudo -u factory-api sqlite3 -readonly "$requests_db" "SELECT 'cost_backfill',family,after_id,target_id,COALESCE(completed_at_ms,'pending') FROM cost_backfill ORDER BY family;"
 printf '\nFactory API installed on port 8080; health, pricing, fleet and service-user checks passed.\n'
 printf '%s\n' \
+    'Cost backfill completes when every family above shows a completion time; until then usage warns.' \
     'Review refresh results, then confirm only pending selections:' \
     'sudo -u factory-api curl -fsS -X POST http://127.0.0.1:8080/v1/pricing/refresh' \
     'sudo -u factory-api curl -fsS -X POST http://127.0.0.1:8080/v1/pricing/confirm/Claude%20Sonnet' \
