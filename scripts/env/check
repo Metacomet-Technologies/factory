@@ -52,7 +52,8 @@ EXEMPT = {
     "orb": {"playwright", "layout:checkout", "layout:vite-plus-env"},
     "cursor": set(),
     "sandbox": {"playwright", "layout:checkout", "layout:vite-plus-env"},
-    "ci": {"playwright", "layout:checkout", "layout:vite-plus-env"},
+    # The hosted runner lacks bwrap; the sandbox job installs its own.
+    "ci": {"playwright", "layout:checkout", "layout:vite-plus-env", "bubblewrap"},
     "factory-gpu": set(),
     "factory-console": set(),
 }

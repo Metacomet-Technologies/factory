@@ -49,7 +49,7 @@ Where kiosk UI checks run (the `verify-kiosk` skill):
 | `orb` (Amp) | `.agents/setup` on orb creation | Playwright (setup downloads no browsers), layout |
 | `cursor` (Cursor Cloud) | Team environment in the Cursor dashboard: `metacomet-technologies/factory`, id `d36f659b…`, snapshot `snapshot-20261016-…`. Install script there; no repo `.cursor/environment.json`, which would override it | nothing |
 | `sandbox` (`scripts/sandbox` host) | The host it runs on (orb, Cursor or runner); CI's `sandbox` job installs its own prerequisites | Playwright, layout |
-| `ci` (GitHub Actions `kiosk` job, ubuntu-24.04) | `.github/workflows/ci.yml`: `setup-node` and npm from the pins, rustup from `rust-toolchain.toml` | Playwright, layout |
+| `ci` (GitHub Actions `kiosk` job, ubuntu-24.04) | `.github/workflows/ci.yml`: `setup-node` and npm from the pins, rustup from `rust-toolchain.toml` | Playwright, layout, bubblewrap (the `sandbox` job installs it) |
 | `factory-gpu` | By hand (admin), converging through MET-225 | nothing |
 | `factory-console` | By hand (admin), converging through MET-225 | nothing |
 
