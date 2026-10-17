@@ -1,5 +1,5 @@
-import { useEffect, useState, type MouseEvent } from "react";
-import { Activity, Cpu, Moon, Server, Sun, Terminal, Radio, Info } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Activity, Cpu, Moon, Server, Sun, Terminal, Info } from "lucide-react";
 import { useApi } from "./api/client";
 import { useStream } from "./api/stream";
 import { useBuildUpdate } from "./api/build-update";
@@ -13,20 +13,37 @@ import {
 } from "./components/sections";
 import { Button } from "./components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
+import { LiveIndicator } from "./components/ui/live-indicator";
+import { PageHeader } from "./components/ui/page-header";
 import { VersionFooter } from "./components/version-footer";
 import { UpsBadge, UpsSection } from "./components/ups";
 import UpsPage from "./components/ups-page";
 import DevicesPage from "./components/devices-page";
-import { Card, CardContent, CardHeader } from "./components/ui/card";
+import LlmPage from "./components/llm-page";
 
-function followLink(event: MouseEvent<HTMLAnchorElement>) {
-  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0)
+/** Same-origin links without a modifier key route in-app; everything else falls through. */
+function followLink(event: globalThis.MouseEvent) {
+  if (event.defaultPrevented || event.button !== 0) return;
+  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  const anchor = (event.target as Element | null)?.closest("a[href]");
+  if (!(anchor instanceof HTMLAnchorElement) || anchor.target || anchor.hasAttribute("download"))
     return;
+  if (anchor.origin !== window.location.origin || anchor.hash) return;
   event.preventDefault();
-  const href = event.currentTarget.getAttribute("href");
-  if (!href || href === window.location.pathname) return;
-  window.history.pushState(null, "", href);
+  if (anchor.pathname === window.location.pathname) return;
+  window.history.pushState(null, "", anchor.pathname);
   window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
+/** Breadcrumb segments for the top bar; every crumb except the last links to a higher level. */
+export function crumbs(path: string): { label: string; href: string }[] {
+  const parts = path.split("/").filter(Boolean);
+  if (parts.length === 0) return [{ label: "dashboard", href: "/" }];
+  // Devices live on the dashboard fleet grid, so the "devices" crumb returns there.
+  return parts.map((part, i) => ({
+    label: part,
+    href: i === 0 && part === "devices" ? "/" : `/${parts.slice(0, i + 1).join("/")}`,
+  }));
 }
 
 export default function App() {
@@ -37,7 +54,11 @@ export default function App() {
   useEffect(() => {
     const sync = () => setPath(window.location.pathname);
     window.addEventListener("popstate", sync);
-    return () => window.removeEventListener("popstate", sync);
+    document.addEventListener("click", followLink);
+    return () => {
+      window.removeEventListener("popstate", sync);
+      document.removeEventListener("click", followLink);
+    };
   }, []);
   const [dark, setDark] = useState(() => document.documentElement.dataset.theme === "dark");
   const [followsSystem, setFollowsSystem] = useState(
@@ -87,6 +108,7 @@ export default function App() {
     : live.connected && live.devices
       ? live.devices
       : deviceCurrent.data;
+  const deviceError = collectorDown ? "Device collector unavailable" : deviceCurrent.error;
   useBuildUpdate(live.snapshotRevision, usage.loading || gpu.loading);
   return (
     <TooltipProvider>
@@ -94,25 +116,30 @@ export default function App() {
         Skip to dashboard
       </a>
       <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">
-            <Activity aria-hidden="true" size={20} />
-          </span>
-          <div>
-            <h1>
-              factory<span className="muted"> / kiosk</span>
-            </h1>
-            <p className="muted">Private infrastructure, at a glance</p>
-          </div>
-        </div>
-        <div className="header-actions">
-          <span role="status" className={live.connected ? "status-ok" : "status-warn"}>
-            <Radio aria-hidden="true" size={14} />
-            {live.connected ? "Live" : "Reconnecting"}
-          </span>
-          <a href="/devices" onClick={followLink}>
-            Devices
+        <nav className="brand" aria-label="Breadcrumb">
+          <a href="/" className="brand-home">
+            <span className="brand-mark">
+              <Activity aria-hidden="true" size={20} />
+            </span>
+            <h1>factory</h1>
           </a>
+          <ol className="crumbs">
+            {crumbs(path).map((crumb, i, all) => (
+              <li key={crumb.href}>
+                <span className="crumb-sep" aria-hidden="true">
+                  /
+                </span>
+                {i === all.length - 1 ? (
+                  <span aria-current="page">{crumb.label}</span>
+                ) : (
+                  <a href={crumb.href}>{crumb.label}</a>
+                )}
+              </li>
+            ))}
+          </ol>
+        </nav>
+        <div className="header-actions">
+          <LiveIndicator status={live.status} />
           <UpsBadge current={upsCurrent} now={now} warnings={upsWarnings} />
           <Tooltip>
             <TooltipTrigger
@@ -157,49 +184,14 @@ export default function App() {
           history={deviceHistory.data}
           range={deviceRange}
           setRange={setDeviceRange}
-          error={collectorDown ? "Device collector unavailable" : deviceCurrent.error}
+          error={deviceError}
           loading={deviceCurrent.loading}
           connected={live.connected}
           live={live.connected && live.devices != null}
           now={now}
         />
-      ) : path === "/devices" ? (
-        <main id="main" className="dashboard devices-page">
-          <div className="intro">
-            <div>
-              <p className="eyebrow">DEVICES</p>
-              <h2>Devices</h2>
-            </div>
-            <p className="muted">
-              <a href="/" onClick={followLink}>
-                Dashboard
-              </a>
-            </p>
-          </div>
-          {devices.error && (
-            <p role="alert" className="status-fail">
-              {devices.error}
-            </p>
-          )}
-          {!devices.loading && devices.data?.devices.length === 0 && (
-            <p className="muted">No devices reported.</p>
-          )}
-          <div className="dashboard-grid">
-            {devices.data?.devices.map((device) => (
-              <a
-                key={device.device_id}
-                href={device.href}
-                onClick={followLink}
-                className="ups-card-link"
-              >
-                <Card>
-                  <CardHeader>{device.device_id}</CardHeader>
-                  <CardContent>{device.health}</CardContent>
-                </Card>
-              </a>
-            ))}
-          </div>
-        </main>
+      ) : path === "/llm" ? (
+        <LlmPage usage={usage} pricing={pricing} range={usageRange} setRange={setUsageRange} />
       ) : path === "/ups" ? (
         <UpsPage
           current={upsCurrent}
@@ -210,37 +202,33 @@ export default function App() {
         />
       ) : (
         <main id="main" className="dashboard">
-          <div className="intro">
-            <div>
-              <p className="eyebrow">OPERATIONS OVERVIEW</p>
-              <h2>Your local compute. In focus.</h2>
-            </div>
-            <p className="muted">Auto-refreshes every 60s</p>
-          </div>
+          <PageHeader
+            eyebrow="Operations overview"
+            title="Your local compute. In focus."
+            aside="Auto-refreshes every 60s"
+          />
           <div className="dashboard-grid">
-            <FleetSection resource={fleet} icon={<Server />} />
+            <FleetSection
+              resource={fleet}
+              devices={devices.data?.devices}
+              icon={<Server />}
+              index={0}
+            />
             <GpuSection
               resource={gpu}
               live={live.gpu}
               range={gpuRange}
               setRange={setGpuRange}
               icon={<Cpu />}
+              index={1}
             />
-            <UpsSection current={upsCurrent} now={now} warnings={upsWarnings} />
-            <a href="/devices/factory-gpu" onClick={followLink} className="ups-card-link">
-              <Card>
-                <CardHeader>factory-gpu</CardHeader>
-                <CardContent>
-                  {devices.error ? devices.error : (devices.data?.devices[0]?.health ?? "—")}
-                </CardContent>
-              </Card>
-            </a>
+            <UpsSection current={upsCurrent} now={now} warnings={upsWarnings} index={2} />
             <UsageSection
               resource={usage}
               pricing={pricing}
               range={usageRange}
-              setRange={setUsageRange}
               icon={<Activity />}
+              index={3}
             />
             <aside className="sidebar" aria-label="Frontier tools and live requests">
               <AgentsSection
@@ -251,8 +239,9 @@ export default function App() {
                 }
                 icon={<Terminal />}
                 revision={live.agentsRevision}
+                index={4}
               />
-              <TickerSection requests={live.requests} connected={live.connected} />
+              <TickerSection requests={live.requests} connected={live.connected} index={5} />
             </aside>
           </div>
         </main>

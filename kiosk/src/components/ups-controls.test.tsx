@@ -14,7 +14,7 @@ let state: ControlState;
 let refusal: string;
 let health: number;
 let stateStatus: number;
-let stateError: string;
+let stateError: string | { code: string; message: string };
 let confirmFailure: Response | Error | null;
 beforeEach(() => {
   refusal = "";
@@ -171,6 +171,16 @@ describe("UPS controls", () => {
       expect(screen.getByRole("button", { name: "test.quick" })).toBeEnabled();
     },
   );
+
+  it("shows the message of a factory-api style object error instead of [object Object]", async () => {
+    stateStatus = 404;
+    stateError = { code: "not_found", message: "unknown endpoint" };
+    render(<UpsControls />);
+    await screen.findByText("unknown endpoint");
+    expect(screen.getByRole("region", { name: "Controls" })).not.toHaveTextContent(
+      "[object Object]",
+    );
+  });
 
   it.each(["409", "network", "403"])(
     "preserves an open dialog on a failed poll except 403: %s",

@@ -2,7 +2,7 @@ import { render, screen, within, fireEvent, waitFor, act } from "@testing-librar
 import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
 import App from "./App";
 import { agentFixtures, fixtures } from "../mock/fixtures";
-import { streamReducer, initialLiveState, parseEvent } from "./api/stream";
+import { streamReducer, initialLiveState, parseEvent, STREAM_SILENCE_MS } from "./api/stream";
 import type { StreamEvent, UpsCurrent } from "./api/types";
 import { UpsBadge, UpsSection } from "./components/ups";
 import UpsPage from "./components/ups-page";
@@ -12,6 +12,10 @@ import { upsChartData } from "./lib/ups";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { AgentsSection, FleetSection } from "./components/sections";
 import { VersionFooter } from "./components/version-footer";
+const openLlmDetails = async () => {
+  fireEvent.click(screen.getByRole("link", { name: "Local LLM usage, pricing and model details" }));
+  return screen.findByRole("heading", { name: "Local LLM · Usage & spend" });
+};
 // Captured from the real sandbox API; synthetic quotas include the reported label and percentages.
 import capturedUsage from "./agents-usage.sse?raw";
 
@@ -583,12 +587,26 @@ describe("dashboard contract", () => {
       { name: "offline-unknown", online: false, last_seen_ms: null, services: [] },
       { name: "online-dated", online: true, last_seen_ms: 0, services: [] },
     ];
-    render(<FleetSection resource={{ data, error: null, loading: false }} icon={null} />);
+    render(
+      <FleetSection
+        resource={{ data, error: null, loading: false }}
+        devices={[
+          { device_id: "collector-only", health: "healthy", href: "/devices/collector-only" },
+        ]}
+        icon={null}
+      />,
+    );
     const nodes = screen.getAllByRole("article");
-    expect(nodes[0]).toHaveTextContent("Last seen now");
-    expect(nodes[1]).toHaveTextContent("Last seen —");
-    expect(nodes[2]).toHaveTextContent(`Last seen ${seen(0)}`);
-    expect(nodes[2]).not.toHaveTextContent("Last seen now");
+    expect(nodes).toHaveLength(4);
+    expect(screen.getByRole("link", { name: /collector-only/ })).toHaveAttribute(
+      "href",
+      "/devices/collector-only",
+    );
+    expect(nodes[3]).toHaveTextContent("Host health · healthy");
+    expect(nodes[0]).toHaveTextContent("seen now");
+    expect(nodes[1]).toHaveTextContent("seen —");
+    expect(nodes[2]).toHaveTextContent(`seen ${seen(0)}`);
+    expect(nodes[2]).not.toHaveTextContent("seen now");
   });
   it("renders every section, null tps, pricing estimates and a read-only pending banner", async () => {
     api();
@@ -602,6 +620,15 @@ describe("dashboard contract", () => {
       within(screen.getByRole("region", { name: "Fleet" })).getByText("Offline"),
     ).toBeInTheDocument();
     expect(screen.getByText("Failing · —")).toBeInTheDocument();
+    const usageCard = within(screen.getByRole("region", { name: "Local LLM" }));
+    expect(usageCard.getByText("Pricing update pending")).toBeInTheDocument();
+    expect(usageCard.getByText("+ $1.12 est.")).toBeInTheDocument();
+    expect(usageCard.queryByRole("table")).not.toBeInTheDocument();
+    expect(
+      within(screen.getByRole("region", { name: "GPU" })).getByText("9 GiB"),
+    ).toBeInTheDocument();
+    expect(await screen.findByLabelText("GPU utilization history")).toBeInTheDocument();
+    await openLlmDetails();
     expect(screen.getByText("+ $1.12 estimated (pre-history)")).toBeInTheDocument();
     expect(
       screen.getByText(
@@ -613,11 +640,9 @@ describe("dashboard contract", () => {
     expect(screen.getByText("8 unpriced · anthropic/claude-sonnet-5.5")).toBeInTheDocument();
     expect(screen.getByText("3 unpriced · openai/gpt-6.1-sol")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /confirm/i })).not.toBeInTheDocument();
-    expect(
-      within(screen.getByRole("region", { name: "GPU" })).getByText("9 GiB"),
-    ).toBeInTheDocument();
-    expect(await screen.findByLabelText("GPU utilization history")).toBeInTheDocument();
     expect(within(screen.getByRole("table")).getByText("— / 56.8")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("link", { name: "factory" }));
+    await screen.findByRole("heading", { name: "Your local compute. In focus." });
     const tools = within(screen.getByRole("region", { name: "Frontier CLIs" }));
     expect(
       tools.getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent),
@@ -715,10 +740,11 @@ describe("dashboard contract", () => {
     render(<App />);
     await screen.findByText("Meter unavailable. Usage cannot be retrieved.");
     expect(screen.getByText("Telemetry unavailable")).toBeInTheDocument();
-    expect(screen.getByText("No model requests in this range.")).toBeInTheDocument();
     expect(
       screen.getByText("Pricing provider unavailable. Reference rates are unknown."),
     ).toBeInTheDocument();
+    await openLlmDetails();
+    expect(screen.getByText("No model requests in this range.")).toBeInTheDocument();
     expect(screen.getByText("ChatGPT mid-tier reference: — · rates: —")).toBeInTheDocument();
   });
   it("keeps endpoint errors isolated and exposes section empty states", async () => {
@@ -726,19 +752,68 @@ describe("dashboard contract", () => {
     render(<App />);
     await screen.findByText("Unable to load this section");
     expect(screen.getByText(/HTTP 503/)).toBeInTheDocument();
-    expect(screen.getByText("No model requests in this range.")).toBeInTheDocument();
     expect(screen.getByText("No frontier tools configured.")).toBeInTheDocument();
-    expect(screen.getByText("No reference pricing configured.")).toBeInTheDocument();
     expect(screen.getByText("No GPU history available.")).toBeInTheDocument();
+    await openLlmDetails();
+    expect(screen.getByText("No model requests in this range.")).toBeInTheDocument();
+    expect(screen.getByText("No reference pricing configured.")).toBeInTheDocument();
   });
   it("changes the usage range", async () => {
     api();
     render(<App />);
     await screen.findByText("$3.41");
-    fireEvent.click(
-      within(screen.getByRole("region", { name: "Local LLM" })).getByRole("button", { name: "7d" }),
-    );
+    expect(
+      within(screen.getByRole("region", { name: "Local LLM" })).queryByRole("button"),
+    ).not.toBeInTheDocument();
+    await openLlmDetails();
+    fireEvent.click(screen.getByRole("button", { name: "7d" }));
     await screen.findByText("$23.87");
+    fireEvent.click(screen.getByRole("link", { name: "factory" }));
+    expect(await screen.findByText("$23.87")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Local LLM" })).toHaveTextContent("7d");
+  });
+  it("reopens the stream after silence and refetches on the next open, not before", async () => {
+    vi.useFakeTimers();
+    const fetch = api();
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const first = MockSource.latest;
+    const closed = vi.spyOn(first, "close");
+    act(() => first.onopen?.());
+    expect(screen.getByText("Live")).toBeInTheDocument();
+    const fleetFetches = () =>
+      fetch.mock.calls.filter(([path]: [string]) => path.startsWith("/v1/fleet")).length;
+    // A keepalive event just under the limit keeps the socket.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STREAM_SILENCE_MS - 1);
+    });
+    act(() => first.onmessage?.(new MessageEvent("message", { data: "{}" })));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STREAM_SILENCE_MS - 1);
+    });
+    expect(closed).not.toHaveBeenCalled();
+    expect(screen.getByText("Live")).toBeInTheDocument();
+    // Silence past the limit drops the socket and schedules a reopen within the first backoff.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(closed).toHaveBeenCalled();
+    expect(screen.getByText("Reconnecting")).toBeInTheDocument();
+    const before = fleetFetches();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(MockSource.latest).not.toBe(first);
+    expect(fleetFetches()).toBe(before);
+    act(() => MockSource.latest.onopen?.());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("Live")).toBeInTheDocument();
+    expect(fleetFetches()).toBe(before + 1);
+    vi.useRealTimers();
   });
   it("refreshes displayed values at 60 seconds, not before", async () => {
     vi.useFakeTimers();

@@ -1,13 +1,16 @@
 import { BatteryWarning, Battery, Plug } from "lucide-react";
 import type { UpsCurrent } from "../api/types";
 import { number } from "../lib/format";
-import { Card, CardContent, CardHeader } from "./ui/card";
-import { Badge } from "./ui/badge";
+import { Panel } from "./ui/panel";
+import { Stat } from "./ui/stat";
+import { StatusChip } from "./ui/status-chip";
+import { MeterBar } from "./ui/meter-bar";
 import { Button } from "./ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
 type Props = { current: UpsCurrent | null | undefined; now: number; warnings?: string[] };
-function state({ current, now }: Props) {
+export type UpsLabel = "No data" | "Low battery" | "On battery" | "Replace battery" | "Online";
+export function upsState({ current, now }: Props): UpsLabel {
   if (!current || now - current.ts_ms > 30_000) return "No data";
   if (current.low_battery) return "Low battery";
   if (current.on_battery) return "On battery";
@@ -15,7 +18,16 @@ function state({ current, now }: Props) {
   if (current.on_line) return "Online";
   return "No data";
 }
-function runtime(seconds: number | null | undefined) {
+export function upsTone(label: UpsLabel) {
+  return label === "On battery" || label === "Low battery"
+    ? "fail"
+    : label === "Replace battery"
+      ? "warn"
+      : label === "Online"
+        ? "ok"
+        : "neutral";
+}
+export function runtime(seconds: number | null | undefined) {
   if (seconds == null) return "—";
   if (seconds >= 3600)
     return `${Math.floor(seconds / 3600)} h ${Math.floor((seconds % 3600) / 60)} m`;
@@ -23,7 +35,7 @@ function runtime(seconds: number | null | undefined) {
 }
 
 export function UpsBadge(props: Props) {
-  const label = state(props);
+  const label = upsState(props);
   const current = label === "No data" ? null : props.current;
   const alarm = label === "On battery" || label === "Low battery";
   return (
@@ -73,89 +85,79 @@ export function UpsBadge(props: Props) {
   );
 }
 
-export function UpsSection(props: Props & { warnings: string[] }) {
-  const label = state(props);
+export function UpsSection(props: Props & { warnings: string[]; index?: number }) {
+  const label = upsState(props);
   const current = label === "No data" ? null : props.current;
   const alarm = label === "On battery" || label === "Low battery";
+  const tone = upsTone(label);
+  const markers = [
+    current?.charge_warning_percent == null
+      ? []
+      : [{ at: current.charge_warning_percent, label: "Warning" }],
+    current?.charge_low_percent == null
+      ? []
+      : [{ at: current.charge_low_percent, label: "Low / shutdown" }],
+  ].flat();
   return (
-    <section className={`ups${alarm ? " ups-warning" : ""}`} aria-label="UPS">
-      <a href="/ups" className="ups-card-link" aria-label="UPS history and settings">
-        <Card>
-          <CardHeader>
-            <div className="section-heading">
-              <div className="section-title">
-                <Plug aria-hidden="true" />
-                <h2>UPS</h2>
-              </div>
-              <Badge
-                variant="outline"
-                className={
-                  alarm || label === "Replace battery"
-                    ? "status-warn"
-                    : label === "Online"
-                      ? "status-ok"
-                      : "muted"
-                }
-              >
-                {label}
-              </Badge>
-            </div>
-            <p className="muted">Power · factory-gpu, modem, eero</p>
-          </CardHeader>
-          <CardContent>
-            <div className="ups-readings">
-              <div>
-                <p className="muted">Charge</p>
-                <strong className="ups-charge">{number(current?.charge_percent)}%</strong>
-                <div className="ups-charge-track" aria-label="Charge thresholds">
-                  <span
-                    style={{
-                      width: `${Math.min(100, Math.max(0, current?.charge_percent ?? 0))}%`,
-                    }}
-                  />
-                  {current?.charge_warning_percent != null && (
-                    <i style={{ left: `${current.charge_warning_percent}%` }} />
-                  )}
-                  {current?.charge_low_percent != null && (
-                    <i style={{ left: `${current.charge_low_percent}%` }} />
-                  )}
-                </div>
-                <p className="muted">
-                  Warning {number(current?.charge_warning_percent)}% · Low/shutdown{" "}
-                  {number(current?.charge_low_percent)}%
-                </p>
-              </div>
-              <div>
-                <p className="muted">Runtime</p>
-                <strong className={alarm ? "ups-runtime-alarm status-warn" : "ups-runtime"}>
-                  {runtime(current?.runtime_s)}
-                </strong>
-              </div>
-              <div>
-                <p className="muted">Load</p>
-                <strong>
-                  {number(current?.load_w)} W of {number(current?.load_nominal_w)} W
-                </strong>
-                <p className="muted">{number(current?.load_percent)}%</p>
-              </div>
-              <div>
-                <p className="muted">Input / output</p>
-                <strong>
-                  {number(current?.input_v)} / {number(current?.output_v)} V
-                </strong>
-                <p className="muted">Battery {number(current?.battery_v)} V</p>
-              </div>
-            </div>
-            <p className="muted">Last self-test: {current?.test_result ?? "—"}</p>
-            {label === "No data" &&
-              props.warnings.map((warning) => (
-                <p className="status-warn" key={warning}>
-                  {warning}
-                </p>
-              ))}
-          </CardContent>
-        </Card>
-      </a>
-    </section>
+    <a href="/ups" className="panel-link ups" aria-label="UPS history and settings">
+      <Panel
+        title="UPS"
+        subtitle="Power · factory-gpu, modem, eero"
+        icon={<Plug />}
+        index={props.index}
+        tone={alarm ? "fail" : label === "Replace battery" ? "warn" : undefined}
+        action={
+          <StatusChip tone={tone} dot={label !== "No data"} pulse={alarm}>
+            {label}
+          </StatusChip>
+        }
+      >
+        <div className="ups-readings">
+          <div>
+            <Stat
+              label="Charge"
+              value={current?.charge_percent ?? null}
+              format={(n) => `${number(n)}%`}
+              tone={alarm ? "fail" : undefined}
+            />
+            <MeterBar
+              label="Charge thresholds"
+              value={current?.charge_percent}
+              tone={alarm ? "fail" : current ? "ok" : "muted"}
+              markers={markers}
+            />
+            <p className="muted ups-threshold-note">
+              Warning {number(current?.charge_warning_percent)}% · Low/shutdown{" "}
+              {number(current?.charge_low_percent)}%
+            </p>
+          </div>
+          <Stat
+            label="Runtime"
+            value={runtime(current?.runtime_s)}
+            tone={alarm ? "fail" : undefined}
+            size={alarm ? "lg" : "md"}
+          />
+          <Stat
+            label="Load"
+            value={`${number(current?.load_w)} W of ${number(current?.load_nominal_w)} W`}
+            note={`${number(current?.load_percent)}%`}
+            size="sm"
+          />
+          <Stat
+            label="Input / output"
+            value={`${number(current?.input_v)} / ${number(current?.output_v)} V`}
+            note={`Battery ${number(current?.battery_v)} V`}
+            size="sm"
+          />
+        </div>
+        <p className="muted">Last self-test: {current?.test_result ?? "—"}</p>
+        {label === "No data" &&
+          props.warnings.map((warning) => (
+            <p className="status-warn" key={warning}>
+              {warning}
+            </p>
+          ))}
+      </Panel>
+    </a>
   );
 }

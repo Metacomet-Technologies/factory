@@ -36,7 +36,7 @@ async function firstFrames(url: string, placeholder = false) {
           ["light", "blocked"],
         ]) as ["dark" | "light", "dark" | "light" | "invalid" | "blocked" | null][]) {
       const explicit = saved === "dark" || saved === "light" ? saved : null;
-      const expected = (explicit ?? system) === "dark" ? "rgb(19, 19, 21)" : "rgb(246, 246, 247)";
+      const expected = (explicit ?? system) === "dark" ? "rgb(13, 15, 20)" : "rgb(243, 244, 248)";
       const name = `${placeholder ? "placeholder" : "kiosk"}-${system}${saved ? `-saved-${saved}` : ""}`;
       const page = await browser.newPage({
         colorScheme: system,

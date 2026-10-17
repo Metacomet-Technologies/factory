@@ -1,0 +1,317 @@
+{
+  "generated_at_ms": 1792202573075,
+  "warnings": [],
+  "device": {
+    "device_id": "factory-gpu",
+    "observed_at_ms": 1792202569285,
+    "identity": {
+      "hostname": "factory-gpu",
+      "boot_id": "sandbox-boot",
+      "uptime": {
+        "value": 1123200,
+        "unit": "s",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      }
+    },
+    "cpu": {
+      "utilization": {
+        "value": 23,
+        "unit": "%",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      },
+      "iowait": {
+        "value": 0.4,
+        "unit": "%",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      },
+      "load1": {
+        "value": 1.4,
+        "unit": "load",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      },
+      "load5": {
+        "value": 1.1,
+        "unit": "load",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      },
+      "load15": {
+        "value": 0.9,
+        "unit": "load",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      },
+      "temperature": {
+        "value": null,
+        "unit": "C",
+        "observed_at_ms": 1792202509284,
+        "availability": "unsupported",
+        "detail": "no cpu temperature sensor"
+      }
+    },
+    "memory": {
+      "total": {
+        "value": 68719476736,
+        "unit": "bytes",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      },
+      "available": {
+        "value": 41231686656,
+        "unit": "bytes",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      },
+      "used": {
+        "value": 27487790080,
+        "unit": "bytes",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      },
+      "swap_total": {
+        "value": 0,
+        "unit": "bytes",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      },
+      "swap_free": {
+        "value": 0,
+        "unit": "bytes",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      }
+    },
+    "gpus": [
+      {
+        "index": 0,
+        "memory_used": {
+          "value": 9255,
+          "unit": "MiB",
+          "observed_at_ms": 1792202569285,
+          "availability": "available",
+          "detail": null
+        },
+        "memory_total": {
+          "value": 12288,
+          "unit": "MiB",
+          "observed_at_ms": 1792202569285,
+          "availability": "available",
+          "detail": null
+        },
+        "utilization": {
+          "value": 65,
+          "unit": "%",
+          "observed_at_ms": 1792202569285,
+          "availability": "available",
+          "detail": null
+        },
+        "temperature": {
+          "value": 62,
+          "unit": "C",
+          "observed_at_ms": 1792202569285,
+          "availability": "available",
+          "detail": null
+        },
+        "power": {
+          "value": 135.5,
+          "unit": "W",
+          "observed_at_ms": 1792202569285,
+          "availability": "available",
+          "detail": null
+        }
+      }
+    ],
+    "filesystems": [
+      {
+        "id": "/dev/nvme0n1p2\t/",
+        "source": "/dev/nvme0n1p2",
+        "mountpoint": "/",
+        "fstype": "ext4",
+        "size": {
+          "value": 1999000000000,
+          "unit": "bytes",
+          "observed_at_ms": 1792202509284,
+          "availability": "available",
+          "detail": null
+        },
+        "used": {
+          "value": 812000000000,
+          "unit": "bytes",
+          "observed_at_ms": 1792202509284,
+          "availability": "available",
+          "detail": null
+        },
+        "used_percent": {
+          "value": 40.6,
+          "unit": "%",
+          "observed_at_ms": 1792202509284,
+          "availability": "available",
+          "detail": null
+        },
+        "inodes_used_percent": {
+          "value": 20,
+          "unit": "%",
+          "observed_at_ms": 1792202509284,
+          "availability": "available",
+          "detail": null
+        }
+      }
+    ],
+    "drives": [
+      {
+        "id": "wwn-sandbox",
+        "kernel": "nvme0n1",
+        "model": null,
+        "size": {
+          "value": 2000398934016,
+          "unit": "bytes",
+          "observed_at_ms": 1792202509284,
+          "availability": "available",
+          "detail": null
+        },
+        "smart": {
+          "availability": "unsupported",
+          "passed": null,
+          "observed_at_ms": 1792202509284,
+          "detail": "SMART unsupported"
+        },
+        "available_spare": {
+          "value": null,
+          "unit": "%",
+          "observed_at_ms": 1792202509284,
+          "availability": "unsupported",
+          "detail": "SMART unsupported"
+        },
+        "spare_threshold_percent": null,
+        "media_errors": {
+          "value": null,
+          "unit": "count",
+          "observed_at_ms": 1792202509284,
+          "availability": "unsupported",
+          "detail": "SMART unsupported"
+        },
+        "media_critical": false,
+        "temperature": {
+          "value": null,
+          "unit": "C",
+          "observed_at_ms": 1792202509284,
+          "availability": "unsupported",
+          "detail": "SMART unsupported"
+        }
+      }
+    ],
+    "disk_io": {
+      "read": {
+        "value": 0,
+        "unit": "B/s",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      },
+      "write": {
+        "value": 0,
+        "unit": "B/s",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      }
+    },
+    "network": {
+      "rx": {
+        "value": 0,
+        "unit": "B/s",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      },
+      "tx": {
+        "value": 0,
+        "unit": "B/s",
+        "observed_at_ms": 1792202569285,
+        "availability": "available",
+        "detail": null
+      }
+    },
+    "cooling": {
+      "temperatures": [
+        {
+          "name": "k10temp k10temp temp1",
+          "metric": {
+            "value": 45,
+            "unit": "C",
+            "observed_at_ms": 1792202509284,
+            "availability": "available",
+            "detail": null
+          }
+        }
+      ],
+      "fans": [],
+      "temperatures_availability": "available",
+      "fans_availability": "unsupported"
+    },
+    "maintenance": {
+      "services": [],
+      "backup": {
+        "availability": "available",
+        "last_success_ms": 10,
+        "last_attempt_ms": 10,
+        "error": null,
+        "observed_at_ms": 1792202569285
+      },
+      "clock": {
+        "synchronized": true,
+        "availability": "available",
+        "observed_at_ms": 1792202569285
+      },
+      "reboot": {
+        "availability": "available",
+        "reboot_required": false,
+        "pending_since_ms": null,
+        "days_pending": null,
+        "consecutive_skips": 0,
+        "alert_due": false,
+        "last_check_ms": 10,
+        "last_decision": "not-needed",
+        "detail": null
+      },
+      "ups": {
+        "href": "/ups",
+        "availability": "available",
+        "status": "OL",
+        "charge_percent": 100,
+        "observed_at_ms": 1792202569283,
+        "detail": null
+      }
+    },
+    "collector": {
+      "fast_interval_ms": 15000,
+      "slow_interval_ms": 300000,
+      "last_fast_ms": 1792202569285,
+      "last_slow_ms": 1792202509284,
+      "fast_ok": true,
+      "filesystems": "available",
+      "drives": "available",
+      "smart": "unsupported",
+      "detail": null
+    },
+    "health": {
+      "status": "healthy",
+      "reasons": []
+    }
+  }
+}

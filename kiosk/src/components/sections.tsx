@@ -5,6 +5,7 @@ import { useAgentsRefresh } from "../api/agents-refresh";
 import type { LiveState } from "../api/stream";
 import type {
   Agents,
+  DeviceList,
   Fleet,
   Gpu,
   GpuSample,
@@ -12,53 +13,19 @@ import type {
   Pricing,
   UsageRange,
   GpuRange,
-  ModelUsage,
 } from "../api/types";
 import { count, ms, number, seen, time, usd } from "../lib/format";
-import { Card, CardContent, CardHeader } from "./ui/card";
-import { Badge } from "./ui/badge";
+import { Panel, Tile } from "./ui/panel";
+import { Stat, StatGrid } from "./ui/stat";
+import { StatusChip, StatusText } from "./ui/status-chip";
+import { MeterBar } from "./ui/meter-bar";
+import { RangeToggle } from "./ui/range-toggle";
 import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
 import { Skeleton } from "./ui/skeleton";
-import { Separator } from "./ui/separator";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./ui/table";
-import { ToggleGroup, ToggleGroupItem } from "./ui/toggle-group";
 import { Button } from "./ui/button";
 
 const GpuChart = lazy(() => import("./gpu-chart"));
 
-function Section({
-  title,
-  subtitle,
-  icon,
-  action,
-  className = "",
-  children,
-}: {
-  title: string;
-  subtitle: string;
-  icon: ReactNode;
-  action?: ReactNode;
-  className?: string;
-  children: ReactNode;
-}) {
-  return (
-    <section className={className} aria-label={title}>
-      <Card>
-        <CardHeader>
-          <div className="section-heading">
-            <div className="section-title">
-              {icon}
-              <h2>{title}</h2>
-            </div>
-            {action}
-          </div>
-          <p className="muted">{subtitle}</p>
-        </CardHeader>
-        <CardContent>{children}</CardContent>
-      </Card>
-    </section>
-  );
-}
 export function ResourceState({
   resource,
   empty,
@@ -84,7 +51,7 @@ export function ResourceState({
     );
   return empty ? <p className="empty">{empty}</p> : null;
 }
-function Warnings({ warnings }: { warnings: string[] }) {
+export function Warnings({ warnings }: { warnings: string[] }) {
   return warnings.length ? (
     <ul className="warnings">
       {warnings.map((warning) => (
@@ -96,19 +63,41 @@ function Warnings({ warnings }: { warnings: string[] }) {
     </ul>
   ) : null;
 }
-export function FleetSection({ resource, icon }: { resource: Resource<Fleet>; icon: ReactNode }) {
+const healthTone = (health: DeviceList["devices"][number]["health"]) =>
+  health === "critical"
+    ? "fail"
+    : health === "warning" || health === "stale"
+      ? "warn"
+      : health === "healthy"
+        ? "ok"
+        : "neutral";
+
+/** Nodes with a device page (matched by name) render as links to their host health page. */
+export function FleetSection({
+  resource,
+  devices = [],
+  icon,
+  index,
+}: {
+  resource: Resource<Fleet>;
+  devices?: DeviceList["devices"] | undefined;
+  icon: ReactNode;
+  index?: number;
+}) {
   const data = resource.data;
+  const online = data?.nodes.filter((node) => node.online).length ?? 0;
   return (
-    <Section
+    <Panel
       title="Fleet"
       subtitle="Nodes & service health"
       icon={icon}
       className="fleet"
+      index={index}
       action={
         data ? (
-          <Badge variant="outline">
-            {data.nodes.filter((node) => node.online).length} / {data.nodes.length} online
-          </Badge>
+          <StatusChip tone={online === data.nodes.length ? "ok" : "warn"}>
+            {online} / {data.nodes.length} online
+          </StatusChip>
         ) : null
       }
     >
@@ -117,54 +106,92 @@ export function FleetSection({ resource, icon }: { resource: Resource<Fleet>; ic
         empty={data?.nodes.length === 0 ? "No fleet nodes configured." : undefined}
       />
       <div className="node-grid">
-        {data?.nodes.map((node) => (
-          <article className="node" key={node.name}>
-            <div className="row">
-              <h3>{node.name}</h3>
-              <Badge variant="outline" className={node.online ? "status-ok" : "status-fail"}>
-                {node.online ? "Online" : "Offline"}
-              </Badge>
-            </div>
-            <p className="muted node-meta">
-              {node.tailscale_ip ?? "—"} · {node.os ?? "—"}
-            </p>
-            <p className="muted">
-              Last seen {node.online && node.last_seen_ms == null ? "now" : seen(node.last_seen_ms)}
-            </p>
-            <Separator className="my-3" />
-            {node.services.length === 0 ? (
-              <p className="muted">No services reported.</p>
-            ) : (
-              <ul className="services">
-                {node.services.map((service) => (
-                  <li key={service.name}>
-                    <div className="row">
-                      <span title={service.git_sha ?? undefined}>
-                        {service.name}
-                        {service.version ? ` v${service.version}` : ""}
-                      </span>
-                      <span className={service.ok ? "status-ok" : "status-fail"}>
-                        {service.ok ? "OK" : "Failing"} · {ms(service.latency_ms)}
-                      </span>
-                    </div>
-                    {!service.ok && <p className="muted">{service.detail ?? "—"}</p>}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </article>
-        ))}
+        {data?.nodes.map((node) => {
+          const device = devices.find((item) => item.device_id === node.name);
+          const tone = node.online ? undefined : "fail";
+          const body = (
+            <>
+              <div className="row">
+                <h3>
+                  {node.name}
+                  {device && (
+                    <ArrowUpRight aria-hidden="true" size={14} className="tile-link-hint" />
+                  )}
+                </h3>
+                <span className="row chips">
+                  {device && (
+                    <StatusChip
+                      tone={device.health === "unknown" ? "accent" : healthTone(device.health)}
+                    >
+                      Host health{device.health === "unknown" ? "" : ` · ${device.health}`}
+                    </StatusChip>
+                  )}
+                  <StatusChip tone={node.online ? "ok" : "fail"} dot>
+                    {node.online ? "Online" : "Offline"}
+                  </StatusChip>
+                </span>
+              </div>
+              <p className="muted node-meta">
+                {node.tailscale_ip ?? "—"} · {node.os ?? "—"} · seen{" "}
+                {node.online && node.last_seen_ms == null ? "now" : seen(node.last_seen_ms)}
+              </p>
+              <div className="divider" />
+              {node.services.length === 0 ? (
+                <p className="muted">No services reported.</p>
+              ) : (
+                <ul className="services">
+                  {node.services.map((service) => (
+                    <li key={service.name}>
+                      <div className="row">
+                        <span title={service.git_sha ?? undefined}>
+                          {service.name}
+                          {service.version ? ` v${service.version}` : ""}
+                        </span>
+                        <StatusText tone={service.ok ? "ok" : "fail"} className="service-state">
+                          {service.ok ? "OK" : "Failing"} · {ms(service.latency_ms)}
+                        </StatusText>
+                      </div>
+                      {!service.ok && <p className="muted">{service.detail ?? "—"}</p>}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
+          );
+          return device ? (
+            <a key={node.name} href={device.href} className="tile-link">
+              <Tile tone={tone}>{body}</Tile>
+            </a>
+          ) : (
+            <Tile key={node.name} tone={tone}>
+              {body}
+            </Tile>
+          );
+        })}
+        {/* Devices without a matching fleet node still need a way into their host page. */}
+        {data &&
+          devices
+            .filter((device) => !data.nodes.some((node) => node.name === device.device_id))
+            .map((device) => (
+              <a key={device.device_id} href={device.href} className="tile-link">
+                <Tile>
+                  <div className="row">
+                    <h3>
+                      {device.device_id}
+                      <ArrowUpRight aria-hidden="true" size={14} className="tile-link-hint" />
+                    </h3>
+                    <StatusChip
+                      tone={device.health === "unknown" ? "accent" : healthTone(device.health)}
+                    >
+                      Host health{device.health === "unknown" ? "" : ` · ${device.health}`}
+                    </StatusChip>
+                  </div>
+                  <p className="muted node-meta">Device collector only · not a fleet node</p>
+                </Tile>
+              </a>
+            ))}
       </div>
-    </Section>
-  );
-}
-function Metric({ label, value, note }: { label: string; value: string; note?: string }) {
-  return (
-    <div className="metric">
-      <p className="muted">{label}</p>
-      <p className="metric-value">{value}</p>
-      {note && <p className="muted">{note}</p>}
-    </div>
+    </Panel>
   );
 }
 export function GpuSection({
@@ -173,58 +200,63 @@ export function GpuSection({
   range,
   setRange,
   icon,
+  index,
 }: {
   resource: Resource<Gpu>;
   live: GpuSample | null | undefined;
   range: GpuRange;
   setRange: (range: GpuRange) => void;
   icon: ReactNode;
+  index?: number;
 }) {
   const data = resource.data;
   const current = live === undefined ? data?.current : live;
   return (
-    <Section
+    <Panel
       title="GPU"
       subtitle="Live telemetry · utilization history"
       icon={icon}
       className="gpu"
+      index={index}
       action={
-        <ToggleGroup
-          value={[range]}
-          onValueChange={(values) => {
-            const value = values[0];
-            if (value === "1h" || value === "24h" || value === "7d") setRange(value);
-          }}
-          aria-label="GPU history range"
-          size="sm"
-        >
-          {["1h", "24h", "7d"].map((value) => (
-            <ToggleGroupItem key={value} value={value}>
-              {value}
-            </ToggleGroupItem>
-          ))}
-        </ToggleGroup>
+        <RangeToggle
+          value={range}
+          options={["1h", "24h", "7d"] as const}
+          onChange={setRange}
+          label="GPU history range"
+        />
       }
     >
       <ResourceState resource={resource} />
       {!resource.loading && (
         <>
-          <div className="gpu-metrics">
-            <Metric
+          <StatGrid columns={2}>
+            <Stat
               label="Memory"
-              value={number(current ? current.memory_used_mib / 1024 : null, "GiB")}
+              value={current ? current.memory_used_mib / 1024 : null}
+              format={(n) => number(n, "GiB")}
               note={
                 current
                   ? `of ${number(current.memory_total_mib / 1024, "GiB")}`
                   : "Telemetry unavailable"
               }
             />
-            <Metric label="Utilization" value={number(current?.utilization_percent ?? null, "%")} />
-            <Metric label="Temperature" value={number(current?.temperature_c ?? null, "°C")} />
-            <Metric label="Power" value={number(current?.power_w ?? null, "W")} />
-          </div>
+            <Stat
+              label="Utilization"
+              value={current?.utilization_percent ?? null}
+              format={(n) => number(n, "%")}
+            />
+            <Stat
+              label="Temperature"
+              value={current?.temperature_c ?? null}
+              format={(n) => number(n, "°C")}
+            />
+            <Stat label="Power" value={current?.power_w ?? null} format={(n) => number(n, "W")} />
+          </StatGrid>
           {data && data.history.length > 0 ? (
-            <Suspense fallback={<Skeleton className="gpu-chart" aria-label="Loading GPU chart" />}>
+            <Suspense
+              fallback={<Skeleton className="trend-chart" aria-label="Loading GPU chart" />}
+            >
               <GpuChart history={data.history} />
             </Suspense>
           ) : (
@@ -235,203 +267,67 @@ export function GpuSection({
           </p>
         </>
       )}
-    </Section>
-  );
-}
-function ModelCards({ models }: { models: ModelUsage[] }) {
-  return (
-    <div className="model-cards">
-      {models.map((model) => (
-        <article className="model-card" key={model.model ?? "non-model"}>
-          <h3>{model.model ?? "Non-model requests"}</h3>
-          <dl>
-            {[
-              ["Requests", count(model.requests)],
-              ["Tokens in / out", `${count(model.prompt_tokens)} / ${count(model.output_tokens)}`],
-              [
-                "Prompt / generation tps",
-                `${number(model.avg_prompt_tps)} / ${number(model.avg_gen_tps)}`,
-              ],
-              ["Latency p50 / p95", `${ms(model.p50_latency_ms)} / ${ms(model.p95_latency_ms)}`],
-              ["Total load time", ms(model.total_load_ms)],
-            ].map(([label, value]) => (
-              <div className="row" key={label}>
-                <dt className="muted">{label}</dt>
-                <dd>{value}</dd>
-              </div>
-            ))}
-          </dl>
-        </article>
-      ))}
-    </div>
+    </Panel>
   );
 }
 export function UsageSection({
   resource,
   pricing,
   range,
-  setRange,
   icon,
+  index,
 }: {
   resource: Resource<Usage>;
   pricing: Resource<Pricing>;
   range: UsageRange;
-  setRange: (range: UsageRange) => void;
   icon: ReactNode;
+  index?: number;
 }) {
   const data = resource.data;
+  const pending = pricing.data?.families.filter((family) => family.pending) ?? [];
+  const warnings = [...(data?.warnings ?? []), ...(pricing.data?.warnings ?? [])];
   return (
-    <Section
-      title="Local LLM"
-      subtitle="Usage, performance & spend avoided"
-      icon={icon}
-      className="usage"
-      action={
-        <ToggleGroup
-          value={[range]}
-          onValueChange={(values) => {
-            const value = values[0];
-            if (value === "24h" || value === "7d" || value === "30d") setRange(value);
-          }}
-          aria-label="Usage range"
-          size="sm"
-        >
-          {["24h", "7d", "30d"].map((value) => (
-            <ToggleGroupItem key={value} value={value}>
-              {value}
-            </ToggleGroupItem>
-          ))}
-        </ToggleGroup>
-      }
+    <a
+      href="/llm"
+      className="panel-link usage"
+      aria-label="Local LLM usage, pricing and model details"
     >
-      <ResourceState resource={resource} />
-      {data && (
-        <>
-          <div className="usage-metrics">
-            <Metric label="Requests" value={count(data.totals.requests)} />
-            <Metric label="Tokens in" value={count(data.totals.prompt_tokens)} />
-            <Metric label="Tokens out" value={count(data.totals.output_tokens)} />
-          </div>
-          <Separator className="my-6" />
-          <div className="row">
-            <h3>Spend avoided</h3>
-            <span className="muted">Reference pricing · USD</span>
-          </div>
-          <div className="spend-grid">
+      <Panel
+        title="Local LLM"
+        subtitle={`Usage & spend avoided · ${range}`}
+        icon={icon}
+        index={index}
+        tone={pending.length ? "warn" : undefined}
+        action={
+          <StatusChip tone={pending.length ? "warn" : "neutral"} dot={pending.length > 0}>
+            {pending.length ? "Pricing update pending" : "Details"}
+            <ArrowUpRight aria-hidden="true" size={14} />
+          </StatusChip>
+        }
+      >
+        <ResourceState resource={resource} />
+        {data && (
+          <StatGrid columns={3}>
+            <Stat label="Requests" value={data.totals.requests} format={count} size="lg" />
+            <Stat label="Tokens in" value={data.totals.prompt_tokens} format={count} size="lg" />
+            <Stat label="Tokens out" value={data.totals.output_tokens} format={count} size="lg" />
             {data.spend_avoided.map((family) => (
-              <article key={family.family} className="spend-card">
-                <div className="row">
-                  <h4>{family.family}</h4>
-                  <ArrowUpRight aria-hidden="true" size={16} className="accent-text" />
-                </div>
-                <p className="spend-value">
-                  {usd(family.usd)} <span className="muted">priced</span>
-                </p>
-                {family.estimated_usd > 0 && (
-                  <p className="accent-text">
-                    + {usd(family.estimated_usd)} estimated (pre-history)
-                  </p>
-                )}
-                <p className="muted">
-                  {family.unpriced_requests} unpriced · {family.model_id ?? "—"}
-                </p>
-              </article>
+              <Stat
+                key={family.family}
+                label={`${family.family} avoided`}
+                value={family.usd}
+                format={usd}
+                suffix={
+                  family.estimated_usd > 0 ? `+ ${usd(family.estimated_usd)} est.` : undefined
+                }
+              />
             ))}
-          </div>
-          {data.spend_avoided.length === 0 && (
-            <p className="empty">No spend-avoided estimates available.</p>
-          )}
-        </>
-      )}
-      <div className="pricing-state">
-        <ResourceState
-          resource={pricing}
-          empty={
-            pricing.data?.families.length === 0 ? "No reference pricing configured." : undefined
-          }
-        />
-        {pricing.data?.families.map((family) => (
-          <div key={family.family}>
-            {family.pending && (
-              <Alert className="pending">
-                <InfoIcon />
-                <AlertTitle>
-                  New reference model available: {family.pending.model_id}. Confirm via CLI
-                </AlertTitle>
-                <AlertDescription>{family.family} · This dashboard is read-only.</AlertDescription>
-              </Alert>
-            )}
-            {(family.selected == null || family.rates == null) && (
-              <p className="muted">
-                {family.family} reference: {family.selected?.model_id ?? "—"} · rates:{" "}
-                {family.rates
-                  ? `${usd(family.rates.input_per_mtok)} / ${usd(family.rates.output_per_mtok)} per Mtok`
-                  : "—"}
-              </p>
-            )}
-          </div>
-        ))}
-        <Warnings warnings={pricing.data?.warnings ?? []} />
-      </div>
-      {data && (
-        <>
-          <div className="model-heading">
-            <h3>Model performance</h3>
-            <p className="muted">Latency includes load; total load is also reported separately.</p>
-          </div>
-          {data.models.length === 0 ? (
-            <p className="empty">No model requests in this range.</p>
-          ) : (
-            <>
-              <div className="model-table">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      {[
-                        "Model",
-                        "Requests",
-                        "Tokens in / out",
-                        "Prompt / gen tps",
-                        "p50 / p95",
-                        "Total load",
-                      ].map((label) => (
-                        <TableHead key={label}>{label}</TableHead>
-                      ))}
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {data.models.map((model) => (
-                      <TableRow key={model.model ?? "non-model"}>
-                        <TableCell className="font-medium">
-                          {model.model ?? "Non-model requests"}
-                        </TableCell>
-                        <TableCell>{count(model.requests)}</TableCell>
-                        <TableCell>
-                          {count(model.prompt_tokens)} / {count(model.output_tokens)}
-                        </TableCell>
-                        <TableCell>
-                          {number(model.avg_prompt_tps)} / {number(model.avg_gen_tps)}
-                        </TableCell>
-                        <TableCell>
-                          {ms(model.p50_latency_ms)} / {ms(model.p95_latency_ms)}
-                        </TableCell>
-                        <TableCell>{ms(model.total_load_ms)}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-              <ModelCards models={data.models} />
-            </>
-          )}
-          <Warnings warnings={data.warnings} />
-        </>
-      )}
-    </Section>
+          </StatGrid>
+        )}
+        <Warnings warnings={warnings} />
+      </Panel>
+    </a>
   );
-}
-function InfoIcon() {
-  return <AlertTriangle aria-hidden="true" />;
 }
 function balanceText(balance: Agents["tools"][number]["balances"][number]) {
   const format = (value: string | null | undefined) => {
@@ -456,10 +352,12 @@ export function AgentsSection({
   resource,
   icon,
   revision = 0,
+  index,
 }: {
   resource: Resource<Agents>;
   icon: ReactNode;
   revision?: number;
+  index?: number;
 }) {
   const [now, setNow] = useState(Date.now);
   const observations = resource.data?.tools.flatMap((tool) =>
@@ -482,10 +380,11 @@ export function AgentsSection({
     };
   }, []);
   return (
-    <Section
+    <Panel
       title="Frontier CLIs"
-      subtitle="Account capacity · separate from local usage"
+      subtitle="Account capacity, not local usage"
       icon={icon}
+      index={index}
       action={
         <div className="agent-refresh">
           <span
@@ -509,7 +408,7 @@ export function AgentsSection({
             disabled={refresh.refreshing || refresh.seconds > 0}
             onClick={() => void refresh.refresh()}
           >
-            <RefreshCw aria-hidden="true" />
+            <RefreshCw aria-hidden="true" className={refresh.refreshing ? "animate-spin" : ""} />
           </Button>
         </div>
       }
@@ -568,10 +467,18 @@ export function AgentsSection({
                         tool.windows.map((window) => (
                           <div className="agent-window" key={window.name}>
                             <span>{window.name.replaceAll("_", " ")}</span>
-                            <progress
-                              aria-label={`${label} ${window.name} used`}
-                              max={100}
+                            <MeterBar
+                              label={`${label} ${window.name} used`}
                               value={window.used_percent}
+                              tone={
+                                status === "stale"
+                                  ? "muted"
+                                  : window.used_percent >= 90
+                                    ? "fail"
+                                    : window.used_percent >= 75
+                                      ? "warn"
+                                      : "accent"
+                              }
                             />
                             <span>{number(window.used_percent)}% used</span>
                             <span
@@ -606,21 +513,24 @@ export function AgentsSection({
             })
           : null}
       </ul>
-    </Section>
+    </Panel>
   );
 }
 export function TickerSection({
   requests,
   connected,
+  index,
 }: {
   requests: LiveState["requests"];
   connected: boolean;
+  index?: number;
 }) {
   return (
-    <Section
+    <Panel
       title="Live requests"
       subtitle="Most recent completions"
       icon={<Radio />}
+      index={index}
       action={<span className="muted">{requests.length} recent</span>}
     >
       <div
@@ -654,6 +564,6 @@ export function TickerSection({
           </ul>
         )}
       </div>
-    </Section>
+    </Panel>
   );
 }
