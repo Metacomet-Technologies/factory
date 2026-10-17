@@ -11,6 +11,11 @@ process.env.PLAYWRIGHT_BROWSERS_PATH ??= `${process.cwd()}/.browsers`;
 const { chromium, expect } = await import("@playwright/test");
 const browser = await chromium.launch();
 const errors: string[] = [];
+// Trusted main served from the same populated mock fixtures, e.g. an `origin/main` export
+// running `vp run mock-dev` on other ports. Existing cards must keep their exact boxes.
+const baselineUrl = process.env.BASELINE_URL;
+const moved: string[] = [];
+let baseline: { name: string | null; x: number; y: number; width: number; height: number }[] = [];
 const reports: Record<string, unknown> = {};
 
 async function open(path: string, theme: "dark" | "light", width = 1728, height = 1117) {
@@ -30,6 +35,8 @@ async function fits(page: Page, label: string) {
         name: panel.getAttribute("aria-label"),
         x: Math.round(box.x),
         y: Math.round(box.y),
+        width: Math.round(box.width),
+        height: Math.round(box.height),
         right: Math.round(box.right),
         bottom: Math.round(box.bottom),
       };
@@ -56,6 +63,18 @@ async function fits(page: Page, label: string) {
         `${label}: ${a.name} overlaps ${b.name}`,
       ).toBe(true);
   reports[label] = layout;
+  for (const before of baseline) {
+    const after = layout.panels.find((panel) => panel.name === before.name);
+    const same =
+      after &&
+      (["x", "y", "width", "height"] as const).every(
+        (key) => Math.abs(after[key] - before[key]) <= 1,
+      );
+    if (!same)
+      moved.push(
+        `${label}: ${before.name} main ${JSON.stringify(before)} branch ${JSON.stringify(after)}`,
+      );
+  }
 }
 
 const shot = (page: Page, name: string) =>
@@ -65,6 +84,26 @@ const shot = (page: Page, name: string) =>
   });
 
 try {
+  if (baselineUrl) {
+    const page = await open("/", "dark");
+    await page.goto(baselineUrl);
+    await expect(page.getByRole("region", { name: "Local LLM" })).toBeVisible();
+    await page.waitForTimeout(2500);
+    baseline = await page.evaluate(() =>
+      [...document.querySelectorAll("main section.panel")].map((panel) => {
+        const box = panel.getBoundingClientRect();
+        return {
+          name: panel.getAttribute("aria-label"),
+          x: Math.round(box.x),
+          y: Math.round(box.y),
+          width: Math.round(box.width),
+          height: Math.round(box.height),
+        };
+      }),
+    );
+    reports.baseline = baseline;
+    await page.close();
+  }
   for (const theme of ["dark", "light"] as const) {
     const page = await open("/", theme);
     await page.goto(origin);
@@ -174,10 +213,11 @@ try {
       await network.close();
     }
   expect(errors).toEqual([]);
+  expect(moved, "existing cards moved relative to main").toEqual([]);
 } finally {
   await writeFile(
     new URL("network-checks.json", artifacts),
-    JSON.stringify({ origin, errors, reports }, null, 2),
+    JSON.stringify({ origin, baselineUrl, errors, moved, reports }, null, 2),
   );
   await browser.close();
 }
