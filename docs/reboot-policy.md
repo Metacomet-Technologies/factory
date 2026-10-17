@@ -132,9 +132,20 @@ including `OB DISCHRG`. Nonzero exit, empty output, or no `OL` token blocks as
 
 ## State and post-boot observations
 
-`/var/lib/factory-reboot/status.json` is root-owned and private. Both services
-lock the same state and publish by atomic replacement, with file/directory sync.
-Logs go to the journal. A failed state write prevents a reboot.
+`/var/lib/factory-reboot/status.json` is root-owned and private (directory mode
+0700, file mode 0600). Both services lock the same state and replace that file
+atomically, with file and directory sync. Logs go to the journal. A failed
+state write prevents a reboot.
+
+After each successful private write, the check also publishes
+`/var/lib/factory-reboot-status/status.json` when that directory exists. The
+copy is mode 0640, group `factory-api`, and contains only `reboot_required`,
+`pending_since_ms`, `days_pending`, `consecutive_skips`, `alert_due`,
+`last_check_ms`, and `last_decision`. A publish failure logs a warning and does
+not change the private file or the reboot decision. The installer creates the
+directory `root:factory-api` mode 0750 when the `factory-api` group exists, and
+publishes the current status. Rollback removes that directory only when this
+install created it.
 
 - `mode`: effective mode of the last operation. The installer's immediate check
   **always** uses observe, even when configuration is enforce; the next timer

@@ -245,3 +245,20 @@ async fn history_rejects_other_ranges() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     server.abort();
 }
+
+#[test]
+fn reboot_status_defaults_to_the_published_copy() {
+    assert_eq!(
+        devices::DEFAULT_REBOOT_STATUS,
+        "/var/lib/factory-reboot-status/status.json"
+    );
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_factory-api"))
+        .env_clear()
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(text.contains("[default: /var/lib/factory-reboot-status/status.json]"));
+    assert!(text.contains("FACTORY_API_REBOOT_STATUS"));
+}

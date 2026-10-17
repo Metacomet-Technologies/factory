@@ -196,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
         if state.reboot_status == std::path::Path::new(devices::DEFAULT_REBOOT_STATUS) {
             state.reboot_status = state
                 .devices_root
-                .join("var/lib/factory-reboot/status.json");
+                .join(devices::DEFAULT_REBOOT_STATUS.trim_start_matches('/'));
         }
     }
     state.network = network.targets().into();

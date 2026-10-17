@@ -15,7 +15,7 @@ sample store and no remote ingestion.
 | Backup | `/var/lib/factory-backup-status/status.json` |
 | Clock | `require_clock` |
 | SMART | `{root}/var/lib/factory-devices/smart.json` |
-| Reboot age | `/var/lib/factory-reboot/status.json` when readable |
+| Reboot age | `/var/lib/factory-reboot-status/status.json` |
 | Fleet services | the factory-gpu node already collected by fleet |
 
 factory-api does not run `nvidia-smi` or `smartctl`. A missing or unreadable
@@ -108,13 +108,17 @@ timer run. A failed chown removes the temporary file, leaves the previous
 snapshot in place, and fails the service. The installer does not run
 `smartctl` and does not install packages.
 
-Reboot status at `/var/lib/factory-reboot/status.json` is root mode 0600 under
-a mode 0700 directory. factory-api cannot read it. A missing or unreadable
-file is `permission_denied`, not healthy and not zero. When an administrator
-publishes a group-readable copy, the page reads `reboot_required`,
+Private reboot status at `/var/lib/factory-reboot/status.json` stays root mode
+0600 under a mode 0700 directory. factory-api cannot read that file. The reboot
+installer publishes `/var/lib/factory-reboot-status/status.json` when the
+`factory-api` group exists: directory `root:factory-api` mode 0750, file mode
+0640 and group `factory-api`. The published copy contains `reboot_required`,
 `pending_since_ms`, `days_pending`, `consecutive_skips`, `alert_due`,
-`last_check_ms`, and `last_decision`. This install does not change reboot
-policy and does not chmod that file.
+`last_check_ms`, and `last_decision`. It does not include secrets, environment,
+or process arguments. A missing or unreadable published file is
+`permission_denied`, not healthy and not zero. `FACTORY_API_REBOOT_STATUS`
+overrides the path. This does not change reboot policy and does not chmod the
+private file.
 
 Backup status that factory-api can read is
 `/var/lib/factory-backup-status/status.json`, with `last_success_ms`,
