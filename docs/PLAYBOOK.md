@@ -75,7 +75,7 @@ Every prompt has these sections:
 
 **Direct handoffs** (a task given straight to a runner instead of dispatched): never add `dispatch`. The prompt's first step has the builder create its own worktree from a parent directory (`/home/agent/work`), refusing an existing branch or directory. Claude reviews the PR, Devon merges, and Linear state moves by hand. All other §4 rules apply.
 
-**Wrap-up prompt (after merge):** explicitly permits the same thread to update/build only clean main in `/home/agent/work/factory` as agent, without sudo (run git and builds directly; never `sudo -u agent`). Confirm merge and branch; fetch origin and `merge --ff-only origin/main`; build only task artifacts and check changed scripts with `node --test`, never `node --check`. Read `docs/agents/*.md` by repo-root path, because wrap-ups can run from subdirectories. Stop on dirty files or failure. Check dirty/untracked/unpushed work; delete agent-owned ignored build caches (including kiosk's Vite cache) before `git worktree remove`, then run `git worktree prune`. Reply with Mac install/verify/rollback commands. Post remaining deploy steps with Devon's profile mention; no steps means no ping. Never deploy or merge. Devon owns verification/Done, one deploy per runner. Failed verification stays in this thread with a fresh worktree.
+**Wrap-up prompt (after merge):** explicitly permits the same thread to update/build only clean main in `/home/agent/work/factory` as agent, without sudo (run git and builds directly; never `sudo -u agent`). Confirm merge and branch; fetch origin and `merge --ff-only origin/main`; build only task artifacts and check changed scripts with `node --test`, never `node --check`. Read `docs/agents/*.md` by repo-root path, because wrap-ups can run from subdirectories. Stop on dirty files or failure. Check dirty/untracked/unpushed work; delete agent-owned ignored build caches (including kiosk's Vite cache) before `git worktree remove`, then run `git worktree prune`. Reply with Mac install/verify/rollback commands. Post remaining deploy steps with Devon's profile mention; no steps means no ping. Never deploy or merge. Devon owns verification/Done, one deploy per runner. Failed verification stays in this thread with a fresh worktree. Run only the listed steps; never add probes such as `--version` flags (component versions come from `/v1/health`, `/meter/health` and the kiosk footer).
 
 Only after all wrap-up steps succeed, post exactly `Wrap-up finished`, a blank line, and `<!-- factory-dispatch:wrapup-done -->` on the task issue. This is the builder's sole marker exception, not deployment verification or permission to mark Done. Dispatcher archives Done builders after five quiet minutes.
 
@@ -106,7 +106,8 @@ Settings → Mode Dial → Tune Modes (web) changes what low/medium/high run for
 1. Merge (squash, delete branch).
 2. Send the thread the wrap-up prompt (§4); it builds in the main checkout and cleans up its worktree.
 3. From the Mac: `gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-*.sh <prebuilt path>"` (use **full paths**: admins can't `cd` into `/home/agent`).
-4. Verify: `factory-status` (all green; usage/pricing < 2 s), kiosk self-reload, then mark the Linear issue Done. Then update Linear (status, Decided, Next) and, if `docs/PLAYBOOK.md` changed, re-sync the Linear playbook copy.
+4. Kiosk installs: first check the built dist carries the merged commit, `gpu-ssh "sudo -u agent grep -l <short-sha> /home/agent/work/factory/kiosk/dist/assets/*.js"`; `version.json` holds only a build hash. If it doesn't match, rebuild as `agent` from `kiosk/` (README Phase 1) before `install-kiosk.sh`. After install, the footer must show the same SHA for api, kiosk and meter.
+5. Verify: `factory-status` (all green; usage/pricing < 2 s), kiosk self-reload, then mark the Linear issue Done. Then update Linear (status, Decided, Next) and, if `docs/PLAYBOOK.md` changed, re-sync the Linear playbook copy.
 
 ## 7. Operating the factory
 
@@ -176,6 +177,7 @@ gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
 - When a Linear **Decided** section changes a rule, update `AGENTS.md`/docs in the next PR. Agents follow the repo file, not Linear.
 - Resolved (MET-120, 2026-10-13): Amp's **New Worktree** pre-thread `origin` fetch previously failed ("could not read Username") because credentials existed only inside threads; `agent` now has a persistent `gh` login and Git credential helper on both nodes.
 - Amp CLI auto-updates can change `amp usage` text; verify parsers against the current CLI version, not a remembered output format.
+- Linking an undispatched PR (a direct session or a Devon branch) to a dispatched issue makes the dispatcher treat it as that issue's PR: it QA-reviews it and sends findings to the issue's builder thread (seen with PR 116 on MET-218, 2026-10-17). Link it to the parent issue instead, or only once the dispatched PR is closed.
 
 **Networking / Tailscale**
 - Plain `tailscale ping` **ignores the access policy**; test blocks with `tailscale ping --icmp` or a real TCP connection.
