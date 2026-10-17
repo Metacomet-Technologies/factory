@@ -156,6 +156,7 @@ describe("ambient-trial.sh CPU accounting", () => {
   const bash = (body: string) => {
     const result = spawnSync("bash", ["-c", `set -euo pipefail; source "$0"; ${body}`, script], {
       encoding: "utf8",
+      timeout: 30_000,
     });
     expect(result.stderr).toBe("");
     return result.stdout.trim().split(/\s+/).map(Number);
@@ -163,7 +164,7 @@ describe("ambient-trial.sh CPU accounting", () => {
   const sample = (name: string) =>
     `proc=${join(root, name)}; read_stats; tree_delta 100 trial; t=$delta; tree_delta 300 kiosk; echo $t $delta;`;
 
-  it("counts a sampled child once after its parent reaps it", () => {
+  it("counts a sampled child once when its reap is read atomically", () => {
     // Trial parent 100 with child 101, an unrelated process 200, and the kiosk root 300.
     stage("base", [
       [100, 1, 10, 0],
@@ -195,6 +196,94 @@ describe("ambient-trial.sh CPU accounting", () => {
       [300, 1, 40, 0],
     ]);
     expect(bash(sample("base") + sample("steady"))).toEqual([110, 40, 15, 0]);
+  });
+
+  it("keeps counted CPU owed when the reap shows up a sample late", () => {
+    // Sample 2 read the parent before the reap and the child after it: the child is gone
+    // but the parent's reaped CPU still reads 0. Sample 3 sees the reap.
+    stage("one", [
+      [100, 1, 10, 0],
+      [101, 100, 100, 0],
+    ]);
+    stage("two", [[100, 1, 30, 0]]);
+    stage("three", [[100, 1, 30, 100]]);
+    const [base, ...rest] = bash(
+      ["one", "two", "three"]
+        .map((name) => `proc=${join(root, name)}; read_stats; tree_delta 100 trial; echo $delta;`)
+        .join(""),
+    );
+    expect(base).toBe(110);
+    expect(rest).toEqual([20, 0]);
+  });
+
+  it("does not count a child twice when it is read before its reap", () => {
+    // Sample 2 read the child, then it was reaped, then the parent was read with the
+    // child's CPU already in its reaped CPU. By the end of the pass the child is gone.
+    stage("one", [
+      [100, 1, 10, 0],
+      [101, 100, 100, 0],
+    ]);
+    stage("two", [
+      [100, 1, 30, 100],
+      [101, 100, 100, 0],
+    ]);
+    stage("two-after", [[100, 1, 30, 100]]);
+    stage("three", [[100, 1, 30, 100]]);
+    const proc = (name: string) => `proc=${join(root, name)}`;
+    expect(
+      bash(`${proc("one")}; read_stats; tree_delta 100 trial; echo $delta;
+        ${proc("two")}; read_stats; ${proc("two-after")}; tree_delta 100 trial; echo $delta;
+        ${proc("three")}; read_stats; tree_delta 100 trial; echo $delta`),
+    ).toEqual([110, 20, 0]);
+  });
+
+  it("does not report a zombie's old CPU as new when it is reaped mid-read", () => {
+    // A real child uses CPU, exits and stays a zombie before the baseline. The sampler
+    // then reads an isolated /proc view in which the child's stat is a FIFO: opening it
+    // after the parent's stat reaps the child, and it then reads as gone.
+    const [childCpu, reapedSeen, reapedAfter, d2, d3, parentOwn] = bash(`
+      tmp=${join(root, "zombie")}; mkdir -p "$tmp"; mkfifo "$tmp/reap"
+      python3 -I -c '
+import os, sys, time
+child = os.fork()
+if child == 0:
+    end = time.process_time() + 0.3
+    while time.process_time() < end:
+        pass
+    os._exit(0)
+print(child, flush=True)
+open(sys.argv[1]).read()
+os.waitpid(child, 0)
+time.sleep(30)
+' "$tmp/reap" >"$tmp/child" 2>/dev/null </dev/null &
+      holder=$!
+      reaper=
+      trap 'kill $holder $reaper 2>/dev/null || true' EXIT
+      until [[ -s $tmp/child ]]; do sleep 0.01; done
+      kid=$(<"$tmp/child")
+      state() { local line; read -r line <"/proc/$kid/stat"; line=\${line##*) }; echo "\${line%% *}"; }
+      until [[ $(state) == Z ]]; do sleep 0.01; done
+      [[ $holder < $kid ]] || { echo "parent $holder sorts after child $kid" >&2; exit 1; }
+      mkdir -p "$tmp/base" "$tmp/race/$kid" "$tmp/after"
+      ln -s "/proc/$holder" "$tmp/base/$holder"
+      ln -s "/proc/$kid" "$tmp/base/$kid"
+      ln -s "/proc/$holder" "$tmp/race/$holder"
+      mkfifo "$tmp/race/$kid/stat"
+      ln -s "/proc/$holder" "$tmp/after/$holder"
+      proc=$tmp/base; read_stats; tree_delta "$holder" trial
+      base_own=\${own[$holder]}; child_cpu=$((own[$kid] + reaped[$kid]))
+      ( exec 3>"$tmp/race/$kid/stat"; echo >"$tmp/reap"; while [[ -e /proc/$kid ]]; do sleep 0.01; done ) &
+      reaper=$!
+      proc=$tmp/race; read_stats; seen=\${reaped[$holder]}; tree_delta "$holder" trial; d2=$delta
+      wait "$reaper"
+      proc=$tmp/after; read_stats; tree_delta "$holder" trial; d3=$delta
+      echo "$child_cpu" "$seen" "\${reaped[$holder]}" "$d2" "$d3" "$((own[$holder] - base_own))"`);
+    expect(childCpu).toBeGreaterThanOrEqual(10);
+    // The parent was read before the reap; the transfer showed up in the next sample.
+    expect(reapedSeen).toBe(0);
+    expect(reapedAfter).toBe(childCpu);
+    // Only the parent's own new CPU counts; the child's was counted at the baseline.
+    expect(d2! + d3!).toBe(parentOwn);
   });
 
   it("counts a real short-lived child chain exactly once", () => {

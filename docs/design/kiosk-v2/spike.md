@@ -111,10 +111,13 @@ on factory-console. It never touches the kiosk, its autostart entry or its profi
 3. **Sampling:** after a 15 s settle, every 5 s it reads `/proc/<pid>/stat` for the trial
    Chrome's process tree and, with separate state, the kiosk's. Each process's own CPU
    (utime + stime) counts as it grows. A child that exits and is reaped moves its whole
-   total into its parent's reaped CPU (cutime + cstime); the part already counted at the
-   previous sample is credited back, so each tick counts once, including children that
-   start and finish between samples. Members stay tracked if re-parented; PID reuse is
-   detected by start time.
+   total into its parent's reaped CPU (cutime + cstime), so the CPU already counted for
+   it becomes owed by the parent and is paid off by the parent's reaped growth before
+   any of that counts. Owed CPU carries across samples, because `/proc` is not read
+   atomically: a parent read before a reap shows the transfer a sample later, and a
+   child read before its reap is treated as departed if it is gone by the end of the
+   pass. Each tick counts once, including children that start and finish between
+   samples. Members stay tracked if re-parented; identity is PID plus start time.
 4. **Output:** at the end it reads `window.__ambientPerf` over DevTools with Node (as
    `agent`) and prints one JSON object: `mode`, `minutes`, `url`, `settle_s`,
    `interval_s`, `samples`, `cores`, `trial_cpu` (`avg`/`max` as % of one core and of all

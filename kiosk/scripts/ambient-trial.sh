@@ -43,22 +43,28 @@ read_stats() {
 }
 
 # Sets delta to the CPU ticks the tree under $1 used since the previous call for the same
-# name, counting each process's CPU once. State is prev_<name>: "start own reaped parent"
-# per pid. A member stays tracked while it lives, even if re-parented away. When a member
-# exits and is reaped, its whole total moves into an ancestor's reaped CPU; the part
-# already counted at the previous sample is credited back to its nearest live ancestor,
-# so only the unsampled remainder counts. A child that starts and exits between samples
-# is counted once, through its parent's reaped CPU. Not run in a subshell, so that state
-# persists.
-# shellcheck disable=SC2034 # used through tree_delta's nameref
-declare -A prev_trial=() prev_kiosk=()
+# name, counting each tick once. Not run in a subshell, so its state persists:
+#   prev_<name>  pid -> "start own reaped parent" as last counted
+#   owed_<name>  pid -> "start ticks": CPU already counted for exited descendants that has
+#                not yet appeared in that process's reaped CPU
+# Own CPU counts as it grows. A member that exits and is reaped moves its whole total
+# into its parent's reaped CPU, so its counted total (plus anything still owed to it)
+# becomes owed by its parent, and the parent's reaped growth pays that off before any of
+# it counts. Owed CPU carries across samples, because /proc is not read atomically: the
+# parent may be read before the reap and the child after it. A member gone by the end of
+# the pass departs in this sample even though it was read, because the parent may have
+# been read after the reap. A child that starts and exits between samples is counted
+# once, through its parent's reaped CPU. Members stay tracked if re-parented; identity is
+# pid plus start time; a member that leaves through a process outside the tree is dropped.
+# shellcheck disable=SC2034 # used through tree_delta's namerefs
+declare -A prev_trial=() prev_kiosk=() owed_trial=() owed_kiosk=()
 delta=0
 # shellcheck disable=SC2004 # associative keys need the $
 tree_delta() {
-  local root=$1 name=$2 pid child s o r p po pr total=0
-  local -n prev=prev_$name
-  local -A cur=() credit=()
-  local -a queue=("$root")
+  local root=$1 name=$2 pid child s o r p po pr g c n line total=0
+  local -n prev=prev_$name carried=owed_$name
+  local -A cur=() gone=() grow=() owed=() departed=()
+  local -a queue=("$root") f
   for pid in "${!prev[@]}"; do
     read -r s _ <<<"${prev[$pid]}"
     [[ ${started[$pid]:-} != "$s" ]] || queue+=("$pid")
@@ -70,13 +76,11 @@ tree_delta() {
     cur[$pid]="${started[$pid]} ${own[$pid]} ${reaped[$pid]} ${parent[$pid]}"
     for child in ${children[$pid]:-}; do queue+=("$child"); done
   done
-  for pid in "${!prev[@]}"; do
-    read -r s o r p <<<"${prev[$pid]}"
-    [[ ${cur[$pid]:-} != "$s "* ]] || continue
-    while [[ -n $p && -z ${cur[$p]:-} ]]; do
-      if [[ -n ${prev[$p]:-} ]]; then read -r _ _ _ p <<<"${prev[$p]}"; else p=; fi
-    done
-    [[ -z $p ]] || credit[$p]=$((${credit[$p]:-0} + o + r))
+  for pid in "${!cur[@]}"; do
+    line=
+    { read -r line <"$proc/$pid/stat"; } 2>/dev/null || true
+    read -ra f <<<"${line##*) }"
+    [[ ${f[19]:-} == "${cur[$pid]%% *}" ]] || gone[$pid]=1
   done
   for pid in "${!cur[@]}"; do
     read -r s o r _ <<<"${cur[$pid]}"
@@ -84,11 +88,46 @@ tree_delta() {
     pr=0
     [[ ${prev[$pid]:-} != "$s "* ]] || read -r _ po pr _ <<<"${prev[$pid]}"
     ((o <= po)) || total=$((total + o - po))
-    r=$((r - pr - ${credit[$pid]:-0}))
-    ((r <= 0)) || total=$((total + r))
+    grow[$pid]=$((r > pr ? r - pr : 0))
+    [[ -z ${gone[$pid]:-} ]] || departed[$pid]=${cur[$pid]}
   done
+  for pid in "${!prev[@]}"; do
+    [[ ${cur[$pid]:-} == "${prev[$pid]%% *} "* ]] || departed[$pid]=${prev[$pid]}
+  done
+  for pid in "${!carried[@]}"; do
+    read -r s c <<<"${carried[$pid]}"
+    [[ ${cur[$pid]:-} != "$s "* && ${departed[$pid]:-} != "$s "* ]] || owed[$pid]=$c
+  done
+  # Settle departures deepest first, so a chain of exits carries up to a live member.
+  while read -r _ pid; do
+    [[ -n $pid ]] || continue
+    read -r _ o r p <<<"${departed[$pid]}"
+    c=${owed[$pid]:-0}
+    if [[ -n ${gone[$pid]:-} ]]; then
+      g=${grow[$pid]}
+      ((g <= c)) && c=$((c - g)) || total=$((total + g - c)) c=0
+    fi
+    unset "owed[$pid]"
+    [[ -z ${departed[$p]:-} && -z ${cur[$p]:-} ]] || owed[$p]=$((${owed[$p]:-0} + o + r + c))
+  done < <(for pid in "${!departed[@]}"; do
+    n=0
+    p=${departed[$pid]##* }
+    while [[ -n ${departed[$p]:-} ]] && ((n < 64)); do
+      n=$((n + 1))
+      p=${departed[$p]##* }
+    done
+    echo "$n $pid"
+  done | sort -rn)
   prev=()
-  for pid in "${!cur[@]}"; do prev[$pid]=${cur[$pid]}; done
+  carried=()
+  for pid in "${!cur[@]}"; do
+    [[ -z ${gone[$pid]:-} ]] || continue
+    prev[$pid]=${cur[$pid]}
+    g=${grow[$pid]}
+    c=${owed[$pid]:-0}
+    ((g <= c)) && c=$((c - g)) || total=$((total + g - c)) c=0
+    ((c == 0)) || carried[$pid]="${cur[$pid]%% *} $c"
+  done
   delta=$total
 }
 # Stop here when sourced.
