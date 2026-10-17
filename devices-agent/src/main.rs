@@ -49,8 +49,20 @@ fn discover(root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(agent());
+    // Collection may still be inside a blocking probe (a /sys read that never
+    // returns). Dropping the runtime would wait for it, past systemd's 15 s
+    // TimeoutStopSec. Wait 1 s at most, then exit and abandon it; process exit
+    // ends those threads. run() has already cancelled uploads.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+async fn agent() -> Result<()> {
     tracing_subscriber::fmt()
         .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)

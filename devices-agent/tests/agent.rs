@@ -997,3 +997,137 @@ async fn incomplete_response_bodies_keep_the_status_decision() {
         }
     }
 }
+
+/// hwmon0..hwmon2, each named with the same 256-byte name and temp1..temp8
+/// inputs. With `fifo` the inputs are FIFOs with no writer, so every read
+/// blocks until the probe timeout and slow inventory runs for about 24 s.
+fn hwmon_fixture(root: &Path, fifo: bool) {
+    console(root);
+    fs::remove_dir_all(root.join("sys/class/hwmon")).unwrap();
+    let name = "a".repeat(256);
+    for chip in 0..3 {
+        let base = format!("sys/class/hwmon/hwmon{chip}");
+        write(root, &format!("{base}/name"), &format!("{name}\n"));
+        for index in 1..=8 {
+            let path = root.join(format!("{base}/temp{index}_input"));
+            if fifo {
+                let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            } else {
+                fs::write(path, "31000\n").unwrap();
+            }
+        }
+    }
+}
+
+async fn counting_api() -> (String, Arc<Mutex<Vec<Instant>>>) {
+    let arrivals = Arc::new(Mutex::new(Vec::new()));
+    let seen = arrivals.clone();
+    let app = Router::new().route(
+        "/v1/devices/factory-console/samples",
+        post(move || {
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().push(Instant::now());
+                json!({"result":"stored","reason":null}).to_string()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{address}"), arrivals)
+}
+
+/// Run the real binary, signal it once `ready` holds, and require it to exit by
+/// itself, successfully, well inside the unit's 15 s TimeoutStopSec, with no
+/// upload arriving after the signal.
+async fn signal_real_process(
+    fifo: bool,
+    signal: i32,
+    ready: fn(&[Instant], &str) -> bool,
+) -> Duration {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    hwmon_fixture(&root, fifo);
+    let cred = dir.path().join("cred");
+    fs::create_dir(&cred).unwrap();
+    fs::write(cred.join("token"), format!("{TOKEN}\n")).unwrap();
+    let log_path = dir.path().join("agent.log");
+    let (api, arrivals) = counting_api().await;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_factory-devices-agent"))
+        .args(["--api", &api, "--root", root.to_str().unwrap()])
+        .env_clear()
+        .env("CREDENTIALS_DIRECTORY", &cred)
+        .env("RUST_LOG", "factory_devices_agent=debug")
+        .stdout(fs::File::create(&log_path).unwrap())
+        .stderr(fs::File::create(dir.path().join("agent.err")).unwrap())
+        .spawn()
+        .unwrap();
+    let log = || fs::read_to_string(dir.path().join("agent.err")).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !ready(&arrivals.lock().unwrap(), &log()) {
+        assert!(Instant::now() < deadline, "never ready: {}", log());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "exited early: {}",
+            log()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let signalled = Instant::now();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if signalled.elapsed() > Duration::from_secs(12) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!(
+                "still alive 12 s after signal {signal}; needed SIGKILL: {}",
+                log()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let took = signalled.elapsed();
+    assert!(status.success(), "exit {status:?}: {}", log());
+    assert!(took < Duration::from_secs(5), "took {took:?}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let late = arrivals
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|at| **at > signalled + Duration::from_millis(200))
+        .count();
+    assert_eq!(late, 0, "uploads after the signal");
+    assert!(log().contains("agent stopped"), "{}", log());
+    took
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signal_stops_the_process_while_blocking_probes_run() {
+    // Ready once started; the first sample is still blocked in the FIFO reads.
+    fn sampling(arrivals: &[Instant], log: &str) -> bool {
+        log.contains("agent started") && arrivals.is_empty()
+    }
+    fn uploading(arrivals: &[Instant], _: &str) -> bool {
+        !arrivals.is_empty()
+    }
+    let (blocked_term, blocked_int, control) = tokio::join!(
+        async {
+            // Give collection time to enter the blocking reads.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            signal_real_process(true, libc::SIGTERM, sampling).await
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            signal_real_process(true, libc::SIGINT, sampling).await
+        },
+        signal_real_process(false, libc::SIGTERM, uploading),
+    );
+    eprintln!(
+        "exit after signal: fifo SIGTERM {blocked_term:?}, fifo SIGINT {blocked_int:?}, control {control:?}"
+    );
+}
