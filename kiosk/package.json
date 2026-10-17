@@ -2,12 +2,7 @@
   "name": "kiosk",
   "version": "0.2.0",
   "private": true,
-  "workspaces": {
-    "catalog": {
-      "vite": "npm:@voidzero-dev/vite-plus-core@1.1.0",
-      "vite-plus": "1.1.0"
-    }
-  },
+  "workspaces": [],
   "type": "module",
   "scripts": {
     "dev": "vp dev",
@@ -59,6 +54,10 @@
       "version": "24.22.0",
       "onFail": "download"
     }
+  },
+  "catalog": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.1.0",
+    "vite-plus": "1.1.0"
   },
   "trustedDependencies": []
 }
