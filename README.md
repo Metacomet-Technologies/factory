@@ -627,6 +627,10 @@ entry for each local DB: `last_success_ms`, `last_attempt_ms`, `size_bytes`
 snapshot, push and retention finished; failures preserve `last_success_ms`.
 Every failure exits nonzero for systemd/journald. The root lock is
 `/var/backups/factory-db/.backup.lock`, outside the SSH user's writable home.
+On factory-gpu the backup also publishes a copy to
+`/var/lib/factory-backup-status/status.json` (`PUBLISHED_STATUS` in
+`deploy/backup/nodes.conf`), which factory-api reads for `backup:status`;
+factory-console publishes none.
 Inspect with:
 
 ```sh
