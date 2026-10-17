@@ -273,9 +273,8 @@ acting on that agent: no further status polls, normalization, QA reviews or
 claim keeps its slot until wrap-up; recovery is manual. Read failures log
 `cursor-status-pending`. Dry-run previews these reads without calling.
 
-PR normalization: when the latest run is `FINISHED`, the issue's PR is the one
-in its first `cursor-evidence` marker, else the first `git.branches[].prUrl` in
-the claimed repo. Each step reads the PR with `gh pr view` and acts only when
+PR normalization: when the latest run is `FINISHED`, the dispatcher normalizes
+the issue's original PR (below). Each step reads the PR with `gh pr view` and acts only when
 needed, logging one `cursor-pr` decision per action:
 
 1. Title not starting `MET-n — ` → `gh pr edit --title "MET-n — <issue title>"`.
@@ -296,11 +295,31 @@ Devon mention (`cursor-pr-other pr:<n>`) and is never acted on; PR URLs in other
 repos only log `cursor-pr-foreign`.
 
 QA: unchanged reviewer selection treats cursor like amp (Claude reviews at high
-effort on gpu/console). Delivered changes go to `POST /v1/agents/<id>/runs` with the
-same follow-up text instead of `amp threads continue`. Round counting, the
-two-round stop and its Devon mention are unchanged; the merge continuation still
-goes to the local reviewer. A failed send (for example `409 agent_busy` while a run
-is active) keeps the follow-up claim and is not retried, as for Amp.
+effort on gpu/console). Delivered changes go to `POST /v1/agents/<id>/runs`
+instead of `amp threads continue`; the text tells the agent to push its branch,
+open no PR and leave the Linear evidence comment to the dispatcher. Round
+counting, the two-round stop and its Devon mention are unchanged; the merge
+continuation still goes to the local reviewer.
+
+- While the latest run is not terminal (`CREATING`, `RUNNING`, …) or its status
+  is unreadable, the follow-up stays pending (`qa-pending`) with no claim.
+- A documented `409 agent_busy` proves no run started: it posts
+  `<!-- factory-qa:followup-busy <key> -->` and a later poll, once the run is
+  terminal, claims and sends again. Each `followup-claim` is one send; a send is
+  allowed only while busy markers equal claims, so delivery happens once.
+- Any other failure or unknown outcome keeps the claim and is never retried, as
+  for Amp.
+- A changes verdict whose follow-up only asks for evidence for its own PR and
+  head (every line mentions evidence, a diff comment or file list; no other PR or
+  SHA) is moot once matching evidence exists: nothing is sent, `followup-moot` is
+  logged, no round is consumed and a fresh review starts at the same head. Mixed
+  findings and stale or wrong-PR evidence are delivered as usual.
+
+Original PR: the first PR the dispatcher sees for the issue (a linked PR after
+the claim, an evidence marker, or the first run-reported URL, recorded at once as
+`<!-- factory-dispatch:cursor-pr pr:<n> -->`) stays the issue's PR, even if its
+first normalization failed. Later runs reporting another URL get the one Devon
+mention and no writes.
 
 Wrap-up: a cloud agent cannot update factory-gpu's main checkout. After merge,
 the same `wrapup-claim` precedes a **new local Amp thread** on gpu:

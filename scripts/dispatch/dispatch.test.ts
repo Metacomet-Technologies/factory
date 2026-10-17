@@ -2515,6 +2515,9 @@ test('cursor QA uses a Claude reviewer and /runs follow-ups with the two-round s
   assert.equal(f.calls().length, 2);
   i.comments.push(reviewed('changes', nextSha).comments.at(-1));
   await f.run();
+  assert.equal(runs().length, 1, 'the first follow-up run is still CREATING');
+  f.cursor.runs[f.cursor.agents[cursorAgent].latestRunId].status = 'FINISHED';
+  await f.run();
   assert.equal(runs().length, 2);
   assert.ok(i.comments.some((c: any) => c.body.includes('two rounds without ready') && c.body.includes(`${devonPing} `)));
   f.setGitHub({ 90: githubPR({ headRefOid: mergeSha }) });
@@ -2717,4 +2720,121 @@ test('dispatcher Cursor evidence for the current head starts the round-two revie
   const launches = f.calls().filter(a => a[0] === '-x');
   assert.equal(launches.length, 1);
   assert.ok(launches[0][1].includes(`factory-qa:review pr:90 sha:${sha} round:2 thread:T-REVIEW`));
+});
+
+const cursorReviewed = (followup = 'Fix widgets/widget.rs boundary handling; run widget tests.') => {
+  const i = cursorBuilder(123, cursorAgent, { attachments: [attachment('open')] });
+  i.comments.push(qaMarker(`start pr:90 sha:${sha} runner:gpu`), qaMarker(`review-claim pr:90 sha:${sha} thread:${reviewId}`),
+    { body: `Findings for ${sha}\n<!-- factory-qa:review pr:90 sha:${sha} thread:${reviewId} verdict:changes -->\n\n## Builder follow-up\n${followup}` });
+  return i;
+};
+const runPosts = (f: any) => f.cursor.requests.filter((r: any) => r.method === 'POST' && r.path === `/v1/agents/${cursorAgent}/runs`);
+
+test('cursor follow-up waits for an active run, retries a 409 agent_busy after the run ends, and delivers exactly once', { timeout: 20_000 }, async t => {
+  const i = cursorReviewed();
+  let busy = 1;
+  const f = await fixture(t, [i], { github: { 90: githubPR() }, agents: { [cursorAgent]: { runStatus: 'RUNNING' } }, submissionsOnly: true,
+    cursor: (r: any) => r.method === 'POST' && r.path.endsWith('/runs') && busy-- > 0 ? { status: 409, data: { error: { code: 'agent_busy', message: 'busy' } } } : undefined });
+  const latest = () => f.cursor.runs[f.cursor.agents[cursorAgent].latestRunId];
+  const pending = await f.run();
+  assert.equal(pending.code, 0, pending.stdout);
+  assert.match(pending.stdout, /"decision":"qa-pending","issue":"MET-123","pr":"90","reason":"Cursor run active"/);
+  assert.equal(runPosts(f).length, 0);
+  assert.ok(!i.comments.some((c: any) => c.body.includes('factory-qa:followup-claim')), 'an active run claims nothing');
+  latest().status = 'FINISHED';
+  assert.equal((await f.run()).code, 0);
+  assert.equal(runPosts(f).length, 1);
+  assert.ok(i.comments.some((c: any) => commentMarkers(c.body).includes(`<!-- factory-qa:followup-busy pr:90 sha:${sha} -->`)));
+  assert.ok(!i.comments.some((c: any) => c.body.includes('factory-qa:round ')));
+  latest().status = 'RUNNING';
+  assert.equal((await f.run()).code, 0);
+  assert.equal(runPosts(f).length, 1, 'busy retry waits for a terminal run');
+  latest().status = 'FINISHED';
+  for (let pass = 0; pass < 3; pass++) assert.equal((await f.run()).code, 0);
+  assert.equal(runPosts(f).length, 2);
+  assert.equal(i.comments.filter((c: any) => c.body.includes(`factory-qa:round pr:90 sha:${sha}`)).length, 1);
+  assert.equal(i.comments.filter((c: any) => c.body.includes('factory-qa:followup-claim ')).length, 2);
+  assert.ok(i.comments.some((c: any) => c.body.startsWith('QA changes delivered (round 1).')));
+});
+
+for (const [name, failure] of [
+  ['5xx', { status: 503, data: { error: { code: 'upstream_error', message: 'x' } } }],
+  ['other 409', { status: 409, data: { error: { code: 'agent_archived', message: 'x' } } }],
+  ['hang', 'hang'],
+] as const) test(`cursor follow-up ${name} is an unknown outcome: claim kept, never retried`, { timeout: 20_000 }, async t => {
+  const i = cursorReviewed();
+  const f = await fixture(t, [i], { github: { 90: githubPR() }, agents: { [cursorAgent]: {} }, submissionsOnly: true,
+    cursor: (r: any) => r.method === 'POST' && r.path.endsWith('/runs') ? failure : undefined });
+  for (let pass = 0; pass < 3; pass++) await f.run(['poll'], { FAKE_TIMEOUT_MS: '300' });
+  assert.equal(runPosts(f).length, 1);
+  assert.equal(i.comments.filter((c: any) => c.body.includes('factory-qa:followup-claim ')).length, 1);
+  assert.ok(!i.comments.some((c: any) => /factory-qa:(?:followup-busy|round) /.test(c.body)));
+});
+
+test('evidence-only findings are moot once matching evidence exists; mixed, stale and wrong-PR cases still deliver', { timeout: 30_000 }, async t => {
+  const ask = `Post the Linear evidence comment for PR 90 at ${sha}: PR URL, head SHA and complete file list.`;
+  const proof = (pr = 90, head = sha) => ({ body: `${prURL(pr)}\nHead: ${head}\nFiles (\`git diff --name-only origin/main...${head}\`):\n- \`widgets/widget.rs\`\n\n<!-- factory-dispatch:cursor-evidence pr:${pr} sha:${head} -->`, createdAt: '2026-10-13T11:03:00Z' });
+  for (const [label, followup, evidence, moot] of [
+    ['moot', ask, proof(), true],
+    ['mixed', `${ask}\nFix widgets/widget.rs boundary handling.`, proof(), false],
+    ['stale evidence', ask, proof(90, nextSha), false],
+    ['wrong-PR evidence', ask, proof(91), false],
+    ['finding for another head', ask.replace(sha, nextSha), proof(), false],
+  ] as const) {
+    // An Amp builder isolates QA: a cursor poll would post fresh dispatcher evidence first.
+    const i = reviewable();
+    i.comments.push(qaMarker(`start pr:90 sha:${sha} runner:gpu`), qaMarker(`review-claim pr:90 sha:${sha} thread:${reviewId}`),
+      { body: `Findings\n<!-- factory-qa:review pr:90 sha:${sha} thread:${reviewId} verdict:changes -->\n\n## Builder follow-up\n${followup}` }, evidence);
+    const f = await fixture(t, [i], { github: { 90: githubPR() }, submissionsOnly: true });
+    const result = await f.run();
+    assert.equal(result.code, 0, result.stdout);
+    assert.equal(f.calls().filter((a: any) => a[1] === 'continue').length, moot ? 0 : 1, label);
+    assert.equal(result.stdout.includes('"decision":"followup-moot"'), moot, label);
+    assert.equal(i.comments.some((c: any) => /factory-qa:(?:followup-claim|round) /.test(c.body)), !moot, label);
+    if (moot) {
+      const launches = f.calls().filter((a: any) => a[0] === '-x');
+      assert.equal(launches.length, 1, 'a fresh same-head review follows');
+      assert.ok(launches[0][1].includes(`factory-qa:review pr:90 sha:${sha} round:2 thread:T-REVIEW`));
+    }
+  }
+});
+
+test('the original cursor PR survives a failed first evidence attempt; a later different URL gets one mention and no writes', { timeout: 20_000 }, async t => {
+  const i = cursorBuilder();
+  const f = await fixture(t, [i], { agents: { [cursorAgent]: {} }, github: { 90: cursorPR(90, { files: [] }), 95: cursorPR(95) } });
+  reportPR(f, cursorAgent, prURL(90));
+  assert.equal((await f.run()).code, 0);
+  assert.ok(i.comments.some((c: any) => commentMarkers(c.body).includes('<!-- factory-dispatch:cursor-pr pr:90 -->')));
+  assert.ok(i.comments.some((c: any) => c.body.includes('<!-- factory-dispatch:cursor-pr-failed pr:90 step:evidence -->')));
+  assert.equal(evidence(i).length, 0);
+  reportPR(f, cursorAgent, prURL(95));
+  for (let pass = 0; pass < 2; pass++) assert.equal((await f.run()).code, 0);
+  const others = i.comments.filter((c: any) => c.body.includes('cursor-pr-other pr:95'));
+  assert.equal(others.length, 1);
+  assert.ok(others[0].body.startsWith(`${devonPing}: Cursor reported another PR, ${prURL(95)}, besides ${prURL(90)}.`));
+  assert.ok(!f.githubCalls().some((a: any) => a[0] === 'gh' && (a.includes('95') || a.some((v: string) => v.includes('/pulls/95/')))), 'no reads or writes on the replacement');
+  assert.equal(f.githubCalls().filter((a: any) => a[0] === 'gh' && a[2] === 'view' && a[3] === '90').length, 3, 'same-PR retry continues');
+  const github = JSON.parse(readFileSync(join(f.directory, 'github'), 'utf8'));
+  f.setGitHub({ ...github, 90: { ...github[90], files: [{ filename: 'widgets/widget.rs', status: 'modified' }] } });
+  assert.equal((await f.run()).code, 0);
+  assert.equal(evidence(i).length, 1);
+  assert.ok(commentMarkers(evidence(i)[0].body).includes(`<!-- factory-dispatch:cursor-evidence pr:90 sha:${sha} -->`));
+  assert.equal(i.comments.filter((c: any) => c.body.includes(devonPing)).length, 2, 'one evidence failure and one other-PR mention');
+});
+
+test('cursor initial and follow-up prompts assign PR creation to Cursor and evidence to the dispatcher; Amp prompts unchanged', { timeout: 15_000 }, async t => {
+  const cloud = prompt(cursorIssue(), 'cursor');
+  const local = prompt(issue(), 'gpu');
+  for (const text of ['Do not open a PR; Cursor opens it when your run ends.', 'the dispatcher posts the evidence comments on MET-123',
+    'and push; the dispatcher updates the evidence comment.', 'Push your branch; Cursor opens the PR. Reply with']) assert.ok(cloud.includes(text), text);
+  assert.doesNotMatch(cloud, /Push and open the PR|push and update the evidence comment|open the PR yourself|evidence comments on MET-123 and control markers/);
+  for (const text of ['Follow AGENTS.md for permissions, evidence comments on MET-123 and control markers.',
+    'Fix received current-head CI failures, push and update the evidence comment.', 'Push and open the PR. Reply with']) assert.ok(local.includes(text), text);
+  assert.doesNotMatch(local, /Cursor opens|dispatcher posts the evidence/);
+  const i = cursorReviewed();
+  const f = await fixture(t, [i], { github: { 90: githubPR() }, agents: { [cursorAgent]: {} }, submissionsOnly: true });
+  assert.equal((await f.run()).code, 0);
+  const text = runPosts(f)[0].body.prompt.text;
+  assert.ok(text.includes('fix what remains, verify, and push your branch. Cursor updates the PR; the dispatcher posts the Linear evidence comment. Do not open a PR. Never deploy or merge.'));
+  assert.doesNotMatch(text, /post the updated Linear diff comment/);
 });

@@ -32,11 +32,33 @@ function verdict(issue: Issue, key: string) {
   return results.length === 1 ? results[0] : undefined;
 }
 
+// Evidence is data for a fresh reviewer, never instructions for the dispatcher.
+function evidence(body: string, pr: string, sha: string) {
+  return new RegExp(`https://github.com/${config.repository}/pull/${pr}(?:\\s|[)/]|$)`).test(body)
+    && new RegExp(`\\b${sha}\\b`).test(body) && /(?:`{3,}|~{3,})(?:diff|text|rust|typescript|ts|sh)\b|^\s*[-*]\s+\S+/m.test(body)
+    // The dispatcher's own Cursor evidence comment carries only its marker for this head.
+    && commentMarkers(body).every(line => line === `<!-- factory-dispatch:cursor-evidence pr:${pr} sha:${sha} -->`);
+}
+const followupText = (body: string) => body.split(/^## Builder follow-up\s*$/m)[1]?.trim();
+// A changes verdict whose only finding is missing evidence for its own PR and head is moot
+// once that evidence exists: nothing is delivered and no round is consumed.
+function moot(issue: Issue, key: string) {
+  const [, pr, sha] = key.match(/^pr:(\d+) sha:([a-f0-9]{40})/)!;
+  const result = verdict(issue, key);
+  const text = result?.value === 'changes' ? followupText(result.body) : undefined;
+  if (!text) return false;
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  return lines.every(line => /\bevidence\b|diff comment|file list/i.test(line))
+    && new RegExp(`\\b${sha}\\b`).test(text) && (text.match(/\b[a-f0-9]{40}\b/g) ?? []).every(value => value === sha)
+    && new RegExp(`(?:/pull/|PR #?)${pr}\\b`).test(text) && [...text.matchAll(/(?:\/pull\/|PR #?)(\d+)\b/g)].every(m => m[1] === pr)
+    && issue.comments.some(c => evidence(c.body, pr, sha));
+}
+
 function finished(issue: Issue, key: string, pr: string) {
   return ['completed', 'canceled'].includes(issue.state.type)
     || issue.attachments.some(a => a.url.replace(/\/$/, '') === `https://github.com/${config.repository}/pull/${pr}` && a.metadata.status === 'merged')
     || has(issue, `human ${key}`) || has(issue, `retired ${key}`)
-    || (verdict(issue, key)?.value === 'changes' && has(issue, `round ${key}`));
+    || (verdict(issue, key)?.value === 'changes' && (has(issue, `round ${key}`) || moot(issue, key)));
 }
 
 export function qaArchives(issue: Issue) {
@@ -141,7 +163,9 @@ type Context = {
   showAmp: (issue: Issue, args: string[]) => void;
   log: (decision: string, details?: object) => void;
   labelThread: (issue: Issue, id: string) => Promise<void>;
-  cursorRun: (id: string, text: string) => Promise<unknown>;
+  cursorRun: (id: string, text: string) => Promise<'sent' | 'busy'>;
+  cursorStatus: (id: string) => Promise<string | undefined>;
+  cursorTerminal: string[];
   showCursor: (issue: Issue, method: string, path: string) => void;
 };
 
@@ -210,15 +234,31 @@ export async function reviewPRs(ctx: Context) {
           await comment(issue, `Ready verdict superseded by a new head; no merge was submitted.\n\n${qa(`retired ${start.key}`)}`);
           active[start.runner]--;
         }
-        if (result?.value !== 'changes' || has(issue, `round ${start.key}`) || has(issue, `followup-claim ${start.key}`)) continue;
-        const followup = result.body.split(/^## Builder follow-up\s*$/m)[1]?.trim();
+        if (result?.value !== 'changes' || has(issue, `round ${start.key}`)) continue;
+        // Each claim is one send; only a recorded 409 agent_busy (no run started) allows another.
+        const count = (name: string) => lines(issue).filter(line => line === qa(`${name} ${start.key}`)).length;
+        if (count('followup-claim') > count('followup-busy')) continue;
+        const followup = followupText(result.body);
         if (!followup) { log('qa-pending', { issue: issue.identifier, pr, reason: 'Missing builder follow-up' }); continue; }
+        if (moot(issue, start.key)) { log('followup-moot', { issue: issue.identifier, pr, sha: start.sha }); continue; }
+        const cloud = builder.startsWith('bc-');
+        if (cloud && dryRun) ctx.showCursor(issue, 'GET', `/v1/agents/${builder}`);
+        else if (cloud) {
+          let status;
+          try { status = await ctx.cursorStatus(builder); }
+          catch { log('qa-pending', { issue: issue.identifier, pr, reason: 'Cursor status unavailable' }); continue; }
+          if (!ctx.cursorTerminal.includes(status!)) { log('qa-pending', { issue: issue.identifier, pr, reason: 'Cursor run active' }); continue; }
+        }
         await comment(issue, `QA follow-up claimed; inspect interrupted delivery before recovery.\n\n${qa(`followup-claim ${start.key}`)}`);
-        const text = `Dispatcher QA findings for PR ${pr} at ${start.sha}. Check these findings against your current head, fix what remains, verify, push, and post the updated Linear diff comment. Never deploy or merge.\n\n${followup}`;
-        // Cursor builders receive the same text as a follow-up run on their agent.
-        if (builder.startsWith('bc-')) {
+        // Cursor builders receive the findings as a follow-up run on their agent; Cursor updates the PR.
+        const text = `Dispatcher QA findings for PR ${pr} at ${start.sha}. Check these findings against your current head, fix what remains, verify, ${cloud ? 'and push your branch. Cursor updates the PR; the dispatcher posts the Linear evidence comment. Do not open a PR' : 'push, and post the updated Linear diff comment'}. Never deploy or merge.\n\n${followup}`;
+        if (cloud) {
           if (dryRun) ctx.showCursor(issue, 'POST', `/v1/agents/${builder}/runs`);
-          else await ctx.cursorRun(builder, text);
+          else if (await ctx.cursorRun(builder, text) === 'busy') {
+            await comment(issue, `Cursor agent busy (409 agent_busy); no run started. The follow-up is retried after the current run ends.\n\n${qa(`followup-busy ${start.key}`)}`);
+            log('qa-followup-busy', { issue: issue.identifier, pr });
+            continue;
+          }
         } else if (dryRun) showAmp(issue, ['amp', 'threads', 'continue', builder, '-ox', '$QA_FOLLOWUP']);
         else await amp(['threads', 'continue', builder, '-ox', text]);
         const rounds = starts(issue).filter(start => start.pr === pr && has(issue, `round ${start.key}`)).length + 1;
@@ -227,15 +267,12 @@ export async function reviewPRs(ctx: Context) {
         if (rounds >= 2) break;
       }
       if (has(issue, `stopped pr:${pr}`) || starts(issue).some(start => start.pr === pr
-        && verdict(issue, start.key)?.value === 'changes' && !has(issue, `round ${start.key}`))) continue;
-      if (verdict(issue, key)?.value === 'changes') {
+        && verdict(issue, start.key)?.value === 'changes' && !has(issue, `round ${start.key}`) && !moot(issue, start.key))) continue;
+      // Moot findings already have their evidence: a fresh review follows at the same head.
+      if (moot(issue, key)) key += ' round:2';
+      else if (verdict(issue, key)?.value === 'changes') {
         const deliveredAt = issue.comments.find(c => commentMarkers(c.body).includes(qa(`round ${key}`)))?.createdAt;
-        // Evidence is data for a fresh reviewer, never instructions for the dispatcher.
-        const newerEvidence = issue.comments.some(c => Date.parse(c.createdAt ?? '') > Date.parse(deliveredAt ?? '')
-          && new RegExp(`https://github.com/${config.repository}/pull/${pr}(?:\\s|[)/]|$)`).test(c.body)
-          && new RegExp(`\\b${sha}\\b`).test(c.body) && /(?:`{3,}|~{3,})(?:diff|text|rust|typescript|ts|sh)\b|^\s*[-*]\s+\S+/m.test(c.body)
-          // The dispatcher's own Cursor evidence comment carries only its marker for this head.
-          && commentMarkers(c.body).every(line => line === `<!-- factory-dispatch:cursor-evidence pr:${pr} sha:${sha} -->`));
+        const newerEvidence = issue.comments.some(c => Date.parse(c.createdAt ?? '') > Date.parse(deliveredAt ?? '') && evidence(c.body, pr, sha));
         if (!newerEvidence) continue;
         key += ' round:2';
       }
