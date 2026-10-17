@@ -1,6 +1,10 @@
 use clap::{Parser, Subcommand};
-use factory_api::{AppState, alerts, devices, fleet, router};
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use factory_api::{AppState, alerts, devices, fleet, network, router};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
+};
 
 #[derive(Parser)]
 struct Args {
@@ -72,6 +76,14 @@ struct Args {
     devices_root: PathBuf,
     #[arg(long, env = "FACTORY_API_REBOOT_STATUS", default_value = devices::DEFAULT_REBOOT_STATUS)]
     reboot_status: PathBuf,
+    #[arg(long, env = "FACTORY_API_NETWORK_WAN_TARGETS", value_delimiter = ',', default_value = network::DEFAULT_WAN_TARGETS)]
+    network_wan_targets: Vec<IpAddr>,
+    #[arg(long, env = "FACTORY_API_NETWORK_DNS_NAME", default_value = network::DEFAULT_DNS_NAME)]
+    network_dns_name: String,
+    #[arg(long, env = "FACTORY_API_NETWORK_TAILNET_TARGET", default_value = network::DEFAULT_TAILNET_TARGET)]
+    network_tailnet_target: String,
+    #[arg(long, env = "FACTORY_API_NETWORK_ROUTE_TABLE", default_value = network::DEFAULT_ROUTE_TABLE)]
+    network_route_table: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -126,6 +138,12 @@ async fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    let network = network::NetworkConfig::new(
+        args.network_route_table,
+        args.network_wan_targets,
+        args.network_dns_name,
+        args.network_tailnet_target,
+    )?;
     let text = args
         .services_config
         .map(std::fs::read_to_string)
@@ -181,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
                 .join("var/lib/factory-reboot/status.json");
         }
     }
+    state.network = network.targets().into();
     if alerts_config.token.is_some() {
         tracing::info!(channel = %alerts_config.channel, "alerts: Slack token loaded; posting enabled");
     } else {

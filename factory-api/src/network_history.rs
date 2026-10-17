@@ -192,7 +192,7 @@ pub struct NetworkPoint {
     pub ts_ms: i64,
     pub sample_count: i64,
     pub loss_percent: f64,
-    /// Average is weighted by received replies. Null when nothing came back.
+    /// Average is weighted by received replies; all null when nothing came back.
     pub latency_ms: NetworkLatency,
     /// Raw buckets: mean of the bursts' mdev. Hourly points: nearest-rank p95.
     pub jitter_ms: Option<f64>,

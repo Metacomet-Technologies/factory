@@ -1,8 +1,9 @@
 use anyhow::Result;
 use factory_api::{
-    data,
-    network::{Burst, DEVICE_ID, Layer, Rtt, Sample},
+    AppState, data, fleet,
+    network::{Burst, DEVICE_ID, Layer, NetworkConfig, Rtt, Sample},
     network_history::*,
+    now_ms, router,
     ups_history::{DAY_MS, HOUR_MS},
 };
 use factory_db::{
@@ -12,6 +13,7 @@ use factory_db::{
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 
 const TABLES: [&str; 4] = [
     "net_probe_samples",
@@ -510,5 +512,261 @@ fn record_and_reads_use_constant_statement_counts() -> Result<()> {
     assert_eq!(budgets[0].0.data, 5 * 4);
     assert_eq!(budgets[0].1, 3);
     assert_eq!(budgets[0], budgets[1]);
+    Ok(())
+}
+
+async fn state(dir: &tempfile::TempDir, config: &NetworkConfig) -> Result<AppState> {
+    pricing::migrate(dir.path().join("pricing.db"))?;
+    let mut state = AppState::new(
+        "http://127.0.0.1:1".into(),
+        dir.path().join("requests.db"),
+        dir.path().join("pricing.db"),
+        fleet::Config { nodes: vec![] },
+    )
+    .await?;
+    state.network = config.targets().into();
+    state.db.clock_synchronized.store(true, Ordering::Release);
+    Ok(state)
+}
+async fn serve(state: &AppState, scope: &Scope) -> Result<(String, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let app = router(state.clone()).layer(axum::Extension(scope.clone()));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Ok((url, task))
+}
+
+#[tokio::test]
+async fn endpoints_return_registry_history_and_constant_query_budgets() -> Result<()> {
+    let config = NetworkConfig::default();
+    for n in [3, 1001] {
+        let dir = tempfile::tempdir()?;
+        let state = state(&dir, &config).await?;
+        let now = now_ms() / 30_000 * 30_000;
+        state
+            .db
+            .write(&Scope::default(), move |db| {
+                for i in (0..n).rev() {
+                    record(db, DEVICE_ID, &tick(now - i * 30_000)[..4])?;
+                }
+                Ok(())
+            })
+            .await?;
+        let client = reqwest::Client::new();
+        let scope = Scope::default();
+        let (url, task) = serve(&state, &scope).await?;
+        let body: Value = client
+            .get(format!("{url}/v1/network"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(scope.counts().data, 1, "/v1/network n={n}");
+        assert_eq!(body["device_id"], DEVICE_ID);
+        let targets = body["targets"].as_array().unwrap();
+        assert_eq!(
+            targets
+                .iter()
+                .map(|t| (
+                    t["layer"].as_str().unwrap(),
+                    t["target"].as_str().unwrap(),
+                    t["probe"].as_str().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("lan", "gateway", "icmp"),
+                ("wan", "1.1.1.1", "icmp"),
+                ("wan", "8.8.8.8", "icmp"),
+                ("dns", "dns", "resolve"),
+                ("tailnet", "tailnet", "tcp_connect"),
+            ]
+        );
+        assert_eq!(
+            targets[0]["latest"],
+            json!({"ts_ms":now,"layer":"lan","target":"gateway","address":"192.168.4.1",
+                   "sent":10,"received":10,"rtt":{"min_us":400,"avg_us":500,"max_us":900,"mdev_us":100}})
+        );
+        // The tailnet target has never been sampled.
+        assert!(targets[4]["latest"].is_null());
+        assert_eq!(body["warnings"], json!([]));
+        task.abort();
+        for (query, resolution, points) in [
+            ("", "raw", n.min(2880)),
+            ("?range=1h", "raw", n.min(120)),
+            ("?range=24h", "raw", n.min(2880)),
+            ("?range=7d", "hourly", 0),
+            ("?range=30d", "hourly", 0),
+        ] {
+            let scope = Scope::default();
+            let (url, task) = serve(&state, &scope).await?;
+            let body: Value = client
+                .get(format!("{url}/v1/network/history{query}"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            assert_eq!(scope.counts().data, 1, "{query} n={n}");
+            assert_eq!(body["resolution"], resolution);
+            let series = body["series"].as_array().unwrap();
+            assert_eq!(
+                series
+                    .iter()
+                    .map(|s| s["target"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["gateway", "1.1.1.1", "8.8.8.8", "dns"]
+            );
+            let counted: i64 = series[0]["points"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["sample_count"].as_i64().unwrap())
+                .sum();
+            if resolution == "raw" {
+                assert_eq!(counted, points, "{query} n={n}");
+                assert!(series[0]["points"].as_array().unwrap().len() <= 720);
+                assert_eq!(
+                    series[0]["points"][0]["latency_ms"],
+                    json!({"min":0.4,"avg":0.5,"max":0.9})
+                );
+                assert_eq!(series[0]["points"][0]["jitter_ms"], 0.1);
+            } else {
+                assert_eq!(counted, n, "{query} n={n}");
+            }
+            task.abort();
+        }
+        let (url, task) = serve(&state, &Scope::default()).await?;
+        for (method, path, status) in [
+            ("GET", "/v1/network/history?range=365d", 400),
+            ("GET", "/v1/network/history?range=", 400),
+            ("POST", "/v1/network", 405),
+            ("POST", "/v1/network/history", 405),
+        ] {
+            let response = client
+                .request(method.parse()?, format!("{url}{path}"))
+                .send()
+                .await?;
+            assert_eq!(response.status(), status, "{method} {path}");
+            if status == 400 {
+                assert_eq!(
+                    response.json::<Value>().await?["error"]["code"],
+                    "invalid_range"
+                );
+            }
+        }
+        task.abort();
+        state.db.close().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn collector_streams_stores_and_warns_without_faking_samples() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let route = dir.path().join("route");
+    std::fs::write(
+        &route,
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+         lo\t00000000\t0100007F\t0003\t0\t0\t0\t00000000\t0\t0\t0\n",
+    )?;
+    let tailnet = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let tailnet_address = tailnet.local_addr()?.to_string();
+    let accept = tokio::spawn(async move {
+        loop {
+            drop(tailnet.accept().await);
+        }
+    });
+    let config = NetworkConfig::new(
+        route.clone(),
+        vec!["127.0.0.1".parse()?],
+        "localhost".into(),
+        tailnet_address.clone(),
+    )?;
+    let state = state(&dir, &config).await?;
+    let (url, task) = serve(&state, &Scope::default()).await?;
+    let client = reqwest::Client::new();
+    let mut stream = client.get(format!("{url}/v1/stream")).send().await?;
+    state.collect_network().await;
+    let mut frames = String::new();
+    let data = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            frames.push_str(std::str::from_utf8(&stream.chunk().await?.unwrap())?);
+            if let Some(rest) = frames.split("event: network.sample\ndata: ").nth(1)
+                && let Some((line, _)) = rest.split_once('\n')
+            {
+                return anyhow::Ok(serde_json::from_str::<Value>(line)?);
+            }
+        }
+    })
+    .await??;
+    let samples = data["data"].as_array().unwrap();
+    assert_eq!(
+        samples
+            .iter()
+            .map(|s| (
+                s["target"].as_str().unwrap(),
+                s["address"].as_str().unwrap(),
+                s["received"].as_i64().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("gateway", "127.0.0.1", 10),
+            ("127.0.0.1", "127.0.0.1", 10),
+            ("dns", "localhost", 10),
+            ("tailnet", tailnet_address.as_str(), 10),
+        ]
+    );
+    let first = samples[0]["ts_ms"].clone();
+    let view =
+        |state: AppState| async move { anyhow::Ok(serde_json::to_value(state.network().await?)?) };
+    let body = view(state.clone()).await?;
+    assert_eq!(body["warnings"], json!([]));
+    assert!(
+        body["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["latest"]["ts_ms"] == first)
+    );
+    // An unreadable route table is a monitoring error: no lan sample is invented.
+    std::fs::remove_file(&route)?;
+    state.collect_network().await;
+    let body = view(state.clone()).await?;
+    assert_eq!(body["targets"][0]["latest"]["ts_ms"], first);
+    assert_ne!(body["targets"][1]["latest"]["ts_ms"], first);
+    let warnings = body["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0]
+            .as_str()
+            .unwrap()
+            .starts_with("network: gateway probe failed: cannot read route table")
+    );
+    // Writes pause with the clock; probing and streaming continue.
+    let before = body["targets"][1]["latest"]["ts_ms"].clone();
+    state.db.clock_synchronized.store(false, Ordering::Release);
+    state.collect_network().await;
+    let body = view(state.clone()).await?;
+    assert_eq!(body["targets"][1]["latest"]["ts_ms"], before);
+    let warnings: Vec<_> = body["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("network history: clock not synchronized")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.starts_with("clock:")),
+        "{warnings:?}"
+    );
+    accept.abort();
+    task.abort();
+    state.db.close().await?;
     Ok(())
 }

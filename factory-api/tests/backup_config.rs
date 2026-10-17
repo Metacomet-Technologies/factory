@@ -49,6 +49,13 @@ async fn published_backup_default_and_environment_override() -> Result<()> {
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_factory-api"))
             .env_clear()
             .env("FACTORY_API_BACKUP_STATUS", status)
+            // Network probes stay on loopback; tests never probe real hosts.
+            .envs([
+                ("FACTORY_API_NETWORK_WAN_TARGETS", "127.0.0.1"),
+                ("FACTORY_API_NETWORK_DNS_NAME", "localhost"),
+                ("FACTORY_API_NETWORK_TAILNET_TARGET", "127.0.0.1:9"),
+                ("FACTORY_API_NETWORK_ROUTE_TABLE", "/nonexistent"),
+            ])
             .args([
                 "--listen",
                 &address.to_string(),
