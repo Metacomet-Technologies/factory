@@ -258,6 +258,8 @@ pub struct NetworkStatus {
     pub device_id: String,
     /// Registry order: lan, wan, dns, tailnet.
     pub targets: Vec<NetworkTarget>,
+    /// Null before the first stored test.
+    pub latest_speed_test: Option<crate::network_history::NetworkSpeedTest>,
     pub warnings: Vec<String>,
 }
 

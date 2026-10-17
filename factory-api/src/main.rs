@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use factory_api::{AppState, alerts, devices, fleet, network, router};
+use factory_api::{AppState, alerts, devices, fleet, network, network_speed, router};
 use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
@@ -84,6 +84,10 @@ struct Args {
     network_tailnet_target: String,
     #[arg(long, env = "FACTORY_API_NETWORK_ROUTE_TABLE", default_value = network::DEFAULT_ROUTE_TABLE)]
     network_route_table: PathBuf,
+    #[arg(long, env = "FACTORY_API_NETWORK_SPEED_URL", default_value = network_speed::DEFAULT_URL, value_parser = network_speed::base_url)]
+    network_speed_url: String,
+    #[arg(long, env = "FACTORY_API_NETWORK_SPEED_INTERVAL_S", default_value_t = network_speed::DEFAULT_INTERVAL_S, value_parser = clap::value_parser!(u64).range(network_speed::MIN_INTERVAL_S..))]
+    network_speed_interval_s: u64,
 }
 
 #[derive(Subcommand)]
@@ -199,6 +203,17 @@ async fn main() -> anyhow::Result<()> {
                 .join("var/lib/factory-reboot/status.json");
         }
     }
+    tracing::info!(
+        url = %args.network_speed_url,
+        interval_s = args.network_speed_interval_s,
+        "network speed tests"
+    );
+    state.speed_test = Some(network_speed::SpeedConfig {
+        base: args.network_speed_url,
+        latency_target: network.wan[0],
+        interval: Duration::from_secs(args.network_speed_interval_s),
+        plan: network_speed::PLAN,
+    });
     state.network = network.targets().into();
     if alerts_config.token.is_some() {
         tracing::info!(channel = %alerts_config.channel, "alerts: Slack token loaded; posting enabled");

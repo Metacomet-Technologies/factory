@@ -146,6 +146,7 @@ async fn disabled_collector_keeps_manual_http_refresh_and_confirmation() -> Resu
                 ("FACTORY_API_NETWORK_DNS_NAME", "localhost"),
                 ("FACTORY_API_NETWORK_TAILNET_TARGET", "127.0.0.1:9"),
                 ("FACTORY_API_NETWORK_ROUTE_TABLE", "/nonexistent"),
+                ("FACTORY_API_NETWORK_SPEED_URL", "http://127.0.0.1:9"),
             ])
             .args(["--listen", &address, "--meter-url", &feed_url, "--disable-pricing-collector",
                 "--openrouter-feed-url", &format!("{feed_url}/primary"), "--litellm-feed-url", &format!("{feed_url}/secondary")])

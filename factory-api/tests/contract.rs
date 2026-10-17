@@ -1618,6 +1618,7 @@ async fn sigterm_exits_with_sse_clients_and_closes_pool_within_five_seconds() ->
             ("FACTORY_API_NETWORK_DNS_NAME", "localhost"),
             ("FACTORY_API_NETWORK_TAILNET_TARGET", "127.0.0.1:9"),
             ("FACTORY_API_NETWORK_ROUTE_TABLE", "/nonexistent"),
+            ("FACTORY_API_NETWORK_SPEED_URL", "http://127.0.0.1:9"),
         ])
         .args([
             "--listen",

@@ -1,9 +1,10 @@
 use anyhow::Result;
 use factory_api::{
-    data,
+    AppState, data, fleet,
     network::DEVICE_ID,
     network_history::*,
-    network_speed::{SpeedTest, Verdict},
+    network_speed::{Direction, Plan, SpeedConfig, SpeedTest, Step, Verdict},
+    now_ms, router,
     ups_history::DAY_MS,
 };
 use factory_db::{
@@ -12,6 +13,7 @@ use factory_db::{
 };
 use rusqlite::{Connection, types::Value};
 use serde_json::json;
+use std::{sync::atomic::Ordering, time::Duration};
 
 fn database() -> Result<Connection> {
     let mut db = Connection::open_in_memory()?;
@@ -219,5 +221,268 @@ fn record_reads_and_retention_use_constant_statement_counts() -> Result<()> {
     assert_eq!(budgets[0].1.data, 2);
     assert_eq!(budgets[0].2.data, 1);
     assert_eq!(budgets[0], budgets[1]);
+    Ok(())
+}
+
+async fn state(dir: &tempfile::TempDir) -> Result<AppState> {
+    pricing::migrate(dir.path().join("pricing.db"))?;
+    let state = AppState::new(
+        "http://127.0.0.1:1".into(),
+        dir.path().join("requests.db"),
+        dir.path().join("pricing.db"),
+        fleet::Config { nodes: vec![] },
+    )
+    .await?;
+    state.db.clock_synchronized.store(true, Ordering::Release);
+    Ok(state)
+}
+async fn serve(state: &AppState, scope: &Scope) -> Result<(String, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let app = router(state.clone()).layer(axum::Extension(scope.clone()));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Ok((url, task))
+}
+
+#[tokio::test]
+async fn speed_test_endpoint_filters_by_range_with_one_statement() -> Result<()> {
+    for n in [3i64, 1001] {
+        let dir = tempfile::tempdir()?;
+        let state = state(&dir).await?;
+        // Embedders and tests never run a speed test unless they install one.
+        assert!(state.speed_test.is_none());
+        let now = now_ms();
+        // Hourly tests going back n hours, plus one per range boundary.
+        let ages: Vec<i64> = (0..n)
+            .map(|i| i * 3_600_000 + 60_000)
+            .chain([2 * DAY_MS, 10 * DAY_MS, 100 * DAY_MS, 400 * DAY_MS])
+            .collect();
+        state
+            .db
+            .write(&Scope::default(), move |db| {
+                for age in ages.iter().rev() {
+                    record_speed_test(db, DEVICE_ID, &ok(now - age))?;
+                }
+                record_speed_test(db, "factory-console", &ok(now))?;
+                Ok(())
+            })
+            .await?;
+        let client = reqwest::Client::new();
+        let within = |days: i64| {
+            (0..n)
+                .filter(|i| i * 3_600_000 + 60_000 < days * DAY_MS)
+                .count()
+        };
+        for (query, range, expected) in [
+            ("", "7d", within(7) + 1),
+            ("?range=24h", "24h", within(1)),
+            ("?range=7d", "7d", within(7) + 1),
+            ("?range=30d", "30d", within(30) + 2),
+            ("?range=365d", "365d", within(365) + 3),
+        ] {
+            let scope = Scope::default();
+            let (url, task) = serve(&state, &scope).await?;
+            let body: serde_json::Value = client
+                .get(format!("{url}/v1/network/speed-tests{query}"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            task.abort();
+            assert_eq!(scope.counts().data, 1, "{query} n={n}");
+            assert_eq!(body["range"], range);
+            let tests = body["tests"].as_array().unwrap();
+            assert_eq!(tests.len(), expected, "{query} n={n}");
+            let starts: Vec<i64> = tests
+                .iter()
+                .map(|t| t["started_ms"].as_i64().unwrap())
+                .collect();
+            assert!(
+                starts.windows(2).all(|pair| pair[0] <= pair[1]),
+                "oldest first"
+            );
+            assert_eq!(tests.last().unwrap()["download_bps"], 935_000_000);
+            assert_eq!(tests.last().unwrap()["idle_latency_ms"], 8.691);
+        }
+        let (url, task) = serve(&state, &Scope::default()).await?;
+        for (method, path, status) in [
+            ("GET", "/v1/network/speed-tests?range=1h", 400),
+            ("GET", "/v1/network/speed-tests?range=", 400),
+            ("GET", "/v1/network/speed-tests?range=7d&range=30d", 400),
+            ("POST", "/v1/network/speed-tests", 405),
+        ] {
+            let response = client
+                .request(method.parse()?, format!("{url}{path}"))
+                .send()
+                .await?;
+            assert_eq!(response.status(), status, "{method} {path}");
+            if status == 400 {
+                assert_eq!(
+                    response.json::<serde_json::Value>().await?["error"]["code"],
+                    "invalid_range"
+                );
+            }
+        }
+        task.abort();
+        state.db.close().await?;
+    }
+    Ok(())
+}
+
+/// Loopback speed endpoints: `/ok` answers, `/fail` returns HTTP 500.
+async fn speed_server() -> Result<String> {
+    use axum::{
+        extract::{Path, Query},
+        http::StatusCode,
+        response::IntoResponse,
+        routing::{get, post},
+    };
+    #[derive(serde::Deserialize)]
+    struct Down {
+        bytes: usize,
+    }
+    let app = axum::Router::new()
+        .route(
+            "/{mode}/__down",
+            get(
+                |Path(mode): Path<String>, Query(q): Query<Down>| async move {
+                    if mode == "fail" {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    (
+                        [("cf-meta-colo", "SBX"), ("cf-meta-ip", "203.0.113.9")],
+                        vec![0u8; q.bytes],
+                    )
+                        .into_response()
+                },
+            ),
+        )
+        .route(
+            "/{mode}/__up",
+            post(|body: axum::body::Bytes| async move {
+                ([("cf-meta-colo", "SBX")], body.len().to_string())
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Ok(url)
+}
+static STEPS: [Step; 2] = [
+    Step {
+        direction: Direction::Download,
+        bytes: 3000,
+        count: 2,
+    },
+    Step {
+        direction: Direction::Upload,
+        bytes: 2000,
+        count: 1,
+    },
+];
+fn config(base: String) -> SpeedConfig {
+    SpeedConfig {
+        base,
+        latency_target: "127.0.0.1".parse().unwrap(),
+        interval: Duration::from_secs(120),
+        plan: Plan {
+            steps: &STEPS,
+            slow_request: Duration::from_secs(1),
+            cap: Duration::from_secs(20),
+        },
+    }
+}
+
+#[tokio::test]
+async fn collector_stores_then_streams_and_respects_the_clock() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut state = state(&dir).await?;
+    let speed = speed_server().await?;
+    state.speed_test = Some(config(format!("{speed}/ok")));
+    let (url, task) = serve(&state, &Scope::default()).await?;
+    let client = reqwest::Client::new();
+    let mut stream = client.get(format!("{url}/v1/stream")).send().await?;
+    state.collect_speed_test().await;
+    let mut frames = String::new();
+    let frame = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            frames.push_str(std::str::from_utf8(&stream.chunk().await?.unwrap())?);
+            if let Some(rest) = frames.split("event: network.speedtest\ndata: ").nth(1)
+                && let Some((line, _)) = rest.split_once('\n')
+            {
+                return anyhow::Ok(serde_json::from_str::<serde_json::Value>(line)?);
+            }
+        }
+    })
+    .await??;
+    let status = serde_json::to_value(state.network().await?)?;
+    assert_eq!(frame["data"], status["latest_speed_test"]);
+    let row = &frame["data"];
+    assert_eq!(row["outcome"], "ok");
+    assert_eq!(
+        (row["download_bytes"].as_i64(), row["upload_bytes"].as_i64()),
+        (Some(6000), Some(2000))
+    );
+    assert_eq!(row["colo"], "SBX");
+    assert!(row["download_bps"].as_i64().unwrap() > 0 && row["upload_bps"].as_i64().unwrap() > 0);
+    assert!(row["idle_latency_ms"].as_f64().is_some(), "{row}");
+    assert!(!row.to_string().contains("203.0.113.9"));
+    assert_eq!(status["warnings"], json!([]));
+
+    // A failed test is a stored outcome, not a warning.
+    state.speed_test = Some(config(format!("{speed}/fail")));
+    state.collect_speed_test().await;
+    let status = serde_json::to_value(state.network().await?)?;
+    let failed = &status["latest_speed_test"];
+    assert_eq!(failed["outcome"], "failed");
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("download of 3000 bytes: "),
+        "{failed}"
+    );
+    assert!(failed["download_bps"].is_null() && failed["upload_bps"].is_null());
+    assert_eq!(status["warnings"], json!([]));
+
+    // Without a synchronized clock no test runs, so nothing is moved or stored.
+    state.db.clock_synchronized.store(false, Ordering::Release);
+    state.collect_speed_test().await;
+    let status = serde_json::to_value(state.network().await?)?;
+    assert_eq!(status["latest_speed_test"]["id"], failed["id"]);
+
+    // A storage error is the warning.
+    state.db.clock_synchronized.store(true, Ordering::Release);
+    state
+        .db
+        .write(&Scope::default(), |db| {
+            Ok(db.execute_batch("CREATE TRIGGER refuse BEFORE INSERT ON net_speed_tests BEGIN SELECT RAISE(ABORT,'disk full'); END;")?)
+        })
+        .await?;
+    state.collect_speed_test().await;
+    let status = serde_json::to_value(state.network().await?)?;
+    assert_eq!(status["latest_speed_test"]["id"], failed["id"]);
+    assert_eq!(status["warnings"], json!(["network speedtest: disk full"]));
+    task.abort();
+    state.db.close().await?;
+    Ok(())
+}
+
+#[test]
+fn speed_flags_are_validated_at_parse_time() -> Result<()> {
+    for (flag, value, message) in [
+        ("--network-speed-url", "ftp://speed.example", "http(s)"),
+        ("--network-speed-url", "https://speed.example/?x=1", "query"),
+        ("--network-speed-interval-s", "119", "119"),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_factory-api"))
+            .env_clear()
+            .args([flag, value])
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{flag} {value}: {stderr}");
+        assert!(stderr.contains(message), "{flag} {value}: {stderr}");
+    }
     Ok(())
 }

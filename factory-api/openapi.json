@@ -1500,6 +1500,123 @@
         ],
         "type": "object"
       },
+      "NetworkSpeedOutcome": {
+        "enum": [
+          "ok",
+          "failed",
+          "timeout"
+        ],
+        "type": "string"
+      },
+      "NetworkSpeedTest": {
+        "description": "One stored throughput test. Rates are bits per second; latencies are average RTT to the first wan target.",
+        "properties": {
+          "colo": {
+            "description": "Cloudflare colo code. The public IP is never stored.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "download_bps": {
+            "description": "Nearest-rank p90 of per-request rates; null unless the outcome is ok.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "download_bytes": {
+            "description": "Bytes moved, for every outcome.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "download_loaded_latency_ms": {
+            "description": "Bursts run while that direction transferred.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ended_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "error": {
+            "description": "Always set for failed tests.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "idle_latency_ms": {
+            "description": "One burst before the transfers.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/NetworkSpeedOutcome"
+          },
+          "started_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "upload_bps": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "upload_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "upload_loaded_latency_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "started_ms",
+          "ended_ms",
+          "outcome",
+          "download_bytes",
+          "upload_bytes"
+        ],
+        "type": "object"
+      },
+      "NetworkSpeedTests": {
+        "properties": {
+          "range": {
+            "type": "string"
+          },
+          "tests": {
+            "description": "Oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/NetworkSpeedTest"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "range",
+          "tests"
+        ],
+        "type": "object"
+      },
       "NetworkStatus": {
         "properties": {
           "device_id": {
@@ -1508,6 +1625,17 @@
           "generated_at_ms": {
             "format": "int64",
             "type": "integer"
+          },
+          "latest_speed_test": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NetworkSpeedTest",
+                "description": "Null before the first stored test."
+              }
+            ]
           },
           "targets": {
             "description": "Registry order: lan, wan, dns, tailnet.",
@@ -1998,7 +2126,7 @@
             "type": "integer"
           },
           "type": {
-            "description": "Named SSE event: gpu.sample, ups.sample, ups.event, network.sample, llm.request,\nfleet.change, pricing.changed, agents.usage, or devices.sample. ups.sample data is\nUpsCurrent or null on failure. devices.sample data is a device view, or null when the\ncollector fails. History is not in the event.\nups.event data is UpsEvent, sent once when an event opens and once when it closes.\nZero-length self_test events send both an open frame and a closed frame.\nnetwork.sample data is the array of Sample probed by one 30-second tick.",
+            "description": "Named SSE event: gpu.sample, ups.sample, ups.event, network.sample, network.speedtest,\nllm.request, fleet.change, pricing.changed, agents.usage, or devices.sample. ups.sample\ndata is UpsCurrent or null on failure. devices.sample data is a device view, or null when\nthe collector fails. History is not in the event.\nups.event data is UpsEvent, sent once when an event opens and once when it closes.\nZero-length self_test events send both an open frame and a closed frame.\nnetwork.sample data is the array of Sample probed by one 30-second tick.\nnetwork.speedtest data is the NetworkSpeedTest row, sent once after it is stored.",
             "type": "string"
           }
         },
@@ -2902,6 +3030,56 @@
           }
         },
         "summary": "1h and 24h read raw bursts in at most 720 buckets per target; jitter is the\nmean of the bursts' mdev. 7d and 30d read hourly rollups; jitter is the\nnearest-rank p95 of each hour's mdev values. Loss is lost replies over sent.",
+        "tags": []
+      }
+    },
+    "/v1/network/speed-tests": {
+      "get": {
+        "operationId": "network_speed_tests",
+        "parameters": [
+          {
+            "description": "24h, 7d (default), 30d, 365d",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NetworkSpeedTests"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "Throughput tests that started within the range, for charts.",
         "tags": []
       }
     },

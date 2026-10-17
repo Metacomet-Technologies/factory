@@ -191,13 +191,14 @@ pub struct AgentsRefreshCooldown {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StreamEvent {
-    /// Named SSE event: gpu.sample, ups.sample, ups.event, network.sample, llm.request,
-    /// fleet.change, pricing.changed, agents.usage, or devices.sample. ups.sample data is
-    /// UpsCurrent or null on failure. devices.sample data is a device view, or null when the
-    /// collector fails. History is not in the event.
+    /// Named SSE event: gpu.sample, ups.sample, ups.event, network.sample, network.speedtest,
+    /// llm.request, fleet.change, pricing.changed, agents.usage, or devices.sample. ups.sample
+    /// data is UpsCurrent or null on failure. devices.sample data is a device view, or null when
+    /// the collector fails. History is not in the event.
     /// ups.event data is UpsEvent, sent once when an event opens and once when it closes.
     /// Zero-length self_test events send both an open frame and a closed frame.
     /// network.sample data is the array of Sample probed by one 30-second tick.
+    /// network.speedtest data is the NetworkSpeedTest row, sent once after it is stored.
     pub r#type: String,
     pub ts_ms: i64,
     pub data: serde_json::Value,

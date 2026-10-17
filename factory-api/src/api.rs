@@ -1,7 +1,7 @@
 use crate::devices::{self, DeviceList, DeviceView};
 use crate::devices_history::{self, DeviceHistory};
 use crate::network::{NetworkStatus, Sample};
-use crate::network_history::{self, NetworkSeries};
+use crate::network_history::{self, NetworkSeries, NetworkSpeedTest};
 use crate::types::*;
 use crate::ups::{Ups, UpsCurrent};
 use crate::ups_history::{self, UpsEnergy, UpsEvents, UpsPoint, UpsSettings};
@@ -153,6 +153,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
             | "/v1/settings/ups"
             | "/v1/network"
             | "/v1/network/history"
+            | "/v1/network/speed-tests"
             | "/v1/pricing"
             | "/v1/pricing/refresh"
             | "/v1/agents"
@@ -206,6 +207,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
         "/v1/settings/ups" => get_ups_settings(&state).await,
         "/v1/network" => network(&state).await,
         "/v1/network/history" => network_history(&state, request).await,
+        "/v1/network/speed-tests" => network_speed_tests(&state, request).await,
         "/openapi.json" => Json(ApiDoc::openapi()).into_response(),
         "/v1/stream" => stream(&state).into_response(),
         "/v1/gpu" => match range(&request, true) {
@@ -630,6 +632,44 @@ async fn network_history(state: &AppState, request: Request<Body>) -> Response {
             }),
     )
 }
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+struct NetworkSpeedTests {
+    range: String,
+    /// Oldest first.
+    tests: Vec<NetworkSpeedTest>,
+}
+/// Throughput tests that started within the range, for charts.
+#[utoipa::path(get, path="/v1/network/speed-tests", params(("range"=Option<String>, Query, description="24h, 7d (default), 30d, 365d")), responses((status=200, body=NetworkSpeedTests),(status=400, body=ApiError),(status=500, body=ApiError)))]
+async fn network_speed_tests(state: &AppState, request: Request<Body>) -> Response {
+    let Ok(Query(query)) = Query::<RangeQuery>::try_from_uri(request.uri()) else {
+        return error(StatusCode::BAD_REQUEST, "invalid_range", "malformed query");
+    };
+    let range = query.range.unwrap_or_else(|| "7d".into());
+    let days = match range.as_str() {
+        "24h" => 1,
+        "7d" => 7,
+        "30d" => 30,
+        "365d" => 365,
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_range",
+                "range must be 24h, 7d, 30d, or 365d",
+            );
+        }
+    };
+    let since = now_ms() - days * ups_history::DAY_MS;
+    response(
+        state
+            .db
+            .requests
+            .read(&state.query_scope, move |db| {
+                network_history::speed_tests(db, crate::network::DEVICE_ID, since)
+            })
+            .await
+            .map(|tests| NetworkSpeedTests { range, tests }),
+    )
+}
 #[utoipa::path(get, path="/v1/agents", responses((status=200, body=Agents)))]
 async fn agents(state: &AppState) -> Json<Agents> {
     Json(crate::usage::read(&state.usage_snapshot).await)
@@ -794,6 +834,7 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         put_ups_settings,
         network,
         network_history,
+        network_speed_tests,
         pricing,
         refresh,
         confirm_selection
@@ -810,6 +851,7 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         DeviceView,
         DeviceHistory,
         NetworkStatus,
+        NetworkSpeedTest,
         Sample,
         Pricing,
         Agents,

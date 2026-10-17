@@ -58,14 +58,15 @@ pub const SEQUENCE: [Step; 6] = [
     step(Direction::Upload, 50, 3),
 ];
 
-pub struct Plan<'a> {
-    pub steps: &'a [Step],
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub steps: &'static [Step],
     /// A finished step with any request slower than this ends its direction.
     pub slow_request: Duration,
     /// Hard cap over the whole test, latency bursts included.
     pub cap: Duration,
 }
-pub const PLAN: Plan<'static> = Plan {
+pub const PLAN: Plan = Plan {
     steps: &SEQUENCE,
     slow_request: Duration::from_secs(1),
     cap: Duration::from_secs(60),
@@ -78,6 +79,7 @@ pub struct SpeedConfig {
     /// The first wan target. Idle and loaded latency bursts go here.
     pub latency_target: IpAddr,
     pub interval: Duration,
+    pub plan: Plan,
 }
 /// Validate `--network-speed-url` at parse time.
 pub fn base_url(text: &str) -> Result<String> {
@@ -154,11 +156,11 @@ fn update(partial: &Mutex<Partial>, change: impl FnOnce(&mut Partial)) {
 }
 
 /// One test, never retried. Errors become a failed verdict, and the cap a timeout.
-pub async fn run(config: &SpeedConfig, plan: &Plan<'_>) -> SpeedTest {
+pub async fn run(config: &SpeedConfig) -> SpeedTest {
     let started_ms = crate::now_ms();
     let started = Instant::now();
     let partial = Mutex::new(Partial::default());
-    let verdict = match tokio::time::timeout(plan.cap, measure(config, plan, &partial)).await {
+    let verdict = match tokio::time::timeout(config.plan.cap, measure(config, &partial)).await {
         Ok(Ok([download_bps, upload_bps])) => Verdict::Ok {
             download_bps,
             upload_bps,
@@ -180,11 +182,7 @@ pub async fn run(config: &SpeedConfig, plan: &Plan<'_>) -> SpeedTest {
         colo: partial.colo,
     }
 }
-async fn measure(
-    config: &SpeedConfig,
-    plan: &Plan<'_>,
-    partial: &Mutex<Partial>,
-) -> Result<[i64; 2]> {
+async fn measure(config: &SpeedConfig, partial: &Mutex<Partial>) -> Result<[i64; 2]> {
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -198,7 +196,7 @@ async fn measure(
     for direction in [Direction::Download, Direction::Upload] {
         let done = CancellationToken::new();
         let transfer = async {
-            let rate = transfer(&client, &config.base, plan, direction, partial).await;
+            let rate = transfer(&client, config, direction, partial).await;
             done.cancel();
             rate
         };
@@ -232,22 +230,26 @@ async fn loaded_latency(
 }
 async fn transfer(
     client: &reqwest::Client,
-    base: &str,
-    plan: &Plan<'_>,
+    config: &SpeedConfig,
     direction: Direction,
     partial: &Mutex<Partial>,
 ) -> Result<i64> {
     let mut rates = Vec::new();
-    for step in plan.steps.iter().filter(|s| s.direction == direction) {
+    for step in config
+        .plan
+        .steps
+        .iter()
+        .filter(|s| s.direction == direction)
+    {
         let mut slowest = Duration::ZERO;
         for _ in 0..step.count {
-            let elapsed = request(client, base, step, partial)
+            let elapsed = request(client, &config.base, step, partial)
                 .await
                 .with_context(|| format!("{} of {} bytes", direction.as_str(), step.bytes))?;
             rates.push(rate_bps(step.bytes, elapsed));
             slowest = slowest.max(elapsed);
         }
-        if slowest > plan.slow_request {
+        if slowest > config.plan.slow_request {
             break;
         }
     }
@@ -440,7 +442,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{address}")
     }
-    const STEPS: [Step; 6] = [
+    static STEPS: [Step; 6] = [
         Step {
             direction: Direction::Download,
             bytes: 1000,
@@ -477,13 +479,13 @@ mod tests {
             base: base_url(&format!("{}/{mode}", server().await)).unwrap(),
             latency_target: "127.0.0.1".parse().unwrap(),
             interval: Duration::from_secs(MIN_INTERVAL_S),
+            plan: Plan {
+                steps: &STEPS,
+                slow_request: Duration::from_millis(500),
+                cap,
+            },
         };
-        let plan = Plan {
-            steps: &STEPS,
-            slow_request: Duration::from_millis(500),
-            cap,
-        };
-        run(&config, &plan).await
+        run(&config).await
     }
 
     #[tokio::test]
