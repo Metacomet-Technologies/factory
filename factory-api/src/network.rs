@@ -253,7 +253,7 @@ pub struct NetworkTarget {
     pub latest: Option<Sample>,
 }
 #[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct Network {
+pub struct NetworkStatus {
     pub generated_at_ms: i64,
     pub device_id: String,
     /// Registry order: lan, wan, dns, tailnet.

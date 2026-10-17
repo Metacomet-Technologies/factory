@@ -592,7 +592,7 @@ impl AppState {
         self.warning("devices history", result.err().map(|e| e.to_string()))
             .await;
     }
-    pub async fn network(&self) -> Result<network::Network> {
+    pub async fn network(&self) -> Result<network::NetworkStatus> {
         let warnings = self
             .read_warnings()
             .await
@@ -620,7 +620,7 @@ impl AppState {
                     .map(|i| latest.swap_remove(i)),
             })
             .collect();
-        Ok(network::Network {
+        Ok(network::NetworkStatus {
             generated_at_ms: now_ms(),
             device_id: network::DEVICE_ID.into(),
             targets,

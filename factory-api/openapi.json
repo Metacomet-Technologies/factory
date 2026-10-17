@@ -1382,32 +1382,16 @@
       },
       "Network": {
         "properties": {
-          "device_id": {
-            "type": "string"
+          "rx": {
+            "$ref": "#/components/schemas/Metric"
           },
-          "generated_at_ms": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "targets": {
-            "description": "Registry order: lan, wan, dns, tailnet.",
-            "items": {
-              "$ref": "#/components/schemas/NetworkTarget"
-            },
-            "type": "array"
-          },
-          "warnings": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
+          "tx": {
+            "$ref": "#/components/schemas/Metric"
           }
         },
         "required": [
-          "generated_at_ms",
-          "device_id",
-          "targets",
-          "warnings"
+          "rx",
+          "tx"
         ],
         "type": "object"
       },
@@ -1513,6 +1497,37 @@
           "layer",
           "target",
           "points"
+        ],
+        "type": "object"
+      },
+      "NetworkStatus": {
+        "properties": {
+          "device_id": {
+            "type": "string"
+          },
+          "generated_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "targets": {
+            "description": "Registry order: lan, wan, dns, tailnet.",
+            "items": {
+              "$ref": "#/components/schemas/NetworkTarget"
+            },
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "generated_at_ms",
+          "device_id",
+          "targets",
+          "warnings"
         ],
         "type": "object"
       },
@@ -2819,7 +2834,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Network"
+                  "$ref": "#/components/schemas/NetworkStatus"
                 }
               }
             },

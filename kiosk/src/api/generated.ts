@@ -160,6 +160,47 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v1/network": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * Every registry target in layer order with its latest stored sample (null
+     *     before the first tick), plus network and clock warnings.
+     */
+    get: operations["network"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/network/history": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * 1h and 24h read raw bursts in at most 720 buckets per target; jitter is the
+     *     mean of the bursts' mdev. 7d and 30d read hourly rollups; jitter is the
+     *     nearest-rank p95 of each hour's mdev values. Loss is lost replies over sent.
+     */
+    get: operations["network_history"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v1/pricing": {
     parameters: {
       query?: never;
@@ -396,6 +437,13 @@ export interface components {
       /** Format: int64 */
       observed_at_ms: number;
     };
+    Burst: {
+      /** Format: int32 */
+      received: number;
+      rtt?: null | components["schemas"]["Rtt"];
+      /** Format: int32 */
+      sent: number;
+    };
     ClearedAlert: {
       /** Format: int64 */
       cleared_at_ms: number;
@@ -619,6 +667,11 @@ export interface components {
       /** Format: int64 */
       observed_at_ms: number;
     };
+    /**
+     * @description Declaration order is registry order; diagnosis blames the first failing layer.
+     * @enum {string}
+     */
+    Layer: "lan" | "wan" | "dns" | "tailnet";
     LlmRequest: {
       client_hostname: string;
       /** Format: double */
@@ -671,6 +724,53 @@ export interface components {
       rx: components["schemas"]["Metric"];
       tx: components["schemas"]["Metric"];
     };
+    NetworkHistory: {
+      range: string;
+      resolution: components["schemas"]["Resolution"];
+      series: components["schemas"]["NetworkSeries"][];
+    };
+    NetworkLatency: {
+      /** Format: double */
+      avg?: number | null;
+      /** Format: double */
+      max?: number | null;
+      /** Format: double */
+      min?: number | null;
+    };
+    NetworkPoint: {
+      /**
+       * Format: double
+       * @description Raw buckets: mean of the bursts' mdev. Hourly points: nearest-rank p95.
+       */
+      jitter_ms?: number | null;
+      /** @description Average is weighted by received replies; all null when nothing came back. */
+      latency_ms: components["schemas"]["NetworkLatency"];
+      /** Format: double */
+      loss_percent: number;
+      /** Format: int64 */
+      sample_count: number;
+      /** Format: int64 */
+      ts_ms: number;
+    };
+    NetworkSeries: {
+      layer: components["schemas"]["Layer"];
+      points: components["schemas"]["NetworkPoint"][];
+      target: string;
+    };
+    NetworkStatus: {
+      device_id: string;
+      /** Format: int64 */
+      generated_at_ms: number;
+      /** @description Registry order: lan, wan, dns, tailnet. */
+      targets: components["schemas"]["NetworkTarget"][];
+      warnings: string[];
+    };
+    NetworkTarget: {
+      latest?: null | components["schemas"]["Sample"];
+      layer: components["schemas"]["Layer"];
+      probe: components["schemas"]["ProbeKind"];
+      target: string;
+    };
     Node: {
       /** Format: int64 */
       last_seen_ms?: number | null;
@@ -688,6 +788,8 @@ export interface components {
       family: string;
       pending_model_id?: string | null;
     };
+    /** @enum {string} */
+    ProbeKind: "icmp" | "resolve" | "tcp_connect";
     Ram: {
       available: components["schemas"]["Metric"];
       swap_free: components["schemas"]["Metric"];
@@ -718,6 +820,35 @@ export interface components {
       /** Format: int64 */
       pending_since_ms?: number | null;
       reboot_required?: boolean | null;
+    };
+    /** @enum {string} */
+    Resolution: "raw" | "hourly";
+    Rtt: {
+      /** Format: int64 */
+      avg_us: number;
+      /** Format: int64 */
+      max_us: number;
+      /**
+       * Format: int64
+       * @description Jitter, as iputils computes it: the population standard deviation.
+       */
+      mdev_us: number;
+      /** Format: int64 */
+      min_us: number;
+    };
+    Sample: components["schemas"]["Burst"] & {
+      /**
+       * @description What was probed: the gateway or WAN IP, the resolved name, or the
+       *     resolved tailnet socket address. Null when it could not be found.
+       */
+      address?: string | null;
+      layer: components["schemas"]["Layer"];
+      target: string;
+      /**
+       * Format: int64
+       * @description Start of the tick; every target in one tick shares it.
+       */
+      ts_ms: number;
     };
     Selection: {
       /** Format: int64 */
@@ -764,12 +895,13 @@ export interface components {
       /** Format: int64 */
       ts_ms: number;
       /**
-       * @description Named SSE event: gpu.sample, ups.sample, ups.event, llm.request, fleet.change,
-       *     pricing.changed, agents.usage, or devices.sample. ups.sample data is UpsCurrent or null
-       *     on failure. devices.sample data is a device view, or null when the collector fails.
-       *     History is not in the event.
+       * @description Named SSE event: gpu.sample, ups.sample, ups.event, network.sample, llm.request,
+       *     fleet.change, pricing.changed, agents.usage, or devices.sample. ups.sample data is
+       *     UpsCurrent or null on failure. devices.sample data is a device view, or null when the
+       *     collector fails. History is not in the event.
        *     ups.event data is UpsEvent, sent once when an event opens and once when it closes.
        *     Zero-length self_test events send both an open frame and a closed frame.
+       *     network.sample data is the array of Sample probed by one 30-second tick.
        */
       type: string;
     };
@@ -1182,6 +1314,71 @@ export interface operations {
         };
       };
       400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  network: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["NetworkStatus"];
+        };
+      };
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  network_history: {
+    parameters: {
+      query?: {
+        /** @description 1h, 24h (default), 7d, 30d */
+        range?: string;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["NetworkHistory"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      500: {
         headers: {
           [name: string]: unknown;
         };

@@ -1,6 +1,6 @@
 use crate::devices::{self, DeviceList, DeviceView};
 use crate::devices_history::{self, DeviceHistory};
-use crate::network::{Network, Sample};
+use crate::network::{NetworkStatus, Sample};
 use crate::network_history::{self, NetworkSeries};
 use crate::types::*;
 use crate::ups::{Ups, UpsCurrent};
@@ -574,7 +574,7 @@ async fn put_ups_settings(state: &AppState, request: Request<Body>) -> Response 
 }
 /// Every registry target in layer order with its latest stored sample (null
 /// before the first tick), plus network and clock warnings.
-#[utoipa::path(get, path="/v1/network", responses((status=200, body=Network),(status=500, body=ApiError)))]
+#[utoipa::path(get, path="/v1/network", responses((status=200, body=NetworkStatus),(status=500, body=ApiError)))]
 async fn network(state: &AppState) -> Response {
     response(state.network().await)
 }
@@ -809,7 +809,7 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         DeviceList,
         DeviceView,
         DeviceHistory,
-        Network,
+        NetworkStatus,
         Sample,
         Pricing,
         Agents,
