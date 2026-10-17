@@ -621,8 +621,9 @@ describe("dashboard contract", () => {
     const tools = within(screen.getByRole("region", { name: "Frontier CLIs" }));
     expect(
       tools.getAllByRole("heading", { level: 3 }).map((heading) => heading.textContent),
-    ).toEqual(["Amp", "Claude Code", "ChatGPT"]);
-    expect(tools.getByText("not tracked: Cursor, Kimi")).toBeInTheDocument();
+    ).toEqual(["Amp", "Cursor", "Claude Code", "ChatGPT", "Kimi", "OpenCode"]);
+    expect(tools.getByText("session cost: $1.25")).toBeInTheDocument();
+    expect(tools.queryByText(/not tracked:/)).not.toBeInTheDocument();
     const event: StreamEvent = {
       type: "llm.request",
       ts_ms: 1000,
@@ -927,9 +928,9 @@ describe("frontier capacity", () => {
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
     const data = agentFixtures();
-    data.tools[0]!.observed_at_ms = Date.now() - 179_000;
-    data.tools[2]!.observed_at_ms = Date.now() - 117_000;
-    data.tools[3]!.observed_at_ms = null;
+    for (const tool of data.tools) tool.observed_at_ms = Date.now() - 179_000;
+    data.tools.find((tool) => tool.tool === "codex")!.observed_at_ms = Date.now() - 117_000;
+    data.tools.find((tool) => tool.tool === "kimi")!.observed_at_ms = null;
     const { rerender } = render(
       <AgentsSection resource={{ data: null, error: null, loading: true }} icon={null} />,
     );
@@ -1107,10 +1108,13 @@ describe("frontier capacity", () => {
     render(<AgentsSection resource={{ data, error: null, loading: false }} icon={null} />);
     expect(screen.getByText("$171.27 of $200 · 998.1 of 1,000 orb hours")).toBeInTheDocument();
     expect(screen.getByText("62,500 Codex credits")).toBeInTheDocument();
+    expect(screen.getByText("$12.5 of $50")).toBeInTheDocument();
+    expect(screen.getByText("session cost: $1.25")).toBeInTheDocument();
     expect(screen.queryByText(/\$62,500/)).not.toBeInTheDocument();
     expect(screen.getByText("Plan: Gigawatt")).toBeInTheDocument();
-    expect(screen.getByText("Plan: —")).toBeInTheDocument();
-    expect(screen.getByText("Balance: —")).toBeInTheDocument();
+    expect(screen.getAllByText("Plan: pro")).toHaveLength(2);
+    expect(screen.getAllByText("Plan: —")).toHaveLength(3);
+    expect(screen.getAllByText("Balance: —")).toHaveLength(2);
     expect(screen.getByText("observed 7 min ago")).toBeInTheDocument();
     expect(screen.getAllByRole("progressbar").map((bar) => bar.getAttribute("value"))).toEqual([
       "14",
@@ -1119,6 +1123,9 @@ describe("frontier capacity", () => {
       "12",
       "0",
       "17",
+      "20",
+      "8",
+      "35",
     ]);
     expect(screen.getByText("resets in 1.6 h")).toHaveAttribute(
       "title",
@@ -1139,7 +1146,7 @@ describe("frontier capacity", () => {
     delete amp.windows[1]!.resets_at_ms;
     amp.balances = [];
     amp.balance = null;
-    data.tools[2]!.balances = [];
+    data.tools.find((tool) => tool.tool === "codex")!.balances = [];
     // Exercise the primary balance fallback independently of additive balances[].
     render(<AgentsSection resource={{ data, error: null, loading: false }} icon={null} />);
     const row = within(screen.getByRole("listitem", { name: "Amp" }));
@@ -1158,10 +1165,11 @@ describe("frontier capacity", () => {
         data.tools[0] = { ...agentFixtures().tools[0]!, status, reason: "format changed" };
       if (status === "stale") data.tools[0]!.reason = "format changed";
       data.tools[0]!.cli_version = "0.0.1791864325-g52e626";
-      data.tools[2]!.cli_version = null;
-      if (status !== "not_tracked") data.tools[2]!.reason = "timeout";
+      const chatgpt = data.tools.find((tool) => tool.tool === "codex")!;
+      chatgpt.cli_version = null;
+      if (status !== "not_tracked") chatgpt.reason = "timeout";
       render(<AgentsSection resource={{ data, error: null, loading: false }} icon={null} />);
-      expect(screen.getByText("not tracked: Cursor, Kimi")).toBeInTheDocument();
+      expect(screen.queryByText(/not tracked:/)).not.toBeInTheDocument();
       if (status !== "not_tracked") {
         expect(screen.getByText("format changed (amp 0.0.1791864325-g52e626)")).toHaveClass(
           "status-warn",
@@ -1171,14 +1179,14 @@ describe("frontier capacity", () => {
         ).toHaveClass("status-warn");
       }
       if (status === "stale") {
-        expect(screen.getAllByText("stale · observed 51 min ago")).toHaveLength(3);
+        expect(screen.getAllByText("stale · observed 51 min ago")).toHaveLength(6);
         expect(screen.getByText(/\$171.27 of \$200/)).toBeInTheDocument();
-        expect(screen.getAllByRole("progressbar")).toHaveLength(6);
+        expect(screen.getAllByRole("progressbar")).toHaveLength(9);
       } else {
         expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
         expect(screen.queryByText(/\$171.27/)).not.toBeInTheDocument();
         expect(screen.getAllByText(status === "unknown" ? "unknown" : "not tracked")).toHaveLength(
-          3,
+          6,
         );
       }
     },
@@ -1200,7 +1208,7 @@ describe("frontier capacity", () => {
         }),
       ),
     );
-    expect(await screen.findAllByText(/usage source unavailable/)).toHaveLength(3);
+    expect(await screen.findAllByText(/usage source unavailable/)).toHaveLength(6);
     expect(screen.getByText("$3.41")).toBeInTheDocument();
     api();
     act(() => MockSource.latest.onerror?.());

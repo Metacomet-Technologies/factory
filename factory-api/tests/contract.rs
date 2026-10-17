@@ -494,10 +494,11 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             .collect::<Vec<_>>(),
         vec![
             (&json!("amp"), &json!("unknown")),
-            (&json!("cursor"), &json!("not_tracked")),
+            (&json!("cursor"), &json!("unknown")),
             (&json!("claude-code"), &json!("unknown")),
             (&json!("codex"), &json!("unknown")),
-            (&json!("kimi"), &json!("not_tracked"))
+            (&json!("kimi"), &json!("unknown")),
+            (&json!("opencode"), &json!("unknown"))
         ]
     );
     let alerts = fetch(&client, &format!("{url}/v1/alerts")).await;

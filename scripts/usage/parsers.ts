@@ -5,7 +5,11 @@ export type Window = { name: string; used_percent: number; resets_at_ms: number 
 export type Balance = { amount: string; unit: 'usd' | 'orb_hours' | 'codex_credits'; remaining: string; total: string | null; label?: string | null };
 export type Reading = { plan: string | null; windows: Window[]; balance: Balance | null; balances: Balance[]; reset_credits_available: number | null };
 export type Tool = Reading & { tool: string; status: 'ok' | 'unknown' | 'stale' | 'not_tracked'; reason: string | null; note: null; observed_at_ms: number | null; source: string | null; cli_version: string | null };
-export const sources = { amp: 'amp-cli', 'claude-code': 'claude-usage', codex: 'codex-app-server' } as const;
+export const TOOL_ORDER = ['amp', 'cursor', 'claude-code', 'codex', 'kimi', 'opencode'] as const;
+export const sources = {
+  amp: 'amp-cli', cursor: 'cursor-about', 'claude-code': 'claude-usage', codex: 'codex-app-server',
+  kimi: 'kimi-oauth-usage', opencode: 'opencode-stats',
+} as const;
 export const emptyReading = (): Reading => ({ plan: null, windows: [], balance: null, balances: [], reset_credits_available: null });
 export function check(value: unknown): asserts value { if (!value) throw new Error(FORMAT_CHANGED); }
 function percent(value: unknown): number { check(typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100); return value; }
@@ -124,6 +128,170 @@ export function parseCodex(message: any): Reading {
   }
   const resets = message.result.rateLimitResetCredits;
   return { plan: rate.planType, windows, balance: credits, balances: credits ? [credits] : [], reset_credits_available: resets == null ? null : integer(resets.availableCount) };
+}
+const cursorPlans: Record<string, string> = {
+  free: 'free', pro: 'pro', 'pro plus': 'pro_plus', 'pro+': 'pro_plus', ultra: 'ultra',
+  team: 'team', teams: 'team', business: 'business', enterprise: 'enterprise', edu: 'edu',
+};
+// Plan name only. `agent about` has no headless usage meters; email and request ids are dropped.
+export function parseCursor(text: string): Reading {
+  const data = JSON.parse(text);
+  check(data && typeof data === 'object' && !Array.isArray(data));
+  check(typeof data.cliVersion === 'string' && /^\d{4}\.\d{1,2}\.\d{1,2}-[a-f0-9]+$/.test(data.cliVersion));
+  check(Object.hasOwn(data, 'userEmail') && Object.hasOwn(data, 'subscriptionTier'));
+  const email = data.userEmail, tier = data.subscriptionTier;
+  check(email === null || (typeof email === 'string' && email.length <= 320));
+  check(tier === null || (typeof tier === 'string' && tier.length <= 64));
+  if (email === null && tier === null) throw new Error('not logged in');
+  if (typeof email === 'string' && email.length > 0 && tier === null) throw new Error('CLI failed');
+  check(typeof email === 'string' && email.length > 0 && typeof tier === 'string');
+  const plan = cursorPlans[tier.trim().toLowerCase().replace(/^cursor\s+/, '').replace(/\s+/g, ' ')];
+  check(plan);
+  return { ...emptyReading(), plan };
+}
+function ratioPercent(value: unknown): number {
+  check(typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1);
+  const used = Math.round(value * 1_000_000) / 10_000;
+  check(used >= 0 && used <= 100);
+  return used;
+}
+function quotaWindow(entry: unknown, name: string, minutes: number | null): Window | null {
+  if (entry == null) return null;
+  check(entry && typeof entry === 'object' && !Array.isArray(entry));
+  const record = entry as Record<string, unknown>;
+  check(Object.keys(record).every(key => key === 'usedRatio' || key === 'resetAt') && Object.hasOwn(record, 'usedRatio'));
+  return { name, used_percent: ratioPercent(record.usedRatio), resets_at_ms: record.resetAt == null ? null : iso(record.resetAt), window_minutes: minutes };
+}
+function cents(value: unknown): number {
+  check(Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 100_000_000_000);
+  return value as number;
+}
+function centsToDecimal(value: number): string {
+  const whole = Math.trunc(value / 100), frac = value % 100;
+  return frac === 0 ? String(whole) : `${whole}.${String(frac).padStart(2, '0')}`.replace(/0$/, '');
+}
+// Local loopback quota only. request_id, login text and non-USD wallets are not stored.
+export function parseKimi(text: string): Reading {
+  const message = JSON.parse(text);
+  check(message && typeof message === 'object' && !Array.isArray(message));
+  check(Object.keys(message).every(key => ['code', 'msg', 'data', 'request_id'].includes(key)));
+  check(message.code === 0 && message.msg === 'success' && message.data && typeof message.data === 'object');
+  if (message.request_id != null) check(typeof message.request_id === 'string' && /^[A-Za-z0-9_-]{8,80}$/.test(message.request_id));
+  const data = message.data as Record<string, unknown>;
+  if (data.kind === 'error') {
+    check(Object.keys(data).every(key => ['kind', 'message', 'status'].includes(key)));
+    check(typeof data.message === 'string' && data.message.length > 0 && data.message.length <= 500);
+    if (data.status != null) check(Number.isInteger(data.status) && (data.status as number) >= 100 && (data.status as number) <= 599);
+    if (data.message === 'No token for "kimi-code". Run /login to authenticate.') throw new Error('not logged in');
+    throw new Error('CLI failed');
+  }
+  check(data.kind === 'ok' && Object.keys(data).every(key => key === 'kind' || key === 'quota'));
+  const quota = data.quota as Record<string, unknown>;
+  check(quota && typeof quota === 'object' && !Array.isArray(quota));
+  check(Object.keys(quota).every(key => key === 'usages' || key === 'extraUsage'));
+  const usages = quota.usages as Record<string, unknown>;
+  check(usages && typeof usages === 'object' && !Array.isArray(usages));
+  check(Object.keys(usages).every(key => ['limit5h', 'limit7d', 'monthTotal', 'monthCode'].includes(key)));
+  quotaWindow(usages.monthCode, 'monthly', null);
+  const windows = [
+    quotaWindow(usages.limit5h, 'five_hour', 300),
+    quotaWindow(usages.limit7d, 'weekly', 10080),
+    quotaWindow(usages.monthTotal, 'monthly', null),
+  ].filter(window => window != null);
+  check(windows.length > 0);
+  let wallet: Balance | null = null;
+  if (quota.extraUsage != null) {
+    const extra = quota.extraUsage as Record<string, unknown>;
+    check(extra && typeof extra === 'object' && !Array.isArray(extra));
+    const currency = extra.currency;
+    check(currency == null || (typeof currency === 'string' && /^[A-Z]{3}$/.test(currency)));
+    if (extra.balanceCents != null || extra.totalCents != null) check(currency != null);
+    if (currency === 'USD') {
+      const amount = centsToDecimal(cents(extra.balanceCents));
+      const total = extra.totalCents == null ? null : centsToDecimal(cents(extra.totalCents));
+      check(total === null || Number(amount) <= Number(total));
+      wallet = { amount, unit: 'usd', remaining: amount, total };
+    }
+  }
+  return { plan: null, windows, balance: wallet, balances: wallet ? [wallet] : [], reset_credits_available: null };
+}
+const OPENCODE_TOP = '┌────────────────────────────────────────────────────────┐';
+const OPENCODE_SEP = '├────────────────────────────────────────────────────────┤';
+const OPENCODE_BOT = '└────────────────────────────────────────────────────────┘';
+// Local session cost from `opencode stats`, not provider quota. Token counts are checked and dropped.
+export function parseOpencode(text: string): Reading {
+  check(typeof text === 'string' && text.length > 0 && text.length <= 100_000 && !/[\u0000-\u0009\u000b-\u001f]/.test(text));
+  const lines = text.split('\n');
+  while (lines.at(-1) === '') lines.pop();
+  let index = 0;
+  if (/^Large dataset detected \([1-9]\d{0,6} sessions\)\. This may take a while\.\.\.$/.test(lines[0] ?? '')) index += 1;
+  const next = (expected?: string) => { const line = lines[index++]; check(expected === undefined || line === expected); return line; };
+  const title = (name: string) => { const line = next(); check(line?.startsWith('│') && line.endsWith('│') && line.slice(1, -1).trim() === name); };
+  const row = (label: string, pattern: RegExp) => {
+    const line = next();
+    check(line?.startsWith('│') && line.endsWith('│'));
+    const match = line.slice(1, -1).replace(/ $/, '').match(/^(.+?) {2,}(\S+)$/);
+    check(match?.[1] === label && pattern.test(match[2]));
+    return match[2];
+  };
+  const open = (name: string) => { next(OPENCODE_TOP); title(name); next(OPENCODE_SEP); };
+  const count = /^(?:0|[1-9]\d{0,2}(?:,\d{3})*|[1-9]\d*)$/;
+  const money = /^\$(0|[1-9]\d*)\.\d{2}$/;
+  const tokens = /^(?:0|[1-9]\d{0,2}|(?:0|[1-9]\d*)\.\d[KM])$/;
+  open('OVERVIEW');
+  row('Sessions', count); row('Messages', count); row('Days', /^(?:0|[1-9]\d*)$/);
+  next(OPENCODE_BOT); next('');
+  open('COST & TOKENS');
+  const total = row('Total Cost', money);
+  row('Avg Cost/Day', money); row('Avg Tokens/Session', tokens); row('Median Tokens/Session', tokens);
+  row('Input', tokens); row('Output', tokens); row('Cache Read', tokens); row('Cache Write', tokens);
+  next(OPENCODE_BOT);
+  if (lines[index] === '') {
+    const saved = index;
+    index += 1;
+    if (lines[index] === OPENCODE_TOP) {
+      index += 1; title('TOOL USAGE'); next(OPENCODE_SEP);
+      let rows = 0;
+      while (lines[index] !== OPENCODE_BOT) {
+        const line = lines[index++];
+        check(line?.startsWith('│') && line.endsWith('│') && line.includes('%') && line.length <= 120);
+        rows += 1; check(rows <= 100);
+      }
+      check(rows > 0); next(OPENCODE_BOT);
+    } else index = saved;
+  }
+  while (index < lines.length) check(lines[index++] === '');
+  return opencodeSession(decimal(total.slice(1)));
+}
+const OPENCODE_V2_COUNT = /^(?:0|[1-9]\d{0,2}|(?:0|[1-9]\d*)(?:\.\d)?[kmb])$/;
+const OPENCODE_V2_PERCENT = /^(?:[0-9]\.\d{2}|[1-9]\d{1,2}\.\d)%$/;
+function opencodeSession(amount: string): Reading {
+  const session: Balance = { amount, unit: 'usd', remaining: amount, total: null, label: 'session cost' };
+  return { ...emptyReading(), balance: session, balances: [session] };
+}
+// OpenCode 2 `stats --all --cost`. The share card has no cost, so it is rejected.
+// Token rows are shape checks only. Model and tool sections are not accepted.
+export function parseOpencodeV2(text: string): Reading {
+  check(typeof text === 'string' && text.length > 0 && text.length <= 4_000 && !/[\u0000-\u0009\u000b-\u001f\u007f]/.test(text));
+  const lines = text.split('\n');
+  while (lines.at(-1) === '') lines.pop();
+  const row = (index: number, label: string, pattern: RegExp) => {
+    const prefix = `  ${label.padEnd(20)}`;
+    const line = lines[index];
+    check(line?.startsWith(prefix));
+    const value = line.slice(prefix.length);
+    check(pattern.test(value));
+    return value;
+  };
+  check(lines.length === 10 && lines[0] === 'all time · all projects' && lines[1] === '' && lines[2] === 'COST & TOKENS');
+  const total = row(3, 'cost', /^\$(0|[1-9]\d*)\.\d{2}$/);
+  row(4, 'input', OPENCODE_V2_COUNT);
+  row(5, 'output', OPENCODE_V2_COUNT);
+  row(6, 'reasoning', OPENCODE_V2_COUNT);
+  row(7, 'cache read', OPENCODE_V2_COUNT);
+  row(8, 'cache write', OPENCODE_V2_COUNT);
+  row(9, 'cached input', OPENCODE_V2_PERCENT);
+  return opencodeSession(decimal(total.slice(1)));
 }
 export function age(tool: Tool, now: number): Tool {
   return tool.observed_at_ms !== null && now - tool.observed_at_ms > STALE_MS

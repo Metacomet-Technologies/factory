@@ -1,9 +1,12 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { open, readFile, rename, unlink } from 'node:fs/promises';
+import { open, readFile, rename, unlink, lstat } from 'node:fs/promises';
 import { openSync, closeSync } from 'node:fs';
+import { request } from 'node:http';
+import { connect } from 'node:net';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { age, check, emptyReading, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, sources } from './parsers.ts';
+import { age, check, emptyReading, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, parseCursor, parseKimi, parseOpencode, parseOpencodeV2, sources, TOOL_ORDER } from './parsers.ts';
 import type { Tool, Reading } from './parsers.ts';
 
 export const SNAPSHOT = '/var/lib/factory-usage/usage.json';
@@ -11,7 +14,7 @@ export const CLAUDE_ARGS = ['-p', '/usage', '--tools', '', '--strict-mcp-config'
 type Details = { attempted_at_ms: number | null; reason: string | null; cli_version: string | null };
 export type Snapshot = { schema_version: 1; generated_at_ms: number; amp_details: Details; tools: Tool[] };
 type Previous = { amp_details: Details; tools: Pick<Tool, 'tool' | 'observed_at_ms'>[] };
-const reasons = [FORMAT_CHANGED, 'timeout', 'CLI missing', 'unknown, format changed', 'CLI timed out', 'CLI failed', 'CLI output too large', 'last good reading older than 45 minutes'];
+const reasons = [FORMAT_CHANGED, 'timeout', 'CLI missing', 'unknown, format changed', 'CLI timed out', 'CLI failed', 'CLI output too large', 'last good reading older than 45 minutes', 'not logged in'];
 function reason(error: unknown): string {
   if (!(error instanceof Error) || !reasons.includes(error.message)) return FORMAT_CHANGED;
   if (error.message === 'unknown, format changed') return FORMAT_CHANGED;
@@ -20,7 +23,92 @@ function reason(error: unknown): string {
 
 // Never expose raw stdout/stderr or exception text. One process group per probe
 // ensures timeout cleanup cannot signal a runner or an unrelated CLI process.
+function kimiPort(): number {
+  const raw = process.env.FACTORY_KIMI_PORT;
+  if (raw == null || raw === '') return 58627;
+  if (!/^\d+$/.test(raw)) throw new Error('CLI failed');
+  const port = Number(raw);
+  if (port < 1 || port > 65535) throw new Error('CLI failed');
+  return port;
+}
+function kimiTokenPath(): string {
+  const root = process.env.KIMI_CODE_HOME;
+  if (root != null && root !== '') {
+    if (!root.startsWith('/') || root.includes('\0')) throw new Error('CLI failed');
+    return join(root, 'server.token');
+  }
+  const home = process.env.HOME;
+  if (!home?.startsWith('/') || home.includes('\0')) throw new Error('CLI failed');
+  return join(home, '.kimi-code', 'server.token');
+}
+function canConnect(port: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = connect({ host: '127.0.0.1', port, timeout: 200 });
+    const done = (open: boolean) => { socket.destroy(); resolve(open); };
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => done(false));
+  });
+}
+async function readKimiToken(): Promise<string> {
+  let info;
+  try { info = await lstat(kimiTokenPath()); } catch { throw new Error('CLI failed'); }
+  if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o777) !== 0o600 || info.uid !== process.getuid() || info.size < 16 || info.size > 128) throw new Error('CLI failed');
+  const token = (await readFile(kimiTokenPath(), 'utf8')).trim();
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(token)) throw new Error('CLI failed');
+  return token;
+}
+function httpGet(port: number, token: string, timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const req = request({
+      protocol: 'http:', hostname: '127.0.0.1', port, method: 'GET', path: '/api/v1/oauth/usage',
+      headers: { Accept: 'application/json', Authorization: `Bearer ${token}`, Connection: 'close' },
+      timeout: timeoutMs,
+    }, res => {
+      if (res.statusCode !== 200) { res.resume(); reject(new Error('CLI failed')); return; }
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => {
+        body += chunk;
+        if (Buffer.byteLength(body) > 65_536) { req.destroy(); reject(new Error('CLI output too large')); }
+      });
+      res.on('end', () => resolve(body));
+      res.on('error', () => reject(new Error('CLI failed')));
+    });
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    req.on('error', () => reject(new Error('CLI failed')));
+    req.end();
+  });
+}
+// `kimi usage` is not a real subcommand. Talk only to 127.0.0.1, discard the
+// banner (it prints the bearer token), and never call the upstream quota URL.
+async function kimiUsage(program: string, timeoutMs: number): Promise<string> {
+  const port = kimiPort();
+  const deadline = Date.now() + timeoutMs;
+  const left = () => { const value = deadline - Date.now(); if (value <= 0) throw new Error('timeout'); return value; };
+  let child: ReturnType<typeof spawn> | undefined;
+  let owns = false;
+  try {
+    if (!(await canConnect(port))) {
+      owns = true;
+      let spawnError: string | undefined;
+      child = spawn(program, ['web', '--no-open', '--port', String(port)], { detached: true, stdio: 'ignore' });
+      child.on('error', error => { spawnError = (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'CLI missing' : 'CLI failed'; });
+      const ready = Date.now() + Math.min(left(), 8_000);
+      while (Date.now() < ready && !(await canConnect(port))) {
+        if (spawnError) throw new Error(spawnError);
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      if (spawnError) throw new Error(spawnError);
+      if (!(await canConnect(port))) throw new Error('timeout');
+    }
+    return await httpGet(port, await readKimiToken(), left());
+  } finally {
+    if (owns && child?.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* Already exited. */ } }
+  }
+}
 export function command(program: string, args: string[], timeoutMs = 20_000, rpc = false): Promise<string> {
+  if (args.length === 1 && args[0] === 'usage' && program.split(/[/\\]/).pop() === 'kimi') return kimiUsage(program, timeoutMs);
   return new Promise((resolve, reject) => {
     const child = spawn(program, args, { detached: true, stdio: ['pipe', 'pipe', 'ignore'] });
     let output = '', pending = '', phase = 1, done = false;
@@ -62,16 +150,24 @@ export function command(program: string, args: string[], timeoutMs = 20_000, rpc
 }
 type Run = typeof command;
 function version(program: string, value: string): string {
-  const patterns: Record<string, RegExp> = { amp: /^(0\.0\.\d+-g[a-f0-9]+) \(released [0-9T:.Z-]+, [^)]+\)\s*$/, claude: /^(\d+\.\d+\.\d+) \(Claude Code\)\s*$/, codex: /^codex-cli (\d+\.\d+\.\d+)\s*$/ };
+  const patterns: Record<string, RegExp> = {
+    amp: /^(0\.0\.\d+-g[a-f0-9]+) \(released [0-9T:.Z-]+, [^)]+\)\s*$/,
+    claude: /^(\d+\.\d+\.\d+) \(Claude Code\)\s*$/,
+    codex: /^codex-cli (\d+\.\d+\.\d+)\s*$/,
+    agent: /^(\d{4}\.\d{1,2}\.\d{1,2}-[a-f0-9]+)\s*$/,
+    kimi: /^(\d+\.\d+\.\d+)\s*$/,
+    opencode: /^(?:opencode v)?(\d+\.\d+\.\d+)\s*$/,
+  };
   const match = value.match(patterns[program]); check(match); return match[1];
 }
+const programs: Record<string, string> = { amp: 'amp', cursor: 'agent', 'claude-code': 'claude', codex: 'codex', kimi: 'kimi', opencode: 'opencode' };
 
 export async function collect(previous: Previous | null, run: Run = command, now = Date.now()): Promise<Snapshot> {
   let details: Details = previous?.amp_details ?? { attempted_at_ms: null, reason: null, cli_version: null };
   const tools = await Promise.all(Object.entries(sources).map(async ([tool, source]): Promise<Tool> => {
     let cli_version: string | null = null;
     try {
-      const program = tool === 'claude-code' ? 'claude' : tool;
+      const program = programs[tool];
       cli_version = version(program, await run(program, ['--version']));
       let reading: Reading;
       if (tool === 'amp') {
@@ -84,8 +180,12 @@ export async function collect(previous: Previous | null, run: Run = command, now
           catch (error) { details.reason = reason(error); }
         }
         if (details.reason) throw new Error(details.reason);
-      } else if (tool === 'claude-code') reading = parseClaude(await run('claude', CLAUDE_ARGS));
-      else reading = parseCodex(JSON.parse(await run('codex', ['app-server'], 20_000, true)));
+      } else if (tool === 'cursor') reading = parseCursor(await run('agent', ['about', '--format', 'json']));
+      else if (tool === 'claude-code') reading = parseClaude(await run('claude', CLAUDE_ARGS));
+      else if (tool === 'codex') reading = parseCodex(JSON.parse(await run('codex', ['app-server'], 20_000, true)));
+      else if (tool === 'kimi') reading = parseKimi(await run('kimi', ['usage']));
+      else if (Number(cli_version.split('.')[0]) >= 2) reading = parseOpencodeV2(await run('opencode', ['stats', '--all', '--cost'], 35_000));
+      else reading = parseOpencode(await run('opencode', ['stats']));
       return { tool, source, cli_version, status: 'ok', reason: null, note: null, observed_at_ms: now, ...reading };
     } catch (error) {
       // A failed probe has no live values. Only the last good timestamp survives.
@@ -93,8 +193,7 @@ export async function collect(previous: Previous | null, run: Run = command, now
       return age({ tool, source, cli_version, status: 'unknown', reason: reason(error), note: null, observed_at_ms, ...emptyReading() }, now);
     }
   }));
-  for (const tool of ['cursor', 'kimi']) tools.push({ tool, source: null, cli_version: null, status: 'not_tracked', reason: null, note: null, observed_at_ms: null, ...emptyReading() });
-  tools.sort((a, b) => ['amp', 'cursor', 'claude-code', 'codex', 'kimi'].indexOf(a.tool) - ['amp', 'cursor', 'claude-code', 'codex', 'kimi'].indexOf(b.tool));
+  tools.sort((a, b) => TOOL_ORDER.indexOf(a.tool as typeof TOOL_ORDER[number]) - TOOL_ORDER.indexOf(b.tool as typeof TOOL_ORDER[number]));
   return { schema_version: 1, generated_at_ms: now, amp_details: details, tools };
 }
 

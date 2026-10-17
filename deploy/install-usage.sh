@@ -54,7 +54,7 @@ cd /home/agent/work
 sudo -u agent test -x /home/agent/work
 path=/usr/local/bin:/usr/bin:/bin
 declare -A executables
-for command in node amp claude codex; do
+for command in node amp claude codex agent kimi opencode; do
     # Keep script text out of sudo -i's login-shell command string.
     executable=$(sudo -iu agent bash -s -- "$command" <<'LOOKUP'
 cd /home/agent/work && command -v "$1"
@@ -69,7 +69,7 @@ as_agent() { sudo -u agent env -i HOME=/home/agent USER=agent PATH="$path" "$@";
 supported_node() { [[ $1 =~ ^v?24\.([0-9]+)\.([0-9]+)$ && ${BASH_REMATCH[1]} -ge 12 ]]; }
 node_version=$(as_agent "$node" --version)
 supported_node "$node_version" || fail "Use Node 24.x (>= 24.12.0); found $node_version"
-for command in amp claude codex; do as_agent timeout 30s "${executables[$command]}" --version; done
+for command in amp claude codex agent kimi opencode; do as_agent timeout 30s "${executables[$command]}" --version; done
 # Collector dry-run emits only its sanitized snapshot, never raw CLI output.
 preview_status=0
 preview=$(as_agent timeout 300s "$node" "$root/scripts/usage/collect.ts" --dry-run) || preview_status=$?
@@ -77,7 +77,7 @@ printf '%s\n' "$preview"
 [[ $preview_status -eq 0 ]] || fail 'Collector dry-run failed; no deployment changes made.'
 check_snapshot() { as_agent "$node" --input-type=module -e '
 const snapshot = JSON.parse(process.argv[1]);
-for (const name of ["amp", "claude-code", "codex"]) {
+for (const name of ["amp", "cursor", "claude-code", "codex", "kimi", "opencode"]) {
   if (snapshot.tools?.find(tool => tool.tool === name)?.status !== "ok") {
     throw new Error(name + " must report ok before deployment");
   }
