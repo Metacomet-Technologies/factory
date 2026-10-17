@@ -286,7 +286,8 @@ gets claude; claude gets amp; missing/unknown gets claude. Reviews use high effo
 through the shared engine arguments; Claude reviewers get
 `--features model:claude-opus-5-5,effort:high`. `review-prompt.md` requires the full diff and full
 changed deploy/migration/script files, Isolation/Build/Done-means checks, current
-CI, and contributes/closes correction via `update_diff`. Reviewers never edit code.
+CI, and a contributes/closes check via `update_diff` that keeps the PR link accurate
+(link type is informational; merge does not change issue state). Reviewers never edit code.
 
 State transitions under the existing exclusive dispatcher lock:
 
