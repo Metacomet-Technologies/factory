@@ -114,6 +114,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 |---|---|
 | `gpu-ssh "…"` | factory-gpu, as `dgarbs51` |
 | `console-ssh "…"` | factory-console |
+| `gpu-agent <tool>` / `console-agent <tool>` | interactive agent CLI (claude, amp, agent, opencode, codex, kimi) as `agent` in `/home/agent/work/factory`; main checkout, so read-only work only (edits there block ff-only updates and wrap-ups) |
 | `gpu-desktop` / `console-desktop` | RDP desktop sessions |
 | `factory-status` | full health check (Mac only) |
 | `opin …` | 1Password CLI on a node |
@@ -179,6 +180,8 @@ gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
 - `sudo` over `ssh host cmd` needs `ssh -t` (or NOPASSWD). Heredocs after `ssh host` run on the Mac; use `ssh host 'bash -s' <<'EOF'`.
 - In a Mac `bash <<'EOF'` script, every non-interactive `ssh` must use `ssh -n`; otherwise it consumes the remaining heredoc and the script silently ends.
 - sudo-rs needs `sudo -i` scripts on stdin: from Mac, `gpu-ssh 'sudo -iu agent bash -s' <<'EOF'` (or console-ssh). Do not rely on a quoted `bash -c` surviving the login shell.
+- Agent CLIs must resolve from `/home/agent/.local/bin` on both nodes: `sudo -iu agent` starts a non-interactive login shell that doesn't read `.bashrc`, so installers that put binaries elsewhere need a symlink there (opencode: `~/.opencode/bin`, kimi: `~/.kimi-code/bin`). Check with `ssh -tq dgarbs51@<host> "sudo -iu agent command -v <tool>"`.
+- Never capture `ssh -t` output into a variable: TTY sessions can emit terminal escapes (seen: `ESC ]3008`) that corrupt the value. Capture without a TTY, or pass literal values.
 - Mosh has no scrollback; use `ssh gpu` for long output.
 - With `set -o pipefail`, never pipe into `grep -q`: it can close early and cause SIGPIPE upstream. Capture output, then test it.
 - Never redact secrets with sed one-liners. Print only whitelisted fields; omit raw secret-bearing output.
