@@ -449,18 +449,23 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
         updated_plugin = plugin.replace("OuJYUh", "NewSuffix99").replace(
             "q517Yo", "NewSuffix99").replace("46ba5e96083e1347", "012345abcdef")
         expect("would-reboot", updates={"ps": f"4909 1 {runner}\n138429 4909 {updated_plugin}\n"})
-        if node == "factory-gpu":
-            codex = ("/home/agent/.codex/packages/app-server-daemon/releases/"
-                     "0.162.1-x86_64-unknown-linux-musl/bin/codex app-server --listen unix:// "
-                     "--analytics-default-enabled --managed-daemon")
-            pid_update = ("/home/agent/.codex/packages/app-server-daemon/releases/"
-                          "0.162.1-x86_64-unknown-linux-musl/bin/codex app-server daemon pid-update-loop")
-            expect("would-reboot", updates={"ps": f"341001 1 {codex}\n"})
-            expect("would-reboot", updates={"ps": f"341001 1 {codex.replace('0.162.1', '9.9.9')}\n"})
-            expect("would-reboot", updates={"ps": f"341108 1 {pid_update}\n"})
-            expect("would-reboot", updates={"ps": f"341108 1 {pid_update.replace('0.162.1', '9.9.9')}\n"})
-            expect("skipped", "agent-busy", updates={"ps": f"341001 1 {codex.split(' app-server')[0]} exec work\n"})
-            expect("skipped", "agent-busy", updates={"ps": f"341108 1 {pid_update.rsplit(' daemon', 1)[0]}\n"})
+        opencode = "/home/agent/.opencode/bin/opencode"
+        expect("would-reboot", updates={"ps": f"341200 1 {opencode} serve --service\n"})
+        expect("skipped", "agent-busy", updates={"ps": f"341200 1 {opencode}\n"})
+        expect("skipped", "agent-busy", updates={"ps": f"341200 1 {opencode} run work\n"})
+        expect("skipped", "agent-busy", updates={"ps": f"341200 1 {opencode} serve\n"})
+        codex = ("/home/agent/.codex/packages/app-server-daemon/releases/"
+                 "0.162.1-x86_64-unknown-linux-musl/bin/codex app-server --listen unix:// "
+                 "--analytics-default-enabled --managed-daemon")
+        pid_update = ("/home/agent/.codex/packages/app-server-daemon/releases/"
+                      "0.162.1-x86_64-unknown-linux-musl/bin/codex app-server daemon pid-update-loop")
+        expect("would-reboot", updates={"ps": f"341001 1 {codex}\n"})
+        expect("would-reboot", updates={"ps": f"341001 1 {codex.replace('0.162.1', '9.9.9')}\n"})
+        expect("would-reboot", updates={"ps": f"341108 1 {pid_update}\n"})
+        expect("would-reboot", updates={"ps": f"341108 1 {pid_update.replace('0.162.1', '9.9.9')}\n"})
+        expect("skipped", "agent-busy", updates={"ps": f"341001 1 {codex.split(' app-server')[0]} exec work\n"})
+        expect("skipped", "agent-busy", updates={"ps": f"341108 1 {pid_update.rsplit(' daemon', 1)[0]}\n"})
+        expect("skipped", "agent-busy", updates={"ps": "341300 1 bash\n"})
         expect("skipped", "agent-busy", updates={"ps": f"4909 1 {runner}\n"
                "138429 4909 /home/agent/.amp/bin/amp run /home/agent/work/task.ts\n"})
         expect("skipped", "agent-busy", updates={"ps": f"4909 1 {runner}\n138429 1 {updated_plugin}\n"})
@@ -470,7 +475,7 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             data = expect("would-reboot", updates={"ps": f"4909 1 {runner}\n138429 4909 {updated_plugin}\n",
                           "meter_code": 7, "ups_code": 1})
             assert "curl " not in calls.read_text() and "upsc " not in calls.read_text()
-    print("PASS: both node calendars and argv-independent idle runner; both idle Codex daemon helpers and versions allow; other Codex and Amp work block; console excludes op/meter/UPS")
+    print("PASS: both node calendars allow idle opencode and Codex daemons; interactive opencode, bash, other Codex and Amp work block; console excludes op/meter/UPS")
 
     # Optional stronger installer check: real scripts in a root user namespace,
     # with a read-only host and every writable destination/command replaced.
@@ -578,7 +583,7 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             (publish_root / relative).mkdir(parents=True)
         (publish_root / "run/reboot-required").touch()
         shutil.copy2(shutil.which("getent"), fixture / "getent-real")
-        shutil.copy2(shutil.which("install"), fixture / "install-real")
+        shutil.copy2(shutil.which("install"), fixture / "install")
         policy_copy = artifacts / "reboot-policy.py"
         policy_text = policy_copy.read_text()
         chown_call = 'shutil.chown(temp, user="root", group="factory-api")'
@@ -592,7 +597,7 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             "  exit\n"
             "fi\n"
             "exec \"$REBOOT_FIXTURE/getent-real\" \"$@\"\n")
-        (fixture / "install").write_text(
+        (fixture / "install-wrapper").write_text(
             "#!/bin/bash\n"
             "user=root\n"
             "group=\n"
@@ -607,9 +612,9 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             "if [[ -n $group ]]; then\n"
             "  printf '%s\\t%s\\t%s\\n' \"$user\" \"$group\" \"${args[-1]}\" >> \"$REBOOT_FIXTURE/owners\"\n"
             "fi\n"
-            "exec \"$REBOOT_FIXTURE/install-real\" \"${args[@]}\"\n")
+            "exec \"$REBOOT_FIXTURE/install\" \"${args[@]}\"\n")
         for name in ("getent", "install"):
-            (fixture / name).chmod(0o755)
+            (fixture / ("install-wrapper" if name == "install" else name)).chmod(0o755)
         (fixture / "factory-api-group").write_text("present\n")
         (fixture / "owners").write_text("")
         publish_mounts = [bwrap, "--ro-bind", "/", "/", "--unshare-user", "--uid", "0", "--gid", "0",
@@ -619,7 +624,7 @@ with tempfile.TemporaryDirectory(prefix="factory-reboot-test ") as temporary:
             publish_mounts += ["--bind", str(publish_root / relative), "/" + relative]
         for name in ("ps", "curl", "upsc", "systemctl", "timedatectl", "cp", "getent", "install"):
             destination = shutil.which(name, path="/usr/sbin:/usr/bin:/sbin:/bin")
-            source = bin_dir / name if name in ("ps", "curl", "upsc", "systemctl", "timedatectl", "cp") else fixture / name
+            source = bin_dir / name if name in ("ps", "curl", "upsc", "systemctl", "timedatectl", "cp") else fixture / ("install-wrapper" if name == "install" else name)
             if destination:
                 publish_mounts += ["--ro-bind", str(source), destination]
             elif name == "upsc":
