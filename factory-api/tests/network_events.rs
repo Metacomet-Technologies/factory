@@ -628,3 +628,28 @@ async fn endpoints_serve_the_stored_state_and_pages_in_constant_queries() -> Res
     }
     Ok(())
 }
+
+#[test]
+fn diagnosis_flags_are_validated_at_parse_time() -> Result<()> {
+    for (flag, value, message) in [
+        ("--network-thresholds", "wifi:20/100/30", "unknown layer"),
+        ("--network-thresholds", "wan:20/100", "three values"),
+        ("--network-thresholds", "wan:0/100/30", "loss 1-100"),
+        (
+            "--network-thresholds",
+            "wan:20/100/30,wan:20/100/30",
+            "twice",
+        ),
+        ("--network-throughput-low-mbps", "0", "0"),
+        ("--network-throughput-low-mbps", "100001", "100001"),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_factory-api"))
+            .env_clear()
+            .args([flag, value])
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{flag} {value}: {stderr}");
+        assert!(stderr.contains(message), "{flag} {value}: {stderr}");
+    }
+    Ok(())
+}

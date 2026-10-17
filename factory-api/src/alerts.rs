@@ -5,6 +5,11 @@
 //! lives in a small JSON file (never SQLite) so restarts do not repost. A source
 //! that cannot be read holds its open alerts until readable again. UPS alone
 //! alerts on communication loss after 60 s. Never log the Slack token.
+use crate::network::Layer;
+use crate::network_diagnosis::LinkState;
+use crate::network_history::{
+    NetworkAlertInput, NetworkEvent, NetworkSpeedOutcome, NetworkSpeedTest,
+};
 use crate::types::{ActiveAlert, AlertSeverity, Alerts, ClearedAlert, Fleet};
 use crate::{AppState, fleet, now_ms};
 use anyhow::{Context, Result, anyhow, bail};
@@ -24,6 +29,7 @@ pub const DASHBOARD_URL: &str = "https://factory-gpu.bearded-pompano.ts.net";
 /// systemd credential name; the unit loads it with `LoadCredential=`.
 pub const TOKEN_CREDENTIAL: &str = "slack-bot-token";
 pub const INTERVAL: Duration = Duration::from_secs(30);
+pub const DEFAULT_THROUGHPUT_LOW_MBPS: u32 = 500;
 
 const RECENT: usize = 20;
 const NODE_OFFLINE_MS: i64 = 5 * 60_000;
@@ -42,10 +48,12 @@ const DISPATCH_STALE_MS: i64 = 5 * 60_000;
 const USAGE_STALE_MS: i64 = crate::usage::STALE_MS;
 const MAX_BACKOFF_MS: i64 = 15 * 60_000;
 const MAX_RECOVERY_ATTEMPTS: u32 = 12;
-const SOURCES: [&str; 11] = [
+const SOURCES: [&str; 12] = [
     "node", "service", "gpu", "meter", "pricing", "backup", "clock", "dispatch", "usage", "ups",
-    "devices",
+    "devices", "network",
 ];
+const NETWORK_DOWN_MS: i64 = 2 * 60_000;
+const NETWORK_SPEED_TESTS: usize = crate::network_history::ALERT_SPEED_TESTS as usize;
 const DEVICE_STALE_MS: i64 = 120_000;
 const DEVICE_CPU_WARN_C: f64 = 80.0;
 const DEVICE_CPU_CRIT_C: f64 = 95.0;
@@ -117,6 +125,8 @@ pub struct Config {
     pub channel: String,
     pub slack_url: String,
     pub token: Option<Token>,
+    /// `network:throughput_low` opens below this rate in either direction.
+    pub network_throughput_low_bps: i64,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -125,6 +135,7 @@ impl Default for Config {
             channel: DEFAULT_CHANNEL.into(),
             slack_url: DEFAULT_SLACK_URL.into(),
             token: None,
+            network_throughput_low_bps: i64::from(DEFAULT_THROUGHPUT_LOW_MBPS) * 1_000_000,
         }
     }
 }
@@ -172,6 +183,8 @@ pub struct Signals {
     pub ups_events: Vec<crate::ups_history::UpsEvent>,
     /// None means the device collector cannot be evaluated. Open device alerts stay open.
     pub devices: Option<crate::devices::DeviceAlertInput>,
+    /// None when network storage cannot be read.
+    pub network: Option<NetworkAlertInput>,
 }
 
 enum Verdict {
@@ -258,6 +271,25 @@ fn backoff(attempts: u32) -> i64 {
 }
 fn reading<T: std::fmt::Display>(value: Option<T>, unit: &str) -> String {
     value.map_or_else(|| "unknown".into(), |v| format!("{v}{unit}"))
+}
+fn network_peaks(event: &NetworkEvent) -> String {
+    let mut text = format!(
+        "peak loss {}",
+        reading(event.peak_loss_percent.map(|l| l.round()), "%")
+    );
+    for (name, us) in [("RTT", event.peak_rtt_us), ("jitter", event.peak_mdev_us)] {
+        if let Some(us) = us {
+            text.push_str(&format!(", peak {name} {:.1} ms", us as f64 / 1000.0));
+        }
+    }
+    text
+}
+fn mbps(tests: &[NetworkSpeedTest], rate: fn(&NetworkSpeedTest) -> Option<i64>) -> String {
+    tests
+        .iter()
+        .map(|t| reading(rate(t).map(|bps| (bps as f64 / 1e6).round()), ""))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 fn ups_detail(sample: &crate::ups::UpsCurrent) -> String {
     format!(
@@ -671,9 +703,93 @@ impl Engine {
         }
         out
     }
+    fn network_findings(&self, now: i64, input: &NetworkAlertInput) -> Findings {
+        let mut out = Findings::new();
+        if let Some(event) = &input.open_event
+            && let LinkState::Down { layer } = event.state
+            && let Some(cause) = match layer {
+                Layer::Lan => Some("gateway unreachable"),
+                Layer::Wan => Some("ISP outage, every wan target lost"),
+                Layer::Dns => Some("name resolution failing"),
+                // v1 has no tailnet alert.
+                Layer::Tailnet => None,
+            }
+        {
+            let open_ms = now - event.started_ms;
+            let verdict = if open_ms >= NETWORK_DOWN_MS {
+                Verdict::Fire(
+                    AlertSeverity::Critical,
+                    format!(
+                        "network {} down for {}: {cause}; {}",
+                        layer.as_str(),
+                        duration(open_ms),
+                        network_peaks(event)
+                    ),
+                )
+            } else {
+                Verdict::Hold
+            };
+            out.insert(format!("network:{}_down", layer.as_str()), verdict);
+        }
+        self.speed_findings(&mut out, input);
+        out
+    }
+    fn speed_findings(&self, out: &mut Findings, input: &NetworkAlertInput) {
+        let floor = self.config.network_throughput_low_bps;
+        let low = |t: &NetworkSpeedTest| {
+            t.download_bps.is_some_and(|bps| bps < floor)
+                || t.upload_bps.is_some_and(|bps| bps < floor)
+        };
+        let ok = &input.recent_ok_tests;
+        if ok.len() >= NETWORK_SPEED_TESTS && ok[..NETWORK_SPEED_TESTS].iter().all(low) {
+            let tests = &ok[..NETWORK_SPEED_TESTS];
+            out.insert(
+                "network:throughput_low".into(),
+                Verdict::Fire(
+                    AlertSeverity::Warning,
+                    format!(
+                        "network throughput below {} Mb/s in the last {NETWORK_SPEED_TESTS} ok speed tests: download {} Mb/s; upload {} Mb/s",
+                        floor / 1_000_000,
+                        mbps(tests, |t| t.download_bps),
+                        mbps(tests, |t| t.upload_bps)
+                    ),
+                ),
+            );
+        } else if ok.first().is_some_and(low) {
+            // Only an ok test at or above the floor both ways proves the link recovered.
+            out.insert("network:throughput_low".into(), Verdict::Hold);
+        }
+        let failing = |t: &NetworkSpeedTest| t.outcome != NetworkSpeedOutcome::Ok;
+        let recent = &input.recent_tests;
+        if recent.len() >= NETWORK_SPEED_TESTS && recent[..NETWORK_SPEED_TESTS].iter().all(failing)
+        {
+            let outcomes: Vec<_> = recent[..NETWORK_SPEED_TESTS]
+                .iter()
+                .map(|t| match &t.error {
+                    Some(error) => format!("failed: {}", one_line(error, 100)),
+                    None => "timeout".into(),
+                })
+                .collect();
+            out.insert(
+                "network:speedtest_failing".into(),
+                Verdict::Fire(
+                    AlertSeverity::Warning,
+                    format!(
+                        "network speed test failing: the last {NETWORK_SPEED_TESTS} tests did not finish: {}",
+                        outcomes.join("; ")
+                    ),
+                ),
+            );
+        } else if recent.first().is_some_and(failing) {
+            out.insert("network:speedtest_failing".into(), Verdict::Hold);
+        }
+    }
     fn findings(&mut self, source: &str, now: i64, signals: &Signals) -> Option<Findings> {
         let mut out = Findings::new();
         match source {
+            "network" => {
+                out = self.network_findings(now, signals.network.as_ref()?);
+            }
             "devices" => {
                 let input = signals.devices.as_ref()?;
                 out = self.device_findings(now, input);
@@ -1240,12 +1356,22 @@ impl AppState {
                     .collect(),
             )
         };
-        let (backup, clock_synchronized, dispatch_last_trigger_ms, pricing_pending, usage) = tokio::join!(
+        let network = async {
+            self.db
+                .requests
+                .read(&self.query_scope, |db| {
+                    crate::network_history::alert_input(db, crate::network::DEVICE_ID)
+                })
+                .await
+                .ok()
+        };
+        let (backup, clock_synchronized, dispatch_last_trigger_ms, pricing_pending, usage, network) = tokio::join!(
             backup,
             clock,
             dispatch,
             pricing,
-            crate::usage::observations(&self.usage_snapshot, now)
+            crate::usage::observations(&self.usage_snapshot, now),
+            network
         );
         let ups = Some(self.ups_latest.read().await.clone());
         let gpu = *self.gpu_latest.lock().expect("GPU sample lock");
@@ -1270,6 +1396,7 @@ impl AppState {
             ups,
             ups_events: vec![],
             devices,
+            network,
         }
     }
     pub(crate) fn start_alerts(&self) -> Option<tokio::task::JoinHandle<()>> {
@@ -1434,6 +1561,7 @@ mod tests {
             channel: "C-test".into(),
             slack_url: url.into(),
             token: token.then(|| Token::new("xoxb-test-token\n").unwrap()),
+            ..Config::default()
         }
     }
     fn service(name: &str, ok: bool) -> Service {
@@ -2248,6 +2376,7 @@ mod tests {
             channel: "C-test".into(),
             slack_url: "http://127.0.0.1:1/api".into(),
             token: None,
+            ..Config::default()
         });
         let signals = |input: DeviceAlertInput| Signals {
             devices: Some(input),
@@ -2446,5 +2575,269 @@ mod tests {
             )),
         );
         assert!(keys(&engine).iter().all(|key| !key.contains("smart")));
+    }
+
+    fn network_event(state: LinkState, started_ms: i64) -> NetworkEvent {
+        NetworkEvent {
+            id: 1,
+            state,
+            started_ms,
+            ended_ms: None,
+            end_reason: None,
+            peak_loss_percent: Some(100.0),
+            peak_rtt_us: None,
+            peak_mdev_us: None,
+        }
+    }
+    fn network(input: NetworkAlertInput) -> Signals {
+        Signals {
+            network: Some(input),
+            ..Default::default()
+        }
+    }
+    fn open_network(state: LinkState, started_ms: i64) -> Signals {
+        network(NetworkAlertInput {
+            open_event: Some(network_event(state, started_ms)),
+            ..Default::default()
+        })
+    }
+    fn active(engine: &Engine) -> Vec<(String, AlertSeverity, String, i64)> {
+        engine
+            .view()
+            .active
+            .into_iter()
+            .map(|a| (a.key, a.severity, a.summary, a.opened_at_ms))
+            .collect()
+    }
+
+    #[test]
+    fn network_down_alerts_open_after_two_minutes_and_clear_when_the_event_ends() {
+        let mut engine = Engine::load(Config::default());
+        let wan = LinkState::Down { layer: Layer::Wan };
+        engine.evaluate(T0 + 119_000, &open_network(wan, T0));
+        assert!(active(&engine).is_empty(), "119 s is not yet 2 min");
+        engine.evaluate(T0 + 120_000, &open_network(wan, T0));
+        let opened = vec![(
+            "network:wan_down".to_string(),
+            AlertSeverity::Critical,
+            "network wan down for 2 min: ISP outage, every wan target lost; peak loss 100%"
+                .to_string(),
+            T0 + 120_000,
+        )];
+        assert_eq!(active(&engine), opened);
+        engine.evaluate(T0 + 10 * MIN, &open_network(wan, T0));
+        assert_eq!(active(&engine), opened);
+        // A newer down episode (the last one ended between reads) is younger
+        // than 2 min: it holds the alert instead of clearing or reposting it.
+        engine.evaluate(T0 + 11 * MIN, &open_network(wan, T0 + 11 * MIN));
+        assert_eq!(active(&engine), opened);
+        // Down changing to degraded ends the condition.
+        let degraded = LinkState::Degraded {
+            layer: Layer::Wan,
+            reason: crate::network_diagnosis::Reason::Loss,
+        };
+        engine.evaluate(T0 + 12 * MIN, &open_network(degraded, T0 + 12 * MIN));
+        assert!(active(&engine).is_empty());
+        assert_eq!(engine.view().recent[0].key, "network:wan_down");
+        for (layer, key, summary) in [
+            (
+                Layer::Lan,
+                "network:lan_down",
+                "network lan down for 5 min: gateway unreachable; peak loss 100%",
+            ),
+            (
+                Layer::Dns,
+                "network:dns_down",
+                "network dns down for 5 min: name resolution failing; peak loss 100%",
+            ),
+        ] {
+            let down = LinkState::Down { layer };
+            let at = T0 + 20 * MIN;
+            engine.evaluate(at + 119_000, &open_network(down, at));
+            assert!(active(&engine).is_empty(), "{key}");
+            engine.evaluate(at + 5 * MIN, &open_network(down, at));
+            assert_eq!(
+                active(&engine),
+                [(
+                    key.into(),
+                    AlertSeverity::Critical,
+                    summary.into(),
+                    at + 5 * MIN
+                )]
+            );
+            // The event closed: no open event, nothing held.
+            engine.evaluate(at + 6 * MIN, &network(NetworkAlertInput::default()));
+            assert!(active(&engine).is_empty(), "{key}");
+        }
+        // A change of layer clears the old key and starts the new one's 2 minutes.
+        let lan = LinkState::Down { layer: Layer::Lan };
+        engine.evaluate(T0 + 40 * MIN, &open_network(wan, T0 + 30 * MIN));
+        engine.evaluate(T0 + 41 * MIN, &open_network(lan, T0 + 41 * MIN));
+        assert!(active(&engine).is_empty());
+        // tailnet has no alert in v1, however long it is down.
+        let tailnet = LinkState::Down {
+            layer: Layer::Tailnet,
+        };
+        engine.evaluate(T0 + 120 * MIN, &open_network(tailnet, T0 + 50 * MIN));
+        assert!(active(&engine).is_empty());
+        // Peaks with replies appear in the summary.
+        let mut event = network_event(degraded, T0);
+        event.state = LinkState::Down { layer: Layer::Dns };
+        event.peak_loss_percent = Some(100.0);
+        event.peak_rtt_us = Some(12_345);
+        event.peak_mdev_us = Some(1_500);
+        engine.evaluate(
+            T0 + 3 * MIN,
+            &network(NetworkAlertInput {
+                open_event: Some(event),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            active(&engine)[0].2,
+            "network dns down for 3 min: name resolution failing; peak loss 100%, peak RTT 12.3 ms, peak jitter 1.5 ms"
+        );
+    }
+
+    #[test]
+    fn unreadable_network_storage_holds_open_alerts() {
+        let mut engine = Engine::load(Config::default());
+        let wan = LinkState::Down { layer: Layer::Wan };
+        engine.evaluate(T0 + 120_000, &open_network(wan, T0));
+        assert_eq!(active(&engine).len(), 1);
+        let unreadable = Signals::default();
+        assert!(
+            engine
+                .evaluate(T0 + 150_000, &unreadable)
+                .contains(&"network")
+        );
+        assert!(
+            !engine
+                .evaluate(T0 + 180_000, &unreadable)
+                .contains(&"network")
+        );
+        assert_eq!(active(&engine).len(), 1);
+        engine.evaluate(T0 + 210_000, &network(NetworkAlertInput::default()));
+        assert!(active(&engine).is_empty());
+    }
+
+    fn speed(id: i64, rates: Option<(i64, i64)>, error: Option<&str>) -> NetworkSpeedTest {
+        NetworkSpeedTest {
+            id,
+            started_ms: id,
+            ended_ms: id,
+            outcome: match (rates, error) {
+                (Some(_), _) => NetworkSpeedOutcome::Ok,
+                (None, Some(_)) => NetworkSpeedOutcome::Failed,
+                (None, None) => NetworkSpeedOutcome::Timeout,
+            },
+            error: error.map(str::to_owned),
+            download_bps: rates.map(|r| r.0),
+            upload_bps: rates.map(|r| r.1),
+            download_bytes: 0,
+            upload_bytes: 0,
+            idle_latency_ms: None,
+            download_loaded_latency_ms: None,
+            upload_loaded_latency_ms: None,
+            colo: None,
+        }
+    }
+
+    #[test]
+    fn throughput_low_needs_three_slow_ok_tests_and_one_fast_test_to_clear() {
+        let mut engine = Engine::load(Config::default());
+        const M: i64 = 1_000_000;
+        let ok = |rates: &[(i64, i64)]| {
+            network(NetworkAlertInput {
+                recent_ok_tests: rates
+                    .iter()
+                    .map(|&(down, up)| speed(1, Some((down, up)), None))
+                    .collect(),
+                ..Default::default()
+            })
+        };
+        let key = "network:throughput_low";
+        let open = |engine: &Engine| active(engine).iter().any(|a| a.0 == key);
+        for rates in [
+            vec![(404 * M, 940 * M), (938 * M, 404 * M)],
+            vec![(404 * M, 940 * M), (938 * M, 404 * M), (500 * M, 500 * M)],
+            vec![(500 * M, 940 * M), (938 * M, 404 * M), (400 * M, 400 * M)],
+        ] {
+            engine.evaluate(T0, &ok(&rates));
+            assert!(!open(&engine), "{rates:?}");
+        }
+        engine.evaluate(
+            T0,
+            &ok(&[
+                (404 * M, 940 * M),
+                (938 * M, 404 * M),
+                (500 * M - 1, 600 * M),
+            ]),
+        );
+        assert_eq!(
+            active(&engine),
+            [(
+                key.into(),
+                AlertSeverity::Warning,
+                "network throughput below 500 Mb/s in the last 3 ok speed tests: download 404, 938, 500 Mb/s; upload 940, 404, 600 Mb/s".into(),
+                T0
+            )]
+        );
+        // A newer slow test, even after a fast one, cannot prove recovery.
+        engine.evaluate(T0 + MIN, &ok(&[(450 * M, 940 * M), (940 * M, 940 * M)]));
+        assert!(open(&engine));
+        // Exactly at the floor both ways is not low.
+        engine.evaluate(T0 + 2 * MIN, &ok(&[(500 * M, 500 * M), (450 * M, 450 * M)]));
+        assert!(!open(&engine));
+        // The floor is configuration.
+        let mut strict = Engine::load(Config {
+            network_throughput_low_bps: 950 * M,
+            ..Config::default()
+        });
+        strict.evaluate(T0, &ok(&[(940 * M, 940 * M); 3]));
+        assert_eq!(active(&strict)[0].0, key);
+        assert!(
+            active(&strict)[0]
+                .2
+                .starts_with("network throughput below 950 Mb/s")
+        );
+    }
+
+    #[test]
+    fn speedtest_failing_needs_three_unfinished_tests_and_clears_on_an_ok_test() {
+        let mut engine = Engine::load(Config::default());
+        let recent = |tests: Vec<NetworkSpeedTest>| {
+            network(NetworkAlertInput {
+                recent_tests: tests,
+                ..Default::default()
+            })
+        };
+        let failed = |id| speed(id, None, Some("download of 10000000 bytes: HTTP 500"));
+        let timeout = |id| speed(id, None, None);
+        let fine = |id| speed(id, Some((900_000_000, 900_000_000)), None);
+        let key = "network:speedtest_failing";
+        let open = |engine: &Engine| active(engine).iter().any(|a| a.0 == key);
+        for tests in [
+            vec![failed(3), timeout(2)],
+            vec![failed(3), timeout(2), fine(1)],
+        ] {
+            engine.evaluate(T0, &recent(tests));
+            assert!(!open(&engine));
+        }
+        engine.evaluate(T0, &recent(vec![failed(3), timeout(2), failed(1)]));
+        assert_eq!(
+            active(&engine),
+            [(
+                key.into(),
+                AlertSeverity::Warning,
+                "network speed test failing: the last 3 tests did not finish: failed: download of 10000000 bytes: HTTP 500; timeout; failed: download of 10000000 bytes: HTTP 500".into(),
+                T0
+            )]
+        );
+        // Still failing, with an older ok test in the window: held, not cleared.
+        engine.evaluate(T0 + MIN, &recent(vec![timeout(5), fine(4), failed(3)]));
+        assert!(open(&engine));
+        engine.evaluate(T0 + 2 * MIN, &recent(vec![fine(6), timeout(5), failed(3)]));
+        assert!(!open(&engine));
     }
 }

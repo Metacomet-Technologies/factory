@@ -696,16 +696,49 @@ pub const SPEED_RETAIN_SQL: &str = "DELETE FROM net_speed_tests WHERE id IN (WIT
 pub fn retain_speed_tests(db: &mut Connection, now: i64) -> Result<usize> {
     Ok(db.execute(SPEED_RETAIN_SQL, [(now - SPEED_RETENTION_MS).max(0)])?)
 }
-pub const LATEST_SPEED_SQL: &str = concat!(
+pub const RECENT_SPEED_SQL: &str = concat!(
     "SELECT ",
     speed_columns!(),
-    " FROM net_speed_tests WHERE device_id=?1 ORDER BY started_ms DESC, id DESC LIMIT 1"
+    " FROM net_speed_tests WHERE device_id=?1 ORDER BY started_ms DESC, id DESC LIMIT ?2"
 );
-pub fn latest_speed_test(db: &Connection, device_id: &str) -> Result<Option<NetworkSpeedTest>> {
+/// Walks the started index past failed and timed-out tests, which retention
+/// bounds to 365 days of them.
+pub const RECENT_OK_SPEED_SQL: &str = concat!(
+    "SELECT ",
+    speed_columns!(),
+    " FROM net_speed_tests WHERE device_id=?1 AND outcome='ok' ORDER BY started_ms DESC, id DESC LIMIT ?2"
+);
+fn recent_speed_tests(
+    db: &Connection,
+    sql: &str,
+    device_id: &str,
+    limit: u32,
+) -> Result<Vec<NetworkSpeedTest>> {
     Ok(db
-        .prepare_cached(LATEST_SPEED_SQL)?
-        .query_row([device_id], speed_test)
-        .optional()?)
+        .prepare_cached(sql)?
+        .query_map(params![device_id, limit], speed_test)?
+        .collect::<rusqlite::Result<_>>()?)
+}
+pub fn latest_speed_test(db: &Connection, device_id: &str) -> Result<Option<NetworkSpeedTest>> {
+    Ok(recent_speed_tests(db, RECENT_SPEED_SQL, device_id, 1)?.pop())
+}
+/// What the alert engine needs from network storage.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkAlertInput {
+    pub open_event: Option<NetworkEvent>,
+    /// The newest tests, newest first, at most ALERT_SPEED_TESTS.
+    pub recent_tests: Vec<NetworkSpeedTest>,
+    /// The newest ok tests, newest first, at most ALERT_SPEED_TESTS; failed
+    /// and timed-out tests between them are skipped.
+    pub recent_ok_tests: Vec<NetworkSpeedTest>,
+}
+pub const ALERT_SPEED_TESTS: u32 = 3;
+pub fn alert_input(db: &Connection, device_id: &str) -> Result<NetworkAlertInput> {
+    Ok(NetworkAlertInput {
+        open_event: open_event(db, device_id)?,
+        recent_tests: recent_speed_tests(db, RECENT_SPEED_SQL, device_id, ALERT_SPEED_TESTS)?,
+        recent_ok_tests: recent_speed_tests(db, RECENT_OK_SPEED_SQL, device_id, ALERT_SPEED_TESTS)?,
+    })
 }
 pub const SPEED_TESTS_SQL: &str = concat!(
     "SELECT ",

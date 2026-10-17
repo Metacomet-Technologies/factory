@@ -1,6 +1,6 @@
 use anyhow::Result;
 use factory_api::{
-    AppState, data, fleet,
+    AppState, alerts, data, fleet,
     network::DEVICE_ID,
     network_history::*,
     network_speed::{Direction, Plan, SpeedConfig, SpeedTest, Step, Verdict},
@@ -168,8 +168,13 @@ fn hot_queries_use_the_started_index() -> Result<()> {
     };
     for (sql, args, exceptions) in [
         (
-            LATEST_SPEED_SQL,
-            vec![Value::from(DEVICE_ID.to_string())],
+            RECENT_SPEED_SQL,
+            vec![Value::from(DEVICE_ID.to_string()), 3.into()],
+            vec![],
+        ),
+        (
+            RECENT_OK_SPEED_SQL,
+            vec![Value::from(DEVICE_ID.to_string()), 3.into()],
             vec![],
         ),
         (
@@ -220,6 +225,64 @@ fn record_reads_and_retention_use_constant_statement_counts() -> Result<()> {
     assert_eq!(budgets[0].0.data, 1);
     assert_eq!(budgets[0].1.data, 2);
     assert_eq!(budgets[0].2.data, 1);
+    assert_eq!(budgets[0], budgets[1]);
+    Ok(())
+}
+
+#[test]
+fn alert_input_skips_unfinished_tests_between_ok_ones() -> Result<()> {
+    let mut db = database()?;
+    let slow = |started_ms| {
+        test(
+            started_ms,
+            Verdict::Ok {
+                download_bps: 404_000_000,
+                upload_bps: 900_000_000,
+            },
+        )
+    };
+    for t in [
+        slow(1_000),
+        test(2_000, Verdict::Timeout),
+        slow(3_000),
+        test(4_000, Verdict::Failed("HTTP 500".into())),
+        slow(5_000),
+    ] {
+        record_speed_test(&mut db, DEVICE_ID, &t)?;
+    }
+    record_speed_test(&mut db, "factory-console", &ok(6_000))?;
+    let input = alert_input(&db, DEVICE_ID)?;
+    let started =
+        |tests: &[NetworkSpeedTest]| tests.iter().map(|t| t.started_ms).collect::<Vec<_>>();
+    assert_eq!(started(&input.recent_ok_tests), [5_000, 3_000, 1_000]);
+    assert_eq!(started(&input.recent_tests), [5_000, 4_000, 3_000]);
+    assert_eq!(input.open_event, None);
+    let mut engine = alerts::Engine::load(alerts::Config::default());
+    engine.evaluate(
+        10_000,
+        &alerts::Signals {
+            network: Some(input),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        engine
+            .view()
+            .active
+            .iter()
+            .map(|a| a.key.as_str())
+            .collect::<Vec<_>>(),
+        ["network:throughput_low"]
+    );
+    // The alert read is three statements however many tests are stored.
+    let mut budgets = Vec::new();
+    for tests in [3, 20_000] {
+        let mut db = Tracked::new(fixture(tests)?, |db| db)?;
+        let read = Scope::default();
+        db.run(&read, Category::Data, |db| alert_input(db, DEVICE_ID))?;
+        budgets.push(read.counts());
+    }
+    assert_eq!(budgets[0].data, 3);
     assert_eq!(budgets[0], budgets[1]);
     Ok(())
 }
