@@ -298,7 +298,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
   const cursor = { requests: [] as any[], agents: {} as Record<string, any>, runs: {} as Record<string, any> };
   for (const [id, agent] of Object.entries(options.agents ?? {}) as [string, any][]) {
     cursor.agents[id] = { id, status: 'ACTIVE', url: `https://cursor.com/agents/${id}`, updatedAt: quietUpdated, latestRunId: `run-${id}`, ...agent };
-    cursor.runs[`run-${id}`] = { id: `run-${id}`, agentId: id, status: agent.runStatus ?? 'FINISHED', updatedAt: quietUpdated };
+    cursor.runs[`run-${id}`] = { id: `run-${id}`, agentId: id, status: 'runStatus' in agent ? agent.runStatus : 'FINISHED', updatedAt: quietUpdated };
   }
   async function fakeCursor(request: any, response: any) {
     let text = '';
@@ -2426,6 +2426,9 @@ for (const [name, cursor, environment] of [
   ['missing ID', (r: any) => r.method === 'POST' ? { status: 201, data: { agent: { id: 'T-not-cursor' }, run: {} } } : undefined, {}],
   ['401', (r: any) => r.method === 'POST' ? { status: 401, data: { code: 'error', message: `bad ${cursorKey}` } } : undefined, {}],
   ['403', (r: any) => r.method === 'POST' ? { status: 403, data: { error: { code: 'plan_required', message: 'no' } } } : undefined, {}],
+  ['reflected key', (r: any) => r.method === 'POST' ? { status: 400, data: { error: { code: 'validation_error', message: `bad ${cursorKey}` } } } : undefined, {}],
+  ['reflected header', (r: any) => r.method === 'POST' ? { status: 422, data: { error: { code: `Authorization: ${basic}`, message: `got ${basic}` } } } : undefined, {}],
+  ['reflected 401', (r: any) => r.method === 'POST' ? { status: 401, data: { code: cursorKey, message: `Authorization: ${basic}` } } : undefined, {}],
 ] as const) test(`cursor ${name}: keeps the claim, mentions Devon once, and never retries or leaks the key`, { timeout: 10_000 }, async t => {
   const i = cursorIssue();
   const f = await fixture(t, [i], { cursor });
@@ -2438,11 +2441,15 @@ for (const [name, cursor, environment] of [
   const message = failure.match(/^Cursor launch failed: (.*)\. Label remains off/)![1];
   assert.ok(message.length <= 200, message);
   if (name.startsWith('40')) assert.equal(message, `Cursor key rejected (HTTP ${name})`);
-  if (name === '5xx') assert.match(message, /^Cursor HTTP 503 upstream_error: x+$/);
+  if (name === '5xx') assert.equal(message, 'Cursor HTTP 503 upstream_error');
+  if (name === 'reflected key') assert.equal(message, 'Cursor HTTP 400 validation_error');
+  if (name === 'reflected header') assert.equal(message, 'Cursor HTTP 422');
+  if (name === 'reflected 401') assert.equal(message, 'Cursor key rejected (HTTP 401)');
   assert.equal(commentMarkers(failure).length, 0);
   assert.ok(i.comments[0].body.includes('<!-- factory-dispatch:claim runner:cursor -->'));
   assert.ok(!i.comments.some((c: any) => c.body.includes('factory-dispatch:thread')));
-  assert.ok(!JSON.stringify([result.stdout, result.stderr, i.comments]).includes(cursorKey));
+  const published = JSON.stringify([result.stdout, result.stderr, i.comments]);
+  for (const secret of [cursorKey, basic.slice('Basic '.length)]) assert.ok(!published.includes(secret), secret);
   await f.run(['poll'], environment);
   await f.run(['issue', 'MET-123'], environment);
   i.labels.push({ ...dispatchLabel });
@@ -2539,19 +2546,43 @@ test('cursor wrap-up starts a new local low Amp thread without worktree steps, t
   assert.equal(f.cursor.requests.filter(r => r.method === 'POST').length, 1);
 });
 
-test('cursor archive waits for an active run and quiet time, and records an already archived agent', { timeout: 10_000 }, async t => {
+test('cursor archive requires a known, quiet, terminal latest run, and records an already archived agent', { timeout: 15_000 }, async t => {
   const done = (n: number) => cursorBuilder(n, otherAgent(n), { state: { type: 'completed' }, completedAt: '2026-10-13T11:00:00Z',
     comments: [cursorClaim(), cursorThread(otherAgent(n)), { body: '<!-- factory-dispatch:wrapup -->' }] });
-  const issues = [done(120), done(121), done(122)];
-  const f = await fixture(t, issues, { agents: { [otherAgent(120)]: { runStatus: 'RUNNING' },
-    [otherAgent(121)]: { updatedAt: '2026-10-13T11:56:00.000Z' }, [otherAgent(122)]: { status: 'ARCHIVED' } } });
+  const cases: Record<number, any> = { 120: { runStatus: 'RUNNING' }, 121: { updatedAt: '2026-10-13T11:56:00.000Z' }, 122: { status: 'ARCHIVED' },
+    123: { runStatus: undefined }, 124: { runStatus: 'PAUSED' }, 125: { latestRunId: undefined }, 126: { status: undefined },
+    127: { updatedAt: 'not a date' }, 128: { runStatus: 'CREATING' }, 129: {} };
+  const issues = Object.keys(cases).map(n => done(Number(n)));
+  const f = await fixture(t, issues, { agents: Object.fromEntries(Object.entries(cases).map(([n, agent]) => [otherAgent(Number(n)), agent])) });
   assert.equal((await f.run()).code, 0);
-  assert.ok(!f.cursor.requests.some(r => r.method === 'POST'));
-  assert.equal(issues[0].comments.length, 3);
-  assert.equal(issues[1].comments.length, 3);
-  assert.ok(issues[2].comments.some((c: any) => commentMarkers(c.body).includes(`<!-- factory-dispatch:archived thread:${otherAgent(122)} -->`)));
+  const archivedIds = () => issues.flatMap((i: any) => i.comments.flatMap((c: any) => commentMarkers(c.body))
+    .flatMap((line: string) => line.match(/^<!-- factory-dispatch:archived thread:(bc-[\w-]+) -->$/)?.[1] ?? []));
+  assert.deepEqual(f.cursor.requests.filter(r => r.method === 'POST').map(r => r.path), [`/v1/agents/${otherAgent(129)}/archive`]);
+  assert.deepEqual(archivedIds().sort(), [otherAgent(122), otherAgent(129)]);
+  for (const n of [120, 121, 123, 124, 125, 126, 127, 128]) assert.ok(!issues[n - 120].comments.some((c: any) => c.body.includes('archive-claim')), String(n));
   f.cursor.runs[`run-${otherAgent(120)}`].status = 'FINISHED';
   assert.equal((await f.run(['poll'], { FAKE_NOW: String(now + 60_000) })).code, 0);
   assert.deepEqual(f.cursor.requests.filter(r => r.method === 'POST').map(r => r.path).sort(),
-    [`/v1/agents/${otherAgent(120)}/archive`, `/v1/agents/${otherAgent(121)}/archive`]);
+    [`/v1/agents/${otherAgent(120)}/archive`, `/v1/agents/${otherAgent(121)}/archive`, `/v1/agents/${otherAgent(129)}/archive`]);
+  await f.run(['poll'], { FAKE_NOW: String(now + 60_000) });
+  assert.equal(f.cursor.requests.filter(r => r.method === 'POST').length, 3);
+  assert.deepEqual(archivedIds().sort(), [120, 121, 122, 129].map(otherAgent));
+});
+
+test('a failed cursor agent gets no QA review or /runs follow-up after a late PR and changes verdict', { timeout: 15_000 }, async t => {
+  const i = cursorBuilder(123, cursorAgent);
+  const f = await fixture(t, [i], { github: { 90: githubPR() }, agents: { [cursorAgent]: { runStatus: 'ERROR' } }, submissionsOnly: true });
+  assert.equal((await f.run()).code, 0);
+  assert.ok(commentMarkers(i.comments.at(-1).body).includes(`<!-- factory-dispatch:cursor-failed ${cursorAgent} -->`));
+  i.attachments.push(attachment('open'));
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.calls().length, 0, 'no QA launch for a failed agent');
+  i.comments.push(qaMarker(`start pr:90 sha:${sha} runner:gpu`), qaMarker(`review-claim pr:90 sha:${sha} thread:${reviewId}`), reviewed('changes').comments.at(-1));
+  for (let pass = 0; pass < 3; pass++) assert.equal((await f.run()).code, 0);
+  assert.equal(f.calls().length, 0);
+  assert.ok(!f.cursor.requests.some(r => r.method === 'POST'));
+  assert.ok(!i.comments.some((c: any) => /factory-qa:(?:followup-claim|round) /.test(c.body)));
+  assert.equal(i.comments.filter((c: any) => c.body.includes('factory-qa:start ')).length, 1, 'only the hand-written start');
+  assert.equal(i.comments.filter((c: any) => c.body.includes(devonPing)).length, 1);
+  assert.equal(f.cursor.requests.length, 2, 'status read once before the marker');
 });

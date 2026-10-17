@@ -253,9 +253,12 @@ Unknown outcome: a timeout (30 seconds), transport error, non-2xx response or
 missing/invalid agent ID keeps the claim and posts one comment with the reason and
 `<Devon>: inspect cursor.com/agents before manual recovery`. There is never a
 retry, including after relabeling. 401/403 say `Cursor key rejected (HTTP n)`.
-Other errors include only Cursor's `error.code`/`message`, redacted and truncated
-to 200 characters. The key travels only as the Basic username (`key:`); it is
-never logged, commented or echoed, and dry-run prints `Basic [redacted]`.
+Other errors publish only `Cursor HTTP <status>` plus Cursor's `error.code` when
+it is one of the codes documented in the v1 OpenAPI Error schema; free-text
+messages are never published because they may reflect request data. Output is
+also redacted for the raw key and its Basic encoding and capped at 200 characters.
+The key travels only as the Basic username (`key:`); it is never logged,
+commented or echoed, and dry-run prints `Basic [redacted]`.
 
 Status: v1 agents are only `ACTIVE`/`ARCHIVED`; execution status lives on runs.
 Each pass, an active cursor builder (not Done/Canceled, no wrap-up, no open or
@@ -263,7 +266,10 @@ merged PR newer than the claim) gets `GET /v1/agents/<id>` and, when it has one,
 `GET /v1/agents/<id>/runs/<latestRunId>`. Run `ERROR`, `CANCELLED` or `EXPIRED`,
 or an `ARCHIVED` agent (archived or expired), posts one Devon mention with the
 status and agent URL plus `<!-- factory-dispatch:cursor-failed <bc-id> -->`; the
-dispatcher then stops polling that agent. Read failures log `cursor-status-pending`.
+dispatcher then stops acting on that agent: no further status polls, QA reviews
+or `/runs` follow-ups (logged `qa-skipped`), even after a late PR or verdict. The
+claim keeps its slot until wrap-up; recovery is manual. Read failures log
+`cursor-status-pending`.
 No other status-driven action exists. Dry-run previews these reads without calling.
 
 QA: unchanged reviewer selection treats cursor like amp (Claude reviews at high
@@ -283,10 +289,14 @@ the thread is labeled `factory`. Failures post the usual non-retrying comment.
 
 Archive: after Done and the wrap-up marker, both archive through the shared
 five-attempt path and thread-ID markers. The wrap-up thread uses Amp's listing
-quiet time. The agent uses `GET /v1/agents/<id>` and its latest run: an active run
-(`CREATING`/`RUNNING`) or an agent/run update newer than five minutes stays
-pending. Otherwise the documented, idempotent `POST /v1/agents/<id>/archive`
-runs; an already `ARCHIVED` agent only records the marker. Canceled issues never
+quiet time. The agent archives only with proof: `GET /v1/agents/<id>` returns
+`ACTIVE` (or the prose-documented `IDLE`) with a `latestRunId`, that run reads back
+with a terminal status (`FINISHED`, `ERROR`, `CANCELLED`, `EXPIRED`), and both
+records have valid `updatedAt` values at least five minutes old. Anything else
+(active, missing or unknown run status, absent run ID, unknown agent status,
+unreadable or future timestamps) stays `archive-pending`. Then the documented,
+idempotent `POST /v1/agents/<id>/archive` runs; an already `ARCHIVED` agent only
+records the marker. Canceled issues never
 archive the agent. `DELETE` is never used.
 
 Limits: no webhooks, so status lags one poll. One run per agent; follow-ups to a busy

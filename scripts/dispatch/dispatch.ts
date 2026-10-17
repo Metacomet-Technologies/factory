@@ -50,6 +50,17 @@ const marker = (name: string) => `<!-- factory-dispatch:${name} -->`;
 // Cursor's documented agent ID format; a Cursor ID is valid only with runner:cursor.
 export const cursorId = 'bc-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
 const cursorFailures = ['ERROR', 'CANCELLED', 'EXPIRED'];
+const cursorTerminal = ['FINISHED', ...cursorFailures];
+// The schema lists ACTIVE/ARCHIVED; the endpoint prose also documents IDLE.
+const cursorOpen = ['ACTIVE', 'IDLE'];
+// Error codes documented by the Cloud Agents v1 OpenAPI Error schema.
+const cursorErrorCodes = ['unauthorized', 'api_key_not_found', 'plan_required', 'role_forbidden', 'feature_unavailable',
+  'integration_not_connected', 'validation_error', 'missing_body', 'invalid_model', 'invalid_branch_name',
+  'repository_required', 'repository_access', 'pr_resolution_failed', 'artifact_not_found', 'service_account_required',
+  'agent_not_found', 'run_not_found', 'environment_not_found', 'build_not_found', 'team_admin_required',
+  'environment_name_conflict', 'duplicate_json_key', 'agent_busy', 'agent_archived', 'agent_id_conflict',
+  'run_not_cancellable', 'rate_limit_exceeded', 'usage_limit_exceeded', 'stream_expired', 'stream_unavailable',
+  'invalid_last_event_id', 'client_cancelled', 'not_implemented', 'upstream_error', 'internal_error'];
 const threadPattern = new RegExp(`^<!-- factory-dispatch:thread (T-[a-f0-9-]{36}(?! runner:cursor)|${cursorId}(?= runner:cursor ))(?: runner:(gpu|console|orb|cursor))? -->$`);
 const claimPattern = /^<!-- factory-dispatch:claim runner:(gpu|console|orb|cursor) -->$/;
 const wrapupThreadPattern = /^<!-- factory-dispatch:wrapup-thread (T-[a-f0-9-]{36}) -->$/;
@@ -309,7 +320,9 @@ export async function run(command: string, identifier: string | undefined, dryRu
   const key = readFileSync(process.env.LINEAR_API_KEY_FILE ?? '/etc/factory-dispatch/linear-api-key', 'utf8').trim();
   if (!key) throw new Error('Linear key file is empty');
   let cursorKey: string | undefined;
-  const redact = (text: string) => cursorKey ? text.replaceAll(key, '[redacted]').replaceAll(cursorKey, '[redacted]') : text.replaceAll(key, '[redacted]');
+  // Covers the raw Cursor key and its Basic-auth encoding as well as the Linear key.
+  const redact = (text: string) => [key, ...(cursorKey ? [cursorKey, Buffer.from(`${cursorKey}:`).toString('base64')] : [])]
+    .reduce((value, secret) => value.replaceAll(secret, '[redacted]'), text);
   const log = (decision: string, details: object = {}) => console.log(redact(JSON.stringify({ decision, ...details })));
   // The caps line keeps its existing local-runner shape.
   log('caps', { caps: { gpu: caps.gpu, console: caps.console } });
@@ -334,8 +347,9 @@ export async function run(command: string, identifier: string | undefined, dryRu
     let data;
     try { data = await response.json(); } catch { data = undefined; }
     if (!response.ok) {
-      const detail = [data?.error?.code, data?.error?.message].filter(value => typeof value === 'string').join(': ');
-      throw new Error(redact(`Cursor HTTP ${response.status}${detail ? ` ${detail}` : ''}`).replace(/\s+/g, ' ').slice(0, 200));
+      // Only a documented error code is published; Cursor's free-text message may reflect request data.
+      const code = cursorErrorCodes.includes(data?.error?.code) ? ` ${data.error.code}` : '';
+      throw new Error(redact(`Cursor HTTP ${response.status}${code}`).slice(0, 200));
     }
     if (data === undefined) throw new Error('Cursor returned invalid JSON; outcome unknown');
     return data;
@@ -810,13 +824,16 @@ export async function run(command: string, identifier: string | undefined, dryRu
       let agent, run;
       try {
         agent = await cursor('GET', `/v1/agents/${id}`);
-        if (agent?.status !== 'ARCHIVED' && typeof agent?.latestRunId === 'string' && /^run-[\w-]+$/.test(agent.latestRunId)) run = await cursor('GET', `/v1/agents/${id}/runs/${agent.latestRunId}`);
+        if (cursorOpen.includes(agent?.status) && typeof agent.latestRunId === 'string' && /^run-[\w-]+$/.test(agent.latestRunId)) run = await cursor('GET', `/v1/agents/${id}/runs/${agent.latestRunId}`);
       } catch {
         log('archive-pending', { issue: issue.identifier, reason: 'Cursor agent unreadable' });
         continue;
       }
-      const updated = Math.max(Date.parse(agent?.updatedAt), run ? Date.parse(run.updatedAt) : -Infinity);
-      if (agent?.status !== 'ARCHIVED' && (['CREATING', 'RUNNING'].includes(run?.status) || !Number.isFinite(updated) || Date.now() - updated < 5 * 60_000)) {
+      // Archive only with proof: the latest run is terminal and both records are quiet.
+      // An unknown agent status, absent run ID or unknown run status waits.
+      const updated = [agent?.updatedAt, run?.updatedAt].map(value => typeof value === 'string' ? Date.parse(value) : NaN);
+      if (agent?.status !== 'ARCHIVED' && (!cursorOpen.includes(agent?.status) || run?.id !== agent.latestRunId || !cursorTerminal.includes(run?.status)
+        || updated.some(time => !Number.isFinite(time) || Date.now() - time < 5 * 60_000))) {
         log('archive-pending', { issue: issue.identifier });
         continue;
       }

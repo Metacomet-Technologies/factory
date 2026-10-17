@@ -190,6 +190,8 @@ export async function reviewPRs(ctx: Context) {
     const builder = lines(issue).map(line => line.match(new RegExp(`^<!-- factory-dispatch:thread (T-[a-f0-9-]{36}(?: runner:(?:gpu|console))?|${cursorId} runner:cursor) -->$`))).find(Boolean)?.[1].split(' ')[0];
     const claim = issue.comments.find(c => commentMarkers(c.body).some(line => /^<!-- factory-dispatch:claim runner:(gpu|console|cursor) -->$/.test(line)));
     if (!builder || !claim?.createdAt || ['completed', 'canceled'].includes(issue.state.type)) continue;
+    // A failed Cursor agent gets no new review or follow-up until Devon recovers it by hand.
+    if (lines(issue).includes(`<!-- factory-dispatch:cursor-failed ${builder} -->`)) { log('qa-skipped', { issue: issue.identifier, reason: 'Cursor agent failed' }); continue; }
     const attachments = issue.attachments.filter(a => Date.parse(a.createdAt) > Date.parse(claim.createdAt!)
       && new RegExp(`^https://github.com/${config.repository}/pull/\\d+/?$`).test(a.url));
     for (const attachment of attachments) {
