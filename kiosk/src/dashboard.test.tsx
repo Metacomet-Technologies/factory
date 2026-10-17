@@ -2,7 +2,7 @@ import { render, screen, within, fireEvent, waitFor, act } from "@testing-librar
 import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
 import App from "./App";
 import { agentFixtures, fixtures } from "../mock/fixtures";
-import { streamReducer, initialLiveState, parseEvent } from "./api/stream";
+import { streamReducer, initialLiveState, parseEvent, STREAM_SILENCE_MS } from "./api/stream";
 import type { StreamEvent, UpsCurrent } from "./api/types";
 import { UpsBadge, UpsSection } from "./components/ups";
 import UpsPage from "./components/ups-page";
@@ -771,6 +771,49 @@ describe("dashboard contract", () => {
     fireEvent.click(screen.getByRole("link", { name: "factory" }));
     expect(await screen.findByText("$23.87")).toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Local LLM" })).toHaveTextContent("7d");
+  });
+  it("reopens the stream after silence and refetches on the next open, not before", async () => {
+    vi.useFakeTimers();
+    const fetch = api();
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const first = MockSource.latest;
+    const closed = vi.spyOn(first, "close");
+    act(() => first.onopen?.());
+    expect(screen.getByText("Live")).toBeInTheDocument();
+    const fleetFetches = () =>
+      fetch.mock.calls.filter(([path]: [string]) => path.startsWith("/v1/fleet")).length;
+    // A keepalive event just under the limit keeps the socket.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STREAM_SILENCE_MS - 1);
+    });
+    act(() => first.onmessage?.(new MessageEvent("message", { data: "{}" })));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STREAM_SILENCE_MS - 1);
+    });
+    expect(closed).not.toHaveBeenCalled();
+    expect(screen.getByText("Live")).toBeInTheDocument();
+    // Silence past the limit drops the socket and schedules a reopen within the first backoff.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(closed).toHaveBeenCalled();
+    expect(screen.getByText("Reconnecting")).toBeInTheDocument();
+    const before = fleetFetches();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(MockSource.latest).not.toBe(first);
+    expect(fleetFetches()).toBe(before);
+    act(() => MockSource.latest.onopen?.());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("Live")).toBeInTheDocument();
+    expect(fleetFetches()).toBe(before + 1);
+    vi.useRealTimers();
   });
   it("refreshes displayed values at 60 seconds, not before", async () => {
     vi.useFakeTimers();

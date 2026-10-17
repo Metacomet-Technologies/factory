@@ -1,4 +1,4 @@
-import type { components, paths } from "./generated";
+import type { components, paths } from "./generated.ts";
 
 export type UsageRange = "24h" | "7d" | "30d";
 export type GpuRange = "1h" | "24h" | "7d";

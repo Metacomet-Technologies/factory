@@ -1049,6 +1049,23 @@
   padding-top: 14px;
   border-top: 1px solid var(--border);
 }
+/* Actions sit side by side on wide screens so the Controls section stays short. */
+@media (min-width: 900px) {
+  .ups-control-tier {
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 12px 24px;
+    align-items: start;
+  }
+  .ups-control-tier > h4,
+  .ups-control-tier > p,
+  .ups-control-tier > ol,
+  .ups-control-tier > .row {
+    grid-column: 1 / -1;
+  }
+  .ups-control-audit {
+    max-height: 240px;
+  }
+}
 .ups-control-action,
 .ups-control-setting {
   display: grid;
@@ -1237,7 +1254,7 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .ups-energy {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .ups-readings {
     grid-template-columns: repeat(4, minmax(0, 1fr));

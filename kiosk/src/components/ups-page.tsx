@@ -450,19 +450,6 @@ export default function UpsPage({
           </Suspense>
         )}
       </section>
-      <Panel
-        title="Energy & cost"
-        subtitle="Measured energy only; gaps are not extrapolated."
-        icon={<Zap />}
-        index={1}
-        aria-label="Energy"
-      >
-        <div className="ups-energy">
-          {(["24h", "7d", "30d", "365d"] as const).map((value) => (
-            <Energy key={value} range={value} revision={revision + settingsRevision} />
-          ))}
-        </div>
-      </Panel>
       <div className="ups-chart-grid">
         <Timeline key={revision} now={now} index={2} />
         <Panel
@@ -535,11 +522,24 @@ export default function UpsPage({
           )}
         </Panel>
         <Panel
+          title="Energy & cost"
+          subtitle="Measured energy only; gaps are not extrapolated."
+          icon={<Zap />}
+          index={4}
+          aria-label="Energy"
+        >
+          <div className="ups-energy">
+            {(["24h", "7d", "30d", "365d"] as const).map((value) => (
+              <Energy key={value} range={value} revision={revision + settingsRevision} />
+            ))}
+          </div>
+        </Panel>
+        <Panel
           id="ups-settings"
           title="UPS settings"
           subtitle="Electricity rate and battery date"
           icon={<Settings2 />}
-          index={4}
+          index={5}
           aria-label="UPS settings"
         >
           {settings.error && (

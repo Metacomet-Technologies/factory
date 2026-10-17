@@ -429,6 +429,12 @@ frames match the captured transport and include nullable model/token counts.
 Outage
 fixtures use contract nulls, empty model/history lists and warnings. Mock SSE
 emits GPU samples every 3s, requests every 5s and keepalive comments every 15s.
+UPS and device pages are served from `mock/site-fixtures.ts`: generated UPS
+history, events, energy and settings, a captured sandbox device view in
+`mock/device-view.json` with its timestamps shifted to now, and a read-only
+`/control/v1/state` (POST answers 405, so no control action can be confirmed
+against the mock). The stream also emits `ups.sample` and `devices.sample`
+every 15s.
 Every response uses only contract fields. Change `MOCK_PORT` to choose another
 mock port. `MOCK_OUTAGE=1 vp run mock-dev` runs the entire dashboard against
 outage fixtures.
@@ -488,20 +494,29 @@ controls and tooltips passed. Desktop viewport captures cut off the footer.
 
 ## Accent and contrast
 
-- Fill: `--primary: oklch(0.38 0.17 300)` in both themes.
-- Fill text: `--primary-foreground: #ffffff`, 10.89:1 against primary.
-- Dark text/icons/focus: `--accent-text: oklch(0.72 0.15 300)`, 7.12:1 against
-  page `#131315` and 6.59:1 against card `#1b1b1e`.
-- Light text/icons/focus: `--accent-text: oklch(0.38 0.17 300)`, 10.08:1 against
-  page `#f6f6f7` and 10.89:1 against white cards.
+Tokens live in `src/index.css` as `light-dark()` pairs; usage rules and the
+resolved hex values are in `docs/agents/kiosk-styleguide.md`. Ratios below are
+WCAG contrast computed from the resolved sRGB values.
 
-The GPU series uses dark-purple fill with an accent-text outline, keeping its
-boundary visible in dark mode. Purple never indicates service status. On
-cards, dark semantic colors have contrast ratios of 9.77:1 (ok), 10.12:1 (warn)
-and 8.17:1 (fail); light equivalents have 6.51:1, 6.31:1 and 6.50:1. Muted
-text's lowest measured surface contrast is 6.45:1 dark and 5.17:1 light. The
-browser check also inspects each rendered text/background pair rather than
-relying only on token calculations.
+- Fill: `--primary: oklch(0.5 0.2 285)` (`#5e45cd`) in both themes, with
+  `--primary-foreground: #ffffff` at 6.54:1.
+- Dark text/icons/focus: `--accent-text: oklch(0.76 0.14 285)` (`#a8a3ff`),
+  8.53:1 against page `#0d0f14` and 7.89:1 against card `#151821`.
+- Light text/icons/focus: `--accent-text: oklch(0.45 0.2 285)` (`#5234bc`),
+  7.42:1 against page `#f3f4f8` and 8.15:1 against white cards.
+
+Foreground text measures 16.81:1 (dark page) / 15.93:1 (light page); muted
+text's lowest surface contrast is 6.75:1 dark (`#a3a9b8` on `--muted`) and
+5.17:1 light (`#5c6271` on `--muted`). Semantic colours on cards: dark ok
+10.04:1, warn 10.75:1, fail 7.99:1; light ok 5.42:1, warn 5.66:1, fail 6.08:1.
+Status chips tint their background with 14% of the semantic colour; the text on
+that tint stays at 6.29:1 or better in dark and 4.43:1 or better in light.
+Purple never indicates service status. The GPU chart series uses the primary
+fill with an accent-text outline so its boundary stays visible in dark mode.
+Disabled buttons keep shadcn's 50% opacity and are exempt from these targets;
+their reason text next to them carries the information. The browser check also
+inspects each rendered text/background pair rather than relying only on token
+calculations.
 
 ## Contract gaps resolved against the deployed API
 

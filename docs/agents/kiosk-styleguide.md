@@ -36,6 +36,24 @@ primitives do the heavy lifting, so prefer composing them over writing CSS.
 | `--radius-sm/md/lg/xl` | 6 / 8 / 12 / 14 px corners |
 | `--dur-fast`, `--dur`, `--dur-slow`, `--ease-out` | 160 / 320 / 640 ms and the shared easing curve |
 
+Resolved values and measured WCAG contrast (text colour against `--card`):
+
+| Token | Light | Dark |
+| --- | --- | --- |
+| `--background` / `--card` / `--muted` | `#f3f4f8` / `#ffffff` / `#eaecf2` | `#0d0f14` / `#151821` / `#1e222d` |
+| `--foreground` | `#171923` (17.5:1) | `#eef0f5` (15.6:1) |
+| `--muted-foreground` | `#5c6271` (6.1:1; 5.2:1 on muted) | `#a3a9b8` (7.5:1; 6.8:1 on muted) |
+| `--accent-text` | `#5234bc` (8.2:1) | `#a8a3ff` (7.9:1) |
+| `--primary` (+ white text) | `#5e45cd` (6.5:1) | same |
+| `--ok` | `#007a46` (5.4:1) | `#5ed99e` (10.0:1) |
+| `--warn` | `#975800` (5.7:1) | `#fac053` (10.8:1) |
+| `--fail` | `#be2132` (6.1:1) | `#ff8d8f` (8.0:1) |
+
+Status chips tint their background with 14% of the semantic colour; the text
+on that tint stays at 4.4:1 or better in light and 6.3:1 or better in dark.
+If you change a token, re-measure every row (any contrast checker that
+accepts hex works) and keep each one at or above 4.5:1.
+
 Light and dark values live in one `light-dark()` declaration per token, so a
 new token needs both values at once. Theme follows the system unless the user
 toggles it; never force a default.

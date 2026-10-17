@@ -142,7 +142,8 @@ export default function UpsControls() {
         // An earlier in-flight request cannot restore controls after denial.
         throw new ControlError(denied, 403);
       }
-      let data: T & { error?: string; result?: string };
+      // factory-api answers unknown /control routes with `{ error: { code, message } }`.
+      let data: T & { error?: string | { message?: string }; result?: string };
       try {
         data = (await response.json()) as typeof data;
       } catch (error) {
@@ -155,7 +156,9 @@ export default function UpsControls() {
       if (forbidden.current && response.status !== 403) throw new ControlError(denied, 403);
       if (!response.ok)
         throw new ControlError(
-          data.error ?? data.result ?? `HTTP ${response.status}`,
+          (typeof data.error === "string" ? data.error : data.error?.message) ??
+            data.result ??
+            `HTTP ${response.status}`,
           response.status,
         );
       return data;

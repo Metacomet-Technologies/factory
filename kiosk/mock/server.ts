@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { agentFixtures, fixtures } from "./fixtures.ts";
-import type { GpuRange, UsageRange, StreamEvent } from "../src/api/types.ts";
+import { siteFixtures } from "./site-fixtures.ts";
+import type { DeviceRange, GpuRange, UsageRange, UpsRange, StreamEvent } from "../src/api/types.ts";
 
 const port = Number(process.env.MOCK_PORT ?? 4179);
 const outage = process.env.MOCK_OUTAGE === "1";
@@ -31,7 +32,7 @@ createServer((request, response) => {
         data.utilization_percent = 50 + (index++ % 27);
         data.power_w = 120 + (index % 35);
       }
-      send({ type: "gpu.sample", ts_ms: Date.now(), data });
+      send({ type: "gpu.sample", ts_ms: Date.now(), data: data ?? null });
     }, 3000);
     const llm = setInterval(() => {
       if (!outage)
@@ -51,11 +52,17 @@ createServer((request, response) => {
       () => send({ type: "agents.usage", ts_ms: Date.now(), data: agents() }),
       15000,
     );
+    const site = setInterval(() => {
+      const live = siteFixtures(outage);
+      send({ type: "ups.sample", ts_ms: Date.now(), data: live.ups.current ?? null });
+      send({ type: "devices.sample", ts_ms: Date.now(), data: live.deviceView });
+    }, 15000);
     const keepalive = setInterval(() => response.write(": keepalive\n\n"), 15000);
     response.on("close", () => {
       clearInterval(gpu);
       clearInterval(llm);
       clearInterval(usage);
+      clearInterval(site);
       clearInterval(keepalive);
     });
     return;
@@ -63,12 +70,19 @@ createServer((request, response) => {
   const range = url.searchParams.get("range");
   if (
     (url.pathname === "/v1/llm/usage" && range !== null && !["24h", "7d", "30d"].includes(range)) ||
-    (url.pathname === "/v1/gpu" && range !== null && !["1h", "24h", "7d"].includes(range))
+    (url.pathname === "/v1/gpu" && range !== null && !["1h", "24h", "7d"].includes(range)) ||
+    (url.pathname.startsWith("/v1/ups/") &&
+      range !== null &&
+      !["1h", "24h", "7d", "30d", "365d"].includes(range)) ||
+    (url.pathname === "/v1/devices/factory-gpu/history" &&
+      range !== null &&
+      !["1h", "24h", "7d"].includes(range))
   ) {
     response.writeHead(400).end();
     return;
   }
   const data = fixtures(outage, (range ?? "24h") as UsageRange, (range ?? "1h") as GpuRange);
+  const site = siteFixtures(outage, (range ?? "24h") as UpsRange, (range ?? "1h") as DeviceRange);
   const routes: Record<string, unknown> = {
     "/v1/health": data.health,
     "/v1/fleet": data.fleet,
@@ -76,6 +90,16 @@ createServer((request, response) => {
     "/v1/gpu": data.gpu,
     "/v1/pricing": data.pricing,
     "/v1/agents": agents(),
+    "/v1/ups": site.ups,
+    "/v1/ups/history": site.upsHistory,
+    "/v1/ups/events": site.upsEvents,
+    "/v1/ups/energy": site.upsEnergy,
+    "/v1/settings/ups": site.upsSettings,
+    "/v1/devices": site.devices,
+    "/v1/devices/factory-gpu": site.deviceView,
+    "/v1/devices/factory-gpu/history": site.deviceHistory,
+    "/control/v1/state": site.control,
+    "/control/v1/audit": { rows: site.control.audit },
   };
   if (!(url.pathname in routes)) {
     response.writeHead(404).end();
