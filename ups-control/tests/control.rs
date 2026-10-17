@@ -50,6 +50,29 @@ fn proc_fixtures_and_guard_fail_closed() {
         ),
         Some(77)
     );
+    for (table, peer, local, uid) in [
+        (&v4, peer, local, 1234),
+        (
+            &v6,
+            "[::1]:49443".parse().unwrap(),
+            "[::1]:8090".parse().unwrap(),
+            77,
+        ),
+    ] {
+        let mut repeated: Vec<_> = table.lines().nth(1).unwrap().split_whitespace().collect();
+        let inode = repeated[9];
+        repeated[0] = "9:";
+        repeated[4] = "00000001:00000000";
+        let duplicate = format!("{table}{}\n", repeated.join(" "));
+        assert_eq!(guard::owner(&duplicate, peer, local), Some(uid));
+        repeated[9] = "101";
+        let conflicting_inode = format!("{table}{}\n", repeated.join(" "));
+        assert_eq!(guard::owner(&conflicting_inode, peer, local), None);
+        repeated[9] = inode;
+        repeated[7] = "4321";
+        let conflicting_uid = format!("{table}{}\n", repeated.join(" "));
+        assert_eq!(guard::owner(&conflicting_uid, peer, local), None);
+    }
     let allowed: Vec<String> = vec!["DGarbs51@github".into()];
     assert!(guard::authorize(
         peer,

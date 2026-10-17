@@ -39,7 +39,7 @@ def seed(directory):
 
 
 def writer(path, stop, ready):
-    with sqlite3.connect(path) as db:
+    with contextlib.closing(sqlite3.connect(path)) as db:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA wal_autocheckpoint=0")
         db.executescript('CREATE TABLE events(id INTEGER); CREATE TABLE children(id INTEGER);'
@@ -138,11 +138,11 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
             orphan_day = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=3)
             orphan = directory / (orphan_day.strftime("%Y%m%d") + "T235959.000000000Z.db.zst")
             orphan.write_bytes(b"interrupted publication without a checksum")
-            with sqlite3.connect(root / f"{names[0]}.db") as db:
+            with contextlib.closing(sqlite3.connect(root / f"{names[0]}.db")) as db:
                 before = db.execute("SELECT count(*) FROM events").fetchone()[0]
             run("factory-backup.sh", env)
             assert not orphan.exists()
-            with sqlite3.connect(root / f"{names[0]}.db") as db:
+            with contextlib.closing(sqlite3.connect(root / f"{names[0]}.db")) as db:
                 assert db.execute("SELECT count(*) FROM events").fetchone()[0] > before
             status = json.loads(Path(env["STATUS_FILE"]).read_text())
             today = dt.datetime.now(dt.timezone.utc).date()
@@ -165,7 +165,7 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
                                    cwd=latest.parent, check=True, capture_output=True)
                     restored = root / "restored.db"
                     subprocess.run(["zstd", "-q", "-d", "-f", str(latest), "-o", str(restored)], check=True)
-                    with sqlite3.connect(restored) as db:
+                    with contextlib.closing(sqlite3.connect(restored)) as db:
                         assert db.execute("PRAGMA integrity_check").fetchone() == ("ok",)
                         assert db.execute("SELECT count(*) FROM events").fetchone() == \
                             db.execute("SELECT count(*) FROM children").fetchone()
@@ -212,6 +212,7 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
     assert all(path.read_bytes() == data for path, data in retired.items())
     print("PASS: empty-origin console succeeds without SSH/push/prune; retired archives preserved")
 
+    assert not list(root.glob("*.db-wal")) and not list(root.glob("*.db-shm"))
     live_files = {path: hashlib.sha256(path.read_bytes()).digest() for path in root.glob("*.db*")}
     for env in environments.values():
         output = run("restore-check.sh", env, "all")

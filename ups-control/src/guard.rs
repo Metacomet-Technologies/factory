@@ -33,13 +33,15 @@ pub fn owner(table: &str, peer: SocketAddr, local: SocketAddr) -> Option<u32> {
             continue;
         }
         if endpoint(fields[1]) == Some(peer) && endpoint(fields[2]) == Some(local) {
-            let uid = fields[7].parse().ok()?;
-            if found.replace(uid).is_some() {
+            // Connection churn can make /proc repeat a socket. Only a different
+            // UID or inode makes the ownership ambiguous.
+            let identity = (fields[7].parse().ok()?, fields[9]);
+            if found.replace(identity).is_some_and(|old| old != identity) {
                 return None;
             }
         }
     }
-    found
+    found.map(|(uid, _)| uid)
 }
 
 pub fn authorize(
