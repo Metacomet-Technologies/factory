@@ -562,7 +562,8 @@ async fn endpoints_return_registry_history_and_constant_query_budgets() -> Resul
             .error_for_status()?
             .json()
             .await?;
-        assert_eq!(scope.counts().data, 1, "/v1/network n={n}");
+        // Latest sample per target, then the latest speed test.
+        assert_eq!(scope.counts().data, 2, "/v1/network n={n}");
         assert_eq!(body["device_id"], DEVICE_ID);
         let targets = body["targets"].as_array().unwrap();
         assert_eq!(
@@ -589,6 +590,7 @@ async fn endpoints_return_registry_history_and_constant_query_budgets() -> Resul
         );
         // The tailnet target has never been sampled.
         assert!(targets[4]["latest"].is_null());
+        assert!(body["latest_speed_test"].is_null());
         assert_eq!(body["warnings"], json!([]));
         task.abort();
         for (query, resolution, points) in [

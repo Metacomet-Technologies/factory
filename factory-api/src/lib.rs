@@ -7,6 +7,7 @@ pub mod fleet;
 mod kiosk;
 pub mod network;
 pub mod network_history;
+pub mod network_speed;
 pub mod pool;
 pub mod types;
 pub mod ups;
@@ -60,6 +61,8 @@ pub struct AppState {
     pub ups_name: String,
     /// Network probe registry, built once from NetworkConfig in layer order.
     pub network: Arc<[network::Target]>,
+    /// main installs the configured runner; embedders and tests never run a speed test.
+    pub speed_test: Option<network_speed::SpeedConfig>,
     pricing_client: reqwest::Client,
     pub db: Arc<pool::Pool>,
     /// Explicit request/job handle propagated to both database pools.
@@ -124,6 +127,7 @@ impl AppState {
             ups_name: "cyberpower".into(),
             // main installs the configured registry; embedders and tests probe nothing.
             network: Arc::new([]),
+            speed_test: None,
             pricing_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
                 .user_agent("factory-pricing/0.1")
@@ -600,11 +604,14 @@ impl AppState {
             .filter(|w| w.starts_with("network") || w.starts_with("clock:"))
             .collect();
         let keys: Vec<String> = self.network.iter().map(|t| t.key.clone()).collect();
-        let mut latest = self
+        let (mut latest, latest_speed_test) = self
             .db
             .requests
             .read(&self.query_scope, move |db| {
-                network_history::latest(db, network::DEVICE_ID, &keys)
+                Ok((
+                    network_history::latest(db, network::DEVICE_ID, &keys)?,
+                    network_history::latest_speed_test(db, network::DEVICE_ID)?,
+                ))
             })
             .await?;
         let targets = self
@@ -624,6 +631,7 @@ impl AppState {
             generated_at_ms: now_ms(),
             device_id: network::DEVICE_ID.into(),
             targets,
+            latest_speed_test,
             warnings,
         })
     }
@@ -653,6 +661,42 @@ impl AppState {
         self.warning("network", (!errors.is_empty()).then(|| errors.join("; ")))
             .await;
     }
+    /// Run one throughput test and store it. A failed or timed-out test is a
+    /// stored outcome; only a storage error is a warning.
+    pub async fn collect_speed_test(&self) {
+        let Some(config) = &self.speed_test else {
+            return;
+        };
+        // The write would be refused, so do not move 0.7 GB for nothing.
+        if self.require_clock().is_err() {
+            return;
+        }
+        let test = network_speed::run(config).await;
+        let stored = self
+            .db
+            .write(&self.query_scope, move |db| {
+                network_history::record_speed_test(db, network::DEVICE_ID, &test)
+            })
+            .await;
+        match stored {
+            Ok(row) => {
+                tracing::info!(
+                    id = row.id,
+                    outcome = ?row.outcome,
+                    download_bps = row.download_bps,
+                    upload_bps = row.upload_bps,
+                    colo = row.colo,
+                    "network speed test stored"
+                );
+                self.emit("network.speedtest", &row);
+                self.warning("network speedtest", None).await;
+            }
+            Err(error) => {
+                self.warning("network speedtest", Some(error.to_string()))
+                    .await
+            }
+        }
+    }
     pub fn start_collectors(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = vec![self.start_usage_collector()];
         tasks.extend(self.start_alerts());
@@ -662,21 +706,38 @@ impl AppState {
             );
         }
         for kind in [
-            "meter", "fleet", "gpu", "ups", "devices", "network", "pricing", "clock", "database",
+            "meter",
+            "fleet",
+            "gpu",
+            "ups",
+            "devices",
+            "network",
+            "speedtest",
+            "pricing",
+            "clock",
+            "database",
         ] {
-            if kind == "pricing" && self.disable_pricing_collector {
+            let seconds = Duration::from_secs;
+            let schedule = match kind {
+                "pricing" if self.disable_pricing_collector => None,
+                "speedtest" => self
+                    .speed_test
+                    .as_ref()
+                    .map(|c| (network_speed::STARTUP_DELAY, c.interval)),
+                // Retry promptly after clock synchronization; feed attempts stay daily.
+                "pricing" | "clock" => Some((Duration::ZERO, seconds(2))),
+                "gpu" | "devices" => Some((Duration::ZERO, seconds(15))),
+                "ups" => Some((Duration::ZERO, seconds(10))),
+                "database" => Some((Duration::ZERO, seconds(300))),
+                _ => Some((Duration::ZERO, seconds(30))),
+            };
+            let Some((delay, period)) = schedule else {
                 continue;
-            }
+            };
             let mut state = self.clone();
             tasks.push(tokio::spawn(async move {
-                let mut timer = tokio::time::interval(Duration::from_secs(match kind {
-                    // Retry promptly after clock synchronization; feed attempts stay daily.
-                    "pricing" | "clock" => 2,
-                    "gpu" | "devices" => 15,
-                    "ups" => 10,
-                    "database" => 300,
-                    _ => 30,
-                }));
+                let mut timer =
+                    tokio::time::interval_at(tokio::time::Instant::now() + delay, period);
                 timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut last_pricing = None::<Instant>;
                 let mut last_optimize = Instant::now();
@@ -695,6 +756,7 @@ impl AppState {
                             }
                             "fleet" => state.collect_fleet().await,
                             "network" => state.collect_network().await,
+                            "speedtest" => state.collect_speed_test().await,
                             "gpu" => {
                                 let (current, _) = state.gpu_current().await;
                                 state.emit("gpu.sample", current);
@@ -778,6 +840,18 @@ impl AppState {
                                     .warning(
                                         "network retention",
                                         network_retention.err().map(|e| e.to_string()),
+                                    )
+                                    .await;
+                                let speed_retention = state
+                                    .db
+                                    .write(&state.query_scope, |db| {
+                                        network_history::retain_speed_tests(db, now_ms())
+                                    })
+                                    .await;
+                                state
+                                    .warning(
+                                        "network speedtest retention",
+                                        speed_retention.err().map(|e| e.to_string()),
                                     )
                                     .await;
                                 let result = async {

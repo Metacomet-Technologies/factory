@@ -189,7 +189,10 @@ def inside():
         tailnet = STATE / "network-tailnet"
         if not tailnet.exists():
             tailnet.write_text("up\n")
-        start("fake-net", ["python3", ROOT / "scripts/sandbox-shims/fake-net.py", "2222", STATE])
+        speed = STATE / "network-speed"
+        if not speed.exists():
+            speed.write_text("ok\n")
+        start("fake-net", ["python3", ROOT / "scripts/sandbox-shims/fake-net.py", "2222", STATE, "8099"])
         credentials = STATE / "credentials"
         credentials.mkdir(mode=0o700, exist_ok=True)
         for name in ("nut-password", "slack-bot-token"):
@@ -293,6 +296,11 @@ def inside():
                               "--disable-pricing-collector",
                               "--network-route-table", route, "--network-dns-name", "probe.sandbox.test",
                               "--network-tailnet-target", "127.0.0.1:2222",
+                              # The minimum interval: a hang test ends at the 60 s cap well
+                              # before the next starts, and a full-speed loopback test costs
+                              # well under a second of CPU every two minutes.
+                              "--network-speed-url", "http://127.0.0.1:8099",
+                              "--network-speed-interval-s", "120",
                               "--static-dir", ROOT / "kiosk/dist" if kiosk == "1" else STATE / "no-kiosk"])
         ready(BASE + 2, "/v1/health")
         started = time.monotonic()

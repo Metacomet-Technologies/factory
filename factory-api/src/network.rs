@@ -258,6 +258,8 @@ pub struct NetworkStatus {
     pub device_id: String,
     /// Registry order: lan, wan, dns, tailnet.
     pub targets: Vec<NetworkTarget>,
+    /// Null before the first stored test.
+    pub latest_speed_test: Option<crate::network_history::NetworkSpeedTest>,
     pub warnings: Vec<String>,
 }
 
@@ -393,7 +395,7 @@ where
         .collect();
     Burst::from_replies(PROBES, &replies)
 }
-async fn ping(address: IpAddr) -> Result<Burst> {
+pub async fn ping(address: IpAddr) -> Result<Burst> {
     let child = tokio::process::Command::new("ping")
         .args(["-n", "-q", "-c", "10", "-i", "0.2", "-W", "1"])
         .arg(address.to_string())

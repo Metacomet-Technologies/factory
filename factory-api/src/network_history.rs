@@ -1,5 +1,7 @@
-//! Network probe storage. Raw bursts and their hourly rollups commit together.
+//! Network storage. Raw bursts and their hourly rollups commit together;
+//! throughput tests are one row each.
 use crate::network::{Burst, Layer, Rtt, Sample};
+use crate::network_speed::{SpeedTest, Verdict};
 use crate::ups_history::{DAY_MS, HOUR_MS};
 use anyhow::{Result, ensure};
 use rusqlite::{
@@ -256,4 +258,162 @@ pub fn history(
             points,
         })
         .collect())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkSpeedOutcome {
+    Ok,
+    Failed,
+    Timeout,
+}
+impl NetworkSpeedOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+impl ToSql for NetworkSpeedOutcome {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+impl FromSql for NetworkSpeedOutcome {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let text = value.as_str()?;
+        [Self::Ok, Self::Failed, Self::Timeout]
+            .into_iter()
+            .find(|o| o.as_str() == text)
+            .ok_or(FromSqlError::InvalidType)
+    }
+}
+/// One stored throughput test. Rates are bits per second; latencies are average RTT to the first wan target.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct NetworkSpeedTest {
+    pub id: i64,
+    pub started_ms: i64,
+    pub ended_ms: i64,
+    pub outcome: NetworkSpeedOutcome,
+    /// Always set for failed tests.
+    pub error: Option<String>,
+    /// Nearest-rank p90 of per-request rates; null unless the outcome is ok.
+    pub download_bps: Option<i64>,
+    pub upload_bps: Option<i64>,
+    /// Bytes moved, for every outcome.
+    pub download_bytes: i64,
+    pub upload_bytes: i64,
+    /// One burst before the transfers.
+    pub idle_latency_ms: Option<f64>,
+    /// Bursts run while that direction transferred.
+    pub download_loaded_latency_ms: Option<f64>,
+    pub upload_loaded_latency_ms: Option<f64>,
+    /// Cloudflare colo code. The public IP is never stored.
+    pub colo: Option<String>,
+}
+macro_rules! speed_columns {
+    () => {
+        "id,started_ms,ended_ms,outcome,error,download_bps,upload_bps,download_bytes,upload_bytes,idle_latency_us,download_loaded_latency_us,upload_loaded_latency_us,colo"
+    };
+}
+fn speed_test(row: &Row<'_>) -> rusqlite::Result<NetworkSpeedTest> {
+    let ms = |i: usize| -> rusqlite::Result<Option<f64>> {
+        Ok(row.get::<_, Option<i64>>(i)?.map(|us| us as f64 / 1000.0))
+    };
+    Ok(NetworkSpeedTest {
+        id: row.get(0)?,
+        started_ms: row.get(1)?,
+        ended_ms: row.get(2)?,
+        outcome: row.get(3)?,
+        error: row.get(4)?,
+        download_bps: row.get(5)?,
+        upload_bps: row.get(6)?,
+        download_bytes: row.get(7)?,
+        upload_bytes: row.get(8)?,
+        idle_latency_ms: ms(9)?,
+        download_loaded_latency_ms: ms(10)?,
+        upload_loaded_latency_ms: ms(11)?,
+        colo: row.get(12)?,
+    })
+}
+/// Insert one test and return the row as stored.
+pub fn record_speed_test(
+    db: &mut Connection,
+    device_id: &str,
+    test: &SpeedTest,
+) -> Result<NetworkSpeedTest> {
+    let (outcome, error, download_bps, upload_bps) = match &test.verdict {
+        Verdict::Ok {
+            download_bps,
+            upload_bps,
+        } => (
+            NetworkSpeedOutcome::Ok,
+            None,
+            Some(*download_bps),
+            Some(*upload_bps),
+        ),
+        Verdict::Failed(error) => (
+            NetworkSpeedOutcome::Failed,
+            Some(error.as_str()),
+            None,
+            None,
+        ),
+        Verdict::Timeout => (NetworkSpeedOutcome::Timeout, None, None, None),
+    };
+    Ok(db
+        .prepare_cached(concat!(
+            "INSERT INTO net_speed_tests(device_id,started_ms,ended_ms,outcome,error,download_bps,upload_bps,download_bytes,upload_bytes,idle_latency_us,download_loaded_latency_us,upload_loaded_latency_us,colo) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) RETURNING ",
+            speed_columns!()
+        ))?
+        .query_row(
+            params![
+                device_id,
+                test.started_ms,
+                test.ended_ms,
+                outcome,
+                error,
+                download_bps,
+                upload_bps,
+                test.download_bytes,
+                test.upload_bytes,
+                test.idle_latency_us,
+                test.download_loaded_latency_us,
+                test.upload_loaded_latency_us,
+                test.colo,
+            ],
+            speed_test,
+        )?)
+}
+
+pub const SPEED_RETENTION_MS: i64 = 365 * DAY_MS;
+/// A skip-scan over the few device ids keeps every step an index search.
+pub const SPEED_RETAIN_SQL: &str = "DELETE FROM net_speed_tests WHERE id IN (WITH RECURSIVE device(id) AS (SELECT MIN(device_id) FROM net_speed_tests UNION ALL SELECT (SELECT MIN(device_id) FROM net_speed_tests WHERE device_id>device.id) FROM device WHERE device.id IS NOT NULL) SELECT t.id FROM device JOIN net_speed_tests t ON t.device_id=device.id AND t.started_ms<?1 LIMIT 1000)";
+/// Tests that started more than 365 days ago go, at most 1000 per maintenance tick.
+pub fn retain_speed_tests(db: &mut Connection, now: i64) -> Result<usize> {
+    Ok(db.execute(SPEED_RETAIN_SQL, [(now - SPEED_RETENTION_MS).max(0)])?)
+}
+pub const LATEST_SPEED_SQL: &str = concat!(
+    "SELECT ",
+    speed_columns!(),
+    " FROM net_speed_tests WHERE device_id=?1 ORDER BY started_ms DESC, id DESC LIMIT 1"
+);
+pub fn latest_speed_test(db: &Connection, device_id: &str) -> Result<Option<NetworkSpeedTest>> {
+    Ok(db
+        .prepare_cached(LATEST_SPEED_SQL)?
+        .query_row([device_id], speed_test)
+        .optional()?)
+}
+pub const SPEED_TESTS_SQL: &str = concat!(
+    "SELECT ",
+    speed_columns!(),
+    " FROM net_speed_tests WHERE device_id=?1 AND started_ms>=?2 ORDER BY started_ms, id"
+);
+/// Tests that started at or after `since`, oldest first.
+pub fn speed_tests(db: &Connection, device_id: &str, since: i64) -> Result<Vec<NetworkSpeedTest>> {
+    Ok(db
+        .prepare_cached(SPEED_TESTS_SQL)?
+        .query_map(params![device_id, since], speed_test)?
+        .collect::<rusqlite::Result<_>>()?)
 }

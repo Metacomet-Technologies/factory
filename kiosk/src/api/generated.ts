@@ -201,6 +201,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v1/network/speed-tests": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Throughput tests that started within the range, for charts. */
+    get: operations["network_speed_tests"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v1/pricing": {
     parameters: {
       query?: never;
@@ -757,10 +774,58 @@ export interface components {
       points: components["schemas"]["NetworkPoint"][];
       target: string;
     };
+    /** @enum {string} */
+    NetworkSpeedOutcome: "ok" | "failed" | "timeout";
+    /** @description One stored throughput test. Rates are bits per second; latencies are average RTT to the first wan target. */
+    NetworkSpeedTest: {
+      /** @description Cloudflare colo code. The public IP is never stored. */
+      colo?: string | null;
+      /**
+       * Format: int64
+       * @description Nearest-rank p90 of per-request rates; null unless the outcome is ok.
+       */
+      download_bps?: number | null;
+      /**
+       * Format: int64
+       * @description Bytes moved, for every outcome.
+       */
+      download_bytes: number;
+      /**
+       * Format: double
+       * @description Bursts run while that direction transferred.
+       */
+      download_loaded_latency_ms?: number | null;
+      /** Format: int64 */
+      ended_ms: number;
+      /** @description Always set for failed tests. */
+      error?: string | null;
+      /** Format: int64 */
+      id: number;
+      /**
+       * Format: double
+       * @description One burst before the transfers.
+       */
+      idle_latency_ms?: number | null;
+      outcome: components["schemas"]["NetworkSpeedOutcome"];
+      /** Format: int64 */
+      started_ms: number;
+      /** Format: int64 */
+      upload_bps?: number | null;
+      /** Format: int64 */
+      upload_bytes: number;
+      /** Format: double */
+      upload_loaded_latency_ms?: number | null;
+    };
+    NetworkSpeedTests: {
+      range: string;
+      /** @description Oldest first. */
+      tests: components["schemas"]["NetworkSpeedTest"][];
+    };
     NetworkStatus: {
       device_id: string;
       /** Format: int64 */
       generated_at_ms: number;
+      latest_speed_test?: null | components["schemas"]["NetworkSpeedTest"];
       /** @description Registry order: lan, wan, dns, tailnet. */
       targets: components["schemas"]["NetworkTarget"][];
       warnings: string[];
@@ -895,13 +960,14 @@ export interface components {
       /** Format: int64 */
       ts_ms: number;
       /**
-       * @description Named SSE event: gpu.sample, ups.sample, ups.event, network.sample, llm.request,
-       *     fleet.change, pricing.changed, agents.usage, or devices.sample. ups.sample data is
-       *     UpsCurrent or null on failure. devices.sample data is a device view, or null when the
-       *     collector fails. History is not in the event.
+       * @description Named SSE event: gpu.sample, ups.sample, ups.event, network.sample, network.speedtest,
+       *     llm.request, fleet.change, pricing.changed, agents.usage, or devices.sample. ups.sample
+       *     data is UpsCurrent or null on failure. devices.sample data is a device view, or null when
+       *     the collector fails. History is not in the event.
        *     ups.event data is UpsEvent, sent once when an event opens and once when it closes.
        *     Zero-length self_test events send both an open frame and a closed frame.
        *     network.sample data is the array of Sample probed by one 30-second tick.
+       *     network.speedtest data is the NetworkSpeedTest row, sent once after it is stored.
        */
       type: string;
     };
@@ -1368,6 +1434,44 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["NetworkHistory"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  network_speed_tests: {
+    parameters: {
+      query?: {
+        /** @description 24h, 7d (default), 30d, 365d */
+        range?: string;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["NetworkSpeedTests"];
         };
       };
       400: {
