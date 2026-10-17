@@ -11,10 +11,13 @@ usage errors. Items the environment is exempt from are reported with
 Versions resolve the way builds do: `rustc` and `cargo` run in the repository
 root (honoring rust-toolchain.toml), `node`, `pnpm` and `vp` resolve in `kiosk/`.
 The check never installs or caches anything: rustup auto-install is forced off,
-and Vite+ shims are never executed (running one writes its resolve cache and
-installs a missing pin). For a shim, `vp env current --json` names the project's
-pinned version and binary, and only that real binary runs. The output never
-includes environment variables; command output is cut to its first line.
+Vite+ shims are never executed (running one writes its resolve cache and
+installs a missing pin), and pnpm is never executed (its launcher runs `node`
+from PATH and creates state under HOME). For a shim, `vp env current --json`
+names the project's pinned versions and binaries; only a real Node binary runs,
+with `--version`. pnpm and Vite+ versions come from their package manifests or
+the Vite+ store. The output never includes environment variables; command
+output is cut to its first line.
 """
 
 import argparse
@@ -115,14 +118,31 @@ def os_release(root):
     return fields
 
 
+def package_version(binary, names):
+    """Version in the nearest package.json above `binary` named one of `names`."""
+    directory = os.path.dirname(os.path.realpath(binary))
+    while directory != os.path.dirname(directory):
+        try:
+            manifest = json.loads(read(os.path.join(directory, "package.json")) or "{}")
+        except ValueError:
+            manifest = {}
+        if manifest.get("name") in names:
+            return manifest.get("version")
+        directory = os.path.dirname(directory)
+    return None
+
+
 def js_tool(tool, cwd):
-    """Return (version output or None, detail) for node/pnpm as `cwd` resolves them."""
+    """Return (version or None, detail) for node/pnpm as `cwd` resolves them, running only Node."""
     path = shutil.which(tool)
     if not path:
         return None, None
     real = os.path.realpath(path)
     if os.path.basename(real) != "vp":
-        return run([path, "--version"], cwd), path
+        if tool == "node":
+            return run([path, "--version"], cwd), path
+        found = package_version(real, {tool})
+        return found, path if found else f"{path}: no {tool} package.json"
     # Vite+ shim: ask Vite+ for the project's resolution instead of running it.
     try:
         current = json.loads(run([real, "env", "current", "--json"], cwd, whole=True) or "")
@@ -134,7 +154,10 @@ def js_tool(tool, cwd):
     binary = entry.get("bin_path") if tool == "node" else (entry.get("bin_paths") or {}).get(tool)
     if not entry.get("installed") or not binary or not os.access(binary, os.X_OK):
         return None, f"Vite+ pins {entry.get('version')}, not installed"
-    return run([binary, "--version"], cwd), binary
+    if tool == "node":
+        return run([binary, "--version"], cwd), binary
+    # The Vite+ store keys installs by version; running pnpm would write state.
+    return entry.get("version"), binary
 
 
 def playwright(root):
@@ -186,8 +209,10 @@ def items(root):
     ):
         out, detail = js_tool(tool, cwd)
         add(name, expected, f"{out} ({detail})" if out else detail, expected and version(out) == expected)
-    vp = run(["vp", "--version"], KIOSK)
-    add("vite-plus", VITE_PLUS, vp, version(vp) == VITE_PLUS)
+    vp = shutil.which("vp")
+    # Global Vite+ installs are named vp-global; npm installs are vite-plus.
+    found = package_version(vp, {"vite-plus", "vp-global"}) if vp else None
+    add("vite-plus", VITE_PLUS, f"{found} ({vp})" if found else vp, found == VITE_PLUS)
 
     base, browsers = playwright(root)
     add(

@@ -60,6 +60,28 @@ class CheckTest(unittest.TestCase):
         os.makedirs(self.home, exist_ok=True)
         self.outputs = fixture_outputs()
         self.env = {"PLAYWRIGHT_BROWSERS_PATH": self.browsers}
+        self.pnpm_state = os.path.join(self.home, ".local", "share", "pnpm")
+        pins = repo_pins()
+        modules = os.path.join(base, "tools", "node_modules")
+        self.link(self.package(os.path.join(modules, "pnpm"), "pnpm", pins["pnpm"], "pnpm.cjs"), "pnpm")
+        self.link(self.package(os.path.join(modules, "vite-plus"), "vite-plus", pins["vp"], "vp"), "vp")
+
+    def package(self, directory, name, version, binary):
+        """An npm-style package whose launcher, like pnpm 12's, runs node from PATH and writes state."""
+        write(os.path.join(directory, "package.json"), json.dumps({"name": name, "version": version}))
+        launcher = os.path.join(directory, "bin", binary)
+        write(launcher, f"""#!/bin/sh
+node --version >/dev/null
+/bin/mkdir -p '{self.pnpm_state}'
+printf '{version}\\n'
+""", 0o755)
+        return launcher
+
+    def link(self, target, tool):
+        os.makedirs(self.bin, exist_ok=True)
+        if os.path.lexists(os.path.join(self.bin, tool)):
+            os.remove(os.path.join(self.bin, tool))
+        os.symlink(target, os.path.join(self.bin, tool))
 
     def install_chromium(self, base):
         write(os.path.join(base, "chromium-1248", "INSTALLATION_COMPLETE"), "")
@@ -72,13 +94,14 @@ class CheckTest(unittest.TestCase):
         reports the pinned runtime and package manager like the real CLI.
         """
         pins = repo_pins()
-        for tool in ("node", "pnpm", "vp"):
-            del self.outputs[tool]
-        runtime = os.path.join(self.tmp.name, "vp-home", "js_runtime", "node", pins["node"], "bin", "node")
-        manager = os.path.join(self.tmp.name, "vp-home", "package_manager", "pnpm", pins["pnpm"], "bin", "pnpm")
+        del self.outputs["node"]
+        home = os.path.join(self.tmp.name, "vp-home")
+        runtime = os.path.join(home, "js_runtime", "node", pins["node"], "bin", "node")
+        store = os.path.join(home, "package_manager", "pnpm", pins["pnpm"], "pnpm")
+        manager = os.path.join(store, "bin", "pnpm")
         if installed:
             write(runtime, f"#!/bin/sh\nprintf 'v{pins['node']}\\n'\n", 0o755)
-            write(manager, f"#!/bin/sh\nprintf '{pins['pnpm']}\\n'\n", 0o755)
+            self.package(store, "pnpm", pins["pnpm"], "pnpm")
         current = {
             "node": {"version": pins["node"], "bin_path": runtime, "installed": installed, "mode": "managed"},
             "package_manager": {
@@ -87,7 +110,9 @@ class CheckTest(unittest.TestCase):
             },
         }
         self.mutated = os.path.join(self.tmp.name, "shim-ran")
-        vp = os.path.join(self.tmp.name, "vp-home", "current", "bin", "vp")
+        write(os.path.join(home, pins["vp"], "package.json"), json.dumps({"name": "vp-global", "version": pins["vp"]}))
+        os.symlink(pins["vp"], os.path.join(home, "current"))
+        vp = os.path.join(home, pins["vp"], "bin", "vp")
         write(vp, f"""#!/bin/sh
 # Only shell builtins: PATH holds nothing but these stubs.
 case "${{0##*/}} $*" in
@@ -96,9 +121,8 @@ case "${{0##*/}} $*" in
   *) : > '{self.mutated}'; printf 'v0.0.1\\n' ;;
 esac
 """, 0o755)
-        os.makedirs(self.bin, exist_ok=True)
         for tool in ("node", "pnpm", "vp"):
-            os.symlink(vp, os.path.join(self.bin, tool))
+            self.link(os.path.join(home, "current", "bin", "vp"), tool)
 
     def run_check(self, env_name):
         stubs = {}
@@ -116,6 +140,7 @@ esac
             env=env, capture_output=True, text=True, check=False,
         )
         self.assertNotIn(SENTINEL, out.stdout + out.stderr)
+        self.assertFalse(os.path.exists(self.pnpm_state), "pnpm ran")
         report = json.loads(out.stdout)
         self.assertEqual(report["env"], env_name)
         return out.returncode, report, {item["name"]: item for item in report["items"]}
@@ -144,6 +169,14 @@ esac
         self.assertFalse(items["node"]["ok"])
         self.assertTrue(items["node"]["actual"].startswith("v24.21.0 ("))
         self.assertTrue(items["rust"]["ok"])
+
+    def test_pnpm_version_comes_from_its_manifest(self):
+        modules = os.path.join(self.tmp.name, "global", "node_modules")
+        self.link(self.package(os.path.join(modules, "pnpm"), "pnpm", "12.14.0", "pnpm.cjs"), "pnpm")
+        code, _, items = self.run_check("ci")
+        self.assertEqual(code, 1)
+        self.assertFalse(items["pnpm"]["ok"])
+        self.assertTrue(items["pnpm"]["actual"].startswith("12.14.0 ("))
 
     def test_missing_shellcheck_fails(self):
         del self.outputs["shellcheck"]
