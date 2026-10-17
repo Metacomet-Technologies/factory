@@ -218,12 +218,23 @@ lives in this worktree's `.sandbox/`, is created on first startup, survives
 - `fake-net` holds a TCP listener on private `127.0.0.1:2222`, the API's tailnet
   target, while `.sandbox/network-tailnet` reads `up`, and closes it on `down`.
   Use `scripts/sandbox logs fake-net` for its failures.
+- `fake-net` also serves the speed endpoints on private `127.0.0.1:8099`, the
+  API's `--network-speed-url`. `GET /__down?bytes=N` streams N zero bytes and
+  `POST /__up` reads the body, both with `cf-meta-colo: SBX`.
+  `.sandbox/network-speed` picks the mode for each request. `ok` (default) runs
+  at loopback speed, `slow` paces bodies at 50 Mb/s so each direction stops
+  after its 10 MB step, `fail` answers HTTP 500, and `hang` accepts and never
+  answers, so the 60 s cap fires. Tests run 120 s after factory-api starts and
+  every 120 s after that, the minimum interval. A `hang` test ends at the cap
+  long before the next one starts.
 
 ```sh
 printf '%s\n' loss > .sandbox/network-ping
 printf '127.0.0.1 localhost\n' > .sandbox/network-hosts
 printf '%s\n' down > .sandbox/network-tailnet
 python3 scripts/sandbox-shims/network-smoke.py
+printf '%s\n' slow > .sandbox/network-speed
+python3 scripts/sandbox-shims/speed-smoke.py
 ```
 
 The check walks every scenario, waits for a tick that started after each fixture
@@ -232,6 +243,16 @@ It also checks `GET /v1/network/history` at raw and hourly resolution and a
 `network.sample` frame on `/v1/stream`, then restores the healthy fixtures. It
 takes about six minutes and prints its evidence as JSON. The shim's RTTs are
 fixtures; only loopback DNS and TCP timings are measured.
+
+`speed-smoke.py` sets each speed mode in turn and waits for a test that started
+after the change. `ok` must move the full 440 MB and 290 MB with colo `SBX` and
+the shim's wan RTT as idle and loaded latency. `slow` must stop at 40 MB each
+way and still be `ok`. `fail` must be `failed` with an HTTP 500 error, and
+`hang` a `timeout` of about 60 s. Rates are null for both, and neither moves a
+byte. Each stored row must match its `network.speedtest` frame on `/v1/stream`,
+`latest_speed_test` in `GET /v1/network` and `GET /v1/network/speed-tests`. It
+restores `ok`, takes up to ten minutes and prints the rows as JSON. Rates and
+loaded latency are loopback measurements, not link speeds.
 
 ## Pricing hooks (MET-111)
 
