@@ -5,6 +5,7 @@ pub mod devices;
 pub mod devices_history;
 pub mod fleet;
 mod kiosk;
+pub mod network;
 pub mod pool;
 pub mod types;
 pub mod ups;
