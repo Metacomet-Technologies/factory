@@ -154,7 +154,7 @@ export function observeStagePolicy(observations: Observation[], log: Log) {
         evidence: [], newDispatch: !observation.existing,
       });
       log('stage-policy', { issue, repository: repo?.name ?? 'unknown',
-        runner: ['gpu', 'console', 'orb'].includes(observation.runner ?? '') ? observation.runner : 'unknown',
+        runner: ['gpu', 'console', 'orb', 'cursor'].includes(observation.runner ?? '') ? observation.runner : 'unknown',
         observedLifecycleState: ['triage', 'backlog', 'unstarted', 'started', 'completed', 'canceled'].includes(observation.state) ? observation.state : 'unknown',
         stage, target, evidenceIdentifiers: [], classification: 'unknown', dispatchSnapshot: 'unknown',
         policyRevision: policy?.revision ?? 'unknown', trustedMainSha: policy?.trustedMainSha ?? 'unknown', ...decision });
