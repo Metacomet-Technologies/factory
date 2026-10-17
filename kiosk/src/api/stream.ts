@@ -255,44 +255,120 @@ export function parseEvent(value: unknown): StreamEvent | null {
   return null;
 }
 
+export type StreamStatus = "connecting" | "live" | "reconnecting";
+
+const EVENT_TYPES = [
+  "gpu.sample",
+  "ups.sample",
+  "ups.event",
+  "llm.request",
+  "fleet.change",
+  "pricing.changed",
+  "agents.usage",
+  "devices.sample",
+];
+/** factory-api emits gpu.sample every 15 s even without a GPU, so 45 s of silence means a dead socket. */
+export const STREAM_SILENCE_MS = 45_000;
+const RETRY_MIN_MS = 1_000;
+const RETRY_MAX_MS = 30_000;
+// EventSource.CLOSED; read as a literal because tests stub the global without static fields.
+const CLOSED = 2;
+
+/**
+ * Live SSE connection with three layers of recovery on top of the browser's own retry:
+ * a silence watchdog that drops and reopens a socket that stopped delivering events,
+ * a jittered exponential backoff when the browser gave up (readyState CLOSED after an
+ * HTTP error), and an immediate reopen when the tab regains network or visibility.
+ * Every reopen after the first bumps `snapshotRevision` so REST views refetch what the
+ * stream may have missed.
+ */
 export function useStream() {
   const [state, dispatch] = useReducer(streamReducer, initialLiveState);
-  const [connected, setConnected] = useState(false);
+  const [status, setStatus] = useState<StreamStatus>("connecting");
   const [snapshotRevision, setSnapshotRevision] = useState(0);
   useEffect(() => {
-    const source = new EventSource(apiUrl("/v1/stream"));
+    let source: EventSource | null = null;
     let opened = false;
-    source.onopen = () => {
-      setConnected(true);
-      if (opened) setSnapshotRevision((revision) => revision + 1);
-      opened = true;
-    };
-    source.onerror = () => {
-      setConnected(false);
+    let attempts = 0;
+    let disposed = false;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    const lost = () => {
+      setStatus("reconnecting");
       dispatch({ type: "gpu.sample", ts_ms: Date.now(), data: null });
       dispatch({ type: "devices.sample", ts_ms: Date.now(), data: null });
     };
+    const close = () => {
+      clearTimeout(watchdog);
+      clearTimeout(retry);
+      source?.close();
+      source = null;
+    };
+    const schedule = () => {
+      clearTimeout(retry);
+      const base = Math.min(RETRY_MAX_MS, RETRY_MIN_MS * 2 ** attempts);
+      attempts += 1;
+      retry = setTimeout(open, base * (0.5 + Math.random() * 0.5));
+    };
+    const armWatchdog = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => {
+        lost();
+        close();
+        schedule();
+      }, STREAM_SILENCE_MS);
+    };
     const receive = (message: MessageEvent<string>) => {
+      armWatchdog();
       try {
         const event = parseEvent(JSON.parse(message.data));
         if (event) dispatch(event);
       } catch {
-        /* Ignore malformed frames; native EventSource owns reconnection. */
+        /* Ignore malformed frames; the socket itself is still healthy. */
       }
     };
-    source.onmessage = receive;
-    for (const type of [
-      "gpu.sample",
-      "ups.sample",
-      "ups.event",
-      "llm.request",
-      "fleet.change",
-      "pricing.changed",
-      "agents.usage",
-      "devices.sample",
-    ])
-      source.addEventListener(type, receive);
-    return () => source.close();
+    function open() {
+      if (disposed) return;
+      close();
+      const next = new EventSource(apiUrl("/v1/stream"));
+      source = next;
+      next.onopen = () => {
+        attempts = 0;
+        setStatus("live");
+        if (opened) setSnapshotRevision((revision) => revision + 1);
+        opened = true;
+        armWatchdog();
+      };
+      next.onerror = () => {
+        lost();
+        clearTimeout(watchdog);
+        // While CONNECTING the browser retries by itself; once CLOSED it never will.
+        if (next.readyState === CLOSED) {
+          close();
+          schedule();
+        }
+      };
+      next.onmessage = receive;
+      for (const type of EVENT_TYPES) next.addEventListener(type, receive);
+    }
+    const resume = () => {
+      if (document.visibilityState === "hidden") return;
+      if (!source || source.readyState === CLOSED) {
+        attempts = 0;
+        open();
+      }
+    };
+    window.addEventListener("online", resume);
+    document.addEventListener("visibilitychange", resume);
+    window.addEventListener("pageshow", resume);
+    open();
+    return () => {
+      disposed = true;
+      close();
+      window.removeEventListener("online", resume);
+      document.removeEventListener("visibilitychange", resume);
+      window.removeEventListener("pageshow", resume);
+    };
   }, []);
-  return { ...state, connected, snapshotRevision };
+  return { ...state, status, connected: status === "live", snapshotRevision };
 }

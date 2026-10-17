@@ -1,12 +1,69 @@
 import { lazy, Suspense } from "react";
-import type { DeviceHistory, DeviceRange, DeviceView } from "../api/types";
+import { Activity, Cpu, HardDrive, MemoryStick, Network, Thermometer, Wrench } from "lucide-react";
+import type { DeviceHistory, DeviceRange, DeviceView, Metric } from "../api/types";
+import type { components } from "../api/generated";
 import { metricText } from "../lib/devices";
 import { number, seen } from "../lib/format";
-import { Badge } from "./ui/badge";
-import { Button } from "./ui/button";
+import { KeyValue } from "./ui/key-value";
+import { MeterBar } from "./ui/meter-bar";
+import { PageHeader } from "./ui/page-header";
+import { Panel } from "./ui/panel";
+import { RangeToggle } from "./ui/range-toggle";
+import { Stat, StatGrid } from "./ui/stat";
+import { StatusChip, type Tone } from "./ui/status-chip";
+
+type HealthStatus = components["schemas"]["HealthStatus"];
+type Availability = components["schemas"]["Availability"];
 
 const DevicesChart = lazy(() => import("./devices-chart"));
 const ranges: DeviceRange[] = ["1h", "24h", "7d"];
+
+export function healthTone(status: HealthStatus): Tone {
+  switch (status) {
+    case "critical":
+      return "fail";
+    case "warning":
+    case "stale":
+      return "warn";
+    case "healthy":
+      return "ok";
+    default:
+      return "neutral";
+  }
+}
+
+const percentTone = (value: number | null | undefined, warn = 80, fail = 95) =>
+  value == null ? "muted" : value >= fail ? "fail" : value >= warn ? "warn" : "ok";
+
+const availabilityText = (value: Availability) => value.replaceAll("_", " ");
+
+/** Numeric stat that tweens on live updates while keeping the metric's unit formatting. */
+function MetricStat({
+  label,
+  metric,
+  tone,
+  size,
+}: {
+  label: string;
+  metric: Metric;
+  tone?: "ok" | "warn" | "fail" | undefined;
+  size?: "sm" | "md" | "lg" | undefined;
+}) {
+  return (
+    <Stat
+      label={label}
+      value={metric.value ?? null}
+      format={(n) => (n == null ? "—" : metricText({ ...metric, value: n }))}
+      tone={tone}
+      size={size}
+      note={
+        metric.value == null && metric.availability !== "available"
+          ? availabilityText(metric.availability)
+          : undefined
+      }
+    />
+  );
+}
 
 export default function DevicesPage({
   view,
@@ -30,21 +87,20 @@ export default function DevicesPage({
   now: number;
 }) {
   const host = view?.device;
+  const temperature = host?.cpu.temperature.value;
+  const maintenance = host?.maintenance;
   return (
     <main id="main" className="dashboard devices-page">
-      <div className="intro">
-        <div>
-          <p className="eyebrow">FACTORY GPU</p>
-          <h2>Host health</h2>
-        </div>
-        <p className="muted">
-          <a href="/">Dashboard</a>
-          {" · "}
-          <a href="/devices">Devices</a>
-          {host ? ` · updated ${seen(host.observed_at_ms, now)}` : ""}
-          {connected ? "" : " · reconnecting"}
-        </p>
-      </div>
+      <PageHeader
+        eyebrow="factory-gpu"
+        title="Host health"
+        aside={
+          <>
+            {host ? `Updated ${seen(host.observed_at_ms, now)}` : "Waiting for host"}
+            {connected ? "" : " · reconnecting"}
+          </>
+        }
+      />
       {error && (
         <p role="alert" className="status-fail">
           {error}
@@ -53,115 +109,270 @@ export default function DevicesPage({
       {loading && !host && <p className="muted">Loading devices…</p>}
       {!loading && !error && !host && <p className="muted">No device sample yet.</p>}
       {host && (
-        <>
-          <section className="ups-panel" aria-label="Host summary">
-            <h3>
-              {host.identity.hostname ?? host.device_id} <Badge>{host.health.status}</Badge>
-              {live ? <span className="muted"> Live</span> : <span className="muted"> Stored</span>}
-            </h3>
-            <div className="ups-readings">
-              <div>
-                <p>CPU</p>
-                <p>{metricText(host.cpu.utilization)}</p>
-              </div>
-              <div>
-                <p>Memory used</p>
-                <p>{metricText(host.memory.used)}</p>
-              </div>
-              <div>
-                <p>Temperature</p>
-                <p>{metricText(host.cpu.temperature)}</p>
-              </div>
-              <div>
-                <p>Load</p>
-                <p>{metricText(host.cpu.load1)}</p>
-              </div>
-            </div>
+        <div className="device-grid">
+          <Panel
+            title={host.identity.hostname ?? host.device_id}
+            subtitle={`Host summary · ${live ? "Live" : "Stored"} · up ${metricText(host.identity.uptime)}`}
+            icon={<HardDrive />}
+            index={0}
+            className="device-summary"
+            tone={
+              host.health.status === "critical"
+                ? "fail"
+                : host.health.status === "warning"
+                  ? "warn"
+                  : undefined
+            }
+            action={
+              <StatusChip
+                tone={healthTone(host.health.status)}
+                dot
+                pulse={live && host.health.status === "critical"}
+              >
+                {host.health.status}
+              </StatusChip>
+            }
+            aria-label="Host summary"
+          >
+            <StatGrid columns={4}>
+              <MetricStat label="CPU" metric={host.cpu.utilization} size="lg" />
+              <MetricStat label="Memory used" metric={host.memory.used} size="lg" />
+              <MetricStat
+                label="Temperature"
+                metric={host.cpu.temperature}
+                size="lg"
+                tone={
+                  temperature == null
+                    ? undefined
+                    : temperature >= 95
+                      ? "fail"
+                      : temperature >= 85
+                        ? "warn"
+                        : undefined
+                }
+              />
+              <MetricStat label="Load" metric={host.cpu.load1} size="lg" />
+            </StatGrid>
+            <MeterBar
+              label="CPU utilization"
+              value={host.cpu.utilization.value}
+              tone={percentTone(host.cpu.utilization.value)}
+            />
             {host.health.reasons.length > 0 && (
-              <ul>
+              <ul className="device-reasons">
                 {host.health.reasons.map((reason) => (
-                  <li key={`${reason.metric}-${reason.threshold}-${reason.detail}`}>
+                  <li
+                    key={`${reason.metric}-${reason.threshold}-${reason.detail}`}
+                    className={reason.status === "critical" ? "status-fail" : "status-warn"}
+                  >
                     {reason.metric} {reason.threshold}{" "}
                     {reason.value == null ? "—" : number(reason.value)} {reason.detail}
                   </li>
                 ))}
               </ul>
             )}
-          </section>
-          <section className="ups-panel" aria-label="CPU history">
-            <h3>CPU history</h3>
-            <div className="row">
-              {ranges.map((item) => (
-                <Button
-                  key={item}
-                  variant={item === range ? "default" : "ghost"}
-                  aria-pressed={item === range}
-                  onClick={() => setRange(item)}
-                >
-                  {item}
-                </Button>
-              ))}
-            </div>
+          </Panel>
+
+          <Panel
+            title="CPU history"
+            subtitle="Average utilization per bucket"
+            icon={<Activity />}
+            index={1}
+            className="device-history"
+            action={
+              <RangeToggle
+                value={range}
+                options={ranges}
+                onChange={setRange}
+                label="History range"
+              />
+            }
+          >
             {!history || history.points.length === 0 ? (
-              <p className="muted">No samples in this range.</p>
+              <p className="empty">No samples in this range.</p>
             ) : (
-              <Suspense fallback={<p className="muted">Loading chart…</p>}>
+              <Suspense fallback={<p className="loading">Loading chart…</p>}>
                 <DevicesChart history={history.points} />
               </Suspense>
             )}
-          </section>
-          <section className="ups-panel" aria-label="Filesystems">
-            <h3>Filesystems</h3>
+          </Panel>
+
+          <Panel title="Memory" subtitle="RAM and swap" icon={<MemoryStick />} index={2}>
+            <StatGrid columns={2}>
+              <MetricStat label="Total" metric={host.memory.total} size="sm" />
+              <MetricStat label="Available" metric={host.memory.available} size="sm" />
+              <MetricStat label="Swap total" metric={host.memory.swap_total} size="sm" />
+              <MetricStat label="Swap free" metric={host.memory.swap_free} size="sm" />
+            </StatGrid>
+            <MeterBar
+              label="Memory used"
+              value={
+                host.memory.used.value != null && host.memory.total.value
+                  ? (100 * host.memory.used.value) / host.memory.total.value
+                  : null
+              }
+              tone={percentTone(
+                host.memory.used.value != null && host.memory.total.value
+                  ? (100 * host.memory.used.value) / host.memory.total.value
+                  : null,
+                85,
+                95,
+              )}
+            />
+          </Panel>
+
+          <Panel title="Network & disk I/O" subtitle="Current rates" icon={<Network />} index={3}>
+            <StatGrid columns={2}>
+              <MetricStat label="Net rx" metric={host.network.rx} size="sm" />
+              <MetricStat label="Net tx" metric={host.network.tx} size="sm" />
+              <MetricStat label="Disk read" metric={host.disk_io.read} size="sm" />
+              <MetricStat label="Disk write" metric={host.disk_io.write} size="sm" />
+            </StatGrid>
+            <KeyValue
+              rows={[
+                ["I/O wait", metricText(host.cpu.iowait)],
+                ["Load 5 / 15", `${metricText(host.cpu.load5)} / ${metricText(host.cpu.load15)}`],
+              ]}
+            />
+          </Panel>
+
+          <Panel title="Filesystems" subtitle="Space and inodes" icon={<HardDrive />} index={4}>
             {host.filesystems.length === 0 ? (
-              <p className="muted">No filesystems reported.</p>
+              <p className="empty">No filesystems reported.</p>
             ) : (
-              <ul>
+              <ul className="device-list">
                 {host.filesystems.map((fs) => (
                   <li key={fs.id}>
-                    {fs.mountpoint} {metricText(fs.used_percent)} used, inodes{" "}
-                    {metricText(fs.inodes_used_percent)}
+                    <div className="row">
+                      <strong>{fs.mountpoint}</strong>
+                      <span className="muted">
+                        {metricText(fs.used)} of {metricText(fs.size)} · inodes{" "}
+                        {metricText(fs.inodes_used_percent)}
+                      </span>
+                    </div>
+                    <MeterBar
+                      label={`${fs.mountpoint} used`}
+                      value={fs.used_percent.value}
+                      tone={percentTone(fs.used_percent.value, 80, 90)}
+                    />
                   </li>
                 ))}
               </ul>
             )}
-          </section>
-          <section className="ups-panel" aria-label="Physical drives">
-            <h3>Drives</h3>
+          </Panel>
+
+          <Panel title="Drives" subtitle="SMART and wear" icon={<Cpu />} index={5}>
             {host.drives.length === 0 ? (
-              <p className="muted">No physical drives reported.</p>
+              <p className="empty">No physical drives reported.</p>
             ) : (
-              <ul>
+              <ul className="device-list">
                 {host.drives.map((drive) => (
                   <li key={drive.id}>
-                    {drive.id} SMART {drive.smart.availability}
-                    {drive.smart.passed == null ? "" : drive.smart.passed ? " passed" : " failed"}
-                    {drive.smart.availability === "unsupported"
-                      ? ". Unsupported SMART is not evidence this drive is healthy."
-                      : ""}
+                    <div className="row">
+                      <strong>{drive.model ?? drive.kernel}</strong>
+                      <StatusChip
+                        tone={
+                          drive.media_critical || drive.smart.passed === false
+                            ? "fail"
+                            : drive.smart.passed
+                              ? "ok"
+                              : "neutral"
+                        }
+                      >
+                        SMART {availabilityText(drive.smart.availability)}
+                        {drive.smart.passed == null
+                          ? ""
+                          : drive.smart.passed
+                            ? " · passed"
+                            : " · failed"}
+                      </StatusChip>
+                    </div>
+                    <p className="muted">
+                      {drive.id} · {metricText(drive.size)} · spare{" "}
+                      {metricText(drive.available_spare)} · media errors{" "}
+                      {metricText(drive.media_errors)} · {metricText(drive.temperature)}
+                      {drive.smart.availability === "unsupported"
+                        ? ". Unsupported SMART is not evidence this drive is healthy."
+                        : ""}
+                    </p>
                   </li>
                 ))}
               </ul>
             )}
-          </section>
-          <section className="ups-panel" aria-label="Maintenance">
-            <h3>Maintenance</h3>
-            <p>
-              Backup {seen(host.maintenance.backup.last_success_ms, now)}. Reboot{" "}
-              {host.maintenance.reboot.availability === "available"
-                ? host.maintenance.reboot.reboot_required
-                  ? "required"
-                  : "not required"
-                : host.maintenance.reboot.availability.replaceAll("_", " ")}
-              . Clock{" "}
-              {host.maintenance.clock.synchronized == null
-                ? "—"
-                : host.maintenance.clock.synchronized
-                  ? "synchronized"
-                  : "not synchronized"}
-              . <a href={host.maintenance.ups.href}>UPS</a>
-            </p>
-          </section>
-        </>
+          </Panel>
+
+          <Panel title="Cooling" subtitle="Sensors and fans" icon={<Thermometer />} index={6}>
+            {host.cooling.temperatures.length === 0 && host.cooling.fans.length === 0 ? (
+              <p className="empty">
+                Sensors {availabilityText(host.cooling.temperatures_availability)} · fans{" "}
+                {availabilityText(host.cooling.fans_availability)}
+              </p>
+            ) : (
+              <KeyValue
+                rows={[...host.cooling.temperatures, ...host.cooling.fans].map(
+                  (item) => [item.name, metricText(item.metric)] as const,
+                )}
+              />
+            )}
+            {host.gpus.length > 0 && (
+              <KeyValue
+                rows={host.gpus.map(
+                  (gpu) =>
+                    [
+                      `GPU ${gpu.index}`,
+                      `${metricText(gpu.utilization)} · ${metricText(gpu.memory_used)} of ${metricText(gpu.memory_total)} · ${metricText(gpu.temperature)} · ${metricText(gpu.power)}`,
+                    ] as const,
+                )}
+              />
+            )}
+          </Panel>
+
+          {maintenance && (
+            <Panel
+              title="Maintenance"
+              subtitle="Backup, reboot, clock, power"
+              icon={<Wrench />}
+              index={7}
+            >
+              <p>
+                Backup {seen(maintenance.backup.last_success_ms, now)}. Reboot{" "}
+                {maintenance.reboot.availability === "available"
+                  ? maintenance.reboot.reboot_required
+                    ? "required"
+                    : "not required"
+                  : availabilityText(maintenance.reboot.availability)}
+                . Clock{" "}
+                {maintenance.clock.synchronized == null
+                  ? "—"
+                  : maintenance.clock.synchronized
+                    ? "synchronized"
+                    : "not synchronized"}
+                . <a href={maintenance.ups.href}>UPS</a>
+                {maintenance.ups.status ? ` ${maintenance.ups.status}` : ""}
+                {maintenance.ups.charge_percent == null
+                  ? ""
+                  : ` · ${number(maintenance.ups.charge_percent)}%`}
+              </p>
+              {maintenance.backup.error && (
+                <p className="status-warn">{maintenance.backup.error}</p>
+              )}
+              {maintenance.reboot.detail && <p className="muted">{maintenance.reboot.detail}</p>}
+              {maintenance.services.length > 0 && (
+                <KeyValue
+                  rows={maintenance.services.map(
+                    (service) =>
+                      [
+                        service.name,
+                        <StatusChip key={service.name} tone={service.ok ? "ok" : "fail"} dot>
+                          {service.ok ? "ok" : "failing"}
+                        </StatusChip>,
+                      ] as const,
+                  )}
+                />
+              )}
+            </Panel>
+          )}
+        </div>
       )}
     </main>
   );

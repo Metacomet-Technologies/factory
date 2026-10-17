@@ -11,8 +11,10 @@ import {
   YAxis,
 } from "recharts";
 import type { Gpu, UpsEvent, UpsPoint } from "../api/types";
+import { useReducedMotion } from "../lib/motion";
 import { upsChartData } from "../lib/ups";
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from "./ui/chart";
+import { Panel } from "./ui/panel";
 
 const config = {
   load: { label: "Load (W)", color: "var(--accent-text)" },
@@ -21,6 +23,11 @@ const config = {
   charge: { label: "Charge (%)", color: "var(--accent-text)" },
   runtime: { label: "Runtime (min)", color: "var(--muted-foreground)" },
 };
+const titles = {
+  load: ["Load", "Watts · GPU dashed"],
+  input: ["Input voltage", "100–139 V transfer band"],
+  charge: ["Charge", "Percent · runtime (min) on the right axis"],
+} as const;
 const date = (value: number) => new Date(value).toLocaleString();
 const tick = (value: number) =>
   new Date(value).toLocaleString(undefined, {
@@ -41,6 +48,7 @@ export default function UpsCharts({
   events: UpsEvent[];
   now: number;
 }) {
+  const reduced = useReducedMotion();
   const { data, scatter } = useMemo(() => {
     const data = upsChartData(history, gpu);
     return {
@@ -54,17 +62,11 @@ export default function UpsCharts({
       event.started_ms >= (history[0]?.ts_ms ?? Infinity) &&
       event.started_ms <= now,
   );
+  const animation = { isAnimationActive: !reduced, animationDuration: 900 } as const;
   return (
     <div className="ups-chart-grid">
-      {(["load", "input", "charge"] as const).map((metric) => (
-        <section key={metric} className="ups-panel">
-          <h3>
-            {metric === "load"
-              ? "Load W · GPU W (dashed)"
-              : metric === "input"
-                ? "Input voltage · 100–139 V transfer band"
-                : "Charge % · Runtime min (right axis)"}
-          </h3>
+      {(["load", "input", "charge"] as const).map((metric, index) => (
+        <Panel key={metric} title={titles[metric][0]} subtitle={titles[metric][1]} index={index}>
           <ChartContainer
             config={config}
             className="ups-history-chart"
@@ -75,7 +77,7 @@ export default function UpsCharts({
               accessibilityLayer
               margin={{ left: 0, right: 12, top: 14, bottom: 0 }}
             >
-              <CartesianGrid vertical={false} />
+              <CartesianGrid vertical={false} strokeDasharray="3 4" />
               <XAxis
                 dataKey="ts_ms"
                 type="number"
@@ -91,14 +93,14 @@ export default function UpsCharts({
               {metric === "charge" && <YAxis yAxisId="runtime" orientation="right" width={36} />}
               <ChartTooltip
                 content={<ChartTooltipContent />}
-                labelFormatter={(value) => date(Number(value))}
+                labelFormatter={(_, items) => date(Number(items[0]?.payload?.ts_ms))}
               />
               {metric === "input" && (
                 <ReferenceArea
                   y1={100}
                   y2={139}
                   fill="var(--accent-text)"
-                  fillOpacity={0.12}
+                  fillOpacity={0.1}
                   ifOverflow="extendDomain"
                 />
               )}
@@ -129,51 +131,55 @@ export default function UpsCharts({
                 ))}
               <Line
                 dataKey={metric}
+                type="monotone"
                 stroke="var(--accent-text)"
+                strokeWidth={2}
                 dot={data.length === 1}
-                isAnimationActive={false}
+                activeDot={{ r: 4, strokeWidth: 0 }}
+                {...animation}
               />
               {metric === "load" && (
                 <Line
                   dataKey="gpu"
+                  type="monotone"
                   stroke="var(--muted-foreground)"
                   strokeDasharray="5 3"
                   dot={false}
-                  isAnimationActive={false}
+                  {...animation}
                 />
               )}
               {metric === "charge" && (
                 <Line
                   dataKey="runtime"
+                  type="monotone"
                   yAxisId="runtime"
                   stroke="var(--muted-foreground)"
                   strokeDasharray="5 3"
                   dot={data.length === 1}
-                  isAnimationActive={false}
+                  {...animation}
                 />
               )}
             </LineChart>
           </ChartContainer>
-          {!history.length && <p className="muted">No history in this range.</p>}
-        </section>
+          {!history.length && <p className="empty">No history in this range.</p>}
+        </Panel>
       ))}
-      <section className="ups-panel">
-        <h3>Runtime vs load · history points</h3>
+      <Panel title="Runtime vs load" subtitle="One point per history bucket" index={3}>
         <ChartContainer
           config={config}
           className="ups-history-chart"
           aria-label="Runtime versus load"
         >
           <ScatterChart accessibilityLayer margin={{ left: 0, right: 12, top: 14, bottom: 0 }}>
-            <CartesianGrid />
+            <CartesianGrid strokeDasharray="3 4" />
             <XAxis type="number" dataKey="load" name="Load" unit=" W" />
             <YAxis type="number" dataKey="runtime" name="Runtime" unit=" min" width={50} />
             <ChartTooltip content={<ChartTooltipContent />} />
-            <Scatter data={scatter} fill="var(--accent-text)" isAnimationActive={false} />
+            <Scatter data={scatter} fill="var(--accent-text)" fillOpacity={0.8} {...animation} />
           </ScatterChart>
         </ChartContainer>
-        {!history.length && <p className="muted">No history in this range.</p>}
-      </section>
+        {!history.length && <p className="empty">No history in this range.</p>}
+      </Panel>
     </div>
   );
 }

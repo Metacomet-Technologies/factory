@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor, within } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
 import App from "../App";
 import DevicesPage from "./devices-page";
@@ -248,17 +248,23 @@ describe("devices page", () => {
       }),
     );
     render(<App />);
-    fireEvent.click(await screen.findByRole("link", { name: "Devices" }));
-    expect(window.location.pathname).toBe("/devices");
-    expect(await screen.findByRole("heading", { name: "Devices" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("link", { name: /factory-gpu/ }));
+    // Only nodes with a device page are links; factory-console and factory-edge stay plain tiles.
+    const fleet = await screen.findByRole("region", { name: "Fleet" });
+    expect(await within(fleet).findAllByRole("link")).toHaveLength(1);
+    fireEvent.click(within(fleet).getByRole("link", { name: /factory-gpu/ }));
     expect(window.location.pathname).toBe("/devices/factory-gpu");
     expect(await screen.findByRole("heading", { name: "Host health" })).toBeInTheDocument();
+    const breadcrumb = within(screen.getByRole("navigation", { name: "Breadcrumb" }));
+    expect(breadcrumb.getByRole("link", { name: "factory" })).toHaveAttribute("href", "/");
+    expect(breadcrumb.getByRole("link", { name: "devices" })).toHaveAttribute("href", "/");
+    expect(breadcrumb.getByText("factory-gpu")).toHaveAttribute("aria-current", "page");
     act(() => {
       window.history.back();
       window.dispatchEvent(new PopStateEvent("popstate"));
     });
-    await waitFor(() => expect(window.location.pathname).toBe("/devices"));
-    expect(screen.getByRole("heading", { name: "Devices" })).toBeInTheDocument();
+    await waitFor(() => expect(window.location.pathname).toBe("/"));
+    expect(
+      screen.getByRole("heading", { name: "Your local compute. In focus." }),
+    ).toBeInTheDocument();
   });
 });

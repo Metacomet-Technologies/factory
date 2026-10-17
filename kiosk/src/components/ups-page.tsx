@@ -1,11 +1,19 @@
 import { lazy, Suspense, useEffect, useState } from "react";
+import { BatteryCharging, History, Plug, Settings2, Zap } from "lucide-react";
 import { apiUrl, useApi } from "../api/client";
 import type { LiveState } from "../api/stream";
 import type { Endpoints, UpsCurrent, UpsEvent, UpsRange, UpsSettings } from "../api/types";
 import { ms, number, usd } from "../lib/format";
 import { electricityRate, rateInput } from "../lib/ups";
-import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
+import { KeyValue } from "./ui/key-value";
+import { MeterBar } from "./ui/meter-bar";
+import { PageHeader } from "./ui/page-header";
+import { Panel, Tile } from "./ui/panel";
+import { RangeToggle } from "./ui/range-toggle";
+import { Stat } from "./ui/stat";
+import { StatusChip } from "./ui/status-chip";
+import { runtime, upsState, upsTone } from "./ups";
 import UpsControls from "./ups-controls";
 
 const UpsCharts = lazy(() => import("./ups-charts"));
@@ -110,15 +118,22 @@ function Energy({ range, revision }: { range: Exclude<UpsRange, "1h">; revision:
   const energy = useApi("/v1/ups/energy", `?range=${range}`, revision);
   const data = energy.data;
   return (
-    <article className="ups-energy-period">
-      <h3>{range}</h3>
+    <Tile className="ups-energy-period">
+      <h3 className="eyebrow">{range}</h3>
       {energy.error ? (
-        <p role="alert">{energy.error}</p>
+        <p role="alert" className="status-fail">
+          {energy.error}
+        </p>
       ) : !data ? (
-        <p className="muted">Loading…</p>
+        <p className="loading">Loading…</p>
       ) : (
         <>
-          <strong>{(data.energy_mwh / 1_000_000).toFixed(6)} kWh</strong>
+          <Stat
+            label={null}
+            value={data.energy_mwh / 1_000_000}
+            format={(n) => (n == null ? "—" : n.toFixed(6))}
+            suffix="kWh"
+          />
           <p>
             {data.cost_nano_usd == null ? (
               <a href="#ups-settings">Set electricity rate</a>
@@ -127,7 +142,7 @@ function Energy({ range, revision }: { range: Exclude<UpsRange, "1h">; revision:
             )}
           </p>
           {data.gpu_energy_mwh != null && (
-            <p>
+            <p className="muted">
               GPU {(data.gpu_energy_mwh / 1_000_000).toFixed(6)} kWh ·{" "}
               {data.energy_mwh > 0 ? number((data.gpu_energy_mwh / data.energy_mwh) * 100) : "—"}%
               share
@@ -136,25 +151,40 @@ function Energy({ range, revision }: { range: Exclude<UpsRange, "1h">; revision:
           <p className="muted">Coverage {data.coverage_percent.toFixed(4)}%</p>
         </>
       )}
-    </article>
+    </Tile>
   );
 }
 
-function Timeline({ now }: { now: number }) {
+function Timeline({ now, index }: { now: number; index: number }) {
   const [cursor, setCursor] = useState("");
   const events = useApi("/v1/ups/events", `?limit=20${cursor}`);
   return (
-    <section className="ups-panel" aria-label="Power events">
-      <h3>Power events</h3>
-      {events.error && <p role="alert">{events.error}</p>}
-      {events.loading && <p className="muted">Loading events…</p>}
-      {events.data?.events.length === 0 && <p className="muted">No power events.</p>}
+    <Panel
+      title="Power events"
+      subtitle="Outages, low battery and self-tests"
+      icon={<History />}
+      index={index}
+      aria-label="Power events"
+    >
+      {events.error && (
+        <p role="alert" className="status-fail">
+          {events.error}
+        </p>
+      )}
+      {events.loading && <p className="loading">Loading events…</p>}
+      {events.data?.events.length === 0 && <p className="empty">No power events.</p>}
       <ol className="ups-events">
         {events.data?.events.map((event) => (
           <li key={event.id}>
             <div className="row">
-              <strong>{event.kind.replaceAll("_", " ")}</strong>
-              <time dateTime={new Date(event.started_ms).toISOString()}>
+              <StatusChip
+                tone={
+                  event.kind === "self_test" ? "neutral" : event.ended_ms == null ? "fail" : "warn"
+                }
+              >
+                {event.kind.replaceAll("_", " ")}
+              </StatusChip>
+              <time className="muted" dateTime={new Date(event.started_ms).toISOString()}>
                 {date(event.started_ms)}
               </time>
             </div>
@@ -164,7 +194,7 @@ function Timeline({ now }: { now: number }) {
               {number(event.min_charge_percent)}% · Runtime{" "}
               {ms(event.min_runtime_s == null ? null : event.min_runtime_s * 1000)}
             </p>
-            {event.detail && <p>{event.detail}</p>}
+            {event.detail && <p className="muted">{event.detail}</p>}
             {event.end_reason === "restart" && (
               <p className="status-warn">factory shut down during outage</p>
             )}
@@ -172,9 +202,15 @@ function Timeline({ now }: { now: number }) {
         ))}
       </ol>
       <div className="row">
-        {cursor && <Button onClick={() => setCursor("")}>Newest events</Button>}
+        {cursor && (
+          <Button variant="outline" size="sm" onClick={() => setCursor("")}>
+            Newest events
+          </Button>
+        )}
         {events.data?.next_before_ms != null && (
           <Button
+            variant="outline"
+            size="sm"
             onClick={() =>
               setCursor(
                 `&before_ms=${events.data!.next_before_ms}&before_id=${events.data!.next_before_id}`,
@@ -185,7 +221,7 @@ function Timeline({ now }: { now: number }) {
           </Button>
         )}
       </div>
-    </section>
+    </Panel>
   );
 }
 
@@ -253,18 +289,9 @@ export default function UpsPage({
     })();
     return () => controller.abort();
   }, [range, revision]);
-  const fresh = current && now - current.ts_ms <= 30_000 ? current : null;
-  const state = !fresh
-    ? "No data"
-    : fresh.low_battery
-      ? "Low battery"
-      : fresh.on_battery
-        ? "On battery"
-        : fresh.replace_battery
-          ? "Replace battery"
-          : fresh.on_line
-            ? "Online"
-            : "No data";
+  const state = upsState({ current, now });
+  const fresh = state === "No data" ? null : current!;
+  const alarm = state === "On battery" || state === "Low battery";
   const elapsed = fresh ? Math.max(0, (now - fresh.ts_ms) / 1000) : 0;
   const shutdown = fresh?.runtime_s == null ? null : Math.max(0, fresh.runtime_s - elapsed - 300);
   const samples = live.upsSamples.filter((sample) => sample.ts_ms >= now - 900_000);
@@ -292,55 +319,93 @@ export default function UpsPage({
     ) ?? [];
   return (
     <main id="main" className="dashboard ups-page">
-      <div className="intro">
-        <div>
-          <a href="/">Back to dashboard</a>
-          <h2>UPS · Power & battery</h2>
-        </div>
-        <p className="muted">factory-gpu, modem, eero</p>
-      </div>
-      <section className="ups-panel ups-live" aria-label="Live UPS">
-        <Badge
-          variant="outline"
-          className={fresh?.on_battery ? "status-warn" : fresh ? "status-ok" : "muted"}
-        >
-          {state}
-        </Badge>
-        <div>
-          <span className="muted">Charge</span>
-          <strong>{number(fresh?.charge_percent)}%</strong>
-        </div>
-        <div>
-          <span className="muted">
-            {fresh?.on_battery ? "Until shutdown threshold" : "Runtime"}
-          </span>
-          <strong className={fresh?.on_battery ? "status-warn" : ""}>
-            {fresh?.on_battery
-              ? fresh.charge_percent != null && fresh.charge_percent <= 30
-                ? "0 s"
-                : shutdown == null
-                  ? "—"
-                  : `${Math.floor(shutdown)} s`
-              : ms(fresh?.runtime_s == null ? null : fresh.runtime_s * 1000)}
-          </strong>
-        </div>
-        <div>
-          <span className="muted">Load</span>
-          <strong>{number(fresh?.load_w)} W</strong>
-        </div>
-        <div>
-          <span className="muted">Input</span>
-          <strong>{number(fresh?.input_v)} V</strong>
+      <PageHeader eyebrow="Power" title="UPS · Power & battery" aside="factory-gpu, modem, eero" />
+      <Panel
+        title="Live"
+        subtitle="Streamed every 15 s"
+        icon={<Plug />}
+        index={0}
+        className="ups-live"
+        tone={alarm ? "fail" : state === "Replace battery" ? "warn" : undefined}
+        action={
+          <StatusChip tone={upsTone(state)} dot={state !== "No data"} pulse={alarm}>
+            {state}
+          </StatusChip>
+        }
+        aria-label="Live UPS"
+      >
+        <div className="ups-live-grid">
+          <div>
+            <Stat
+              label="Charge"
+              value={fresh?.charge_percent ?? null}
+              format={(n) => `${number(n)}%`}
+              tone={alarm ? "fail" : undefined}
+              size="lg"
+            />
+            <MeterBar
+              label="Charge"
+              value={fresh?.charge_percent}
+              tone={alarm ? "fail" : fresh ? "ok" : "muted"}
+              markers={[
+                ...(fresh?.charge_warning_percent == null
+                  ? []
+                  : [{ at: fresh.charge_warning_percent, label: "Warning" }]),
+                ...(fresh?.charge_low_percent == null
+                  ? []
+                  : [{ at: fresh.charge_low_percent, label: "Low / shutdown" }]),
+              ]}
+            />
+          </div>
+          <Stat
+            label={fresh?.on_battery ? "Until shutdown threshold" : "Runtime"}
+            value={
+              fresh?.on_battery
+                ? fresh.charge_percent != null && fresh.charge_percent <= 30
+                  ? "0 s"
+                  : shutdown == null
+                    ? "—"
+                    : `${Math.floor(shutdown)} s`
+                : runtime(fresh?.runtime_s)
+            }
+            tone={alarm ? "fail" : undefined}
+            size="lg"
+          />
+          <Stat
+            label="Load"
+            value={`${number(fresh?.load_w)} W`}
+            note={`${number(fresh?.load_percent)}% of ${number(fresh?.load_nominal_w)} W`}
+            size="lg"
+          />
+          <Stat
+            label="Input"
+            value={`${number(fresh?.input_v)} V`}
+            note={`Output ${number(fresh?.output_v)} V · Battery ${number(fresh?.battery_v)} V`}
+            size="lg"
+          />
         </div>
         <div className="ups-spark">
-          <span className="muted">Load · last 15 min (SSE) · 0–{number(sparkMax)} W</span>
+          <span className="muted">Load · last 15 min (live) · 0–{number(sparkMax)} W</span>
           <svg
             viewBox="0 0 100 44"
             preserveAspectRatio="none"
             role="img"
             aria-label="15-minute live load sparkline"
           >
-            <path d={spark} fill="none" stroke="var(--accent-text)" strokeWidth="1" />
+            <defs>
+              <linearGradient id="ups-spark-fill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="var(--accent-text)" stopOpacity={0.35} />
+                <stop offset="100%" stopColor="var(--accent-text)" stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            {spark && <path d={`${spark} V44 H0 Z`} fill="url(#ups-spark-fill)" stroke="none" />}
+            <path
+              d={spark}
+              fill="none"
+              stroke="var(--accent-text)"
+              strokeWidth="1.5"
+              vectorEffect="non-scaling-stroke"
+            />
           </svg>
           {!samples.length && <span className="muted">Waiting for live samples</span>}
         </div>
@@ -356,29 +421,26 @@ export default function UpsPage({
               {warning}
             </p>
           ))}
-      </section>
-      <section aria-label="UPS history">
-        <div className="row ups-range">
+      </Panel>
+      <section aria-label="UPS history" className="ups-history">
+        <div className="row section-head">
           <h3>History</h3>
-          <div role="group" aria-label="History range">
-            {ranges.map((value) => (
-              <Button
-                key={value}
-                variant={range === value ? "default" : "outline"}
-                aria-pressed={range === value}
-                onClick={() => setRange(value)}
-              >
-                {value}
-              </Button>
-            ))}
-          </div>
+          <RangeToggle value={range} options={ranges} onChange={setRange} label="History range" />
         </div>
-        {history.error && <p role="alert">History: {history.error}</p>}
-        {gpu.error && <p role="alert">GPU overlay unavailable: {gpu.error}</p>}
+        {history.error && (
+          <p role="alert" className="status-fail">
+            History: {history.error}
+          </p>
+        )}
+        {gpu.error && (
+          <p role="alert" className="status-warn">
+            GPU overlay unavailable: {gpu.error}
+          </p>
+        )}
         {history.loading ? (
-          <p className="muted">Loading history…</p>
+          <p className="loading">Loading history…</p>
         ) : (
-          <Suspense fallback={<p className="muted">Loading charts…</p>}>
+          <Suspense fallback={<p className="loading">Loading charts…</p>}>
             <UpsCharts
               history={history.data ?? []}
               gpu={gpu.data?.history ?? []}
@@ -388,42 +450,65 @@ export default function UpsPage({
           </Suspense>
         )}
       </section>
-      <section className="ups-panel" aria-label="Energy">
-        <h3>Energy & cost</h3>
-        <p className="muted">Measured energy only; gaps are not extrapolated.</p>
+      <Panel
+        title="Energy & cost"
+        subtitle="Measured energy only; gaps are not extrapolated."
+        icon={<Zap />}
+        index={1}
+        aria-label="Energy"
+      >
         <div className="ups-energy">
           {(["24h", "7d", "30d", "365d"] as const).map((value) => (
             <Energy key={value} range={value} revision={revision + settingsRevision} />
           ))}
         </div>
-      </section>
+      </Panel>
       <div className="ups-chart-grid">
-        <Timeline key={revision} now={now} />
-        <section className="ups-panel" aria-label="Battery health">
-          <h3>Battery health</h3>
-          <p>
-            Last self-test: {selfTest?.detail ?? fresh?.test_result ?? "—"} ·{" "}
-            {eventHistory.loading
-              ? "Loading test date…"
-              : selfTest
-                ? date(selfTest.started_ms)
-                : "Date not recorded"}
-          </p>
-          {eventHistory.error && <p role="alert">{eventHistory.error}</p>}
-          <p>
-            Battery age:{" "}
-            {installed == null
-              ? "Set installation date below"
-              : `${number(Math.max(0, now - installed) / 86_400_000)} days`}
-          </p>
-          <p>
-            Replace by: {replace ? replace.toLocaleDateString(undefined, { timeZone: "UTC" }) : "—"}{" "}
-            · estimate (installed date + 3 years)
-          </p>
+        <Timeline key={revision} now={now} index={2} />
+        <Panel
+          title="Battery health"
+          subtitle="Self-test, age and runtime trend"
+          icon={<BatteryCharging />}
+          index={3}
+          aria-label="Battery health"
+        >
+          <KeyValue
+            rows={[
+              [
+                "Last self-test",
+                `${selfTest?.detail ?? fresh?.test_result ?? "—"} · ${
+                  eventHistory.loading
+                    ? "Loading test date…"
+                    : selfTest
+                      ? date(selfTest.started_ms)
+                      : "Date not recorded"
+                }`,
+              ],
+              [
+                "Battery age",
+                installed == null
+                  ? "Set installation date below"
+                  : `${number(Math.max(0, now - installed) / 86_400_000)} days`,
+              ],
+              [
+                "Replace by",
+                `${replace ? replace.toLocaleDateString(undefined, { timeZone: "UTC" }) : "—"} · estimate (installed date + 3 years)`,
+              ],
+            ]}
+          />
+          {eventHistory.error && (
+            <p role="alert" className="status-fail">
+              {eventHistory.error}
+            </p>
+          )}
           <h4>Minimum runtime trend · hourly, 70–110 W average load</h4>
-          {hourly.error && <p role="alert">{hourly.error}</p>}
+          {hourly.error && (
+            <p role="alert" className="status-fail">
+              {hourly.error}
+            </p>
+          )}
           {hourly.loading ? (
-            <p className="muted">Loading hourly history…</p>
+            <p className="loading">Loading hourly history…</p>
           ) : trend.length ? (
             <div className="ups-trend" tabIndex={0} role="region" aria-label="Hourly runtime trend">
               <table>
@@ -446,12 +531,22 @@ export default function UpsPage({
               </table>
             </div>
           ) : (
-            <p className="muted">No hourly samples at the reference load in the last year.</p>
+            <p className="empty">No hourly samples at the reference load in the last year.</p>
           )}
-        </section>
-        <section id="ups-settings" className="ups-panel" aria-label="UPS settings">
-          <h3>UPS settings</h3>
-          {settings.error && <p role="alert">{settings.error}</p>}
+        </Panel>
+        <Panel
+          id="ups-settings"
+          title="UPS settings"
+          subtitle="Electricity rate and battery date"
+          icon={<Settings2 />}
+          index={4}
+          aria-label="UPS settings"
+        >
+          {settings.error && (
+            <p role="alert" className="status-fail">
+              {settings.error}
+            </p>
+          )}
           {settings.data ? (
             <Settings
               settings={settings.data}
@@ -459,10 +554,14 @@ export default function UpsPage({
               saved={() => setSettingsRevision((value) => value + 1)}
             />
           ) : (
-            <p className="muted">Loading settings…</p>
+            <p className="loading">Loading settings…</p>
           )}
-          {settingsRevision > 0 && <p role="status">Settings saved.</p>}
-        </section>
+          {settingsRevision > 0 && (
+            <p role="status" className="status-ok">
+              Settings saved.
+            </p>
+          )}
+        </Panel>
         <UpsControls />
       </div>
     </main>
