@@ -14,6 +14,7 @@ StateDirectoryMode=0750
 WorkingDirectory=/var/lib/factory-api
 ExecStart=/usr/local/bin/factory-api --listen 127.0.0.1:8080 --meter-url http://127.0.0.1:11434 --db-path /var/lib/factory-api/requests.db --pricing-db-path /var/lib/factory-api/pricing.db
 Environment=RUST_LOG=factory_api=info
+Environment=FACTORY_API_NETWORK_THROUGHPUT_LOW_MBPS=250
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=15
