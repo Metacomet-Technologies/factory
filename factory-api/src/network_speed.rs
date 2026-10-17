@@ -218,14 +218,13 @@ async fn loaded_latency(
 ) {
     let mut timer = tokio::time::interval(LOADED_SPACING);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    timer.tick().await;
     loop {
-        if let Ok(burst) = network::ping(target).await {
-            update(partial, |p| p.loaded[direction as usize].push(burst));
-        }
         tokio::select! { biased;
             _ = done.cancelled() => return,
             _ = timer.tick() => (),
+        }
+        if let Ok(burst) = network::ping(target).await {
+            update(partial, |p| p.loaded[direction as usize].push(burst));
         }
     }
 }
