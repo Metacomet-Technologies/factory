@@ -337,7 +337,13 @@ export function networkFixtures(
     {
       ...episode(
         1,
-        { state: "degraded", layer: "dns", reason: "latency", peak_rtt_us: 312_000 },
+        {
+          state: "degraded",
+          layer: "dns",
+          reason: "latency",
+          peak_rtt_us: 312_000,
+          peak_mdev_us: 48_000,
+        },
         now - 5 * 86_400_000,
         now - 5 * 86_400_000 + 3_600_000,
       ),

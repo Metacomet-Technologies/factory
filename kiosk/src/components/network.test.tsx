@@ -218,15 +218,15 @@ describe("network page", () => {
       "1.1.1.1 solid · 8.8.8.8 dashed",
     );
   });
-  it("lists events with layer, duration and peak loss, including the open one", async () => {
+  it("lists events with layer, duration, peak loss and peak jitter, including the open one", async () => {
     serve(networkFixtures("down"));
     await open();
     const events = within(screen.getByRole("region", { name: "Network events" }));
     const rows = await events.findAllByRole("row");
-    expect(rows[1]).toHaveTextContent(/DownWAN3 min · ongoing100%—Ongoing/);
-    expect(rows[2]).toHaveTextContent(/DownWAN5 min100%—Recovered/);
-    expect(rows[3]).toHaveTextContent(/Degraded · lossLAN20 min30%—Recovered/);
-    expect(rows[4]).toHaveTextContent(/Degraded · latencyDNS1 h0%312 msAPI restarted/);
+    expect(rows[1]).toHaveTextContent(/DownWAN3 min · ongoing100%——Ongoing/);
+    expect(rows[2]).toHaveTextContent(/DownWAN5 min100%——Recovered/);
+    expect(rows[3]).toHaveTextContent(/Degraded · lossLAN20 min30%——Recovered/);
+    expect(rows[4]).toHaveTextContent(/Degraded · latencyDNS1 h0%312 ms48 msAPI restarted/);
   });
   it("lists the newest speed tests with failures and their errors", async () => {
     serve(networkFixtures("healthy", false, "24h", "24h"));

@@ -161,16 +161,46 @@ describe("network history shapes", () => {
     });
   });
   it("keys per-target chart columns by index, since target names contain dots", () => {
-    const { targets, rows } = layerRows(history, "wan");
-    expect(targets).toEqual(["1.1.1.1", "8.8.8.8"]);
-    expect(rows[0]).toEqual({ ts_ms: 0, latency0: 9, loss0: 10, latency1: 12, loss1: 0 });
-    expect(rows[2]).toEqual({
-      ts_ms: 120_000,
-      latency0: null,
-      loss0: 100,
-      latency1: null,
-      loss1: 100,
-    });
+    const lines = layerRows(history, "wan");
+    expect(lines.map((line) => line.target)).toEqual(["1.1.1.1", "8.8.8.8"]);
+    expect(lines[0]!.points[0]).toEqual({ ts_ms: 0, latency0: 9, loss0: 10 });
+    expect(lines[1]!.points[2]).toEqual({ ts_ms: 120_000, latency1: null, loss1: 100 });
+  });
+  it("gives each target its own points, so a missed bucket never breaks another line", () => {
+    const lines = layerRows(
+      [
+        series("wan", "1.1.1.1", [
+          [0, 9, 0],
+          [30_000, 10, 0],
+          [60_000, null, 100],
+          [90_000, 11, 0],
+        ]),
+        series("wan", "8.8.8.8", [
+          [90_000, 13, 0],
+          [0, 12, 0],
+        ]),
+      ],
+      "wan",
+    );
+    expect(lines).toEqual([
+      {
+        target: "1.1.1.1",
+        points: [
+          { ts_ms: 0, latency0: 9, loss0: 0 },
+          { ts_ms: 30_000, latency0: 10, loss0: 0 },
+          { ts_ms: 60_000, latency0: null, loss0: 100 },
+          { ts_ms: 90_000, latency0: 11, loss0: 0 },
+        ],
+      },
+      {
+        target: "8.8.8.8",
+        points: [
+          { ts_ms: 0, latency1: 12, loss1: 0 },
+          { ts_ms: 90_000, latency1: 13, loss1: 0 },
+        ],
+      },
+    ]);
+    expect(lines[1]!.points.every((point) => point.latency1 != null)).toBe(true);
   });
   it("clips event bands to the window and runs an open event to now", () => {
     const since = NOW - 3_600_000;

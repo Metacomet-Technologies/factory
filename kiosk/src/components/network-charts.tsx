@@ -69,7 +69,9 @@ function LayerPanel({
   index: number;
 }) {
   const reduced = useReducedMotion();
-  const { targets, rows } = useMemo(() => layerRows(series, layer), [series, layer]);
+  const lines = useMemo(() => layerRows(series, layer), [series, layer]);
+  const targets = lines.map((line) => line.target);
+  const empty = lines.every((line) => !line.points.length);
   const label = layerLabel[layer];
   const config: ChartConfig = Object.fromEntries(
     targets.flatMap((target, at) => [
@@ -90,11 +92,7 @@ function LayerPanel({
           className="network-chart"
           aria-label={`${label} ${metric} history`}
         >
-          <LineChart
-            data={rows}
-            accessibilityLayer
-            margin={{ left: 0, right: 12, top: 8, bottom: 0 }}
-          >
+          <LineChart accessibilityLayer margin={{ left: 0, right: 12, top: 8, bottom: 0 }}>
             <CartesianGrid vertical={false} strokeDasharray="3 4" />
             <XAxis
               dataKey="ts_ms"
@@ -121,14 +119,15 @@ function LayerPanel({
                 />
               ))}
             {/* Each point is a bucket that starts at ts_ms, so its value holds until the next. */}
-            {targets.map((target, at) => (
+            {lines.map(({ target, points }, at) => (
               <Line
                 key={target}
+                data={points}
                 dataKey={`${metric}${at}`}
                 type="stepAfter"
                 {...strokes[at % 2]}
                 strokeWidth={2}
-                dot={rows.length === 1}
+                dot={points.length === 1}
                 connectNulls={false}
                 isAnimationActive={!reduced}
                 animationDuration={900}
@@ -137,7 +136,7 @@ function LayerPanel({
           </LineChart>
         </ChartContainer>
       ))}
-      {!rows.length && <p className="empty">No samples in this range.</p>}
+      {empty && <p className="empty">No samples in this range.</p>}
     </Panel>
   );
 }

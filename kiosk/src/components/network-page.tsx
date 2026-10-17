@@ -121,7 +121,16 @@ function Events({ now, index }: { now: number; index: number }) {
       {!!page?.events.length && (
         <Table>
           <Head
-            labels={["Started", "State", "Layer", "Duration", "Peak loss", "Peak latency", "Ended"]}
+            labels={[
+              "Started",
+              "State",
+              "Layer",
+              "Duration",
+              "Peak loss",
+              "Peak latency",
+              "Peak jitter",
+              "Ended",
+            ]}
           />
           <TableBody>
             {page.events.map((event) => (
@@ -137,6 +146,7 @@ function Events({ now, index }: { now: number; index: number }) {
                 </TableCell>
                 <TableCell>{percent(event.peak_loss_percent)}</TableCell>
                 <TableCell>{latency(event.peak_rtt_us)}</TableCell>
+                <TableCell>{latency(event.peak_mdev_us)}</TableCell>
                 <TableCell>{event.end_reason ? endLabel[event.end_reason] : "Ongoing"}</TableCell>
               </TableRow>
             ))}

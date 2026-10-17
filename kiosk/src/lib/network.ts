@@ -113,25 +113,28 @@ export type LayerRow = { ts_ms: number } & Record<
   `latency${number}` | `loss${number}`,
   number | null
 >;
+export type LayerLine = { target: string; points: LayerRow[] };
 /**
- * Chart rows for one layer with a latency and loss column per target. Columns are keyed by
- * index because target names such as 1.1.1.1 contain dots, which Recharts reads as a path.
+ * One point list per target, so a bucket one target missed never breaks another target's
+ * line, while a null RTT stays a gap. Columns are keyed by index because target names such
+ * as 1.1.1.1 contain dots, which Recharts reads as a path.
  */
-export function layerRows(series: NetworkSeries[], layer: NetworkLayer) {
-  const lines = series.filter((line) => line.layer === layer);
-  const rows = new Map<number, LayerRow>();
-  lines.forEach((line, index) => {
-    for (const point of line.points) {
-      const row = rows.get(point.ts_ms) ?? ({ ts_ms: point.ts_ms } as LayerRow);
-      row[`latency${index}`] = point.latency_ms.avg ?? null;
-      row[`loss${index}`] = point.loss_percent;
-      rows.set(point.ts_ms, row);
-    }
-  });
-  return {
-    targets: lines.map((line) => line.target),
-    rows: [...rows.values()].sort((a, b) => a.ts_ms - b.ts_ms),
-  };
+export function layerRows(series: NetworkSeries[], layer: NetworkLayer): LayerLine[] {
+  return series
+    .filter((line) => line.layer === layer)
+    .map((line, index) => ({
+      target: line.target,
+      points: line.points
+        .map(
+          (point) =>
+            ({
+              ts_ms: point.ts_ms,
+              [`latency${index}`]: point.latency_ms.avg ?? null,
+              [`loss${index}`]: point.loss_percent,
+            }) as LayerRow,
+        )
+        .sort((a, b) => a.ts_ms - b.ts_ms),
+    }));
 }
 
 export type EventBand = {
