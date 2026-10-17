@@ -505,6 +505,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn immediately_finished_direction_keeps_one_loaded_sample() {
+        let done = CancellationToken::new();
+        done.cancel();
+        let partial = Mutex::new(Partial::default());
+        loaded_latency(
+            "127.0.0.1".parse().unwrap(),
+            &done,
+            Direction::Download,
+            &partial,
+        )
+        .await;
+        let partial = partial.into_inner().unwrap();
+        assert_eq!(partial.loaded[0].len(), 1);
+        assert!(mean_rtt_us(&partial.loaded[0]).is_some());
+        assert!(partial.loaded[1].is_empty());
+    }
+
+    #[tokio::test]
     async fn runner_measures_every_outcome_against_a_loopback_server() {
         let cap = Duration::from_secs(20);
         let [ok, slow, fail, short, badcolo, hang] = futures_util::future::join_all([
