@@ -261,9 +261,37 @@ export function parseOpencode(text: string): Reading {
     } else index = saved;
   }
   while (index < lines.length) check(lines[index++] === '');
-  const amount = decimal(total.slice(1));
+  return opencodeSession(decimal(total.slice(1)));
+}
+const OPENCODE_V2_COUNT = /^(?:0|[1-9]\d{0,2}|(?:0|[1-9]\d*)(?:\.\d)?[kmb])$/;
+const OPENCODE_V2_PERCENT = /^(?:[0-9]\.\d{2}|[1-9]\d{1,2}\.\d)%$/;
+function opencodeSession(amount: string): Reading {
   const session: Balance = { amount, unit: 'usd', remaining: amount, total: null, label: 'session cost' };
   return { ...emptyReading(), balance: session, balances: [session] };
+}
+// OpenCode 2 `stats --all --cost`. The share card has no cost, so it is rejected.
+// Token rows are shape checks only. Model and tool sections are not accepted.
+export function parseOpencodeV2(text: string): Reading {
+  check(typeof text === 'string' && text.length > 0 && text.length <= 4_000 && !/[\u0000-\u0009\u000b-\u001f\u007f]/.test(text));
+  const lines = text.split('\n');
+  while (lines.at(-1) === '') lines.pop();
+  const row = (index: number, label: string, pattern: RegExp) => {
+    const prefix = `  ${label.padEnd(20)}`;
+    const line = lines[index];
+    check(line?.startsWith(prefix));
+    const value = line.slice(prefix.length);
+    check(pattern.test(value));
+    return value;
+  };
+  check(lines.length === 10 && lines[0] === 'all time · all projects' && lines[1] === '' && lines[2] === 'COST & TOKENS');
+  const total = row(3, 'cost', /^\$(0|[1-9]\d*)\.\d{2}$/);
+  row(4, 'input', OPENCODE_V2_COUNT);
+  row(5, 'output', OPENCODE_V2_COUNT);
+  row(6, 'reasoning', OPENCODE_V2_COUNT);
+  row(7, 'cache read', OPENCODE_V2_COUNT);
+  row(8, 'cache write', OPENCODE_V2_COUNT);
+  row(9, 'cached input', OPENCODE_V2_PERCENT);
+  return opencodeSession(decimal(total.slice(1)));
 }
 export function age(tool: Tool, now: number): Tool {
   return tool.observed_at_ms !== null && now - tool.observed_at_ms > STALE_MS

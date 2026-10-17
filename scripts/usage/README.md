@@ -75,8 +75,9 @@ output or exception text. The collector kills only its own probe process group.
   `Pro Plus`/`pro+` → `pro_plus`, ultra, team/teams, business, enterprise, edu.
   Email, request id, OS and terminal fields are dropped. An ok row has a plan
   and empty windows. Version shape is `YYYY.M.D-<hex>`, checked on CLI
-  `2026.10.16-e3cb207`. The signed-in plan fixture is synthetic; only the
-  logged-out JSON was captured.
+  `2026.10.16-e3cb207`. A live signed-in `subscriptionTier` of `Ultra` maps
+  to `ultra`; the address was present and is not stored. The committed
+  signed-in fixture remains synthetic Pro.
 * **Kimi Code:** there is no `kimi usage` subcommand in 2.2.0. If
   `127.0.0.1` and `FACTORY_KIMI_PORT` (default 58627) are already accepting
   connections, `GET /api/v1/oauth/usage` uses the existing local server and
@@ -91,15 +92,27 @@ output or exception text. The collector kills only its own probe process group.
   A USD `extraUsage` wallet becomes one balance from cent integers; other
   currencies are omitted, never converted. The logged-out body
   `No token for "kimi-code". Run /login to authenticate.` is `not logged in`
-  and the message is not stored. The ok fixture reconstructs the 2.2.0 schema;
-  this machine was not logged in, so a live ok body is still unverified.
-* **OpenCode:** `opencode stats` with no flags, verified on 1.19.3. This is
-  local session cost, not account remaining. The two box tables must be
-  present in order. Only `Total Cost` is stored, as USD `label: "session cost"`
-  with `total: null` and `amount` equal to `remaining`. Session, message and
-  token lines are shape checks and are not stored. An optional tool-usage box
-  is accepted and ignored. A model box or any other extra line is
-  `format changed`. v2 `--json` is not parsed.
+  and the message is not stored. A live logged-in probe returned HTTP 200,
+  `code` 0, `msg` `success`, `kind` `ok`, usage keys `limit5h` and `limit7d`
+  only, and `currency` null, so that account has two windows and no wallet.
+  `monthTotal` stays optional. The ratios from that probe were not printed;
+  the USD and monthly fixtures remain synthetic. Cent fields with a null
+  currency are `format changed`, not a dropped wallet.
+* **OpenCode:** local session cost, not account remaining. Only the cost is
+  stored, as USD `label: "session cost"` with `total: null` and `amount`
+  equal to `remaining`. Version `1.19.3` uses `opencode stats` with no flags.
+  The two box tables must be present in order. Session, message and token
+  lines are shape checks and are not stored. An optional tool-usage box is
+  accepted and ignored. A model box or any other extra line is
+  `format changed`. Version `opencode v2.0.32` is recorded as `2.0.32` and
+  probed with `opencode stats --all --cost` (35s, because that CLI waits up
+  to 30s for its local server). The default share card, including
+  `no activity in this range`, has no cost and is `format changed`. The v2
+  text must be the plain `all time · all projects` cost block, with two
+  spaces before each row. A live empty account printed `$0.00` and is stored
+  as session cost `0.00`. Token rows are checked and dropped. `--json`,
+  `--models`, `--tools` and `--full` are not used, so model and tool names
+  are not read. ANSI or an extra section is `format changed`.
 * **Codex:** JSON-RPC messages include `jsonrpc: "2.0"`.
   Wait for successful id 1 `initialize`, then send `initialized` and id 2
   `account/rateLimits/read`. Keep stdin open through the id 2 response; ignore

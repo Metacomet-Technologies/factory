@@ -6,8 +6,8 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { collect, command, readPrevious, writeSnapshot, CLAUDE_ARGS, supportedNode } from './collect.ts';
-import { age, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, parseCursor, parseKimi, parseOpencode, STALE_MS } from './parsers.ts';
-import { amp, ampAutoReload, ampNew, details, detailsAutoReload, detailsNew, claude, codex, cursorAbout, cursorLoggedOut, kimiLoggedOut, kimiUsage, opencodeStats, fixtureRun, versions } from './fixtures.ts';
+import { age, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, parseCursor, parseKimi, parseOpencode, parseOpencodeV2, STALE_MS } from './parsers.ts';
+import { amp, ampAutoReload, ampNew, details, detailsAutoReload, detailsNew, claude, codex, cursorAbout, cursorLoggedOut, kimiLive, kimiLoggedOut, kimiUsage, opencodeStats, opencodeV2ShareCard, opencodeV2Stats, opencodeV2Zero, fixtureRun, versions } from './fixtures.ts';
 const now = 1791800000000;
 
 test('supported Node versions require Node 24.12.0 or newer', () => {
@@ -315,6 +315,7 @@ test('cursor, kimi and opencode fail closed and drop identity, tokens and wallet
   assert.equal(parseCursor(JSON.stringify(cursorAbout)).plan, 'pro');
   assert.equal(parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: 'Pro Plus' })).plan, 'pro_plus');
   assert.equal(parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: 'Cursor Ultra' })).plan, 'ultra');
+  assert.equal(parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: 'Ultra' })).plan, 'ultra');
   assert.equal(parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: 'Teams' })).plan, 'team');
   assert.throws(() => parseCursor(JSON.stringify(cursorLoggedOut)), { message: 'not logged in' });
   assert.throws(() => parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: null })), { message: 'CLI failed' });
@@ -333,10 +334,34 @@ test('cursor, kimi and opencode fail closed and drop identity, tokens and wallet
   const rmb = parseKimi(JSON.stringify({ ...kimiUsage, data: { ...kimiUsage.data, quota: { ...kimiUsage.data.quota, extraUsage: { ...kimiUsage.data.quota.extraUsage, currency: 'CNY' } } } }));
   assert.deepEqual(rmb.balances, []);
   assert.throws(() => parseKimi(JSON.stringify({ ...kimiUsage, request_id: 'redacted@example.invalid' })), { message: FORMAT_CHANGED });
+  const live = parseKimi(JSON.stringify(kimiLive));
+  assert.deepEqual(live.windows.map(window => [window.name, window.used_percent, window.window_minutes]), [['five_hour', 50, 300], ['weekly', 25, 10080]]);
+  assert.deepEqual(live.balances, []);
+  assert.doesNotMatch(JSON.stringify(live), /liveShapeRequestId|currency/);
+  assert.throws(() => parseKimi(JSON.stringify({ ...kimiLive, data: { ...kimiLive.data, quota: { ...kimiLive.data.quota, extraUsage: { currency: null, balanceCents: 100 } } } })), { message: FORMAT_CHANGED });
   const session = parseOpencode(opencodeStats);
   assert.deepEqual(session.balances, [{ amount: '12.50', remaining: '12.50', total: null, unit: 'usd', label: 'session cost' }]);
   assert.throws(() => parseOpencode(opencodeStats.replace('Total Cost', 'Spend')), { message: FORMAT_CHANGED });
   assert.throws(() => parseOpencode(`${opencodeStats}\n│ secret │\n`), { message: FORMAT_CHANGED });
+  const v2 = parseOpencodeV2(opencodeV2Stats);
+  assert.deepEqual(v2.balances, [{ amount: '12.50', remaining: '12.50', total: null, unit: 'usd', label: 'session cost' }]);
+  assert.doesNotMatch(JSON.stringify(v2), /12\.5k|3\.4k|7\.41/);
+  assert.deepEqual(parseOpencodeV2(opencodeV2Zero).balances, [{ amount: '0.00', remaining: '0.00', total: null, unit: 'usd', label: 'session cost' }]);
+  assert.throws(() => parseOpencodeV2(opencodeV2ShareCard), { message: FORMAT_CHANGED });
+  assert.throws(() => parseOpencodeV2(opencodeV2Zero.replace('\n  cost', '\n cost')), { message: FORMAT_CHANGED });
+  assert.throws(() => parseOpencodeV2(opencodeV2Stats.replace(' cached input', ' cached input\u001b[0m')), { message: FORMAT_CHANGED });
+  assert.throws(() => parseOpencodeV2(`${opencodeV2Stats}MODELS\n private-model  1\n`), { message: FORMAT_CHANGED });
+  const seen: string[][] = [];
+  const v2run = await collect(null, async (program, args) => {
+    if (program !== 'opencode') return fixtureRun(program, args);
+    seen.push(args);
+    return args[0] === '--version' ? 'opencode v2.0.32\n' : opencodeV2Stats;
+  }, now);
+  assert.deepEqual(seen, [['--version'], ['stats', '--all', '--cost']]);
+  assert.equal(v2run.tools[5].status, 'ok');
+  assert.equal(v2run.tools[5].cli_version, '2.0.32');
+  assert.equal(v2run.tools[5].balances[0].amount, '12.50');
+  assert.doesNotMatch(JSON.stringify(v2run.tools[5]), /12\.5k|private-model/);
   const missing = await collect(null, async (program, args) => {
     if (program === 'kimi') throw new Error('CLI missing');
     return fixtureRun(program, args);

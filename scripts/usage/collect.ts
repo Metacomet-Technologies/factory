@@ -6,7 +6,7 @@ import { connect } from 'node:net';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { age, check, emptyReading, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, parseCursor, parseKimi, parseOpencode, sources, TOOL_ORDER } from './parsers.ts';
+import { age, check, emptyReading, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, parseCursor, parseKimi, parseOpencode, parseOpencodeV2, sources, TOOL_ORDER } from './parsers.ts';
 import type { Tool, Reading } from './parsers.ts';
 
 export const SNAPSHOT = '/var/lib/factory-usage/usage.json';
@@ -156,7 +156,7 @@ function version(program: string, value: string): string {
     codex: /^codex-cli (\d+\.\d+\.\d+)\s*$/,
     agent: /^(\d{4}\.\d{1,2}\.\d{1,2}-[a-f0-9]+)\s*$/,
     kimi: /^(\d+\.\d+\.\d+)\s*$/,
-    opencode: /^(\d+\.\d+\.\d+)\s*$/,
+    opencode: /^(?:opencode v)?(\d+\.\d+\.\d+)\s*$/,
   };
   const match = value.match(patterns[program]); check(match); return match[1];
 }
@@ -184,6 +184,7 @@ export async function collect(previous: Previous | null, run: Run = command, now
       else if (tool === 'claude-code') reading = parseClaude(await run('claude', CLAUDE_ARGS));
       else if (tool === 'codex') reading = parseCodex(JSON.parse(await run('codex', ['app-server'], 20_000, true)));
       else if (tool === 'kimi') reading = parseKimi(await run('kimi', ['usage']));
+      else if (Number(cli_version.split('.')[0]) >= 2) reading = parseOpencodeV2(await run('opencode', ['stats', '--all', '--cost'], 35_000));
       else reading = parseOpencode(await run('opencode', ['stats']));
       return { tool, source, cli_version, status: 'ok', reason: null, note: null, observed_at_ms: now, ...reading };
     } catch (error) {
