@@ -69,6 +69,17 @@ function api(outage = false, failing = "", empty = false) {
       "/v1/llm/usage": data.usage,
       "/v1/gpu": data.gpu,
       "/v1/ups": { generated_at_ms: Date.now(), current: null, warnings: [] },
+      "/v1/devices": {
+        generated_at_ms: Date.now(),
+        devices: [{ device_id: "factory-gpu", health: "unknown", href: "/devices/factory-gpu" }],
+      },
+      "/v1/devices/factory-gpu": null,
+      "/v1/devices/factory-gpu/history": {
+        device_id: "factory-gpu",
+        range: "1h",
+        generated_at_ms: Date.now(),
+        points: [],
+      },
       "/v1/ups/history": [],
       "/v1/ups/events": {
         events: [

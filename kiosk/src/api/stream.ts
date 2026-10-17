@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useState } from "react";
 import { apiUrl } from "./client";
-import type { Agents, GpuSample, UpsCurrent, StreamEvent } from "./types";
+import type { Agents, DeviceView, GpuSample, UpsCurrent, StreamEvent } from "./types";
 
 export interface LiveState {
   gpu: GpuSample | null | undefined;
@@ -14,6 +14,9 @@ export interface LiveState {
   fleetRevision: number;
   pricingRevision: number;
   agentsRevision: number;
+  devices: DeviceView | null | undefined;
+  devicesAt: number;
+  devicesRevision: number;
 }
 export const initialLiveState: LiveState = {
   gpu: undefined,
@@ -27,6 +30,9 @@ export const initialLiveState: LiveState = {
   fleetRevision: 0,
   pricingRevision: 0,
   agentsRevision: 0,
+  devices: undefined,
+  devicesAt: 0,
+  devicesRevision: 0,
 };
 export function streamReducer(state: LiveState, event: StreamEvent): LiveState {
   switch (event.type) {
@@ -58,6 +64,13 @@ export function streamReducer(state: LiveState, event: StreamEvent): LiveState {
       return { ...state, pricingRevision: state.pricingRevision + 1 };
     case "agents.usage":
       return { ...state, agents: event.data, agentsRevision: state.agentsRevision + 1 };
+    case "devices.sample":
+      return {
+        ...state,
+        devices: event.data,
+        devicesAt: event.ts_ms,
+        devicesRevision: state.devicesRevision + 1,
+      };
   }
 }
 
@@ -75,7 +88,12 @@ export function parseEvent(value: unknown): StreamEvent | null {
   )
     return null;
   const data = value.data;
-  if ((value.type === "gpu.sample" || value.type === "ups.sample") && data === null)
+  if (
+    (value.type === "gpu.sample" ||
+      value.type === "ups.sample" ||
+      value.type === "devices.sample") &&
+    data === null
+  )
     return value as StreamEvent;
   if (!data || typeof data !== "object") return null;
   const fields = data as Record<string, unknown>;
@@ -170,6 +188,30 @@ export function parseEvent(value: unknown): StreamEvent | null {
       )
         return value as StreamEvent;
       break;
+    case "devices.sample": {
+      const device = fields.device;
+      if (
+        typeof fields.generated_at_ms !== "number" ||
+        !Array.isArray(fields.warnings) ||
+        !device ||
+        typeof device !== "object"
+      )
+        break;
+      const host = device as Record<string, unknown>;
+      const health = host.health as Record<string, unknown> | undefined;
+      const cpu = host.cpu as Record<string, unknown> | undefined;
+      const utilization = cpu?.utilization as Record<string, unknown> | undefined;
+      if (
+        host.device_id === "factory-gpu" &&
+        health &&
+        ["critical", "warning", "healthy", "unknown", "stale"].includes(String(health.status)) &&
+        utilization &&
+        (utilization.value == null ||
+          (typeof utilization.value === "number" && Number.isFinite(utilization.value)))
+      )
+        return value as StreamEvent;
+      break;
+    }
     case "agents.usage":
       if (
         Array.isArray(fields.tools) &&
@@ -228,6 +270,7 @@ export function useStream() {
     source.onerror = () => {
       setConnected(false);
       dispatch({ type: "gpu.sample", ts_ms: Date.now(), data: null });
+      dispatch({ type: "devices.sample", ts_ms: Date.now(), data: null });
     };
     const receive = (message: MessageEvent<string>) => {
       try {
@@ -246,6 +289,7 @@ export function useStream() {
       "fleet.change",
       "pricing.changed",
       "agents.usage",
+      "devices.sample",
     ])
       source.addEventListener(type, receive);
     return () => source.close();

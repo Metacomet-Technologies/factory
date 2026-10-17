@@ -39,7 +39,7 @@ fn migration_adopts_captured_schema_and_is_atomic_strict_and_repeatable() -> Res
             data::initialize(&mut db)?;
             assert_eq!(
                 db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?,
-                1
+                2
             );
             if legacy {
                 assert_eq!(
@@ -47,7 +47,14 @@ fn migration_adopts_captured_schema_and_is_atomic_strict_and_repeatable() -> Res
                     19
                 );
             }
-            for table in ["ups_samples", "ups_rollup_hourly", "ups_events", "settings"] {
+            for table in [
+                "ups_samples",
+                "ups_rollup_hourly",
+                "ups_events",
+                "settings",
+                "device_samples",
+                "device_rollup_hourly",
+            ] {
                 assert_eq!(
                     db.query_row(
                         "SELECT strict FROM pragma_table_list WHERE name=?1",
@@ -68,7 +75,7 @@ fn migration_adopts_captured_schema_and_is_atomic_strict_and_repeatable() -> Res
             ] {
                 assert!(db.execute(sql, []).is_err(), "{sql}");
             }
-            db.pragma_update(None, "user_version", 2)?;
+            db.pragma_update(None, "user_version", 3)?;
             assert!(data::initialize(&mut db).is_err());
         }
     }
