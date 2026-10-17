@@ -200,12 +200,10 @@ rollup checkpoint. Rows are plain inserts, so a known ID is never rewritten.
 
 Measured budgets (enforced in tests): API usage **6** reads for every range,
 replacing 11. Meter stats **3**, GPU history **≤2**, health/requests 1. A full
-5,000-row API rollup batch is **≤16**. The pricing view reads each family's
-selection, rates and pending change in one batched statement, checked against
-`pricing::Store::show` and EXPLAIN. That meets the step-5 targets: pricing **2**
-(≤3, was 9), confirm **9** including the HTTP preflight (≤12, was 29), refresh
-view reads **4** (≤6, was 17). Refresh totals are **13 / 33** at 3 / 1,001 source
-models. Sync pages keep MET-204's budget; the step-5 sync target is not adopted.
+5,000-row API rollup batch is **≤16**. Pricing, confirm and refresh keep today's
+measured budgets: pricing **9**, confirm **29**, refresh view reads **17**. Their
+step-5 targets (≤3 / ≤12 / ≤6 view reads) moved to MET-230 and are not met here.
+Sync pages keep MET-204's budget.
 A rewinding cost page adds at most one status read and three rewrite statements
 when its rows are already rolled up. Requests setup is 132 statements (116).
 

@@ -249,7 +249,15 @@ def inside():
         if meter_db.exists():
             with sqlite3.connect(meter_db.as_uri() + "?mode=ro", uri=True) as db:
                 version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version != 1:
+        if version == 1:
+            # Reused pre-rollup state: the supported offline in-place upgrade to v2.
+            with (STATE / "meter-upgrade.json").open("wb") as log:
+                result = subprocess.run([binary / "meter", "migrate", "--db", meter_db],
+                                        stdout=log, stderr=subprocess.STDOUT, timeout=600)
+            if result.returncode != 0:
+                raise RuntimeError("Meter v1 to v2 upgrade failed; see meter-upgrade.json; "
+                                   "startup stopped (reset to discard this state)")
+        elif version != 2:
             if version not in (None, 0):
                 raise RuntimeError(f"Unsupported meter user_version={version}")
             source = meter_db if version == 0 else legacy_db
