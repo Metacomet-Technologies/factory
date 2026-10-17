@@ -1,9 +1,13 @@
 # Devices
 
 Phase 1 reads factory-gpu from the factory-api process. There is no second GPU
-sample store and no remote ingestion.
+sample store.
 
-Phase 2 remote ingestion design (for review): [devices-ingest.md](devices-ingest.md).
+Phase 2A (MET-219) lets enrolled remote devices, first factory-console, push
+host samples to the same factory-api. The contract is
+[devices-ingest.md](devices-ingest.md); operations are in
+[Phase 2A: remote devices](#phase-2a-remote-devices). factory-gpu is never
+written remotely and its local flow is unchanged.
 
 ## Sources
 
@@ -99,9 +103,14 @@ without an NVMe counter omits that field. It is not a SMART health threshold.
 - `GET /v1/devices`
 - `GET /v1/devices/factory-gpu`
 - `GET /v1/devices/factory-gpu/history?range=1h|24h|7d`
+- `GET /v1/devices/{device_id}` and `/history` for an enrolled remote device
+- `POST /v1/devices/{device_id}/samples` (remote devices, bearer token)
 
-Other ranges return 400. Unknown device ids return 404. The list shape can
-hold another id later. This phase only emits `factory-gpu`.
+Other ranges return 400. Unknown device ids return 404. The list is
+`factory-gpu` first, then each enrolled remote device. A remote device's
+response has an `ingest` object (last received time, session, seq, agent
+version, clock skew, dropped samples, identity conflict); it is null for
+factory-gpu.
 
 A metric value is null unless its availability is `available`. Unknown is
 never stored as zero. A failed probe leaves unrelated good readings in place.
@@ -225,6 +234,99 @@ Unprivileged tests use `DEVICES_TEST_ROOT` and do not call host `smartctl`.
 5. Reboot age stays `permission_denied` until a group-readable status file exists.
 6. `GET /v1/devices/factory-gpu/history?range=30d` returns 400.
 7. The kiosk links `/devices` and `/devices/factory-gpu` render, and a stream disconnect stops showing the last sample as live.
+
+## Phase 2A: remote devices
+
+The server side of [devices-ingest.md](devices-ingest.md), option A. The
+factory-console agent (stage B) is not built yet, so after this deploy
+factory-console shows "Waiting for first sample" until an agent uploads.
+
+- Credentials: `/etc/factory-api/device-tokens`, `root:factory-api` 0640, one
+  line per credential: `<device_id> <sha256 hex> <label>`. At most two per
+  device. factory-api rereads the file when it changes, compares hashes in
+  constant time, and fails closed (401, no remote devices listed) when the file
+  is missing or unreadable. `--device-tokens` or `FACTORY_API_DEVICE_TOKENS`
+  overrides the path.
+- Ids `factory-gpu`, `fs`, `smart`, `cpu` and `telemetry` are reserved.
+- Responses: accepted samples, stored or ignored, are 200 as the contract says
+  (not 202). Errors are 400, 401, 403, 404, 405, 413, 415, 429 and 500 with the
+  contract's error codes. Tokens never appear in a URL, log or response.
+- Health: stale when no sample has arrived for 45 s, or the newest reading is
+  older than 45 s. After a factory-api restart a remote device is unknown until
+  its next fresh sample. History is written only when both clocks are
+  synchronized.
+- Alerts: the phase-1 keys, prefixed with the device id, for example
+  `devices:factory-console:telemetry`,
+  `devices:factory-console:cpu:temperature:warning` and
+  `devices:factory-console:fs:{id}:space:critical`. Summaries start with the
+  device id. Remote telemetry alerts stay quiet while fleet reports the node
+  offline, because the `node:` alert already covers it. There is no remote
+  unclean-shutdown notice (schema v1 has no `unsafe_shutdowns`).
+- Kiosk: `/devices` lists both devices. `/devices/{device_id}` adds an Agent
+  link panel: Live, Stale, Offline (no sample for 2 minutes) or Waiting for
+  first sample, plus transport and collection age, session, clock skew,
+  dropped samples and capabilities. Remote devices show no GPU or UPS.
+
+There is no DB migration. Remote samples use the existing `device_samples`
+table.
+
+### Deploy
+
+After merge, the wrap-up thread fast-forwards `/home/agent/work/factory` on
+factory-gpu and builds `target/release/factory-api` and `kiosk/dist` as
+`agent` (docs/PLAYBOOK.md); `gpu-ssh` runs as `dgarbs51`, which cannot build in
+`/home/agent`. Then Devon runs these from the Mac:
+
+```sh
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api --check-only"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-kiosk.sh /home/agent/work/factory/kiosk/dist"
+gpu-ssh 'curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "Content-Type: application/json" -d "{}" http://127.0.0.1:8080/v1/devices/factory-console/samples'
+```
+
+The last command prints `401`. Save the printed API and kiosk backup paths.
+
+### Enrollment
+
+Devon generates the token manually (`fdv1_` plus 43 base64url characters from
+32 random bytes) and stores it at
+`op://Factory/factory-console devices token/credential` first. Then:
+
+```sh
+op read 'op://Factory/factory-console devices token/credential' | gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-factory-api.sh --enroll-device factory-console'
+```
+
+The token is read from stdin only and never printed; only its SHA-256 is
+written. Re-running with the same token changes nothing. A second token for
+the same device adds a second line (rotation); a third is refused until one
+is removed. The command prints the exact undo command with its snapshot path
+under `/var/backups/factory-api/enroll-*`. No restart is needed.
+
+Check through Serve from the Mac (a wrong token must be 401):
+
+```sh
+curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "Authorization: Bearer fdv1_wrongwrongwrongwrongwrongwrongwrongwrongabc" -H "Content-Type: application/json" -d "{}" https://factory-gpu.bearded-pompano.ts.net/v1/devices/factory-console/samples
+```
+
+### Rollback
+
+Remove only one enrolled credential line (the path printed by enrollment):
+
+```sh
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh --unenroll-device /var/backups/factory-api/enroll-SNAPSHOT"
+```
+
+If the enrollment created `/etc/factory-api/device-tokens`, removing its only
+line removes the file again. Other lines are untouched. Roll the binary and
+kiosk back with their own printed snapshots:
+
+```sh
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/API_SNAPSHOT"
+gpu-ssh "sudo bash /home/agent/work/factory/deploy/rollback-kiosk.sh /var/backups/factory-kiosk/KIOSK_SNAPSHOT"
+```
+
+The previous binary ignores the hash file and returns 404 for the samples
+endpoint. Remote rows in `device_samples` stay and age out with retention.
 
 ## Rollback of the API
 

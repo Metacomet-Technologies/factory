@@ -652,6 +652,17 @@
             "format": "int64",
             "type": "integer"
           },
+          "ingest": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/IngestView",
+                "description": "Remote ingest state (docs/devices-ingest.md). Null for factory-gpu."
+              }
+            ]
+          },
           "maintenance": {
             "oneOf": [
               {
@@ -1206,6 +1217,113 @@
           "maintenance",
           "collector",
           "health"
+        ],
+        "type": "object"
+      },
+      "IngestResult": {
+        "properties": {
+          "current_updated": {
+            "type": "boolean"
+          },
+          "device_id": {
+            "type": "string"
+          },
+          "history_written": {
+            "type": "boolean"
+          },
+          "observed_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "reason": {
+            "description": "Null on stored, except `clock_unsynchronized`; `duplicate`, `out_of_order` or `expired` on ignored.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "received_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "result": {
+            "description": "`stored` or `ignored`.",
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "result",
+          "device_id",
+          "session_id",
+          "seq",
+          "observed_at_ms",
+          "received_at_ms",
+          "current_updated",
+          "history_written"
+        ],
+        "type": "object"
+      },
+      "IngestView": {
+        "properties": {
+          "agent_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "clock_skew_ms": {
+            "description": "`sent_at_ms - received_at_ms` of the last accepted request, including latency.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "dropped_samples": {
+            "description": "Sequence gaps within a session since factory-api started.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "identity_conflict": {
+            "type": "boolean"
+          },
+          "last_received_at_ms": {
+            "description": "Server clock when the last accepted sample arrived; null before the first one.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "seq": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "Always `remote`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "dropped_samples",
+          "identity_conflict"
         ],
         "type": "object"
       },
@@ -3609,6 +3727,237 @@
             "description": ""
           }
         },
+        "tags": []
+      }
+    },
+    "/v1/devices/{device_id}": {
+      "get": {
+        "operationId": "remote_device_current",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceView"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "An enrolled remote device: stale after 45 s of transport or collection age, and\n`unknown` until its first fresh sample since factory-api started. `factory-gpu`\nis served the same way at its literal path.",
+        "tags": []
+      }
+    },
+    "/v1/devices/{device_id}/history": {
+      "get": {
+        "operationId": "remote_device_history",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "1h (default), 24h, or 7d",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceHistory"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": []
+      }
+    },
+    "/v1/devices/{device_id}/samples": {
+      "post": {
+        "operationId": "ingest_sample",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Schema version 1 sample; see docs/devices-ingest.md",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestResult"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds before retrying",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "device_bearer": []
+          }
+        ],
+        "summary": "One remote sample (docs/devices-ingest.md). Checks run in the contract's order:\nmethod, Sec-Fetch-Site, credential, device binding, content type, body size,\nJSON and schema, then rate. Errors use ApiError, adding `error.field` and, for\n`unsupported_schema_version`, `accepted_schema_versions`.",
         "tags": []
       }
     },

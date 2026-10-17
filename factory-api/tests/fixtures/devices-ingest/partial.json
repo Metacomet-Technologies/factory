@@ -1,0 +1,279 @@
+{
+  "schema_version": 1,
+  "device_id": "factory-console",
+  "agent": {
+    "name": "factory-devices-agent",
+    "version": "0.1.0"
+  },
+  "session_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+  "seq": 1,
+  "observed_at_ms": 1792238415000,
+  "sent_at_ms": 1792238415095,
+  "identity": {
+    "hostname": "factory-console",
+    "boot_id": "0b7d6c1e-8f2a-4c3b-9d4e-5f6a7b8c9d0e",
+    "uptime": {
+      "value": 31.2,
+      "unit": "s",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "cpu": {
+    "utilization": {
+      "value": null,
+      "unit": "%",
+      "observed_at_ms": 1792238415000,
+      "availability": "stale",
+      "detail": "waiting for a second sample"
+    },
+    "iowait": {
+      "value": null,
+      "unit": "%",
+      "observed_at_ms": 1792238415000,
+      "availability": "stale",
+      "detail": "waiting for a second sample"
+    },
+    "load1": {
+      "value": 0.62,
+      "unit": "load",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "load5": {
+      "value": 0.55,
+      "unit": "load",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "load15": {
+      "value": 0.48,
+      "unit": "load",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "temperature": {
+      "value": 51.0,
+      "unit": "C",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "memory": {
+    "total": {
+      "value": 17179869184,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "available": {
+      "value": 11811160064,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "used": {
+      "value": 5368709120,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "swap_total": {
+      "value": 2147483648,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    },
+    "swap_free": {
+      "value": 2147483648,
+      "unit": "bytes",
+      "observed_at_ms": 1792238415000,
+      "availability": "available",
+      "detail": null
+    }
+  },
+  "filesystems": [
+    {
+      "id": "/dev/nvme0n1p2\t/",
+      "source": "/dev/nvme0n1p2",
+      "mountpoint": "/",
+      "fstype": "ext4",
+      "size": {
+        "value": null,
+        "unit": "bytes",
+        "observed_at_ms": 1792238415000,
+        "availability": "error",
+        "detail": "capacity missing"
+      },
+      "used": {
+        "value": null,
+        "unit": "bytes",
+        "observed_at_ms": 1792238415000,
+        "availability": "error",
+        "detail": "capacity missing"
+      },
+      "used_percent": {
+        "value": null,
+        "unit": "%",
+        "observed_at_ms": 1792238415000,
+        "availability": "error",
+        "detail": "capacity missing"
+      },
+      "inodes_used_percent": {
+        "value": null,
+        "unit": "%",
+        "observed_at_ms": 1792238415000,
+        "availability": "error",
+        "detail": "capacity missing"
+      }
+    }
+  ],
+  "drives": [
+    {
+      "id": "eui.0025388b91b2c3d4",
+      "kernel": "nvme0n1",
+      "model": "APPLE SSD AP0256M",
+      "size": {
+        "value": 251000193024,
+        "unit": "bytes",
+        "observed_at_ms": 1792238415000,
+        "availability": "available",
+        "detail": null
+      },
+      "smart": {
+        "availability": "available",
+        "passed": true,
+        "observed_at_ms": 1792238415000,
+        "detail": null
+      },
+      "available_spare": {
+        "value": 100,
+        "unit": "%",
+        "observed_at_ms": 1792238415000,
+        "availability": "available",
+        "detail": null
+      },
+      "spare_threshold_percent": 2,
+      "media_errors": {
+        "value": 0,
+        "unit": "count",
+        "observed_at_ms": 1792238415000,
+        "availability": "available",
+        "detail": null
+      },
+      "media_critical": false,
+      "temperature": {
+        "value": 38,
+        "unit": "C",
+        "observed_at_ms": 1792238415000,
+        "availability": "available",
+        "detail": null
+      }
+    }
+  ],
+  "disk_io": {
+    "read": {
+      "value": null,
+      "unit": "B/s",
+      "observed_at_ms": 1792238415000,
+      "availability": "stale",
+      "detail": "waiting for a second sample"
+    },
+    "write": {
+      "value": null,
+      "unit": "B/s",
+      "observed_at_ms": 1792238415000,
+      "availability": "stale",
+      "detail": "waiting for a second sample"
+    }
+  },
+  "network": {
+    "rx": {
+      "value": null,
+      "unit": "B/s",
+      "observed_at_ms": 1792238415000,
+      "availability": "stale",
+      "detail": "waiting for a second sample"
+    },
+    "tx": {
+      "value": null,
+      "unit": "B/s",
+      "observed_at_ms": 1792238415000,
+      "availability": "stale",
+      "detail": "waiting for a second sample"
+    }
+  },
+  "cooling": {
+    "temperatures": [
+      {
+        "name": "coretemp Package id 0",
+        "metric": {
+          "value": 51.0,
+          "unit": "C",
+          "observed_at_ms": 1792238415000,
+          "availability": "available",
+          "detail": null
+        }
+      }
+    ],
+    "fans": [
+      {
+        "name": "applesmc fan1",
+        "metric": {
+          "value": 1800,
+          "unit": "rpm",
+          "observed_at_ms": 1792238415000,
+          "availability": "available",
+          "detail": null
+        }
+      }
+    ],
+    "temperatures_availability": "available",
+    "fans_availability": "available"
+  },
+  "maintenance": {
+    "backup": {
+      "availability": "error",
+      "last_success_ms": null,
+      "last_attempt_ms": null,
+      "error": null,
+      "observed_at_ms": 1792238415000
+    },
+    "clock": {
+      "synchronized": true,
+      "availability": "available",
+      "observed_at_ms": 1792238415000
+    },
+    "reboot": {
+      "availability": "permission_denied",
+      "reboot_required": null,
+      "pending_since_ms": null,
+      "days_pending": null,
+      "consecutive_skips": null,
+      "alert_due": null,
+      "last_check_ms": null,
+      "last_decision": null,
+      "detail": "status file unreadable"
+    }
+  },
+  "collector": {
+    "fast_interval_ms": 15000,
+    "slow_interval_ms": 300000,
+    "last_fast_ms": 1792238415000,
+    "last_slow_ms": 1792238415000,
+    "fast_ok": true,
+    "filesystems": "error",
+    "drives": "available",
+    "smart": "available",
+    "detail": "filesystem capacity probe failed"
+  }
+}

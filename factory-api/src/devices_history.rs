@@ -1,5 +1,5 @@
 //! Device sample storage. A raw row and its hourly rollup commit together.
-use crate::devices::DeviceView;
+use crate::devices::{DeviceView, HostSnapshot};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -57,7 +57,10 @@ fn finite(value: Option<f64>) -> Option<f64> {
 
 impl StoredSample {
     pub fn from_view(view: &DeviceView) -> Self {
-        let device = &view.device;
+        Self::from_host(&view.device)
+    }
+
+    pub fn from_host(device: &HostSnapshot) -> Self {
         let bytes = device
             .memory
             .used
@@ -91,8 +94,16 @@ MIN(net_tx_bps),AVG(net_tx_bps),MAX(net_tx_bps),
 MIN(cpu_temp_c),AVG(cpu_temp_c),MAX(cpu_temp_c)
 FROM device_samples WHERE device_id=?2 AND ts_ms>=?1 AND ts_ms<?3";
 
+pub const LATEST_SQL: &str = "SELECT MAX(ts_ms) FROM device_samples WHERE device_id=?1";
+
+/// The device's newest stored sample time; remote ordering reloads it after a restart.
+pub fn latest_ts(db: &Connection, device_id: &str) -> Result<Option<i64>> {
+    Ok(db.query_row(LATEST_SQL, [device_id], |row| row.get(0))?)
+}
+
 /// Skip a timestamp that does not advance. A retried write finds the row already committed.
-pub fn record(db: &mut Connection, sample: &StoredSample) -> Result<()> {
+/// Returns whether a row was inserted.
+pub fn record(db: &mut Connection, sample: &StoredSample) -> Result<bool> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let previous: Option<i64> = tx
         .query_row(
@@ -103,7 +114,7 @@ pub fn record(db: &mut Connection, sample: &StoredSample) -> Result<()> {
         .optional()?;
     if previous.is_some_and(|ts| sample.ts_ms <= ts) {
         tx.commit()?;
-        return Ok(());
+        return Ok(false);
     }
     tx.execute(
         INSERT_SQL,
@@ -123,7 +134,7 @@ pub fn record(db: &mut Connection, sample: &StoredSample) -> Result<()> {
     let hour = sample.ts_ms / HOUR_MS * HOUR_MS;
     tx.execute(ROLLUP_SQL, params![hour, sample.device_id, hour + HOUR_MS])?;
     tx.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// Completed hours only. A raw row whose rollup is missing stays until that rollup commits.
@@ -193,7 +204,7 @@ pub fn history(
         .collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn record_view(db: &mut Connection, view: &DeviceView) -> Result<()> {
+pub fn record_view(db: &mut Connection, view: &DeviceView) -> Result<bool> {
     record(db, &StoredSample::from_view(view))
 }
 
@@ -323,6 +334,8 @@ mod tests {
         assert!(raw.iter().map(|point| point.sample_count).sum::<i64>() > 0);
         let hourly = history(&db, "factory-gpu", 0, 8 * DAY_MS, false).unwrap();
         assert!(hourly.len() <= 720);
+        assert_eq!(latest_ts(&db, "factory-gpu").unwrap(), Some(8000 * 10000));
+        assert_eq!(latest_ts(&db, "factory-console").unwrap(), None);
         let cases: Vec<(&str, Vec<rusqlite::types::Value>, &str, bool)> = vec![
             (
                 RAW_HISTORY_SQL,
@@ -334,6 +347,12 @@ mod tests {
                 ],
                 "device_samples",
                 true,
+            ),
+            (
+                LATEST_SQL,
+                vec!["factory-gpu".to_string().into()],
+                "device_samples",
+                false,
             ),
             (
                 HOURLY_HISTORY_SQL,

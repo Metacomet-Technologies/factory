@@ -2,6 +2,11 @@
 set -Eeuo pipefail
 umask 0077
 repo=$(dirname "$(dirname "$(realpath "$0")")")
+# MET-219: remove only the credential line one enrollment added.
+if [[ ${1:-} == --unenroll-device ]]; then
+    shift
+    exec bash "$repo/deploy/device-tokens.sh" unenroll "$@"
+fi
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/rollback-factory-api.sh <snapshot-directory>.'
 [[ $# -eq 1 ]] || fail 'Supply the exact snapshot directory printed by the installer.'
