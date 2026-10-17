@@ -3,6 +3,8 @@
 Phase 1 reads factory-gpu from the factory-api process. There is no second GPU
 sample store and no remote ingestion.
 
+Phase 2 remote ingestion design (for review): [devices-ingest.md](devices-ingest.md).
+
 ## Sources
 
 | Reading | Source |
