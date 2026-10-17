@@ -22,6 +22,12 @@ import UpsPage from "./components/ups-page";
 import DevicesPage from "./components/devices-page";
 import LlmPage from "./components/llm-page";
 import NetworkPage from "./components/network-page";
+import { parseAmbient } from "./ambient/mode";
+import { startAmbientPerf } from "./ambient/perf";
+import { AmbientScene } from "./ambient/scene";
+
+// MET-237 spike: read once at load; no parameter keeps the v1 kiosk unchanged.
+const ambient = parseAmbient(window.location.search);
 
 /** Same-origin links without a modifier key route in-app; everything else falls through. */
 function followLink(event: globalThis.MouseEvent) {
@@ -62,6 +68,7 @@ export default function App() {
       document.removeEventListener("click", followLink);
     };
   }, []);
+  useEffect(() => (ambient.perf ? startAmbientPerf(ambient.mode ?? "v1") : undefined), []);
   const [dark, setDark] = useState(() => document.documentElement.dataset.theme === "dark");
   const [followsSystem, setFollowsSystem] = useState(
     () => !document.documentElement.dataset.themePreference,
@@ -132,6 +139,7 @@ export default function App() {
   useBuildUpdate(live.snapshotRevision, usage.loading || gpu.loading);
   return (
     <TooltipProvider>
+      {ambient.mode && <AmbientScene mode={ambient.mode} dark={dark} />}
       <a href="#main" className="skip-link">
         Skip to dashboard
       </a>

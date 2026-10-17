@@ -1,0 +1,219 @@
+{
+  "v": 3,
+  "layout": "files",
+  "createdOnFiles": {
+    "v": 1,
+    "at": "2026-10-17T15:54:23Z"
+  },
+  "title": "Factory Kiosk",
+  "namespace": "FactoryKiosk",
+  "libraries": [
+    {
+      "name": "react",
+      "version": "18"
+    },
+    {
+      "name": "react-dom",
+      "version": "18"
+    }
+  ],
+  "sections": {},
+  "groups": [
+    "Icons"
+  ],
+  "assetGroups": {
+    "Icons": {
+      "name": "Icons",
+      "tile": "xs",
+      "order": [
+        "activity.svg",
+        "server.svg",
+        "cpu.svg",
+        "plug.svg",
+        "terminal.svg",
+        "radio.svg",
+        "triangle-alert.svg",
+        "arrow-up-right.svg",
+        "refresh-cw.svg",
+        "info.svg",
+        "sun.svg",
+        "moon.svg",
+        "battery.svg",
+        "battery-warning.svg",
+        "battery-charging.svg",
+        "gauge.svg",
+        "receipt.svg",
+        "rotate-ccw-clock.svg",
+        "settings-2.svg",
+        "zap.svg",
+        "hard-drive.svg",
+        "memory-stick.svg",
+        "network.svg",
+        "thermometer.svg",
+        "wrench.svg"
+      ],
+      "files": {
+        "activity.svg": {
+          "name": "activity.svg",
+          "blob": "b74894e8d2a81892064c13130f50d21d",
+          "size": 317,
+          "type": "image/svg+xml"
+        },
+        "server.svg": {
+          "name": "server.svg",
+          "blob": "e62610fe26d4b970d8e1e0b98f1bdd73",
+          "size": 372,
+          "type": "image/svg+xml"
+        },
+        "cpu.svg": {
+          "name": "cpu.svg",
+          "blob": "4a596b471acb6e033aebb7624db12d12",
+          "size": 509,
+          "type": "image/svg+xml"
+        },
+        "plug.svg": {
+          "name": "plug.svg",
+          "blob": "df8cd499fb22aa189cd2cba93826fdc2",
+          "size": 322,
+          "type": "image/svg+xml"
+        },
+        "terminal.svg": {
+          "name": "terminal.svg",
+          "blob": "59f2e5e4f6d37c0e9b0323b117ef40f5",
+          "size": 228,
+          "type": "image/svg+xml"
+        },
+        "radio.svg": {
+          "name": "radio.svg",
+          "blob": "0237e57f5434339435a9e143ae5dfb15",
+          "size": 392,
+          "type": "image/svg+xml"
+        },
+        "triangle-alert.svg": {
+          "name": "triangle-alert.svg",
+          "blob": "7652afb2f5a5859c18a0f244b231286a",
+          "size": 308,
+          "type": "image/svg+xml"
+        },
+        "arrow-up-right.svg": {
+          "name": "arrow-up-right.svg",
+          "blob": "03b4b4dcb48e6568b6c35de8e29774d2",
+          "size": 227,
+          "type": "image/svg+xml"
+        },
+        "refresh-cw.svg": {
+          "name": "refresh-cw.svg",
+          "blob": "cc3851168e1ec0554c91b42895fa4480",
+          "size": 351,
+          "type": "image/svg+xml"
+        },
+        "info.svg": {
+          "name": "info.svg",
+          "blob": "d24c42511f8b594f06c63214468affcd",
+          "size": 257,
+          "type": "image/svg+xml"
+        },
+        "sun.svg": {
+          "name": "sun.svg",
+          "blob": "46db28d2f4e516dd16dc8dcdd40db4ec",
+          "size": 424,
+          "type": "image/svg+xml"
+        },
+        "moon.svg": {
+          "name": "moon.svg",
+          "blob": "8de574ec3a81dd19cf5c7b151e8bcbc8",
+          "size": 305,
+          "type": "image/svg+xml"
+        },
+        "battery.svg": {
+          "name": "battery.svg",
+          "blob": "d453c9013255c7b0ce142399a44fc793",
+          "size": 259,
+          "type": "image/svg+xml"
+        },
+        "battery-warning.svg": {
+          "name": "battery-warning.svg",
+          "blob": "a2b7737b5959a87aab2316234d7dc597",
+          "size": 348,
+          "type": "image/svg+xml"
+        },
+        "battery-charging.svg": {
+          "name": "battery-charging.svg",
+          "blob": "c1f7b71eb862e68869b81596a5a21313",
+          "size": 351,
+          "type": "image/svg+xml"
+        },
+        "gauge.svg": {
+          "name": "gauge.svg",
+          "blob": "2a3c901743fa8a98ec88bc733ce63248",
+          "size": 245,
+          "type": "image/svg+xml"
+        },
+        "receipt.svg": {
+          "name": "receipt.svg",
+          "blob": "c3a749ce9674f8ecfa6f77a45c37ac50",
+          "size": 704,
+          "type": "image/svg+xml"
+        },
+        "rotate-ccw-clock.svg": {
+          "name": "rotate-ccw-clock.svg",
+          "blob": "6441a76817c66c18d5947ff1cdf5fe66",
+          "size": 287,
+          "type": "image/svg+xml"
+        },
+        "settings-2.svg": {
+          "name": "settings-2.svg",
+          "blob": "54db563ed135ce50168e3e106156732f",
+          "size": 283,
+          "type": "image/svg+xml"
+        },
+        "zap.svg": {
+          "name": "zap.svg",
+          "blob": "037fc60de790b72c7f2e7f78020aade6",
+          "size": 361,
+          "type": "image/svg+xml"
+        },
+        "hard-drive.svg": {
+          "name": "hard-drive.svg",
+          "blob": "b988932456dd32069ce92fa9065ee15b",
+          "size": 418,
+          "type": "image/svg+xml"
+        },
+        "memory-stick.svg": {
+          "name": "memory-stick.svg",
+          "blob": "da7a70fce1c426d1b9d7e853b197260e",
+          "size": 441,
+          "type": "image/svg+xml"
+        },
+        "network.svg": {
+          "name": "network.svg",
+          "blob": "07e1927d6a297c81741a56b36c0cb30d",
+          "size": 400,
+          "type": "image/svg+xml"
+        },
+        "thermometer.svg": {
+          "name": "thermometer.svg",
+          "blob": "0d7576307d483d2747d21e18ddb3bd73",
+          "size": 237,
+          "type": "image/svg+xml"
+        },
+        "wrench.svg": {
+          "name": "wrench.svg",
+          "blob": "ee26e60294d5747cd4112494749d1a50",
+          "size": 388,
+          "type": "image/svg+xml"
+        }
+      }
+    }
+  },
+  "blobs": {},
+  "docs": {
+    "sections": []
+  },
+  "lastChange": {
+    "by": "Devon",
+    "at": "2026-10-17T17:05:53Z",
+    "via": "Kiosk direction lab votes · MET-227",
+    "note": "v2 Snake River dusk: teal brand, apricot sky, meadow-green ok, frosted glass, Teton ridgeline backdrop with alpenglow sweep, stars and aurora, Verdict strip, comet trend, Geist + Geist Mono, new kiosk grid. The drift report still describes v1 code at 757250d."
+  }
+}

@@ -1,0 +1,3 @@
+# Icons
+
+The 25 lucide icons (lucide-react 1.54, ISC) the kiosk imports, as SVG at 24 × 24 with a 2 px stroke and round caps and joins. In the app they draw in `currentColor`. These files are drawn in a single ink, #7a808d, a neutral that reads at least 3.6:1 on both themes' grounds, because an `<img>` cannot inherit colour. File names are lucide's own; `rotate-ccw-clock` is the `History` export and `triangle-alert` is `AlertTriangle`. In components use `FactoryKiosk.Icon` with the export name. v2 also uses lucide `Mountain` for the brand mark. It is drawn by `FactoryKiosk.Icon` and is not yet in this asset set.

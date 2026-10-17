@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+@import "./ambient/ambient.css";
 @custom-variant dark (&:is(.dark *));
 
 /* Tokens are documented in docs/agents/kiosk-styleguide.md. Change them there first. */
