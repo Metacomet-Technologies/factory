@@ -2,8 +2,10 @@ pub mod alerts;
 mod api;
 pub mod costs;
 pub mod data;
+pub mod device_auth;
 pub mod devices;
 pub mod devices_history;
+pub mod devices_ingest;
 pub mod fleet;
 mod kiosk;
 pub mod network;
@@ -54,6 +56,8 @@ pub struct AppState {
     pub backup_status: PathBuf,
     pub devices_root: PathBuf,
     pub reboot_status: PathBuf,
+    /// Remote device credentials and ingest state (docs/devices-ingest.md).
+    pub remote: Arc<devices_ingest::Registry>,
     pub alerts: Arc<alerts::Alerting>,
     usage_refresh_lock: Arc<std::sync::Mutex<()>>,
     meter_sync_lock: Arc<tokio::sync::Mutex<()>>,
@@ -122,6 +126,9 @@ impl AppState {
             backup_status: alerts::DEFAULT_BACKUP_STATUS.into(),
             devices_root: PathBuf::from("/"),
             reboot_status: devices::DEFAULT_REBOOT_STATUS.into(),
+            remote: Arc::new(devices_ingest::Registry::new(device_auth::Tokens::new(
+                device_auth::DEFAULT_PATH,
+            ))),
             alerts: Arc::new(alerts::Alerting::new(alerts::Config::default())),
             usage_refresh_lock: Default::default(),
             meter_sync_lock: Default::default(),

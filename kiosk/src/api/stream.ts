@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useState } from "react";
 import { apiUrl } from "./client";
+import { DEVICE_ID } from "../lib/devices";
 import type { Agents, DeviceView, GpuSample, UpsCurrent, StreamEvent } from "./types";
 
 export interface LiveState {
@@ -17,6 +18,8 @@ export interface LiveState {
   devices: DeviceView | null | undefined;
   devicesAt: number;
   devicesRevision: number;
+  /** Latest pushed view per remote device; factory-gpu stays in `devices`. */
+  remoteDevices: Record<string, DeviceView>;
   networkRevision: number;
 }
 export const initialLiveState: LiveState = {
@@ -34,6 +37,7 @@ export const initialLiveState: LiveState = {
   devices: undefined,
   devicesAt: 0,
   devicesRevision: 0,
+  remoteDevices: {},
   networkRevision: 0,
 };
 export function streamReducer(state: LiveState, event: StreamEvent): LiveState {
@@ -67,6 +71,13 @@ export function streamReducer(state: LiveState, event: StreamEvent): LiveState {
     case "agents.usage":
       return { ...state, agents: event.data, agentsRevision: state.agentsRevision + 1 };
     case "devices.sample":
+      // Null keeps its phase-1 meaning (the factory-gpu collector failed); remote devices never send it.
+      if (event.data && event.data.device.device_id !== "factory-gpu")
+        return {
+          ...state,
+          remoteDevices: { ...state.remoteDevices, [event.data.device.device_id]: event.data },
+          devicesRevision: state.devicesRevision + 1,
+        };
       return {
         ...state,
         devices: event.data,
@@ -207,7 +218,8 @@ export function parseEvent(value: unknown): StreamEvent | null {
       const cpu = host.cpu as Record<string, unknown> | undefined;
       const utilization = cpu?.utilization as Record<string, unknown> | undefined;
       if (
-        host.device_id === "factory-gpu" &&
+        typeof host.device_id === "string" &&
+        DEVICE_ID.test(host.device_id) &&
         health &&
         ["critical", "warning", "healthy", "unknown", "stale"].includes(String(health.status)) &&
         utilization &&

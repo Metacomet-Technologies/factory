@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Private network namespace and fixed-destination loopback/Unix relays (Linux)."""
+import base64
 import hashlib
 import json
 import os
@@ -126,6 +127,21 @@ def listeners(inside):
         raise
 
 
+def enroll_sandbox_device(credentials):
+    """A synthetic factory-console credential: the token stays in credentials/, factory-api gets its hash."""
+    token_file = credentials / "factory-console-device-token"
+    if not token_file.exists():
+        token = "fdv1_" + base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+        token_file.write_text(token)
+        token_file.chmod(0o600)
+    token = token_file.read_text().strip()
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    hashes = STATE / "device-tokens"
+    atomic(hashes, f"factory-console {digest} sandbox-synthetic\n")
+    hashes.chmod(0o640)
+    return hashes
+
+
 def write_devices_fixture(root):
     """Synthetic /proc and /sys so the device collector never reads the host."""
     files = {
@@ -200,7 +216,9 @@ def inside():
             (credentials / name).chmod(0o600)
         os.environ["CREDENTIALS_DIRECTORY"] = str(credentials)
         (STATE / "serve-login").write_text("DGarbs51@github\n")
-        start("fake-serve", ["python3", ROOT / "scripts/sandbox-shims/fake-serve.py", str(BASE + 3), "8090", STATE])
+        start("fake-serve", ["python3", ROOT / "scripts/sandbox-shims/fake-serve.py", str(BASE + 3), "8090", STATE,
+                             str(BASE + 2)])
+        device_tokens = enroll_sandbox_device(credentials)
         control_args = [binary / "factory-ups-control", "--db-path", STATE / "ups-control.db",
                         "--slack-url", f"http://127.0.0.1:{BASE+3}/slack/chat.postMessage"]
         subprocess.run([*control_args, "migrate"], check=True, timeout=30)
@@ -309,6 +327,7 @@ def inside():
                               # well under a second of CPU every two minutes.
                               "--network-speed-url", "http://127.0.0.1:8099",
                               "--network-speed-interval-s", "120",
+                              "--device-tokens", device_tokens,
                               "--static-dir", ROOT / "kiosk/dist" if kiosk == "1" else STATE / "no-kiosk"])
         ready(BASE + 2, "/v1/health")
         started = time.monotonic()

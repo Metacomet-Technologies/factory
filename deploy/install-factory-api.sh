@@ -2,6 +2,11 @@
 set -Eeuo pipefail
 umask 0077
 root=$(dirname "$(dirname "$(realpath "$0")")")
+# MET-219: add one remote device credential hash; the token is read from stdin only.
+if [[ ${1:-} == --enroll-device ]]; then
+    shift
+    exec bash "$root/deploy/device-tokens.sh" enroll "$@"
+fi
 binary=${1:-}
 unit=$root/deploy/factory-api.service
 destination=/usr/local/bin/factory-api
