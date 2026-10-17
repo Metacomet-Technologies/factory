@@ -17,6 +17,7 @@ pub fn router(seed: u64) -> Router {
         )
         .route("/api/ps", get(models))
         .route("/api/tags", get(models))
+        .route("/api/show", post(show))
         .route("/api/chat", post(completion))
         .route("/api/generate", post(completion))
         .route("/v1/chat/completions", post(completion))
@@ -32,6 +33,65 @@ async fn models() -> Json<Value> {
         "expires_at":"2099-01-01T00:00:00Z",
         "details":{"format":"gguf","family":"synthetic","parameter_size":"12B","quantization_level":"Q4_K_M"}
     }))}))
+}
+
+/// Per-preset `/api/show` metadata: (parent, family, parameter size, context length, num_ctx, tools).
+fn preset(model: &str) -> Option<(&'static str, &'static str, &'static str, u64, u64, bool)> {
+    match model.strip_suffix(":latest").unwrap_or(model) {
+        "factory-assist" => Some(("gemma4:12b", "gemma4", "11.9B", 262_144, 65_536, true)),
+        "factory-assist-max" => Some(("gemma4:12b", "gemma4", "11.9B", 262_144, 262_144, true)),
+        // Mirrors production practice: qwen2.5-coder emits tool calls as prose, not natively.
+        "factory-code" => Some(("qwen2.5-coder:14b", "qwen2", "14.8B", 32_768, 16_384, false)),
+        _ => None,
+    }
+}
+
+async fn show(Json(request): Json<Value>) -> Response {
+    let name = request["model"].as_str().unwrap_or_default();
+    let Some((parent, family, size, context, num_ctx, tools)) = preset(name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":format!("model '{name}' not found")})),
+        )
+            .into_response();
+    };
+    let mut capabilities = vec!["completion"];
+    if tools {
+        capabilities.push("tools");
+    }
+    Json(json!({
+        "modelfile":format!("# synthetic sandbox Modelfile\nFROM {parent}\nPARAMETER num_ctx {num_ctx}\n"),
+        "parameters":format!("num_ctx                        {num_ctx}"),
+        "template":"{{ .Prompt }}",
+        "details":{"parent_model":parent,"format":"gguf","family":family,"families":[family],
+            "parameter_size":size,"quantization_level":"Q4_K_M"},
+        "model_info":{"general.architecture":family,format!("{family}.context_length"):context},
+        "capabilities":capabilities,
+        "modified_at":"2026-01-01T00:00:00Z"
+    }))
+    .into_response()
+}
+
+/// Arguments satisfying a JSON schema's required fields, preferring its first allowed value.
+fn arguments(schema: &Value) -> Value {
+    let mut values = serde_json::Map::new();
+    for key in schema["required"].as_array().into_iter().flatten() {
+        let Some(key) = key.as_str() else { continue };
+        let rule = &schema["properties"][key];
+        let value = if let Some(first) = rule["enum"].get(0) {
+            first.clone()
+        } else {
+            match rule["type"].as_str() {
+                Some("integer" | "number") => rule["minimum"].as_i64().unwrap_or(1).into(),
+                Some("boolean") => false.into(),
+                Some("object") => arguments(rule),
+                Some("array") => json!([]),
+                _ => "synthetic".into(),
+            }
+        };
+        values.insert(key.into(), value);
+    }
+    values.into()
 }
 
 pub fn openrouter() -> Value {
@@ -92,14 +152,18 @@ async fn completion(
     let prompt = 20 + hash % 181;
     let output = 8 + (hash >> 8) % 25;
     let text = format!("Synthetic response {hash:016x}.");
-    let tool = request["tools"]
-        .as_array()
-        .and_then(|tools| tools.first())
-        .and_then(|tool| tool["function"]["name"].as_str());
+    let first_tool = request["tools"].as_array().and_then(|tools| tools.first());
+    let tool = first_tool.and_then(|tool| tool["function"]["name"].as_str());
     let mut message = json!({"role":"assistant","content":text});
-    if let Some(name) = tool {
-        message["content"] = Value::Null;
-        message["tool_calls"] = json!([{"index":0,"id":format!("call_{hash:016x}"),"type":"function","function":{"name":name,"arguments":"{}"}}]);
+    if openai {
+        if let Some(name) = tool {
+            message["content"] = Value::Null;
+            message["tool_calls"] = json!([{"index":0,"id":format!("call_{hash:016x}"),"type":"function","function":{"name":name,"arguments":"{}"}}]);
+        }
+    } else if let Some(name) = tool.filter(|_| preset(model).is_some_and(|p| p.5)) {
+        message["content"] = "".into();
+        message["tool_calls"] = json!([{"function":{"index":0,"name":name,
+            "arguments":arguments(&first_tool.unwrap()["function"]["parameters"])}}]);
     }
     let usage =
         json!({"prompt_tokens":prompt,"completion_tokens":output,"total_tokens":prompt+output});

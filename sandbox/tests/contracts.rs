@@ -299,3 +299,88 @@ async fn seed_has_exact_count_gaps_nulls_bursts_and_repeatable_rows() {
     .await
     .expect("seed test timed out");
 }
+
+#[tokio::test]
+async fn show_and_native_tool_calls_follow_ollama_shapes() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (fake, _fake_server) = serve(sandbox::fake::router(42)).await;
+        let (twin, _twin_server) = serve(sandbox::fake::router(42)).await;
+        let client = reqwest::Client::new();
+        let post = |base: &str, path: &str, body: Value| {
+            client.post(format!("{base}{path}")).json(&body).send()
+        };
+        for (model, family, context, num_ctx, tools) in [
+            ("factory-assist", "gemma4", 262_144, 65_536, true),
+            ("factory-assist-max", "gemma4", 262_144, 262_144, true),
+            ("factory-code", "qwen2", 32_768, 16_384, false),
+        ] {
+            let mut shows = Vec::new();
+            for name in [model.to_string(), format!("{model}:latest")] {
+                let response = post(&fake, "/api/show", json!({"model":name})).await.unwrap();
+                assert_eq!(response.status(), 200);
+                shows.push(response.json::<Value>().await.unwrap());
+            }
+            assert_eq!(shows[0], shows[1]);
+            let show = &shows[0];
+            assert_eq!(show["details"]["family"], family);
+            assert_eq!(show["details"]["format"], "gguf");
+            assert_eq!(show["model_info"]["general.architecture"], family);
+            assert_eq!(show["model_info"][format!("{family}.context_length")], context);
+            assert!(show["parameters"].as_str().unwrap().ends_with(&format!(" {num_ctx}")));
+            assert!(show["template"].is_string());
+            let capabilities = show["capabilities"].as_array().unwrap();
+            assert!(capabilities.contains(&json!("completion")));
+            assert_eq!(capabilities.contains(&json!("tools")), tools);
+        }
+        for name in ["factory-unknown", "factory-assist:12b", ""] {
+            let response = post(&fake, "/api/show", json!({"model":name})).await.unwrap();
+            assert_eq!(response.status(), 404);
+            let error = response.json::<Value>().await.unwrap();
+            assert_eq!(error, json!({"error":format!("model '{name}' not found")}));
+        }
+
+        // Required fields only; the enum and integer bounds must be honored, the optional key omitted.
+        let tools = json!([
+            {"type":"function","function":{"name":"get_service_logs","parameters":{"type":"object",
+                "properties":{"node":{"type":"string","enum":["factory-console","factory-gpu"]},
+                    "lines":{"type":"integer","minimum":3,"maximum":200},"model":{"type":"string"}},
+                "required":["node","lines"]}}},
+            {"type":"function","function":{"name":"get_fleet_status","parameters":{"type":"object","properties":{},"required":[]}}}
+        ]);
+        let chat = |base: String, model: &str, tools: Value, seed: u64| {
+            let request = json!({"model":model,"stream":true,"tools":tools,"options":{"seed":seed},
+                "messages":[{"role":"user","content":"read logs"}]});
+            let client = client.clone();
+            async move {
+                client.post(format!("{base}/api/chat")).json(&request).send().await.unwrap().text().await.unwrap()
+            }
+        };
+        let frames = |body: &str| -> Vec<Value> {
+            body.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+        };
+        for model in ["factory-assist", "factory-assist-max:latest"] {
+            let first = chat(fake.clone(), model, tools.clone(), 1001).await;
+            assert_eq!(first, chat(twin.clone(), model, tools.clone(), 1001).await);
+            assert_eq!(first, chat(fake.clone(), model, tools.clone(), 1001).await);
+            let parsed = frames(&first);
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(
+                parsed[0]["message"]["tool_calls"],
+                json!([{"function":{"index":0,"name":"get_service_logs","arguments":{"node":"factory-console","lines":3}}}])
+            );
+            assert_eq!(parsed[1]["done"], true);
+            assert!(parsed[1].get("message").unwrap().get("tool_calls").is_none());
+        }
+        let calls = |body: String| frames(&body).iter().any(|f| f["message"].get("tool_calls").is_some());
+        assert!(!calls(chat(fake.clone(), "factory-code", tools.clone(), 1001).await));
+        for model in sandbox::MODELS {
+            for offered in [json!([]), Value::Null] {
+                let body = chat(fake.clone(), model, offered, 1001).await;
+                assert!(!calls(body.clone()));
+                assert!(frames(&body)[0]["message"]["content"].as_str().unwrap().starts_with("Synthetic response"));
+            }
+        }
+    })
+    .await
+    .expect("show/tool test timed out");
+}
