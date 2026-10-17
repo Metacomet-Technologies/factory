@@ -14,7 +14,7 @@ import { parsePolicy } from './policy.ts';
 const executable = fileURLToPath(new URL('dispatch.ts', import.meta.url));
 const threadId = 'T-01234567-89ab-4cde-8fab-0123456789ab';
 const reviewId = 'T-12345678-89ab-4cde-8fab-0123456789ab';
-const sha = 'a'.repeat(40), nextSha = 'b'.repeat(40), mergeSha = 'c'.repeat(40);
+const sha = 'a'.repeat(40), nextSha = 'b'.repeat(40), mergeSha = 'c'.repeat(40), oldSha = 'd'.repeat(40);
 const policyContent = readFileSync(new URL('../../.factory/stage-policy.json', import.meta.url), 'utf8');
 const playbook = '# Synthetic playbook\n\nNo production data.\n';
 const key = 'synthetic-test-secret-not-a-credential';
@@ -81,6 +81,7 @@ async function fixture(t: any, issues = [issue()], options: any = {}) {
   if (options.sweep !== undefined) setSweep(options.sweep);
   writeFileSync(worktreesFile, JSON.stringify(options.worktrees ?? { gpu: [], console: [] }));
   writeFileSync(eventsFile, '');
+  if (options.mainBehind) writeFileSync(join(directory, 'main-behind'), '');
   writeFileSync(githubFile, JSON.stringify(options.github ?? {}));
   if (options.policy !== null) writeFileSync(join(directory, 'policy'), options.policy ?? policyContent);
   writeFileSync(threadsFile, JSON.stringify(options.threads ?? issues.flatMap(i => i.comments.flatMap((c: any) => {
@@ -182,7 +183,13 @@ if ('${program}' === 'git' && args[0] === 'ls-remote') {
     }
   } else if (args[2] === 'branch') output = process.env.FAKE_BRANCH ?? 'main';
   else if (args[2] === 'status') output = process.env.FAKE_DIRTY ?? '';
-  else if (args[2] === 'merge-base') { if (process.env.FAKE_BEHIND) process.exit(1); output = ''; }
+  else if (args[2] === 'merge-base') { if (process.env.FAKE_BEHIND || fs.existsSync(process.env.FAKE_MAIN_BEHIND)) process.exit(1); output = ''; }
+  // A behind checkout sits at oldSha until a fast-forward reaches the merge.
+  else if (args[2] === 'merge') {
+    if (args.slice(3).join(' ') !== '--ff-only origin/main' || process.env.FAKE_FF_FAIL) process.exit(1);
+    fs.rmSync(process.env.FAKE_MAIN_BEHIND, { force: true }); output = '';
+  }
+  else if (args[2] === 'rev-parse' && args[3] === 'HEAD' && fs.existsSync(process.env.FAKE_MAIN_BEHIND)) output = '${oldSha}';
   else if (args[2] === 'rev-parse') output = process.env.FAKE_POLICY_SHA ?? '${mergeSha}';
   else if (args[2] === 'show') {
     if (args[3] === '${mergeSha}:.factory/stage-policy.json') {
@@ -439,7 +446,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
       DISPATCH_GITHUB_URL: `http://127.0.0.1:${(server.address() as any).port}`,
       FAKE_GITHUB_URL: `http://127.0.0.1:${(server.address() as any).port}`,
       FAKE_CALLS: callsFile, FAKE_THREADS: threadsFile, FAKE_GITHUB: githubFile, FAKE_NOW: String(now),
-      FAKE_WORKTREES: worktreesFile, FAKE_EVENTS: eventsFile, FAKE_POLICY: join(directory, 'policy'),
+      FAKE_WORKTREES: worktreesFile, FAKE_EVENTS: eventsFile, FAKE_POLICY: join(directory, 'policy'), FAKE_MAIN_BEHIND: join(directory, 'main-behind'),
       CURSOR_API_KEY_FILE: join(directory, 'cursor-key'), DISPATCH_CURSOR_URL: `http://127.0.0.1:${(server.address() as any).port}`, ...environment,
     }, stdio: ['ignore', 'pipe', 'pipe'] });
     current = child;
@@ -1697,6 +1704,141 @@ test('non-playbook merge records one checked marker without updating the documen
   assert.match(f.mutations[0].input.body, /factory-qa:playbook-checked pr:90/);
 });
 
+const devon = 'https://linear.app/metacomet/profiles/devon';
+const ago = (minutes: number) => new Date(now - minutes * 60_000).toISOString();
+const prAttachment = (pr: number) => ({ ...attachment('merged'), url: `https://github.com/Metacomet-Technologies/factory/pull/${pr}` });
+const mergedPR = (files = [{ filename: 'docs/PLAYBOOK.md' }]) => githubPR({ state: 'MERGED', mergeCommit: { oid: mergeSha }, files });
+const builderThread = (runner: string) => runner === 'cursor' ? { body: `<!-- factory-dispatch:thread ${cursorAgent} runner:cursor -->` } : threadComment(runner);
+// An in-progress issue whose merged PR has finished (or is running) its wrap-up.
+const wrapped = (n: number, runner: string, done: string | null = ago(1), pr = 90, submitted = ago(5)) => issue(n, { labels: [], state: { type: 'started' },
+  comments: [claimComment(), builderThread(runner), { body: '<!-- factory-dispatch:wrapup -->', createdAt: submitted },
+    ...(done ? [{ body: '<!-- factory-dispatch:wrapup-done -->', createdAt: done }] : [])], attachments: [prAttachment(pr)] });
+const mainWrites = (f: any) => f.events().filter((e: any) => e[0] === 'git' && e[3] === '/home/agent/work/factory' && ['fetch', 'merge'].includes(e[4]));
+const decisions = (result: any, name: string) => result.stdout.trim().split('\n').map((line: string) => JSON.parse(line)).filter((d: any) => d.decision === name);
+const markerCount = (i: any, text: string) => i.comments.filter((c: any) => commentMarkers(c.body).includes(text)).length;
+
+test('console wrap-up fast-forwards the gpu checkout, then syncs the playbook in the same poll; dry-run only plans it', { timeout: 10_000 }, async t => {
+  const i = wrapped(123, 'console');
+  const f = await fixture(t, [i], { github: { 90: mergedPR() }, mainBehind: true });
+  const preview = await f.run(['poll', '--dry-run']);
+  assert.equal(preview.code, 0, preview.stdout);
+  assert.deepEqual(decisions(preview, 'main-ff').map(({ dryRun, issue, sha, from }) => ({ dryRun, issue, sha, from })), [{ dryRun: true, issue: 'MET-123', sha: mergeSha, from: oldSha }]);
+  assert.match(preview.stdout, /'git' '-C' '\/home\/agent\/work\/factory' 'merge' '--ff-only' 'origin\/main'/);
+  assert.deepEqual(mainWrites(f), []);
+  const result = await f.run();
+  assert.equal(result.code, 0, result.stdout);
+  assert.deepEqual(mainWrites(f).map((e: any) => e.slice(4)), [['fetch', 'origin', 'main'], ['merge', '--ff-only', 'origin/main']]);
+  assert.deepEqual(decisions(result, 'main-ff').map(({ issue, pr, from, to }) => ({ issue, pr, from, to })), [{ issue: 'MET-123', pr: '90', from: oldSha, to: mergeSha }]);
+  const syncs = f.mutations.filter(m => m.operation === 'SyncPlaybook');
+  assert.equal(syncs.length, 1);
+  assert.ok(syncs[0].input.content.includes(`main\` at ${mergeSha} after PR 90`));
+  assert.ok(!i.comments.some((c: any) => c.body.includes(devon)));
+  // Up to date afterwards: reads only, no further fetch or merge.
+  const again = await f.run();
+  assert.equal(mainWrites(f).length, 2);
+  assert.deepEqual(decisions(again, 'main-ff'), []);
+});
+
+test('up-to-date checkout reads the merge but never fetches or merges', { timeout: 10_000 }, async t => {
+  const f = await fixture(t, [wrapped(123, 'console')], { github: { 90: mergedPR([{ filename: 'widgets/widget.rs' }]) } });
+  const result = await f.run();
+  assert.equal(result.code, 0, result.stdout);
+  assert.ok(f.events().some((e: any) => e[0] === 'git' && e[4] === 'merge-base' && e[6] === mergeSha));
+  assert.deepEqual(mainWrites(f), []);
+  assert.equal(decisions(result, 'main-ff').length + decisions(result, 'main-ff-refused').length, 0);
+});
+
+for (const [name, environment, reason] of [['dirty', { FAKE_DIRTY: '?? stray-file' }, /uncommitted or untracked/], ['off main', { FAKE_BRANCH: 'feature' }, /not on main/],
+  ['diverged', { FAKE_FF_FAIL: '1' }, /merge --ff-only origin\/main failed/]] as const) {
+  test(`${name} checkout refuses the fast-forward with one mention per merge SHA and no repeat`, { timeout: 10_000 }, async t => {
+    const issues = [wrapped(123, 'console'), wrapped(124, 'console', ago(1), 91)];
+    const f = await fixture(t, issues, { github: { 90: mergedPR(), 91: mergedPR() }, mainBehind: true });
+    for (let poll = 1; poll <= 2; poll++) {
+      const result = await f.run(['poll'], environment);
+      assert.equal(result.code, 0, result.stdout);
+      assert.deepEqual(decisions(result, 'main-ff-refused').map(d => d.issue), ['MET-123', 'MET-124']);
+      assert.ok(decisions(result, 'main-ff-refused').every(d => reason.test(d.reason)));
+      // At most one fast-forward attempt per poll, even with two behind issues.
+      assert.equal(mainWrites(f).filter((e: any) => e[4] === 'merge').length, name === 'diverged' ? poll : 0);
+    }
+    for (const i of issues) {
+      const refusals = i.comments.filter((c: any) => commentMarkers(c.body).includes(`<!-- factory-dispatch:main-ff-refused sha:${mergeSha} -->`));
+      assert.equal(refusals.length, 1);
+      assert.ok(refusals[0].body.startsWith(`${devon}: `) && reason.test(refusals[0].body));
+    }
+    assert.equal(f.mutations.filter(m => m.operation === 'SyncPlaybook').length, 0);
+  });
+}
+
+test('an open gpu or cursor wrap-up holds the fast-forward until it posts wrapup-done', { timeout: 15_000 }, async t => {
+  for (const runner of ['gpu', 'cursor']) {
+    const builder = wrapped(124, runner, null, 91);
+    const f = await fixture(t, [wrapped(123, 'console'), builder], { github: { 90: mergedPR([{ filename: 'widgets/widget.rs' }]), 91: mergedPR() }, mainBehind: true });
+    const held = await f.run();
+    assert.equal(held.code, 0, held.stdout);
+    assert.deepEqual(decisions(held, 'main-ff-waiting').map(d => d.blocking), ['MET-124']);
+    assert.deepEqual(mainWrites(f), []);
+    assert.ok(!f.issues.some(i => i.comments.some((c: any) => c.body.includes('main-ff-refused'))));
+    builder.comments.push({ body: '<!-- factory-dispatch:wrapup-done -->', createdAt: ago(0) });
+    const moved = await f.run();
+    assert.deepEqual(decisions(moved, 'main-ff').map(d => d.issue), ['MET-123', 'MET-124']);
+    assert.equal(mainWrites(f).length, 2);
+  }
+});
+
+test('playbook sync pending more than 15 minutes after wrapup-done mentions Devon exactly once with the reason', { timeout: 10_000 }, async t => {
+  const i = wrapped(123, 'console', ago(15));
+  const f = await fixture(t, [i], { github: { 90: mergedPR() }, mainBehind: true });
+  const environment = { FAKE_BRANCH: 'feature' };
+  const early = await f.run(['poll'], environment);
+  assert.deepEqual(decisions(early, 'qa-sync-pending').map(d => d.reason), ['checkout not on main']);
+  assert.equal(markerCount(i, '<!-- factory-qa:sync-stalled pr:90 -->'), 0);
+  for (let poll = 0; poll < 2; poll++) assert.equal((await f.run(['poll'], { ...environment, FAKE_NOW: String(now + 1) })).code, 0);
+  const stalled = i.comments.filter((c: any) => commentMarkers(c.body).includes('<!-- factory-qa:sync-stalled pr:90 -->'));
+  assert.equal(stalled.length, 1);
+  assert.ok(stalled[0].body.startsWith(`${devon}: `) && stalled[0].body.includes('checkout not on main'));
+});
+
+test('one wrap-up per runner: a second merged issue waits for wrapup-done; other runners proceed', { timeout: 15_000 }, async t => {
+  const merged = (n: number, runner: string, pr: number) => issue(n, { labels: [], state: { type: 'started' }, comments: [claimComment(), threadComment(runner)], attachments: [prAttachment(pr)] });
+  const [first, second, other] = [merged(123, 'gpu', 90), merged(124, 'gpu', 91), merged(125, 'console', 92)];
+  // A Done issue's unfinished legacy wrap-up never blocks its runner.
+  const legacy = wrapped(126, 'gpu', null, 93, ago(600));
+  legacy.state = { type: 'completed' };
+  const f = await fixture(t, [first, second, other, legacy]);
+  const continues = () => f.calls().filter(a => a[1] === 'continue').length;
+  const result = await f.run();
+  assert.equal(result.code, 0, result.stdout);
+  assert.equal(continues(), 2);
+  assert.deepEqual([first, second, other].map(i => markerCount(i, '<!-- factory-dispatch:wrapup -->')), [1, 0, 1]);
+  assert.deepEqual(decisions(result, 'wrapup-waiting').map(({ issue, runner, blocking }) => ({ issue, runner, blocking })), [{ issue: 'MET-124', runner: 'gpu', blocking: 'MET-123' }]);
+  assert.equal(markerCount(second, '<!-- factory-dispatch:wrapup-claim -->'), 0);
+  await f.run();
+  assert.equal(continues(), 2);
+  first.comments.push({ body: '<!-- factory-dispatch:wrapup-done -->' });
+  await f.run();
+  assert.equal(continues(), 3);
+  assert.equal(markerCount(second, '<!-- factory-dispatch:wrapup -->'), 1);
+  assert.equal(markerCount(legacy, '<!-- factory-dispatch:wrapup-stalled -->'), 0);
+});
+
+test('a wrap-up open more than 60 minutes mentions Devon exactly once and is never released', { timeout: 10_000 }, async t => {
+  const open = wrapped(123, 'gpu', null, 90, ago(60));
+  const waiting = issue(124, { labels: [], state: { type: 'started' }, comments: [claimComment(), threadComment('gpu')], attachments: [prAttachment(91)] });
+  const f = await fixture(t, [open, waiting]);
+  await f.run();
+  assert.equal(markerCount(open, '<!-- factory-dispatch:wrapup-stalled -->'), 0);
+  for (let poll = 0; poll < 2; poll++) {
+    const result = await f.run(['poll'], { FAKE_NOW: String(now + 1) });
+    assert.equal(decisions(result, 'wrapup-waiting')[0].blocking, 'MET-123');
+  }
+  const stalled = open.comments.filter((c: any) => commentMarkers(c.body).includes('<!-- factory-dispatch:wrapup-stalled -->'));
+  assert.equal(stalled.length, 1);
+  assert.ok(stalled[0].body.startsWith(`${devon}: `));
+  assert.equal(f.calls().length, 0);
+  assert.equal(markerCount(open, '<!-- factory-dispatch:wrapup-done -->'), 0);
+});
+
 test('builder and QA launches label their threads; label failure retries without relaunching', { timeout: 15_000 }, async t => {
   for (const reviewer of [false, true]) {
     const i = reviewer ? reviewable() : issue();
@@ -2692,12 +2834,21 @@ test('cursor wrap-up records usage: direct, after one 0-token re-read, and unrea
     [otherAgent(121)]: { usage: zero }, [otherAgent(122)]: {} }, worktrees: { gpu: [{ path: '/home/agent/work/factory', branch: 'main' }], console: [] } });
   const usage = (i: any) => i.comments.filter((c: any) => c.body.startsWith('Cursor usage'));
   const reads = (n: number) => f.cursor.requests.filter(r => r.path === `/v1/agents/${otherAgent(n)}/usage`).length;
-  assert.equal((await f.run()).code, 0);
-  for (const i of issues) assert.ok(i.comments.some((c: any) => commentMarkers(c.body).includes('<!-- factory-dispatch:wrapup -->')), i.identifier);
+  const wrapped = (i: any) => i.comments.some((c: any) => commentMarkers(c.body).includes('<!-- factory-dispatch:wrapup -->'));
+  // Cursor wrap-ups share gpu's main checkout, so each waits for the previous wrapup-done.
+  const pass = async (expected: boolean[]) => {
+    assert.equal((await f.run()).code, 0);
+    assert.deepEqual(issues.map(wrapped), expected);
+    for (const i of issues.filter(wrapped)) if (!commentMarkers(i.comments.map((c: any) => c.body).join('\n')).includes('<!-- factory-dispatch:wrapup-done -->')) i.comments.push({ body: '<!-- factory-dispatch:wrapup-done -->' });
+  };
+  await pass([true, false, false]);
   assert.equal(usage(issues[0])[0].body, `Cursor usage: 1234 tokens, $2.50 charged (0 = plan-included)\n\n<!-- factory-dispatch:cursor-usage ${otherAgent(120)} -->`);
-  for (const i of issues.slice(1)) assert.equal(usage(i)[0].body, `Cursor usage not reported yet; re-reading once on a later poll.\n\n<!-- factory-dispatch:cursor-usage-pending ${i.comments[1].body.match(/bc-[\w-]+/)[0]} -->`);
+  await pass([true, true, false]);
+  assert.equal(usage(issues[1])[0].body, `Cursor usage not reported yet; re-reading once on a later poll.\n\n<!-- factory-dispatch:cursor-usage-pending ${otherAgent(121)} -->`);
   f.cursor.agents[otherAgent(121)].usage = { ...zero, totalUsage: { ...zero.totalUsage, totalTokens: 5000 } };
-  for (let pass = 0; pass < 2; pass++) assert.equal((await f.run()).code, 0);
+  await pass([true, true, true]);
+  assert.equal(usage(issues[2])[0].body, `Cursor usage not reported yet; re-reading once on a later poll.\n\n<!-- factory-dispatch:cursor-usage-pending ${otherAgent(122)} -->`);
+  await pass([true, true, true]);
   assert.equal(usage(issues[1]).at(-1).body, `Cursor usage: 5000 tokens, $0.00 charged (0 = plan-included)\n\n<!-- factory-dispatch:cursor-usage ${otherAgent(121)} -->`);
   assert.equal(usage(issues[2]).at(-1).body, `Cursor usage unavailable: Cursor HTTP 404.\n\n<!-- factory-dispatch:cursor-usage ${otherAgent(122)} -->`);
   assert.deepEqual([reads(120), reads(121), reads(122)], [1, 2, 2]);

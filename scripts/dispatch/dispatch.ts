@@ -2,7 +2,7 @@ import { readFileSync, openSync, closeSync, mkdirSync, writeFileSync, renameSync
 import { homedir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { reviewPRs, cleanupQAWorktrees, syncPlaybook, qaArchives, devonMention } from './qa.ts';
+import { reviewPRs, cleanupQAWorktrees, fastForwardMain, syncPlaybook, qaArchives, devonMention } from './qa.ts';
 import { repos, issueRepo } from './repos.ts';
 import { observeStagePolicy } from './policy.ts';
 
@@ -236,6 +236,17 @@ Only after all wrap-up steps succeed, post a Linear comment on ${issue.identifie
 Wrap-up finished
 
 <!-- factory-dispatch:wrapup-done -->`;
+}
+
+// A wrap-up builds in its runner's main checkout; a cursor builder's wrap-up runs on gpu.
+export function wrapupRunner(issue: Issue) {
+  const runner = issue.comments.flatMap(comment => commentMarkers(comment.body)).map(line => line.match(threadPattern)).find(Boolean)?.[2];
+  return runner === 'cursor' ? 'gpu' : runner;
+}
+// Done or Canceled is Devon's manual release; the dispatcher never releases an open wrap-up.
+export function openWrapup(issue: Issue) {
+  const lines = issue.comments.flatMap(comment => commentMarkers(comment.body));
+  return lines.includes(marker('wrapup')) && !lines.includes(marker('wrapup-done')) && !['completed', 'canceled'].includes(issue.state.type);
 }
 
 // ponytail: Linear documents metadata as arbitrary JSON, not GitHub's keys.
@@ -723,6 +734,11 @@ export async function run(command: string, identifier: string | undefined, dryRu
     const match = thread(issue);
     if (!match) continue;
     if (has(issue, 'wrapup')) {
+      const submitted = Date.parse(issue.comments.find(c => commentMarkers(c.body).includes(marker('wrapup')))?.createdAt ?? '');
+      if (openWrapup(issue) && Date.now() - submitted > 60 * 60_000 && !has(issue, 'wrapup-stalled')) {
+        await comment(issue, `${devonMention}: this wrap-up has run for more than 60 minutes without \`wrapup-done\`, so new wrap-ups on ${wrapupRunner(issue)} wait. The dispatcher never releases it; inspect the wrap-up thread, then let it finish or mark the issue Done or Canceled.\n\n${marker('wrapup-stalled')}`);
+        log('wrapup-stalled', { issue: issue.identifier, runner: wrapupRunner(issue) });
+      }
       if (has(issue, `cursor-usage-pending ${match[1]}`) && !has(issue, `cursor-usage ${match[1]}`)) {
         if (dryRun) showCursor(issue, 'GET', `/v1/agents/${match[1]}/usage`);
         else await cursorUsage(issue, match[1], true);
@@ -735,6 +751,9 @@ export async function run(command: string, identifier: string | undefined, dryRu
       && Date.parse(attachment.createdAt) > Date.parse(claim?.createdAt ?? ''))) {
       log('awaiting-merge', { issue: issue.identifier }); continue;
     }
+    // Wrap-ups on one runner share its main checkout, so they run one at a time.
+    const blocking = qaContext.issues.find(other => other !== issue && openWrapup(other) && wrapupRunner(other) === wrapupRunner(issue));
+    if (blocking) { log('wrapup-waiting', { issue: issue.identifier, runner: wrapupRunner(issue), blocking: blocking.identifier }); continue; }
     await comment(issue, `Wrap-up claimed; an interrupted submission requires manual inspection.\n\n${marker('wrapup-claim')}`);
     // A cloud agent cannot update this host's main checkout: start a local low-effort Amp thread.
     const cloud = match[2] === 'cursor';
@@ -763,6 +782,8 @@ export async function run(command: string, identifier: string | undefined, dryRu
     if (cloud && dryRun) showCursor(issue, 'GET', `/v1/agents/${match[1]}/usage`);
     else if (cloud) await cursorUsage(issue, match[1], false);
   }
+  // Before the sync, so a merge wrapped up on console reaches gpu's checkout this poll.
+  await fastForwardMain(qaContext);
   await syncPlaybook(qaContext);
   for (const issue of issues) {
     const repo = claimedRepo(issue);
