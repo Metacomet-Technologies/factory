@@ -61,6 +61,9 @@ class Speed(BaseHTTPRequestHandler):
             length = -1
         if url.path != "/__down" or not 0 <= length <= MAX_BYTES:
             return self.answer(404 if url.path != "/__down" else 400)
+        # speed.cloudflare.com answers 403 here without a Referer.
+        if length >= 100_000_000 and not self.headers.get("Referer"):
+            return self.answer(403)
         mode = speed_mode()
         if mode == "hang":
             return self.stall()

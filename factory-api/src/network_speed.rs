@@ -258,6 +258,8 @@ async fn transfer(
 /// Download times response headers to last body byte, so connection setup and
 /// server think time do not count against the link. Upload times request start
 /// to response, because the response is the only sign the last byte arrived.
+/// speed.cloudflare.com refuses `__down` of 100 MB or more without the Referer
+/// its own browser test sends, so both requests send it.
 async fn request(
     client: &reqwest::Client,
     base: &str,
@@ -269,6 +271,7 @@ async fn request(
         Direction::Download => {
             let mut response = client
                 .get(format!("{base}/__down?bytes={bytes}"))
+                .header(reqwest::header::REFERER, format!("{base}/"))
                 .send()
                 .await
                 .and_then(reqwest::Response::error_for_status)
@@ -293,6 +296,7 @@ async fn request(
             let started = Instant::now();
             let response = client
                 .post(format!("{base}/__up"))
+                .header(reqwest::header::REFERER, format!("{base}/"))
                 .body(vec![0u8; bytes as usize])
                 .send()
                 .await
@@ -404,7 +408,17 @@ mod tests {
     /// Modes by path prefix: ok, slow (each body or response waits 600 ms),
     /// fail (HTTP 500), hang (never answers) and short (truncated body).
     async fn server() -> String {
-        async fn down(Path(mode): Path<String>, Query(q): Query<Down>) -> Response {
+        async fn down(
+            Path(mode): Path<String>,
+            Query(q): Query<Down>,
+            request: axum::http::HeaderMap,
+        ) -> Response {
+            let referer = request.get("referer").and_then(|v| v.to_str().ok());
+            if !referer
+                .is_some_and(|r| r.starts_with("http://") && r.ends_with(&format!("/{mode}/")))
+            {
+                return StatusCode::FORBIDDEN.into_response();
+            }
             let headers = [("cf-meta-colo", "SBX"), ("cf-meta-ip", "203.0.113.9")];
             match mode.as_str() {
                 "fail" => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
