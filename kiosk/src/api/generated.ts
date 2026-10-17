@@ -468,10 +468,18 @@ export interface components {
       total?: string | null;
       unit: string;
     };
+    AgentSpendItem: {
+      /** @description USD decimal string with the same precision rules as balance amounts. */
+      amount: string;
+      /** @description Unique within the tool: 1–64 characters from [a-z0-9._ -]. */
+      label: string;
+    };
     AgentTool: {
       balance?: null | components["schemas"]["AgentBalance"];
       /** @description Amp has independent USD and normalized orb-hour pools. Never sum units. */
       balances: components["schemas"]["AgentBalance"][];
+      /** @description Cursor cycle spend details in USD; empty for every other tool. */
+      breakdown?: components["schemas"]["AgentSpendItem"][];
       cli_version?: string | null;
       note?: string | null;
       /** Format: int64 */

@@ -158,7 +158,17 @@ pub struct AgentTool {
     pub balance: Option<AgentBalance>,
     /// Amp has independent USD and normalized orb-hour pools. Never sum units.
     pub balances: Vec<AgentBalance>,
+    /// Cursor cycle spend details in USD; empty for every other tool.
+    #[serde(default)]
+    pub breakdown: Vec<AgentSpendItem>,
     pub reset_credits_available: Option<u64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AgentSpendItem {
+    /// Unique within the tool: 1–64 characters from [a-z0-9._ -].
+    pub label: String,
+    /// USD decimal string with the same precision rules as balance amounts.
+    pub amount: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AgentWindow {
