@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { agentFixtures, fixtures } from "./fixtures.ts";
 import { siteFixtures } from "./site-fixtures.ts";
+import { networkFixtures, networkScenarios, type NetworkScenario } from "./network-fixtures.ts";
 import type { DeviceRange, GpuRange, UsageRange, UpsRange, StreamEvent } from "../src/api/types.ts";
 
 const port = Number(process.env.MOCK_PORT ?? 4179);
@@ -8,6 +9,8 @@ const outage = process.env.MOCK_OUTAGE === "1";
 const agentStatus = process.env.MOCK_AGENTS_STATUS ?? (outage ? "unknown" : "ok");
 if (!["ok", "stale", "unknown", "not_tracked"].includes(agentStatus))
   throw new Error("Invalid MOCK_AGENTS_STATUS");
+const networkScenario = (process.env.MOCK_NETWORK ?? "healthy") as NetworkScenario;
+if (!networkScenarios.includes(networkScenario)) throw new Error("Invalid MOCK_NETWORK");
 const agents = () => agentFixtures(agentStatus as Parameters<typeof agentFixtures>[0]);
 createServer((request, response) => {
   const url = new URL(request.url ?? "/", "http://localhost");
@@ -56,6 +59,7 @@ createServer((request, response) => {
       const live = siteFixtures(outage);
       send({ type: "ups.sample", ts_ms: Date.now(), data: live.ups.current ?? null });
       send({ type: "devices.sample", ts_ms: Date.now(), data: live.deviceView });
+      send({ type: "network.sample", ts_ms: Date.now(), data: [] });
     }, 15000);
     const keepalive = setInterval(() => response.write(": keepalive\n\n"), 15000);
     response.on("close", () => {
@@ -74,6 +78,12 @@ createServer((request, response) => {
     (url.pathname.startsWith("/v1/ups/") &&
       range !== null &&
       !["1h", "24h", "7d", "30d", "365d"].includes(range)) ||
+    (url.pathname === "/v1/network/history" &&
+      range !== null &&
+      !["1h", "24h", "7d", "30d"].includes(range)) ||
+    (url.pathname === "/v1/network/speed-tests" &&
+      range !== null &&
+      !["24h", "7d", "30d", "365d"].includes(range)) ||
     (url.pathname === "/v1/devices/factory-gpu/history" &&
       range !== null &&
       !["1h", "24h", "7d"].includes(range))
@@ -83,7 +93,16 @@ createServer((request, response) => {
   }
   const data = fixtures(outage, (range ?? "24h") as UsageRange, (range ?? "1h") as GpuRange);
   const site = siteFixtures(outage, (range ?? "24h") as UpsRange, (range ?? "1h") as DeviceRange);
+  const network = networkFixtures(networkScenario);
+  const before = url.searchParams.get("before");
   const routes: Record<string, unknown> = {
+    "/v1/network": network.status,
+    "/v1/network/history": network.history((range ?? "24h") as "24h"),
+    "/v1/network/speed-tests": network.speed(range ?? "7d"),
+    "/v1/network/events": network.eventPage(
+      before == null ? null : Number(before),
+      Number(url.searchParams.get("limit") ?? 50),
+    ),
     "/v1/health": data.health,
     "/v1/fleet": data.fleet,
     "/v1/llm/usage": data.usage,
@@ -109,5 +128,7 @@ createServer((request, response) => {
     .writeHead(200, { "Content-Type": "application/json" })
     .end(JSON.stringify(routes[url.pathname]));
 }).listen(port, "127.0.0.1", () =>
-  console.log(`Mock API on 127.0.0.1:${port}${outage ? " (outage fixtures)" : ""}`),
+  console.log(
+    `Mock API on 127.0.0.1:${port}${outage ? " (outage fixtures)" : ""} · network ${networkScenario}`,
+  ),
 );

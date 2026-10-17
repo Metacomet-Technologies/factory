@@ -160,6 +160,14 @@ not of device hardware, so it does not go under `/v1/devices`.
   - Throughput chart with loaded-latency overlay.
   - Events table with layer, duration and peak loss.
   - Recent speed tests table.
+- **As built (MET-218).** The badge reads `Unknown` when no target has a sample
+  newer than 2 minutes, because `healthy` only means no episode is open. The
+  card's 24 h sparklines draw each wan target as its own line. The speed-test
+  endpoint has no `1h` range, so the 1h view fetches `24h` and clips the chart.
+  Event bands are at least 1/150 of the visible range wide so short episodes
+  stay visible. `network.sample` refetches `/v1/network`; `network.speedtest`
+  also refetches the speed tests. History and events follow the shared 60 s
+  refresh and stream reconnects.
 
 ## Alerts
 

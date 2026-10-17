@@ -20,6 +20,8 @@ import { UpsBadge, UpsSection } from "./components/ups";
 import UpsPage from "./components/ups-page";
 import DevicesPage from "./components/devices-page";
 import LlmPage from "./components/llm-page";
+import NetworkPage from "./components/network-page";
+import { NetworkSection } from "./components/network";
 
 /** Same-origin links without a modifier key route in-app; everything else falls through. */
 function followLink(event: globalThis.MouseEvent) {
@@ -109,6 +111,12 @@ export default function App() {
       ? live.devices
       : deviceCurrent.data;
   const deviceError = collectorDown ? "Device collector unavailable" : deviceCurrent.error;
+  const network = useApi(
+    "/v1/network",
+    "",
+    live.networkRevision + live.speedTestRevision + live.snapshotRevision,
+  );
+  const networkHistory = useApi("/v1/network/history", "?range=24h", live.snapshotRevision);
   useBuildUpdate(live.snapshotRevision, usage.loading || gpu.loading);
   return (
     <TooltipProvider>
@@ -192,6 +200,13 @@ export default function App() {
         />
       ) : path === "/llm" ? (
         <LlmPage usage={usage} pricing={pricing} range={usageRange} setRange={setUsageRange} />
+      ) : path === "/network" ? (
+        <NetworkPage
+          status={network}
+          now={now}
+          revision={live.snapshotRevision}
+          speedRevision={live.speedTestRevision}
+        />
       ) : path === "/ups" ? (
         <UpsPage
           current={upsCurrent}
@@ -223,12 +238,13 @@ export default function App() {
               index={1}
             />
             <UpsSection current={upsCurrent} now={now} warnings={upsWarnings} index={2} />
+            <NetworkSection status={network} history={networkHistory} now={now} index={3} />
             <UsageSection
               resource={usage}
               pricing={pricing}
               range={usageRange}
               icon={<Activity />}
-              index={3}
+              index={4}
             />
             <aside className="sidebar" aria-label="Frontier tools and live requests">
               <AgentsSection
@@ -239,9 +255,9 @@ export default function App() {
                 }
                 icon={<Terminal />}
                 revision={live.agentsRevision}
-                index={4}
+                index={5}
               />
-              <TickerSection requests={live.requests} connected={live.connected} index={5} />
+              <TickerSection requests={live.requests} connected={live.connected} index={6} />
             </aside>
           </div>
         </main>

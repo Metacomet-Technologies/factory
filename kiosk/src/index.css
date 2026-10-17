@@ -923,14 +923,16 @@
 /* ---- UPS ----------------------------------------------------------------- */
 .ups-page,
 .devices-page,
-.llm-page {
+.llm-page,
+.network-page {
   display: grid;
   align-content: start;
   gap: 16px;
 }
 .ups-page .page-header,
 .devices-page .page-header,
-.llm-page .page-header {
+.llm-page .page-header,
+.network-page .page-header {
   margin: 0;
 }
 .llm-page .page-aside {
@@ -1154,6 +1156,31 @@
   margin-top: 6px;
 }
 
+/* ---- Network ------------------------------------------------------------ */
+.network-readings {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 16px;
+  align-items: start;
+}
+.network-spark {
+  grid-column: 1 / -1;
+  font-size: 12px;
+}
+.network-spark svg {
+  display: block;
+  width: 100%;
+  height: 36px;
+  margin-top: 2px;
+}
+.network-tables {
+  display: grid;
+  gap: 16px;
+}
+.network-throughput {
+  grid-column: 1 / -1;
+}
+
 /* ---- Devices ------------------------------------------------------------ */
 .device-list {
   display: grid;
@@ -1269,7 +1296,8 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .usage,
-  .ups {
+  .ups,
+  .network {
     grid-column: 1 / -1;
   }
   .sidebar {
@@ -1330,7 +1358,7 @@
   }
   .sidebar {
     grid-column: 3;
-    grid-row: 2 / 4;
+    grid-row: 2 / 5;
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto 1fr;
     gap: 12px;
@@ -1341,8 +1369,15 @@
   .gpu {
     grid-column: 3;
   }
-  .ups {
+  .ups,
+  .network {
     grid-column: 1 / 3;
+  }
+  .network-readings {
+    grid-template-columns: repeat(3, minmax(0, 0.7fr)) repeat(2, minmax(0, 1.4fr));
+  }
+  .network-spark {
+    grid-column: auto;
   }
   .usage {
     grid-column: 1 / 3;
