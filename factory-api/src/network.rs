@@ -393,7 +393,7 @@ where
         .collect();
     Burst::from_replies(PROBES, &replies)
 }
-async fn ping(address: IpAddr) -> Result<Burst> {
+pub async fn ping(address: IpAddr) -> Result<Burst> {
     let child = tokio::process::Command::new("ping")
         .args(["-n", "-q", "-c", "10", "-i", "0.2", "-W", "1"])
         .arg(address.to_string())

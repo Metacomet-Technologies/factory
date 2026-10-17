@@ -7,6 +7,7 @@ pub mod fleet;
 mod kiosk;
 pub mod network;
 pub mod network_history;
+pub mod network_speed;
 pub mod pool;
 pub mod types;
 pub mod ups;
