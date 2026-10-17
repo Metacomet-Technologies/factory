@@ -1,0 +1,22 @@
+[package]
+name = "factory-devices-agent"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+# Phase-1 collector and the v1 contract types, reused rather than forked.
+factory-api = { path = "../factory-api" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde_json.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

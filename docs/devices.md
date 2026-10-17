@@ -4,7 +4,9 @@ Phase 1 reads factory-gpu from the factory-api process. There is no second GPU
 sample store.
 
 Phase 2A (MET-219) lets enrolled remote devices, first factory-console, push
-host samples to the same factory-api. The contract is
+host samples to the same factory-api. Phase 2B (MET-220) is the factory-console
+agent that pushes them; see
+[Phase 2B: factory-console agent](#phase-2b-factory-console-agent). The contract is
 [devices-ingest.md](devices-ingest.md); operations are in
 [Phase 2A: remote devices](#phase-2a-remote-devices). factory-gpu is never
 written remotely and its local flow is unchanged.
@@ -237,9 +239,9 @@ Unprivileged tests use `DEVICES_TEST_ROOT` and do not call host `smartctl`.
 
 ## Phase 2A: remote devices
 
-The server side of [devices-ingest.md](devices-ingest.md), option A. The
-factory-console agent (stage B) is not built yet, so after this deploy
-factory-console shows "Waiting for first sample" until an agent uploads.
+The server side of [devices-ingest.md](devices-ingest.md), option A. Until
+the stage B agent is installed, factory-console shows "Waiting for first
+sample".
 
 - Credentials: `/etc/factory-api/device-tokens`, `root:factory-api` 0640, one
   line per credential: `<device_id> <sha256 hex> <label>`. At most two per
@@ -393,6 +395,84 @@ gpu-ssh "sudo bash /home/agent/work/factory/deploy/rollback-kiosk.sh /var/backup
 
 The previous binary ignores the hash file and returns 404 for the samples
 endpoint. Remote rows in `device_samples` stay and age out with retention.
+
+## Phase 2B: factory-console agent
+
+`factory-devices-agent` (`devices-agent/`) samples factory-console every 15 s,
+takes slow inventory every 5 min, and uploads to
+`https://factory-gpu.bearded-pompano.ts.net/v1/devices/factory-console/samples`.
+What it reads, how failures are encoded, and the capability table are in
+[devices-ingest.md](devices-ingest.md#5-stage-b-factory-console-agent). It is
+read-only: no commands, writes, self-tests, reboots or remediation. The buffer
+is 240 samples in memory; a restart starts a new session and drops it.
+
+- Unit `factory-devices-agent.service`: `User=factory-devices`,
+  `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
+  `PrivateDevices`, no capabilities, and `LoadCredential=token:` from
+  `/etc/factory-devices-agent/token` (`root:root` 0600). The token is in no unit,
+  environment, argument or log. Restart on failure, at most 5 starts in 10 min.
+- SMART: the phase-1 helper and timer from `deploy/devices/`, with the drop-in
+  `factory-devices-smart.service.d/console.conf` setting
+  `FACTORY_DEVICES_GROUP=factory-devices`. `/var/lib/factory-devices` is
+  `root:factory-devices` 2750 and `smart.json` 0640. The helper never installs
+  `smartctl`; without it SMART is `unsupported`.
+- Groups: `factory-devices` joins another group only for a published backup or
+  reboot status file that is group-readable, not group-writable, in a
+  directory of the same group that is not group-writable, and not group root.
+  factory-console publishes neither today, so both are `unsupported`.
+- Installer: refuses any host but factory-console, never runs the binary as
+  root, reads the token from stdin only (a terminal is not read), keeps the
+  existing token when stdin is empty, and is idempotent. Re-running restarts
+  the agent (a new session). `--check-only` reads no stdin and changes nothing.
+- Rollback stops and removes the agent unit and binary, and restores or removes
+  the SMART helper files as the given snapshot recorded. The token stays unless
+  `--remove-token` is passed; the user, its groups and
+  `/var/lib/factory-devices` stay. It never touches factory-api.
+
+Tests: `cargo test -p factory-devices-agent` (fixture roots and a fake
+factory-api) and `python3 -B deploy/devices-agent/test-install.py` (fake root,
+PATH shims, no privileges).
+
+### Deploy (Devon, from the Mac)
+
+Stage A must be deployed on factory-gpu and factory-console enrolled first
+([Enrollment](#enrollment)). Build as `agent` in the console's main checkout,
+then preflight, install, and verify:
+
+```sh
+console-ssh 'sudo -u agent bash -lc "cd /home/agent/work/factory && test -z \"\$(git status --porcelain)\" && git fetch origin && git merge --ff-only origin/main && cargo build --release --locked -p factory-devices-agent"'
+console-ssh "sudo bash /home/agent/work/factory/deploy/devices-agent/install-devices-agent.sh /home/agent/work/factory/target/release/factory-devices-agent --check-only"
+op read 'op://Factory/factory-console devices token/credential' | console-ssh 'sudo bash /home/agent/work/factory/deploy/devices-agent/install-devices-agent.sh /home/agent/work/factory/target/release/factory-devices-agent'
+```
+
+Save the printed backup path. Then:
+
+```sh
+console-ssh 'systemctl is-active factory-devices-agent.service factory-devices-smart.timer; systemctl show factory-devices-agent.service -p User -p NRestarts'
+console-ssh 'sudo journalctl -u factory-devices-agent.service -b --no-pager -n 20 -o cat'
+console-ssh 'sudo journalctl -u factory-devices-agent.service --no-pager -o cat | grep -ciE "fdv1_|bearer|authorization"'
+curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/devices/factory-console | python3 -c 'import json,sys,time; d=json.load(sys.stdin); i=d["ingest"]; print(d["device"]["health"]["status"], i["session_id"], i["seq"], int(time.time()*1000) - i["last_received_at_ms"], "ms since last sample")'
+console-ssh 'sudo journalctl -u factory-devices-agent.service -b --no-pager -o cat -g "discovered sources" -n 1'
+```
+
+The first two print `active` twice, `User=factory-devices`, and an `agent
+started` line with no warnings. The grep prints `0`. The curl prints a status
+other than `stale` or `unknown` and an age under 45000 ms; then open
+`https://factory-gpu.bearded-pompano.ts.net/devices` and check both nodes. The
+last line is the real capability table; record it on MET-220 and in
+devices-ingest.md.
+
+### Rollback
+
+```sh
+console-ssh "sudo bash /home/agent/work/factory/deploy/devices-agent/rollback-devices-agent.sh /var/backups/factory-devices-agent/SNAPSHOT"
+```
+
+Use the first install's snapshot to also remove the SMART helper it added. Add
+`--remove-token` to delete `/etc/factory-devices-agent/token`. Removing the
+account is separate: `console-ssh 'sudo userdel factory-devices'`. The server
+keeps showing factory-console (stale, then offline) until its credential is
+unenrolled with the Phase 2A rollback.
 
 ## Rollback of the API
 

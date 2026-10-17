@@ -1,5 +1,5 @@
 [workspace]
-members = ["shared", "meter", "pricing", "factory-api", "factory-db", "sandbox", "ups-control"]
+members = ["shared", "meter", "pricing", "factory-api", "factory-db", "sandbox", "ups-control", "devices-agent"]
 resolver = "2"
 
 [workspace.package]
