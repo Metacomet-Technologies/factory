@@ -1,7 +1,8 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { commentMarkers, cursorId, engineArgs, openWrapup, prepareWorktree, runnerCommand, runWorktreeCommand, wrapupRunner, type Issue } from './dispatch.ts';
+import { commentMarkers, cursorId, engineArgs, openWrapup, prepareWorktree, runnerCommand, runWorktreeCommand, sharesCheckout, wrapupRunner, type Issue } from './dispatch.ts';
 import { repos } from './repos.ts';
 
 const config = JSON.parse(readFileSync(new URL('qa-config.json', import.meta.url), 'utf8'));
@@ -361,26 +362,51 @@ function lacksMerge(sha: string) {
   return runWorktreeCommand('gpu', ['git', '-C', main, 'merge-base', '--is-ancestor', sha, 'HEAD'], [0, 1]).status === 1;
 }
 
+// PR -> merge SHA verified in the checkout. Only these skip the GitHub read, so unverified
+// merges, historical ones included, are always checked; a lost file only costs reads.
+const containsPath = () => `${homedir()}/.local/state/factory-dispatch/main-contains.json`;
+function readContains(): Record<string, string> {
+  try {
+    const value = JSON.parse(readFileSync(containsPath(), 'utf8'));
+    if (value && typeof value === 'object' && !Array.isArray(value)
+      && Object.entries(value).every(([pr, sha]) => /^\d+$/.test(pr) && typeof sha === 'string' && shaPattern.test(sha))) return value;
+  } catch { /* Missing or unreadable: verify every merge. */ }
+  return {};
+}
+function writeContains(ctx: Context, value: Record<string, string>) {
+  const path = containsPath(), temporary = `${path}.${process.pid}.tmp`;
+  try {
+    mkdirSync(path.slice(0, path.lastIndexOf('/')), { recursive: true, mode: 0o700 });
+    writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temporary, path);
+  } catch { ctx.log('error', { action: 'main-contains', message: 'Could not store verified merges' }); }
+  finally { rmSync(temporary, { force: true }); }
+}
+
 // The dispatcher runs from gpu's main checkout, so it fast-forwards that checkout to merges
 // wrapped up on any runner. It never resets, rebases, stashes or force-checks-out.
 export async function fastForwardMain(ctx: Context) {
   const behind: { issue: Issue; pr: string; sha: string }[] = [];
+  const contains = readContains();
+  let verified = false;
   for (const issue of ctx.issues.filter(i => lines(i).includes(wrapupDone))) {
     for (const pr of mergedPRs(issue)) {
-      // Either marker proves the checkout contained this merge, which bounds GitHub reads.
-      if (has(issue, `playbook-synced pr:${pr}`) || has(issue, `playbook-checked pr:${pr}`)) continue;
+      // Document markers are not containment proof: historical playbook-checked never required it.
+      if (contains[pr]) continue;
       try {
         const data = await info(pr, true);
         const sha = data.mergeCommit?.oid;
         if (data.state !== 'MERGED' || !shaPattern.test(sha ?? '')) throw new Error('PR not merged on GitHub');
         if (lacksMerge(sha)) behind.push({ issue, pr, sha });
+        else { contains[pr] = sha; verified = true; }
       } catch { ctx.log('main-ff-pending', { issue: issue.identifier, pr, reason: 'merge SHA or checkout unreadable' }); }
     }
   }
+  if (verified && !ctx.dryRun) writeContains(ctx, contains);
   if (!behind.length) return;
   const issues = behind.map(({ issue }) => issue.identifier);
   // A gpu wrap-up builds in this checkout; moving it underneath would break that build.
-  const blocking = ctx.issues.find(issue => openWrapup(issue) && wrapupRunner(issue) === 'gpu');
+  const blocking = ctx.issues.find(issue => openWrapup(issue) && sharesCheckout(wrapupRunner(issue), 'gpu'));
   if (blocking) { ctx.log('main-ff-waiting', { issues, blocking: blocking.identifier }); return; }
   let from: string, reason: string | undefined;
   try {
@@ -428,7 +454,7 @@ export async function syncPlaybook(ctx: Context) {
           await ctx.comment(issue, `${devonMention}: the Linear playbook sync for PR ${pr} has been pending for more than 15 minutes since wrap-up: ${reason}. The dispatcher retries each poll.\n\n${qa(`sync-stalled pr:${pr}`)}`);
         }
       };
-      // Both markers require the checkout to contain the merge, so either one ends fast-forward reads.
+      // Non-PLAYBOOK merges also wait for the checkout, so a stuck checkout alerts for any merge.
       let content = '', sha = '', reason: string | undefined, changed = false;
       try {
         const data = await info(pr, true);

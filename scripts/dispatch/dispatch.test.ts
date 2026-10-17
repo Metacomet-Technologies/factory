@@ -109,7 +109,8 @@ globalThis.fetch = (url, options) => {
 };
 const read = fs.readFileSync;
 const repoConfig = ${JSON.stringify(options.repos === undefined ? null : JSON.stringify(options.repos))};
-fs.readFileSync = (path, ...args) => path === '/home/agent/work/factory/docs/PLAYBOOK.md' ? ${JSON.stringify(playbook)}
+fs.readFileSync = (path, ...args) => path === '/home/agent/work/factory/docs/PLAYBOOK.md'
+  ? (process.env.FAKE_REAL_MAIN ? read(process.env.FAKE_REAL_MAIN + '/docs/PLAYBOOK.md', ...args) : ${JSON.stringify(playbook)})
   : repoConfig !== null && String(path).endsWith('/scripts/dispatch/repos.json') ? repoConfig : read(path, ...args);
 syncBuiltinESMExports();`);
   writeFileSync(join(directory, 'key'), key);
@@ -1758,7 +1759,8 @@ test('Done and Canceled issues with wrapup-done still fast-forward a behind chec
   }
 });
 
-test('a merge present only on the remote is fetched once and fast-forwarded with real Git, then synced; an unreadable checkout never fetches', { timeout: 20_000 }, async t => {
+// A disposable remote whose newest commit (the merge) is absent from the main checkout.
+function realMain(t: any, base: string, merged: Record<string, string>) {
   const root = mkdtempSync(join(tmpdir(), 'factory-dispatch-git-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const git = (cwd: string, ...args: string[]) => execFileSync('/usr/bin/git', ['-c', 'user.name=Synthetic', '-c', 'user.email=synthetic@example.invalid',
@@ -1767,18 +1769,23 @@ test('a merge present only on the remote is fetched once and fast-forwarded with
   git(root, 'init', '-q', '--bare', 'remote.git');
   git(root, 'clone', '-q', 'remote.git', 'main');
   mkdirSync(join(checkout, 'docs'));
-  writeFileSync(join(checkout, 'docs/PLAYBOOK.md'), playbook);
+  writeFileSync(join(checkout, 'docs/PLAYBOOK.md'), base);
   git(checkout, 'add', '.'); git(checkout, 'commit', '-qm', 'base'); git(checkout, 'push', '-q', 'origin', 'main');
-  const from = git(checkout, 'rev-parse', 'HEAD');
   git(root, 'clone', '-q', 'remote.git', 'other');
-  writeFileSync(join(other, 'widget.txt'), 'merged\n');
+  for (const [file, text] of Object.entries(merged)) writeFileSync(join(other, file), text);
   git(other, 'add', '.'); git(other, 'commit', '-qm', 'merge'); git(other, 'push', '-q', 'origin', 'main');
-  const merge = git(other, 'rev-parse', 'HEAD');
+  return { git, checkout, from: git(checkout, 'rev-parse', 'HEAD'), merge: git(other, 'rev-parse', 'HEAD') };
+}
+const containsFile = (f: any) => join(f.directory, '.local/state/factory-dispatch/main-contains.json');
+
+test('a merge present only on the remote is fetched once and fast-forwarded with real Git, then syncs the new playbook; an unreadable checkout never fetches', { timeout: 20_000 }, async t => {
+  const oldPlaybook = '# Old synthetic playbook\n', newPlaybook = '# New synthetic playbook\n\nChanged by the merge.\n';
+  const { git, checkout, from, merge } = realMain(t, oldPlaybook, { 'docs/PLAYBOOK.md': newPlaybook });
   // The case real Git reports with exit 128, not 1.
   assert.throws(() => git(checkout, 'merge-base', '--is-ancestor', merge, 'HEAD'), (error: any) => error.status === 128);
   const i = wrapped(123, 'console');
   const f = await fixture(t, [i], { github: { 90: githubPR({ state: 'MERGED', mergeCommit: { oid: merge }, files: [{ filename: 'docs/PLAYBOOK.md' }] }) } });
-  const unreadable = await f.run(['poll'], { FAKE_REAL_MAIN: join(root, 'missing') });
+  const unreadable = await f.run(['poll'], { FAKE_REAL_MAIN: join(checkout, '..', 'missing') });
   assert.equal(unreadable.code, 0, unreadable.stdout);
   assert.deepEqual(decisions(unreadable, 'main-ff-pending').map(d => d.reason), ['merge SHA or checkout unreadable']);
   assert.deepEqual(mainWrites(f), []);
@@ -1796,17 +1803,47 @@ test('a merge present only on the remote is fetched once and fast-forwarded with
   const syncs = f.mutations.filter(m => m.operation === 'SyncPlaybook');
   assert.equal(syncs.length, 1);
   assert.ok(syncs[0].input.content.includes(`main\` at ${merge} after PR 90`));
+  assert.ok(syncs[0].input.content.endsWith(newPlaybook) && !syncs[0].input.content.includes(oldPlaybook.trim()));
   await f.run(['poll'], environment);
   assert.equal(mainWrites(f).length, 2, 'current checkout performs no Git writes');
+  assert.equal(f.mutations.filter(m => m.operation === 'SyncPlaybook').length, 1);
 });
 
-test('up-to-date checkout reads the merge but never fetches or merges', { timeout: 10_000 }, async t => {
+test('a historical playbook-checked marker never hides a non-playbook remote merge absent locally; a current checkout writes nothing', { timeout: 20_000 }, async t => {
+  for (const current of [false, true]) {
+    const { git, checkout, merge } = realMain(t, playbook, { 'widget.txt': 'merged\n' });
+    if (current) { git(checkout, 'fetch', '-q', 'origin', 'main'); git(checkout, 'merge', '-q', '--ff-only', 'origin/main'); }
+    const i = wrapped(123, 'console');
+    i.comments.push({ body: 'PR 90 did not change the playbook; no document sync needed.\n\n<!-- factory-qa:playbook-checked pr:90 -->' });
+    const f = await fixture(t, [i], { github: { 90: githubPR({ state: 'MERGED', mergeCommit: { oid: merge } }) } });
+    const result = await f.run(['poll'], { FAKE_REAL_MAIN: checkout });
+    assert.equal(result.code, 0, result.stdout);
+    assert.deepEqual(mainWrites(f).map((e: any) => e.slice(4)), current ? [] : [['fetch', 'origin', 'main'], ['merge', '--ff-only', 'origin/main']]);
+    assert.deepEqual(decisions(result, 'main-ff').map(d => d.to), current ? [] : [merge]);
+    assert.equal(git(checkout, 'rev-parse', 'HEAD'), merge);
+    assert.equal(markerCount(i, '<!-- factory-qa:playbook-checked pr:90 -->'), 1);
+    assert.equal(f.mutations.length, 0);
+  }
+});
+
+test('up-to-date checkout reads the merge but never fetches or merges; only a verified merge skips later reads', { timeout: 10_000 }, async t => {
   const f = await fixture(t, [wrapped(123, 'console')], { github: { 90: mergedPR([{ filename: 'widgets/widget.rs' }]) } });
+  assert.equal((await f.run(['poll', '--dry-run'])).code, 0);
+  assert.equal(existsSync(containsFile(f)), false, 'dry-run stores nothing');
   const result = await f.run();
   assert.equal(result.code, 0, result.stdout);
   assert.ok(f.events().some((e: any) => e[0] === 'git' && e[4] === 'merge-base' && e[6] === mergeSha));
   assert.deepEqual(mainWrites(f), []);
   assert.equal(decisions(result, 'main-ff').length + decisions(result, 'main-ff-refused').length, 0);
+  assert.deepEqual(JSON.parse(readFileSync(containsFile(f), 'utf8')), { 90: mergeSha });
+  // A verified merge needs no GitHub read: an outage no longer reaches it.
+  f.setGitHub({ 90: { ...mergedPR([{ filename: 'widgets/widget.rs' }]), publicFail: true } });
+  const later = await f.run();
+  assert.deepEqual(decisions(later, 'main-ff-pending'), []);
+  assert.deepEqual(mainWrites(f), []);
+  // A lost file only costs reads: the unverified merge is read again.
+  rmSync(containsFile(f));
+  assert.equal(decisions(await f.run(), 'main-ff-pending').length, 1);
 });
 
 for (const [name, environment, reason] of [['dirty', { FAKE_DIRTY: '?? stray-file' }, /uncommitted or untracked/], ['off main', { FAKE_BRANCH: 'feature' }, /not on main/],
@@ -1878,6 +1915,25 @@ test('one wrap-up per runner: a second merged issue waits for wrapup-done; other
   await f.run();
   assert.equal(continues(), 3);
   assert.equal(markerCount(second, '<!-- factory-dispatch:wrapup -->'), 1);
+});
+
+test('legacy runner-less threads take the runner from the claim; an unknown runner blocks every checkout', { timeout: 30_000 }, async t => {
+  const claimed = (runner: string) => ({ body: `<!-- factory-dispatch:claim runner:${runner} -->`, createdAt: '2026-10-10T12:00:00.000Z' });
+  const legacy = (runner?: string) => issue(123, { labels: [], state: { type: 'completed' },
+    comments: [...(runner ? [claimed(runner)] : []), { body: `<!-- factory-dispatch:thread ${threadId} -->` }, { body: '<!-- factory-dispatch:wrapup -->' }] });
+  const merged = (n: number, runner: string, pr: number) => issue(n, { labels: [], state: { type: 'started' }, comments: [claimed(runner), threadComment(runner)], attachments: [prAttachment(pr)] });
+  for (const [runner, waits, ffWaits] of [['gpu', ['MET-124'], true], ['console', ['MET-125'], false], [undefined, ['MET-124', 'MET-125'], true]] as const) {
+    const admission = await fixture(t, [legacy(runner), merged(124, 'gpu', 91), merged(125, 'console', 92)]);
+    const result = await admission.run();
+    assert.equal(result.code, 0, result.stdout);
+    assert.deepEqual(decisions(result, 'wrapup-waiting').map(d => [d.issue, d.blocking]), waits.map(id => [id, 'MET-123']), String(runner));
+    assert.deepEqual(admission.issues.slice(1).map(i => markerCount(i, '<!-- factory-dispatch:wrapup -->')), ['MET-124', 'MET-125'].map(id => waits.includes(id as any) ? 0 : 1));
+    const ff = await fixture(t, [legacy(runner), wrapped(126, 'console', ago(1), 93)], { github: { 93: mergedPR([{ filename: 'widgets/widget.rs' }]) }, mainBehind: true });
+    const moved = await ff.run();
+    assert.equal(moved.code, 0, moved.stdout);
+    assert.deepEqual(decisions(moved, 'main-ff-waiting').map(d => d.blocking), ffWaits ? ['MET-123'] : [], String(runner));
+    assert.equal(mainWrites(ff).length, ffWaits ? 0 : 2, String(runner));
+  }
 });
 
 test('Done and Canceled issues with an unfinished wrap-up still block their runner, ping once at 60 minutes, and are never released', { timeout: 20_000 }, async t => {

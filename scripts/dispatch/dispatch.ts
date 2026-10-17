@@ -239,10 +239,14 @@ Wrap-up finished
 }
 
 // A wrap-up builds in its runner's main checkout; a cursor builder's wrap-up runs on gpu.
+// Legacy thread markers lack the runner, so the dispatch claim supplies it.
 export function wrapupRunner(issue: Issue) {
-  const runner = issue.comments.flatMap(comment => commentMarkers(comment.body)).map(line => line.match(threadPattern)).find(Boolean)?.[2];
+  const lines = issue.comments.flatMap(comment => commentMarkers(comment.body));
+  const runner = lines.map(line => line.match(threadPattern)).find(Boolean)?.[2] ?? lines.map(line => line.match(claimPattern)).find(Boolean)?.[1];
   return runner === 'cursor' ? 'gpu' : runner;
 }
+// An unknown runner may be either checkout, so it conflicts with every runner.
+export const sharesCheckout = (a?: string, b?: string) => !a || !b || a === b;
 // Only wrapup-done ends a wrap-up, whatever the issue state; the dispatcher never releases one.
 export function openWrapup(issue: Issue) {
   const lines = issue.comments.flatMap(comment => commentMarkers(comment.body));
@@ -736,7 +740,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
     if (has(issue, 'wrapup')) {
       const submitted = Date.parse(issue.comments.find(c => commentMarkers(c.body).includes(marker('wrapup')))?.createdAt ?? '');
       if (openWrapup(issue) && Date.now() - submitted > 60 * 60_000 && !has(issue, 'wrapup-stalled')) {
-        await comment(issue, `${devonMention}: this wrap-up has run for more than 60 minutes without \`wrapup-done\`, so new wrap-ups on ${wrapupRunner(issue)} wait. The dispatcher never releases it; inspect the wrap-up thread.\n\n${marker('wrapup-stalled')}`);
+        await comment(issue, `${devonMention}: this wrap-up has run for more than 60 minutes without \`wrapup-done\`, so new wrap-ups on ${wrapupRunner(issue) ?? 'every runner (its runner is unknown)'} wait. The dispatcher never releases it; inspect the wrap-up thread.\n\n${marker('wrapup-stalled')}`);
         log('wrapup-stalled', { issue: issue.identifier, runner: wrapupRunner(issue) });
       }
       if (has(issue, `cursor-usage-pending ${match[1]}`) && !has(issue, `cursor-usage ${match[1]}`)) {
@@ -752,7 +756,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
       log('awaiting-merge', { issue: issue.identifier }); continue;
     }
     // Wrap-ups on one runner share its main checkout, so they run one at a time.
-    const blocking = qaContext.issues.find(other => other !== issue && openWrapup(other) && wrapupRunner(other) === wrapupRunner(issue));
+    const blocking = qaContext.issues.find(other => other !== issue && openWrapup(other) && sharesCheckout(wrapupRunner(other), wrapupRunner(issue)));
     if (blocking) { log('wrapup-waiting', { issue: issue.identifier, runner: wrapupRunner(issue), blocking: blocking.identifier }); continue; }
     await comment(issue, `Wrap-up claimed; an interrupted submission requires manual inspection.\n\n${marker('wrapup-claim')}`);
     // A cloud agent cannot update this host's main checkout: start a local low-effort Amp thread.

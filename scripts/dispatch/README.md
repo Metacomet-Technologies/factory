@@ -660,21 +660,36 @@ The completion marker means submitted, not that the build or deployment passed.
 Wrap-ups run after dispatch decisions; a freed slot is available next pass.
 
 **One wrap-up per runner (MET-214).** Each runner's wrap-ups share its main
-checkout; a cursor builder's wrap-up runs on gpu. A wrap-up is open while its issue
+checkout; a cursor builder's wrap-up runs on gpu. A legacy thread marker without
+`runner:` takes the runner from the dispatch claim. With neither, the runner is
+unknown and conflicts with every runner. A wrap-up is open while its issue
 has `wrapup` without `wrapup-done`, whatever the issue state. A newly merged
 issue is not claimed while another issue's wrap-up is open on the same runner: it
-logs `wrapup-waiting` with the `blocking` issue and retries each poll. Runners do
-not block each other. An open wrap-up older than 60 minutes (from its `wrapup`
+logs `wrapup-waiting` with the `blocking` issue and retries each poll. Known,
+different runners do not block each other. An open wrap-up older than 60 minutes (from its `wrapup`
 comment) gets one Devon mention with `<!-- factory-dispatch:wrapup-stalled -->`.
 The dispatcher never releases it, and Done or Canceled does not either: only
 `wrapup-done` ends it.
 
+**Rollout prerequisite (MET-214, blocked until reconciled).** A read-only
+`poll --dry-run` of this code on 2026-10-17 found 11 gpu issues with `wrapup`
+but no `wrapup-done`: MET-123, MET-124, MET-126, MET-127, MET-135, MET-138,
+MET-140, MET-157, MET-170, MET-192 (Done) and MET-211 (In Progress). Once
+deployed, each gets one `wrapup-stalled` mention, and every new gpu or Cursor
+wrap-up and the gpu fast-forward wait on them. Nothing releases them
+automatically, whether by Done/Canceled, age or archive state. Before merging,
+Devon must establish for each issue whether its wrap-up actually finished, and
+record `wrapup-done` only on actual completion evidence. Until then the rollout
+is blocked.
+
 **Main checkout fast-forward (MET-214).** The dispatcher deploys from
 factory-gpu's `/home/agent/work/factory`, so each pass, after wrap-ups and before
 the playbook sync, it reads the merge SHA of every merged factory PR on an issue
-with `wrapup-done`, in any issue state, that has no `playbook-synced` or
-`playbook-checked` marker. Both markers are posted only once the checkout
-contains the merge (markers from before MET-214 predate that rule). When a merge
+with `wrapup-done`, in any issue state. Linear document markers are never
+containment proof: historical `playbook-checked` comments never required it. Only
+merges this step verified in the checkout skip later GitHub reads, recorded per PR
+in `~/.local/state/factory-dispatch/main-contains.json` (never written by
+dry-run). A missing or invalid file only re-reads every merge, once. When a merge
 is absent from the checkout's object database (real Git exits 128) or not an
 ancestor of `HEAD`, it runs `git -C
 /home/agent/work/factory fetch origin main` then `merge --ff-only origin/main`,
@@ -685,8 +700,8 @@ Decisions:
 
 - `main-ff` with `issue`, `pr`, `sha`, `from` and `to`; dry-run logs it with
   `dryRun: true` and the planned git argv, without running them.
-- `main-ff-waiting` with `blocking`: an open gpu wrap-up builds in that checkout,
-  so nothing moves until its `wrapup-done`. No mention.
+- `main-ff-waiting` with `blocking`: an open gpu (or unknown-runner) wrap-up
+  builds in that checkout, so nothing moves until its `wrapup-done`. No mention.
 - `main-ff-refused` with `reason`: off `main`, `git status --porcelain` not empty,
   or the `--ff-only` merge failed (diverged). One Devon mention per issue and merge
   SHA with `<!-- factory-dispatch:main-ff-refused sha:<sha> -->`; a later pass
