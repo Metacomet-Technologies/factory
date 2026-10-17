@@ -778,8 +778,9 @@ document sync and SIGKILL before/after each submission/sync marker boundary.
 
 ### Slim prompt contract (MET-144)
 
-AGENTS.md owns shared rules (≤ 1,500 UTF-8 bytes); database and kiosk rules load
-only for their areas (each ≤ 4,000 bytes). Builders read Isolation READMEs, not
+AGENTS.md owns shared rules (≤ 1,500 UTF-8 bytes). Database and kiosk rules load
+only for their areas, and Cloud toolchain notes load from `docs/agents/cloud.md`
+(each ≤ 4,000 bytes). Builders read Isolation READMEs, not
 the root README/full PLAYBOOK by default. Builder fixed text stays ≤ 1,800 bytes;
 review carries §5 without another mandatory playbook read. Wrap-up/merge prompts
 grant only their narrow exceptions to the shared contract.

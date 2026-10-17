@@ -465,21 +465,23 @@ test('full fake-server poll: dispatch, prompt contract, Linear state, and manual
 
 test('agent contract and prompt byte budgets, scoped reads and single startup checks', () => {
   const agents = readFileSync(new URL('../../AGENTS.md', import.meta.url), 'utf8');
-  assert.ok(Buffer.byteLength(agents) <= 1500);
+  assert.ok(Buffer.byteLength(agents) <= 1500, `AGENTS.md is ${Buffer.byteLength(agents)} bytes`);
   assert.doesNotMatch(agents, /PLAYBOOK/);
   for (const text of ['assigned worktree and feature branch, never the main checkout',
     'Never deploy', 'sudo', 'never set token environment variables or run gh auth commands',
     'cargo fmt --check', 'cargo clippy --all-targets -- -D warnings', 'cargo test --workspace',
     'vp check', 'vp test --run', 'vp build', 'node --test scripts/dispatch',
     'scripts/sandbox', 'never production', 'docs/agents/<area>.md',
+    '`kiosk.md` for kiosk, `cloud.md`',
     'Never edit other issues or existing status, labels, assignee or priority',
     'factory-dispatch', 'factory-qa', 'standalone unfenced', 'exact-match lines',
     'After opening a PR and each later push', 'only PR URL', 'head SHA',
     'complete `git diff --name-only origin/main...HEAD` file list', 'Markdown',
     'deletions and renames, including sources', 'No diff/contents',
     'redact sensitive data and identify omissions']) assert.ok(agents.includes(text), text);
-  for (const area of ['db', 'kiosk']) {
-    assert.ok(Buffer.byteLength(readFileSync(new URL(`../../docs/agents/${area}.md`, import.meta.url))) <= 4000);
+  for (const area of ['db', 'kiosk', 'cloud']) {
+    const text = readFileSync(new URL(`../../docs/agents/${area}.md`, import.meta.url));
+    assert.ok(Buffer.byteLength(text) <= 4000, `${area}.md is ${Buffer.byteLength(text)} bytes`);
   }
   const review = readFileSync(new URL('review-prompt.md', import.meta.url), 'utf8');
   for (const runner of ['gpu', 'console']) for (const link of ['contributes', 'closes']) {
