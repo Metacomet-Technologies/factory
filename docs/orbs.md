@@ -3,15 +3,20 @@
 ## Scope and compatibility
 
 Orbs support Rust workspace checks, kiosk checks/builds, offline script tests,
-and an on-demand mock kiosk preview. `.agents/setup` installs dependencies but
-does not compile, test, start services, download Playwright browsers, or log in.
-No resume hook is needed.
+and an on-demand mock kiosk preview. `.agents/setup` runs
+`scripts/env/setup.sh --env orb`, which converges the orb to the toolchain
+contract in `docs/environments.md` and ends with `scripts/env/check --env orb`.
+It installs the toolchain and the kiosk's locked dependencies, but does not
+compile, test, start services, download Playwright browsers, or log in. No
+resume hook is needed.
 
-The setup uses Rust 1.99.0 with rustfmt/clippy, matching the observed factory
-runners, and Vite+ 1.1.0. Vite+ selects Node and Bun from the kiosk's `devEngines`
-and the scripts' `.node-version` files. System packages provide the C compiler,
-Python 3, flock, Bubblewrap, shellcheck, SQLite CLI, zstd, and rsync. SQLite used
-by Rust is bundled; it does not depend on the host SQLite CLI version.
+Every version comes from the repo: Rust from `rust-toolchain.toml` (1.99.0 with
+rustfmt/clippy, matching the factory runners), Vite+ from the kiosk catalog,
+Node and Bun from the kiosk's `devEngines` and `.node-version`. The scripts keep
+their own `.node-version`. System packages provide the C compiler, Python 3,
+flock, Bubblewrap, shellcheck, SQLite CLI, zstd, rsync and xz. SQLite used by
+Rust is bundled; it does not depend on the host SQLite CLI version. Rust crates
+are fetched by the first build, not by setup.
 
 Linux x86_64 and these development tools provide practical parity with the
 Ubuntu factory runners. Their kernels, GPU, real Ollama, Tailscale, systemd

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Read-only check of the toolchain contract in docs/environments.md.
 
-Usage: scripts/env/check --env <name>
+Usage: scripts/env/check --env <name> [--failing]
 
 Prints one JSON object: the environment name, overall `ok`, and every contract
 item with expected and actual values. Exits 1 when a required item fails, 2 on
-usage errors. Items the environment is exempt from are reported with
+usage errors. `--failing` prints only the failing required items instead, one
+`name<TAB>expected<TAB>actual` line each (scripts/env/setup.sh and the sandbox
+preflight read it). Items the environment is exempt from are reported with
 `"required": false` and never fail the run.
 
 Versions resolve the way builds do: `rustc` and `cargo` run in the repository
@@ -31,8 +33,6 @@ import sys
 REPO = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 KIOSK = os.path.join(REPO, "kiosk")
 
-# ponytail: Vite+ has no repo pin file yet; keep this in step with .agents/setup and ci.yml.
-VITE_PLUS = "1.1.0"
 LAYOUT_CHECKOUT = "/home/agent/work/factory"
 LAYOUT_VP_ENV = "/home/agent/.config/vite-plus/env"
 
@@ -98,7 +98,8 @@ def pins():
     toolchain = read(os.path.join(REPO, "rust-toolchain.toml")) or ""
     channel = re.search(r'^\s*channel\s*=\s*"([^"]+)"', toolchain, re.M)
     components = re.search(r"^\s*components\s*=\s*\[([^\]]*)\]", toolchain, re.M)
-    engines = json.loads(read(os.path.join(KIOSK, "package.json")) or "{}").get("devEngines", {})
+    package = json.loads(read(os.path.join(KIOSK, "package.json")) or "{}")
+    engines = package.get("devEngines", {})
     manager = engines.get("packageManager", {})
     return {
         "rust": channel.group(1) if channel else None,
@@ -106,6 +107,8 @@ def pins():
         "node": engines.get("runtime", {}).get("version"),
         "node-root": (read(os.path.join(REPO, ".node-version")) or "").strip().lstrip("v") or None,
         "bun": manager.get("version") if manager.get("name") == "bun" else None,
+        # The global `vp` matches the kiosk's own Vite+ pin.
+        "vite-plus": package.get("catalog", {}).get("vite-plus"),
     }
 
 
@@ -206,7 +209,8 @@ def items(root):
     vp = shutil.which("vp")
     # Global Vite+ installs are named vp-global; npm installs are vite-plus.
     found = package_version(vp, {"vite-plus", "vp-global"}) if vp else None
-    add("vite-plus", VITE_PLUS, f"{found} ({vp})" if found else vp, found == VITE_PLUS)
+    expected = pin["vite-plus"]
+    add("vite-plus", expected, f"{found} ({vp})" if found else vp, expected and found == expected)
 
     base, browsers = playwright(root)
     add(
@@ -233,6 +237,7 @@ def items(root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--env", required=True, choices=sorted(EXEMPT))
+    parser.add_argument("--failing", action="store_true", help="print failing required items as TSV, not JSON")
     # Tests point host paths (/etc, /home/agent) at a fixture tree.
     parser.add_argument("--root", default="/", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -242,6 +247,11 @@ def main():
     for item in report:
         item["required"] = item["name"] not in exempt
     ok = all(item["ok"] for item in report if item["required"])
+    if args.failing:
+        for item in report:
+            if item["required"] and not item["ok"]:
+                print("\t".join(str(item[key]) for key in ("name", "expected", "actual")))
+        return 0 if ok else 1
     json.dump({"env": args.env, "ok": ok, "items": report}, sys.stdout, indent=2)
     sys.stdout.write("\n")
     return 0 if ok else 1

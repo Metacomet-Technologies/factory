@@ -62,28 +62,13 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.ref || github.sha }}
-      - name: Read pinned runtime versions
-        id: versions
-        run: |
-          node -e 'const p = require("./package.json"); console.log("node=" + p.devEngines.runtime.version); console.log("bun=" + p.devEngines.packageManager.version)' >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: ${{ steps.versions.outputs.node }}
-      - name: Install pinned Vite+ and Bun via npm
-        env:
-          BUN_VERSION: ${{ steps.versions.outputs.bun }}
-        # https://viteplus.dev/guide/local-cli: npm CLI supports package-manager commands.
-        # Install outside the checkout so bootstrapping cannot change its manifests.
-        run: |
-          npm install --prefix "$RUNNER_TEMP/kiosk-tools" --no-audit --no-fund vite-plus@1.1.0 "bun@$BUN_VERSION"
-          echo "$RUNNER_TEMP/kiosk-tools/node_modules/.bin" >> "$GITHUB_PATH"
-      - name: Check the toolchain contract (docs/environments.md)
+      - name: Converge to the toolchain contract (docs/environments.md)
         working-directory: .
-        # The hosted image lacks the pinned Rust; provision it explicitly, since the checker is read-only.
+        # Installs Rust, Vite+, Node and Bun from the repo pins, puts them on PATH, then runs scripts/env/check.
         run: |
-          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" --profile minimal --component rustfmt --component clippy
           python3 -B scripts/env/test_check.py
-          scripts/env/check --env ci
+          python3 -B scripts/env/test_setup.py
+          scripts/env/setup.sh --ci
       - run: node --version && bun --version && vp --version
       - name: Install kiosk dependencies and select its local CLI
         run: |
@@ -136,12 +121,8 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.ref || github.sha }}
-      - name: Install sandbox prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y bubblewrap shellcheck
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+      - name: Converge to the sandbox toolchain contract (docs/environments.md)
+        run: scripts/env/setup.sh --ci --env sandbox
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
