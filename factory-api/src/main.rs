@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
-use factory_api::{AppState, alerts, devices, fleet, network, network_speed, router};
+use factory_api::{
+    AppState, alerts, devices, fleet, network, network_diagnosis, network_speed, router,
+};
 use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
@@ -84,6 +86,9 @@ struct Args {
     network_tailnet_target: String,
     #[arg(long, env = "FACTORY_API_NETWORK_ROUTE_TABLE", default_value = network::DEFAULT_ROUTE_TABLE)]
     network_route_table: PathBuf,
+    /// Comma-separated layer:loss/rtt/jitter overrides, e.g. wan:20/100/30 (see docs/network.md).
+    #[arg(long, env = "FACTORY_API_NETWORK_THRESHOLDS", value_parser = network_diagnosis::Thresholds::parse)]
+    network_thresholds: Option<network_diagnosis::Thresholds>,
     #[arg(long, env = "FACTORY_API_NETWORK_SPEED_URL", default_value = network_speed::DEFAULT_URL, value_parser = network_speed::base_url)]
     network_speed_url: String,
     #[arg(long, env = "FACTORY_API_NETWORK_SPEED_INTERVAL_S", default_value_t = network_speed::DEFAULT_INTERVAL_S, value_parser = clap::value_parser!(u64).range(network_speed::MIN_INTERVAL_S..))]
@@ -238,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
         plan: network_speed::PLAN,
     });
     state.network = network.targets().into();
+    state.network_thresholds = args.network_thresholds.unwrap_or_default();
     if alerts_config.token.is_some() {
         tracing::info!(channel = %alerts_config.channel, "alerts: Slack token loaded; posting enabled");
     } else {

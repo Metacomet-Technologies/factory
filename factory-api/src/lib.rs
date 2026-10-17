@@ -63,6 +63,7 @@ pub struct AppState {
     pub ups_name: String,
     /// Network probe registry, built once from NetworkConfig in layer order.
     pub network: Arc<[network::Target]>,
+    pub network_thresholds: network_diagnosis::Thresholds,
     /// main installs the configured runner; embedders and tests never run a speed test.
     pub speed_test: Option<network_speed::SpeedConfig>,
     pricing_client: reqwest::Client,
@@ -130,6 +131,7 @@ impl AppState {
             ups_name: "cyberpower".into(),
             // main installs the configured registry; embedders and tests probe nothing.
             network: Arc::new([]),
+            network_thresholds: network_diagnosis::DEFAULT_THRESHOLDS,
             speed_test: None,
             pricing_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
@@ -645,7 +647,8 @@ impl AppState {
             warnings,
         })
     }
-    pub async fn collect_network(&self) {
+    /// Probe every target, diagnose the tick and store both together.
+    pub async fn collect_network(&self, collector: &mut network_history::Collector) {
         let ts_ms = now_ms();
         let mut samples = Vec::new();
         let mut errors = Vec::new();
@@ -655,16 +658,30 @@ impl AppState {
                 Err(error) => errors.push(format!("{error:#}")),
             }
         }
+        let tick = collector.diagnose(ts_ms, &samples, &self.network_thresholds);
         let batch = samples.clone();
-        let stored = if samples.is_empty() {
-            Ok(())
+        let stored = if self.network.is_empty() {
+            Ok(Vec::new())
         } else {
             self.db
                 .write(&self.query_scope, move |db| {
-                    network_history::record(db, network::DEVICE_ID, &batch)
+                    network_history::record(db, network::DEVICE_ID, &batch, Some(&tick))
                 })
                 .await
         };
+        if let Ok(events) = &stored {
+            collector.committed();
+            for event in events {
+                tracing::info!(
+                    id = event.id,
+                    state = ?event.state,
+                    started_ms = event.started_ms,
+                    end_reason = ?event.end_reason,
+                    "network event {}",
+                    if event.ended_ms.is_some() { "closed" } else { "opened" }
+                );
+            }
+        }
         self.warning("network history", stored.err().map(|e| e.to_string()))
             .await;
         self.emit("network.sample", &samples);
@@ -753,6 +770,7 @@ impl AppState {
                 let mut last_optimize = Instant::now();
                 let mut ups_collector = None::<ups_history::Collector>;
                 let mut devices_sampler = devices::Sampler::default();
+                let mut network_collector = network_history::Collector::default();
                 loop {
                     tokio::select! { biased;
                         _ = state.shutdown.cancelled() => break,
@@ -765,7 +783,7 @@ impl AppState {
                                 let _ = state.sync_meter().await;
                             }
                             "fleet" => state.collect_fleet().await,
-                            "network" => state.collect_network().await,
+                            "network" => state.collect_network(&mut network_collector).await,
                             "speedtest" => state.collect_speed_test().await,
                             "gpu" => {
                                 let (current, _) = state.gpu_current().await;
