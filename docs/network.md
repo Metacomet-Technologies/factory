@@ -90,6 +90,39 @@ Examples. If the gateway is fine but both anycast targets are down, that is
 `Down { dns }`. A state transition opens or closes a `network_events` row with
 its start, end, layer and peak values. Thresholds live in config with defaults.
 
+Each target's burst is classified on its own. Nothing received is `Lost`.
+Otherwise the first limit reached, in the order loss, latency (average RTT),
+jitter (mdev), names `Degraded`. Each limit trips at or above its value.
+
+| Layer | Loss | RTT | Jitter |
+| --- | --- | --- | --- |
+| `lan` | 20 % | 20 ms | 10 ms |
+| `wan` | 20 % | 100 ms | 30 ms |
+| `dns` | 20 % | 250 ms | 100 ms |
+| `tailnet` | 20 % | 150 ms | 50 ms |
+
+`--network-thresholds` (`FACTORY_API_NETWORK_THRESHOLDS`) overrides layers
+with comma-separated `layer:loss/rtt/jitter` entries in integer percent and
+milliseconds, such as `wan:30/150/40`. Unlisted layers keep the defaults.
+Loss must be 1 to 100, and RTT and jitter 1 to 1000 ms, because every attempt
+times out after 1 s.
+
+- A layer is as healthy as its healthiest target. One wan resolver dropping
+  ICMP does not blame the ISP; both lost does.
+- A layer with no sample this tick is unknown, for example when ping itself is
+  broken. Unknown never names a fault.
+- A layer is down after 2 consecutive `Lost` ticks. One `Lost` tick is
+  `Degraded { loss }`. Any other tick, unknown included, resets the count, so
+  recovery takes one good tick.
+- The first layer in registry order that is down or degraded names the state,
+  so a degraded `lan` masks a down `wan`.
+- The `net_events` row for a state stays open while the state holds and
+  tracks the peak loss, average RTT and jitter of the faulting layer's chosen
+  targets. Recovery closes it as `recovered`. A different state closes it as
+  `changed` and opens the next one at the same tick.
+- The counts restart with the process, so the first tick closes an event left
+  open by the previous process as `restart`.
+
 ## Storage (factory-api, versioned migration)
 
 Follows docs/agents/db.md. All tables are STRICT, with `*_ms` timestamps and

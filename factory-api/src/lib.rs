@@ -6,6 +6,7 @@ pub mod devices_history;
 pub mod fleet;
 mod kiosk;
 pub mod network;
+pub mod network_diagnosis;
 pub mod network_history;
 pub mod network_speed;
 pub mod pool;
