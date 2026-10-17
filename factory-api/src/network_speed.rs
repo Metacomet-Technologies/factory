@@ -208,23 +208,25 @@ async fn measure(config: &SpeedConfig, partial: &Mutex<Partial>) -> Result<[i64;
     }
     Ok(rates)
 }
-/// Bursts run while the direction transfers. The burst in flight when it ends
-/// is kept, so even a sub-second transfer gets one loaded sample.
+/// Bursts run while the direction transfers. The first starts at once and the
+/// one in flight when it ends is kept, so even a direction that fails at once
+/// gets one loaded sample.
 async fn loaded_latency(
     target: IpAddr,
     done: &CancellationToken,
     direction: Direction,
     partial: &Mutex<Partial>,
 ) {
-    let mut timer = tokio::time::interval(LOADED_SPACING);
+    let mut timer =
+        tokio::time::interval_at(tokio::time::Instant::now() + LOADED_SPACING, LOADED_SPACING);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        if let Ok(burst) = network::ping(target).await {
+            update(partial, |p| p.loaded[direction as usize].push(burst));
+        }
         tokio::select! { biased;
             _ = done.cancelled() => return,
             _ = timer.tick() => (),
-        }
-        if let Ok(burst) = network::ping(target).await {
-            update(partial, |p| p.loaded[direction as usize].push(burst));
         }
     }
 }
