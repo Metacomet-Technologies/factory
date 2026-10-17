@@ -110,7 +110,8 @@ times out after 1 s.
 - A layer is as healthy as its healthiest target. One wan resolver dropping
   ICMP does not blame the ISP; both lost does.
 - A layer with no sample this tick is unknown, for example when ping itself is
-  broken. Unknown never names a fault.
+  broken. Unknown never names a fault, so a faulting layer that loses every
+  sample ends its episode as `recovered`.
 - A layer is down after 2 consecutive `Lost` ticks. One `Lost` tick is
   `Degraded { loss }`. Any other tick, unknown included, resets the count, so
   recovery takes one good tick.
