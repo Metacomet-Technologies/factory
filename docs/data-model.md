@@ -235,10 +235,11 @@ rollups through the latest ID. Rollbacks restore those verified v1/v5 snapshots
 (**all telemetry returns to backup time**). Reruns on v2/v6 restore no DB. No
 production migration, deployment or production read has been run.
 
-Open deviation: `scripts/sandbox-shims/runtime.py` (outside this change's scope)
-still starts meter only from v1. Fresh sandboxes work; `down`/`up` on a v2
-database and reuse of a v1 database stop at its guard until that file is
-approved for change.
+Sandbox launcher: `scripts/sandbox-shims/runtime.py` starts meter on v2. A reused
+v1 `meter.db` is upgraded in place by `meter migrate --db` (log in
+`.sandbox/meter-upgrade.json`); a failed upgrade stops startup with a clear
+message. A reused pre-MET-205 requests cache (v5) still needs the offline
+`factory-api migrate --requests-db`; the API refuses it with that instruction.
 
 ## Scope, evidence, and decisions
 
