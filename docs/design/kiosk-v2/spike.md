@@ -38,7 +38,8 @@ the content restyle is MET-227. Colours come from `tokens.json`, both themes.
 Code: `kiosk/src/ambient/` (`mode.ts`, `scene.tsx`, `ambient.css`, `perf.ts`), wired in
 `kiosk/src/App.tsx` and `kiosk/src/index.css`.
 
-Captures at 1728×1117 from `vp run ambient:check` against the sandbox:
+Captures at 1728×1117 from `vp run ambient:check` against the populated mock (a failing
+Network panel and a warning Local LLM panel):
 [dark `both`](spike/1728-dark-both.png), [light `both`](spike/1728-light-both.png),
 [dark `static`](spike/1728-dark-static.png). The v1 grid covers most of the band; the
 MET-227 grid leaves the ridgeline open below the panels.
@@ -60,21 +61,35 @@ over the network; the trial script reads the object over the DevTools port.
 
 ## Browser check
 
+Against the populated mock (plain, warning and failure panels), with a build of main as
+the baseline, from `kiosk/`:
+
 ```sh
-scripts/sandbox up --kiosk          # from the repository root
-cd kiosk && vp run ambient:check    # Playwright Chromium installed for this user
+vp build && MOCK_NETWORK=down vp run mock-preview   # mock :4179, this build on :4180
+# A build of origin/main served with KIOSK_API_PROXY=http://127.0.0.1:4179 on :14237, then:
+AMBIENT_ORIGIN=http://127.0.0.1:4180 AMBIENT_BASELINE_ORIGIN=http://127.0.0.1:14237 vp run ambient:check
+```
+
+Against the sandbox, from the repository root:
+
+```sh
+scripts/sandbox up --kiosk
+(cd kiosk && vp run ambient:check)   # Playwright Chromium installed for this user
 scripts/sandbox down
 ```
 
 `ambient:check` uses `AMBIENT_ORIGIN`, else this worktree's sandbox, else the mock
 preview on :4180. Per theme it checks that the default URL, `?ambient=stars` and
-`?perf=1` produce the same DOM classes and panel style with no scene; with
-`AMBIENT_BASELINE_ORIGIN` set to a build of main against the same API it also compares
-the default URL's classes, panel style and request paths with main. Classes that only
-track live data (`chip-dot-pulse`, `ticker`, `empty`) are reported, not failed. For each
-mode it checks the scene animation count, no page scroll and no added dashboard
-overflow, the panel `backdrop-filter`, the perf object, no requests the v1 page does not
-make, and zero running animations under reduced motion. Captures and
+`?perf=1` produce the same DOM classes and the same style on every panel, with no scene.
+With `AMBIENT_BASELINE_ORIGIN` set to a build of main against the same API, it also
+compares the default URL's classes, panel styles and request paths with main. Classes
+that only track live data (`chip-dot-pulse`, `ticker`, `empty`) are reported, not failed.
+Any origin other than the sandbox, whose synthetic data is healthy, must show plain,
+warning and failure panels. For each mode it checks the scene animation count, no page
+scroll and no added dashboard overflow, the perf object, no requests the v1 page does
+not make, and zero running animations under reduced motion. On every panel it checks
+the `backdrop-filter`, the glass shadow (both inset sheens and the depth drop), and, on
+warning and failure panels only, v1's 3 px tone ring and tone border. Captures and
 `ambient-check.json` go to `.amp/in/artifacts/ambient/`.
 
 ## Trial on factory-console
@@ -93,8 +108,13 @@ on factory-console. It never touches the kiosk, its autostart entry or its profi
    `https://factory-gpu.bearded-pompano.ts.net/?ambient=<mode>&perf=1` (`?perf=1` for
    `v1`), `--start-fullscreen`, and `--remote-debugging-port=0`. It refuses to continue
    unless DevTools listens on 127.0.0.1 only.
-3. **Sampling:** after a 15 s settle, every 5 s it sums `/proc/<pid>/stat` utime, stime,
-   cutime and cstime over the trial Chrome's process tree and, separately, the kiosk's.
+3. **Sampling:** after a 15 s settle, every 5 s it reads `/proc/<pid>/stat` for the trial
+   Chrome's process tree and, with separate state, the kiosk's. Each process's own CPU
+   (utime + stime) counts as it grows. A child that exits and is reaped moves its whole
+   total into its parent's reaped CPU (cutime + cstime); the part already counted at the
+   previous sample is credited back, so each tick counts once, including children that
+   start and finish between samples. Members stay tracked if re-parented; PID reuse is
+   detected by start time.
 4. **Output:** at the end it reads `window.__ambientPerf` over DevTools with Node (as
    `agent`) and prints one JSON object: `mode`, `minutes`, `url`, `settle_s`,
    `interval_s`, `samples`, `cores`, `trial_cpu` (`avg`/`max` as % of one core and of all

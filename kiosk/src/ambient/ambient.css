@@ -152,6 +152,18 @@
   border-radius: 14px;
   box-shadow: var(--fk-shadow-glass);
 }
+/* Warning and failure panels keep v1's tone border and 3 px ring on top of the glass
+   shadow. These outrank v1's .panel[data-tone] rules, which would drop the glass shadow. */
+:root[data-ambient] .panel[data-tone="warn"] {
+  box-shadow:
+    var(--fk-shadow-glass),
+    0 0 0 3px color-mix(in oklab, var(--warn) 18%, transparent);
+}
+:root[data-ambient] .panel[data-tone="fail"] {
+  box-shadow:
+    var(--fk-shadow-glass),
+    0 0 0 3px color-mix(in oklab, var(--fail) 18%, transparent);
+}
 :root[data-ambient] :where(.panel, .ups-panel)::before {
   content: "";
   position: absolute;

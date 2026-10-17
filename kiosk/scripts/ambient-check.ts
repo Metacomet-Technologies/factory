@@ -5,14 +5,15 @@ import { fileURLToPath } from "node:url";
 // MET-237: the ambient spike at the kiosk size, per mode and theme. Origin: AMBIENT_ORIGIN,
 // else this worktree's sandbox, else the mock preview (`vp run mock-preview`).
 // AMBIENT_BASELINE_ORIGIN, when set, is a build of main against the same API; the default
-// URL must then match it exactly.
+// URL must then match it exactly. Every origin except the sandbox (whose synthetic data is
+// healthy) must show plain, warning and failure panels, as `MOCK_NETWORK=down` does.
 const root = new URL("../../", import.meta.url);
 const ports = new URL(".sandbox/ports.json", root);
-const origin =
-  process.env.AMBIENT_ORIGIN ??
-  (existsSync(ports)
-    ? `http://127.0.0.1:${(JSON.parse(await readFile(ports, "utf8")) as { "factory-api": number })["factory-api"]}`
-    : "http://127.0.0.1:4180");
+const sandbox = existsSync(ports)
+  ? `http://127.0.0.1:${(JSON.parse(await readFile(ports, "utf8")) as { "factory-api": number })["factory-api"]}`
+  : undefined;
+const origin = process.env.AMBIENT_ORIGIN ?? sandbox ?? "http://127.0.0.1:4180";
+const requireTones = origin !== sandbox;
 const baseline = process.env.AMBIENT_BASELINE_ORIGIN;
 const artifacts = new URL(".amp/in/artifacts/ambient/", root);
 await mkdir(artifacts, { recursive: true });
@@ -66,19 +67,23 @@ async function visit(base: string, query: string, theme: Theme, reducedMotion = 
     const classes = new Set<string>();
     for (const element of document.querySelectorAll("*"))
       for (const name of element.classList) classes.add(name);
-    const panel = document.querySelector(".panel");
-    const style = panel ? getComputedStyle(panel) : null;
     const dashboard = document.querySelector(".dashboard");
     return {
       classes: [...classes].sort(),
       ambientAttribute: document.documentElement.dataset.ambient ?? null,
       sceneElements: document.querySelectorAll(".fk-backdrop, [data-ambient-scene]").length,
-      panel: style && {
-        background: style.backgroundColor,
-        backdrop: style.backdropFilter,
-        radius: style.borderRadius,
-        shadow: style.boxShadow,
-      },
+      panels: [...document.querySelectorAll<HTMLElement>(".panel")].map((panel, i) => {
+        const style = getComputedStyle(panel);
+        return {
+          name: panel.getAttribute("aria-label") ?? `panel ${i}`,
+          tone: panel.dataset.tone ?? "plain",
+          background: style.backgroundColor,
+          backdrop: style.backdropFilter,
+          radius: style.borderRadius,
+          border: style.borderTopColor,
+          shadow: style.boxShadow,
+        };
+      }),
       pageScroll: {
         scrollHeight: document.documentElement.scrollHeight,
         scrollWidth: document.documentElement.scrollWidth,
@@ -121,8 +126,8 @@ try {
         `${theme} ${query}: DOM classes differ from the default URL`,
       );
       check(
-        JSON.stringify(same.state.panel) === JSON.stringify(v1.state.panel),
-        `${theme} ${query}: panel style differs from the default URL`,
+        JSON.stringify(same.state.panels) === JSON.stringify(v1.state.panels),
+        `${theme} ${query}: panel styles differ from the default URL`,
       );
       check(same.state.sceneElements === 0, `${theme} ${query}: scene elements present`);
       if (query === "?perf=1")
@@ -138,8 +143,8 @@ try {
         `${theme} default: DOM classes differ from main (${baseline})`,
       );
       check(
-        JSON.stringify(main.state.panel) === JSON.stringify(v1.state.panel),
-        `${theme} default: panel style differs from main`,
+        JSON.stringify(main.state.panels) === JSON.stringify(v1.state.panels),
+        `${theme} default: panel styles differ from main`,
       );
       check(
         JSON.stringify(main.paths) === JSON.stringify(v1.paths),
@@ -148,6 +153,10 @@ try {
       report[`${theme}-main`] = { classes: main.state.classes.length, paths: main.paths };
     }
     report[`${theme}-v1`] = { ...v1.state, classes: v1.state.classes.length, paths: v1.paths };
+    const tones = new Set(v1.state.panels.map((panel) => panel.tone));
+    if (requireTones)
+      for (const tone of ["plain", "warn", "fail"])
+        check(tones.has(tone), `${theme} default: no ${tone} panel to check (populated mock?)`);
 
     for (const mode of modes) {
       const label = `${theme} ${mode}`;
@@ -184,11 +193,32 @@ try {
         `${label}: dashboard overflow ${moving.state.dashboardOverflow} differs from v1 ${v1.state.dashboardOverflow}`,
       );
       check(
-        mode === "static"
-          ? moving.state.panel?.backdrop === "none"
-          : moving.state.panel?.backdrop === "blur(18px) saturate(1.7)",
-        `${label}: panel backdrop-filter is ${moving.state.panel?.backdrop}`,
+        moving.state.panels.length === v1.state.panels.length,
+        `${label}: ${moving.state.panels.length} panels, v1 has ${v1.state.panels.length}`,
       );
+      for (const panel of moving.state.panels) {
+        const plain = v1.state.panels.find((other) => other.name === panel.name);
+        const name = `${label} ${panel.tone} panel "${panel.name}"`;
+        check(
+          panel.backdrop === (mode === "static" ? "none" : "blur(18px) saturate(1.7)"),
+          `${name}: backdrop-filter ${panel.backdrop}`,
+        );
+        // The glass shadow: two inset sheen lines and the soft depth drop.
+        check(
+          panel.shadow.split("inset").length === 3 && panel.shadow.includes("0px 22px 44px -28px"),
+          `${name}: no glass shadow (${panel.shadow})`,
+        );
+        // Tone cues: v1's 3 px ring and tone border on warning and failure panels only.
+        check(
+          panel.shadow.includes("0px 0px 0px 3px") === (panel.tone !== "plain"),
+          `${name}: tone ring ${panel.tone === "plain" ? "present" : "missing"}`,
+        );
+        if (panel.tone !== "plain")
+          check(
+            panel.tone === plain?.tone && panel.border === plain.border,
+            `${name}: border ${panel.border}, v1 ${plain?.border}`,
+          );
+      }
       check(
         moving.state.perf?.mode === mode,
         `${label}: perf sampler mode ${moving.state.perf?.mode}`,
@@ -207,7 +237,7 @@ try {
         reduced_motion_running: still.state.running,
         page_scroll: moving.state.pageScroll,
         dashboard_overflow: moving.state.dashboardOverflow,
-        panel: moving.state.panel,
+        panels: moving.state.panels,
         perf: moving.state.perf,
       };
     }

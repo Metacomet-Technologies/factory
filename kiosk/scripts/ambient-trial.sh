@@ -20,6 +20,80 @@ die() {
   exit 1
 }
 
+# ---- CPU accounting ------------------------------------------------------------
+# Sourcing this file defines only these functions (kiosk/src/ambient/trial.test.ts).
+proc=/proc
+declare -A children=() parent=() started=() own=() reaped=()
+# One pass over $proc: each pid's parent, start time, own CPU (utime + stime) and reaped
+# CPU (cutime + cstime: everything its waited-for children used, recursively).
+read_stats() {
+  local file line pid
+  local -a f
+  children=() parent=() started=() own=() reaped=()
+  for file in "$proc"/[0-9]*/stat; do
+    { read -r line <"$file"; } 2>/dev/null || continue
+    pid=${line%% *}
+    read -ra f <<<"${line##*) }"
+    children[${f[1]}]+=" $pid"
+    parent[$pid]=${f[1]}
+    own[$pid]=$((f[11] + f[12]))
+    reaped[$pid]=$((f[13] + f[14]))
+    started[$pid]=${f[19]}
+  done
+}
+
+# Sets delta to the CPU ticks the tree under $1 used since the previous call for the same
+# name, counting each process's CPU once. State is prev_<name>: "start own reaped parent"
+# per pid. A member stays tracked while it lives, even if re-parented away. When a member
+# exits and is reaped, its whole total moves into an ancestor's reaped CPU; the part
+# already counted at the previous sample is credited back to its nearest live ancestor,
+# so only the unsampled remainder counts. A child that starts and exits between samples
+# is counted once, through its parent's reaped CPU. Not run in a subshell, so that state
+# persists.
+# shellcheck disable=SC2034 # used through tree_delta's nameref
+declare -A prev_trial=() prev_kiosk=()
+delta=0
+# shellcheck disable=SC2004 # associative keys need the $
+tree_delta() {
+  local root=$1 name=$2 pid child s o r p po pr total=0
+  local -n prev=prev_$name
+  local -A cur=() credit=()
+  local -a queue=("$root")
+  for pid in "${!prev[@]}"; do
+    read -r s _ <<<"${prev[$pid]}"
+    [[ ${started[$pid]:-} != "$s" ]] || queue+=("$pid")
+  done
+  while ((${#queue[@]})); do
+    pid=${queue[0]}
+    queue=("${queue[@]:1}")
+    [[ -n ${own[$pid]:-} && -z ${cur[$pid]:-} ]] || continue
+    cur[$pid]="${started[$pid]} ${own[$pid]} ${reaped[$pid]} ${parent[$pid]}"
+    for child in ${children[$pid]:-}; do queue+=("$child"); done
+  done
+  for pid in "${!prev[@]}"; do
+    read -r s o r p <<<"${prev[$pid]}"
+    [[ ${cur[$pid]:-} != "$s "* ]] || continue
+    while [[ -n $p && -z ${cur[$p]:-} ]]; do
+      if [[ -n ${prev[$p]:-} ]]; then read -r _ _ _ p <<<"${prev[$p]}"; else p=; fi
+    done
+    [[ -z $p ]] || credit[$p]=$((${credit[$p]:-0} + o + r))
+  done
+  for pid in "${!cur[@]}"; do
+    read -r s o r _ <<<"${cur[$pid]}"
+    po=0
+    pr=0
+    [[ ${prev[$pid]:-} != "$s "* ]] || read -r _ po pr _ <<<"${prev[$pid]}"
+    ((o <= po)) || total=$((total + o - po))
+    r=$((r - pr - ${credit[$pid]:-0}))
+    ((r <= 0)) || total=$((total + r))
+  done
+  prev=()
+  for pid in "${!cur[@]}"; do prev[$pid]=${cur[$pid]}; done
+  delta=$total
+}
+# Stop here when sourced.
+if (return 0 2>/dev/null); then return 0; fi
+
 dry_run=0
 args=()
 for arg in "$@"; do
@@ -43,7 +117,6 @@ if [[ $mode == v1 ]]; then url="$origin/?perf=1"; else url="$origin/?ambient=$mo
 interval=5
 settle=15
 
-proc=/proc
 autostart=/home/console/.config/autostart/console-kiosk.desktop
 lock=/run/lock/factory-ambient-trial.lock
 # Test hooks, honoured only by --dry-run so a real trial always reads the real system.
@@ -206,50 +279,6 @@ trap 'exit 130' INT
 trap 'exit 141' PIPE
 trap 'exit 143' TERM
 
-# One pass over /proc: parent links and cumulative CPU ticks (own plus reaped children).
-declare -A children=() ticks=()
-read_stats() {
-  local file line rest pid
-  local -a f
-  children=()
-  ticks=()
-  for file in "$proc"/[0-9]*/stat; do
-    { read -r line <"$file"; } 2>/dev/null || continue
-    pid=${line%% *}
-    rest=${line##*) }
-    read -ra f <<<"$rest"
-    children[${f[1]}]+=" $pid"
-    ticks[$pid]=$((f[11] + f[12] + f[13] + f[14]))
-  done
-}
-
-# Sets delta to the ticks used since the previous call by the tree under $1; state lives
-# in prev_<name>. Not run in a subshell, so that state persists.
-# shellcheck disable=SC2004 # associative keys need the $ inside (( ))
-tree_delta() {
-  local root=$1 name=$2 pid child total=0
-  local -n prev=prev_$name
-  local -A cur=()
-  local queue=("$root")
-  while ((${#queue[@]})); do
-    pid=${queue[0]}
-    queue=("${queue[@]:1}")
-    [[ -n ${ticks[$pid]:-} ]] || continue
-    cur[$pid]=${ticks[$pid]}
-    for child in ${children[$pid]:-}; do queue+=("$child"); done
-  done
-  for pid in "${!cur[@]}"; do
-    if [[ -n ${prev[$pid]:-} ]]; then
-      ((cur[$pid] > prev[$pid])) && total=$((total + cur[$pid] - prev[$pid]))
-    else
-      total=$((total + cur[$pid]))
-    fi
-  done
-  prev=()
-  for pid in "${!cur[@]}"; do prev[$pid]=${cur[$pid]}; done
-  delta=$total
-}
-
 profile=$(mktemp -d /tmp/ambient-trial.XXXXXX)
 chown "$console_uid" "$profile"
 chmod 700 "$profile"
@@ -273,9 +302,6 @@ while read -r address; do
 done <<<"$listeners"
 
 sleep "$settle"
-# shellcheck disable=SC2034 # used through tree_delta's nameref
-declare -A prev_trial=() prev_kiosk=()
-delta=0
 read_stats
 tree_delta "$launcher" trial
 tree_delta "$kiosk_pid" kiosk

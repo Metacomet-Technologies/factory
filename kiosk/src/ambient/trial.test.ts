@@ -134,3 +134,83 @@ describe("ambient-trial.sh --dry-run", () => {
     });
   });
 });
+
+describe("ambient-trial.sh CPU accounting", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "ambient-cpu-test."));
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+  // /proc/<pid>/stat with utime (field 14), cutime (16) and starttime (22); the rest zero.
+  const stage = (
+    name: string,
+    rows: [pid: number, ppid: number, own: number, reaped: number][],
+  ) => {
+    for (const [pid, ppid, own, reaped] of rows) {
+      const dir = join(root, name, String(pid));
+      mkdirSync(dir, { recursive: true });
+      const fields = [ppid, ...Array<number>(9).fill(0), own, 0, reaped, 0, 0, 0, 0, 0, pid * 7, 0];
+      writeFileSync(join(dir, "stat"), `${pid} (Chrome Helper (Renderer)) S ${fields.join(" ")}\n`);
+    }
+  };
+  const bash = (body: string) => {
+    const result = spawnSync("bash", ["-c", `set -euo pipefail; source "$0"; ${body}`, script], {
+      encoding: "utf8",
+    });
+    expect(result.stderr).toBe("");
+    return result.stdout.trim().split(/\s+/).map(Number);
+  };
+  const sample = (name: string) =>
+    `proc=${join(root, name)}; read_stats; tree_delta 100 trial; t=$delta; tree_delta 300 kiosk; echo $t $delta;`;
+
+  it("counts a sampled child once after its parent reaps it", () => {
+    // Trial parent 100 with child 101, an unrelated process 200, and the kiosk root 300.
+    stage("base", [
+      [100, 1, 10, 0],
+      [101, 100, 100, 0],
+      [200, 1, 50, 0],
+      [300, 1, 40, 0],
+    ]);
+    // 101 exited and was reaped: parent own 30, reaped 100. 200 and the kiosk kept running.
+    stage("reaped", [
+      [100, 1, 30, 100],
+      [200, 1, 500, 0],
+      [300, 1, 45, 0],
+    ]);
+    expect(bash(sample("base") + sample("reaped"))).toEqual([110, 40, 20, 5]);
+  });
+
+  it("keeps steady and re-parented members and ignores unrelated processes", () => {
+    stage("base", [
+      [100, 1, 10, 0],
+      [101, 100, 100, 0],
+      [200, 1, 50, 0],
+      [300, 1, 40, 0],
+    ]);
+    // 101 was re-parented to init and kept running; 200 is not part of either tree.
+    stage("steady", [
+      [100, 1, 15, 0],
+      [101, 1, 110, 0],
+      [200, 1, 500, 0],
+      [300, 1, 40, 0],
+    ]);
+    expect(bash(sample("base") + sample("steady"))).toEqual([110, 40, 15, 0]);
+  });
+
+  it("counts a real short-lived child chain exactly once", () => {
+    // root -> timeout -> busy bash: sampled mid-run, then reaped before the next sample.
+    const [mid, after, growth] = bash(`
+      ( sleep 0.4; timeout 0.8 bash -c 'while :; do :; done' || :; exec sleep 5 ) &
+      r=$!
+      sleep 0.2; read_stats; tree_delta "$r" trial; base=$((own[$r] + reaped[$r]))
+      sleep 0.6; read_stats; tree_delta "$r" trial; mid=$delta
+      sleep 1.2; read_stats; tree_delta "$r" trial; after=$delta
+      kill "$r"
+      echo "$mid" "$after" "$((own[$r] + reaped[$r] - base))"`);
+    expect(mid).toBeGreaterThanOrEqual(5);
+    // Everything ended up in the root's own and reaped CPU; only the baseline sleep's
+    // tick, if any, was already counted before.
+    expect(mid! + after!).toBeLessThanOrEqual(growth!);
+    expect(mid! + after!).toBeGreaterThanOrEqual(growth! - 1);
+  });
+});
