@@ -568,9 +568,11 @@ async fn endpoints_return_registry_history_and_constant_query_budgets() -> Resul
             .error_for_status()?
             .json()
             .await?;
-        // Latest sample per target, then the latest speed test.
-        assert_eq!(scope.counts().data, 2, "/v1/network n={n}");
+        // Latest sample per target, the latest speed test, then the open event.
+        assert_eq!(scope.counts().data, 3, "/v1/network n={n}");
         assert_eq!(body["device_id"], DEVICE_ID);
+        assert_eq!(body["state"], json!({"state": "healthy"}));
+        assert!(body["open_event"].is_null());
         let targets = body["targets"].as_array().unwrap();
         assert_eq!(
             targets

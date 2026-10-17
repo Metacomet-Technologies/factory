@@ -122,6 +122,8 @@ times out after 1 s.
   `changed` and opens the next one at the same tick.
 - The counts restart with the process, so the first tick closes an event left
   open by the previous process as `restart`.
+- `GET /v1/network` reports the stored open row's state, so it is `healthy`
+  when none is open.
 
 ## Storage (factory-api, versioned migration)
 
@@ -145,7 +147,7 @@ not of device hardware, so it does not go under `/v1/devices`.
 - `GET /v1/network` returns current state, latest sample per target, latest speed test, open event and warnings.
 - `GET /v1/network/history?range=1h|24h|7d|30d` returns per-target latency and loss series. Raw data for short ranges, hourly for long ones.
 - `GET /v1/network/speed-tests?range=` returns test points for charts.
-- `GET /v1/network/events?before=&limit=` returns paged outage and degradation episodes.
+- `GET /v1/network/events?before=&limit=` returns paged outage and degradation episodes. `before` is an event id, such as the previous page's `next_before`, and the page holds the episodes after it, newest first by start time and then id.
 - SSE emits `network.sample` and `network.speedtest`.
 
 ## Kiosk

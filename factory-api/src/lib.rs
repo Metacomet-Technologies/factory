@@ -616,13 +616,14 @@ impl AppState {
             .filter(|w| w.starts_with("network") || w.starts_with("clock:"))
             .collect();
         let keys: Vec<String> = self.network.iter().map(|t| t.key.clone()).collect();
-        let (mut latest, latest_speed_test) = self
+        let (mut latest, latest_speed_test, open_event) = self
             .db
             .requests
             .read(&self.query_scope, move |db| {
                 Ok((
                     network_history::latest(db, network::DEVICE_ID, &keys)?,
                     network_history::latest_speed_test(db, network::DEVICE_ID)?,
+                    network_history::open_event(db, network::DEVICE_ID)?,
                 ))
             })
             .await?;
@@ -642,6 +643,10 @@ impl AppState {
         Ok(network::NetworkStatus {
             generated_at_ms: now_ms(),
             device_id: network::DEVICE_ID.into(),
+            state: open_event
+                .as_ref()
+                .map_or_else(Default::default, |e| e.state),
+            open_event,
             targets,
             latest_speed_test,
             warnings,

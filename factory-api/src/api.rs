@@ -1,7 +1,7 @@
 use crate::devices::{self, DeviceList, DeviceView};
 use crate::devices_history::{self, DeviceHistory};
 use crate::network::{NetworkStatus, Sample};
-use crate::network_history::{self, NetworkSeries, NetworkSpeedTest};
+use crate::network_history::{self, NetworkEvents, NetworkSeries, NetworkSpeedTest};
 use crate::types::*;
 use crate::ups::{Ups, UpsCurrent};
 use crate::ups_history::{self, UpsEnergy, UpsEvents, UpsPoint, UpsSettings};
@@ -154,6 +154,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
             | "/v1/network"
             | "/v1/network/history"
             | "/v1/network/speed-tests"
+            | "/v1/network/events"
             | "/v1/pricing"
             | "/v1/pricing/refresh"
             | "/v1/agents"
@@ -208,6 +209,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
         "/v1/network" => network(&state).await,
         "/v1/network/history" => network_history(&state, request).await,
         "/v1/network/speed-tests" => network_speed_tests(&state, request).await,
+        "/v1/network/events" => network_events(&state, request).await,
         "/openapi.json" => Json(ApiDoc::openapi()).into_response(),
         "/v1/stream" => stream(&state).into_response(),
         "/v1/gpu" => match range(&request, true) {
@@ -670,6 +672,45 @@ async fn network_speed_tests(state: &AppState, request: Request<Body>) -> Respon
             .map(|tests| NetworkSpeedTests { range, tests }),
     )
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkEventsQuery {
+    limit: Option<u32>,
+    before: Option<i64>,
+}
+/// Degraded and down episodes, newest first by started_ms then id, the open one included.
+#[utoipa::path(get, path="/v1/network/events", params(("limit"=Option<u32>, Query, description="1–200; default 50"),("before"=Option<i64>, Query, description="Exclusive cursor: an event id, such as the previous page's next_before. The page continues after that event in (started_ms, id) descending order; an unknown id is a 400.")), responses((status=200, body=NetworkEvents),(status=400, body=ApiError),(status=500, body=ApiError)))]
+async fn network_events(state: &AppState, request: Request<Body>) -> Response {
+    let query = match Query::<NetworkEventsQuery>::try_from_uri(request.uri()) {
+        Ok(Query(v)) => v,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_query", e.to_string()),
+    };
+    let limit = query.limit.unwrap_or(50);
+    let before = query.before;
+    if !(1..=200).contains(&limit) || before.is_some_and(|id| id < 1) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "limit must be 1–200; before must be a positive event id",
+        );
+    }
+    let page = state
+        .db
+        .requests
+        .read(&state.query_scope, move |db| {
+            network_history::events(db, crate::network::DEVICE_ID, limit, before)
+        })
+        .await;
+    match page {
+        Ok(Some(page)) => Json(page).into_response(),
+        Ok(None) => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_query",
+            "before is not a known event id",
+        ),
+        Err(e) => response::<()>(Err(e)),
+    }
+}
 #[utoipa::path(get, path="/v1/agents", responses((status=200, body=Agents)))]
 async fn agents(state: &AppState) -> Json<Agents> {
     Json(crate::usage::read(&state.usage_snapshot).await)
@@ -835,6 +876,7 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         network,
         network_history,
         network_speed_tests,
+        network_events,
         pricing,
         refresh,
         confirm_selection

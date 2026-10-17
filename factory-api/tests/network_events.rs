@@ -1,7 +1,7 @@
 use anyhow::Result;
 use factory_api::{
-    data,
-    network::{Burst, DEVICE_ID, Layer, Rtt, Sample},
+    AppState, data, fleet,
+    network::{Burst, DEVICE_ID, Layer, NetworkConfig, Rtt, Sample},
     network_diagnosis::{DEFAULT_THRESHOLDS, LinkState, Peak, Reason},
     network_history::*,
 };
@@ -11,6 +11,7 @@ use factory_db::{
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 
 const TARGETS: [(&str, Layer); 5] = [
     ("gateway", Layer::Lan),
@@ -492,5 +493,138 @@ fn tick_writes_and_event_reads_use_constant_statement_counts() -> Result<()> {
     // page adds the cursor lookup.
     assert_eq!(budgets[0], (vec![22, 23, 22, 21], vec![1, 1, 2]));
     assert_eq!(budgets[0], budgets[1]);
+    Ok(())
+}
+
+async fn serve(state: &AppState, scope: &Scope) -> Result<(String, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let app = factory_api::router(state.clone()).layer(axum::Extension(scope.clone()));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Ok((url, task))
+}
+
+#[tokio::test]
+async fn endpoints_serve_the_stored_state_and_pages_in_constant_queries() -> Result<()> {
+    let client = reqwest::Client::new();
+    for n in [3, 600] {
+        let dir = tempfile::tempdir()?;
+        pricing::migrate(dir.path().join("pricing.db"))?;
+        let mut state = AppState::new(
+            "http://127.0.0.1:1".into(),
+            dir.path().join("requests.db"),
+            dir.path().join("pricing.db"),
+            fleet::Config { nodes: vec![] },
+        )
+        .await?;
+        state.network = NetworkConfig::default().targets().into();
+        state.db.clock_synchronized.store(true, Ordering::Release);
+        // n wan outages that each recover, then one still down.
+        state
+            .db
+            .write(&Scope::default(), move |db| {
+                let mut collector = Collector::default();
+                let mut ts_ms = 30_000;
+                let mut write = |samples: Vec<Sample>| -> Result<()> {
+                    let tick = collector.diagnose(samples[0].ts_ms, &samples, &DEFAULT_THRESHOLDS);
+                    record(db, DEVICE_ID, &samples, Some(&tick))?;
+                    collector.committed();
+                    Ok(())
+                };
+                for _ in 0..n {
+                    write(wan(ts_ms, Burst::lost(10)))?;
+                    write(wan(ts_ms + 30_000, Burst::lost(10)))?;
+                    write(healthy(ts_ms + 60_000))?;
+                    ts_ms += 90_000;
+                }
+                write(wan(ts_ms, Burst::lost(10)))?;
+                write(wan(ts_ms + 30_000, Burst::lost(10)))?;
+                Ok(())
+            })
+            .await?;
+        let get = |path: String, scope: Scope| {
+            let state = state.clone();
+            let client = client.clone();
+            async move {
+                let (url, task) = serve(&state, &scope).await?;
+                let response = client.get(format!("{url}{path}")).send().await?;
+                let status = response.status();
+                let body: Value = response.json().await?;
+                task.abort();
+                anyhow::Ok((status, body, scope.counts().data))
+            }
+        };
+        let (status, body, queries) = get("/v1/network".into(), Scope::default()).await?;
+        assert_eq!((status.as_u16(), queries), (200, 3), "/v1/network n={n}");
+        let down_ms = 30_000 + n * 90_000 + 30_000;
+        assert_eq!(body["state"], json!({"state": "down", "layer": "wan"}));
+        assert_eq!(
+            body["open_event"],
+            json!({"id": 2 * n + 2, "state": "down", "layer": "wan", "started_ms": down_ms,
+                   "ended_ms": null, "end_reason": null, "peak_loss_percent": 100.0,
+                   "peak_rtt_us": null, "peak_mdev_us": null})
+        );
+        // Page newest first through every episode with the returned cursor.
+        // The first page is one query; each cursor page adds the cursor lookup.
+        let mut seen = Vec::new();
+        let mut path = "/v1/network/events?limit=200".to_string();
+        let mut budget = 1;
+        loop {
+            let (status, page, queries) = get(path.clone(), Scope::default()).await?;
+            assert_eq!((status.as_u16(), queries), (200, budget), "{path}");
+            seen.extend(
+                page["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["id"].as_i64().unwrap()),
+            );
+            if page["next_before"].is_null() {
+                break;
+            }
+            path = format!(
+                "/v1/network/events?limit=200&before={}",
+                page["next_before"]
+            );
+            budget = 2;
+        }
+        assert_eq!(seen, (1..=2 * n + 2).rev().collect::<Vec<_>>(), "n={n}");
+        let (_, page, _) = get("/v1/network/events".into(), Scope::default()).await?;
+        let events = page["events"].as_array().unwrap();
+        assert_eq!(events.len() as i64, (2 * n + 2).min(50));
+        assert_eq!(events[0], body["open_event"]);
+        assert_eq!(
+            (
+                events[1]["state"].as_str(),
+                events[1]["end_reason"].as_str()
+            ),
+            (Some("degraded"), Some("changed"))
+        );
+        if n > 3 {
+            assert_eq!(page["next_before"], 2 * n + 2 - 49);
+        }
+        let unknown = format!("/v1/network/events?before={}", 2 * n + 3);
+        for path in [
+            "/v1/network/events?limit=0",
+            "/v1/network/events?limit=201",
+            "/v1/network/events?before=0",
+            "/v1/network/events?before=x",
+            "/v1/network/events?before_ms=1",
+            "/v1/network/events?before_id=3",
+            &unknown,
+        ] {
+            let (status, body, _) = get(path.into(), Scope::default()).await?;
+            assert_eq!(status.as_u16(), 400, "{path}");
+            assert_eq!(body["error"]["code"], "invalid_query", "{path}");
+        }
+        let (url, task) = serve(&state, &Scope::default()).await?;
+        let post = client
+            .post(format!("{url}/v1/network/events"))
+            .send()
+            .await?;
+        assert_eq!(post.status().as_u16(), 405);
+        task.abort();
+        state.db.close().await?;
+    }
     Ok(())
 }
