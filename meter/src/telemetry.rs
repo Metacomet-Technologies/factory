@@ -85,6 +85,8 @@ pub fn start(state: AppState, seconds: u64) -> tokio::task::JoinHandle<()> {
                 },
                 _ = hosts.tick() => if let Err(error) = refresh_hosts(&state).await { tracing::warn!(%error, "Tailscale refresh failed"); },
                 _ = maintenance.tick() => {
+                    // Startup catch-up (first tick is immediate), then every five minutes.
+                    let _ = state.db.rollups().await;
                     let optimize = optimized.elapsed().as_secs() >= 86_400;
                     match state.db.maintain(optimize).await {
                         Ok(()) if optimize => optimized = std::time::Instant::now(),

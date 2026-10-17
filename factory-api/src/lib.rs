@@ -11,6 +11,7 @@ pub mod network_diagnosis;
 pub mod network_history;
 pub mod network_speed;
 pub mod pool;
+pub mod rollups;
 pub mod types;
 pub mod ups;
 pub mod ups_history;
@@ -368,6 +369,30 @@ impl AppState {
         .await;
         result
     }
+    /// Bounded rollup catch-up: at startup, then every five minutes. A failed,
+    /// lagging or cost-blocked run is a `rollups:` maintenance warning in
+    /// usage; the next run resumes from the committed checkpoint.
+    pub async fn roll_up(&self) -> Result<rollups::Progress> {
+        let result = self
+            .db
+            .write(&self.query_scope, |db| {
+                rollups::run(db, now_ms(), rollups::BATCHES_PER_RUN)
+            })
+            .await;
+        let warning = match &result {
+            Ok(p) if p.caught_up && p.verified => None,
+            Ok(p) if p.waiting_for_costs => {
+                Some("waiting for frozen cost backfill; usage reads newer rows raw".into())
+            }
+            Ok(p) => Some(format!(
+                "catch-up incomplete after {} batches; continuing on next run",
+                p.batches
+            )),
+            Err(e) => Some(format!("job failed: {e:#}; usage reads unrolled rows raw")),
+        };
+        self.warning("rollups", warning).await;
+        result
+    }
     pub async fn collect_fleet(&self) {
         let next = fleet::collect(self).await;
         let mut previous = self.fleet.write().await;
@@ -589,18 +614,18 @@ impl AppState {
     }
     pub async fn usage(&self, range: String, since: i64) -> Result<Usage> {
         let warnings = self.read_warnings().await;
-        let (records, warnings, spend) = self
+        // Raw percentiles stay exact through 30 days; longer ranges are flagged.
+        let approximate = !matches!(range.as_str(), "24h" | "7d" | "30d");
+        let rows = self
             .db
             .requests
             .read(&self.query_scope, move |db| {
-                data::usage_records(db, since, warnings)
+                data::usage_records(db, since, approximate, warnings)
             })
             .await?;
         self.db
             .pricing
-            .read(&self.query_scope, move |db| {
-                data::usage(db, range, records, warnings, spend)
-            })
+            .read(&self.query_scope, move |db| data::usage(db, range, rows))
             .await
     }
     pub async fn ups(&self) -> ups::Ups {
@@ -911,6 +936,7 @@ impl AppState {
                                 state.check_clock().await;
                             }
                             "database" => {
+                                let _ = state.roll_up().await;
                                 let optimize =
                                     last_optimize.elapsed() >= Duration::from_secs(86400);
                                 let retention = state

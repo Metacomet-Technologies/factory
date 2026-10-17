@@ -135,6 +135,102 @@ from older installers recorded `v4` without a version when no migration ran; the
 restore no request data. No retention, rollups or pruning are added. No production
 migration, deployment or production read has been run.
 
+## Usage, spend and GPU history rollups implementation (MET-205)
+
+MET-205 adds **meter v2** and **API `requests.db` v6** through the shared runner
+(literal checksums `0xdefc08deaf53df27` / `0xbcc07fc3ad3e0747`). Both only add
+tables and indexes; no existing row changes and the file is never replaced.
+Runtime refuses older and newer versions with an offline-migration message.
+
+Tables follow "Rollup tables and exact aggregation" exactly: STRICT, WITHOUT ROWID
+`request_hourly`/`request_daily` in both databases, API `spend_hourly`/`spend_daily`
+(FK to the matching request row), meter `gpu_hourly`, and `rollup_state` (meter
+`requests` and `gpu` jobs; API one `requests` job). Latency histograms are
+`request_latency_hourly`/`request_latency_daily`: PK
+`(bucket_ms,dimension_key,scheme,bin)`, FK to the request row, positive counts.
+Scheme 1 is fixed: below 8 µs one bin per microsecond; above, eight sub-bins per
+power of two (bin = 8·(e−2)+m, at most 12.5% wide, bin ≤ 495), represented by the
+bin midpoint. A new layout adds a scheme number. Covering
+`requests_ts_latency` indexes let exact percentiles read only latency columns.
+
+**Deviation:** `rollup_state` adds nullable `verified_at_ms`. Rows are created with
+the first committed batch; `verified_at_ms` is set only after the comparison
+below. Until then, reads ignore aggregates and read every row raw.
+
+**Job.** A startup run, then every five minutes (meter maintenance tick; API
+`database` collector), at most 20 transactions per job per run. Each transaction
+selects at most 5,000 IDs above `last_id`, adds their hourly contributions
+(checked integer sums, REAL TPS ratio sums), recomputes affected days from hours,
+and advances the checkpoint. Late rows have higher IDs and update older buckets.
+The API batch never passes a request whose classifications are still being
+backfilled (`WaitingForCosts`). A failed, lagging or cost-blocked run sets meter
+`/meter/health` `maintenance` to `unhealthy` or adds an API `rollups:` usage warning.
+The next run resumes from the committed checkpoint; usage stays correct meanwhile.
+
+**Publication.** When a job first catches up, one reviewed full comparison
+runs before `verified_at_ms`. It checks every hour and day per dimension against
+raw: request counts, token sums with NULL-aware known counts, TPS ratio sums/counts,
+load sums and exact daily histograms. API spend is checked per hour, day, family,
+dimension and status against `request_costs`. Every family also needs
+priced+estimated+unpriced = inference requests in every request bucket. GPU hours
+are compared from the first whole hour of retained raw samples, because v1 already
+pruned at seven days. The offline migrations print these comparisons.
+
+**Reads.** Each request runs in one read transaction. Daily rows cover whole UTC
+days from the first day boundary, hourly rows the hours before it, and raw rows the
+partial first hour plus every row above the verified checkpoint. The intervals are
+disjoint by time and ID. Ranges ≤30d keep exact nearest-rank percentiles from the
+covering index. New `365d` ranges (meter stats, API usage) merge histograms and
+set additive `percentiles_approximate`. GPU history up to seven days stays raw.
+Longer ranges return hourly means (`samples` set; ts is the hour start) before
+the first whole raw hour, then raw samples. Meter's existing seven-day GPU
+deletion now removes only verified, rolled-up IDs. No other pruning exists; that is MET-206.
+
+**Fill-ins.** Cost backfill pages carry the rollup checkpoint in their page read.
+A page containing rolled-up requests reads their prior statuses once. Unpriced →
+estimated fill-ins, or a newly configured family's rows, then rewrite affected
+hourly spend rows and recompute their days **in the same transaction**. Ordinary
+pages keep MET-204's budget.
+
+**Ingestion invariant.** API sync only inserts IDs above its cursor, and the
+cursor is at least every cached ID, so no lower ID can appear at or below the
+rollup checkpoint. Rows are plain inserts, so a known ID is never rewritten.
+
+Measured budgets (enforced in tests): API usage **6** reads for every range,
+replacing 11; pricing, confirm and sync are unchanged. Meter stats **3**, GPU
+history **≤2**, health/requests 1. A full 5,000-row API rollup batch is **≤16**.
+A rewinding cost page adds at most one status read and three rewrite statements
+when its rows are already rolled up. Requests setup is 132 statements (116).
+
+Release `benchmark_100k` on one host: usage 30d p95 **275 ms** at the merge base;
+on this branch **352 ms** before the first rollup run, **45 ms** rolled up, and
+365d **11 ms**. The 200 ms bound now applies to the rolled-up state, which the
+startup run reaches. Exact ≤30d percentiles still read 100k latency index entries.
+A 100k-row backfill takes one bounded run of 20 batches plus verification.
+
+Sandbox (100k seeded rows): baseline v1/v5 data from the merge-base binaries was
+stopped, copied and migrated offline. Meter v1→v2 backfilled 100,520 rows
+(requests plus GPU) in 935 ms; API v5→v6 backfilled 100,150 rows in 1,350 ms.
+All existing table counts were unchanged and both comparisons were equal. Old and
+new code on the same files at a fixed instant gave byte-identical results.
+That covers usage and spend (24h/7d/30d), meter stats (with and without a model
+filter) and GPU history sample totals. The branch stack then ran on the migrated
+files with `maintenance` ok and advanced on its five-minute tick.
+
+**Installers.** `install-meter.sh [--check-only] <binary>` verifies the schema
+read-only. For v1 it stops meter, checkpoints, makes and verifies the MET-74
+archive, and copies the stopped generation into the snapshot. It records the old
+version, then upgrades in place, comparing requests/GPU/drop-episode counts. It
+then requires v2 and two verified rollup jobs. `install-factory-api.sh` treats v5
+like v4: verified `.backup`, recorded version, every-table counts before and after,
+then `migrate --requests-db`. It requires v6 and, with costs complete, verified
+rollups through the latest ID. Rollbacks restore those verified v1/v5 snapshots
+(**all telemetry returns to backup time**). Reruns on v2/v6 restore no DB. No
+production migration, deployment or production read has been run.
+
+Known follow-up: `scripts/sandbox-shims/runtime.py` (outside this change) still
+starts meter only from v1, so a reused sandbox needs it to accept v2.
+
 ## Scope, evidence, and decisions
 
 Sources read: root `README.md`; `meter/src/{db,lib,main,telemetry,usage}.rs`;

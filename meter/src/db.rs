@@ -1,12 +1,13 @@
-use crate::{migrate, storage};
+use crate::{migrate, rollup, storage};
+use anyhow::Context;
 use anyhow::{Result, bail};
+use factory_db::rollup::{self as rollups, Latencies, Window};
 use factory_db::{Pool, Scope};
 pub use rusqlite::Connection;
 use rusqlite::params;
 use serde::Serialize;
 use shared::{GpuSample, ModelStats, RequestRecord};
 use std::{
-    collections::BTreeMap,
     path::Path,
     sync::{Arc, Mutex},
     time::Instant,
@@ -30,8 +31,29 @@ struct Episode {
     requests: u64,
     gpu: u64,
 }
+/// Last rollup job outcome. A failed or lagging job is unhealthy maintenance;
+/// the next five-minute run resumes from the committed checkpoint.
+#[derive(Clone, Serialize, utoipa::ToSchema)]
+pub struct Maintenance {
+    /// "ok", "unhealthy", or "pending" before the first rollup run.
+    pub status: String,
+    pub detail: Option<String>,
+    pub checked_at_ms: Option<i64>,
+}
+
+impl Default for Maintenance {
+    fn default() -> Self {
+        Self {
+            status: "pending".into(),
+            detail: None,
+            checked_at_ms: None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
+    maintenance: Maintenance,
     status: QueueStatus,
     episode: Option<Episode>,
     warning: Option<Instant>,
@@ -50,17 +72,14 @@ pub struct Db {
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         // Read-only preflight before the pool can apply settings or create a file.
-        migrate::require_v1(&migrate::readonly(path)?)?;
+        migrate::require_current(&migrate::readonly(path)?)?;
         let pool = Pool::open_sync(
             path.into(),
             Default::default(),
             |db, reader| {
-                migrate::require_v1(&db)?;
+                migrate::require_current(&db)?;
                 if !reader {
-                    db.execute(
-                        "DELETE FROM gpu_samples WHERE ts_ms < ?1",
-                        [crate::now_ms() - 7 * 86_400_000],
-                    )?;
+                    rollup::prune_gpu(&db, crate::now_ms())?;
                 }
                 Ok(db)
             },
@@ -103,10 +122,7 @@ impl Db {
                         for sample in samples {
                             storage::insert_gpu(&tx, None, &sample)?;
                         }
-                        tx.execute(
-                            "DELETE FROM gpu_samples WHERE ts_ms < ?1",
-                            [crate::now_ms() - 7 * 86_400_000],
-                        )?;
+                        rollup::prune_gpu(&tx, crate::now_ms())?;
                         tx.commit()?;
                         Ok(())
                     })(),
@@ -181,10 +197,7 @@ impl Db {
                 for s in gpu {
                     storage::insert_gpu(&tx, None, &s)?;
                 }
-                tx.execute(
-                    "DELETE FROM gpu_samples WHERE ts_ms < ?1",
-                    [crate::now_ms() - 7 * 86_400_000],
-                )?;
+                rollup::prune_gpu(&tx, crate::now_ms())?;
                 tx.commit()?;
                 Ok(())
             })
@@ -223,38 +236,60 @@ impl Db {
         .await
     }
 
-    pub async fn stats(&self, since: i64, model: Option<String>) -> Result<Vec<ModelStats>> {
-        self.read(move |db| {
-            let filter = if model.is_some() { " AND model=?2" } else { "" };
-            let mut query = db.prepare(&format!(
-                "SELECT {} FROM requests WHERE ts_ms>=?1{filter}",
-                storage::REQUEST_COLUMNS
-            ))?;
-            let rows = if let Some(model) = model {
-                query
-                    .query_map(params![since, model], storage::request)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            } else {
-                query
-                    .query_map([since], storage::request)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            Ok(stats(rows))
-        })
-        .await
+    /// Rollups plus a disjoint raw edge, in one read snapshot: at most three
+    /// statements. Ranges up to 30 days keep exact raw nearest-rank percentiles
+    /// from the covering latency index; longer ranges merge histograms.
+    pub async fn stats(
+        &self,
+        since: i64,
+        model: Option<String>,
+        exact: bool,
+    ) -> Result<Vec<ModelStats>> {
+        self.read(move |db| stats(db, since, model.as_deref(), exact))
+            .await
     }
 
-    pub async fn history(&self, since: i64) -> Result<Vec<GpuSample>> {
-        self.read(move |db| {
-            Ok(db
-                .prepare(&format!(
-                    "SELECT {} FROM gpu_samples WHERE ts_ms>=?1 ORDER BY ts_ms,id",
-                    storage::GPU_COLUMNS
-                ))?
-                .query_map([since], storage::gpu)?
-                .collect::<rusqlite::Result<_>>()?)
-        })
-        .await
+    /// Raw samples within the seven-day raw retention. Older ranges add hourly
+    /// means for hours before the raw boundary: at most two statements.
+    pub async fn history(&self, since: i64) -> Result<Vec<rollup::GpuPoint>> {
+        let now = crate::now_ms();
+        self.read(move |db| history(db, since, now)).await
+    }
+
+    /// Bounded rollup catch-up on the writer, outside any ingestion transaction.
+    pub async fn rollups(&self) -> Result<rollup::Progress> {
+        let state = self.state.clone();
+        let result = self
+            .pool
+            .write(&self.scope.clone().unwrap_or_default(), |db| {
+                rollup::run(db, crate::now_ms(), rollup::BATCHES_PER_RUN)
+            })
+            .await;
+        let maintenance = Maintenance {
+            status: match &result {
+                Ok(p) if p.caught_up && p.verified => "ok",
+                _ => "unhealthy",
+            }
+            .into(),
+            detail: match &result {
+                Ok(p) if p.caught_up && p.verified => None,
+                Ok(p) => Some(format!(
+                    "rollup catch-up incomplete after {} batches; continuing on next run",
+                    p.batches
+                )),
+                Err(e) => Some(format!("rollup job failed: {e:#}")),
+            },
+            checked_at_ms: Some(crate::now_ms()),
+        };
+        if let Some(detail) = &maintenance.detail {
+            tracing::warn!(%detail, "meter rollups");
+        }
+        state.lock().unwrap().maintenance = maintenance;
+        result
+    }
+
+    pub fn maintenance(&self) -> Maintenance {
+        self.state.lock().unwrap().maintenance.clone()
     }
 
     pub async fn maintain(&self, optimize: bool) -> Result<()> {
@@ -294,53 +329,118 @@ fn flush_episode(db: &Connection, state: &Mutex<State>) {
     }
 }
 
-pub fn stats(records: Vec<RequestRecord>) -> Vec<ModelStats> {
-    let mut groups = BTreeMap::<Option<String>, Vec<RequestRecord>>::new();
-    for record in records {
-        groups.entry(record.model.clone()).or_default().push(record);
-    }
-    groups
+fn stats(db: &Connection, since: i64, model: Option<&str>, exact: bool) -> Result<Vec<ModelStats>> {
+    let window = Window::new(since);
+    let filter = if model.is_some() { " AND model=?3" } else { "" };
+    let edge_filter = if model.is_some() {
+        " AND r.model=?3"
+    } else {
+        ""
+    };
+    let bind = |first: i64, second: i64| -> Vec<rusqlite::types::Value> {
+        let mut values = vec![first.into(), second.into()];
+        values.extend(model.map(|m| m.to_owned().into()));
+        values
+    };
+    let rollup_rows = db
+        .prepare(&rollups::rollup_sql(filter))?
+        .query_map(
+            rusqlite::params_from_iter(bind(window.hour, window.day)),
+            |r| Ok((r.get::<_, Option<String>>(1)?, rollups::agg(r, 2)?)),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let edge = db
+        .prepare(&rollups::edge_sql(
+            &rollups::raw_columns("r"),
+            "",
+            edge_filter,
+        ))?
+        .query_map(
+            rusqlite::params_from_iter(bind(since, window.hour)),
+            rollups::raw,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let latencies = if exact {
+        Latencies::Exact(
+            db.prepare(&format!(
+                "SELECT model,total_duration_ns,latency_ms FROM requests INDEXED BY requests_ts_latency WHERE ts_ms>=?1{}",
+                if model.is_some() { " AND model=?2" } else { "" }
+            ))?
+            .query_map(
+                rusqlite::params_from_iter(
+                    std::iter::once(rusqlite::types::Value::from(since))
+                        .chain(model.map(|m| m.to_owned().into())),
+                ),
+                |r| Ok((r.get(0)?, rollups::latency_ms(r.get(1)?, r.get(2)?))),
+            )?
+            .collect::<rusqlite::Result<_>>()?,
+        )
+    } else {
+        let filter = if model.is_some() {
+            " AND dimension_key->>1=?3"
+        } else {
+            ""
+        };
+        Latencies::Approximate(
+            db.prepare(&rollups::histogram_sql(filter))?
+                .query_map(
+                    rusqlite::params_from_iter(bind(window.hour, window.day)),
+                    |r| Ok((r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as u64)),
+                )?
+                .collect::<rusqlite::Result<_>>()?,
+        )
+    };
+    let summaries = rollups::summarize(rollup_rows, &edge, latencies, rollup::TPS)?;
+    summaries
         .into_iter()
-        .map(|(model, records)| {
-            let average = |prompt: bool| {
-                let rates: Vec<_> = records
-                    .iter()
-                    .filter_map(|r| {
-                        let (tokens, duration) = if prompt {
-                            (r.prompt_eval_count, r.prompt_eval_duration)
-                        } else {
-                            (r.eval_count, r.eval_duration)
-                        };
-                        match (tokens, duration) {
-                            (Some(t), Some(d)) if d > 0 => Some(t as f64 * 1e9 / d as f64),
-                            _ => None,
-                        }
-                    })
-                    .collect();
-                (!rates.is_empty()).then(|| rates.iter().sum::<f64>() / rates.len() as f64)
-            };
-            let mut latencies: Vec<_> = records
-                .iter()
-                .map(|r| {
-                    r.total_duration
-                        .map(|n| n as f64 / 1e6)
-                        .unwrap_or(r.latency_ms)
-                })
-                .collect();
-            latencies.sort_by(f64::total_cmp);
-            let percentile = |p: f64| {
-                latencies[((latencies.len() as f64 * p).ceil() as usize).saturating_sub(1)]
-            };
-            ModelStats {
+        .filter(|(_, s)| s.agg.requests > 0)
+        .map(|(model, s)| {
+            Ok(ModelStats {
                 model,
-                requests: records.len(),
-                input_tokens: records.iter().filter_map(|r| r.prompt_eval_count).sum(),
-                output_tokens: records.iter().filter_map(|r| r.eval_count).sum(),
-                avg_prompt_tokens_per_second: average(true),
-                avg_generation_tokens_per_second: average(false),
-                p50_total_latency_ms: percentile(0.5),
-                p95_total_latency_ms: percentile(0.95),
-            }
+                requests: usize::try_from(s.agg.requests)?,
+                input_tokens: u64::try_from(s.agg.input_tokens)?,
+                output_tokens: u64::try_from(s.agg.output_tokens)?,
+                avg_prompt_tokens_per_second: s.agg.avg_prompt_tps(),
+                avg_generation_tokens_per_second: s.agg.avg_generation_tps(),
+                p50_total_latency_ms: s.p50_ms.context("missing latency")?,
+                p95_total_latency_ms: s.p95_ms.context("missing latency")?,
+                percentiles_approximate: !exact,
+            })
         })
         .collect()
+}
+
+fn history(db: &Connection, since: i64, now: i64) -> Result<Vec<rollup::GpuPoint>> {
+    let raw = |r: &rusqlite::Row<'_>| {
+        Ok(rollup::GpuPoint {
+            sample: storage::gpu(r)?,
+            samples: None,
+        })
+    };
+    if since >= now - 7 * rollups::DAY_MS {
+        return Ok(db
+            .prepare(&format!(
+                "SELECT {} FROM gpu_samples WHERE ts_ms>=?1 ORDER BY ts_ms,id",
+                storage::GPU_COLUMNS
+            ))?
+            .query_map([since], raw)?
+            .collect::<rusqlite::Result<_>>()?);
+    }
+    // Hourly means (including the hour overlapping `since`) before the first
+    // whole hour of raw retention; raw samples from there on, plus any sample
+    // not yet rolled up. Until rollups are verified, the checkpoint reads as 0,
+    // so the second query returns every retained raw sample instead.
+    let boundary = rollups::ceil(now - 7 * rollups::DAY_MS, rollups::HOUR_MS);
+    let first = rollups::floor(since, rollups::HOUR_MS);
+    let mut points = db
+        .prepare(rollup::GPU_HOURLY_SQL)?
+        .query_map(params![first, boundary], rollup::gpu_hourly_point)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    points.extend(
+        db.prepare(&rollup::gpu_raw_sql())?
+            .query_map(params![since, boundary], raw)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    );
+    points.sort_by_key(|p| (p.sample.ts, p.samples.is_none()));
+    Ok(points)
 }

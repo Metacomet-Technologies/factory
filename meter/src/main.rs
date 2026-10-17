@@ -22,7 +22,8 @@ struct Config {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialize a database or convert a stopped, checkpointed legacy file offline.
+    /// Initialize a database, convert a stopped, checkpointed legacy file, or
+    /// upgrade an existing typed --db in place and backfill its rollups, offline.
     Migrate {
         #[arg(long)]
         legacy: Option<PathBuf>,
@@ -31,8 +32,9 @@ enum Command {
         /// Validate with WAL-aware reads as the DB owner; discard temporary output.
         #[arg(long, conflicts_with = "check_only")]
         dry_run: bool,
-        /// WAL-aware schema/version preflight as the DB owner. Copies no rows.
-        #[arg(long, requires = "legacy", conflicts_with = "db")]
+        /// WAL-aware schema/version preflight as the DB owner (--legacy, or an
+        /// existing typed --db). Copies and writes no rows.
+        #[arg(long)]
         check_only: bool,
     },
 }
@@ -55,10 +57,26 @@ async fn main() -> anyhow::Result<()> {
     {
         return tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             if check_only {
-                meter::migrate::check_legacy(&meter::migrate::readonly(
-                    legacy.as_deref().unwrap(),
-                )?)?;
-                println!("legacy user_version=0; captured schema fingerprint verified");
+                anyhow::ensure!(
+                    legacy.is_some() != db.is_some(),
+                    "--check-only takes exactly one of --legacy or --db"
+                );
+                if let Some(legacy) = legacy {
+                    meter::migrate::check_legacy(&meter::migrate::readonly(&legacy)?)?;
+                    println!("legacy user_version=0; captured schema fingerprint verified");
+                } else {
+                    let path = db.unwrap();
+                    let version = meter::migrate::check_current(&meter::migrate::readonly(&path)?)?;
+                    println!("meter user_version={version}; schema fingerprint verified");
+                }
+            } else if legacy.is_none()
+                && !dry_run
+                && db
+                    .as_deref()
+                    .is_some_and(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0))
+            {
+                let report = meter::migrate::upgrade(db.as_deref().unwrap())?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 let report = meter::migrate::migrate(legacy.as_deref(), db.as_deref(), dry_run)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);

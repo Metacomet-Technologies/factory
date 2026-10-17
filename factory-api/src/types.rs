@@ -91,6 +91,10 @@ pub struct Usage {
     pub spend_avoided: Vec<SpendAvoided>,
     pub models: Vec<ModelUsage>,
     pub warnings: Vec<String>,
+    /// True when percentiles come from merged fixed-bucket latency histograms
+    /// (ranges beyond 30 days); otherwise they are exact nearest-rank values.
+    #[serde(default)]
+    pub percentiles_approximate: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GpuCurrent {

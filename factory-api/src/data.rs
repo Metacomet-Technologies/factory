@@ -1,6 +1,6 @@
 use crate::types::*;
 use anyhow::{Context, Result};
-use factory_db::money::NanoUsd;
+use factory_db::{money::NanoUsd, rollup};
 use rusqlite::Connection;
 use shared::RequestRecord;
 use std::{collections::BTreeMap, path::Path};
@@ -31,11 +31,13 @@ pub fn verify_path(path: &Path) -> Result<()> {
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let empty = factory_db::migrations::schema_fingerprint(&db)?.is_empty();
     anyhow::ensure!(
-        version == 5 || (version == 0 && empty),
-        "requests requires user_version=5, found {version}; stop factory-api, take a verified backup, then run factory-api migrate --requests-db <path>"
+        version == 6 || (version == 0 && empty),
+        "requests requires user_version=6, found {version}; stop factory-api, take a verified backup, then run factory-api migrate --requests-db <path>"
     );
     Ok(())
 }
+
+const V6: &str = include_str!("requests_v6.sql");
 
 /// Offline only for existing databases. Runtime may initialize a fresh file.
 pub fn initialize(db: &mut Connection) -> Result<()> {
@@ -78,6 +80,11 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
                 version: 5,
                 sql: include_str!("requests_v5.sql"),
                 checksum: 0xc09d8eb6bc540f70,
+            },
+            Migration {
+                version: 6,
+                sql: V6,
+                checksum: 0xbcc07fc3ad3e0747,
             },
         ],
         Some(LegacySchema {
@@ -280,189 +287,243 @@ pub struct FrozenSpend {
     pub estimated_requests: usize,
 }
 
-pub type UsageRows = (
-    Vec<RequestRecord>,
-    Vec<String>,
-    BTreeMap<String, FrozenSpend>,
-);
+/// Usage for one range from a single requests-DB read snapshot.
+#[derive(Debug, Default)]
+pub struct UsageRows {
+    pub models: BTreeMap<Option<String>, rollup::Summary>,
+    pub spend: BTreeMap<String, FrozenSpend>,
+    pub warnings: Vec<String>,
+    pub approximate: bool,
+}
 
-pub fn usage_records(db: &Connection, since: i64, mut warnings: Vec<String>) -> Result<UsageRows> {
+/// Rollups plus a disjoint raw edge, in one read snapshot: five statements
+/// regardless of history. Daily rows cover whole UTC days from the first day
+/// boundary, hourly rows the hours before it, and raw rows the partial first
+/// hour plus everything above the verified checkpoint. Ranges up to 30 days
+/// read exact nearest-rank percentiles from the covering latency index;
+/// longer ranges merge fixed-bucket histograms and are flagged approximate.
+pub fn usage_records(
+    db: &Connection,
+    since: i64,
+    approximate: bool,
+    mut warnings: Vec<String>,
+) -> Result<UsageRows> {
+    let window = rollup::Window::new(since);
+    let inference = format!(" AND endpoint IN ({})", crate::rollups::inference_list());
+    let rollups = db
+        .prepare(&rollup::rollup_sql(&inference))?
+        .query_map([window.hour, window.day], |r| {
+            Ok((r.get::<_, Option<String>>(1)?, rollup::agg(r, 2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let families = crate::costs::families()?;
+    let mut spend: Vec<FrozenSpend> = vec![FrozenSpend::default(); families.len()];
+    let mut add = |family: &str, status: &str, nano: Option<i64>, n: i64| -> Result<()> {
+        let Some(total) = families
+            .iter()
+            .position(|f| f == family)
+            .map(|i| &mut spend[i])
+        else {
+            return Ok(());
+        };
+        let n = usize::try_from(n)?;
+        match (status, nano) {
+            ("priced", Some(cost)) => {
+                total.priced = total.priced.checked_add(NanoUsd(cost))?;
+                total.priced_requests += n;
+            }
+            ("estimated", Some(cost)) => {
+                total.estimated = total.estimated.checked_add(NanoUsd(cost))?;
+                total.estimated_requests += n;
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+    let verified =
+        "EXISTS(SELECT 1 FROM rollup_state WHERE job='requests' AND verified_at_ms IS NOT NULL)";
+    let columns = "family,priced_nano_usd,estimated_nano_usd,priced_requests,estimated_requests";
     let mut statement = db.prepare(&format!(
-        "SELECT {REQUEST_COLUMNS} FROM requests WHERE ts_ms>=?1 ORDER BY ts_ms,id"
+        "SELECT {columns} FROM spend_hourly WHERE bucket_ms>=?1 AND bucket_ms<?2 AND {verified}{inference}
+         UNION ALL SELECT {columns} FROM spend_daily WHERE bucket_ms>=?2 AND {verified}{inference}"
     ))?;
-    let mut rows = statement.query([since])?;
-    let mut records = Vec::new();
-    while let Some(row) = rows.next()? {
-        let unsigned = |column| -> Result<Option<u64>> {
-            Ok(row
-                .get::<_, Option<i64>>(column)?
-                .map(u64::try_from)
-                .transpose()?)
-        };
-        let record = RequestRecord {
-            id: row.get(0)?,
-            ts: row.get(1)?,
-            endpoint: row.get(2)?,
-            model: row.get(3)?,
-            prompt_eval_count: unsigned(4)?,
-            eval_count: unsigned(5)?,
-            load_duration: unsigned(6)?,
-            prompt_eval_duration: unsigned(7)?,
-            eval_duration: unsigned(8)?,
-            total_duration: unsigned(9)?,
-            usage: row
-                .get::<_, Option<String>>(10)?
-                .map(|s| serde_json::from_str(&s))
-                .transpose()?,
-            latency_ms: row.get(11)?,
-            status: row.get(12)?,
-            stream: row.get(13)?,
-            error: row.get(14)?,
-            client_ip: row.get(15)?,
-            client_hostname: row.get(16)?,
-            user_key: row.get(17)?,
-            actor_kind: row.get(18)?,
-        };
-        if crate::INFERENCE_ENDPOINTS.contains(&record.endpoint.as_str()) {
-            records.push(record);
+    let mut rows = statement.query([window.hour, window.day])?;
+    while let Some(r) = rows.next()? {
+        let family = r.get_ref(0)?.as_str()?;
+        add(family, "priced", Some(r.get(1)?), r.get(3)?)?;
+        add(family, "estimated", Some(r.get(2)?), r.get(4)?)?;
+    }
+    drop(rows);
+    drop(statement);
+    // Raw edge with its frozen costs: one row per (request, family), or one
+    // row with NULL family for a request not yet classified.
+    let mut edge = Vec::<rollup::Raw>::new();
+    let mut statement = db.prepare(&rollup::edge_sql(
+        &format!(
+            "{},c.family,c.cost_status,c.cost_nano_usd",
+            rollup::raw_columns("r")
+        ),
+        "LEFT JOIN request_costs c ON c.request_id=r.id",
+        &format!(" AND r.endpoint IN ({})", crate::rollups::inference_list()),
+    ))?;
+    let mut rows = statement.query([since, window.hour])?;
+    while let Some(r) = rows.next()? {
+        let raw = rollup::raw(r)?;
+        if edge.last().is_none_or(|last| last.id != raw.id) {
+            edge.push(raw);
+        }
+        if let Some(family) = r.get_ref(rollup::RAW_WIDTH)?.as_str_or_null()? {
+            add(
+                family,
+                r.get_ref(rollup::RAW_WIDTH + 1)?.as_str()?,
+                r.get(rollup::RAW_WIDTH + 2)?,
+                1,
+            )?;
         }
     }
     drop(rows);
-    // Frozen costs exist only for inference requests. One primary-key range walk
-    // over the window's id span is far cheaper than a probe per request and family;
-    // rows whose request lies outside the time window are filtered here.
-    let families = crate::costs::families()?;
-    let mut ids: Vec<i64> = records.iter().map(|r| r.id).collect();
-    ids.sort_unstable();
-    let mut spend = vec![FrozenSpend::default(); families.len()];
-    if let (Some(&first), Some(&last)) = (ids.first(), ids.last()) {
-        let mut statement = db.prepare(
-            "SELECT request_id,family,cost_status,cost_nano_usd FROM request_costs WHERE request_id>=?1 AND request_id<=?2 ORDER BY request_id",
-        )?;
-        let mut rows = statement.query([first, last])?;
-        while let Some(row) = rows.next()? {
-            if ids.binary_search(&row.get(0)?).is_err() {
-                continue;
-            }
-            let family = row.get_ref(1)?.as_str()?;
-            let Some(total) = families
-                .iter()
-                .position(|f| f == family)
-                .map(|i| &mut spend[i])
-            else {
-                continue;
-            };
-            let cost = row.get::<_, Option<i64>>(3)?.map(NanoUsd);
-            match (row.get_ref(2)?.as_str()?, cost) {
-                ("priced", Some(cost)) => {
-                    total.priced = total.priced.checked_add(cost)?;
-                    total.priced_requests += 1;
-                }
-                ("estimated", Some(cost)) => {
-                    total.estimated = total.estimated.checked_add(cost)?;
-                    total.estimated_requests += 1;
-                }
-                _ => {}
-            }
-        }
-    }
+    drop(statement);
+    let latencies = if approximate {
+        rollup::Latencies::Approximate(
+            db.prepare(&rollup::histogram_sql(&format!(
+                " AND dimension_key->>0 IN ({})",
+                crate::rollups::inference_list()
+            )))?
+            .query_map([window.hour, window.day], |r| {
+                Ok((r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as u64))
+            })?
+            .collect::<rusqlite::Result<_>>()?,
+        )
+    } else {
+        rollup::Latencies::Exact(
+            db.prepare(&format!(
+                "SELECT model,total_duration_ns,latency_ms FROM requests INDEXED BY requests_ts_latency
+                 WHERE ts_ms>=?1{inference}"
+            ))?
+            .query_map([since], |r| {
+                Ok((r.get(0)?, rollup::latency_ms(r.get(1)?, r.get(2)?)))
+            })?
+            .collect::<rusqlite::Result<_>>()?,
+        )
+    };
+    let models = rollup::summarize(rollups, &edge, latencies, crate::rollups::TPS)?;
     warnings.extend(
         db.prepare("SELECT message FROM warnings WHERE resolved_at_ms IS NULL UNION ALL SELECT 'meter: rebuilding request history; usage is incomplete' FROM sync_state WHERE id=1 AND rebuilding=1 UNION ALL SELECT 'costs: frozen request costs are backfilling; spend is incomplete' WHERE EXISTS(SELECT 1 FROM cost_backfill WHERE completed_at_ms IS NULL OR after_id<target_id)")?
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?,
     );
     warnings.sort();
-    Ok((records, warnings, families.into_iter().zip(spend).collect()))
+    Ok(UsageRows {
+        models: models
+            .into_iter()
+            .filter(|(_, m)| m.agg.requests > 0)
+            .collect(),
+        spend: families.into_iter().zip(spend).collect(),
+        warnings,
+        approximate,
+    })
 }
 
-pub fn usage(
+/// Selected reference model per family at `at_ms`, in configuration order:
+/// one statement for every family, with pricing's own tie order.
+pub fn selected_models(
     store: &pricing::Store,
-    range: String,
-    records: Vec<RequestRecord>,
-    warnings: Vec<String>,
-    spend: BTreeMap<String, FrozenSpend>,
-) -> Result<Usage> {
-    let totals = Totals {
-        requests: records.len(),
-        prompt_tokens: records.iter().filter_map(|r| r.prompt_eval_count).sum(),
-        output_tokens: records.iter().filter_map(|r| r.eval_count).sum(),
-    };
-    let references = pricing::parse_references(pricing::DEFAULT_CONFIG)?;
-    let spend_avoided = store
-        .show(&references, crate::now_ms())?
+    families: &[String],
+    at_ms: i64,
+) -> Result<Vec<(String, Option<String>)>> {
+    if families.is_empty() {
+        return Ok(vec![]);
+    }
+    let sql = (1..=families.len())
+        .map(|i| {
+            format!(
+                "SELECT {i},(SELECT model_id FROM reference_selection WHERE family=?{i} AND confirmed=1 AND effective_from_ms<=?{at}
+                   ORDER BY effective_from_ms DESC,id DESC LIMIT 1)",
+                at = families.len() + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let mut values: Vec<rusqlite::types::Value> =
+        families.iter().map(|f| f.clone().into()).collect();
+    values.push(at_ms.into());
+    let mut selected: Vec<(usize, Option<String>)> = store
+        .connection()
+        .prepare(&sql)?
+        .query_map(rusqlite::params_from_iter(values), |r| {
+            Ok((r.get::<_, i64>(0)? as usize, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    selected.sort_by_key(|(i, _)| *i);
+    Ok(selected
         .into_iter()
-        .map(|s| {
-            let frozen = spend.get(&s.family).copied().unwrap_or_default();
+        .map(|(i, model)| (families[i - 1].clone(), model))
+        .collect())
+}
+
+pub fn usage(store: &pricing::Store, range: String, rows: UsageRows) -> Result<Usage> {
+    let requests = rows.models.values().map(|m| m.agg.requests).sum::<i64>();
+    let totals = Totals {
+        requests: usize::try_from(requests)?,
+        prompt_tokens: u64::try_from(
+            rows.models
+                .values()
+                .map(|m| m.agg.input_tokens)
+                .sum::<i64>(),
+        )?,
+        output_tokens: u64::try_from(
+            rows.models
+                .values()
+                .map(|m| m.agg.output_tokens)
+                .sum::<i64>(),
+        )?,
+    };
+    let families: Vec<String> = pricing::parse_references(pricing::DEFAULT_CONFIG)?
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    let spend_avoided = selected_models(store, &families, crate::now_ms())?
+        .into_iter()
+        .map(|(family, model_id)| {
+            let frozen = rows.spend.get(&family).copied().unwrap_or_default();
             Ok(SpendAvoided {
-                model_id: s.selected.map(|s| s.model_id),
+                model_id,
                 usd: frozen.priced.display_usd(),
                 estimated_usd: frozen.estimated.display_usd(),
                 // Unpriced, or not yet classified while costs backfill (warned).
-                unpriced_requests: records
-                    .len()
+                unpriced_requests: totals
+                    .requests
                     .checked_sub(frozen.priced_requests + frozen.estimated_requests)
                     .context("cost rows exceed inference requests")?,
-                family: s.family,
+                family,
             })
         })
         .collect::<Result<_>>()?;
-    let mut groups = BTreeMap::<Option<&str>, Vec<&RequestRecord>>::new();
-    for record in &records {
-        groups
-            .entry(record.model.as_deref())
-            .or_default()
-            .push(record);
-    }
-    let models = groups
+    let models = rows
+        .models
         .into_iter()
-        .map(|(model, rows)| {
-            let average = |prompt: bool| {
-                let (sum, count) = rows
-                    .iter()
-                    .filter_map(|r| {
-                        if prompt {
-                            tps(r.prompt_eval_count, r.prompt_eval_duration)
-                        } else {
-                            tps(r.eval_count, r.eval_duration)
-                        }
-                    })
-                    .fold((0.0, 0usize), |(sum, count), rate| (sum + rate, count + 1));
-                (count > 0).then(|| sum / count as f64)
-            };
-            let mut latencies: Vec<_> = rows
-                .iter()
-                .map(|r| r.total_duration.map(ns_to_ms).unwrap_or(r.latency_ms))
-                .collect();
-            latencies.sort_by(f64::total_cmp);
-            let percentile = |p: f64| {
-                latencies
-                    .get((latencies.len() as f64 * p).ceil() as usize - 1)
-                    .copied()
-            };
-            ModelUsage {
-                model: model.map(str::to_owned),
-                requests: rows.len(),
-                prompt_tokens: rows.iter().filter_map(|r| r.prompt_eval_count).sum(),
-                output_tokens: rows.iter().filter_map(|r| r.eval_count).sum(),
-                avg_prompt_tps: average(true),
-                avg_gen_tps: average(false),
-                p50_latency_ms: percentile(0.5),
-                p95_latency_ms: percentile(0.95),
-                total_load_ms: rows
-                    .iter()
-                    .filter_map(|r| r.load_duration)
-                    .map(ns_to_ms)
-                    .sum(),
-            }
+        .map(|(model, m)| {
+            Ok(ModelUsage {
+                model,
+                requests: usize::try_from(m.agg.requests)?,
+                prompt_tokens: u64::try_from(m.agg.input_tokens)?,
+                output_tokens: u64::try_from(m.agg.output_tokens)?,
+                avg_prompt_tps: m.agg.avg_prompt_tps(),
+                avg_gen_tps: m.agg.avg_generation_tps(),
+                p50_latency_ms: m.p50_ms,
+                p95_latency_ms: m.p95_ms,
+                total_load_ms: m.agg.load_ns as f64 / 1_000_000.0,
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
     Ok(Usage {
         range,
         generated_at_ms: crate::now_ms(),
         totals,
         spend_avoided,
         models,
-        warnings,
+        warnings: rows.warnings,
+        percentiles_approximate: rows.approximate,
     })
 }
 
@@ -693,10 +754,11 @@ mod tests {
             })?;
             after = count;
             let scope = Scope::recording();
-            let (records, warnings, spend) =
-                db.run(&scope, Category::Data, |db| usage_records(db, 0, vec![]))?;
+            let rows = db.run(&scope, Category::Data, |db| {
+                usage_records(db, 0, false, vec![])
+            })?;
             let result = reader.run(&scope, Category::Data, |store| {
-                usage(store, "30d".into(), records, warnings, spend)
+                usage(store, "30d".into(), rows)
             })?;
             assert_eq!(result.totals.requests, count as usize);
             assert_eq!(
@@ -714,8 +776,16 @@ mod tests {
             })?;
             queries.extend(scope.statements());
         }
-        // Requests with frozen costs and warnings, plus pricing show (no history reads).
-        const ONE_SELECTED_FAMILY_USAGE: usize = 8;
+        // Long ranges swap the exact latency read for merged histograms.
+        let scope = Scope::recording();
+        let rows = db.run(&scope, Category::Data, |db| {
+            usage_records(db, 0, true, vec![])
+        })?;
+        assert!(rows.approximate);
+        assert_eq!(scope.counts().data, ONE_SELECTED_FAMILY_USAGE - 1);
+        queries.extend(scope.statements());
+        // Rollups, spend, raw edge, latencies and warnings, plus one selected-model read.
+        const ONE_SELECTED_FAMILY_USAGE: usize = 6;
         assert_eq!(counts, [ONE_SELECTED_FAMILY_USAGE; 2]);
         // The model switch is effective at 50, never at its earlier observation.
         let history = reader.run(&Scope::default(), Category::Data, |store| {
@@ -756,8 +826,17 @@ mod tests {
         let check = |connection: &Connection, sql: &str| -> Result<()> {
             let mut parameters = Vec::<rusqlite::types::Value>::new();
             let count = connection.prepare(sql)?.parameter_count();
-            let requests = sql.contains("FROM requests");
-            if count > 0 {
+            let requests = ["FROM requests", "FROM request_", "FROM spend_"]
+                .iter()
+                .any(|t| sql.contains(t));
+            if requests {
+                // Window bounds: since, then hour/day boundaries.
+                parameters.extend((0..count).map(|_| 0.into()));
+            } else if sql.starts_with("SELECT 1,(SELECT model_id") {
+                // Selected models: every family, then the instant.
+                parameters.extend((1..count).map(|_| "Claude Sonnet".to_owned().into()));
+                parameters.push(60.into());
+            } else if count > 0 {
                 parameters.push(if requests {
                     0.into()
                 } else if sql.contains("WHERE model_id=?1") {
@@ -766,18 +845,39 @@ mod tests {
                     "Claude Sonnet".to_owned().into()
                 });
             }
-            if count > 1 {
+            if count > 1 && !requests && !sql.starts_with("SELECT 1,(SELECT model_id") {
                 parameters.push(60.into());
             }
             let plan =
                 explain::query_plan(connection, sql, rusqlite::params_from_iter(parameters))?;
             let mut required = Vec::new();
             let mut exceptions = Vec::new();
-            if sql.contains("FROM request_costs WHERE request_id>=?1") {
-                // Frozen costs for the window: one primary-key range walk.
+            if sql.contains("FROM request_hourly") {
+                for table in ["request_hourly", "request_daily"] {
+                    required.push(RequiredSearch { table, index: None });
+                }
+            } else if sql.contains("FROM request_latency_hourly") {
+                for table in ["request_latency_hourly", "request_latency_daily"] {
+                    required.push(RequiredSearch { table, index: None });
+                }
+            } else if sql.contains("FROM spend_hourly") {
+                for table in ["spend_hourly", "spend_daily"] {
+                    required.push(RequiredSearch { table, index: None });
+                }
+            } else if sql.contains("FROM requests r LEFT JOIN request_costs c") {
+                // Raw edge: the partial first hour by time, then unrolled ids.
                 required.push(RequiredSearch {
-                    table: "request_costs",
+                    table: "r",
+                    index: Some("requests_ts"),
+                });
+                required.push(RequiredSearch {
+                    table: "c",
                     index: None,
+                });
+            } else if sql.contains("INDEXED BY requests_ts_latency") {
+                required.push(RequiredSearch {
+                    table: "requests",
+                    index: Some("requests_ts_latency"),
                 });
             } else if requests {
                 required.push(RequiredSearch {
@@ -810,6 +910,13 @@ mod tests {
                     index: Some("items_refresh"),
                 });
             } else {
+                if sql.starts_with("SELECT 1,(SELECT model_id") {
+                    exceptions.push(Exception {
+                        kind: ExceptionKind::SmallWholeSetRead,
+                        table: "CONSTANT",
+                        reason: "one constant row per configured reference family",
+                    });
+                }
                 required.push(RequiredSearch {
                     table: "reference_selection",
                     index: Some(if sql.contains("confirmed=0") {
@@ -823,9 +930,14 @@ mod tests {
                 .with_context(|| format!("{sql}\n{plan:?}"))
         };
         for sql in queries {
-            if ["FROM requests", "FROM request_costs", "FROM warnings"]
-                .iter()
-                .any(|t| sql.contains(t))
+            if [
+                "FROM requests",
+                "FROM request_",
+                "FROM spend_",
+                "FROM warnings",
+            ]
+            .iter()
+            .any(|t| sql.contains(t))
             {
                 db.run(&Scope::default(), Category::Setup, |db| check(db, &sql))?;
             } else {

@@ -9,16 +9,65 @@ use shared::{GpuSample, RequestRecord};
 use std::{collections::BTreeMap, path::Path, time::Instant};
 
 const SQL: &str = include_str!("v1.sql");
+const SQL_V2: &str = include_str!("v2.sql");
+pub const VERSION: i64 = 2;
+
+fn manifest() -> [migrations::Migration<'static>; 2] {
+    [
+        migrations::Migration {
+            version: 1,
+            sql: SQL,
+            checksum: 0x963424d2b374d530,
+        },
+        migrations::Migration {
+            version: 2,
+            sql: SQL_V2,
+            checksum: 0xdefc08deaf53df27,
+        },
+    ]
+}
 // DDL-only capture, 2026-10-11; SHA256 e75e3e70fffa58d15832577345618cdde44e0630bab27af05eed4dbcfd8bf959.
 const LEGACY: &str = include_str!("../tests/fixtures/legacy.sql");
 
-pub fn require_v1(db: &Connection) -> Result<()> {
+pub fn require_current(db: &Connection) -> Result<()> {
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     ensure!(
-        version == 1,
-        "meter requires user_version=1, found {version}; run meter migrate offline"
+        version == VERSION,
+        "meter requires user_version={VERSION}, found {version}; stop meter, take a verified backup, then run meter migrate --db <path> offline"
     );
     Ok(())
+}
+
+/// Read-only preflight of an existing typed database: v1 (to upgrade) or v2,
+/// with exactly the schema this binary's migrations produce.
+pub fn check_current(db: &Connection) -> Result<i64> {
+    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    ensure!(
+        version == 1 || version == VERSION,
+        "typed meter user_version must be 1 or {VERSION}, found {version}"
+    );
+    let mut expected = Connection::open_in_memory()?;
+    let manifest = manifest();
+    migrations::run(
+        &mut expected,
+        &manifest[..version as usize],
+        None,
+        |_, _| Ok(()),
+        |_, _| Ok(()),
+    )?;
+    // Daily PRAGMA optimize may already have created sqlite_stat1.
+    if db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='sqlite_stat1')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        expected.execute_batch("ANALYZE")?;
+    }
+    ensure!(
+        migrations::schema_fingerprint(db)? == migrations::schema_fingerprint(&expected)?,
+        "meter v{version} schema fingerprint mismatch"
+    );
+    Ok(version)
 }
 
 pub fn check_legacy(db: &Connection) -> Result<()> {
@@ -140,6 +189,137 @@ pub struct Report {
     pub verified_rows: u64,
     pub elapsed_ms: u128,
     pub dry_run: bool,
+}
+
+/// Backfill result: every rollup table's row count and the aggregate-versus-raw
+/// comparison that published the verified state.
+#[derive(Serialize)]
+pub struct RollupReport {
+    pub batches: usize,
+    pub rows: usize,
+    pub elapsed_ms: u128,
+    pub requests_last_id: i64,
+    pub gpu_last_id: i64,
+    pub tables: BTreeMap<String, i64>,
+    pub raw_requests: i64,
+    pub dimension_keys: usize,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub input_known: i64,
+    pub output_known: i64,
+    pub gpu_samples: usize,
+}
+
+const TABLES: [&str; 9] = [
+    "requests",
+    "gpu_samples",
+    "drop_episodes",
+    "request_hourly",
+    "request_daily",
+    "request_latency_hourly",
+    "request_latency_daily",
+    "gpu_hourly",
+    "rollup_state",
+];
+
+fn counts(db: &Connection, tables: &[&str]) -> Result<BTreeMap<String, i64>> {
+    tables
+        .iter()
+        .map(|t| {
+            Ok((
+                (*t).into(),
+                db.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))?,
+            ))
+        })
+        .collect()
+}
+
+/// Resumable batched backfill to completion, then a repeat comparison for the
+/// report. Each batch commits its aggregates and checkpoint together.
+pub fn backfill(db: &mut Connection) -> Result<RollupReport> {
+    let started = Instant::now();
+    let (mut batches, mut rows) = (0, 0);
+    loop {
+        let progress = crate::rollup::run(db, crate::now_ms(), crate::rollup::BATCHES_PER_RUN)?;
+        batches += progress.batches;
+        rows += progress.rows;
+        if progress.caught_up && progress.verified {
+            break;
+        }
+    }
+    let state = |job| -> Result<i64> {
+        Ok(factory_db::rollup::state(db, job)?
+            .context("rollup state missing")?
+            .last_id)
+    };
+    let (requests_last_id, gpu_last_id) = (state("requests")?, state("gpu")?);
+    let tx = db.transaction()?;
+    let verified = factory_db::rollup::verify(&tx, requests_last_id, crate::rollup::TPS)?;
+    let gpu_samples = crate::rollup::verify_gpu(&tx, gpu_last_id)?;
+    let tables = counts(&tx, &TABLES)?;
+    drop(tx);
+    Ok(RollupReport {
+        batches,
+        rows,
+        elapsed_ms: started.elapsed().as_millis(),
+        requests_last_id,
+        gpu_last_id,
+        tables,
+        raw_requests: verified.raw_requests,
+        dimension_keys: verified.dimension_keys,
+        input_tokens: verified.input_tokens,
+        output_tokens: verified.output_tokens,
+        input_known: verified.input_known,
+        output_known: verified.output_known,
+        gpu_samples,
+    })
+}
+
+#[derive(Serialize)]
+pub struct UpgradeReport {
+    pub from: u32,
+    pub to: u32,
+    pub before: BTreeMap<String, i64>,
+    pub after: BTreeMap<String, i64>,
+    pub rollups: RollupReport,
+}
+
+/// In-place v1 -> v2 upgrade of a stopped, checkpointed, backed-up database.
+/// Adds tables only; the file is never replaced and no existing row changes.
+/// A rerun on v2 resumes the backfill without schema changes.
+pub fn upgrade(path: &Path) -> Result<UpgradeReport> {
+    let meta = std::fs::symlink_metadata(path)?;
+    ensure!(
+        meta.is_file() && meta.len() > 0,
+        "--db must be an existing meter database"
+    );
+    check_current(&readonly(path)?)?;
+    let mut db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    factory_db::settings::apply(&db, false, 65_536)?;
+    let before = counts(&db, &TABLES[..3])?;
+    let report = migrations::run(
+        &mut db,
+        &manifest(),
+        None,
+        |_, _| Ok(()),
+        |tx, _| {
+            ensure!(
+                counts(tx, &TABLES[..3])? == before,
+                "migration changed telemetry row counts"
+            );
+            Ok(())
+        },
+    )?;
+    let rollups = backfill(&mut db)?;
+    let after = counts(&db, &TABLES[..3])?;
+    ensure!(after == before, "backfill changed telemetry row counts");
+    Ok(UpgradeReport {
+        from: report.from,
+        to: report.to,
+        before,
+        after,
+        rollups,
+    })
 }
 
 fn strict<T: serde::de::DeserializeOwned + Serialize>(text: &str, allowed: &[&str]) -> Result<T> {
@@ -328,7 +508,7 @@ pub fn migrate(legacy: Option<&Path>, destination: Option<&Path>, dry_run: bool)
     db.run(&scope, Category::Setup, |db| {
         factory_db::settings::apply(db, false, 65_536)
     })?;
-    db.run(&scope, Category::Setup, |db| migrations::run(db, &[migrations::Migration { version: 1, sql: SQL, checksum: 0x963424d2b374d530 }], None,
+    db.run(&scope, Category::Setup, |db| migrations::run(db, &manifest(), None,
         |_, _| Ok(()), |db, _| {
             if let Some(source) = &source { copy(source, db, &mut report)?; }
             for (table, stats) in [("requests", &mut report.requests), ("gpu_samples", &mut report.gpu_samples)] {
@@ -341,6 +521,8 @@ pub fn migrate(legacy: Option<&Path>, destination: Option<&Path>, dry_run: bool)
             }
             Ok(())
         }))?;
+    // Rollups for a converted or new file are built by the runtime's startup
+    // catch-up; only the in-place upgrade backfills offline.
     drop(db); // Close/checkpoint WAL before publishing the single new file.
     temporary.as_file().sync_all()?;
     if !dry_run {

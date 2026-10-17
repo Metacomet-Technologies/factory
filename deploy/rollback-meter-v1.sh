@@ -28,7 +28,10 @@ done
 mode=$(cat "$snapshot/mode")
 enabled=$(cat "$snapshot/enabled")
 active=$(cat "$snapshot/active")
-case "$mode" in legacy|fresh|v1) ;; *) fail "Invalid DB mode: $mode" ;; esac
+# v1: the stopped v1 generation is restored (MET-205 upgrades it in place to
+# v2). v2: an install over v2 changed no schema, so the DB is kept.
+case "$mode" in legacy|fresh|v1|v2) ;; *) fail "Invalid DB mode: $mode" ;; esac
+if [[ "$mode" == v2 && -f "$snapshot/db-changing" ]]; then fail 'A v2 snapshot never changes the DB.'; fi
 case "$enabled" in enabled|disabled|static|indirect|not-found) ;; *) fail "Invalid enable state: $enabled" ;; esac
 case "$active" in active|inactive|failed|unknown) ;; *) fail "Invalid active state: $active" ;; esac
 [[ ! -d /etc/systemd/system/meter.service.d ]] || fail 'Review meter unit drop-ins first.'

@@ -399,20 +399,32 @@ pub fn backfill_page(db: &mut Connection, histories: &[History], now_ms: i64) ->
     }
     let low = active.iter().map(|(_, s)| s.after_id).min().unwrap_or(0);
     let high = active.iter().map(|(_, s)| s.target_id).max().unwrap_or(0);
+    // Each row carries the rollup checkpoint, so the page stays one statement.
+    let mut rolled = 0;
     let rows = tx
         .prepare(
-            "SELECT id,ts_ms,endpoint,prompt_eval_count,eval_count FROM requests
-             WHERE id>?1 AND id<=?2 ORDER BY id LIMIT ?3",
+            "SELECT id,ts_ms,endpoint,prompt_eval_count,eval_count,
+               COALESCE((SELECT last_id FROM rollup_state WHERE job='requests'),0)
+             FROM requests WHERE id>?1 AND id<=?2 ORDER BY id LIMIT ?3",
         )?
         .query_map(params![low, high, PAGE as i64], |r| {
             Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, Option<i64>>(4)?,
+                (
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                ),
+                r.get::<_, i64>(5)?,
             ))
         })?
+        .map(|row| {
+            row.map(|(row, last)| {
+                rolled = last;
+                row
+            })
+        })
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut end = if rows.len() < PAGE {
         high
@@ -452,7 +464,18 @@ pub fn backfill_page(db: &mut Connection, histories: &[History], now_ms: i64) ->
         }
         costs.extend(classified);
     }
+    // Requests already in the rollups: their spend buckets change in this same
+    // transaction (unpriced -> estimated fill-ins, or a newly added family).
+    let before = if rolled > low && !costs.is_empty() {
+        crate::rollups::existing(&tx, low, end.min(rolled))?
+    } else {
+        Default::default()
+    };
     store(&tx, &costs, now_ms)?;
+    if rolled > low && !costs.is_empty() {
+        let days: BTreeMap<i64, i64> = rows.iter().map(|r| (r.0, r.1)).collect();
+        crate::rollups::Rewrite::new(&costs, &before, rolled, &days).apply(&tx)?;
+    }
     for (_, state) in &active {
         tx.execute(
             "UPDATE cost_backfill SET after_id=MAX(after_id,MIN(target_id,?2)) WHERE family=?1",

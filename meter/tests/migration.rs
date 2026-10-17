@@ -193,7 +193,7 @@ fn cli_initialization_empty_conversion_dry_run_rerun_and_version_refusal() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     let strict: Vec<(String,i64)> = db.prepare("SELECT name,strict FROM pragma_table_list WHERE name IN ('requests','gpu_samples','drop_episodes') ORDER BY name").unwrap()
         .query_map([], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
@@ -206,19 +206,26 @@ fn cli_initialization_empty_conversion_dry_run_rerun_and_version_refusal() {
         ]
     );
     drop(db);
-    let before = std::fs::read(&target).unwrap();
+    // Rerunning on an existing v2 file is the idempotent in-place upgrade:
+    // no schema change, and the (empty) rollup backfill is published.
+    let rerun = cli(&["migrate".as_ref(), "--db".as_ref(), target.as_os_str()]);
     assert!(
-        !cli(&["migrate".as_ref(), "--db".as_ref(), target.as_os_str()])
-            .status
-            .success()
+        rerun.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rerun.stderr)
     );
-    assert_eq!(std::fs::read(&target).unwrap(), before);
+    let rerun: serde_json::Value = serde_json::from_slice(&rerun.stdout).unwrap();
+    assert_eq!(
+        (rerun["from"].as_i64(), rerun["to"].as_i64()),
+        (Some(2), Some(2))
+    );
+    assert_eq!(rerun["rollups"]["tables"]["rollup_state"], 2);
     let source = dir.path().join("legacy.db");
     drop(legacy(&source));
     let empty = dir.path().join("empty.db");
     let report = migrate(Some(&source), Some(&empty), false).unwrap();
     assert_eq!(report.verified_rows, 0);
-    for version in [0, 2] {
+    for version in [0, 1, 3] {
         let db = Connection::open(&target).unwrap();
         db.pragma_update(None, "user_version", version).unwrap();
         drop(db);
@@ -231,7 +238,7 @@ fn cli_initialization_empty_conversion_dry_run_rerun_and_version_refusal() {
             "127.0.0.1:0".as_ref(),
         ]);
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("requires user_version=1"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("requires user_version=2"));
         assert_eq!(std::fs::read(&target).unwrap(), before);
     }
 }

@@ -82,6 +82,10 @@ pub struct ModelStats {
     pub avg_generation_tokens_per_second: Option<f64>,
     pub p50_total_latency_ms: f64,
     pub p95_total_latency_ms: f64,
+    /// True when percentiles come from merged fixed-bucket histograms (ranges
+    /// beyond 30 days); otherwise they are exact nearest-rank raw values.
+    #[serde(default)]
+    pub percentiles_approximate: bool,
 }
 
 #[derive(Default, Deserialize, ToSchema)]

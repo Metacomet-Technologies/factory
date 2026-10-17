@@ -33,7 +33,7 @@ sudo -u meter "$meter_binary" migrate --legacy "$legacy_db" --db "$temp/v1.db" >
 for suffix in '' -wal -shm; do cmp "$legacy_db$suffix" "$temp/snapshot/meter.db$suffix"; done
 [[ $(counts "$temp/v1.db") == $'0\n0' ]]
 for suffix in -wal -shm ''; do mv "$temp/v1.db$suffix" "$temp/swapped.db$suffix"; done
-[[ $(meter_sqlite "$temp/swapped.db" 'PRAGMA user_version;') == 1 ]]
+[[ $(meter_sqlite "$temp/swapped.db" 'PRAGMA user_version;') == 2 ]]
 [[ $(meter_sqlite "$temp/swapped.db" 'PRAGMA integrity_check;') == ok ]]
 for suffix in '' -wal -shm; do
     [[ $(stat -c %u:%g:%a "$temp/swapped.db$suffix") == "$(id -u):$(id -g):600" ]]
@@ -106,4 +106,26 @@ sudo -u meter "$meter_binary" migrate --legacy "$crashed" --db "$temp/recovered.
 [[ $(meter_sqlite "$temp/recovered.db" 'SELECT id,prompt_eval_count,eval_count,status FROM requests;') == '7|13|7|502' ]]
 # v1 reruns also checkpoint; never infer pending frames from WAL size alone.
 checkpoint_meter_db "$temp/recovered.db"
-printf 'Installer DB reads, sidecar modes, checkpoint recovery, immutable conversion, swap, and rollback comparison passed (UID %s).\n' "$EUID"
+# MET-205: a v1 file upgrades in place (same inode) with unchanged telemetry
+# counts, then reports verified rollup state; a rerun on v2 is a no-op.
+v1=$temp/v1-inplace.db
+sqlite3 "$v1" < "$repo/meter/src/v1.sql"
+sqlite3 "$v1" "PRAGMA user_version=1; PRAGMA journal_mode=WAL;
+INSERT INTO requests(ts_ms,endpoint,model,prompt_eval_count,eval_count,latency_ms,status,stream,client_ip,client_hostname)
+  VALUES(7200000,'/api/chat','m',3,NULL,1.5,200,0,'127.0.0.1','fixture'),(3600000,'/api/chat',NULL,0,7,2.5,200,1,'127.0.0.1','fixture');
+INSERT INTO gpu_samples(ts_ms,gpu_index,memory_used_mib,memory_total_mib,utilization_percent,temperature_c,power_w) VALUES(3600000,0,1,2,3,4,5);
+INSERT INTO drop_episodes(started_at_ms,ended_at_ms,dropped_requests,dropped_gpu_samples) VALUES(1,2,3,4);" >/dev/null
+sudo -u meter "$meter_binary" migrate --check-only --db "$v1" >/dev/null
+inode=$(stat -c %i "$v1")
+before=$(telemetry_counts "$v1")
+[[ $before == $'2\n1\n1' ]]
+sudo -u meter "$meter_binary" migrate --db "$v1" >/dev/null
+[[ $(stat -c %i "$v1") == "$inode" && $(telemetry_counts "$v1") == "$before" ]]
+[[ $(meter_sqlite "$v1" 'PRAGMA user_version;') == 2 ]]
+[[ $(rollup_state "$v1" | cut -d'|' -f1,2) == $'gpu|1\nrequests|2' ]]
+! rollup_state "$v1" | grep -q unverified
+[[ $(meter_sqlite "$v1" 'SELECT SUM(requests) FROM request_daily;') == 2 ]]
+sudo -u meter "$meter_binary" migrate --check-only --db "$v1" >/dev/null
+sudo -u meter "$meter_binary" migrate --db "$v1" >/dev/null
+[[ $(telemetry_counts "$v1") == "$before" ]]
+printf 'Installer DB reads, sidecar modes, checkpoint recovery, immutable conversion, swap, in-place v2 upgrade, and rollback comparison passed (UID %s).\n' "$EUID"

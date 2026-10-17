@@ -2769,6 +2769,10 @@
             },
             "type": "array"
           },
+          "percentiles_approximate": {
+            "description": "True when percentiles come from merged fixed-bucket latency histograms\n(ranges beyond 30 days); otherwise they are exact nearest-rank values.",
+            "type": "boolean"
+          },
           "range": {
             "type": "string"
           },
@@ -3100,7 +3104,7 @@
         "operationId": "usage",
         "parameters": [
           {
-            "description": "24h (default), 7d, 30d",
+            "description": "24h (default), 7d, 30d, 365d. Percentiles are exact nearest-rank values through 30d; 365d percentiles come from merged latency histograms and set percentiles_approximate.",
             "in": "query",
             "name": "range",
             "required": false,

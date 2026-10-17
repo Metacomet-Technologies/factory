@@ -1,5 +1,6 @@
 pub mod db;
 pub mod migrate;
+pub mod rollup;
 mod storage;
 mod telemetry;
 mod usage;
@@ -290,6 +291,8 @@ mod api {
         build: Health,
         #[serde(flatten)]
         queue: db::QueueStatus,
+        /// Rollup job health; status stays "ok" so inference health is unchanged.
+        maintenance: db::Maintenance,
     }
 
     fn since(range: Option<&str>) -> Result<i64, String> {
@@ -297,7 +300,8 @@ mod api {
             "24h" => 1,
             "7d" => 7,
             "30d" => 30,
-            _ => return Err("range must be 24h, 7d, or 30d".into()),
+            "365d" => 365,
+            _ => return Err("range must be 24h, 7d, 30d, or 365d".into()),
         };
         Ok(now_ms() - days * 86_400_000)
     }
@@ -354,7 +358,9 @@ mod api {
                 if path == "/meter/gpu/history" {
                     history_doc(state, since).await
                 } else {
-                    stats_doc(state, since, parameters.model).await
+                    // Exact raw percentiles through 30 days; longer ranges are flagged.
+                    let exact = parameters.range.as_deref() != Some("365d");
+                    stats_doc(state, since, parameters.model, exact).await
                 }
             }
             "/meter/gpu" => gpu(state).await,
@@ -372,6 +378,7 @@ mod api {
         serde_json::to_value(MeterHealth {
             build: shared::build_info(env!("FACTORY_INPUTS_FINGERPRINT")),
             queue: state.db.queue_status(),
+            maintenance: state.db.maintenance(),
         })
         .map_err(|e| e.to_string())
     }
@@ -405,15 +412,16 @@ mod api {
         serde_json::to_value(GpuResponse { gpus, ollama_ps }).map_err(|e| e.to_string())
     }
 
-    #[utoipa::path(get, path = "/meter/stats", params(("range" = Option<String>, Query, description = "24h (default), 7d, 30d"), ("model" = Option<String>, Query)), responses((status = 200, body = [ModelStats]), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
+    #[utoipa::path(get, path = "/meter/stats", params(("range" = Option<String>, Query, description = "24h (default), 7d, 30d, 365d. Percentiles are exact through 30d and approximate (flagged) beyond."), ("model" = Option<String>, Query)), responses((status = 200, body = [ModelStats]), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
     async fn stats_doc(
         state: &AppState,
         since: i64,
         model: Option<String>,
+        exact: bool,
     ) -> Result<serde_json::Value, String> {
         let stats = state
             .db
-            .stats(since, model)
+            .stats(since, model, exact)
             .await
             .map_err(|e| e.to_string())?;
         serde_json::to_value(stats).map_err(|e| e.to_string())
@@ -443,7 +451,7 @@ mod api {
         }
         Ok(response)
     }
-    #[utoipa::path(get, path = "/meter/gpu/history", params(("range" = Option<String>, Query, description = "24h (default), 7d, 30d; retained for 7 days")), responses((status = 200, body = [shared::GpuSample]), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
+    #[utoipa::path(get, path = "/meter/gpu/history", params(("range" = Option<String>, Query, description = "24h (default), 7d, 30d, 365d. Raw samples are retained 7 days; longer ranges return hourly means (with samples) before that.")), responses((status = 200, body = [rollup::GpuPoint]), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
     async fn history_doc(state: &AppState, since: i64) -> Result<serde_json::Value, String> {
         let samples = state.db.history(since).await.map_err(|e| e.to_string())?;
         serde_json::to_value(samples).map_err(|e| e.to_string())
@@ -463,6 +471,8 @@ mod api {
             Health,
             MeterHealth,
             db::QueueStatus,
+            db::Maintenance,
+            rollup::GpuPoint,
             ModelStats,
             ApiError,
             MeterQuery,
