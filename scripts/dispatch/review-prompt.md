@@ -28,8 +28,8 @@ Read {{identifier}}: Isolation, Build and Done means. Checklist (PLAYBOOK.md §5
   checks are not success. Subscriptions may not roll over and never authorize
   merge. After rebases, confirm pushes landed.
 - Use get_diff/update_diff to check/correct the issue's contributes/closes choice
-  (default contributes). Closes auto-closes on merge; partial/research/unverified
-  installs contribute. Report early closure for human reopening; never change status.
+  (default contributes). Link type is informational; merge does not change issue
+  state. Partial/research/unverified installs contribute. Never change status.
 
 Post one Linear verdict on {{identifier}} with findings and this sole authorized
 standalone unfenced marker; replace T-REVIEW with your own actual Amp thread ID:
