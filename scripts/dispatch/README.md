@@ -231,18 +231,19 @@ Lifecycle and markers:
 2. `POST /v1/agents` with `name` (`MET-n — title`, at most 100 characters),
    `prompt.text` (the shared builder prompt with the cloud Startup block),
    `repos: [{ url: https://github.com/Metacomet-Technologies/factory, startingRef: main }]`
-   and `autoCreatePR: false`. No `model` (Cursor's default applies), no
-   `envVars`, no `mcpServers`: Linear comes from the dashboard MCP (OAuth).
+   `autoCreatePR: true` and `skipReviewerRequest: true`. No `model` (Cursor's
+   default applies), no `envVars`, no `mcpServers`: Linear comes from the
+   dashboard MCP (OAuth). `openAsCursorGithubApp` keeps its user-key default, so
+   PRs open as Devon.
 3. Post `https://cursor.com/agents/<id>` with
    `<!-- factory-dispatch:thread <bc-id> runner:cursor -->`, then move to In Progress.
 
-`autoCreatePR` is off because Cursor opens that PR only when the run completes,
-with a title and body it chooses (PR 92 had neither the identifier nor the link
-line). That would leave no PR for the builder's evidence comment and nothing
-Linear links to the issue. The prompt instead tells the agent to push its own
-`cursor/…` branch and open the PR itself, titled `MET-n — …` with
-`Contributes MET-n` (or `Closes`, from Link type). Whether a cloud agent can open
-PRs without `autoCreatePR` is **unverified until the MET-180 live check**.
+Cursor opens the PR when a run ends (MET-216; MET-207's agent-opened PR only got
+"registered for approval"). The prompt tells the agent to push its branch, open
+no PR, post no evidence comment, title its work `MET-n — <issue title>` and end
+its reply with tests, deviations and unverified items. The dispatcher then
+normalizes that PR (below). Cursor's own title and body, and whether follow-up
+runs push to the same branch, are **unverified until the MET-216 live check**.
 
 Every thread-marker consumer accepts `bc-<uuid>` (Cursor's documented format)
 only with `runner:cursor`: capacity, QA builder lookup, wrap-up, labeling (skipped:
@@ -261,23 +262,67 @@ The key travels only as the Basic username (`key:`); it is never logged,
 commented or echoed, and dry-run prints `Basic [redacted]`.
 
 Status: v1 agents are only `ACTIVE`/`ARCHIVED`; execution status lives on runs.
-Each pass, an active cursor builder (not Done/Canceled, no wrap-up, no open or
-merged PR newer than the claim) gets `GET /v1/agents/<id>` and, when it has one,
-`GET /v1/agents/<id>/runs/<latestRunId>`. Run `ERROR`, `CANCELLED` or `EXPIRED`,
-or an `ARCHIVED` agent (archived or expired), posts one Devon mention with the
-status and agent URL plus `<!-- factory-dispatch:cursor-failed <bc-id> -->`; the
-dispatcher then stops acting on that agent: no further status polls, QA reviews
-or `/runs` follow-ups (logged `qa-skipped`), even after a late PR or verdict. The
+Each pass, an active cursor builder (not Done/Canceled, no wrap-up, no merged PR
+newer than the claim) gets `GET /v1/agents/<id>` and, when it has one,
+`GET /v1/agents/<id>/runs/<latestRunId>`. Before a PR links, run `ERROR`,
+`CANCELLED` or `EXPIRED`, or an `ARCHIVED` agent (archived or expired), posts one
+Devon mention with the status and agent URL plus
+`<!-- factory-dispatch:cursor-failed <bc-id> -->`; the dispatcher then stops
+acting on that agent: no further status polls, normalization, QA reviews or
+`/runs` follow-ups (logged `qa-skipped`), even after a late PR or verdict. The
 claim keeps its slot until wrap-up; recovery is manual. Read failures log
-`cursor-status-pending`.
-No other status-driven action exists. Dry-run previews these reads without calling.
+`cursor-status-pending`. Dry-run previews these reads without calling.
+
+PR normalization: when the latest run is `FINISHED`, the dispatcher normalizes
+the issue's original PR (below). Each step reads the PR with `gh pr view` and acts only when
+needed, logging one `cursor-pr` decision per action:
+
+1. Title not starting `MET-n — ` → `gh pr edit --title "MET-n — <issue title>"`.
+2. Body without a `Closes MET-n` / `Contributes MET-n` line (per Link type) →
+   prepend it, keeping the rest (`gh pr edit --body-file -`).
+3. Draft → `gh pr ready`.
+4. No `<!-- factory-dispatch:cursor-evidence pr:<n> sha:<head> -->` yet → post the
+   AGENTS.md evidence comment: PR URL, head SHA and the full file list from
+   `gh api …/pulls/<n>/files` (deletions and rename sources called out). A head
+   that moves during the read waits for the next poll. A new head after a
+   follow-up run gets a new comment; QA accepts it as round-two evidence.
+
+A closed PR or one not based on `main` is skipped (`cursor-pr-skipped`). A
+failed step logs `cursor-pr-failed` and posts one Devon mention naming the step
+(`<!-- factory-dispatch:cursor-pr-failed pr:<n> step:<step> -->`); later steps
+wait and every poll retries. A run that reports another PR in the repo posts one
+Devon mention (`cursor-pr-other pr:<n>`) and is never acted on; PR URLs in other
+repos only log `cursor-pr-foreign`.
 
 QA: unchanged reviewer selection treats cursor like amp (Claude reviews at high
-effort on gpu/console). Delivered changes go to `POST /v1/agents/<id>/runs` with the
-same follow-up text instead of `amp threads continue`. Round counting, the
-two-round stop and its Devon mention are unchanged; the merge continuation still
-goes to the local reviewer. A failed send (for example `409 agent_busy` while a run
-is active) keeps the follow-up claim and is not retried, as for Amp.
+effort on gpu/console). Delivered changes go to `POST /v1/agents/<id>/runs`
+instead of `amp threads continue`; the text tells the agent to push its branch,
+open no PR and leave the Linear evidence comment to the dispatcher. Round
+counting, the two-round stop and its Devon mention are unchanged; the merge
+continuation still goes to the local reviewer.
+
+- While the latest run is not terminal (`CREATING`, `RUNNING`, …) or its status
+  is unreadable, the follow-up stays pending (`qa-pending`) with no claim.
+- A documented `409 agent_busy` proves no run started: it posts
+  `<!-- factory-qa:followup-busy <key> -->` and a later poll, once the run is
+  terminal, claims and sends again. Each `followup-claim` is one send; a send is
+  allowed only while busy markers equal claims, so delivery happens once.
+- Any other failure or unknown outcome keeps the claim and is never retried, as
+  for Amp.
+- A changes verdict whose follow-up only asks for evidence for its own PR and
+  head is moot. Recognition is conservative: every line must open with a
+  post/update/provide evidence (or diff) comment request and name no other work
+  (no fix, run, test, change, code, …), and no other PR or SHA may appear. It is moot once matching evidence exists: nothing is sent, `followup-moot` is
+  logged, no round is consumed and a fresh review starts at the same head. Mixed
+  findings and stale or wrong-PR evidence are delivered as usual.
+
+Original PR: the first PR the dispatcher sees for the issue (an evidence marker,
+the earliest post-claim linked PR by attachment time, or the first run-reported
+URL) is recorded before any write as `<!-- factory-dispatch:cursor-pr pr:<n> -->`
+and stays the issue's PR, even if its first normalization failed. Later runs
+reporting another URL get the one Devon mention and no writes. QA for a Cursor
+builder with that marker reviews, follows up and merges only the recorded PR;
+other linked PRs are ignored.
 
 Wrap-up: a cloud agent cannot update factory-gpu's main checkout. After merge,
 the same `wrapup-claim` precedes a **new local Amp thread** on gpu:
@@ -286,6 +331,12 @@ the same `wrapup-claim` precedes a **new local Amp thread** on gpu:
 skips the worktree-removal steps because no worktree marker exists. The submitted
 comment carries `wrapup` plus `<!-- factory-dispatch:wrapup-thread <T-id> -->`;
 the thread is labeled `factory`. Failures post the usual non-retrying comment.
+Then `GET /v1/agents/<id>/usage` posts `Cursor usage: <totalTokens> tokens,
+$<chargedCents/100> charged (0 = plan-included)` with
+`<!-- factory-dispatch:cursor-usage <bc-id> -->`. Tokens can lag a finished run:
+a 0-token or failed read instead posts `cursor-usage-pending <bc-id>`, and one
+later poll re-reads and posts whatever it gets (or `Cursor usage unavailable`).
+Usage never blocks or retries the wrap-up.
 
 Archive: after Done and the wrap-up marker, both archive through the shared
 five-attempt path and thread-ID markers. The wrap-up thread uses Amp's listing
