@@ -24,7 +24,7 @@ Each message is one line followed by the dashboard link
 | `gpu:temperature` | GPU 0 is above 85 °C for 2 min | critical | meter `/meter/gpu` sample (15 s) |
 | `meter:sync` | no successful meter sync for 5 min (10 cycles) | warning | factory-api meter sync |
 | `pricing:<family>:<model>` | `pricing.changed`: a new reference model is pending | info | pricing DB |
-| `backup:status` | a MET-74 backup failed, a pending marker is stuck for 2 h, or the last success is older than 36 h | warning | `/var/lib/factory-backup/status.json` |
+| `backup:status` | a MET-74 backup failed, a pending marker is stuck for 2 h, or the last success is older than 36 h | warning | `/var/lib/factory-backup-status/status.json` |
 | `clock:ntp` | `timedatectl show -p NTPSynchronized --value` is `no` | warning | timedatectl |
 | `dispatch:timer` | `factory-dispatch.timer` last fired more than 5 min ago, or never | warning | `systemctl show --timestamp=unix -p LastTriggerUSec` |
 | `usage:stale` | a collected tool's `observed_at_ms` is older than 45 min (3 collector intervals) | warning | `/var/lib/factory-usage/usage.json` |
@@ -79,7 +79,7 @@ consecutive-failure counts restart with the process.
 | `FACTORY_ALERTS_CHANNEL` / `--alerts-channel` | `C0C9N9HCRG8` |
 | `FACTORY_ALERTS_SLACK_URL` / `--alerts-slack-url` | `https://slack.com/api` |
 | `FACTORY_API_ALERTS_STATE` / `--alerts-state` | `/var/lib/factory-api/alerts.json` |
-| `FACTORY_API_BACKUP_STATUS` / `--backup-status` | `/var/lib/factory-backup/status.json` |
+| `FACTORY_API_BACKUP_STATUS` / `--backup-status` | `/var/lib/factory-backup-status/status.json` |
 | `FACTORY_API_NETWORK_THROUGHPUT_LOW_MBPS` / `--network-throughput-low-mbps` | `500` (1 to 100000) |
 
 The token is never logged. Startup logs only `alerts: Slack token loaded; posting
