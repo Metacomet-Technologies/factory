@@ -64,6 +64,77 @@ Remaining approved MET-92 stages are tracked separately: frozen costs
 snapshots and runtime query-counter alerts
 [MET-206](https://linear.app/metacomet/issue/MET-206). MET-203 adds no pruning.
 
+## Frozen request costs implementation (MET-204)
+
+On 2026-10-17, main has API `requests.db` v4 (MET-203), meter v1 and pricing v1.
+MET-204 adds **API v5**; meter and pricing code and schemas are unchanged.
+
+After stopping factory-api and taking a fresh verified backup, run
+`factory-api migrate --requests-db <path>`. The shared runner adds STRICT
+`request_costs` with exactly the contract columns, primary key
+`(request_id,family)` (WITHOUT ROWID, so key reads touch one B-tree), FK cascade to `requests`, and a table CHECK that
+priced/estimated rows have cost, provenance and rates while unpriced rows have
+none. It adds index `(family,request_id)` and a `BEFORE UPDATE` trigger that
+rejects every update except unpriced → estimated. STRICT `cost_backfill` holds one
+row per configured family: `after_id`, `target_id`, `unpriced_from_id` and
+`completed_at_ms`. Migration seeds `target_id=MAX(requests.id)`; an empty cache is
+seeded complete because later rows are frozen at ingestion. No existing table or
+row changes, no data is copied, and the file is never replaced. Runtime refuses
+v4 and newer versions; only a new empty file is initialized without the command.
+
+Classification is per inference request and configured family at `ts_ms`, never
+at `priced_at_ms`. The selection is the latest confirmed one effective at or before
+the request (equal times: higher ID). The rate is that model's latest snapshot
+fetched at or before it (equal times: later refresh, then OpenRouter, then higher
+ID). Otherwise the row is estimated from the earliest confirmed selection's
+earliest snapshot, matching pre-MET-204 usage. With no such price it is unpriced.
+Missing token counts are unpriced; zero tokens are priced zero. Cost is checked
+i128 `(p*in + o*out + 500)/1000`, once per request, checked into i64; overflow
+is refused. Rows store selection/snapshot IDs, model and rates, plus freeze time.
+Pricing's public `History` omits row IDs, so the API runs three equivalent
+queries per family through `Store::connection()`. Tests compare them with
+`History::rates_at` and `Store::cost`.
+
+Each meter page reads pricing history in one pool read snapshot (3F statements),
+then writes requests, costs and cursor in one cache transaction. A pricing storage
+or lookup failure, or cost overflow, at request X commits only earlier records,
+leaves the cursor before X and surfaces a `meter:` warning. Retries do not skip X.
+
+Backfill runs on every 30 s meter tick, even when meter is unreachable: at most
+20 transactions of at most 500 ascending request IDs, each committing its
+classifications and cursor together. Restarts resume from `after_id`. Inserts keep
+existing rows; only unpriced → estimated updates, so a retry cannot reprice. When
+a walk reaches `target_id`, a one-time check requires exactly one classification
+per inference request and none for other endpoints. Only then is
+`completed_at_ms` set. Until all families complete, usage warns
+`costs: frozen request costs are backfilling; spend is incomplete`.
+That check walks `requests` once with primary-key probes. It is the reviewed EQP
+exception; pricing failures pause backfill with a `costs:` warning.
+
+Rows unpriced only because no reference price existed set `unpriced_from_id`.
+After a price is confirmed, the next poll rewinds that family's walk there and
+turns complete-token unpriced rows into estimates. Spend rollups do not exist yet;
+MET-205 must rewrite affected buckets in that transaction.
+
+Usage reads the window via `requests_ts`, then walks one cost primary-key range
+over the window's ID span, skipping rows outside the window. It sums frozen
+priced/estimated nano-USD in Rust with checked i64 arithmetic. A probe per
+request and family measured about 3× slower. `unpriced_requests` is inference
+requests minus priced and estimated, including rows still being backfilled.
+The JSON and OpenAPI shapes are unchanged; USD remains a presentation conversion.
+Usage reads drop from 16 to 11; pricing stays 9. Requests setup is 116 statements.
+The release `benchmark_100k` (100k requests, two families) measured usage p95
+285–375 ms against 230–247 ms on main on the same orb. Frozen-cost reads replace
+cheap in-memory pricing, and MET-205 rollups remove the raw-row scan.
+
+The installer treats v4 like legacy: verified `.backup` snapshot, recorded version,
+before/after row counts of every existing table, then an in-place migration as
+`factory-api`. Rollback restores that verified v4 snapshot and the MET-203 binary,
+**restoring all telemetry to the backup time**. It keeps displaced files. Snapshots
+from older installers recorded `v4` without a version when no migration ran; they
+restore no request data. No retention, rollups or pruning are added. No production
+migration, deployment or production read has been run.
+
 ## Scope, evidence, and decisions
 
 Sources read: root `README.md`; `meter/src/{db,lib,main,telemetry,usage}.rs`;
@@ -750,10 +821,11 @@ maintenance statements are counted separately, never hidden in data ceilings.
 | meter health / requests / stats / GPU history | 1 / 1 per page / ≤4 with rollups+raw quantile / ≤2 with raw+hourly history |
 | API health/fleet/agents/SSE/static/OpenAPI and GPU collector | Measured ceiling **0** local DB statements; target after step 5: **0** |
 | API GPU | Measured ceiling **0** local; target after step 5: **0 local, ≤2 upstream history** (upstream enforcement awaits meter adoption) |
-| API usage | Measured ceiling **16** total reads for 24h/7d/30d with two selected and pending families; target after step 5: **≤8**, regardless of R |
+| API usage | Measured ceiling **11** total reads for 24h/7d/30d with two selected and pending families (16 before MET-204 froze costs); target after step 5: **≤8**, regardless of R |
 | API pricing / confirm | Measured ceilings **9 / 29** across all views and confirmation, including HTTP confirmation preflight; target after step 5: **≤3 / ≤12** |
 | API pricing refresh | Measured **26 / 46** for 3 / 1,001 models per source, two asymmetric families: 17 before/after view reads + job formula below. Worst view ceiling is 18. Target after step 5: **≤6 view reads** plus job budget |
-| API meter-sync page | Measured job ceiling **1 + ceil(n/100) + ceil(g/100)**, g gap warnings, plus **1 cursor read per sync run**; both inserts batch 100 rows, no per-row SELECT. Target after step 5: **≤10 + 2*ceil(n/100)** including pricing history and separate raw/cost batches; n≤5,000 (current wire pages ≤500) |
+| API meter-sync page | MET-204 measured job ceiling **2 + ceil(n/100) + ceil(g/100) + 3F + ceil(F·n/200)** for pages with inference rows (F families, 3 pricing-history reads each; cost rows batch 200), plus **1 cursor read per sync run**; raw/warning inserts batch 100 rows, no per-row SELECT. Target after step 5: **≤10 + 2*ceil(n/100)** including pricing history and separate raw/cost batches; n≤5,000 (current wire pages ≤500) |
+| API cost backfill | MET-204 measured **≤ 2 + ceil(F·500/200) + F** per ≤500-row transaction (9 at F=2), F more when an estimate fill-in rewinds, **1 + 2F** at completion, 3F pricing reads per poll, **1** when idle; at most 20 transactions per 30 s poll |
 | Pricing refresh | **P6 fixed and enforced:** ≤6 + ceil(M/100) + ceil(B/100) + ceil(I/100) for two configured families. Measured **9 / 29** with 3 / 1,001 fallback source rows, two pending rows and 10 / 1,008 items. One bulk release-history read, no S per-model reads; M is total source rows, B pending rows, I items |
 | Rollup/retention | ≤16 per ≤5,000-row batch per database; pruning chunk ≤5,000; cost families fixed by input configuration |
 | GPU sampling | G+1 data statements, plus one transaction; G physical GPUs |

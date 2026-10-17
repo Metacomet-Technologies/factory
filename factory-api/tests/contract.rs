@@ -1046,6 +1046,7 @@ async fn sixty_second_pricing_source_and_sqlite_writer_do_not_stall_reads() -> R
                         status: 200,
                         ..Default::default()
                     }],
+                    &[],
                 )
             })
             .await
@@ -1151,12 +1152,15 @@ async fn cursor_sync_recovers_multiple_pages_and_restarts_without_false_gaps() -
 #[tokio::test]
 async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
-    const USAGE: usize = 16;
+    // Records, frozen costs and warnings (3) plus pricing show (8); was 16
+    // with live history reads before MET-204.
+    const USAGE: usize = 11;
     const PRICING: usize = 9;
     const CONFIRM: usize = 29;
     const NO_DATABASE: usize = 0;
-    // Includes v1–v4 manifests, legacy warning adoption and runner validation.
-    const REQUESTS_SETUP: usize = 110;
+    // Includes v1–v5 manifests, legacy warning adoption, cost-backfill seeding
+    // (one row per family) and runner validation.
+    const REQUESTS_SETUP: usize = 116;
     const PRICING_SETUP: usize = 74;
     for n in [3usize, 1001] {
         let temp = tempfile::tempdir()?;
@@ -1213,9 +1217,15 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
         let sync = factory_db::Scope::default();
         state.query_scope = sync.clone();
         state.sync_meter().await?;
+        // Per page: cursor read/update, 100-row request and gap-warning batches,
+        // three pricing-history reads per family, then 200-row cost batches.
+        let families = factory_api::costs::families()?.len();
         let page_counts: Vec<_> = (0..n)
             .step_by(500)
-            .map(|offset| 2 + 2 * (n - offset).min(500).div_ceil(100))
+            .map(|offset| {
+                let rows = (n - offset).min(500);
+                2 + 2 * rows.div_ceil(100) + 3 * families + (families * rows).div_ceil(200)
+            })
             .collect();
         // Initial cursor read plus final empty page's state read and two updates.
         assert_eq!(sync.counts().data, 4 + page_counts.iter().sum::<usize>());
@@ -1717,28 +1727,35 @@ async fn benchmark_100k() -> Result<()> {
             Ok(())
         })
         .await?;
+    let histories = state
+        .db
+        .pricing
+        .read(&state.query_scope, |store| {
+            factory_api::costs::load(store, &factory_api::costs::families()?)
+        })
+        .await;
     state
         .db
         .write(&state.query_scope, move |db| {
-            factory_api::data::sync(
-                db,
-                (1..=100_000)
-                    .map(|id| RequestRecord {
-                        id,
-                        ts: at - (id % 29) * 86_400_000,
-                        endpoint: "/api/chat".into(),
-                        model: Some(format!("model-{}", id % 7)),
-                        prompt_eval_count: Some(37),
-                        eval_count: Some(19),
-                        prompt_eval_duration: Some(100_000_000),
-                        eval_duration: Some(1_000_000_000),
-                        total_duration: Some(id as u64 * 100_000),
-                        load_duration: Some(5_000_000),
-                        status: 200,
-                        ..Default::default()
-                    })
-                    .collect(),
-            )?;
+            let mut records: Vec<_> = (1..=100_000)
+                .map(|id| RequestRecord {
+                    id,
+                    ts: at - (id % 29) * 86_400_000,
+                    endpoint: "/api/chat".into(),
+                    model: Some(format!("model-{}", id % 7)),
+                    prompt_eval_count: Some(37),
+                    eval_count: Some(19),
+                    prompt_eval_duration: Some(100_000_000),
+                    eval_duration: Some(1_000_000_000),
+                    total_duration: Some(id as u64 * 100_000),
+                    load_duration: Some(5_000_000),
+                    status: 200,
+                    ..Default::default()
+                })
+                .collect();
+            let (costs, stopped) = factory_api::costs::freeze(&histories, &mut records);
+            anyhow::ensure!(stopped.is_none());
+            factory_api::data::sync(db, records, &costs)?;
             Ok(())
         })
         .await?;

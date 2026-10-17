@@ -148,8 +148,13 @@ async fn main() -> anyhow::Result<()> {
         let mut db = rusqlite::Connection::open(&path)?;
         factory_db::settings::apply(&db, false, 65_536)?;
         factory_api::data::initialize(&mut db)?;
+        let (requests, families): (i64, i64) = db.query_row(
+            "SELECT (SELECT COUNT(*) FROM requests),(SELECT COUNT(*) FROM cost_backfill)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         println!(
-            "requests user_version=4; legacy requests retained in requests_before_v4; replay resumes from sync_state"
+            "requests user_version=5; replay resumes from sync_state; cost backfill pending for {requests} cached requests across {families} families"
         );
         return Ok(());
     }

@@ -1,6 +1,6 @@
 use crate::types::*;
 use anyhow::{Context, Result};
-use factory_db::money::{MicroUsdPerMtok, NanoUsd, request_cost};
+use factory_db::money::NanoUsd;
 use rusqlite::Connection;
 use shared::RequestRecord;
 use std::{collections::BTreeMap, path::Path};
@@ -31,8 +31,8 @@ pub fn verify_path(path: &Path) -> Result<()> {
     let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let empty = factory_db::migrations::schema_fingerprint(&db)?.is_empty();
     anyhow::ensure!(
-        version == 4 || (version == 0 && empty),
-        "requests requires user_version=4, found {version}; stop factory-api, take a verified backup, then run factory-api migrate --requests-db <path>"
+        version == 5 || (version == 0 && empty),
+        "requests requires user_version=5, found {version}; stop factory-api, take a verified backup, then run factory-api migrate --requests-db <path>"
     );
     Ok(())
 }
@@ -74,6 +74,11 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
                 sql: include_str!("requests_v4.sql"),
                 checksum: 0x27c842b5b0708030,
             },
+            Migration {
+                version: 5,
+                sql: include_str!("requests_v5.sql"),
+                checksum: 0xc09d8eb6bc540f70,
+            },
         ],
         Some(LegacySchema {
             fingerprint: &schema_fingerprint(&legacy)?,
@@ -100,6 +105,9 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
                     )?;
                 }
             }
+            if from < 5 {
+                crate::costs::seed(tx, &crate::costs::families()?, crate::now_ms())?;
+            }
             Ok(())
         },
     )?;
@@ -108,7 +116,12 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
 
 pub const REQUEST_COLUMNS: &str = "id,ts_ms,endpoint,model,prompt_eval_count,eval_count,load_duration_ns,prompt_eval_duration_ns,eval_duration_ns,total_duration_ns,usage_json,latency_ms,status,stream,error,client_ip,client_hostname,user_key,actor_kind";
 
-pub fn sync(db: &mut Connection, records: Vec<RequestRecord>) -> Result<Vec<RequestRecord>> {
+/// Store one meter page with its frozen costs (see costs::freeze) atomically.
+pub fn sync(
+    db: &mut Connection,
+    records: Vec<RequestRecord>,
+    costs: &[crate::costs::Cost],
+) -> Result<Vec<RequestRecord>> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (watermark, rebuilding, replay_through): (i64, bool, i64) = tx.query_row(
         "SELECT last_after_id,rebuilding,replay_through_id FROM sync_state WHERE id=1",
@@ -201,6 +214,7 @@ pub fn sync(db: &mut Connection, records: Vec<RequestRecord>) -> Result<Vec<Requ
             rusqlite::params_from_iter(parameters),
         )?;
     }
+    crate::costs::store(&tx, costs, now)?;
     if records.is_empty() {
         // A successful new poll alone is not recovery: every ID must be present.
         tx.execute("UPDATE warnings SET resolved_at_ms=?1,last_seen_ms=?1 WHERE resolved_at_ms IS NULL AND first_id IS NOT NULL AND (SELECT COUNT(*) FROM requests WHERE id BETWEEN first_id AND last_id)=last_id-first_id+1", [now])?;
@@ -221,54 +235,6 @@ pub fn sync(db: &mut Connection, records: Vec<RequestRecord>) -> Result<Vec<Requ
     Ok(new)
 }
 
-pub fn spend(
-    store: &pricing::Store,
-    family: &str,
-    model_id: Option<String>,
-    records: &[RequestRecord],
-) -> Result<SpendAvoided> {
-    let history = store.history(family, records.iter().map(|r| r.ts).max().unwrap_or(0))?;
-    let mut result = SpendAvoided {
-        family: family.into(),
-        model_id,
-        usd: 0.0,
-        estimated_usd: 0.0,
-        unpriced_requests: 0,
-    };
-    let mut priced = NanoUsd::default();
-    let mut estimated = NanoUsd::default();
-    for record in records {
-        let (Some(prompt), Some(output)) = (record.prompt_eval_count, record.eval_count) else {
-            result.unpriced_requests += 1;
-            continue;
-        };
-        match history.rates_at(record.ts) {
-            Some((input, output_rate)) => {
-                priced = priced.checked_add(request_cost(
-                    prompt,
-                    output,
-                    MicroUsdPerMtok(input),
-                    MicroUsdPerMtok(output_rate),
-                )?)?;
-            }
-            None => {
-                if let Some((input, output_rate)) = history.earliest {
-                    estimated = estimated.checked_add(request_cost(
-                        prompt,
-                        output,
-                        MicroUsdPerMtok(input),
-                        MicroUsdPerMtok(output_rate),
-                    )?)?;
-                } else {
-                    result.unpriced_requests += 1;
-                }
-            }
-        }
-    }
-    result.usd = priced.display_usd();
-    result.estimated_usd = estimated.display_usd();
-    Ok(result)
-}
 pub fn pricing_view(
     store: &pricing::Store,
     references: &[pricing::Reference],
@@ -305,11 +271,22 @@ pub fn pricing_view(
         .collect();
     Ok(Pricing { families, warnings })
 }
-pub fn usage_records(
-    db: &Connection,
-    since: i64,
-    mut warnings: Vec<String>,
-) -> Result<(Vec<RequestRecord>, Vec<String>)> {
+/// Frozen spend for one family over a usage range, summed with checked arithmetic.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FrozenSpend {
+    pub priced: NanoUsd,
+    pub estimated: NanoUsd,
+    pub priced_requests: usize,
+    pub estimated_requests: usize,
+}
+
+pub type UsageRows = (
+    Vec<RequestRecord>,
+    Vec<String>,
+    BTreeMap<String, FrozenSpend>,
+);
+
+pub fn usage_records(db: &Connection, since: i64, mut warnings: Vec<String>) -> Result<UsageRows> {
     let mut statement = db.prepare(&format!(
         "SELECT {REQUEST_COLUMNS} FROM requests WHERE ts_ms>=?1 ORDER BY ts_ms,id"
     ))?;
@@ -350,13 +327,52 @@ pub fn usage_records(
             records.push(record);
         }
     }
+    drop(rows);
+    // Frozen costs exist only for inference requests. One primary-key range walk
+    // over the window's id span is far cheaper than a probe per request and family;
+    // rows whose request lies outside the time window are filtered here.
+    let families = crate::costs::families()?;
+    let mut ids: Vec<i64> = records.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    let mut spend = vec![FrozenSpend::default(); families.len()];
+    if let (Some(&first), Some(&last)) = (ids.first(), ids.last()) {
+        let mut statement = db.prepare(
+            "SELECT request_id,family,cost_status,cost_nano_usd FROM request_costs WHERE request_id>=?1 AND request_id<=?2 ORDER BY request_id",
+        )?;
+        let mut rows = statement.query([first, last])?;
+        while let Some(row) = rows.next()? {
+            if ids.binary_search(&row.get(0)?).is_err() {
+                continue;
+            }
+            let family = row.get_ref(1)?.as_str()?;
+            let Some(total) = families
+                .iter()
+                .position(|f| f == family)
+                .map(|i| &mut spend[i])
+            else {
+                continue;
+            };
+            let cost = row.get::<_, Option<i64>>(3)?.map(NanoUsd);
+            match (row.get_ref(2)?.as_str()?, cost) {
+                ("priced", Some(cost)) => {
+                    total.priced = total.priced.checked_add(cost)?;
+                    total.priced_requests += 1;
+                }
+                ("estimated", Some(cost)) => {
+                    total.estimated = total.estimated.checked_add(cost)?;
+                    total.estimated_requests += 1;
+                }
+                _ => {}
+            }
+        }
+    }
     warnings.extend(
-        db.prepare("SELECT message FROM warnings WHERE resolved_at_ms IS NULL UNION ALL SELECT 'meter: rebuilding request history; usage is incomplete' FROM sync_state WHERE id=1 AND rebuilding=1")?
+        db.prepare("SELECT message FROM warnings WHERE resolved_at_ms IS NULL UNION ALL SELECT 'meter: rebuilding request history; usage is incomplete' FROM sync_state WHERE id=1 AND rebuilding=1 UNION ALL SELECT 'costs: frozen request costs are backfilling; spend is incomplete' WHERE EXISTS(SELECT 1 FROM cost_backfill WHERE completed_at_ms IS NULL OR after_id<target_id)")?
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?,
     );
     warnings.sort();
-    Ok((records, warnings))
+    Ok((records, warnings, families.into_iter().zip(spend).collect()))
 }
 
 pub fn usage(
@@ -364,6 +380,7 @@ pub fn usage(
     range: String,
     records: Vec<RequestRecord>,
     warnings: Vec<String>,
+    spend: BTreeMap<String, FrozenSpend>,
 ) -> Result<Usage> {
     let totals = Totals {
         requests: records.len(),
@@ -374,7 +391,20 @@ pub fn usage(
     let spend_avoided = store
         .show(&references, crate::now_ms())?
         .into_iter()
-        .map(|s| spend(store, &s.family, s.selected.map(|s| s.model_id), &records))
+        .map(|s| {
+            let frozen = spend.get(&s.family).copied().unwrap_or_default();
+            Ok(SpendAvoided {
+                model_id: s.selected.map(|s| s.model_id),
+                usd: frozen.priced.display_usd(),
+                estimated_usd: frozen.estimated.display_usd(),
+                // Unpriced, or not yet classified while costs backfill (warned).
+                unpriced_requests: records
+                    .len()
+                    .checked_sub(frozen.priced_requests + frozen.estimated_requests)
+                    .context("cost rows exceed inference requests")?,
+                family: s.family,
+            })
+        })
         .collect::<Result<_>>()?;
     let mut groups = BTreeMap::<Option<&str>, Vec<&RequestRecord>>::new();
     for record in &records {
@@ -454,6 +484,8 @@ mod tests {
         assert_eq!(tps(Some(23), Some(0)), None);
         assert_eq!(tps(None, Some(100)), None);
     }
+    use crate::costs::{self, Status};
+
     #[test]
     fn priced_estimated_unpriced_and_missing_tokens() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -474,24 +506,28 @@ mod tests {
             100_000,
             vec![],
         )?;
-        let record = |ts, prompt| RequestRecord {
-            ts,
-            prompt_eval_count: prompt,
-            eval_count: Some(250_000),
-            ..Default::default()
-        };
-        let rows = vec![
-            record(120_999, Some(1_000_000)),
-            record(99_999, Some(500_000)),
-            record(121_000, None),
-            RequestRecord {
-                eval_count: None,
-                ..record(121_000, Some(10))
-            },
-            record(109_999, Some(250_000)),
-            record(110_000, Some(250_000)),
+        let rows: [(i64, Option<u64>, Option<u64>); 6] = [
+            (120_999, Some(1_000_000), Some(250_000)),
+            (99_999, Some(500_000), Some(250_000)),
+            (121_000, None, Some(250_000)),
+            (121_000, Some(10), None),
+            (109_999, Some(250_000), Some(250_000)),
+            (110_000, Some(250_000), Some(250_000)),
         ];
-        assert_eq!(spend(&store, "test", None, &rows)?.unpriced_requests, 6);
+        let classify = |store: &pricing::Store| -> Result<Vec<costs::Cost>> {
+            let history = costs::History::load(store, "test")?;
+            rows.iter()
+                .enumerate()
+                .map(|(i, (ts, p, o))| costs::classify(&history, i as i64 + 1, *ts, *p, *o))
+                .collect()
+        };
+        // No confirmed selection: unpriced, and complete-token rows await a price.
+        let before = classify(&store)?;
+        assert!(before.iter().all(|c| c.status == Status::Unpriced));
+        assert_eq!(
+            before.iter().map(|c| c.awaiting_price).collect::<Vec<_>>(),
+            [true, true, false, false, true, true]
+        );
         store.confirm("test", 110_000)?;
         // Later rates must not leak into either historical cost or pre-history estimates.
         let later = pricing::Model {
@@ -500,16 +536,38 @@ mod tests {
             ..model
         };
         store.refresh(&references, &[later], &[], 130_000, vec![])?;
-        let spend = spend(&store, "test", Some("model".into()), &rows)?;
+        let after = classify(&store)?;
         assert_eq!(
-            (spend.usd, spend.estimated_usd, spend.unpriced_requests),
-            (6.5, 5.5, 2)
+            after
+                .iter()
+                .map(|c| (c.status, c.nano_usd))
+                .collect::<Vec<_>>(),
+            [
+                (Status::Priced, Some(4_000_000_000)),
+                (Status::Estimated, Some(3_000_000_000)),
+                (Status::Unpriced, None),
+                (Status::Unpriced, None),
+                (Status::Estimated, Some(2_500_000_000)),
+                (Status::Priced, Some(2_500_000_000)),
+            ]
         );
+        let first = after[0].provenance.as_ref().unwrap();
+        assert_eq!(
+            (
+                first.model_id.as_str(),
+                first.input_micro_usd_per_mtok,
+                first.output_micro_usd_per_mtok
+            ),
+            ("model", 2_000_000, 8_000_000)
+        );
+        // Estimates carry the earliest confirmed selection and its earliest snapshot.
+        assert_eq!(after[1].provenance, after[0].provenance);
+        assert!(after[2].provenance.is_none() && !after[2].awaiting_price);
         Ok(())
     }
 
     #[test]
-    fn spend_rounds_each_request_once_and_checks_totals() -> Result<()> {
+    fn costs_round_each_request_once_and_refuse_overflow() -> Result<()> {
         let mut store = pricing::Store::in_memory()?;
         let references = pricing::parse_references("[[reference]]\nname='test'\nmatch='^model$'")?;
         let mut model = pricing::Model {
@@ -520,50 +578,28 @@ mod tests {
         };
         store.refresh(&references, std::slice::from_ref(&model), &[], 10, vec![])?;
         store.confirm("test", 11)?;
-        let row = RequestRecord {
-            ts: 11,
-            prompt_eval_count: Some(1),
-            eval_count: Some(0),
-            ..Default::default()
-        };
-        let rows = [row.clone(), row.clone()];
-        let result = spend(&store, "test", None, &rows)?;
-        assert_eq!(result.usd, 0.000000004);
-        assert_eq!(result.estimated_usd, 0.0);
-        assert_eq!(store.cost("test", 1, 0, 11)?.0, 2);
-        let early = [
-            RequestRecord {
-                ts: 10,
-                ..row.clone()
-            },
-            RequestRecord {
-                ts: 10,
-                ..row.clone()
-            },
-        ];
+        let history = costs::History::load(&store, "test")?;
+        let one = costs::classify(&history, 1, 11, Some(1), Some(0))?;
+        assert_eq!((one.status, one.nano_usd), (Status::Priced, Some(2)));
+        // Two half-up rounded requests total 4, not round(3.0) on aggregate tokens.
         assert_eq!(
-            spend(&store, "test", None, &early)?.estimated_usd,
-            0.000000004
+            NanoUsd::checked_sum([NanoUsd(2), NanoUsd(one.nano_usd.unwrap())])?,
+            NanoUsd(4)
         );
+        let early = costs::classify(&history, 2, 10, Some(1), Some(0))?;
+        assert_eq!((early.status, early.nano_usd), (Status::Estimated, Some(2)));
+        // Zero tokens are a priced zero, never unpriced.
+        let zero = costs::classify(&history, 3, 11, Some(0), Some(0))?;
+        assert_eq!((zero.status, zero.nano_usd), (Status::Priced, Some(0)));
         model.input_micro_usd_per_mtok = i64::MAX;
-        store.refresh(&references, &[model], &[], 11, vec![])?;
-        let large = RequestRecord {
-            prompt_eval_count: Some(1000),
-            ..row
-        };
-        assert!(spend(&store, "test", None, &[large.clone(), large.clone()]).is_err());
-        assert!(
-            spend(
-                &store,
-                "test",
-                None,
-                &[RequestRecord {
-                    prompt_eval_count: Some(1001),
-                    ..large
-                }]
-            )
-            .is_err()
+        store.refresh(&references, &[model], &[], 12, vec![])?;
+        let history = costs::History::load(&store, "test")?;
+        // (1000 * i64::MAX + 500) / 1000 fits; one more token does not.
+        assert_eq!(
+            costs::classify(&history, 4, 12, Some(1000), Some(0))?.nano_usd,
+            Some(i64::MAX)
         );
+        assert!(costs::classify(&history, 5, 12, Some(1001), Some(0)).is_err());
         Ok(())
     }
 
@@ -640,16 +676,27 @@ mod tests {
         let mut counts = vec![];
         let mut queries = Vec::new();
         let mut after = 0;
+        let families = costs::families()?;
         for count in [1, 1000] {
+            let loading = Scope::recording();
+            let histories = reader.run(&loading, Category::Data, |store| {
+                costs::load(store, &families)
+            });
+            // Three history reads per family, independent of the page size.
+            assert_eq!(loading.counts().data, 3 * families.len());
+            queries.extend(loading.statements());
+            let mut page: Vec<_> = (after + 1..=count).map(row).collect();
+            let (frozen, stopped) = costs::freeze(&histories, &mut page);
+            assert!(stopped.is_none());
             db.run(&Scope::default(), Category::Setup, |db| {
-                sync(db, (after + 1..=count).map(row).collect())
+                sync(db, page, &frozen)
             })?;
             after = count;
             let scope = Scope::recording();
-            let (records, warnings) =
+            let (records, warnings, spend) =
                 db.run(&scope, Category::Data, |db| usage_records(db, 0, vec![]))?;
             let result = reader.run(&scope, Category::Data, |store| {
-                usage(store, "30d".into(), records, warnings)
+                usage(store, "30d".into(), records, warnings, spend)
             })?;
             assert_eq!(result.totals.requests, count as usize);
             assert_eq!(
@@ -667,7 +714,8 @@ mod tests {
             })?;
             queries.extend(scope.statements());
         }
-        const ONE_SELECTED_FAMILY_USAGE: usize = 13;
+        // Requests with frozen costs and warnings, plus pricing show (no history reads).
+        const ONE_SELECTED_FAMILY_USAGE: usize = 8;
         assert_eq!(counts, [ONE_SELECTED_FAMILY_USAGE; 2]);
         // The model switch is effective at 50, never at its earlier observation.
         let history = reader.run(&Scope::default(), Category::Data, |store| {
@@ -677,6 +725,26 @@ mod tests {
         assert_eq!(history.rates_at(20), Some((2_000_000, 7_000_000)));
         assert_eq!(history.rates_at(49), Some((2_000_000, 7_000_000)));
         assert_eq!(history.rates_at(50), Some((5_000_000, 7_000_000)));
+        // Frozen-cost provenance selects exactly the rates pricing would.
+        let frozen = reader.run(&Scope::default(), Category::Data, |store| {
+            costs::History::load(store, "Claude Sonnet")
+        })?;
+        for at in [0, 9, 10, 19, 20, 29, 30, 31, 39, 40, 49, 50, 60] {
+            assert_eq!(
+                frozen
+                    .at(at)
+                    .map(|p| (p.input_micro_usd_per_mtok, p.output_micro_usd_per_mtok)),
+                history.rates_at(at),
+                "at {at}"
+            );
+        }
+        assert_eq!(
+            frozen
+                .earliest
+                .as_ref()
+                .map(|p| (p.input_micro_usd_per_mtok, p.output_micro_usd_per_mtok)),
+            history.earliest
+        );
         // Replay actual traced templates with bound values, never expanded SQL.
         use factory_db::explain::{self, Exception, ExceptionKind, RequiredSearch};
         db.run(&Scope::default(), Category::Setup, |db| {
@@ -705,7 +773,13 @@ mod tests {
                 explain::query_plan(connection, sql, rusqlite::params_from_iter(parameters))?;
             let mut required = Vec::new();
             let mut exceptions = Vec::new();
-            if requests {
+            if sql.contains("FROM request_costs WHERE request_id>=?1") {
+                // Frozen costs for the window: one primary-key range walk.
+                required.push(RequiredSearch {
+                    table: "request_costs",
+                    index: None,
+                });
+            } else if requests {
                 required.push(RequiredSearch {
                     table: "requests",
                     index: sql.contains("ts_ms>=").then_some("requests_ts"),
@@ -715,6 +789,11 @@ mod tests {
                     kind: ExceptionKind::SmallWholeSetRead,
                     table: "warnings",
                     reason: "complete warning set is part of the API response",
+                });
+                exceptions.push(Exception {
+                    kind: ExceptionKind::SmallWholeSetRead,
+                    table: "cost_backfill",
+                    reason: "one state row per configured reference family",
                 });
             } else if sql.contains("FROM price_snapshots") {
                 required.push(RequiredSearch {
@@ -744,7 +823,10 @@ mod tests {
                 .with_context(|| format!("{sql}\n{plan:?}"))
         };
         for sql in queries {
-            if sql.contains("FROM requests") || sql.contains("FROM warnings") {
+            if ["FROM requests", "FROM request_costs", "FROM warnings"]
+                .iter()
+                .any(|t| sql.contains(t))
+            {
                 db.run(&Scope::default(), Category::Setup, |db| check(db, &sql))?;
             } else {
                 reader.run(&Scope::default(), Category::Setup, |store| {
