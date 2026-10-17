@@ -92,10 +92,16 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create an empty pricing v1 database. Never converts a legacy file.
+    /// Offline migration after stopping the service and verifying a fresh backup.
     Migrate {
+        #[arg(
+            long,
+            required_unless_present = "requests_db",
+            conflicts_with = "requests_db"
+        )]
+        pricing_db: Option<PathBuf>,
         #[arg(long)]
-        pricing_db: PathBuf,
+        requests_db: Option<PathBuf>,
     },
     /// Post one Slack test alert plus a threaded reply, then exit.
     AlertTest,
@@ -125,7 +131,24 @@ async fn main() -> anyhow::Result<()> {
         println!("posted Slack test alert ts={ts} with a threaded reply");
         return Ok(());
     }
-    if let Some(Command::Migrate { pricing_db }) = args.command {
+    if let Some(Command::Migrate {
+        requests_db: Some(path),
+        ..
+    }) = args.command
+    {
+        let mut db = rusqlite::Connection::open(&path)?;
+        factory_db::settings::apply(&db, false, 65_536)?;
+        factory_api::data::initialize(&mut db)?;
+        println!(
+            "requests user_version=4; legacy requests retained in requests_before_v4; replay resumes from sync_state"
+        );
+        return Ok(());
+    }
+    if let Some(Command::Migrate {
+        pricing_db: Some(pricing_db),
+        ..
+    }) = args.command
+    {
         let report = pricing::migrate(&pricing_db)?;
         let db = rusqlite::Connection::open_with_flags(
             &pricing_db,

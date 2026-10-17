@@ -488,11 +488,14 @@ only in `estimated_usd`. Factory-api reads that append-only history without
 modifying pricing's tables. Without any confirmed selection, or when either
 token count is null, a request increments `unpriced_requests`.
 
-The request cache upserts meter IDs and persists its max-ID watermark across
-restarts. Only the newest 500 rows are available per sync. If the oldest fetched
-ID exceeds watermark + 1, a persistent `gap` warning identifies lost IDs.
-There is no automatic request retention or gap backfill. Upstream failures retain
-cached usage with warnings. A fresh cache cannot reconstruct older meter history.
+The request cache inserts immutable meter facts and persists a separate
+`sync_state` cursor. Sync uses ascending `after_id` pages of up to 500 rows,
+bounded to 20 pages per poll, and resumes committed progress after interruption.
+The offline requests.db v4 migration rebuilds the replica from `after_id=0`
+while preserving UPS/device/network history and archived legacy cache tables.
+Historical replay does not emit live request events. Gap warnings clear only
+when every missing ID is recovered; unavailable source IDs remain warnings.
+There is no automatic request retention. See [cache recovery](docs/data-model.md#cache-recovery-implementation-met-203).
 
 Deployment artifacts are **not executed during development**:
 
@@ -509,8 +512,11 @@ The installer never runs Cargo, performs preflight checks, snapshots existing
 binary/unit files and prior service state, starts port 8080, curls health/fleet,
 and verifies Tailscale and amp-runner as the service user. The health startup
 check polls silently for up to 45 seconds, followed by one visible curl with an
-explicit error on failure. Rollback restores those
-files and service state; databases and user remain. Neither script changes meter,
+explicit error on failure. Before requests migration, the installer stops the
+service and verifies a fresh SQLite backup and telemetry row counts. Rollback
+restores that database snapshot and the compatible binary, reverting telemetry
+to snapshot time while retaining displaced files for recovery. The service user
+remains. Neither script changes meter,
 Ollama, firewall rules, or Tailscale configuration.
 
 ### Runtime kiosk and installation
@@ -783,7 +789,12 @@ systemctl start factory-backup.timer
 ```
 
 Do not restart the application between replacing requests and pricing when
-restoring both. Check its health endpoint before declaring recovery complete.
+restoring both. Before starting the current factory-api binary, requests.db must
+be v4 and pricing.db v1. An older requests backup requires a fresh verified
+snapshot and `factory-api migrate --requests-db /var/lib/factory-api/requests.db`
+as the service user while stopped; never relabel `user_version` manually. A v4
+restore needs no migration. Check its health endpoint and replay coverage before
+declaring recovery complete.
 If any step fails, keep services stopped until the paths/error are reviewed;
 the originals remain at the printed/selected recovery location.
 

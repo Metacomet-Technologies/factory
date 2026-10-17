@@ -53,6 +53,7 @@ pub struct AppState {
     pub reboot_status: PathBuf,
     pub alerts: Arc<alerts::Alerting>,
     usage_refresh_lock: Arc<std::sync::Mutex<()>>,
+    meter_sync_lock: Arc<tokio::sync::Mutex<()>>,
     pub config: Arc<fleet::Config>,
     pub client: reqwest::Client,
     pub pricing_sources: [String; 2],
@@ -119,6 +120,7 @@ impl AppState {
             reboot_status: devices::DEFAULT_REBOOT_STATUS.into(),
             alerts: Arc::new(alerts::Alerting::new(alerts::Config::default())),
             usage_refresh_lock: Default::default(),
+            meter_sync_lock: Default::default(),
             config: Arc::new(config),
             client,
             pricing_sources: [pricing::OPENROUTER_URL.into(), pricing::LITELLM_URL.into()],
@@ -209,16 +211,22 @@ impl AppState {
             .await?)
     }
     pub async fn sync_meter(&self) -> Result<()> {
+        let _guard = self.meter_sync_lock.lock().await;
         let result = async {
             self.require_clock()?;
             let mut cursor: i64 = self
                 .db
                 .requests
                 .read(&self.query_scope, |db| {
-                    Ok(db.query_row("SELECT COALESCE(MAX(id),0) FROM requests", [], |r| r.get(0))?)
+                    Ok(db.query_row(
+                        "SELECT last_after_id FROM sync_state WHERE id=1",
+                        [],
+                        |r| r.get(0),
+                    )?)
                 })
                 .await?;
-            loop {
+            // At most 10,000 rows per collector tick; resume from committed state.
+            for _ in 0..20 {
                 let response = self
                     .client
                     .get(format!(
@@ -244,13 +252,14 @@ impl AppState {
                             == Some(next),
                     "invalid meter cursor page"
                 );
-                if records.is_empty() {
-                    break;
-                }
+                let finished = records.is_empty();
                 let new = self
                     .db
                     .write(&self.query_scope, move |db| data::sync(db, records))
                     .await?;
+                if finished {
+                    return Ok(());
+                }
                 cursor = next;
                 for r in new
                     .into_iter()
@@ -271,7 +280,7 @@ impl AppState {
                     );
                 }
             }
-            Ok(())
+            anyhow::bail!("catch-up incomplete; continuing from meter id {cursor} on next poll")
         }
         .await;
         if result.is_ok() {

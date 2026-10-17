@@ -7,7 +7,7 @@ fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ $# -eq 1 ]] || fail 'Supply the exact snapshot directory printed by the installer.'
 snapshot=$1
 trap 'printf "ERROR: rollback failed at line %s; snapshot retained at %s.\n" "$LINENO" "$snapshot" >&2' ERR
-for command in systemctl cp rm cat mv mktemp date sudo curl touch sqlite3 jq flock sha256sum cmp find realpath; do
+for command in systemctl cp rm cat mv mktemp date sudo curl touch sqlite3 jq flock sha256sum cmp find realpath install; do
     command -v "$command" >/dev/null || fail "Required command missing: $command"
 done
 [[ -f "$snapshot/complete" && -f "$snapshot/enabled" && -f "$snapshot/active" ]] || fail 'Snapshot is incomplete.'
@@ -31,6 +31,17 @@ done
 [[ -f "$snapshot/pricing-mode" ]] || fail 'Use the rollback script matching this snapshot; pricing mode is missing.'
 pricing_mode=$(cat "$snapshot/pricing-mode")
 case "$pricing_mode" in legacy|fresh|v1) ;; *) fail "Invalid pricing mode: $pricing_mode" ;; esac
+[[ -f "$snapshot/requests-mode" ]] || fail 'Use the rollback script matching this snapshot; requests mode is missing.'
+requests_mode=$(cat "$snapshot/requests-mode")
+case "$requests_mode" in legacy|fresh|v4) ;; *) fail "Invalid requests mode: $requests_mode" ;; esac
+requests_db=/var/lib/factory-api/requests.db
+for path in "$requests_db" "$requests_db-wal" "$requests_db-shm" "$snapshot/requests.db"; do
+    [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || fail "Unsafe requests file: $path"
+done
+if [[ "$requests_mode" == legacy && -f "$snapshot/requests.db.sha256" ]]; then
+    sha256sum -c "$snapshot/requests.db.sha256"
+    [[ $(sqlite3 "file:$snapshot/requests.db?immutable=1" 'PRAGMA integrity_check;') == ok ]] || fail 'Requests snapshot integrity failed.'
+fi
 pricing_db=/var/lib/factory-api/pricing.db
 legacy_db=/var/lib/factory-api/pricing.v0.db
 for path in "$pricing_db" "$pricing_db-wal" "$pricing_db-shm" "$legacy_db" "$legacy_db-wal" "$legacy_db-shm"; do
@@ -58,6 +69,23 @@ flock -n 9 || fail 'Backup or deployment is running; retry after it finishes.'
 if [[ $(systemctl show factory-api.service --property=LoadState --value) != not-found ]]; then
     systemctl stop factory-api.service
     systemctl disable factory-api.service
+fi
+if [[ "$requests_mode" != v4 && ! -f "$snapshot/requests-restored" ]]; then
+    if [[ "$requests_mode" == legacy && ! -f "$snapshot/requests.db.sha256" ]]; then
+        [[ -f "$snapshot/requests-version" && -f "$requests_db" ]] || fail 'Requests backup is missing; refusing to restore the old binary.'
+        [[ $(sudo -u factory-api sqlite3 -readonly "$requests_db" 'PRAGMA user_version;') == "$(cat "$snapshot/requests-version")" ]] || fail 'Requests schema changed without a verified backup; service remains stopped.'
+    else
+        aside=$(mktemp -d "$snapshot/requests-rollback-$(date -u +%Y%m%dT%H%M%S.%NZ).XXXXXX")
+        for suffix in -wal -shm ''; do
+            if [[ -e "$requests_db$suffix" ]]; then mv -- "$requests_db$suffix" "$aside/requests.db$suffix"; fi
+        done
+        if [[ "$requests_mode" == legacy ]]; then
+            install -o factory-api -g factory-api -m 0600 "$snapshot/requests.db" "$requests_db"
+            [[ $(sudo -u factory-api sqlite3 -readonly "$requests_db" 'PRAGMA user_version;') == "$(cat "$snapshot/requests-version")" ]] || fail 'Requests restore version failed; service remains stopped.'
+        fi
+        printf 'Requests rollback restores pre-migration telemetry; later writes retained at: %s\n' "$aside"
+    fi
+    touch "$snapshot/requests-restored"
 fi
 if [[ "$pricing_mode" != v1 && ! -f "$snapshot/pricing-restored" ]]; then
     # Unique directory keeps both databases and every displaced sidecar.

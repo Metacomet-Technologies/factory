@@ -212,6 +212,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
         load_duration: Some(3_000_000),
         total_duration: (id != 2).then_some(5_000_000_000),
         latency_ms: 9000.0,
+        status: 200,
         client_hostname: "client".into(),
         ..Default::default()
     };
@@ -641,6 +642,7 @@ async fn mixed_endpoints_only_count_and_stream_inference() -> Result<()> {
         eval_duration: Some(2_000_000_000),
         load_duration: Some(1_000_000),
         total_duration: Some(100_000_000),
+        status: 200,
         client_hostname: id.to_string(),
         ..Default::default()
     };
@@ -1041,6 +1043,7 @@ async fn sixty_second_pricing_source_and_sqlite_writer_do_not_stall_reads() -> R
                         id: 1,
                         ts: now_ms(),
                         endpoint: "/api/chat".into(),
+                        status: 200,
                         ..Default::default()
                     }],
                 )
@@ -1087,6 +1090,7 @@ async fn cursor_sync_recovers_multiple_pages_and_restarts_without_false_gaps() -
                     id,
                     ts: now_ms(),
                     endpoint: "/api/chat".into(),
+                    status: 200,
                     ..Default::default()
                 })
                 .collect(),
@@ -1114,6 +1118,7 @@ async fn cursor_sync_recovers_multiple_pages_and_restarts_without_false_gaps() -
             id,
             ts: now_ms(),
             endpoint: "/api/chat".into(),
+            status: 200,
             ..Default::default()
         })
         .collect();
@@ -1128,6 +1133,7 @@ async fn cursor_sync_recovers_multiple_pages_and_restarts_without_false_gaps() -
             id,
             ts: now_ms(),
             endpoint: "/api/chat".into(),
+            status: 200,
             ..Default::default()
         })
         .to_vec();
@@ -1149,9 +1155,8 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
     const PRICING: usize = 9;
     const CONFIRM: usize = 29;
     const NO_DATABASE: usize = 0;
-    // Includes the requests v1, v2 and v3 migration manifests and runner validation.
-    // v3 adds nine statements: four network tables and five indexes.
-    const REQUESTS_SETUP: usize = 97;
+    // Includes v1–v4 manifests, legacy warning adoption and runner validation.
+    const REQUESTS_SETUP: usize = 110;
     const PRICING_SETUP: usize = 74;
     for n in [3usize, 1001] {
         let temp = tempfile::tempdir()?;
@@ -1166,6 +1171,7 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
                         model: (i % 3 != 0).then(|| "local".into()),
                         prompt_eval_count: Some(3),
                         eval_count: Some(7),
+                        status: 200,
                         ..Default::default()
                     })
                     .collect(),
@@ -1209,9 +1215,10 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
         state.sync_meter().await?;
         let page_counts: Vec<_> = (0..n)
             .step_by(500)
-            .map(|offset| 1 + 2 * (n - offset).min(500).div_ceil(100))
+            .map(|offset| 2 + 2 * (n - offset).min(500).div_ceil(100))
             .collect();
-        assert_eq!(sync.counts().data, 1 + page_counts.iter().sum::<usize>());
+        // Initial cursor read plus final empty page's state read and two updates.
+        assert_eq!(sync.counts().data, 4 + page_counts.iter().sum::<usize>());
         assert_eq!(sync.counts().setup, 0);
         eprintln!(
             "sync n={n}: data={}, page jobs={page_counts:?}, initial cursor=1",
@@ -1452,7 +1459,7 @@ async fn unsynchronized_clock_pauses_feeds_and_all_data_writes_until_recovery() 
         state
             .db
             .write(&state.query_scope, |db| {
-                db.execute("INSERT INTO warnings VALUES ('bad clock')", [])?;
+                db.execute("INSERT INTO warnings(message,first_seen_ms,last_seen_ms) VALUES ('bad clock',0,0)", [])?;
                 Ok(())
             })
             .await
@@ -1727,6 +1734,7 @@ async fn benchmark_100k() -> Result<()> {
                         eval_duration: Some(1_000_000_000),
                         total_duration: Some(id as u64 * 100_000),
                         load_duration: Some(5_000_000),
+                        status: 200,
                         ..Default::default()
                     })
                     .collect(),
