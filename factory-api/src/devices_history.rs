@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(
             db.query_row("SELECT id FROM requests", [], |row| row.get::<_, i64>(0))

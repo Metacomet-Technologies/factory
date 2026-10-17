@@ -1148,8 +1148,9 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
     const PRICING: usize = 9;
     const CONFIRM: usize = 29;
     const NO_DATABASE: usize = 0;
-    // Includes the requests v1 migration manifest and runner validation.
-    const REQUESTS_SETUP: usize = 88;
+    // Includes the requests v1, v2 and v3 migration manifests and runner validation.
+    // v3 adds nine statements: four network tables and five indexes.
+    const REQUESTS_SETUP: usize = 97;
     const PRICING_SETUP: usize = 74;
     for n in [3usize, 1001] {
         let temp = tempfile::tempdir()?;
@@ -1611,6 +1612,13 @@ async fn sigterm_exits_with_sse_clients_and_closes_pool_within_five_seconds() ->
             "PATH",
             format!("{}:{}", temp.path().display(), std::env::var("PATH")?),
         )
+        // Network probes stay on loopback; tests never probe real hosts.
+        .envs([
+            ("FACTORY_API_NETWORK_WAN_TARGETS", "127.0.0.1"),
+            ("FACTORY_API_NETWORK_DNS_NAME", "localhost"),
+            ("FACTORY_API_NETWORK_TAILNET_TARGET", "127.0.0.1:9"),
+            ("FACTORY_API_NETWORK_ROUTE_TABLE", "/nonexistent"),
+        ])
         .args([
             "--listen",
             &address.to_string(),

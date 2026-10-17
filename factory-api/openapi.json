@@ -309,6 +309,36 @@
         ],
         "type": "object"
       },
+      "Burst": {
+        "properties": {
+          "received": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rtt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Rtt",
+                "description": "Null exactly when nothing was received."
+              }
+            ]
+          },
+          "sent": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sent",
+          "received"
+        ],
+        "type": "object"
+      },
       "ClearedAlert": {
         "properties": {
           "cleared_at_ms": {
@@ -1161,6 +1191,16 @@
         ],
         "type": "object"
       },
+      "Layer": {
+        "description": "Declaration order is registry order; diagnosis blames the first failing layer.",
+        "enum": [
+          "lan",
+          "wan",
+          "dns",
+          "tailnet"
+        ],
+        "type": "string"
+      },
       "LlmRequest": {
         "properties": {
           "client_hostname": {
@@ -1355,6 +1395,171 @@
         ],
         "type": "object"
       },
+      "NetworkHistory": {
+        "properties": {
+          "range": {
+            "type": "string"
+          },
+          "resolution": {
+            "$ref": "#/components/schemas/Resolution"
+          },
+          "series": {
+            "items": {
+              "$ref": "#/components/schemas/NetworkSeries"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "range",
+          "resolution",
+          "series"
+        ],
+        "type": "object"
+      },
+      "NetworkLatency": {
+        "properties": {
+          "avg": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "min": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "NetworkPoint": {
+        "properties": {
+          "jitter_ms": {
+            "description": "Raw buckets: mean of the bursts' mdev. Hourly points: nearest-rank p95.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "latency_ms": {
+            "$ref": "#/components/schemas/NetworkLatency",
+            "description": "Average is weighted by received replies; all null when nothing came back."
+          },
+          "loss_percent": {
+            "format": "double",
+            "type": "number"
+          },
+          "sample_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "ts_ms": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ts_ms",
+          "sample_count",
+          "loss_percent",
+          "latency_ms"
+        ],
+        "type": "object"
+      },
+      "NetworkSeries": {
+        "properties": {
+          "layer": {
+            "$ref": "#/components/schemas/Layer"
+          },
+          "points": {
+            "items": {
+              "$ref": "#/components/schemas/NetworkPoint"
+            },
+            "type": "array"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "layer",
+          "target",
+          "points"
+        ],
+        "type": "object"
+      },
+      "NetworkStatus": {
+        "properties": {
+          "device_id": {
+            "type": "string"
+          },
+          "generated_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "targets": {
+            "description": "Registry order: lan, wan, dns, tailnet.",
+            "items": {
+              "$ref": "#/components/schemas/NetworkTarget"
+            },
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "generated_at_ms",
+          "device_id",
+          "targets",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "NetworkTarget": {
+        "properties": {
+          "latest": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Sample"
+              }
+            ]
+          },
+          "layer": {
+            "$ref": "#/components/schemas/Layer"
+          },
+          "probe": {
+            "$ref": "#/components/schemas/ProbeKind"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "layer",
+          "target",
+          "probe"
+        ],
+        "type": "object"
+      },
       "Node": {
         "properties": {
           "last_seen_ms": {
@@ -1433,6 +1638,14 @@
           "family"
         ],
         "type": "object"
+      },
+      "ProbeKind": {
+        "enum": [
+          "icmp",
+          "resolve",
+          "tcp_connect"
+        ],
+        "type": "string"
       },
       "Ram": {
         "properties": {
@@ -1549,6 +1762,76 @@
           "availability"
         ],
         "type": "object"
+      },
+      "Resolution": {
+        "enum": [
+          "raw",
+          "hourly"
+        ],
+        "type": "string"
+      },
+      "Rtt": {
+        "properties": {
+          "avg_us": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "max_us": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "mdev_us": {
+            "description": "Jitter, as iputils computes it: the population standard deviation.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "min_us": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "min_us",
+          "avg_us",
+          "max_us",
+          "mdev_us"
+        ],
+        "type": "object"
+      },
+      "Sample": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Burst"
+          },
+          {
+            "properties": {
+              "address": {
+                "description": "What was probed: the gateway or WAN IP, the resolved name, or the\nresolved tailnet socket address. Null when it could not be found.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "layer": {
+                "$ref": "#/components/schemas/Layer"
+              },
+              "target": {
+                "type": "string"
+              },
+              "ts_ms": {
+                "description": "Start of the tick; every target in one tick shares it.",
+                "format": "int64",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "ts_ms",
+              "layer",
+              "target"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "Selection": {
         "properties": {
@@ -1715,7 +1998,7 @@
             "type": "integer"
           },
           "type": {
-            "description": "Named SSE event: gpu.sample, ups.sample, ups.event, llm.request, fleet.change,\npricing.changed, agents.usage, or devices.sample. ups.sample data is UpsCurrent or null\non failure. devices.sample data is a device view, or null when the collector fails.\nHistory is not in the event.\nups.event data is UpsEvent, sent once when an event opens and once when it closes.\nZero-length self_test events send both an open frame and a closed frame.",
+            "description": "Named SSE event: gpu.sample, ups.sample, ups.event, network.sample, llm.request,\nfleet.change, pricing.changed, agents.usage, or devices.sample. ups.sample data is\nUpsCurrent or null on failure. devices.sample data is a device view, or null when the\ncollector fails. History is not in the event.\nups.event data is UpsEvent, sent once when an event opens and once when it closes.\nZero-length self_test events send both an open frame and a closed frame.\nnetwork.sample data is the array of Sample probed by one 30-second tick.",
             "type": "string"
           }
         },
@@ -2540,6 +2823,85 @@
             "description": ""
           }
         },
+        "tags": []
+      }
+    },
+    "/v1/network": {
+      "get": {
+        "operationId": "network",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NetworkStatus"
+                }
+              }
+            },
+            "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "Every registry target in layer order with its latest stored sample (null\nbefore the first tick), plus network and clock warnings.",
+        "tags": []
+      }
+    },
+    "/v1/network/history": {
+      "get": {
+        "operationId": "network_history",
+        "parameters": [
+          {
+            "description": "1h, 24h (default), 7d, 30d",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NetworkHistory"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "1h and 24h read raw bursts in at most 720 buckets per target; jitter is the\nmean of the bursts' mdev. 7d and 30d read hourly rollups; jitter is the\nnearest-rank p95 of each hour's mdev values. Loss is lost replies over sent.",
         "tags": []
       }
     },

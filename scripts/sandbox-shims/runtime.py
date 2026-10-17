@@ -21,6 +21,11 @@ BASE = 20000 + int.from_bytes(hashlib.sha256(os.fsencode(ROOT)).digest()[:4], "b
 SERVICES = {"fake-ollama": BASE, "meter": BASE + 1, "factory-api": BASE + 2,
             "fake-serve": BASE + 3}
 STOP = threading.Event()
+# /proc/net/route format; the kernel prints addresses little-endian (0104A8C0 = 192.168.4.1).
+ROUTE_TABLE = ("Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+               "sandbox0\t00000000\t0104A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+               "sandbox0\t0004A8C0\t00000000\t0001\t0\t0\t100\t00FCFFFF\t0\t0\t0\n")
+NETWORK_HOSTS = "127.0.0.1 localhost\n127.0.0.1 probe.sandbox.test\n"
 
 
 def identity(pid):
@@ -178,6 +183,13 @@ def inside():
         if not ups_status.exists():
             ups_status.write_text("OL\n")
         start("fake-upsd", ["python3", ROOT / "scripts/sandbox-shims/fake-upsd.py", "3493", ups_status])
+        route = STATE / "network-route"
+        if not route.exists():
+            route.write_text(ROUTE_TABLE)
+        tailnet = STATE / "network-tailnet"
+        if not tailnet.exists():
+            tailnet.write_text("up\n")
+        start("fake-net", ["python3", ROOT / "scripts/sandbox-shims/fake-net.py", "2222", STATE])
         credentials = STATE / "credentials"
         credentials.mkdir(mode=0o700, exist_ok=True)
         for name in ("nut-password", "slack-bot-token"):
@@ -279,6 +291,8 @@ def inside():
                               "--openrouter-feed-url", f"http://127.0.0.1:{BASE}/feeds/openrouter",
                               "--litellm-feed-url", f"http://127.0.0.1:{BASE}/feeds/litellm",
                               "--disable-pricing-collector",
+                              "--network-route-table", route, "--network-dns-name", "probe.sandbox.test",
+                              "--network-tailnet-target", "127.0.0.1:2222",
                               "--static-dir", ROOT / "kiosk/dist" if kiosk == "1" else STATE / "no-kiosk"])
         ready(BASE + 2, "/v1/health")
         started = time.monotonic()
@@ -337,11 +351,16 @@ def run():
     (STATE / "stop").unlink(missing_ok=True)
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
+    # The namespace resolves names from this file alone: the host stub resolver is
+    # unreachable inside it. Edit it in place; a replaced inode is not seen through the bind.
+    hosts = STATE / "network-hosts"
+    if not hosts.exists():
+        hosts.write_text(NETWORK_HOSTS)
     child = subprocess.Popen([
         "bwrap", "--unshare-net", "--unshare-pid", "--unshare-uts", "--hostname", "sandbox",
         "--die-with-parent", "--ro-bind", "/", "/",
         "--bind", str(STATE), str(STATE), "--proc", "/proc", "--dev", "/dev",
-        "--tmpfs", "/run", "--tmpfs", "/tmp", "--setenv", "PATH",
+        "--tmpfs", "/run", "--tmpfs", "/tmp", "--ro-bind", str(hosts), "/etc/hosts", "--setenv", "PATH",
         f"{ROOT}/scripts/sandbox-shims:/usr/bin:/bin",
         "python3", str(Path(__file__).resolve()), "inside", str(ROOT), *sys.argv[3:]])
     try:

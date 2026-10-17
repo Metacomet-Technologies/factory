@@ -140,6 +140,13 @@ async fn disabled_collector_keeps_manual_http_refresh_and_confirmation() -> Resu
         drop(listener);
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_factory-api"))
             .env_clear().env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+            // Network probes stay on loopback; tests never probe real hosts.
+            .envs([
+                ("FACTORY_API_NETWORK_WAN_TARGETS", "127.0.0.1"),
+                ("FACTORY_API_NETWORK_DNS_NAME", "localhost"),
+                ("FACTORY_API_NETWORK_TAILNET_TARGET", "127.0.0.1:9"),
+                ("FACTORY_API_NETWORK_ROUTE_TABLE", "/nonexistent"),
+            ])
             .args(["--listen", &address, "--meter-url", &feed_url, "--disable-pricing-collector",
                 "--openrouter-feed-url", &format!("{feed_url}/primary"), "--litellm-feed-url", &format!("{feed_url}/secondary")])
             .arg("--db-path").arg(temp.path().join("requests.db"))

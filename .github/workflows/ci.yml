@@ -144,7 +144,7 @@ jobs:
           key: sandbox-${{ runner.os }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*') }}
       - name: Check sandbox scripts
         run: |
-          scripts=(scripts/sandbox scripts/sandbox-shims/nvidia-smi scripts/sandbox-shims/tailscale scripts/sandbox-shims/timedatectl)
+          scripts=(scripts/sandbox scripts/sandbox-shims/nvidia-smi scripts/sandbox-shims/tailscale scripts/sandbox-shims/timedatectl scripts/sandbox-shims/ping)
           for script in "${scripts[@]}"; do bash -n "$script"; done
           shellcheck -x "${scripts[@]}"
       - run: scripts/sandbox up --rows 1k

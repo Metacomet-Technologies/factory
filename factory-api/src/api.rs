@@ -1,5 +1,7 @@
 use crate::devices::{self, DeviceList, DeviceView};
 use crate::devices_history::{self, DeviceHistory};
+use crate::network::{NetworkStatus, Sample};
+use crate::network_history::{self, NetworkSeries};
 use crate::types::*;
 use crate::ups::{Ups, UpsCurrent};
 use crate::ups_history::{self, UpsEnergy, UpsEvents, UpsPoint, UpsSettings};
@@ -149,6 +151,8 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
             | "/v1/ups/events"
             | "/v1/ups/energy"
             | "/v1/settings/ups"
+            | "/v1/network"
+            | "/v1/network/history"
             | "/v1/pricing"
             | "/v1/pricing/refresh"
             | "/v1/agents"
@@ -200,6 +204,8 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
         "/v1/ups/energy" => ups_energy(&state, request).await,
         "/v1/settings/ups" if settings_put => put_ups_settings(&state, request).await,
         "/v1/settings/ups" => get_ups_settings(&state).await,
+        "/v1/network" => network(&state).await,
+        "/v1/network/history" => network_history(&state, request).await,
         "/openapi.json" => Json(ApiDoc::openapi()).into_response(),
         "/v1/stream" => stream(&state).into_response(),
         "/v1/gpu" => match range(&request, true) {
@@ -566,6 +572,64 @@ async fn put_ups_settings(state: &AppState, request: Request<Body>) -> Response 
             .await,
     )
 }
+/// Every registry target in layer order with its latest stored sample (null
+/// before the first tick), plus network and clock warnings.
+#[utoipa::path(get, path="/v1/network", responses((status=200, body=NetworkStatus),(status=500, body=ApiError)))]
+async fn network(state: &AppState) -> Response {
+    response(state.network().await)
+}
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum Resolution {
+    Raw,
+    Hourly,
+}
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+struct NetworkHistory {
+    range: String,
+    resolution: Resolution,
+    series: Vec<NetworkSeries>,
+}
+/// 1h and 24h read raw bursts in at most 720 buckets per target; jitter is the
+/// mean of the bursts' mdev. 7d and 30d read hourly rollups; jitter is the
+/// nearest-rank p95 of each hour's mdev values. Loss is lost replies over sent.
+#[utoipa::path(get, path="/v1/network/history", params(("range"=Option<String>, Query, description="1h, 24h (default), 7d, 30d")), responses((status=200, body=NetworkHistory),(status=400, body=ApiError),(status=500, body=ApiError)))]
+async fn network_history(state: &AppState, request: Request<Body>) -> Response {
+    let Ok(Query(query)) = Query::<RangeQuery>::try_from_uri(request.uri()) else {
+        return error(StatusCode::BAD_REQUEST, "invalid_range", "malformed query");
+    };
+    let range = query.range.unwrap_or_else(|| "24h".into());
+    let (hours, resolution) = match range.as_str() {
+        "1h" => (1, Resolution::Raw),
+        "24h" => (24, Resolution::Raw),
+        "7d" => (168, Resolution::Hourly),
+        "30d" => (720, Resolution::Hourly),
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_range",
+                "range must be 1h, 24h, 7d, or 30d",
+            );
+        }
+    };
+    let now = now_ms();
+    let since = now - hours * ups_history::HOUR_MS;
+    let raw = matches!(resolution, Resolution::Raw);
+    response(
+        state
+            .db
+            .requests
+            .read(&state.query_scope, move |db| {
+                network_history::history(db, crate::network::DEVICE_ID, since, now, raw)
+            })
+            .await
+            .map(|series| NetworkHistory {
+                range,
+                resolution,
+                series,
+            }),
+    )
+}
 #[utoipa::path(get, path="/v1/agents", responses((status=200, body=Agents)))]
 async fn agents(state: &AppState) -> Json<Agents> {
     Json(crate::usage::read(&state.usage_snapshot).await)
@@ -728,6 +792,8 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         ups_energy,
         get_ups_settings,
         put_ups_settings,
+        network,
+        network_history,
         pricing,
         refresh,
         confirm_selection
@@ -743,6 +809,8 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
         DeviceList,
         DeviceView,
         DeviceHistory,
+        NetworkStatus,
+        Sample,
         Pricing,
         Agents,
         Alerts,

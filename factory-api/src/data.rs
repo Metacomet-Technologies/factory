@@ -45,6 +45,11 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
                 sql: include_str!("devices_schema.sql"),
                 checksum: 0xec390e5b72cf3828,
             },
+            Migration {
+                version: 3,
+                sql: include_str!("network_schema.sql"),
+                checksum: 0xeafe4295b7f9e60f,
+            },
         ],
         Some(LegacySchema {
             fingerprint: &schema_fingerprint(&legacy)?,

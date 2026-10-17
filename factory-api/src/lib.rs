@@ -5,6 +5,8 @@ pub mod devices;
 pub mod devices_history;
 pub mod fleet;
 mod kiosk;
+pub mod network;
+pub mod network_history;
 pub mod pool;
 pub mod types;
 pub mod ups;
@@ -56,6 +58,8 @@ pub struct AppState {
     pub disable_pricing_collector: bool,
     pub ups_addr: String,
     pub ups_name: String,
+    /// Network probe registry, built once from NetworkConfig in layer order.
+    pub network: Arc<[network::Target]>,
     pricing_client: reqwest::Client,
     pub db: Arc<pool::Pool>,
     /// Explicit request/job handle propagated to both database pools.
@@ -118,6 +122,8 @@ impl AppState {
             disable_pricing_collector: false,
             ups_addr: "127.0.0.1:3493".into(),
             ups_name: "cyberpower".into(),
+            // main installs the configured registry; embedders and tests probe nothing.
+            network: Arc::new([]),
             pricing_client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
                 .user_agent("factory-pricing/0.1")
@@ -586,6 +592,67 @@ impl AppState {
         self.warning("devices history", result.err().map(|e| e.to_string()))
             .await;
     }
+    pub async fn network(&self) -> Result<network::NetworkStatus> {
+        let warnings = self
+            .read_warnings()
+            .await
+            .into_iter()
+            .filter(|w| w.starts_with("network") || w.starts_with("clock:"))
+            .collect();
+        let keys: Vec<String> = self.network.iter().map(|t| t.key.clone()).collect();
+        let mut latest = self
+            .db
+            .requests
+            .read(&self.query_scope, move |db| {
+                network_history::latest(db, network::DEVICE_ID, &keys)
+            })
+            .await?;
+        let targets = self
+            .network
+            .iter()
+            .map(|t| network::NetworkTarget {
+                layer: t.layer,
+                target: t.key.clone(),
+                probe: t.probe.kind(),
+                latest: latest
+                    .iter()
+                    .position(|s| s.target == t.key)
+                    .map(|i| latest.swap_remove(i)),
+            })
+            .collect();
+        Ok(network::NetworkStatus {
+            generated_at_ms: now_ms(),
+            device_id: network::DEVICE_ID.into(),
+            targets,
+            warnings,
+        })
+    }
+    pub async fn collect_network(&self) {
+        let ts_ms = now_ms();
+        let mut samples = Vec::new();
+        let mut errors = Vec::new();
+        for result in network::probe_all(&self.network, ts_ms).await {
+            match result {
+                Ok(sample) => samples.push(sample),
+                Err(error) => errors.push(format!("{error:#}")),
+            }
+        }
+        let batch = samples.clone();
+        let stored = if samples.is_empty() {
+            Ok(())
+        } else {
+            self.db
+                .write(&self.query_scope, move |db| {
+                    network_history::record(db, network::DEVICE_ID, &batch)
+                })
+                .await
+        };
+        self.warning("network history", stored.err().map(|e| e.to_string()))
+            .await;
+        self.emit("network.sample", &samples);
+        self.warning("network", (!errors.is_empty()).then(|| errors.join("; ")))
+            .await;
+    }
     pub fn start_collectors(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut tasks = vec![self.start_usage_collector()];
         tasks.extend(self.start_alerts());
@@ -595,7 +662,7 @@ impl AppState {
             );
         }
         for kind in [
-            "meter", "fleet", "gpu", "ups", "devices", "pricing", "clock", "database",
+            "meter", "fleet", "gpu", "ups", "devices", "network", "pricing", "clock", "database",
         ] {
             if kind == "pricing" && self.disable_pricing_collector {
                 continue;
@@ -627,6 +694,7 @@ impl AppState {
                                 let _ = state.sync_meter().await;
                             }
                             "fleet" => state.collect_fleet().await,
+                            "network" => state.collect_network().await,
                             "gpu" => {
                                 let (current, _) = state.gpu_current().await;
                                 state.emit("gpu.sample", current);
@@ -698,6 +766,18 @@ impl AppState {
                                     .warning(
                                         "devices retention",
                                         device_retention.err().map(|e| e.to_string()),
+                                    )
+                                    .await;
+                                let network_retention = state
+                                    .db
+                                    .write(&state.query_scope, |db| {
+                                        network_history::retain(db, now_ms())
+                                    })
+                                    .await;
+                                state
+                                    .warning(
+                                        "network retention",
+                                        network_retention.err().map(|e| e.to_string()),
                                     )
                                     .await;
                                 let result = async {

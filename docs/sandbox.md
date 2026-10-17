@@ -195,6 +195,44 @@ The API's usage snapshot and refresh trigger also point inside `.sandbox`.
 Without a synthetic `.sandbox/usage.json`, Frontier CLIs show unknown usage;
 the sandbox never displays the host's account quota snapshot.
 
+## Network fakes (MET-197)
+
+The namespace has no route out, so every network probe hits a fixture. Each file
+lives in this worktree's `.sandbox/`, is created on first startup, survives
+`down`/`up`, and is read again on every 30-second tick.
+
+- `ping` is an exact-command shim for `ping -n -q -c 10 -i 0.2 -W 1 <address>`.
+  It prints iputils summaries chosen by `.sandbox/network-ping` (default
+  `healthy`). `192.168.4.1` is the gateway; every other address is a wan target.
+  `loss` gives wan 30% loss, `latency` about 250 ms wan RTT, `wan-down` both wan
+  targets 100% loss with the gateway fine, `lan-down` every ICMP target 100%
+  loss, and `unreachable` the no-route error. Any other value makes ping fail
+  without a summary, which the API reports as a warning, never as loss.
+- `.sandbox/network-route` is a `/proc/net/route` table whose default route is
+  `192.168.4.1`. Delete its `00000000` destination line for a no-gateway sample.
+- `.sandbox/network-hosts` is bound read-only over the namespace's `/etc/hosts`,
+  and the API resolves `probe.sandbox.test`. The host stub resolver is
+  unreachable inside, so removing that line makes resolution fail at once.
+  Rewrite the file in place (`printf ... > file`); a renamed replacement has a
+  new inode the bind mount never sees.
+- `fake-net` holds a TCP listener on private `127.0.0.1:2222`, the API's tailnet
+  target, while `.sandbox/network-tailnet` reads `up`, and closes it on `down`.
+  Use `scripts/sandbox logs fake-net` for its failures.
+
+```sh
+printf '%s\n' loss > .sandbox/network-ping
+printf '127.0.0.1 localhost\n' > .sandbox/network-hosts
+printf '%s\n' down > .sandbox/network-tailnet
+python3 scripts/sandbox-shims/network-smoke.py
+```
+
+The check walks every scenario, waits for a tick that started after each fixture
+change, and asserts each target's `sent`, `received` and RTT in `GET /v1/network`.
+It also checks `GET /v1/network/history` at raw and hourly resolution and a
+`network.sample` frame on `/v1/stream`, then restores the healthy fixtures. It
+takes about six minutes and prints its evidence as JSON. The shim's RTTs are
+fixtures; only loopback DNS and TCP timings are measured.
+
 ## Pricing hooks (MET-111)
 
 `up` passes `--openrouter-feed-url` and `--litellm-feed-url` pointing to the

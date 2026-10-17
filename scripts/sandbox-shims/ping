@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+(($# == 9)) && [[ "${*:1:8}" == '-n -q -c 10 -i 0.2 -W 1' && "$9" =~ ^[0-9a-fA-F.:]+$ ]] || exit 1
+address=$9
+fixture="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/../../.sandbox/network-ping"
+scenario=healthy
+if [[ -f "$fixture" ]]; then
+    scenario=$(tr -d '[:space:]' <"$fixture")
+fi
+# The synthetic route table's gateway; every other address is a wan target.
+role=wan
+[[ "$address" == 192.168.4.1 ]] && role=lan
+
+reply() {
+    local received=$1 rtt=${2:-}
+    printf 'PING %s (%s) 56(84) bytes of data.\n\n--- %s ping statistics ---\n' "$address" "$address" "$address"
+    printf '10 packets transmitted, %s received, %s%% packet loss, time 1809ms\n' "$received" "$((100 - received * 10))"
+    if ((received)); then
+        printf 'rtt min/avg/max/mdev = %s ms\n' "$rtt"
+        exit 0
+    fi
+    printf '\n'
+    exit 1
+}
+
+case "$scenario:$role" in
+    healthy:lan | loss:lan | latency:lan | wan-down:lan) reply 10 0.312/0.405/0.611/0.081 ;;
+    healthy:wan) reply 10 8.113/8.691/9.050/0.272 ;;
+    loss:wan) reply 7 8.120/8.702/9.101/0.288 ;;
+    latency:wan) reply 10 248.310/251.442/259.877/3.115 ;;
+    wan-down:wan | lan-down:*) reply 0 ;;
+    unreachable:*)
+        echo 'ping: connect: Network is unreachable' >&2
+        exit 2 ;;
+    *)
+        echo "ping: unknown sandbox scenario '$scenario'" >&2
+        exit 2 ;;
+esac
