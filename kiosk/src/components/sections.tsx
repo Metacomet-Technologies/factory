@@ -382,7 +382,7 @@ export function AgentsSection({
   return (
     <Panel
       title="Frontier CLIs"
-      subtitle="Account capacity · separate from local usage"
+      subtitle="Account capacity, not local usage"
       icon={icon}
       index={index}
       action={

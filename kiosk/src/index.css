@@ -1402,7 +1402,19 @@
     padding-block: 4px;
   }
   .agent-list li {
-    padding-block: 5px;
+    padding-block: 3px;
+  }
+  .agent-list .agent-status {
+    line-height: 1.4;
+  }
+  /* Six tools must fit beside the main column: empty windows and balance share one line. */
+  .agent-values {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 12px;
+  }
+  .agent-values > .agent-window {
+    flex-basis: 100%;
   }
   .agent-list .agent-heading > p {
     flex-basis: auto;
@@ -1414,8 +1426,13 @@
     margin-top: 2px;
   }
   .agent-window {
-    grid-template-columns: 80px minmax(20px, 1fr) 58px 100px;
+    grid-template-columns: 76px minmax(20px, 1fr) 66px 96px;
     gap: 8px;
+  }
+  .agent-window > span {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .agent-window > .meter,
   .agent-window > span:nth-child(3),
@@ -1427,7 +1444,7 @@
     text-align: right;
   }
   [role="log"] {
-    max-height: 72px;
+    max-height: 40px;
     overflow-y: auto;
     scrollbar-gutter: stable;
   }
