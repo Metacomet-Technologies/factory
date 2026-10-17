@@ -9,7 +9,7 @@ The working agreement and hard-won lessons for building and operating the factor
 - **Separate Decided from Open** at the end of design answers.
 - **Be concise and stay on task.** Don't expand scope; park new ideas as Linear issues.
 - **Agent prompts are pragmatic and tightly scoped** (template in §4).
-- **Verify before asserting:** check current docs or versions when unsure; never guess flags or APIs.
+- **Verify before asserting:** check current docs or versions when unsure; never guess flags or APIs. Commands that parse API JSON use keys read from `factory-api/openapi.json` on main, never remembered ones.
 
 ## 2. The system
 
@@ -71,6 +71,8 @@ Every prompt has these sections:
 
 **Runner hygiene:** one builder thread per task, with wrap-up in that same thread. Title scratch/probe/test threads `MET-<n> probe: …` and label them `factory` via `amp threads label <T-id> factory`; archive them before the final reply and list them. Parallel work uses separate worktrees. Do not message a running thread except for corrections. QA uses fresh per-head threads; dispatcher owns QA worktree cleanup.
 
+**Direct handoffs** (a task given straight to a runner instead of dispatched): never add `dispatch`. The prompt's first step has the builder create its own worktree from a parent directory (`/home/agent/work`), refusing an existing branch or directory. Claude reviews the PR, Devon merges, and Linear state moves by hand. All other §4 rules apply.
+
 **Wrap-up prompt (after merge):** explicitly permits the same thread to update/build only clean main in `/home/agent/work/factory` as agent, without sudo (run git and builds directly; never `sudo -u agent`). Confirm merge and branch; fetch origin and `merge --ff-only origin/main`; build only task artifacts and check changed scripts with `node --test`, never `node --check`. Read `docs/agents/*.md` by repo-root path, because wrap-ups can run from subdirectories. Stop on dirty files or failure. Check dirty/untracked/unpushed work; delete agent-owned ignored build caches (including kiosk's Vite cache) before `git worktree remove`, then run `git worktree prune`. Reply with Mac install/verify/rollback commands. Post remaining deploy steps with Devon's profile mention; no steps means no ping. Never deploy or merge. Devon owns verification/Done, one deploy per runner. Failed verification stays in this thread with a fresh worktree.
 
 Only after all wrap-up steps succeed, post exactly `Wrap-up finished`, a blank line, and `<!-- factory-dispatch:wrapup-done -->` on the task issue. This is the builder's sole marker exception, not deployment verification or permission to mark Done. Dispatcher archives Done builders after five quiet minutes.
@@ -120,6 +122,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 | `opin …` | 1Password CLI on a node |
 
 - **Multi-line remote scripts:** `gpu-ssh 'bash -s' <<'EOF'` … `EOF` (or `console-ssh` for factory-console; a heredoc after a plain `ssh host` runs on the Mac).
+- **Flush-left:** every command block given to Devon starts at column 0, never indented under a list item; an indented heredoc terminator never matches its `EOF`.
 - **Same command on both nodes:** one labeled loop, not two copies:
   `for h in factory-gpu factory-console; do echo "== $h"; ssh dgarbs51@$h '…'; done`
   (or `ssh dgarbs51@$h 'bash -s' <<'EOF'` … `EOF` inside the loop).
@@ -139,7 +142,7 @@ Every command Claude or an agent gives Devon is written as run **from his Mac**,
 
 ### UPS operations
 
-- **Status:** dashboard card or `/ups`; on factory-gpu, `upsc cyberpower@localhost`. While on battery, NUT starts clean shutdown below 30% charge or 300 seconds runtime. BIOS AC-power recovery boots factory-gpu when power returns; UPS outlet return remains unverified until MET-173 records it.
+- **Status:** dashboard card or `/ups`; on factory-gpu, `upsc cyberpower@localhost`. While on battery, NUT starts clean shutdown below 30% charge or 300 seconds runtime. UPS outlets return on their own (MET-173, 2026-10-14), but factory-gpu does not auto-boot until MET-179's BIOS fix is verified.
 - **Controls:** only a personal device on the tailnet signed in as Devon or David may use `/ups`; tagged nodes are refused. `test.quick`/`test.stop` test or stop battery testing; beeper actions change only the UPS alarm; validated settings change input/shutdown/start behavior; `shutdown.stop` cancels the driver's pending shutdown delay, but not upsd's FSD latch or an OS shutdown already underway. These actions have no network effect. `power.cycle` requests clean OS shutdown, then NUT's late `shutdown.return` path cuts and restores UPS output. Its 5–15 minute planning budget is not measured. The UPS battery outlets carry factory-gpu, the fiber modem, and the main eero, so it drops house internet, Wi-Fi, and tailnet access to both factory nodes. `power.off_stay` is disabled. Raw `load.off` and `load.on` are intentionally never exposed.
 - **Self-test:** first Saturday of every month at 11:00 local time, with no missed-run catch-up. Alerts cover on battery, low battery, replace battery, UPS communications lost, and failed self-test.
 - **Manual fallback:** from Mac, enter a root TTY with `ssh -t dgarbs51@factory-gpu 'sudo -i'`. Read the root-only (0600) credential with `cat /etc/nut/factory-control.password`, then run `upscmd -u factory-control cyberpower <command>` and paste it only at the password prompt. Allowed commands: `test.battery.start.quick`, `test.battery.stop`, `beeper.enable`, `beeper.disable`, `beeper.mute`, and `shutdown.stop`. Never put the password in argv; raw `load.off` and `load.on` are never exposed.
@@ -198,7 +201,7 @@ gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
 **Hardware**
 - **T2 MacBook:** Wi-Fi firmware must be supplied (back up `/lib/firmware/brcm`); boot `Option` → EFI Boot. **Its CMOS RTC resets to 1970 at every boot** (the firmware ACPI clock has no time either), so systemd starts the clock at a stale floor date until chrony syncs. factory-api waits for `chrony-wait` (time-sync.target) and refuses refreshes/writes while unsynchronized.
 - **NUT:** write `/etc/nut/*` **before** installing the package (otherwise its postinst deadlocks starting with no config: `systemctl cancel`, stop `nut-driver-enumerator.path`, then `dpkg --configure -a`). A UPS plugged in before NUT's udev rules exist needs `udevadm control --reload-rules && udevadm trigger --subsystem-match=usb --attr-match=idVendor=0764 --action=add`.
-- **UPS outlet return:** unverified. MET-166's supervised `power.cycle` test was not recorded as complete; do not claim outlet-return behavior until Devon records it.
+- **UPS outlet return:** verified by MET-173's supervised `power.cycle` (2026-10-14): the outlets, modem and eero came back on their own, but factory-gpu did not auto-boot (MSI B550 BIOS; MET-179).
 
 **Services / apps**
 - `node --check` doesn't strip TypeScript types and fails on `.ts` files with `Unexpected token ':'`; verify dispatcher and collector scripts with `node --test`, never `node --check`.
