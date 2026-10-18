@@ -1,13 +1,33 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+root=$(dirname "$(dirname "$(realpath "$0")")")
+check_only=0
+if [[ ${1:-} == --check-only ]]; then check_only=1; shift; fi
 source_dir=${1:-/home/agent/work/factory/kiosk/dist}
 destination=/var/lib/factory-api/kiosk
 snapshot=
 stage=
 response=
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-[[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-kiosk.sh [built-dist-directory].'
+# MET-239: refuse an artifact not built from this clean checkout. No override;
+# a mismatch means rebuild. Runs before the root check and any change.
+verify_artifact() {
+    local name=$1 info=$2 checkout=$3 sha dirty head status
+    sha=$(python3 -c 'import json, sys; v = json.loads(sys.argv[1]).get("git_sha"); print(v if isinstance(v, str) else "")' "$info" 2>/dev/null) \
+        || fail "Artifact $name build info is not a JSON object; rebuild from $checkout."
+    dirty=$(python3 -c 'import json, sys; print(json.dumps(json.loads(sys.argv[1]).get("git_dirty")))' "$info")
+    head=$(sudo -u agent git -C "$checkout" rev-parse --short=7 HEAD) || fail "Cannot read the checkout commit: $checkout"
+    status=$(sudo -u agent git -C "$checkout" status --porcelain) || fail "Cannot read the checkout status: $checkout"
+    [[ -n $sha && $sha != unknown ]] || fail "Artifact $name has no build SHA (missing or unknown); rebuild from $checkout."
+    [[ $dirty == false ]] || fail "Artifact $name was built from a dirty tree (git_dirty: $dirty); rebuild from a clean checkout."
+    [[ -z $status ]] || fail "Checkout $checkout is dirty; commit or discard changes, then rebuild."
+    [[ $sha == "$head" ]] || fail "Artifact $name built at $sha but checkout $checkout is at $head; rebuild at $head."
+    printf 'Artifact %s built at %s matches checkout\n' "$name" "$sha"
+}
 [[ $# -le 1 ]] || fail 'Expected at most one built dist directory.'
+[[ -f "$source_dir/version.json" && ! -L "$source_dir/version.json" ]] || fail "Built kiosk version.json missing: $source_dir; rebuild from $root/kiosk."
+verify_artifact kiosk "$(<"$source_dir/version.json")" "$root"
+[[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-kiosk.sh [--check-only] [built-dist-directory].'
 trap 'printf "ERROR: kiosk install failed at line %s. Snapshot: %s. Recover with: bash deploy/rollback-kiosk.sh <snapshot>\n" "$LINENO" "${snapshot:-not created (kiosk unchanged)}" >&2' ERR
 trap '[[ -z "$stage" ]] || rm -rf -- "$stage"; [[ -z "$response" ]] || rm -f -- "$response"' EXIT
 
@@ -29,6 +49,10 @@ entries=$(find "$source_dir" ! -type d ! -type f -print -quit)
 [[ ! -L "$destination" && ( ! -e "$destination" || -d "$destination" ) ]] || fail 'Unsafe kiosk destination.'
 [[ ! -L /var/backups/factory-kiosk && ( ! -e /var/backups/factory-kiosk || -d /var/backups/factory-kiosk ) ]] || fail 'Unsafe kiosk backup directory.'
 curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:8080/v1/health
+if (( check_only )); then
+    printf 'Check only: kiosk preflight passed; nothing changed.\n'
+    exit 0
+fi
 
 # Serialize install/rollback; each snapshot records the complete previous tree or absence.
 install -d -m 0700 /var/backups/factory-kiosk

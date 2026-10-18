@@ -50,6 +50,8 @@ fn discover(root: PathBuf) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // No inputs fingerprint: build-fingerprint.sh covers meter and factory-api only.
+    shared::exit_if_build_info("");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

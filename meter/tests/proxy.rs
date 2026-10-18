@@ -986,3 +986,25 @@ async fn endpoint_budgets_plans_settings_and_openapi() {
     .await
     .expect("budget test timed out");
 }
+
+#[test]
+fn build_info_flag_prints_health_build_fields() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_meter"))
+        .arg("--build-info")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1);
+    let build = shared::build_info(env!("FACTORY_INPUTS_FINGERPRINT"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout).unwrap(),
+        serde_json::json!({
+            "version": build.version,
+            "git_sha": build.git_sha,
+            "git_dirty": build.git_dirty,
+            "built_at_ms": build.built_at_ms,
+            "inputs_fingerprint": build.inputs_fingerprint,
+        })
+    );
+}

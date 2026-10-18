@@ -67,6 +67,20 @@ pub fn build_info(inputs_fingerprint: &str) -> Health {
     }
 }
 
+/// `<binary> --build-info`: print the health build fields as one JSON line and
+/// exit 0. Call first in `main`, before any database, socket or config.
+pub fn exit_if_build_info(inputs_fingerprint: &str) {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--build-info")
+    {
+        let mut info = serde_json::to_value(build_info(inputs_fingerprint)).unwrap();
+        info.as_object_mut().unwrap().remove("status");
+        println!("{info}");
+        std::process::exit(0);
+    }
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct ApiError {
     pub error: String,
