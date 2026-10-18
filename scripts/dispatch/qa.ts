@@ -80,9 +80,15 @@ export function reviewerEngine(issue: Issue) {
   return engine?.name.replace(/^engine\//, '') === 'claude' ? 'amp' : 'claude';
 }
 
+// The command argv carries only flags, repo slugs and PR numbers; gh auth comes
+// from agent's own login, never argv, so the argv is safe to publish in a refusal.
 function command(program: string, args: string[]) {
   const result = spawnSync(program, args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 8_000_000 });
-  if (result.status !== 0) throw new Error(`${program} QA read failed`);
+  if (result.status !== 0) {
+    const reason = result.error?.message ?? `exit ${result.status}`;
+    const stderrLine = result.stderr.trim().split('\n')[0] ?? '';
+    throw new Error(`${[program, ...args].join(' ')} failed (${reason})${stderrLine ? `: ${stderrLine}` : ''}`);
+  }
   return result.stdout.trim();
 }
 function gh(args: string[]) { return command('gh', [...args, '--repo', config.repository]); }
@@ -155,6 +161,19 @@ export async function mergeCheck(pr: string, sha: string, restRead = false) {
   const after = await info(pr, restRead);
   if (after.state !== 'OPEN' || after.isDraft !== false || after.baseRefName !== 'main'
     || after.headRefOid !== sha || head(pr) !== sha) throw new Error('QA head changed during checks');
+}
+
+// gh api --slurp and gh pr checks --json need gh 2.48.0; older versions (Ubuntu ESM
+// 2.46.0) hid PR 55's refusal cause. Fail closed with the version in the message.
+const MIN_GH = '2.48.0';
+function ghPreflight() {
+  const found = command('gh', ['--version']).match(/^gh version (\d+)\.(\d+)\.(\d+)\b/m)?.slice(1).map(Number);
+  if (!found) throw new Error('gh --version output unreadable');
+  const [requiredMajor, requiredMinor, requiredPatch] = MIN_GH.split('.').map(Number);
+  const [major, minor, patch] = found;
+  if (major < requiredMajor || (major === requiredMajor
+    && (minor < requiredMinor || (minor === requiredMinor && patch < requiredPatch))))
+    throw new Error(`gh ${found.join('.')} is older than ${MIN_GH}; upgrade from cli.github.com/packages`);
 }
 
 type Context = {
@@ -487,7 +506,12 @@ export async function syncPlaybook(ctx: Context) {
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
     if (process.argv.length !== 5 || process.argv[2] !== 'check') throw new Error('Usage: qa.ts check PR SHA');
+    ghPreflight();
     await mergeCheck(process.argv[3], process.argv[4]);
     console.log('QA merge gate passed; use --match-head-commit for the merge.');
-  } catch { console.error('QA merge gate refused; inspect current head, CI and self-deploying paths.'); process.exitCode = 1; }
+  } catch (error) {
+    // Fail closed, but name the cause; the generic refusal hid gh 2.46.0's missing --slurp.
+    console.error(`QA merge gate refused: ${(error as Error).message}`);
+    process.exitCode = 1;
+  }
 }
