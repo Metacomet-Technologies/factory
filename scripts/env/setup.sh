@@ -203,14 +203,16 @@ if ((check_only)); then
 fi
 
 if ((ci)) && [[ -n "${GITHUB_PATH:-}" ]]; then
-    # Later steps get PATH from GITHUB_PATH, where each line is prepended: write in reverse order.
+    # Later steps get PATH from GITHUB_PATH, which can only prepend: export just the
+    # entries setup put ahead of the original PATH (not Vite+'s appended
+    # fallback-bin), in reverse because each line is prepended.
     IFS=: read -ra entries <<<"$PATH"
-    seen=":$initial_path:"
-    for ((i = ${#entries[@]} - 1; i >= 0; i--)); do
-        [[ "$seen" == *":${entries[i]}:"* ]] && continue
-        echo "${entries[i]}" >>"$GITHUB_PATH"
-        seen+="${entries[i]}:"
+    prefix=()
+    for entry in "${entries[@]}"; do
+        [[ ":$initial_path:" != *":$entry:"* ]] || break
+        [[ " ${prefix[*]} " == *" $entry "* ]] || prefix+=("$entry")
     done
+    for ((i = ${#prefix[@]} - 1; i >= 0; i--)); do echo "${prefix[i]}" >>"$GITHUB_PATH"; done
 fi
 
 log "$changes change(s); checking the contract"
