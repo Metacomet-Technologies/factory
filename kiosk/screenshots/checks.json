@@ -1,149 +1,563 @@
 {
   "reports": [
     {
-      "width": 1728,
-      "height": 1117,
-      "theme": "dark",
+      "name": "kiosk-dark",
+      "url": "http://127.0.0.1:4180/?kiosk",
+      "system": "dark",
+      "saved": null,
+      "expected": "rgb(13, 18, 24)",
+      "reload": "manual",
+      "cacheDisabled": true,
+      "cpuThrottle": 6,
+      "fcpMs": 420,
+      "firstFrameBackground": "rgb(13, 18, 24)",
+      "animationFrameBackgrounds": ["rgb(13, 18, 24)"],
+      "screencastBackgrounds": ["rgb(13, 18, 24)", "rgb(12, 17, 23)"],
+      "frames": 11
+    },
+    {
+      "name": "kiosk-light",
+      "url": "http://127.0.0.1:4180/?kiosk",
+      "system": "light",
+      "saved": null,
+      "expected": "rgb(242, 246, 247)",
+      "reload": "manual",
+      "cacheDisabled": true,
+      "cpuThrottle": 6,
+      "fcpMs": 392,
+      "firstFrameBackground": "rgb(242, 246, 247)",
+      "animationFrameBackgrounds": ["rgb(242, 246, 247)"],
+      "screencastBackgrounds": ["rgb(242, 246, 247)", "rgb(243, 246, 248)"],
+      "frames": 11
+    },
+    {
+      "name": "kiosk-light-saved-dark",
+      "url": "http://127.0.0.1:4180/?kiosk",
+      "system": "light",
+      "saved": "dark",
+      "expected": "rgb(13, 18, 24)",
+      "reload": "manual",
+      "cacheDisabled": true,
+      "cpuThrottle": 6,
+      "fcpMs": 412,
+      "firstFrameBackground": "rgb(13, 18, 24)",
+      "animationFrameBackgrounds": ["rgb(13, 18, 24)"],
+      "screencastBackgrounds": ["rgb(13, 18, 24)", "rgb(12, 17, 23)"],
+      "frames": 11
+    },
+    {
+      "name": "kiosk-dark-saved-light",
+      "url": "http://127.0.0.1:4180/?kiosk",
+      "system": "dark",
+      "saved": "light",
+      "expected": "rgb(242, 246, 247)",
+      "reload": "manual",
+      "cacheDisabled": true,
+      "cpuThrottle": 6,
+      "fcpMs": 372,
+      "firstFrameBackground": "rgb(242, 246, 247)",
+      "animationFrameBackgrounds": ["rgb(242, 246, 247)"],
+      "screencastBackgrounds": ["rgb(242, 246, 247)", "rgb(243, 246, 248)"],
+      "frames": 10
+    },
+    {
+      "name": "kiosk-dark-saved-invalid",
+      "url": "http://127.0.0.1:4180/?kiosk",
+      "system": "dark",
+      "saved": "invalid",
+      "expected": "rgb(13, 18, 24)",
+      "reload": "manual",
+      "cacheDisabled": true,
+      "cpuThrottle": 6,
+      "fcpMs": 436,
+      "firstFrameBackground": "rgb(13, 18, 24)",
+      "animationFrameBackgrounds": ["rgb(13, 18, 24)"],
+      "screencastBackgrounds": ["rgb(13, 18, 24)", "rgb(12, 17, 23)"],
+      "frames": 12
+    },
+    {
+      "name": "kiosk-light-saved-invalid",
+      "url": "http://127.0.0.1:4180/?kiosk",
+      "system": "light",
+      "saved": "invalid",
+      "expected": "rgb(242, 246, 247)",
+      "reload": "manual",
+      "cacheDisabled": true,
+      "cpuThrottle": 6,
+      "fcpMs": 380,
+      "firstFrameBackground": "rgb(242, 246, 247)",
+      "animationFrameBackgrounds": ["rgb(242, 246, 247)"],
+      "screencastBackgrounds": ["rgb(242, 246, 247)", "rgb(243, 246, 248)"],
+      "frames": 10
+    },
+    {
+      "name": "kiosk-dark-saved-blocked",
+      "url": "http://127.0.0.1:4180/?kiosk",
+      "system": "dark",
+      "saved": "blocked",
+      "expected": "rgb(13, 18, 24)",
+      "reload": "manual",
+      "cacheDisabled": true,
+      "cpuThrottle": 6,
+      "fcpMs": 440,
+      "firstFrameBackground": "rgb(13, 18, 24)",
+      "animationFrameBackgrounds": ["rgb(13, 18, 24)"],
+      "screencastBackgrounds": ["rgb(13, 18, 24)", "rgb(12, 17, 23)"],
+      "frames": 11
+    },
+    {
+      "name": "kiosk-light-saved-blocked",
+      "url": "http://127.0.0.1:4180/?kiosk",
+      "system": "light",
+      "saved": "blocked",
+      "expected": "rgb(242, 246, 247)",
+      "reload": "manual",
+      "cacheDisabled": true,
+      "cpuThrottle": 6,
+      "fcpMs": 408,
+      "firstFrameBackground": "rgb(242, 246, 247)",
+      "animationFrameBackgrounds": ["rgb(242, 246, 247)"],
+      "screencastBackgrounds": ["rgb(242, 246, 247)", "rgb(243, 246, 248)"],
+      "frames": 11
+    },
+    {
+      "name": "1728-dark",
+      "path": "screenshots/1728-dark.png",
       "layout": {
         "width": 1728,
-        "height": 1147,
-        "viewport": 1117
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
       },
       "contrast": {
-        "tokens": {
-          "primary": "oklch(38% .17 300)",
-          "primaryForeground": "#fff",
-          "accentText": "oklch(72% .15 300)"
+        "textMin": {
+          "text": "Failing · —",
+          "ratio": 5.092415960938867,
+          "foreground": "rgba(255, 106, 79, 1.00)",
+          "background": "rgba(26, 45, 42, 1.00)"
         },
-        "pairs": {
-          "white / primary": 10.891193213984485,
-          "accent / background": 7.119533634238857,
-          "accent / card": 6.592577798745375,
-          "muted / card": 7.4609161082891475,
-          "muted / muted": 6.4537589497648185,
-          "ok / card": 9.769533847270802,
-          "warn / card": 10.124030082756365,
-          "fail / card": 8.167497240341898
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.6552275302373123,
+          "cue": "border"
         },
-        "failures": []
+        "failures": {
+          "text": [],
+          "controls": []
+        }
       }
     },
     {
-      "width": 1728,
-      "height": 1117,
-      "theme": "light",
+      "name": "1728-dark-details",
+      "path": "screenshots/1728-dark-details.png",
       "layout": {
         "width": 1728,
-        "height": 1147,
-        "viewport": 1117
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
       },
       "contrast": {
-        "tokens": {
-          "primary": "oklch(38% .17 300)",
-          "primaryForeground": "#fff",
-          "accentText": "oklch(38% .17 300)"
+        "textMin": {
+          "text": "Failing · —",
+          "ratio": 5.092415960938867,
+          "foreground": "rgba(255, 106, 79, 1.00)",
+          "background": "rgba(26, 45, 42, 1.00)"
         },
-        "pairs": {
-          "white / primary": 10.891193213984485,
-          "accent / background": 10.084183286498424,
-          "accent / card": 10.891193213984485,
-          "muted / card": 6.0367128204019656,
-          "muted / muted": 5.166516011603871,
-          "ok / card": 6.50567900834632,
-          "warn / card": 6.309291416034444,
-          "fail / card": 6.504336375463541
+        "controlMin": {
+          "control": "24h",
+          "ratio": 3.6552275302373123,
+          "cue": "border"
         },
-        "failures": []
+        "failures": {
+          "text": [],
+          "controls": []
+        }
       }
     },
     {
-      "width": 1024,
-      "height": 768,
-      "theme": "dark",
+      "name": "1728-light",
+      "path": "screenshots/1728-light.png",
       "layout": {
-        "width": 1024,
-        "height": 2057,
-        "viewport": 768
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
       },
       "contrast": {
-        "tokens": {
-          "primary": "oklch(38% .17 300)",
-          "primaryForeground": "#fff",
-          "accentText": "oklch(72% .15 300)"
+        "textMin": {
+          "text": "factory v 0.2.0",
+          "ratio": 5.147580643243988,
+          "foreground": "rgba(79, 97, 105, 1.00)",
+          "background": "rgba(218, 232, 233, 1.00)"
         },
-        "pairs": {
-          "white / primary": 10.891193213984485,
-          "accent / background": 7.119533634238857,
-          "accent / card": 6.592577798745375,
-          "muted / card": 7.4609161082891475,
-          "muted / muted": 6.4537589497648185,
-          "ok / card": 9.769533847270802,
-          "warn / card": 10.124030082756365,
-          "fail / card": 8.167497240341898
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.526574934652464,
+          "cue": "border"
         },
-        "failures": []
+        "failures": {
+          "text": [],
+          "controls": []
+        }
       }
     },
     {
-      "width": 390,
-      "height": 844,
-      "theme": "dark",
+      "name": "1728-light-details",
+      "path": "screenshots/1728-light-details.png",
       "layout": {
-        "width": 390,
-        "height": 3460,
-        "viewport": 844
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
       },
       "contrast": {
-        "tokens": {
-          "primary": "oklch(38% .17 300)",
-          "primaryForeground": "#fff",
-          "accentText": "oklch(72% .15 300)"
+        "textMin": {
+          "text": "factory v 0.2.0",
+          "ratio": 5.147580643243988,
+          "foreground": "rgba(79, 97, 105, 1.00)",
+          "background": "rgba(218, 232, 233, 1.00)"
         },
-        "pairs": {
-          "white / primary": 10.891193213984485,
-          "accent / background": 7.119533634238857,
-          "accent / card": 6.592577798745375,
-          "muted / card": 7.4609161082891475,
-          "muted / muted": 6.4537589497648185,
-          "ok / card": 9.769533847270802,
-          "warn / card": 10.124030082756365,
-          "fail / card": 8.167497240341898
+        "controlMin": {
+          "control": "24h",
+          "ratio": 3.526574934652464,
+          "cue": "border"
         },
-        "failures": []
+        "failures": {
+          "text": [],
+          "controls": []
+        }
       }
     },
     {
-      "width": 390,
-      "height": 844,
-      "theme": "light",
+      "name": "1024-dark",
+      "contrast": {
+        "textMin": {
+          "text": "Failing · —",
+          "ratio": 4.543913227033642,
+          "foreground": "rgba(255, 106, 79, 1.00)",
+          "background": "rgba(45, 51, 56, 1.00)"
+        },
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.663212786949082,
+          "cue": "border"
+        },
+        "failures": {
+          "text": [],
+          "controls": []
+        }
+      }
+    },
+    {
+      "name": "390-dark",
+      "contrast": {
+        "textMin": {
+          "text": "Failing · —",
+          "ratio": 4.543913227033642,
+          "foreground": "rgba(255, 106, 79, 1.00)",
+          "background": "rgba(45, 51, 56, 1.00)"
+        },
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.268155472224116,
+          "cue": "border"
+        },
+        "failures": {
+          "text": [],
+          "controls": []
+        }
+      }
+    },
+    {
+      "name": "390-light",
+      "contrast": {
+        "textMin": {
+          "text": "Pricing update pending",
+          "ratio": 4.7384570336511,
+          "foreground": "rgba(122, 88, 0, 1.00)",
+          "background": "rgba(216, 222, 211, 1.00)"
+        },
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.087436088428532,
+          "cue": "border"
+        },
+        "failures": {
+          "text": [],
+          "controls": []
+        }
+      }
+    },
+    {
+      "name": "1728-dark-outage",
+      "path": "screenshots/1728-dark-outage.png",
       "layout": {
-        "width": 390,
-        "height": 3460,
-        "viewport": 844
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
       },
       "contrast": {
-        "tokens": {
-          "primary": "oklch(38% .17 300)",
-          "primaryForeground": "#fff",
-          "accentText": "oklch(38% .17 300)"
+        "textMin": {
+          "text": "Failing · —",
+          "ratio": 5.085575314968547,
+          "foreground": "rgba(255, 106, 79, 1.00)",
+          "background": "rgba(26, 45, 42, 1.00)"
         },
-        "pairs": {
-          "white / primary": 10.891193213984485,
-          "accent / background": 10.084183286498424,
-          "accent / card": 10.891193213984485,
-          "muted / card": 6.0367128204019656,
-          "muted / muted": 5.166516011603871,
-          "ok / card": 6.50567900834632,
-          "warn / card": 6.309291416034444,
-          "fail / card": 6.504336375463541
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.6436889522635414,
+          "cue": "border"
         },
-        "failures": []
+        "failures": {
+          "text": [],
+          "controls": []
+        }
+      }
+    },
+    {
+      "name": "1728-dark-chart-loading",
+      "path": "screenshots/1728-dark-chart-loading.png",
+      "layout": {
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
+      },
+      "contrast": {
+        "textMin": {
+          "text": "24h",
+          "ratio": 6.0456641374896165,
+          "foreground": "rgba(159, 176, 186, 1.00)",
+          "background": "rgba(30, 50, 47, 1.00)"
+        },
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.645906741683671,
+          "cue": "border"
+        },
+        "failures": {
+          "text": [],
+          "controls": []
+        }
+      }
+    },
+    {
+      "name": "1728-dark-loading",
+      "path": "screenshots/1728-dark-loading.png",
+      "layout": {
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
+      },
+      "contrast": {
+        "textMin": {
+          "text": "24h",
+          "ratio": 6.0456641374896165,
+          "foreground": "rgba(159, 176, 186, 1.00)",
+          "background": "rgba(30, 50, 47, 1.00)"
+        },
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.645906741683671,
+          "cue": "border"
+        },
+        "failures": {
+          "text": [],
+          "controls": []
+        }
+      }
+    },
+    {
+      "name": "1728-dark-error",
+      "path": "screenshots/1728-dark-error.png",
+      "layout": {
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
+      },
+      "contrast": {
+        "textMin": {
+          "text": "HTTP 503 . Retrying on the next refresh.",
+          "ratio": 5.097528340542048,
+          "foreground": "rgba(255, 106, 79, 1.00)",
+          "background": "rgba(26, 45, 42, 1.00)"
+        },
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.66338884702579,
+          "cue": "border"
+        },
+        "failures": {
+          "text": [],
+          "controls": []
+        }
+      }
+    },
+    {
+      "name": "1728-dark-reconnecting",
+      "path": "screenshots/1728-dark-reconnecting.png",
+      "layout": {
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
+      },
+      "contrast": {
+        "textMin": {
+          "text": "HTTP 503 . Retrying on the next refresh.",
+          "ratio": 5.097528340542048,
+          "foreground": "rgba(255, 106, 79, 1.00)",
+          "background": "rgba(26, 45, 42, 1.00)"
+        },
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.66338884702579,
+          "cue": "border"
+        },
+        "failures": {
+          "text": [],
+          "controls": []
+        }
+      }
+    },
+    {
+      "name": "1728-light-outage",
+      "path": "screenshots/1728-light-outage.png",
+      "layout": {
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
+      },
+      "contrast": {
+        "textMin": {
+          "text": "Host health",
+          "ratio": 5.107077019508925,
+          "foreground": "rgba(79, 97, 105, 1.00)",
+          "background": "rgba(226, 229, 230, 1.00)"
+        },
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.5229659090712144,
+          "cue": "border"
+        },
+        "failures": {
+          "text": [],
+          "controls": []
+        }
+      }
+    },
+    {
+      "name": "1728-light-chart-loading",
+      "path": "screenshots/1728-light-chart-loading.png",
+      "layout": {
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
+      },
+      "contrast": {
+        "textMin": {
+          "text": "factory v 0.2.0",
+          "ratio": 5.147580643243988,
+          "foreground": "rgba(79, 97, 105, 1.00)",
+          "background": "rgba(218, 232, 233, 1.00)"
+        },
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.5236343811460817,
+          "cue": "border"
+        },
+        "failures": {
+          "text": [],
+          "controls": []
+        }
+      }
+    },
+    {
+      "name": "1728-light-loading",
+      "path": "screenshots/1728-light-loading.png",
+      "layout": {
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
+      },
+      "contrast": {
+        "textMin": {
+          "text": "factory v 0.2.0",
+          "ratio": 5.147580643243988,
+          "foreground": "rgba(79, 97, 105, 1.00)",
+          "background": "rgba(218, 232, 233, 1.00)"
+        },
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.5236343811460817,
+          "cue": "border"
+        },
+        "failures": {
+          "text": [],
+          "controls": []
+        }
+      }
+    },
+    {
+      "name": "1728-light-error",
+      "path": "screenshots/1728-light-error.png",
+      "layout": {
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
+      },
+      "contrast": {
+        "textMin": {
+          "text": "factory v 0.2.0",
+          "ratio": 5.147580643243988,
+          "foreground": "rgba(79, 97, 105, 1.00)",
+          "background": "rgba(218, 232, 233, 1.00)"
+        },
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.531839977204194,
+          "cue": "border"
+        },
+        "failures": {
+          "text": [],
+          "controls": []
+        }
+      }
+    },
+    {
+      "name": "1728-light-reconnecting",
+      "path": "screenshots/1728-light-reconnecting.png",
+      "layout": {
+        "width": 1728,
+        "height": 1117,
+        "viewport": 1117,
+        "dashboardOverflow": 0
+      },
+      "contrast": {
+        "textMin": {
+          "text": "Reconnecting",
+          "ratio": 5.069932318084792,
+          "foreground": "rgba(122, 88, 0, 1.00)",
+          "background": "rgba(228, 228, 218, 1.00)"
+        },
+        "controlMin": {
+          "control": "1h",
+          "ratio": 3.531839977204194,
+          "cue": "border"
+        },
+        "failures": {
+          "text": [],
+          "controls": []
+        }
       }
     }
   ],
-  "errors": [],
-  "layoutFailures": [
-    "Kiosk does not fit (dark): 1147 > 1117; original label also 1147",
-    "Kiosk does not fit (light): 1147 > 1117; original label also 1147"
-  ]
+  "errors": []
 }

@@ -11,6 +11,7 @@ export default function DevicesChart({ history }: { history: DeviceHistory["poin
       ariaLabel="CPU utilization history"
       className="trend-chart trend-chart-tall"
       caption="CPU · 0–100%"
+      variant="area"
     />
   );
 }

@@ -5,20 +5,20 @@ import { startAmbientPerf } from "./perf";
 import { AmbientScene } from "./scene";
 
 describe("parseAmbient", () => {
-  it("keeps the v1 kiosk without a known mode", () => {
-    expect(parseAmbient("")).toEqual({ mode: null, perf: false });
-    expect(parseAmbient("?ambient=")).toEqual({ mode: null, perf: false });
-    expect(parseAmbient("?ambient=stars")).toEqual({ mode: null, perf: false });
-    expect(parseAmbient("?ambient=BOTH")).toEqual({ mode: null, perf: false });
+  it("defaults to both without a known mode", () => {
+    expect(parseAmbient("")).toEqual({ mode: "both", perf: false });
+    expect(parseAmbient("?ambient=")).toEqual({ mode: "both", perf: false });
+    expect(parseAmbient("?ambient=stars")).toEqual({ mode: "both", perf: false });
+    expect(parseAmbient("?ambient=BOTH")).toEqual({ mode: "both", perf: false });
   });
-  it("accepts each spike mode", () => {
+  it("accepts each diagnostic mode", () => {
     for (const mode of ["both", "sweep", "none", "static"])
       expect(parseAmbient(`?ambient=${mode}`)).toEqual({ mode, perf: false });
   });
   it("turns perf on only for perf=1", () => {
     expect(parseAmbient("?ambient=both").perf).toBe(false);
     expect(parseAmbient("?perf=true").perf).toBe(false);
-    expect(parseAmbient("?perf=1")).toEqual({ mode: null, perf: true });
+    expect(parseAmbient("?perf=1")).toEqual({ mode: "both", perf: true });
     expect(parseAmbient("?perf=1&ambient=static")).toEqual({ mode: "static", perf: true });
   });
 });
@@ -84,12 +84,11 @@ describe("AmbientScene", () => {
     expect(none.container.querySelector(".fk-sweep")).toBeNull();
   });
 
-  it("scopes the glass to the mounted mode", () => {
+  it("publishes the mounted mode and the static sky image on :root", () => {
     motion(false);
     const root = document.documentElement;
     const scene = render(<AmbientScene mode="static" dark={false} />);
     expect(root.dataset.ambient).toBe("static");
-    expect(root.style.getPropertyValue("--fk-sky-4")).toBe("light-dark(#f2cdb5, #6b4c42)");
     // The pre-blurred image uses the dawn sky until the theme turns dark.
     expect(decodeURIComponent(root.style.getPropertyValue("--fk-static-sky"))).toContain("#f2cdb5");
     scene.rerender(<AmbientScene mode="static" dark />);

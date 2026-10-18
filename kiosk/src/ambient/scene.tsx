@@ -3,8 +3,8 @@ import { cn } from "@/lib/utils";
 import { useReducedMotion } from "@/lib/motion";
 import type { AmbientMode } from "./mode";
 
-// [dawn, night] from docs/design/kiosk-v2/tokens.json. AmbientScene sets them on :root as
-// --fk-<name> only while a mode is active; the static sky image reads them directly.
+// [dawn, night] from docs/design/kiosk-v2/tokens.json, mirrored here for the `static` sky
+// image, which is rendered as a data URL and so cannot read the CSS tokens in index.css.
 const COLORS = {
   "sky-0": ["#f7fafb", "#0b1016"],
   "sky-1": ["#ebf2f4", "#0f1820"],
@@ -15,13 +15,7 @@ const COLORS = {
   "ridge-mid": ["#a9c3c9", "#141f27"],
   "ridge-near": ["#8fb0b8", "#0c141a"],
   snow: ["#ffffff", "#f7e0d0"],
-  glow: ["#e0895a", "#f2a477"],
   rim: ["#00756c", "#3fd1c2"], // accent-text
-  aurora: ["#286d1a", "#7ee081"], // ok
-  star: ["#102026", "#eef4f6"], // foreground
-  "glass-card": ["#ffffff", "#101820"],
-  "glass-edge": ["#ffffffbf", "#ffffff24"],
-  "glass-glint": ["#ffffff8c", "#ffffff12"],
 } as const;
 
 // The band is drawn in a 1728 × 360 box (`band-height`) and stretched to the viewport
@@ -117,7 +111,7 @@ const STARS = Array.from({ length: 50 }, () => {
 
 const viewport = () => ({ width: window.innerWidth, height: window.innerHeight });
 
-/** MET-237 spike backdrop: sky, ridgeline band and the ambient layers for `mode`. */
+/** The kiosk backdrop: sky, Teton ridgeline band and the ambient layers for `mode`. */
 export function AmbientScene({ mode, dark }: { mode: AmbientMode; dark: boolean }) {
   const reduced = useReducedMotion();
   const [size, setSize] = useState(viewport);
@@ -130,11 +124,8 @@ export function AmbientScene({ mode, dark }: { mode: AmbientMode; dark: boolean 
   useLayoutEffect(() => {
     const root = document.documentElement;
     root.dataset.ambient = mode;
-    for (const [name, [dawn, night]] of Object.entries(COLORS))
-      root.style.setProperty(`--fk-${name}`, `light-dark(${dawn}, ${night})`);
     return () => {
       delete root.dataset.ambient;
-      for (const name of Object.keys(COLORS)) root.style.removeProperty(`--fk-${name}`);
     };
   }, [mode]);
   useLayoutEffect(() => {

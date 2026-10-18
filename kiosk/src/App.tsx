@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Activity, Cpu, Moon, Server, Sun, Terminal, Info } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Activity, Cpu, Moon, Mountain, Server, Sun, Terminal, Info } from "lucide-react";
 import { useApi, useHeld } from "./api/client";
 import { useStream } from "./api/stream";
 import { useBuildUpdate } from "./api/build-update";
@@ -15,8 +15,9 @@ import { Button } from "./components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
 import { LiveIndicator } from "./components/ui/live-indicator";
 import { PageHeader } from "./components/ui/page-header";
+import { Verdict } from "./components/ui/verdict";
 import { VersionFooter } from "./components/version-footer";
-import { UpsBadge, UpsSection } from "./components/ups";
+import { UpsBadge, UpsSection, upsState } from "./components/ups";
 import { NetworkSection } from "./components/network";
 import UpsPage from "./components/ups-page";
 import DevicesPage from "./components/devices-page";
@@ -25,8 +26,11 @@ import NetworkPage from "./components/network-page";
 import { parseAmbient } from "./ambient/mode";
 import { startAmbientPerf } from "./ambient/perf";
 import { AmbientScene } from "./ambient/scene";
+import { pulse } from "./lib/motion";
+import { freshStatus, networkBadge } from "./lib/network";
+import { verdict } from "./lib/verdict";
 
-// MET-237 spike: read once at load; no parameter keeps the v1 kiosk unchanged.
+// Read once at load: `?ambient=none|static` is a diagnostic override, `?perf=1` samples frames.
 const ambient = parseAmbient(window.location.search);
 
 /** Same-origin links without a modifier key route in-app; everything else falls through. */
@@ -68,7 +72,7 @@ export default function App() {
       document.removeEventListener("click", followLink);
     };
   }, []);
-  useEffect(() => (ambient.perf ? startAmbientPerf(ambient.mode ?? "v1") : undefined), []);
+  useEffect(() => (ambient.perf ? startAmbientPerf(ambient.mode) : undefined), []);
   const [dark, setDark] = useState(() => document.documentElement.dataset.theme === "dark");
   const [followsSystem, setFollowsSystem] = useState(
     () => !document.documentElement.dataset.themePreference,
@@ -137,9 +141,40 @@ export default function App() {
       ? remoteLive
       : deviceCurrent.data;
   useBuildUpdate(live.snapshotRevision, usage.loading || gpu.loading);
+  // One pulse per refresh: every revision that triggers a refetch or a pushed frame, but
+  // not the per-second GPU samples. The first render is the initial load, not an event.
+  const refresh =
+    live.snapshotRevision +
+    live.fleetRevision +
+    live.pricingRevision +
+    live.agentsRevision +
+    live.devicesRevision +
+    live.networkRevision +
+    live.upsEventRevision;
+  const firstRefresh = useRef(true);
+  useEffect(() => {
+    if (firstRefresh.current) {
+      firstRefresh.current = false;
+      return;
+    }
+    pulse();
+  }, [refresh]);
+  const overview = verdict({
+    fleet,
+    gpu,
+    usage,
+    pricing,
+    agents,
+    devices,
+    network,
+    networkBadge: networkBadge(freshStatus(network.data, now)),
+    ups: upsState({ current: upsCurrent, now }),
+    upsCurrent,
+    stream: live.status,
+  });
   return (
     <TooltipProvider>
-      {ambient.mode && <AmbientScene mode={ambient.mode} dark={dark} />}
+      <AmbientScene mode={ambient.mode} dark={dark} />
       <a href="#main" className="skip-link">
         Skip to dashboard
       </a>
@@ -147,7 +182,7 @@ export default function App() {
         <nav className="brand" aria-label="Breadcrumb">
           <a href="/" className="brand-home">
             <span className="brand-mark">
-              <Activity aria-hidden="true" size={20} />
+              <Mountain aria-hidden="true" size={18} />
             </span>
             <h1>factory</h1>
           </a>
@@ -253,6 +288,7 @@ export default function App() {
             title="Your local compute. In focus."
             aside="Auto-refreshes every 60s"
           />
+          <Verdict issues={overview.issues} okCount={overview.okCount} />
           <div className="dashboard-grid">
             <FleetSection
               resource={fleet}
