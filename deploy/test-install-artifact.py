@@ -171,7 +171,7 @@ esac""",
     "getent": 'echo "$2:x:999:"',
 }
 # Disposable deployment state: tmpfs mounts plus the files each preflight requires.
-SETUP = """mkdir -p /run/systemd/system /var/lib/factory-api /var/backups/factory-db /usr/local/bin \\
+SETUP = """mkdir -p /run/systemd/system /srv/factory /var/lib/factory-api /var/backups/factory-db /usr/local/bin \\
     /usr/local/lib/factory-backup /etc/systemd/system/ollama.service.d
 touch /etc/systemd/system/ollama.service.d/override.conf /etc/factory-backup/nodes.conf \\
     /usr/local/lib/factory-backup/factory-backup.sh /usr/local/lib/factory-backup/restore-check.sh
