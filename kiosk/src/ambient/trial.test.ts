@@ -18,11 +18,17 @@ const kioskFlags = [
 describe("ambient-trial.sh --dry-run", () => {
   let root: string;
   let env: NodeJS.ProcessEnv;
-  const process_ = (pid: number, uid: number, argv: string[], environ: string[] = []) => {
+  const process_ = (
+    pid: number,
+    uid: number,
+    argv: string[],
+    environ: string[] = [],
+    cmdline = `${argv.join("\0")}\0`,
+  ) => {
     const dir = join(root, "proc", String(pid));
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "status"), `Name:\tchrome\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\n`);
-    writeFileSync(join(dir, "cmdline"), `${argv.join("\0")}\0`);
+    writeFileSync(join(dir, "cmdline"), cmdline);
     writeFileSync(join(dir, "environ"), `${environ.join("\0")}\0`);
   };
   const tool = (name: string, body: string) => {
@@ -56,7 +62,14 @@ describe("ambient-trial.sh --dry-run", () => {
     );
     tool("id", '[[ $* == "-u console" ]] && echo 1001 || echo 0');
     tool("hostname", "echo ${FAKE_HOST:-factory-console}");
-    tool("runuser", `echo "runuser $*" >> "${root}/runuser.log"`);
+    tool(
+      "runuser",
+      `if [[ $* == *"systemctl --user show-environment"* ]]; then
+  printf '%s\\n' "\${SYSTEMD_ENV:-}"
+else
+  echo "runuser $*" >> "${root}/runuser.log"
+fi`,
+    );
     env = {
       PATH: `${join(root, "bin")}:/usr/bin:/bin`,
       AMBIENT_TRIAL_PROC: join(root, "proc"),
@@ -96,6 +109,37 @@ describe("ambient-trial.sh --dry-run", () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("mode v1, 3 min");
     expect(result.stdout).toContain("--app=https://factory-gpu.bearded-pompano.ts.net/\\?perf=1 ");
+  });
+
+  it("finds Chrome after its cmdline is rewritten as a space-joined title", () => {
+    process_(
+      2953,
+      1001,
+      ["/opt/google/chrome/chrome", ...kioskFlags],
+      ["WAYLAND_DISPLAY=wayland-0", "DISPLAY=:0", "XDG_RUNTIME_DIR=/run/user/1001"],
+      ["/opt/google/chrome/chrome", ...kioskFlags].join(" "),
+    );
+    const result = run("--dry-run", "both");
+    expect(result).toMatchObject({ status: 0, stderr: "" });
+    expect(result.stdout).toContain("kiosk pid 2953");
+  });
+
+  it("uses the console systemd environment when Chrome's environment is empty", () => {
+    writeFileSync(join(root, "proc", "2953", "environ"), "");
+    env.SYSTEMD_ENV = [
+      "XDG_RUNTIME_DIR=/run/user/1001",
+      "DISPLAY=:0",
+      "WAYLAND_DISPLAY=wayland-0",
+      "XAUTHORITY=/run/user/1001/.Xauthority",
+      "KIOSK_SECRET=not-allowed",
+    ].join("\n");
+
+    const result = run("--dry-run", "both");
+    expect(result).toMatchObject({ status: 0, stderr: "" });
+    expect(result.stdout).toContain(
+      "XDG_RUNTIME_DIR=/run/user/1001 DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XAUTHORITY=/run/user/1001/.Xauthority",
+    );
+    expect(result.stdout).not.toContain("KIOSK_SECRET");
   });
 
   it("refuses the wrong host, a missing kiosk, a held lock and bad arguments", () => {
