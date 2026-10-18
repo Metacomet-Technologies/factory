@@ -57,7 +57,7 @@ describe("verdict", () => {
       { tone: "fail", label: "factory-console offline" },
       { tone: "warn", label: "factory-gpu host warning" },
       { tone: "warn", label: "1 pricing family pending" },
-      { tone: "warn", label: "Network degraded · wan loss" },
+      { tone: "warn", label: "Network degraded · WAN loss" },
     ]);
     // Fleet, factory-gpu, meter-http, Hosts, GPU, Local LLM, Pricing, Network, UPS, stream.
     expect(result.okCount).toBe(10);
@@ -67,7 +67,7 @@ describe("verdict", () => {
     expect(result.issues.map((issue) => issue.label)).toEqual([
       "Fleet unavailable",
       "factory-gpu host warning",
-      "Network degraded · wan loss",
+      "Network degraded · WAN loss",
       "Stream reconnecting",
     ]);
     expect(result.okCount).toBe(5);

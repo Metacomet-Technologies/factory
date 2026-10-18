@@ -70,7 +70,7 @@ export function verdict(input: VerdictInput): { issues: VerdictIssue[]; okCount:
     check(
       input.networkBadge.tone === "ok",
       input.networkBadge.tone === "fail" ? "fail" : "warn",
-      `Network ${input.networkBadge.label.toLowerCase()}`,
+      `Network ${input.networkBadge.label.charAt(0).toLowerCase()}${input.networkBadge.label.slice(1)}`,
     );
   if (input.ups !== "No data" || input.upsCurrent)
     check(

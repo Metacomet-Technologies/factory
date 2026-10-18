@@ -527,8 +527,9 @@ export function TickerSection({
   index?: number;
 }) {
   // Rows that arrive after mount slide in once; the keys stay stable across arrivals so the
-  // existing rows keep still instead of remounting.
-  const [since] = useState(() => requests[0]?.ts_ms ?? null);
+  // existing rows keep still instead of remounting. The list is newest first, and it is empty
+  // on a normal load, so an empty mount means every later row is new.
+  const [since] = useState(() => requests[0]?.ts_ms ?? -Infinity);
   const keys = requests.map(
     (event, index) =>
       `${event.ts_ms}-${requests.slice(0, index).filter((prior) => prior.ts_ms === event.ts_ms).length}`,
@@ -557,10 +558,7 @@ export function TickerSection({
         ) : (
           <ul className="ticker">
             {requests.map((event, index) => (
-              <li
-                key={keys[index]}
-                className={since != null && event.ts_ms > since ? "fk-new" : undefined}
-              >
+              <li key={keys[index]} className={event.ts_ms > since ? "fk-new" : undefined}>
                 <div className="row">
                   <h3>{event.data.model ?? "Non-model request"}</h3>
                   <span className="muted">{time(event.ts_ms)}</span>

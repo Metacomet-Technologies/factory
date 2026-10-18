@@ -11,7 +11,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { count, ms, usd, number, seen } from "./lib/format";
 import { upsChartData } from "./lib/ups";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
-import { AgentsSection, FleetSection } from "./components/sections";
+import { AgentsSection, FleetSection, TickerSection } from "./components/sections";
 import { VersionFooter } from "./components/version-footer";
 const openLlmDetails = async () => {
   fireEvent.click(screen.getByRole("link", { name: "Local LLM usage, pricing and model details" }));
@@ -877,6 +877,31 @@ describe("dashboard contract", () => {
     expect(screen.getByRole("tab", { name: "First" })).toHaveAttribute("aria-selected", "true");
     fireEvent.click(screen.getByRole("tab", { name: "Second" }));
     await waitFor(() => expect(screen.getByRole("tabpanel")).toHaveTextContent("Second panel"));
+  });
+  it("slides in only the ticker rows that arrive after mount", () => {
+    const request = (ts_ms: number, model: string) =>
+      ({
+        type: "llm.request",
+        ts_ms,
+        data: { model, prompt_tokens: 10, output_tokens: 5, latency_ms: 50, client_hostname: "c" },
+      }) as const;
+    // The stream starts empty on a normal load; the first row to arrive is new.
+    const empty = render(<TickerSection requests={[]} connected />);
+    empty.rerender(<TickerSection requests={[request(1000, "first")]} connected />);
+    expect(screen.getByRole("heading", { name: "first" }).closest("li")).toHaveClass("fk-new");
+    empty.unmount();
+    // Rows present at mount stay still (newest first); a later arrival is the only new row.
+    const existing = [request(2000, "older-b"), request(1000, "older-a")];
+    const { rerender } = render(<TickerSection requests={existing} connected />);
+    const olderB = screen.getByRole("heading", { name: "older-b" }).closest("li");
+    expect(olderB).not.toHaveClass("fk-new");
+    rerender(<TickerSection requests={[request(3000, "newer"), ...existing]} connected />);
+    expect(screen.getByRole("heading", { name: "newer" }).closest("li")).toHaveClass("fk-new");
+    expect(screen.getByRole("heading", { name: "older-b" }).closest("li")).toBe(olderB);
+    expect(olderB).not.toHaveClass("fk-new");
+    expect(screen.getByRole("heading", { name: "older-a" }).closest("li")).not.toHaveClass(
+      "fk-new",
+    );
   });
 });
 describe("frontier capacity", () => {
