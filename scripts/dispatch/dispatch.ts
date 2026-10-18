@@ -282,7 +282,7 @@ const fields = {
   attachments: 'url metadata createdAt',
 };
 const issueFields = `id identifier title description priority createdAt completedAt canceledAt team { id key } state { type }
-  ${Object.entries(fields).map(([name, selection]) => `${name}(first: 20) { nodes { ${selection} } ${page} }`).join('\n')}`;
+  ${Object.entries(fields).map(([name, selection]) => `${name}(first: ${name === 'comments' ? 100 : 20}) { nodes { ${selection} } ${page} }`).join('\n')}`;
 
 async function amp(args: string[]) {
   return new Promise<string>((resolve, reject) => {
@@ -315,6 +315,13 @@ async function searchThreads(args: string[], requireTitle: boolean) {
 }
 
 export async function run(command: string, identifier: string | undefined, dryRun: boolean) {
+  const budget = { requests: 0, remaining: null as number | null, reset_ms: null as number | null };
+  try { await runPass(command, identifier, dryRun, budget); }
+  finally { console.log(JSON.stringify({ decision: 'linear-budget', ...budget })); }
+}
+
+async function runPass(command: string, identifier: string | undefined, dryRun: boolean,
+  budget: { requests: number; remaining: number | null; reset_ms: number | null }) {
   if (!supportedNode(process.versions.node)) throw new Error(`Use Node 24.x (>= 24.12.0); found ${process.versions.node}`);
   const team = process.env.DISPATCH_TEAM ?? 'MET';
   const cap = Number(process.env.DISPATCH_MAX_ACTIVE_PER_RUNNER ?? 2);
@@ -391,14 +398,30 @@ export async function run(command: string, identifier: string | undefined, dryRu
   }
   async function query(document: string, variables: object = {}) {
     let response;
+    budget.requests++;
     try {
       response = await fetch(endpoint, { method: 'POST', headers: { Authorization: key, 'Content-Type': 'application/json' }, body: JSON.stringify({ query: document, variables }), signal: AbortSignal.timeout(30_000) });
     } catch { throw new Error('Linear request failed; outcome may be unknown'); }
-    if (!response.ok) throw new Error(`Linear HTTP ${response.status}; outcome may be unknown`);
+    for (const [field, header] of [['remaining', 'x-ratelimit-requests-remaining'], ['reset_ms', 'x-ratelimit-requests-reset']] as const) {
+      const value = response.headers.get(header);
+      if (value !== null) budget[field] = /^\d+$/.test(value) && Number.isSafeInteger(Number(value))
+        && (field !== 'reset_ms' || Number(value) <= 8.64e15) ? Number(value) : null;
+    }
     let result;
-    try { result = await response.json(); }
-    catch { throw new Error('Linear returned invalid JSON; outcome may be unknown'); }
-    if (result.errors?.length || !result.data) throw new Error('Linear GraphQL error; outcome may be unknown');
+    try { result = await response.json(); } catch { result = undefined; }
+    if (!response.ok || result?.errors?.length || !result?.data) {
+      const errors = Array.isArray(result?.errors) ? result.errors.map(error => ({
+        code: typeof error?.extensions?.code === 'string' ? redact(error.extensions.code) : null,
+        message: typeof error?.message === 'string' ? redact(error.message).slice(0, 200) : null,
+      })) : [];
+      log('linear-error', { status: response.status, errors });
+      if (errors.some(error => error.code === 'RATELIMITED')) {
+        throw new Error(`Linear rate limited; resets ${budget.reset_ms === null ? 'unknown' : new Date(budget.reset_ms).toISOString()}`);
+      }
+      if (!response.ok) throw new Error(`Linear HTTP ${response.status}; outcome may be unknown`);
+      if (result === undefined) throw new Error('Linear returned invalid JSON; outcome may be unknown');
+      throw new Error('Linear GraphQL error; outcome may be unknown');
+    }
     return result.data;
   }
   async function pages(document: string, variables: object, select: (data: any) => any) {
@@ -547,10 +570,14 @@ export async function run(command: string, identifier: string | undefined, dryRu
     log('cursor-usage', { issue: issue.identifier, agent: id, final: !!text });
   }
 
-  const raw = await pages(`query Queue($filter: IssueFilter!, $after: String) { issues(filter: $filter, first: 20, after: $after, includeArchived: true) { nodes { ${issueFields} } ${page} } }`, {
-    filter: { team: { key: { eq: team } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }, { comments: { some: { body: { contains: '<!-- factory-qa:' } } } }] },
+  const since = new Date(Date.now() - 7 * 24 * 60 * 60_000).toISOString();
+  const raw = await pages(`query Queue($filter: IssueFilter!, $after: String) { issues(filter: $filter, first: 20, after: $after) { nodes { ${issueFields} } ${page} } }`, {
+    filter: { team: { key: { eq: team } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }, { comments: { some: { body: { contains: '<!-- factory-qa:' } } } }],
+      and: [{ or: [{ state: { type: { nin: ['completed', 'canceled'] } } }, { completedAt: { gte: since } }, { canceledAt: { gte: since } }] }] },
   }, data => data.issues);
-  const issues = await Promise.all(raw.map(hydrate));
+  const issues: Issue[] = [];
+  // Keep overflow reads sequential so a failed request stops all further Linear work.
+  for (const item of raw) issues.push(await hydrate(item));
   if (identifier && !issues.some(issue => issue.identifier === identifier)) {
     issues.push(await hydrate((await query(`query OneIssue($id: String!) { issue(id: $id) { ${issueFields} } }`, { id: identifier })).issue));
   }

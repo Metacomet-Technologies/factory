@@ -306,17 +306,21 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
 `, { mode: 0o755 });
   const mutations: any[] = [];
   const queries: any[] = [];
+  const linearRequests: any[] = [];
   const children = new Set<any>();
   let current: any;
   let crash = options.crash;
   const pageSize = options.pageSize ?? 100;
-  function page(nodes: any[], after: string | null = null) {
+  function page(nodes: any[], after: string | null = null, first = 100) {
     const start = Number(after ?? 0);
-    const end = start + pageSize;
+    const end = start + Math.min(pageSize, first);
     return { nodes: structuredClone(nodes.slice(start, end)), pageInfo: { hasNextPage: end < nodes.length, endCursor: String(Math.min(end, nodes.length)) } };
   }
-  function wire(i: any) {
-    return { ...structuredClone(i), ...Object.fromEntries(['labels', 'comments', 'inverseRelations', 'attachments'].map(name => [name, page(i[name])])) };
+  function first(query: string, name: string) {
+    return Number(query.match(new RegExp(`${name}\\([^)]*first: (\\d+)`))?.[1] ?? 100);
+  }
+  function wire(i: any, query: string) {
+    return { ...structuredClone(i), ...Object.fromEntries(['labels', 'comments', 'inverseRelations', 'attachments'].map(name => [name, page(i[name], null, first(query, name))])) };
   }
   // Fake Cursor Cloud Agents v1: options.cursor may override any response.
   const cursor = { requests: [] as any[], agents: {} as Record<string, any>, runs: {} as Record<string, any> };
@@ -389,6 +393,14 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
       for await (const chunk of request) text += chunk;
       const { query, variables: v } = JSON.parse(text);
       const operation = query.match(/^(?:query|mutation) (\w+)/)[1];
+      linearRequests.push({ operation, query, ...v });
+      const reply = options.linearResponse?.(linearRequests.at(-1), linearRequests.length);
+      for (const [name, value] of Object.entries(reply?.headers ?? {})) response.setHeader(name, String(value));
+      if (reply?.status) {
+        response.statusCode = reply.status;
+        response.end(typeof reply.body === 'string' ? reply.body : JSON.stringify(reply.body));
+        return;
+      }
       const i = issues.find(i => i.id === (v.id ?? v.issueId ?? v.input?.issueId) || i.identifier === v.id);
       let data: any;
       if (query.startsWith('mutation')) {
@@ -407,7 +419,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
         else if (operation === 'RemoveLabel') { i.labels = i.labels.filter((label: any) => label.id !== v.labelId); data = { issueRemoveLabel: { success: true } }; }
         else if (operation === 'Move') {
           i.stateId = v.input.stateId;
-          if (i.stateId === 'done-id') i.state = { type: 'completed' };
+          if (i.stateId === 'done-id') { i.state = { type: 'completed' }; i.completedAt = new Date(now).toISOString(); }
           if (i.stateId === 'started-id') i.state = { type: 'started' };
           data = { issueUpdate: { success: true } };
         }
@@ -420,15 +432,22 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
         if (options.invalidJSON) { response.end(`not JSON: ${key}`); return; }
         if (operation === 'Queue') {
           assert.match(query, /team \{ id key \} state \{ type \}/);
-          assert.deepEqual(v.filter, { team: { key: { eq: 'MET' } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }, { comments: { some: { body: { contains: '<!-- factory-qa:' } } } }] });
-          const selected = issues.filter(i => i.team.key === 'MET' && (labeled(i) || i.comments.some((c: any) => /<!-- factory-(?:dispatch|qa):/.test(c.body))));
-          const connection = page(selected, v.after);
-          connection.nodes = connection.nodes.map(wire);
+          assert.doesNotMatch(query, /includeArchived/);
+          const since = v.filter.and?.[0]?.or?.[1]?.completedAt?.gte;
+          assert.ok(Number.isFinite(Date.parse(since)));
+          assert.deepEqual(v.filter, { team: { key: { eq: 'MET' } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }, { comments: { some: { body: { contains: '<!-- factory-qa:' } } } }],
+            and: [{ or: [{ state: { type: { nin: ['completed', 'canceled'] } } }, { completedAt: { gte: since } }, { canceledAt: { gte: since } }] }] });
+          const selected = issues.filter(i => !i.archivedAt && i.team.key === 'MET'
+            && (labeled(i) || i.comments.some((c: any) => /<!-- factory-(?:dispatch|qa):/.test(c.body)))
+            && (!v.filter.and[0].or[0].state.type.nin.includes(i.state.type)
+              || Date.parse(i.completedAt) >= Date.parse(since) || Date.parse(i.canceledAt) >= Date.parse(since)));
+          const connection = page(selected, v.after, first(query, 'issues'));
+          connection.nodes = connection.nodes.map(i => wire(i, query));
           data = { issues: connection };
-        } else if (operation === 'OneIssue') data = { issue: wire(i) };
+        } else if (operation === 'OneIssue') data = { issue: wire(i, query) };
         else if (operation === 'IssuePage') {
           const name = query.match(/\{ issue\(id: \$id\) \{ (\w+)/)[1];
-          data = { issue: { [name]: page(i[name], v.after) } };
+          data = { issue: { [name]: page(i[name], v.after, first(query, name)) } };
         } else if (operation === 'States') {
           assert.deepEqual(v.filter, { team: { key: { eq: 'MET' } }, name: { eq: 'In Progress' } });
           data = { workflowStates: page([{ id: 'started-id', name: 'In Progress', type: 'started' }], v.after) };
@@ -474,7 +493,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
   // Label/group tests use allCalls and inspect the persisted threads.
   return { issues, get mutations() { return mutations.filter(m => !m.input?.body?.includes('<!-- factory-dispatch:labeled ')); },
     allMutations: mutations,
-    allCalls, queries, run, directory, sweepPath, setSweep, cursor,
+    allCalls, queries, linearRequests, run, directory, sweepPath, setSweep, cursor,
     check: (pr = '90', head = sha, env = {}) => run(['check', pr, head], env, fileURLToPath(new URL('qa.ts', import.meta.url))),
     setGitHub: (github: any) => writeFileSync(githubFile, JSON.stringify(github)),
     githubCalls: () => existsSync(githubFile + '-calls') ? readFileSync(githubFile + '-calls', 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [],
@@ -1032,6 +1051,120 @@ test('GraphQL errors and rejected claim mutations stop before Amp', { timeout: 1
   }
 });
 
+test('MET-256: 150 marker-bearing issues cost at most 10 requests per dry-run poll', { timeout: 15_000 }, async t => {
+  const issues = Array.from({ length: 150 }, (_, n) => issue(n + 1, {
+    labels: [], state: { type: n < 120 ? (n % 2 ? 'canceled' : 'completed') : 'started' },
+    completedAt: n < 120 && n % 2 === 0 ? '2026-10-01T12:00:00Z' : null,
+    canceledAt: n < 120 && n % 2 === 1 ? '2026-10-01T12:00:00Z' : null,
+    comments: [claimComment(), ...Array.from({ length: n < 100 ? 29 : 0 }, () => ({ body: 'ordinary comment' }))],
+  }));
+  const f = await fixture(t, issues);
+  const result = await f.run(['poll', '--dry-run']);
+  assert.equal(result.code, 0, result.stdout);
+  const requests = f.queries.length + f.allMutations.length;
+  t.diagnostic(`150-issue dry-run: ${requests} Linear requests`);
+  assert.ok(requests <= 10, `${requests} requests exceeds 10`);
+  assert.equal(f.queries.some(q => q.operation === 'IssuePage'), false);
+  const observed = result.stdout.split('\n').filter(Boolean).map(line => JSON.parse(line))
+    .filter(line => line.decision === 'stage-policy' && line.stage === 'spec').map(line => line.issue);
+  assert.deepEqual(observed, issues.slice(120).map(i => i.identifier));
+  assert.deepEqual(f.allCalls(), [['threads', 'search', 'author:me archived:false', '--json', '--limit', '500']]);
+  assert.equal(f.allMutations.length, 0);
+});
+
+test('MET-256: queue scopes both finish dates, keeps live work and honors team, markers and archive status', async t => {
+  const closed = (n: number, state: string, date: string | null) => issue(n, {
+    labels: [], state: { type: state }, comments: [claimComment()],
+    completedAt: state === 'completed' ? date : null, canceledAt: state === 'canceled' ? date : null,
+  });
+  const issues = [closed(1, 'completed', '2026-10-06T12:00:00.000Z'), closed(2, 'canceled', '2026-10-06T12:00:00.000Z'),
+    closed(3, 'completed', '2026-10-06T11:59:59.999Z'), closed(4, 'canceled', '2026-10-06T11:59:59.999Z'),
+    closed(5, 'completed', null), closed(6, 'canceled', null),
+    ...['triage', 'backlog', 'unstarted', 'started'].map((state, n) => closed(n + 7, state, null)),
+    issue(11), issue(12, { labels: [] }), issue(13, { team: { key: 'OTHER' } }),
+    issue(14, { archivedAt: '2026-10-12T00:00:00Z' }),
+    issue(15, { labels: [], comments: [{ body: '<!-- factory-qa:old-marker -->' }] })];
+  const f = await fixture(t, issues);
+  const result = await f.run(['poll', '--dry-run']);
+  assert.equal(result.code, 0, result.stdout);
+  assert.equal(f.queries[0].filter.and[0].or[1].completedAt.gte, '2026-10-06T12:00:00.000Z');
+  const observed = result.stdout.split('\n').filter(Boolean).map(line => JSON.parse(line))
+    .filter(line => line.decision === 'stage-policy' && line.stage === 'spec').map(line => line.issue);
+  assert.deepEqual(observed, [1, 2, 7, 8, 9, 10, 11, 15].map(n => `MET-${n}`));
+});
+
+test('MET-256: comments at 100 avoid overflow; later markers still prevent duplicate dispatch in Queue and OneIssue', async t => {
+  for (const count of [30, 100, 201]) for (const manual of [false, true]) {
+    const i = issue(123, { labels: issue().labels.filter(label => !manual || label.name !== 'dispatch'),
+      comments: Array.from({ length: count }, (_, n) => ({ body: n === count - 1
+        ? '<!-- factory-dispatch:claim runner:gpu -->' : 'ordinary comment' })),
+      ...(manual ? { state: { type: 'completed' }, completedAt: '2026-10-01T00:00:00Z' } : {}),
+    });
+    const f = await fixture(t, [i]);
+    const result = await f.run(manual ? ['issue', 'MET-123'] : ['poll']);
+    assert.equal(result.code, 0, result.stdout);
+    assert.equal(f.queries.filter(q => q.operation === 'IssuePage').length, count > 100 ? 3 : 0);
+    assert.equal(f.queries.some(q => q.operation === 'OneIssue'), manual);
+    assert.equal(f.allCalls().some(args => ['-x', '-ox'].includes(args[0])), false);
+    assert.deepEqual(f.allMutations.map(m => m.operation), manual ? [] : ['RemoveLabel']);
+    assert.match(result.stdout, /"decision":"already-claimed"/);
+  }
+});
+
+test('MET-256: budget counts reads and writes, retains last headers, and resets each poll', async t => {
+  const f = await fixture(t, [issue()], { linearResponse: (_request: any, n: number) => ({ headers: n <= 2 ? {
+    'x-ratelimit-requests-remaining': String(2400 - n), 'x-ratelimit-requests-reset': String(now + n * 60_000),
+    'x-ignored': 'unlogged-header',
+  } : {} }) });
+  for (let pass = 0; pass < 2; pass++) {
+    const start = f.linearRequests.length;
+    const result = await f.run();
+    assert.equal(result.code, 0, result.stdout);
+    const budgets = result.stdout.split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(line => line.decision === 'linear-budget');
+    assert.deepEqual(budgets, [{ decision: 'linear-budget', requests: f.linearRequests.length - start,
+      remaining: pass === 0 ? 2398 : null, reset_ms: pass === 0 ? now + 120_000 : null }]);
+    assert.ok(!result.stdout.includes('unlogged-header'));
+  }
+});
+
+test('MET-256: Linear failures log only allowed fields and stop before further requests or actions', async t => {
+  for (const [status, code, operation] of [[400, 'RATELIMITED', 'Queue'], [400, 'BAD_USER_INPUT', 'Queue'],
+    [200, 'RATELIMITED', 'States'], [200, 'FORBIDDEN', 'RemoveLabel'], [400, 'RATELIMITED', 'IssuePage']] as const) {
+    const issues = [issue(), issue(124)];
+    if (operation === 'IssuePage') for (const i of issues) i.comments = Array.from({ length: 101 }, () => ({ body: 'ordinary' }));
+    const f = await fixture(t, issues, { linearResponse: (request: any) => request.operation === operation ? {
+      status, headers: { 'x-ratelimit-requests-remaining': '0', 'x-ratelimit-requests-reset': String(now + 60_000),
+        'x-secret': key, 'x-ignored': 'unlogged-header' },
+      body: { data: { ignored: 'unlogged-data' }, errors: [
+        { message: 'First error', extensions: { code: 'OTHER' } },
+        { message: `${key}: ${'x'.repeat(250)}`, extensions: { code, ignored: 'unlogged-extension' }, path: ['unlogged-path'] },
+      ], ignored: 'unlogged-body' },
+    } : undefined });
+    const result = await f.run();
+    assert.equal(result.code, 1);
+    assert.equal(f.linearRequests.at(-1).operation, operation);
+    assert.equal(f.allCalls().length, 0);
+    assert.equal(f.allMutations.length, 0);
+    const lines = result.stdout.split('\n').filter(Boolean).map(line => JSON.parse(line));
+    assert.deepEqual(lines.filter(line => line.decision === 'linear-error'), [{ decision: 'linear-error', status, errors: [
+      { code: 'OTHER', message: 'First error' }, { code, message: `[redacted]: ${'x'.repeat(188)}` },
+    ] }]);
+    assert.deepEqual(lines.filter(line => line.decision === 'linear-budget'), [{ decision: 'linear-budget',
+      requests: f.linearRequests.length, remaining: 0, reset_ms: now + 60_000 }]);
+    if (code === 'RATELIMITED') assert.equal(lines.at(-1).message, 'Linear rate limited; resets 2026-10-13T12:01:00.000Z');
+    assert.ok(!(result.stdout + result.stderr).includes(key));
+    assert.ok(!(result.stdout + result.stderr).includes('unlogged-'));
+  }
+  for (const headers of [{}, { 'x-ratelimit-requests-remaining': 'invalid', 'x-ratelimit-requests-reset': '999999999999999999' }]) {
+    const f = await fixture(t, [], { linearResponse: () => ({ status: 400, headers, body: `not JSON: ${key}` }) });
+    const result = await f.run();
+    assert.equal(result.code, 1);
+    assert.equal(f.linearRequests.length, 1);
+    assert.match(result.stdout, /"requests":1,"remaining":null,"reset_ms":null/);
+    assert.ok(!(result.stdout + result.stderr).includes(key));
+  }
+});
+
 test('slug boundaries, hint stripping, required sections and strict merge predicate', () => {
   assert.equal(slug('MET-9', '  Hello, WORLD! third fourth fifth '), 'met-9-hello-world-third-fourth');
   assert.equal(slug('MET-123', 'Café naïve 東京 API fifth'), 'met-123-caf-na-ve-api');
@@ -1067,7 +1200,8 @@ test('runner cap parsing, precedence and idle logging', { timeout: 10_000 }, asy
     const result = await f.run(['poll'], environment);
     assert.equal(result.code, 0, result.stdout);
     assert.deepEqual(result.stdout.trim().split('\n').map(line => JSON.parse(line)), [{ decision: 'caps', caps },
-      { decision: 'archive-sweep', reason: 'sweep state missing', openCount: 0, unknownCount: 0, issueCount: 0 }]);
+      { decision: 'archive-sweep', reason: 'sweep state missing', openCount: 0, unknownCount: 0, issueCount: 0 },
+      { decision: 'linear-budget', requests: 2, remaining: null, reset_ms: null }]);
     assert.equal(f.calls().length, 0);
     assert.equal(f.mutations.length, 0);
   }
@@ -1080,10 +1214,11 @@ test('invalid runner caps fail startup before API or Amp calls', { timeout: 10_0
     const f = await fixture(t, []);
     const result = await f.run(['poll'], { DISPATCH_RUNNER_CAPS: value });
     assert.equal(result.code, 1, value);
-    assert.deepEqual(JSON.parse(result.stdout), {
+    assert.deepEqual(result.stdout.trim().split('\n').map(line => JSON.parse(line)), [
+      { decision: 'linear-budget', requests: 0, remaining: null, reset_ms: null }, {
       decision: 'error',
       message: 'DISPATCH_RUNNER_CAPS must contain unique gpu=<positive integer> or console=<positive integer> entries separated by commas',
-    });
+    }]);
     assert.equal(f.queries.length, 0);
     assert.equal(f.mutations.length, 0);
     assert.equal(f.calls().length, 0);
@@ -1132,8 +1267,9 @@ test('explicit grouped and flat runner labels never overflow even with spare pee
   }
 });
 
-test('Done archive waits until exactly five quiet minutes from Amp updated, then happens once', { timeout: 10_000 }, async t => {
+test('MET-256: three-day Done archive waits until exactly five quiet minutes from Amp updated, then happens once', { timeout: 10_000 }, async t => {
   const i = archivable();
+  i.completedAt = '2026-10-10T12:00:00Z';
   const f = await fixture(t, [i], { pageSize: 1 });
   const early = await f.run(['poll'], { FAKE_NOW: String(now - 1) });
   assert.equal(early.code, 0);
@@ -1297,7 +1433,10 @@ test('finished QA reviews archive once; active and undelivered reviews remain op
     if (end === 'changes') i.comments.push(qaMarker(`round pr:90 sha:${sha}`));
     if (['human', 'retired'].includes(end)) i.comments.push(qaMarker(`${end} pr:90 sha:${sha}`));
     if (end === 'merged') i.attachments[0].metadata.status = 'merged';
-    if (['completed', 'canceled'].includes(end)) i.state.type = end;
+    if (['completed', 'canceled'].includes(end)) {
+      i.state.type = end;
+      i[end === 'completed' ? 'completedAt' : 'canceledAt'] = '2026-10-10T12:00:00Z';
+    }
     const f = await fixture(t, [i], { threads: [{ id: reviewId, updated: quietUpdated, archived: false }] });
     const first = await f.run();
     assert.equal(first.code, 0, first.stdout);
@@ -1312,6 +1451,7 @@ test('finished QA reviews archive once; active and undelivered reviews remain op
 test('QA archiving shares the five-attempt budget with builders and enforces quiet time', { timeout: 10_000 }, async t => {
   const builders = Array.from({ length: 4 }, (_, n) => archivable(n + 1));
   const i = reviewed(); i.comments.splice(0, 2); i.state.type = 'canceled';
+  i.canceledAt = '2026-10-10T12:00:00Z';
   const secondId = 'T-22345678-89ab-4cde-8fab-0123456789ab';
   i.comments.push(qaMarker(`review-claim pr:90 sha:${sha} round:2 thread:${secondId}`));
   const f = await fixture(t, [...builders, i]);
@@ -1330,6 +1470,7 @@ test('QA archiving shares the five-attempt budget with builders and enforces qui
 
 test('QA archive crash after Amp before marker repairs without a second archive', { timeout: 10_000 }, async t => {
   const i = reviewed(); i.comments.splice(0, 2); i.state.type = 'canceled';
+  i.canceledAt = '2026-10-10T12:00:00Z';
   const f = await fixture(t, [i], { threads: [{ id: reviewId, updated: quietUpdated, archived: false }],
     crash: (operation: string, v: any) => operation === 'Comment' && v.input.body.includes(`factory-dispatch:archived thread:${reviewId}`) ? 'before' : null });
   assert.equal((await f.run()).signal, 'SIGKILL');
@@ -1851,6 +1992,7 @@ test('Done and Canceled issues with wrapup-done still fast-forward a behind chec
   for (const state of ['completed', 'canceled']) {
     const i = wrapped(123, 'console');
     i.state = { type: state };
+    i[state === 'completed' ? 'completedAt' : 'canceledAt'] = '2026-10-10T12:00:00Z';
     const f = await fixture(t, [i], { github: { 90: mergedPR() }, mainBehind: true });
     const result = await f.run();
     assert.equal(result.code, 0, result.stdout);
@@ -2040,6 +2182,7 @@ test('Done and Canceled issues with wrapup but no wrapup-done block neither wrap
   for (const state of ['completed', 'canceled']) {
     const legacy = wrapped(123, 'gpu', null, 90, ago(600));
     legacy.state = { type: state };
+    legacy[state === 'completed' ? 'completedAt' : 'canceledAt'] = '2026-10-10T12:00:00Z';
     const waiting = issue(124, { labels: [], state: { type: 'started' }, comments: [claimComment(), threadComment('gpu')], attachments: [prAttachment(91)] });
     const behind = wrapped(126, 'console', ago(1), 93);
     // Separate fixtures: a newly submitted gpu wrap-up would itself hold the fast-forward.
@@ -2239,13 +2382,13 @@ test('manually archived open-issue threads stop label attempts after one recorde
   assert.equal(i.comments.filter((c: any) => c.body.includes(`factory-dispatch:label-skipped-archived ${threadId}`)).length, 1);
 });
 
-test('seven-day search boundary skips historical/unknown closes but never skips claim repair', { timeout: 10_000 }, async t => {
+test('manual issue recovery skips historical/unknown close searches but never skips claim repair', { timeout: 10_000 }, async t => {
   for (const state of ['completed', 'canceled']) for (const age of [7 * 24 * 60 * 60_000, 7 * 24 * 60 * 60_000 + 1, -1, null]) {
     const closedAt = age === null ? null : new Date(now - age).toISOString();
     const i = issue(123, { labels: [], state: { type: state }, completedAt: closedAt, canceledAt: closedAt,
       comments: [{ body: `<!-- factory-dispatch:archive-claim thread:${reviewId} -->` }] });
     const f = await fixture(t, [i], { threads: [{ id: reviewId, updated: quietUpdated, archived: true }] });
-    assert.equal((await f.run()).code, 0);
+    assert.equal((await f.run(['issue', 'MET-123'])).code, 0);
     assert.equal(f.allCalls().filter(args => args[1] === 'search').length, age === 7 * 24 * 60 * 60_000 ? 3 : 1);
     assert.equal(f.allCalls().filter(args => args[1] === 'archive').length, 0);
     assert.ok(i.comments.some((c: any) => c.body.includes(`factory-dispatch:archived thread:${reviewId}`)));
@@ -2261,12 +2404,13 @@ test('sweep skips known IDs from every standalone marker, but not quoted markers
   ] });
   const f = await fixture(t, [closed, recorded], { sweep: { unknownIds: [], issues: [], candidates: [] },
     threads: ids.map(id => ({ id, updated: new Date(now).toISOString(), archived: false })) });
-  const result = await f.run();
+  // Explicit recovery includes a closed issue whose missing date excludes it from Queue.
+  const result = await f.run(['issue', 'MET-124']);
   assert.equal(result.code, 0, result.stdout);
   assert.match(result.stdout, /"decision":"archive-sweep-skip".*"unknownCount":0/);
   assert.deepEqual(f.allCalls().filter(args => args[1] === 'search').map(args => args[2]), ['author:me archived:false']);
   recorded.comments[0].body = `\`\`\`\n${recorded.comments[0].body}\n\`\`\``;
-  assert.match((await f.run()).stdout, /"decision":"archive-sweep".*"unknownCount":4/);
+  assert.match((await f.run(['issue', 'MET-124'])).stdout, /"decision":"archive-sweep".*"unknownCount":4/);
 });
 
 test('sweep stores a sorted key atomically, skips unchanged personal threads, and notices new IDs and closes', { timeout: 10_000 }, async t => {
@@ -2497,10 +2641,12 @@ test('simple pending, missing, wrong-SHA and PR-event runs never complete or arc
   for (const runs of [[], [appliedRun({ status: 'in_progress', conclusion: '' }), appliedRun()],
     [appliedRun({ headSha: sha })], [appliedRun({ event: 'pull_request' })], [appliedRun({ headBranch: 'feature' })]]) {
     const i = accessMerged(); i.state.type = 'completed';
+    i.completedAt = '2026-10-10T12:00:00Z';
     const f = await fixture(t, [i], { github: accessGitHub(runs) });
     assert.equal((await f.run()).code, 0);
     assert.deepEqual(f.mutations, []);
-    assert.deepEqual(f.allCalls(), [['threads', 'search', 'author:me archived:false', '--json', '--limit', '500']]);
+    assert.deepEqual(f.allCalls(), ['author:me archived:false', 'label:factory author:me archived:false', 'label:met-123 author:me archived:false']
+      .map(query => ['threads', 'search', query, '--json', '--limit', '500']));
     assert.equal(f.threads()[0].archived, false);
   }
 });

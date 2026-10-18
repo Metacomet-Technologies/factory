@@ -13,6 +13,55 @@ node scripts/dispatch/dispatch.ts issue MET-123 --dry-run
 node --test scripts/dispatch
 ```
 
+## Linear request budget (MET-256)
+
+The queue keeps the team and dispatch-label/dispatch-marker/QA-marker conditions,
+and adds a second condition: state type is neither `completed` nor `canceled`,
+or `completedAt` or `canceledAt` is at least the poll's UTC timestamp minus seven
+days (inclusive). Duplicate issues reported as `canceled` use the same rule.
+`includeArchived` is omitted, so Linear's default excludes archived issues.
+Recent finished issues still reach builder/QA archive, QA cleanup and legacy
+`label:met-<n>` discovery. Older finished issues, including unfinished recovery,
+leave automatic polling; explicit `issue MET-n` can still fetch one for recovery.
+
+Queue pages remain 20 issues. Queue and explicit issue reads fetch 100 comments;
+other nested connections start at 20. Overflow still reads every page in batches
+of 100, without truncating old markers. Overflow reads run sequentially so a
+failed request cannot leave other reads running after the poll has failed.
+The published complexity calculation stays below the 10,000-point per-query
+ceiling at this page size; the live server's complexity is unverified.
+
+Every run, including dry-run and a failed run, emits one JSON record:
+
+```json
+{"decision":"linear-budget","requests":3,"remaining":2497,"reset_ms":1791893100000}
+```
+
+`requests` counts attempted Linear reads and writes. `remaining` and `reset_ms`
+retain the last seen `x-ratelimit-requests-remaining` and
+`x-ratelimit-requests-reset` values; missing initial or invalid values are `null`.
+Reset is UTC epoch milliseconds. HTTP and GraphQL failures log `linear-error`
+with only `status` and each error's `extensions.code` as `code` and `message`
+(redacted before truncation to 200 characters). No other response fields or
+headers are logged. A `RATELIMITED` code fails with
+`Linear rate limited; resets <ISO time>` (`unknown` if no valid reset was seen).
+No automatic retry is added; failure still stops the pass with exit code 1.
+
+Verified on 2026-10-18 against the [published GraphQL schema](https://github.com/linear/linear/blob/master/packages/sdk/src/schema.graphql):
+`IssueFilter.and/or`, `state: WorkflowStateFilter`,
+`WorkflowStateFilter.type: StringComparator` with `nin: [String!]`, and
+`completedAt`/`canceledAt: NullableDateComparator` with `gte: DateTimeOrDuration`.
+[Rate-limit documentation](https://linear.app/developers/rate-limiting) specifies
+the reset units, HTTP 400 `RATELIMITED` shape and complexity ceiling.
+
+The offline 150-issue fixture has 120 issues closed more than seven days ago,
+100 of those with 30 comments, and 30 live marked issues. Unchanged `origin/main`
+made **109 requests** (8 queue, 100 comment overflow, 1 states); this change makes
+**3** (2 queue, 1 states), versus the test's maximum of 10. At one poll per minute
+that fixture uses 180 requests/hour instead of 6,540. This is not a hard request
+cap: live queue size, overflow and lifecycle mutations still affect each poll.
+All checks use fake Linear; the dispatcher never contacts real Linear in tests.
+
 ## Observational stage policy (MET-194)
 
 Every issue/poll pass, including dry-run, emits six `stage-policy` JSON records
@@ -839,7 +888,9 @@ legacy discovery stops after seven days from each issue's closure. No new
 issue labels are created, and existing add-only labels are not removed.
 Historical issues and missing/invalid/future close timestamps make no search
 call. Archived threads leave the search window; pending archive claims remain
-candidates for crash repair even after that window. Every candidate uses
+candidates for crash repair only on issues returned by the queue (or explicitly
+fetched with `issue`). Older finished issues now leave the queue after seven days.
+Every candidate uses
 the existing listing-based quiet check and shared five-attempt cap. CLI search
 has no offset and a maximum limit of 500: more than 500 recently active threads
 can defer discovery of older ones until that window drains. Dry-run previews
@@ -874,7 +925,7 @@ on 2026-10-12. No authenticated Linear API request was made by the dispatcher.
 
 - Endpoint `https://api.linear.app/graphql`, `Authorization: <key>` (not Bearer
   for a personal API key). HTTP success alone is insufficient; check `errors`.
-- `issues(filter: IssueFilter, first, after, includeArchived)` and `issue(id)`;
+- `issues(filter: IssueFilter, first, after)` and `issue(id)`;
   `id`, `identifier`, `title`, `description`, `priority`, `createdAt`, `team.id/key`, `state.type`.
   Filters: `team.key.eq`, `labels.some.name.eq`, `comments.some.body.contains`, `or`.
 - `labels.nodes.{id,name,parent.name}` and `comments.nodes.{body,createdAt}`.
@@ -889,9 +940,10 @@ on 2026-10-12. No authenticated Linear API request was made by the dispatcher.
   `issueUpdate(id: String!, input: IssueUpdateInput!)` with `stateId`;
   all mutation payloads must report `success: true`.
 - `attachments.nodes.{url,metadata,createdAt}`. Connections use `nodes` and
-  `pageInfo.{hasNextPage,endCursor}`. Queue pages and initial nested pages have
-  20 entries; overflow connections paginate separately, never silently truncate.
-  Archived marked issues remain visible for deduplication and capacity.
+  `pageInfo.{hasNextPage,endCursor}`. Queue pages have 20 entries; initial comments
+  have 100 and other nested pages have 20. Overflow connections paginate
+  separately, never silently truncate. The queue excludes archived issues and
+  finished issues older than seven days (MET-256 above).
 
 Wrap-up considers only attachments whose `createdAt` is strictly later than the
 dispatch claim comment's `createdAt`. Both fields are `DateTime!` in the cited
@@ -915,6 +967,33 @@ GitHub auth is preconfigured for agent (gh + git credential helper); don't set G
 The AGENTS.md contract owns auth restrictions without naming token variables.
 Each generated prompt checks `gh auth status` exactly once. Issue sections pass
 through unchanged; their text is not counted against the fixed prompt budget.
+
+### MET-256 recovery of the stopped dispatcher
+
+Artifacts only; not executed in development. After Devon merges, fast-forward
+the clean, idle main checkout, then reinstall to re-enable the stopped timer.
+From Mac (the existing console-list pipe is unchanged):
+
+```sh
+set -euo pipefail
+gpu-ssh 'sudo -iu agent bash -lc '\''set -e; cd /home/agent/work/factory; test "$(git branch --show-current)" = main; test -z "$(git status --porcelain)"; git fetch origin; git merge --ff-only origin/main'\'''
+console-ssh 'sudo -iu agent amp runner list --json' |
+  gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-dispatch.sh'
+gpu-ssh 'sudo journalctl -u factory-dispatch -n 20'
+```
+
+Verify three consecutive timer polls each show `linear-budget` with `requests`
+at most 10 and no errors before marking MET-256 Done. Repeat the journal command
+after subsequent timer passes; do not spend requests on extra manual polls.
+
+Rollback: revert this PR's merge through the normal reviewed GitHub workflow,
+then run the same fast-forward and install commands above. Emergency stop from Mac:
+
+```sh
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'
+```
+
+### Normal running dispatcher and first installation
 
 For an already-installed dispatcher, a merge needs no deployment artifact, build,
 installer invocation or restart. After any wrap-up posts `wrapup-done`, wherever it
