@@ -8,13 +8,15 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { age, check, emptyReading, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, parseCursor, parseKimi, parseOpencode, parseOpencodeV2, sources, TOOL_ORDER } from './parsers.ts';
 import type { Tool, Reading } from './parsers.ts';
+import { ADMIN_INTERVAL_MS, ADMIN_REJECTED, cursorReading, defaultAdmin, fetchCursor, validState } from './cursor.ts';
+import type { AdminDeps, CursorState } from './cursor.ts';
 
 export const SNAPSHOT = '/var/lib/factory-usage/usage.json';
 export const CLAUDE_ARGS = ['-p', '/usage', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '', '--no-session-persistence', '--output-format', 'stream-json', '--verbose', '--prompt-suggestions', 'false'];
 type Details = { attempted_at_ms: number | null; reason: string | null; cli_version: string | null };
-export type Snapshot = { schema_version: 1; generated_at_ms: number; amp_details: Details; tools: Tool[] };
-type Previous = { amp_details: Details; tools: Pick<Tool, 'tool' | 'observed_at_ms'>[] };
-const reasons = [FORMAT_CHANGED, 'timeout', 'CLI missing', 'unknown, format changed', 'CLI timed out', 'CLI failed', 'CLI output too large', 'last good reading older than 45 minutes', 'not logged in'];
+export type Snapshot = { schema_version: 1; generated_at_ms: number; amp_details: Details; cursor_admin: CursorState | null; tools: Tool[] };
+type Previous = { amp_details: Details; cursor_admin?: CursorState | null; tools: Pick<Tool, 'tool' | 'observed_at_ms'>[] };
+const reasons = [FORMAT_CHANGED, 'timeout', 'CLI missing', 'unknown, format changed', 'CLI timed out', 'CLI failed', 'CLI output too large', 'last good reading older than 45 minutes', 'not logged in', ADMIN_REJECTED];
 function reason(error: unknown): string {
   if (!(error instanceof Error) || !reasons.includes(error.message)) return FORMAT_CHANGED;
   if (error.message === 'unknown, format changed') return FORMAT_CHANGED;
@@ -162,8 +164,9 @@ function version(program: string, value: string): string {
 }
 const programs: Record<string, string> = { amp: 'amp', cursor: 'agent', 'claude-code': 'claude', codex: 'codex', kimi: 'kimi', opencode: 'opencode' };
 
-export async function collect(previous: Previous | null, run: Run = command, now = Date.now()): Promise<Snapshot> {
+export async function collect(previous: Previous | null, run: Run = command, now = Date.now(), admin: () => AdminDeps = defaultAdmin): Promise<Snapshot> {
   let details: Details = previous?.amp_details ?? { attempted_at_ms: null, reason: null, cli_version: null };
+  let cursorAdmin: CursorState | null = previous?.cursor_admin ?? null;
   const tools = await Promise.all(Object.entries(sources).map(async ([tool, source]): Promise<Tool> => {
     let cli_version: string | null = null;
     try {
@@ -180,7 +183,27 @@ export async function collect(previous: Previous | null, run: Run = command, now
           catch (error) { details.reason = reason(error); }
         }
         if (details.reason) throw new Error(details.reason);
-      } else if (tool === 'cursor') reading = parseCursor(await run('agent', ['about', '--format', 'json']));
+      } else if (tool === 'cursor') {
+        reading = parseCursor(await run('agent', ['about', '--format', 'json']));
+        const deps = admin();
+        const key = await deps.readKey();
+        if (key === null) cursorAdmin = null;
+        else {
+          // At most one Admin fetch per hour, including failures; 15-minute runs reuse the cache.
+          if (cursorAdmin === null || now - cursorAdmin.attempted_at_ms >= ADMIN_INTERVAL_MS) {
+            cursorAdmin = { attempted_at_ms: now, reason: null, data: null };
+            try { cursorAdmin.data = await fetchCursor(deps, key, now); }
+            catch (error) { cursorAdmin.reason = reason(error); }
+          }
+          const observed_at_ms = previous?.tools.find(value => value.tool === tool)?.observed_at_ms ?? null;
+          // A rejected key keeps the plan visible; other Admin failures fail closed.
+          if (cursorAdmin.reason === ADMIN_REJECTED) return age({ tool, source, cli_version, status: 'unknown', reason: ADMIN_REJECTED, note: null, observed_at_ms, ...emptyReading(), plan: reading.plan }, now);
+          if (cursorAdmin.reason) throw new Error(cursorAdmin.reason);
+          const data = cursorAdmin.data!;
+          reading = cursorReading(reading, data, now);
+          if (reading.balances.length > 0) return { tool, source, cli_version, status: 'ok', reason: null, note: null, observed_at_ms: data.fetched_at_ms, ...reading };
+        }
+      }
       else if (tool === 'claude-code') reading = parseClaude(await run('claude', CLAUDE_ARGS));
       else if (tool === 'codex') reading = parseCodex(JSON.parse(await run('codex', ['app-server'], 20_000, true)));
       else if (tool === 'kimi') reading = parseKimi(await run('kimi', ['usage']));
@@ -194,7 +217,7 @@ export async function collect(previous: Previous | null, run: Run = command, now
     }
   }));
   tools.sort((a, b) => TOOL_ORDER.indexOf(a.tool as typeof TOOL_ORDER[number]) - TOOL_ORDER.indexOf(b.tool as typeof TOOL_ORDER[number]));
-  return { schema_version: 1, generated_at_ms: now, amp_details: details, tools };
+  return { schema_version: 1, generated_at_ms: now, amp_details: details, cursor_admin: cursorAdmin, tools };
 }
 
 export async function readPrevious(path: string, now = Date.now()): Promise<Previous | null> {
@@ -210,7 +233,7 @@ export async function readPrevious(path: string, now = Date.now()): Promise<Prev
     // Only scheduling and last-good timestamps are read; never copy stored text.
     return { amp_details: {
       attempted_at_ms: data.amp_details.attempted_at_ms, reason: data.amp_details.reason, cli_version: data.amp_details.cli_version,
-    }, tools: tools.filter(t => Object.hasOwn(sources, t.tool)).map(t => ({ tool: t.tool, observed_at_ms: t.observed_at_ms })) };
+    }, cursor_admin: data.cursor_admin == null ? null : validState(data.cursor_admin, now), tools: tools.filter(t => Object.hasOwn(sources, t.tool)).map(t => ({ tool: t.tool, observed_at_ms: t.observed_at_ms })) };
   } catch { return null; }
 }
 

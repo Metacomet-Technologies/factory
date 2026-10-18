@@ -67,9 +67,9 @@ output or exception text. The collector kills only its own probe process group.
   report zero turns, cost and token counts. Preserve session, weekly and known
   scoped weekly meters. Nullable resets stay null. The usage report does not
   identify Max versus Pro, so `plan` is null, not a guessed Max multiplier.
-* **Cursor:** `agent about --format json`. Record the plan only. There is no
-  headless usage command; interactive `/usage` is not scraped and dashboard
-  tokens are not extracted. Both a null email and a null tier mean
+* **Cursor:** `agent about --format json` records the plan. The CLI has no
+  headless usage command (Teams spend comes from the Admin API below);
+  interactive `/usage` is not scraped and dashboard tokens are not extracted. Both a null email and a null tier mean
   `not logged in`. An email with a null tier is `CLI failed`. Plans map
   case-insensitively, with an optional `Cursor ` prefix: free, pro,
   `Pro Plus`/`pro+` → `pro_plus`, ultra, team/teams, business, enterprise, edu.
@@ -78,6 +78,41 @@ output or exception text. The collector kills only its own probe process group.
   `2026.10.16-e3cb207`. A live signed-in `subscriptionTier` of `Ultra` maps
   to `ultra`; the address was present and is not stored. The committed
   signed-in fixture remains synthetic Pro.
+* **Cursor Teams spend (MET-221):** with an Admin API key at
+  `/etc/factory-usage/cursor-admin-key` (`root:agent 0640`; regular, non-empty,
+  not world-accessible), the Cursor row adds Teams cycle spend from
+  `https://api.cursor.com`. No key keeps the plan-only row above. The key is
+  sent only as Basic auth and never logged or stored. At most one Admin fetch
+  per hour, including failures (`cursor_admin.attempted_at_ms`); runs between
+  fetches reuse the cached aggregate, and `observed_at_ms` is the fetch time.
+  A fetch reads every `POST /teams/spend` page (3.1 s apart, under 20/min) and
+  every `POST /teams/filtered-usage-events` page (1000 events, 1.05 s apart,
+  under 60/min) from `subscriptionCycleStart` to now, in inclusive ranges of
+  at most 30 days, within a 120-second budget. Mapping:
+  * `plan`: the `agent about` tier (`Teams` → `team`).
+  * one USD balance, label `cycle spend`, `total` null: the sum of members'
+    `spendCents` (on-demand spend). Names, emails and user IDs are dropped.
+  * a `monthly` window only when every member has an enforced
+    `effectivePerUserLimitDollars`. Its limit is their sum, `used_percent` is
+    spend over that limit (capped at 100), and `resets_at_ms` is the next cycle
+    start (same UTC day next month, clamped to month end). No window otherwise.
+  * `breakdown`, at most 20 USD items from summed `chargedCents`: `headless`
+    (`isHeadless`, such as cloud agents), `interactive`, then models by spend.
+    Model labels are lowercased with other characters replaced by `-`; past 17
+    models the tail folds into `other models`.
+  * Private `cursor_admin.data` also keeps `maxUserSpendCents`,
+    `limitedUsersCount`, and per model × headless event counts, `chargedCents`
+    and token sums. The API does not serve them. `requestsCosts` is weighted
+    billing units and is not summed as a request count.
+  401 or 403 makes the row `unknown` with reason `admin key rejected` and keeps
+  the plan. Any other HTTP status, timeout or unexpected shape fails closed for
+  the Cursor row only. After the cached cycle ends, the row shows the plan only
+  until the next hourly fetch. Per-agent cloud usage
+  (`GET /v1/agents/{id}/usage`) is MET-216's, not this collector's.
+  Fetches stay at most hourly, so the API marks the row stale between 45 and
+  60 minutes after each fetch. `FACTORY_CURSOR_ADMIN_KEY_FILE` and a loopback
+  `FACTORY_CURSOR_API_BASE` (`http://127.0.0.1:<port>`) exist for tests and
+  sandbox checks only.
 * **Kimi Code:** there is no `kimi usage` subcommand in 2.2.0. If
   `127.0.0.1` and `FACTORY_KIMI_PORT` (default 58627) are already accepting
   connections, `GET /api/v1/oauth/usage` uses the existing local server and
@@ -286,6 +321,25 @@ gpu-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && node scripts/us
 Rollback requires a reviewed revert PR and its wrap-up pull, not a reset of main.
 After that handoff, run the same command above. This restores the old hourly
 CLI-version mismatch behavior; snapshots and units remain unchanged.
+
+## MET-221 Cursor admin key (from Mac)
+
+After merge and the clean main-checkout handoff, install the key through stdin
+(never argv). Preflight reports the key as present or absent with owner and mode,
+and never fails when it is absent. The installer stages the key at
+`root:agent 0640`, validates it in its dry-run, and moves it into place:
+
+```sh
+op read 'op://Factory/Cursor admin API key/credential' | gpu-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/install-usage.sh --cursor-admin-key-stdin'
+gpu-ssh 'sudo systemctl start factory-usage.service'
+curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/agents | jq '.tools[] | select(.tool == "cursor")'
+```
+
+The installer's dry-run and its first collection each make one Admin fetch.
+Rollback keeps the key unless asked:
+`gpu-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/rollback-usage.sh --remove-cursor-admin-key'`.
+To return to plan-only without removing units, delete only
+`/etc/factory-usage/cursor-admin-key`; the next run clears the cache.
 
 ## Checks
 

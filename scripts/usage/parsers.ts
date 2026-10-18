@@ -3,7 +3,9 @@ export const FORMAT_CHANGED = 'format changed';
 export type Window = { name: string; used_percent: number; resets_at_ms: number | null; window_minutes: number | null };
 // Decimal strings preserve source precision, including non-USD Codex credits.
 export type Balance = { amount: string; unit: 'usd' | 'orb_hours' | 'codex_credits'; remaining: string; total: string | null; label?: string | null };
-export type Reading = { plan: string | null; windows: Window[]; balance: Balance | null; balances: Balance[]; reset_credits_available: number | null };
+export type SpendItem = { label: string; amount: string };
+// `breakdown` is Cursor-only (MET-231); other tools omit it and the API defaults it to [].
+export type Reading = { plan: string | null; windows: Window[]; balance: Balance | null; balances: Balance[]; breakdown?: SpendItem[]; reset_credits_available: number | null };
 export type Tool = Reading & { tool: string; status: 'ok' | 'unknown' | 'stale' | 'not_tracked'; reason: string | null; note: null; observed_at_ms: number | null; source: string | null; cli_version: string | null };
 export const TOOL_ORDER = ['amp', 'cursor', 'claude-code', 'codex', 'kimi', 'opencode'] as const;
 export const sources = {

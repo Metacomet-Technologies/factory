@@ -194,3 +194,29 @@ export async function fixtureRun(program: string, args: string[]) {
   if (program === 'opencode') return opencodeStats;
   throw new Error('Unexpected probe');
 }
+// Cursor Teams Admin API shapes (MET-221), following cursor.com/docs/account/teams/admin-api
+// plus the undocumented maxUserSpendCents and limitedUsersCount seen live on 2026-10-17.
+// Values are synthetic. Emails, names and IDs must never reach a snapshot.
+export const cursorTeams = { ...cursorAbout, subscriptionTier: 'Teams' };
+export const cursorCycleStart = Date.UTC(2026, 9, 1);
+const member = (n: number, spendCents: number, limit: number | null) => ({
+  userId: `user_private${n}`, spendCents, overallSpendCents: spendCents + 100, fastPremiumRequests: 3,
+  name: `Private Name ${n}`, email: `private${n}@example.invalid`, role: 'member',
+  hardLimitOverrideDollars: 0, monthlyLimitDollars: limit, effectivePerUserLimitDollars: limit ?? 0,
+});
+export const cursorSpendPages = [
+  { teamMemberSpend: [member(1, 1250.5, 50), member(2, 300.25, 50)], subscriptionCycleStart: cursorCycleStart, totalMembers: 3, totalPages: 2, limitedUsersCount: 1, maxUserSpendCents: 1250.5 },
+  { teamMemberSpend: [member(3, 0.125, 100)], subscriptionCycleStart: cursorCycleStart, totalMembers: 3, totalPages: 2, limitedUsersCount: 1, maxUserSpendCents: 1250.5 },
+];
+const event = (model: string, isHeadless: boolean, chargedCents: number, tokens = true) => ({
+  timestamp: String(cursorCycleStart + 1000), userEmail: 'private1@example.invalid', cloudAgentId: 'bc-private-agent',
+  conversationId: 'private-conversation', model, kind: 'Usage-based', maxMode: false, requestsCosts: 2,
+  isTokenBasedCall: tokens, isChargeable: true, isHeadless, chargedCents,
+  ...(tokens ? { tokenUsage: { inputTokens: 100, outputTokens: 50, cacheWriteTokens: 10, cacheReadTokens: 1000, totalCents: chargedCents, discountPercentOff: 0 } } : {}),
+});
+export const cursorEventPages = [
+  { totalUsageEventsCount: 4, pagination: { numPages: 2, currentPage: 1, pageSize: 1000, hasNextPage: true, hasPreviousPage: false },
+    usageEvents: [event('claude-4.5-sonnet', true, 900), event('claude-4.5-sonnet', false, 250.5)] },
+  { totalUsageEventsCount: 4, pagination: { numPages: 2, currentPage: 2, pageSize: 1000, hasNextPage: false, hasPreviousPage: true },
+    usageEvents: [event('GPT-5 (Max)', false, 400.375), event('auto', false, 0, false)] },
+];

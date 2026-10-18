@@ -7,8 +7,13 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { collect, command, readPrevious, writeSnapshot, CLAUDE_ARGS, supportedNode } from './collect.ts';
 import { age, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, parseCursor, parseKimi, parseOpencode, parseOpencodeV2, STALE_MS } from './parsers.ts';
+import { cursorReading, fetchCursor, nextCycle, readAdminKey } from './cursor.ts';
+import type { AdminDeps } from './cursor.ts';
+import { cursorCycleStart, cursorEventPages, cursorSpendPages, cursorTeams } from './fixtures.ts';
 import { amp, ampAutoReload, ampNew, details, detailsAutoReload, detailsNew, claude, codex, cursorAbout, cursorLoggedOut, kimiLive, kimiLoggedOut, kimiUsage, opencodeStats, opencodeV2ShareCard, opencodeV2Stats, opencodeV2Zero, fixtureRun, versions } from './fixtures.ts';
 const now = 1791800000000;
+// Never read a real Cursor admin key from this host during tests.
+process.env.FACTORY_CURSOR_ADMIN_KEY_FILE = '/nonexistent/factory-usage-test/cursor-admin-key';
 
 test('supported Node versions require Node 24.12.0 or newer', () => {
   for (const version of ['24.12.0', '24.21.0', '24.22.0']) assert.equal(supportedNode(version), true);
@@ -286,7 +291,7 @@ test('CLI dry-run writes nothing and logs only sanitized snapshot using fake bin
     };
     for (const [program, script] of Object.entries(scripts)) await writeFile(join(dir, program), `#!${process.execPath}\n${script}\n`, { mode: 0o700 });
     const path = join(dir, 'usage.json');
-    const env = { HOME: dir, PATH: `${dir}:/usr/bin:/bin`, FACTORY_USAGE_SNAPSHOT: path, FACTORY_KIMI_PORT: '58941' };
+    const env = { HOME: dir, PATH: `${dir}:/usr/bin:/bin`, FACTORY_USAGE_SNAPSHOT: path, FACTORY_KIMI_PORT: '58941', FACTORY_CURSOR_ADMIN_KEY_FILE: join(dir, 'no-cursor-key') };
     const invoke = (args: string[]) => spawnSync(process.execPath, ['scripts/usage/collect.ts', ...args], { cwd: fileURLToPath(new URL('../..', import.meta.url)), env, encoding: 'utf8', timeout: 5000 });
     for (const cachedVersion of [null, '0.0.1791763306-ged595a', '0.0.1791849701-g1448da']) {
       if (cachedVersion) await writeFile(path, JSON.stringify({
@@ -447,4 +452,192 @@ test('kimi loopback probe rejects loose tokens, redirects and foreign servers, a
     if (previousPort === undefined) delete process.env.FACTORY_KIMI_PORT; else process.env.FACTORY_KIMI_PORT = previousPort;
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+const ADMIN_KEY = 'key_private_admin_0123456789abcdef';
+const cursorNow = cursorCycleStart + 16 * 86_400_000 + 12_345;
+const teamsRun = async (program: string, args: string[]) => program === 'agent' && args[0] !== '--version' ? JSON.stringify(cursorTeams) : fixtureRun(program, args);
+function fakeAdmin(respond?: (path: string, body: any) => { status: number; body: string }, key: string | null = ADMIN_KEY) {
+  const calls: { path: string; body: any; key: string }[] = [];
+  const deps: AdminDeps = {
+    readKey: async () => key,
+    sleep: async () => {},
+    post: async (path, body, sent) => {
+      calls.push({ path, body, key: sent });
+      if (respond) return respond(path, body);
+      const pages = path === '/teams/spend' ? cursorSpendPages : cursorEventPages;
+      return { status: 200, body: JSON.stringify(pages[(body as any).page - 1]) };
+    },
+  };
+  return { calls, admin: () => deps };
+}
+
+test('cursor Teams spend and events sum across pages without identities or the key', async () => {
+  const { calls, admin } = fakeAdmin();
+  const snapshot = await collect(null, teamsRun, cursorNow, admin);
+  const cursor = snapshot.tools[1];
+  assert.equal(cursor.status, 'ok'); assert.equal(cursor.reason, null); assert.equal(cursor.plan, 'team');
+  assert.equal(cursor.observed_at_ms, cursorNow);
+  const spend = { amount: '15.50875', remaining: '15.50875', total: null, unit: 'usd', label: 'cycle spend' };
+  assert.deepEqual(cursor.balances, [spend]); assert.deepEqual(cursor.balance, spend);
+  // 1550.875 cents of a 200 USD team limit (every member limited).
+  assert.deepEqual(cursor.windows, [{ name: 'monthly', used_percent: 7.75, resets_at_ms: Date.UTC(2026, 10, 1), window_minutes: null }]);
+  assert.deepEqual(cursor.breakdown, [
+    { label: 'headless', amount: '9' }, { label: 'interactive', amount: '6.50875' },
+    { label: 'claude-4.5-sonnet', amount: '11.505' }, { label: 'gpt-5 -max-', amount: '4.00375' }, { label: 'auto', amount: '0' },
+  ]);
+  assert.deepEqual(calls.map(c => [c.path, c.body.page]), [['/teams/spend', 1], ['/teams/spend', 2], ['/teams/filtered-usage-events', 1], ['/teams/filtered-usage-events', 2]]);
+  assert.deepEqual([calls[2].body.startDate, calls[2].body.endDate], [cursorCycleStart, cursorNow]);
+  const state = snapshot.cursor_admin!;
+  assert.equal(state.data!.limited_users_count, 1); assert.equal(state.data!.max_user_spend, '12.505');
+  assert.deepEqual(state.data!.usage.find(r => r.model === 'claude-4.5-sonnet' && r.headless), {
+    model: 'claude-4.5-sonnet', headless: true, events: 1, charged: '9', input_tokens: 100, output_tokens: 50, cache_read_tokens: 1000, cache_write_tokens: 10,
+  });
+  assert.equal(state.data!.usage.find(r => r.model === 'auto')!.input_tokens, 0);
+  const text = JSON.stringify(snapshot);
+  assert.doesNotMatch(text, /private|@|Private Name|user_private|bc-|key_/);
+  assert.ok(!text.includes(ADMIN_KEY));
+  // Every other tool is unaffected, and the stored cache round-trips.
+  assert.deepEqual(snapshot.tools.map(t => t.status), ['ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
+  const dir = await mkdtemp(join(tmpdir(), 'usage-cursor-'));
+  try {
+    await writeFile(join(dir, 'usage.json'), text);
+    assert.deepEqual((await readPrevious(join(dir, 'usage.json'), cursorNow))!.cursor_admin, state);
+    const smuggled = structuredClone(snapshot); smuggled.cursor_admin!.data!.breakdown[0].label = 'private@example.invalid';
+    await writeFile(join(dir, 'usage.json'), JSON.stringify(smuggled));
+    assert.equal((await readPrevious(join(dir, 'usage.json'), cursorNow))!.cursor_admin, null);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('cursor without an admin key stays plan-only and makes no HTTP call', async () => {
+  const { calls, admin } = fakeAdmin(undefined, null);
+  const cursor = (await collect(null, teamsRun, cursorNow, admin)).tools[1];
+  assert.equal(cursor.status, 'ok'); assert.equal(cursor.plan, 'team');
+  assert.deepEqual([cursor.windows, cursor.balances, cursor.breakdown], [[], [], undefined]);
+  assert.equal(calls.length, 0);
+  // The default (no key file here) is also plan-only.
+  assert.deepEqual((await collect(null, teamsRun, cursorNow)).tools[1].balances, []);
+});
+
+test('cursor 401 and 403 report the fixed rejection with the plan, and back off hourly', async () => {
+  for (const status of [401, 403]) {
+    const { calls, admin } = fakeAdmin(() => ({ status, body: `{"error":"bad key ${ADMIN_KEY}"}` }));
+    let snapshot = await collect(null, teamsRun, cursorNow, admin);
+    const cursor = snapshot.tools[1];
+    assert.deepEqual([cursor.status, cursor.reason, cursor.plan, cursor.balances], ['unknown', 'admin key rejected', 'team', []]);
+    assert.ok(!JSON.stringify(snapshot).includes(ADMIN_KEY));
+    snapshot = await collect(snapshot, teamsRun, cursorNow + 59 * 60_000, admin);
+    assert.equal(snapshot.tools[1].reason, 'admin key rejected');
+    assert.equal(calls.length, 1);
+    assert.deepEqual(snapshot.tools.filter(t => t.tool !== 'cursor').map(t => t.status), ['ok', 'ok', 'ok', 'ok', 'ok']);
+  }
+});
+
+test('cursor Admin data is fetched at most hourly and reused between fetches', async () => {
+  const { calls, admin } = fakeAdmin();
+  let snapshot = await collect(null, teamsRun, cursorNow, admin);
+  for (const minutes of [15, 30, 45, 59]) {
+    snapshot = await collect(snapshot, teamsRun, cursorNow + minutes * 60_000, admin);
+    assert.equal(snapshot.tools[1].observed_at_ms, cursorNow);
+    assert.equal(snapshot.tools[1].balance?.amount, '15.50875');
+  }
+  assert.equal(calls.length, 4);
+  snapshot = await collect(snapshot, teamsRun, cursorNow + 60 * 60_000, admin);
+  assert.equal(calls.length, 8);
+  assert.equal(snapshot.tools[1].observed_at_ms, cursorNow + 3_600_000);
+});
+
+test('malformed Admin responses fail closed for the Cursor row only', async () => {
+  const spend = cursorSpendPages[0], events = cursorEventPages[1];
+  const bad: [string, unknown][] = [
+    ['/teams/spend', 'not json'], ['/teams/spend', []],
+    ['/teams/spend', { ...spend, subscriptionCycleStart: '2026-10-01' }],
+    ['/teams/spend', { ...spend, teamMemberSpend: [{ ...spend.teamMemberSpend[0], spendCents: -1 }] }],
+    ['/teams/spend', { ...spend, totalPages: 1 }],
+    ['/teams/filtered-usage-events', { ...events, usageEvents: [{ ...events.usageEvents[0], isHeadless: 'no' }] }],
+    ['/teams/filtered-usage-events', { ...events, usageEvents: [{ ...events.usageEvents[0], chargedCents: '1' }] }],
+    ['/teams/filtered-usage-events', { ...events, pagination: undefined }],
+  ];
+  for (const [path, body] of bad) {
+    const { admin } = fakeAdmin((p, b) => ({ status: 200, body: p === path ? (typeof body === 'string' ? body : JSON.stringify(body)) : JSON.stringify(spend.totalPages && p === '/teams/spend' ? { ...spend, totalPages: 1, totalMembers: 2 } : events) }));
+    const snapshot = await collect(null, teamsRun, cursorNow, admin);
+    const cursor = snapshot.tools[1];
+    assert.deepEqual([cursor.status, cursor.reason, cursor.plan, cursor.balances, cursor.windows], ['unknown', FORMAT_CHANGED, null, [], []], String(path));
+    assert.deepEqual(snapshot.tools.filter(t => t.tool !== 'cursor').map(t => t.status), ['ok', 'ok', 'ok', 'ok', 'ok']);
+  }
+  const { admin } = fakeAdmin(() => ({ status: 500, body: '' }));
+  assert.equal((await collect(null, teamsRun, cursorNow, admin)).tools[1].reason, 'CLI failed');
+});
+
+test('cursor cycle start resets spend, the window and the events range', async () => {
+  assert.equal(nextCycle(Date.UTC(2026, 0, 31, 8)), Date.UTC(2026, 1, 28, 8));
+  assert.equal(nextCycle(Date.UTC(2026, 11, 15)), Date.UTC(2027, 0, 15));
+  const old = await collect(null, teamsRun, cursorNow, fakeAdmin().admin);
+  // Past the cached cycle end, last cycle's spend is not shown before the hourly fetch.
+  const boundary = Date.UTC(2026, 10, 1) + 60_000;
+  const reused = await collect({ ...old, cursor_admin: { ...old.cursor_admin!, attempted_at_ms: boundary - 30 * 60_000 } }, teamsRun, boundary, fakeAdmin(() => { throw new Error('no call'); }).admin);
+  assert.deepEqual([reused.tools[1].status, reused.tools[1].plan, reused.tools[1].balances], ['ok', 'team', []]);
+  const start = Date.UTC(2026, 10, 1);
+  const { calls, admin } = fakeAdmin((path, body) => ({ status: 200, body: JSON.stringify(path === '/teams/spend'
+    ? { teamMemberSpend: [{ spendCents: 5, effectivePerUserLimitDollars: 0, email: 'private@example.invalid' }], subscriptionCycleStart: start, totalMembers: 1, totalPages: 1 }
+    : { pagination: { hasNextPage: false }, usageEvents: [] }) }));
+  const fresh = await collect(reused, teamsRun, start + 3_600_000, admin);
+  const cursor = fresh.tools[1];
+  assert.equal(cursor.balance?.amount, '0.05');
+  assert.deepEqual(cursor.windows, []); // An unlimited member means no real limit.
+  assert.deepEqual(cursor.breakdown, [{ label: 'headless', amount: '0' }, { label: 'interactive', amount: '0' }]);
+  assert.equal(calls[1].body.startDate, start);
+  assert.equal(fresh.cursor_admin!.data!.next_cycle_ms, Date.UTC(2026, 11, 1));
+  // A cycle longer than 30 days splits the events range into inclusive 30-day requests.
+  const long = fakeAdmin((path) => ({ status: 200, body: JSON.stringify(path === '/teams/spend'
+    ? { teamMemberSpend: [], subscriptionCycleStart: Date.UTC(2026, 0, 31), totalMembers: 0, totalPages: 0 }
+    : { pagination: { hasNextPage: false }, usageEvents: [] }) }));
+  await fetchCursor(long.admin(), ADMIN_KEY, Date.UTC(2026, 2, 3));
+  assert.deepEqual(long.calls.slice(1).map(c => [c.body.startDate, c.body.endDate]), [
+    [Date.UTC(2026, 0, 31), Date.UTC(2026, 0, 31) + 30 * 86_400_000 - 1], [Date.UTC(2026, 0, 31) + 30 * 86_400_000, Date.UTC(2026, 2, 3)],
+  ]);
+  assert.equal(cursorReading({ plan: 'team', windows: [], balance: null, balances: [], reset_credits_available: null }, fresh.cursor_admin!.data!, Date.UTC(2026, 11, 1)).balances.length, 0);
+});
+
+test('cursor admin key file is strict and dry-run against a fake Admin server leaks nothing', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'usage-cursor-cli-'));
+  const { createServer } = await import('node:http');
+  const seen: string[] = [];
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', () => {
+      seen.push(`${req.method} ${req.url} ${req.headers.authorization}`);
+      const page = JSON.parse(body).page;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(req.url === '/teams/spend' ? cursorSpendPages[page - 1] : cursorEventPages[page - 1]));
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const keyFile = join(dir, 'cursor-admin-key');
+    assert.equal(await readAdminKey(keyFile), null);
+    await writeFile(keyFile, `${ADMIN_KEY}\n`, { mode: 0o644 }); await chmod(keyFile, 0o644);
+    await assert.rejects(readAdminKey(keyFile), { message: 'CLI failed' });
+    await chmod(keyFile, 0o640);
+    assert.equal(await readAdminKey(keyFile), ADMIN_KEY);
+    await writeFile(join(dir, 'empty'), '', { mode: 0o640 });
+    await assert.rejects(readAdminKey(join(dir, 'empty')), { message: 'CLI failed' });
+    const agent = join(dir, 'agent');
+    await writeFile(agent, `#!${process.execPath}\nconsole.log(process.argv[2]==='--version'?'2026.10.16-e3cb207':${JSON.stringify(JSON.stringify(cursorTeams))});\n`, { mode: 0o700 });
+    const port = (server.address() as { port: number }).port;
+    const env = { HOME: dir, PATH: `${dir}:/usr/bin:/bin`, FACTORY_USAGE_SNAPSHOT: join(dir, 'usage.json'), FACTORY_CURSOR_ADMIN_KEY_FILE: keyFile, FACTORY_CURSOR_API_BASE: `http://127.0.0.1:${port}` };
+    const { spawn } = await import('node:child_process');
+    const child = spawn(process.execPath, ['scripts/usage/collect.ts', '--dry-run'], { cwd: fileURLToPath(new URL('../..', import.meta.url)), env });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', c => { stdout += c; }); child.stderr.on('data', c => { stderr += c; });
+    assert.equal(await new Promise(resolve => child.on('close', resolve)), 0, stderr);
+    assert.equal(stderr, '');
+    const cursor = JSON.parse(stdout).tools[1];
+    assert.equal(cursor.status, 'ok'); assert.equal(cursor.balance.amount, '15.50875');
+    assert.ok(!stdout.includes(ADMIN_KEY)); assert.doesNotMatch(stdout, /private|@|user_private|bc-/);
+    assert.deepEqual(seen.map(s => s.split(' ').slice(0, 2).join(' ')), ['POST /teams/spend', 'POST /teams/spend', 'POST /teams/filtered-usage-events', 'POST /teams/filtered-usage-events']);
+    assert.ok(seen.every(s => s.endsWith(`Basic ${Buffer.from(`${ADMIN_KEY}:`).toString('base64')}`)));
+    await assert.rejects(readFile(join(dir, 'usage.json')));
+  } finally { server.close(); await rm(dir, { recursive: true, force: true }); }
 });

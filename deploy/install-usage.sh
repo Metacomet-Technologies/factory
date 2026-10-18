@@ -7,11 +7,14 @@ rollback_hint() { printf '%s\n' "Rollback: gpu-ssh 'sudo bash /home/agent/work/f
 fail() { printf 'ERROR: %s\n' "$*" >&2; rollback_hint; exit 1; }
 [[ $EUID -eq 0 ]] || fail 'Run install-usage.sh as root on factory-gpu.'
 trap 'printf "ERROR: usage install failed at line %s; snapshot: %s\n" "$LINENO" "${snapshot:-none}" >&2; rollback_hint' ERR
-[[ $# -eq 0 ]] || fail 'Usage: install-usage.sh'
+key_stdin=0
+if [[ $# -eq 1 && $1 == --cursor-admin-key-stdin ]]; then key_stdin=1
+else [[ $# -eq 0 ]] || fail 'Usage: install-usage.sh [--cursor-admin-key-stdin]'
+fi
 [[ "$root" == /home/agent/work/factory ]] || fail 'Install only from the merged /home/agent/work/factory checkout.'
 
 # Read-only preflight: no runtime installs, login, settings or runner changes.
-for command in sudo systemctl stat getent install cp mktemp date sed cat dirname flock timeout realpath hostname cut chown chmod curl sleep; do
+for command in sudo systemctl stat getent install cp mktemp mv rm date sed cat dirname flock timeout realpath hostname cut chown chmod curl sleep; do
     command -v "$command" >/dev/null || fail "Missing command: $command"
 done
 [[ $(hostname) == factory-gpu ]] || fail 'Install only on factory-gpu.'
@@ -25,7 +28,7 @@ safe_path() {
         path=$(dirname "$path")
     done
 }
-for file in scripts/usage/collect.ts scripts/usage/parsers.ts scripts/usage/.node-version scripts/usage/collect.lock deploy/install-usage.sh deploy/rollback-usage.sh deploy/factory-usage.service deploy/factory-usage.timer deploy/factory-usage-refresh.path; do
+for file in scripts/usage/collect.ts scripts/usage/parsers.ts scripts/usage/cursor.ts scripts/usage/.node-version scripts/usage/collect.lock deploy/install-usage.sh deploy/rollback-usage.sh deploy/factory-usage.service deploy/factory-usage.timer deploy/factory-usage-refresh.path; do
     safe_path "$root/$file"
     [[ -f "$root/$file" ]] || fail "Missing artifact: $file"
     sudo -u agent test -r "$root/$file"
@@ -49,6 +52,31 @@ for unit in factory-usage.service factory-usage.timer factory-usage-refresh.path
     [[ ! -e "/etc/systemd/system/$unit" || -f "/etc/systemd/system/$unit" ]] || fail "Unsafe unit: $unit"
     [[ -z $(systemctl show "$unit" --property=DropInPaths --value) ]] || fail "Review/remove $unit drop-ins before installing."
 done
+# Cursor Admin API key (MET-221): optional. Absent keeps plan-only Cursor usage.
+key_dir=/etc/factory-usage
+key_file=$key_dir/cursor-admin-key
+staged_key=
+for path in "$key_dir" "$key_file"; do safe_path "$path"; done
+[[ ! -e "$key_dir" || -d "$key_dir" ]] || fail "Not a directory: $key_dir"
+if [[ -e "$key_file" ]]; then
+    [[ -f "$key_file" ]] || fail 'Cursor admin key must be a regular file.'
+    printf 'Cursor admin key: present (%s)\n' "$(stat -c '%U:%G %a' "$key_file")"
+else
+    printf '%s\n' 'Cursor admin key: absent (Cursor stays plan-only)'
+fi
+if [[ $key_stdin -eq 1 ]]; then
+    # Read from stdin only: never argv, never echoed. Staged beside the final path.
+    key=
+    IFS= read -r key || true
+    [[ "$key" =~ ^[!-~]{8,512}$ ]] || { unset key; fail 'Cursor admin key on stdin must be 8-512 printable characters on one line.'; }
+    install -d -o root -g agent -m 0750 "$key_dir"
+    staged_key=$(mktemp "$key_dir/.cursor-admin-key.XXXXXX")
+    trap 'rm -f "$staged_key"' EXIT
+    printf '%s\n' "$key" > "$staged_key"
+    unset key
+    chown root:agent "$staged_key"
+    chmod 0640 "$staged_key"
+fi
 # A readable cwd is essential for the agent's Vite+ Node shim.
 cd /home/agent/work
 sudo -u agent test -x /home/agent/work
@@ -72,7 +100,9 @@ supported_node "$node_version" || fail "Use Node 24.x (>= 24.12.0); found $node_
 for command in amp claude codex agent kimi opencode; do as_agent timeout 30s "${executables[$command]}" --version; done
 # Collector dry-run emits only its sanitized snapshot, never raw CLI output.
 preview_status=0
-preview=$(as_agent timeout 300s "$node" "$root/scripts/usage/collect.ts" --dry-run) || preview_status=$?
+preview_key=()
+[[ -z "$staged_key" ]] || preview_key=("FACTORY_CURSOR_ADMIN_KEY_FILE=$staged_key")
+preview=$(as_agent "${preview_key[@]}" timeout 300s "$node" "$root/scripts/usage/collect.ts" --dry-run) || preview_status=$?
 printf '%s\n' "$preview"
 [[ $preview_status -eq 0 ]] || fail 'Collector dry-run failed; no deployment changes made.'
 check_snapshot() { as_agent "$node" --input-type=module -e '
@@ -109,6 +139,11 @@ install -d -o agent -g factory-api -m 2750 /var/lib/factory-usage
 if [[ -f /var/lib/factory-usage/usage.json ]]; then
     chown agent:factory-api /var/lib/factory-usage/usage.json
     chmod 0640 /var/lib/factory-usage/usage.json
+fi
+if [[ -n "$staged_key" ]]; then
+    mv -f "$staged_key" "$key_file"
+    staged_key=
+    printf 'Cursor admin key installed (%s)\n' "$(stat -c '%U:%G %a' "$key_file")"
 fi
 sed -e "s|@NODE@|$node|g" -e "s|@PATH@|$path|g" "$root/deploy/factory-usage.service" > "$snapshot/new.service"
 install -o root -g root -m 0644 "$snapshot/new.service" /etc/systemd/system/factory-usage.service
