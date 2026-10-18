@@ -8,7 +8,6 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
-import re
 import sys
 
 root = Path(sys.argv[1]).resolve()
@@ -26,14 +25,8 @@ if component == "kiosk":
     # The Bun lockfile (bun.lock) is tracked inside kiosk/.
     files.add("factory-api/openapi.json")
 else:
-    # Workspace settings matter, but membership does not: adding an unrelated
-    # crate must not stale this one. Its own path closure and tree are below.
-    # ponytail: textual drop of the first top-level `members = [...]` (the root
-    # manifest's only one); tomllib needs Python 3.11 and the sandbox CI has 3.10.
-    workspace = (root / "Cargo.toml").read_bytes()
-    workspace, dropped = re.subn(rb"(?ms)^members\s*=\s*\[.*?\][ \t]*\n?", b"", workspace, count=1)
-    if not dropped:
-        sys.exit("build-fingerprint: workspace Cargo.toml has no members list")
+    # No workspace Cargo.toml: unrelated members or workspace dependencies must
+    # not stale this crate. Its path closure and locked tree below cover it.
     metadata = json.loads(run("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"))
     packages = {p["name"]: p for p in metadata["packages"]}
     pending = [component]
@@ -59,9 +52,6 @@ for name in sorted(files):
     for value in (name.encode(), (root / name).read_bytes()):
         digest.update(len(value).to_bytes(8, "big"))
         digest.update(value)
-if component != "kiosk":
-    digest.update(len(workspace).to_bytes(8, "big"))
-    digest.update(workspace)
 digest.update(tree)
 print(digest.hexdigest()[:12])
 PY

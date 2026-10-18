@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 
 export function buildInfo() {
@@ -54,10 +53,9 @@ export function buildInfo() {
     git_dirty: Boolean(git(["status", "--porcelain"])),
     built_at_ms: releaseTime === undefined ? Date.now() : Number(releaseTime) * 1000,
     inputs_fingerprint: fingerprint("kiosk"),
-    // The API contract this kiosk was built against; factory-api health reports its own.
-    expected_openapi_sha256: createHash("sha256")
-      .update(readFileSync(new URL("factory-api/openapi.json", root)))
-      .digest("hex")
-      .slice(0, 12),
+    expected_inputs: {
+      api: fingerprint("factory-api"),
+      meter: fingerprint("meter"),
+    },
   };
 }

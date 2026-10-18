@@ -2,6 +2,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { defineConfig, lazyPlugins } from "vite-plus";
 import { apiTypes } from "./scripts/api-types.ts";
 import { buildInfo } from "./scripts/build-info.ts";
@@ -24,9 +25,16 @@ const proxy = proxyTarget
     )
   : {};
 
+// The footer compares only the API contract; per-component input fingerprints are provenance.
+const { expected_inputs: _inputs, ...identity } = buildInfo();
+const expected_openapi_sha256 = createHash("sha256")
+  .update(readFileSync(new URL("../factory-api/openapi.json", import.meta.url)))
+  .digest("hex")
+  .slice(0, 12);
+
 // https://vite.dev/config/
 export default defineConfig({
-  define: { __BUILD_INFO__: JSON.stringify(buildInfo()) },
+  define: { __BUILD_INFO__: JSON.stringify({ ...identity, expected_openapi_sha256 }) },
   test: {
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
