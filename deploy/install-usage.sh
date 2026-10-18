@@ -100,6 +100,7 @@ supported_node "$node_version" || fail "Use Node 24.x (>= 24.12.0); found $node_
 for command in amp claude codex agent kimi opencode; do as_agent timeout 30s "${executables[$command]}" --version; done
 # Collector dry-run emits only its sanitized snapshot, never raw CLI output.
 preview_status=0
+preflight_ms=$(date +%s%3N)
 preview_key=()
 [[ -z "$staged_key" ]] || preview_key=("FACTORY_CURSOR_ADMIN_KEY_FILE=$staged_key")
 preview=$(as_agent "${preview_key[@]}" timeout 300s "$node" "$root/scripts/usage/collect.ts" --dry-run) || preview_status=$?
@@ -113,6 +114,15 @@ for (const name of ["amp", "cursor", "claude-code", "codex", "kimi", "opencode"]
   }
 }' "$1"; }
 check_snapshot "$preview"
+if [[ -n "$staged_key" ]]; then
+    # The staged key must pass a fresh fetch in this preflight. A cached or failed
+    # result (including one made with an earlier key) leaves the installed key unchanged.
+    as_agent "$node" --input-type=module -e '
+const admin = JSON.parse(process.argv[1]).cursor_admin;
+if (!admin || admin.reason !== null || admin.data === null || !(admin.attempted_at_ms >= Number(process.argv[2]))) {
+  throw new Error("staged Cursor admin key was not validated by a fresh Admin fetch");
+}' "$preview" "$preflight_ms" || fail 'Staged Cursor admin key failed validation; installed key unchanged.'
+fi
 
 # Snapshot units and state before any deployment mutation.
 install -d -o root -g root -m 0700 /var/backups/factory-usage
@@ -144,6 +154,14 @@ if [[ -n "$staged_key" ]]; then
     mv -f "$staged_key" "$key_file"
     staged_key=
     printf 'Cursor admin key installed (%s)\n' "$(stat -c '%U:%G %a' "$key_file")"
+fi
+# Hand the validated preflight snapshot to the first collection, so it reuses that
+# Admin fetch (bound to the key file it used) instead of fetching again.
+if as_agent "$node" --input-type=module -e 'if (JSON.parse(process.argv[1]).cursor_admin == null) process.exit(1)' "$preview"; then
+    handoff=$(as_agent mktemp /var/lib/factory-usage/.usage.json.XXXXXX)
+    printf '%s\n' "$preview" | as_agent tee "$handoff" >/dev/null
+    as_agent chmod 0640 "$handoff"
+    as_agent mv -f "$handoff" /var/lib/factory-usage/usage.json
 fi
 sed -e "s|@NODE@|$node|g" -e "s|@PATH@|$path|g" "$root/deploy/factory-usage.service" > "$snapshot/new.service"
 install -o root -g root -m 0644 "$snapshot/new.service" /etc/systemd/system/factory-usage.service

@@ -1,4 +1,5 @@
-import { lstat, readFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { check, FORMAT_CHANGED } from './parsers.ts';
@@ -18,10 +19,14 @@ const SPEND_PAGE_SIZE = 100, EVENTS_PAGE_SIZE = 1000, MAX_PAGES = 100;
 const MICRO = 1_000_000;
 
 export type Response = { status: number; body: string };
+// `id` names the key file (device, inode, size, mtime), never its contents, so
+// a replaced key cannot reuse a cached result fetched with an earlier key.
+export type AdminKey = { key: string; id: string };
 export type AdminDeps = {
-  readKey: () => Promise<string | null>;
+  readKey: () => Promise<AdminKey | null>;
   post: (path: string, body: object, key: string, timeoutMs: number) => Promise<Response>;
   sleep: (ms: number) => Promise<void>;
+  budgetMs?: number;
 };
 export type UsageRow = { model: string; headless: boolean; events: number; charged: string; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number };
 export type CursorData = {
@@ -29,7 +34,8 @@ export type CursorData = {
   spend: string; limit: string | null; max_user_spend: string | null; limited_users_count: number | null;
   breakdown: { label: string; amount: string }[]; usage: UsageRow[];
 };
-export type CursorState = { attempted_at_ms: number; reason: string | null; data: CursorData | null };
+export type CursorState = { attempted_at_ms: number; key_id: string; reason: string | null; data: CursorData | null };
+const KEY_ID = /^\d{1,20}:\d{1,20}:\d{1,4}:\d{1,16}$/;
 
 function fail(message = FORMAT_CHANGED): never { throw new Error(message); }
 function object(value: unknown): Record<string, unknown> {
@@ -66,33 +72,46 @@ function modelLabel(model: string): string {
 
 export function defaultAdmin(env = process.env): AdminDeps {
   const keyFile = env.FACTORY_CURSOR_ADMIN_KEY_FILE || ADMIN_KEY_FILE;
+  // The production path must be root-owned. An override (the installer's staged
+  // root-owned key, or a test/sandbox file) may also be owned by the collector user.
+  const production = keyFile === ADMIN_KEY_FILE;
   const base = env.FACTORY_CURSOR_API_BASE || ADMIN_BASE;
   // Only the real API or a loopback fake (sandbox checks) may receive the key.
   if (base !== ADMIN_BASE && !/^http:\/\/127\.0\.0\.1:\d{1,5}$/.test(base)) fail('CLI failed');
   return {
-    readKey: () => readAdminKey(keyFile),
+    readKey: () => readAdminKey(keyFile, production),
     post: (path, body, key, timeoutMs) => post(base, path, body, key, timeoutMs),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
   };
 }
-// Missing key: null (plan-only). Anything unsafe or unreadable fails closed.
-export async function readAdminKey(path: string): Promise<string | null> {
-  let info;
-  try { info = await lstat(path); } catch (error) {
+// Missing key: null (plan-only). Anything else must match the declared
+// root:agent 0640 credential (agent being the collector's group); otherwise fail closed.
+export async function readAdminKey(path: string, production = true): Promise<AdminKey | null> {
+  let file;
+  try { file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     fail('CLI failed');
   }
-  if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o007) !== 0 || info.size === 0 || info.size > 1024) fail('CLI failed');
-  let key: string;
-  try { key = (await readFile(path, 'utf8')).trim(); } catch { fail('CLI failed'); }
-  if (!/^[\x21-\x7e]{8,512}$/.test(key)) fail('CLI failed');
-  return key;
+  try {
+    const info = await file.stat();
+    const owner = info.uid === 0 || (!production && info.uid === process.getuid());
+    if (!info.isFile() || !owner || info.gid !== process.getgid() || (info.mode & 0o7777) !== 0o640 || info.size === 0 || info.size > 1024) fail('CLI failed');
+    let key: string;
+    try { key = (await file.readFile('utf8')).trim(); } catch { fail('CLI failed'); }
+    if (!/^[\x21-\x7e]{8,512}$/.test(key)) fail('CLI failed');
+    return { key, id: `${info.dev}:${info.ino}:${info.size}:${Math.trunc(info.mtimeMs)}` };
+  } finally { await file.close(); }
 }
 function post(base: string, path: string, body: object, key: string, timeoutMs: number): Promise<Response> {
   const url = new URL(path, base);
   const payload = JSON.stringify(body);
   const send = url.protocol === 'https:' ? httpsRequest : httpRequest;
   return new Promise((resolve, reject) => {
+    // `timeout` below is only socket idle time; this bounds the whole exchange,
+    // including a server that keeps trickling bytes.
+    const deadline = setTimeout(() => { req.destroy(); reject(new Error('timeout')); }, timeoutMs);
+    const settle = <T>(done: (value: T) => void) => (value: T) => { clearTimeout(deadline); done(value); };
+    resolve = settle(resolve); reject = settle(reject);
     const req = send(url, {
       method: 'POST', timeout: timeoutMs,
       headers: {
@@ -118,15 +137,24 @@ function post(base: string, path: string, body: object, key: string, timeoutMs: 
 
 // Fetch every spend page and every event page since the cycle start. Requests
 // are sequential and paced under Cursor's 20/min (spend) and 60/min (events).
-export async function fetchCursor(deps: AdminDeps, key: string, now: number, budgetMs = 120_000): Promise<CursorData> {
-  const deadline = Date.now() + budgetMs;
+export async function fetchCursor(deps: AdminDeps, key: string, now: number): Promise<CursorData> {
+  const deadline = Date.now() + (deps.budgetMs ?? 120_000);
   const last: Record<string, number> = {};
   const call = async (path: string, body: object, gapMs: number) => {
-    if (last[path] !== undefined) await deps.sleep(Math.max(0, last[path] + gapMs - Date.now()));
+    if (last[path] !== undefined) {
+      const wait = Math.max(0, last[path] + gapMs - Date.now());
+      if (Date.now() + wait >= deadline) fail('timeout');
+      await deps.sleep(wait);
+    }
     const left = deadline - Date.now();
     if (left <= 0) fail('timeout');
     last[path] = Date.now();
-    const res = await deps.post(path, body, key, Math.min(20_000, left));
+    // Also race the injected transport, so no request outlives the fetch budget.
+    let timer: NodeJS.Timeout | undefined;
+    const res = await Promise.race([
+      deps.post(path, body, key, Math.min(20_000, left)),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), left); }),
+    ]).finally(() => clearTimeout(timer));
     if (res.status === 401 || res.status === 403) fail(ADMIN_REJECTED);
     if (res.status !== 200) fail('CLI failed');
     try { return object(JSON.parse(res.body)); } catch { fail(); }
@@ -162,27 +190,37 @@ export async function fetchCursor(deps: AdminDeps, key: string, now: number, bud
   const rows = new Map<string, UsageRow & { micro: number }>();
   for (let from = cycleStart; from <= now; from += EVENTS_RANGE_MS) {
     const to = Math.min(from + EVENTS_RANGE_MS - 1, now);
+    // Pagination and counts must agree; a partial total is never reported as ok.
+    let pages: number | undefined, total: number | undefined, seen = 0;
     for (let page = 1, more = true; more; page++) {
       check(page <= MAX_PAGES);
       const data = await call('/teams/filtered-usage-events', { startDate: from, endDate: to, page, pageSize: EVENTS_PAGE_SIZE }, 1_050);
       const pagination = object(data.pagination);
-      check(typeof pagination.hasNextPage === 'boolean' && (pagination.currentPage === undefined || pagination.currentPage === page));
+      check(pagination.currentPage === page && typeof pagination.hasNextPage === 'boolean');
+      const numPages = count(pagination.numPages, MAX_PAGES), events = count(data.totalUsageEventsCount, MAX_PAGES * EVENTS_PAGE_SIZE);
+      check((pages ?? numPages) === numPages && (total ?? events) === events);
+      pages = numPages; total = events;
       more = pagination.hasNextPage as boolean;
+      check(more === page < numPages);
       check(Array.isArray(data.usageEvents) && data.usageEvents.length <= EVENTS_PAGE_SIZE);
-      check(!more || data.usageEvents.length > 0);
+      seen += data.usageEvents.length;
+      check(more ? data.usageEvents.length > 0 && seen < total : seen === total);
       for (const raw of data.usageEvents) {
         const event = object(raw);
         check(typeof event.model === 'string' && event.model.length > 0 && event.model.length <= 128);
-        check(typeof event.isHeadless === 'boolean');
-        const tokens = event.tokenUsage == null ? {} : object(event.tokenUsage);
+        check(typeof event.isHeadless === 'boolean' && typeof event.isTokenBasedCall === 'boolean');
+        // Request-based events may omit tokenUsage; token-based ones must carry all four counts.
+        if (event.isTokenBasedCall) check(event.tokenUsage != null);
+        const tokens = event.tokenUsage == null ? null : object(event.tokenUsage);
+        const tokenCount = (name: string) => tokens === null ? 0 : count(tokens[name]);
         const id = `${event.isHeadless}\0${event.model}`;
         const row = rows.get(id) ?? { model: modelLabel(event.model), headless: event.isHeadless, events: 0, charged: '0', micro: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
-        row.micro = add(row.micro, micro(event.chargedCents ?? 0));
+        row.micro = add(row.micro, micro(event.chargedCents));
         row.events = add(row.events, 1);
-        row.input_tokens = add(row.input_tokens, count(tokens.inputTokens ?? 0));
-        row.output_tokens = add(row.output_tokens, count(tokens.outputTokens ?? 0));
-        row.cache_read_tokens = add(row.cache_read_tokens, count(tokens.cacheReadTokens ?? 0));
-        row.cache_write_tokens = add(row.cache_write_tokens, count(tokens.cacheWriteTokens ?? 0));
+        row.input_tokens = add(row.input_tokens, tokenCount('inputTokens'));
+        row.output_tokens = add(row.output_tokens, tokenCount('outputTokens'));
+        row.cache_read_tokens = add(row.cache_read_tokens, tokenCount('cacheReadTokens'));
+        row.cache_write_tokens = add(row.cache_write_tokens, tokenCount('cacheWriteTokens'));
         rows.set(id, row);
         check(rows.size <= 200);
       }
@@ -244,10 +282,11 @@ export function validState(value: unknown, now: number): CursorState | null {
   try {
     const s = object(value);
     const attempted = count(s.attempted_at_ms, now);
+    check(typeof s.key_id === 'string' && KEY_ID.test(s.key_id));
     check(attempted > 0 && [null, FORMAT_CHANGED, 'timeout', 'CLI failed', 'CLI output too large', ADMIN_REJECTED].includes(s.reason as string | null));
     const data = s.data === null ? null : validData(s.data, now);
     check(s.reason === null ? data !== null : data === null);
-    return { attempted_at_ms: attempted, reason: s.reason as string | null, data };
+    return { attempted_at_ms: attempted, key_id: s.key_id as string, reason: s.reason as string | null, data };
   } catch { return null; }
 }
 

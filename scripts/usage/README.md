@@ -79,16 +79,27 @@ output or exception text. The collector kills only its own probe process group.
   to `ultra`; the address was present and is not stored. The committed
   signed-in fixture remains synthetic Pro.
 * **Cursor Teams spend (MET-221):** with an Admin API key at
-  `/etc/factory-usage/cursor-admin-key` (`root:agent 0640`; regular, non-empty,
-  not world-accessible), the Cursor row adds Teams cycle spend from
-  `https://api.cursor.com`. No key keeps the plan-only row above. The key is
-  sent only as Basic auth and never logged or stored. At most one Admin fetch
-  per hour, including failures (`cursor_admin.attempted_at_ms`); runs between
-  fetches reuse the cached aggregate, and `observed_at_ms` is the fetch time.
+  `/etc/factory-usage/cursor-admin-key`, the Cursor row adds Teams cycle spend
+  from `https://api.cursor.com`. No key keeps the plan-only row above. The file
+  must be a regular non-symlink, non-empty, owned by root, group the collector's
+  group (`agent`) and mode exactly `0640`; anything else fails the Cursor row
+  closed. The key is sent only as Basic auth and never logged or stored. At
+  most one Admin fetch per hour per key file, including failures
+  (`cursor_admin.attempted_at_ms`); runs between fetches reuse the cached
+  aggregate, and `observed_at_ms` is the fetch time. The cache records the key
+  file's device, inode, size and mtime (`cursor_admin.key_id`, never the key):
+  a replaced key always fetches afresh instead of reusing another key's result.
   A fetch reads every `POST /teams/spend` page (3.1 s apart, under 20/min) and
   every `POST /teams/filtered-usage-events` page (1000 events, 1.05 s apart,
   under 60/min) from `subscriptionCycleStart` to now, in inclusive ranges of
-  at most 30 days, within a 120-second budget. Mapping:
+  at most 30 days. A 120-second wall-clock budget bounds the whole fetch, and
+  each request has a hard deadline (at most 20 s) even while bytes keep
+  arriving; expiry reports `timeout` for Cursor only. Pagination must agree:
+  `currentPage`, constant `numPages`/`totalPages` and totals, `hasNextPage`
+  exactly when pages remain, and summed events/members equal to the reported
+  totals. Every event needs `chargedCents`; token-based events
+  (`isTokenBasedCall`) need all four `tokenUsage` counts, while request-based
+  events may omit `tokenUsage`. Mapping:
   * `plan`: the `agent about` tier (`Teams` → `team`).
   * one USD balance, label `cycle spend`, `total` null: the sum of members'
     `spendCents` (on-demand spend). Names, emails and user IDs are dropped.
@@ -327,7 +338,12 @@ CLI-version mismatch behavior; snapshots and units remain unchanged.
 After merge and the clean main-checkout handoff, install the key through stdin
 (never argv). Preflight reports the key as present or absent with owner and mode,
 and never fails when it is absent. The installer stages the key at
-`root:agent 0640`, validates it in its dry-run, and moves it into place:
+`root:agent 0640` beside the final path and runs its dry-run with it. The
+staged key is installed only if that preflight made a fresh, successful Admin
+fetch; a rejected, failed or cached result exits with the installed key
+unchanged and the staged file removed. It then hands that preflight snapshot to
+the first collection, which reuses its fetch (same key file inode) rather than
+fetching again:
 
 ```sh
 op read 'op://Factory/Cursor admin API key/credential' | gpu-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/install-usage.sh --cursor-admin-key-stdin'
@@ -335,7 +351,9 @@ gpu-ssh 'sudo systemctl start factory-usage.service'
 curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/agents | jq '.tools[] | select(.tool == "cursor")'
 ```
 
-The installer's dry-run and its first collection each make one Admin fetch.
+Installing makes one Admin fetch in total; the manual collection above reuses it
+within the hour. Without `--cursor-admin-key-stdin`, an already installed key is
+reported and used as is, and its preflight snapshot is handed off the same way.
 Rollback keeps the key unless asked:
 `gpu-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/rollback-usage.sh --remove-cursor-admin-key'`.
 To return to plan-only without removing units, delete only

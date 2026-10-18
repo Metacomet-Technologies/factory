@@ -456,11 +456,12 @@ test('kimi loopback probe rejects loose tokens, redirects and foreign servers, a
 
 const ADMIN_KEY = 'key_private_admin_0123456789abcdef';
 const cursorNow = cursorCycleStart + 16 * 86_400_000 + 12_345;
+const emptyEvents = { totalUsageEventsCount: 0, pagination: { numPages: 1, currentPage: 1, pageSize: 1000, hasNextPage: false, hasPreviousPage: false }, usageEvents: [] };
 const teamsRun = async (program: string, args: string[]) => program === 'agent' && args[0] !== '--version' ? JSON.stringify(cursorTeams) : fixtureRun(program, args);
-function fakeAdmin(respond?: (path: string, body: any) => { status: number; body: string }, key: string | null = ADMIN_KEY) {
+function fakeAdmin(respond?: (path: string, body: any) => { status: number; body: string }, key: string | null = ADMIN_KEY, keyId = '1:2:3:4') {
   const calls: { path: string; body: any; key: string }[] = [];
   const deps: AdminDeps = {
-    readKey: async () => key,
+    readKey: async () => key === null ? null : { key, id: keyId },
     sleep: async () => {},
     post: async (path, body, sent) => {
       calls.push({ path, body, key: sent });
@@ -495,7 +496,7 @@ test('cursor Teams spend and events sum across pages without identities or the k
   });
   assert.equal(state.data!.usage.find(r => r.model === 'auto')!.input_tokens, 0);
   const text = JSON.stringify(snapshot);
-  assert.doesNotMatch(text, /private|@|Private Name|user_private|bc-|key_/);
+  assert.doesNotMatch(text, /private|@|Private Name|user_private|bc-|key_private/);
   assert.ok(!text.includes(ADMIN_KEY));
   // Every other tool is unaffected, and the stored cache round-trips.
   assert.deepEqual(snapshot.tools.map(t => t.status), ['ok', 'ok', 'ok', 'ok', 'ok', 'ok']);
@@ -580,7 +581,7 @@ test('cursor cycle start resets spend, the window and the events range', async (
   const start = Date.UTC(2026, 10, 1);
   const { calls, admin } = fakeAdmin((path, body) => ({ status: 200, body: JSON.stringify(path === '/teams/spend'
     ? { teamMemberSpend: [{ spendCents: 5, effectivePerUserLimitDollars: 0, email: 'private@example.invalid' }], subscriptionCycleStart: start, totalMembers: 1, totalPages: 1 }
-    : { pagination: { hasNextPage: false }, usageEvents: [] }) }));
+    : emptyEvents) }));
   const fresh = await collect(reused, teamsRun, start + 3_600_000, admin);
   const cursor = fresh.tools[1];
   assert.equal(cursor.balance?.amount, '0.05');
@@ -591,7 +592,7 @@ test('cursor cycle start resets spend, the window and the events range', async (
   // A cycle longer than 30 days splits the events range into inclusive 30-day requests.
   const long = fakeAdmin((path) => ({ status: 200, body: JSON.stringify(path === '/teams/spend'
     ? { teamMemberSpend: [], subscriptionCycleStart: Date.UTC(2026, 0, 31), totalMembers: 0, totalPages: 0 }
-    : { pagination: { hasNextPage: false }, usageEvents: [] }) }));
+    : emptyEvents) }));
   await fetchCursor(long.admin(), ADMIN_KEY, Date.UTC(2026, 2, 3));
   assert.deepEqual(long.calls.slice(1).map(c => [c.body.startDate, c.body.endDate]), [
     [Date.UTC(2026, 0, 31), Date.UTC(2026, 0, 31) + 30 * 86_400_000 - 1], [Date.UTC(2026, 0, 31) + 30 * 86_400_000, Date.UTC(2026, 2, 3)],
@@ -617,12 +618,24 @@ test('cursor admin key file is strict and dry-run against a fake Admin server le
   try {
     const keyFile = join(dir, 'cursor-admin-key');
     assert.equal(await readAdminKey(keyFile), null);
-    await writeFile(keyFile, `${ADMIN_KEY}\n`, { mode: 0o644 }); await chmod(keyFile, 0o644);
-    await assert.rejects(readAdminKey(keyFile), { message: 'CLI failed' });
+    await writeFile(keyFile, `${ADMIN_KEY}\n`, { mode: 0o640 }); await chmod(keyFile, 0o640);
+    const read = await readAdminKey(keyFile, false);
+    assert.equal(read?.key, ADMIN_KEY);
+    const info = await stat(keyFile);
+    assert.equal(read?.id, `${info.dev}:${info.ino}:${info.size}:${Math.trunc(info.mtimeMs)}`);
+    // Unsafe credential metadata fails closed: world/group bits beyond 0640, a
+    // non-root production owner, a symlink, or an empty file.
+    for (const mode of [0o644, 0o660, 0o600, 0o440]) {
+      await chmod(keyFile, mode);
+      await assert.rejects(readAdminKey(keyFile, false), { message: 'CLI failed' }, mode.toString(8));
+    }
     await chmod(keyFile, 0o640);
-    assert.equal(await readAdminKey(keyFile), ADMIN_KEY);
-    await writeFile(join(dir, 'empty'), '', { mode: 0o640 });
-    await assert.rejects(readAdminKey(join(dir, 'empty')), { message: 'CLI failed' });
+    if (process.getuid() !== 0) await assert.rejects(readAdminKey(keyFile, true), { message: 'CLI failed' });
+    const { symlink } = await import('node:fs/promises');
+    await symlink(keyFile, join(dir, 'linked-key'));
+    await assert.rejects(readAdminKey(join(dir, 'linked-key'), false), { message: 'CLI failed' });
+    await writeFile(join(dir, 'empty'), '', { mode: 0o640 }); await chmod(join(dir, 'empty'), 0o640);
+    await assert.rejects(readAdminKey(join(dir, 'empty'), false), { message: 'CLI failed' });
     const agent = join(dir, 'agent');
     await writeFile(agent, `#!${process.execPath}\nconsole.log(process.argv[2]==='--version'?'2026.10.16-e3cb207':${JSON.stringify(JSON.stringify(cursorTeams))});\n`, { mode: 0o700 });
     const port = (server.address() as { port: number }).port;
@@ -639,5 +652,137 @@ test('cursor admin key file is strict and dry-run against a fake Admin server le
     assert.deepEqual(seen.map(s => s.split(' ').slice(0, 2).join(' ')), ['POST /teams/spend', 'POST /teams/spend', 'POST /teams/filtered-usage-events', 'POST /teams/filtered-usage-events']);
     assert.ok(seen.every(s => s.endsWith(`Basic ${Buffer.from(`${ADMIN_KEY}:`).toString('base64')}`)));
     await assert.rejects(readFile(join(dir, 'usage.json')));
+  } finally { server.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('a replaced admin key never reuses the earlier key cache, within the hour or after', async () => {
+  const warm = await collect(null, teamsRun, cursorNow, fakeAdmin(undefined, ADMIN_KEY, '1:2:3:4').admin);
+  assert.equal(warm.tools[1].balance?.amount, '15.50875');
+  // Ten minutes later a different key file is rejected: the cached spend must not validate it.
+  const rejected = fakeAdmin(() => ({ status: 401, body: '{}' }), 'key_replacement_000000', '1:9:3:5');
+  const after = await collect(warm, teamsRun, cursorNow + 10 * 60_000, rejected.admin);
+  assert.equal(rejected.calls.length, 1);
+  assert.deepEqual([after.tools[1].status, after.tools[1].reason, after.tools[1].balances], ['unknown', 'admin key rejected', []]);
+  assert.equal(after.cursor_admin!.key_id, '1:9:3:5');
+});
+
+test('malformed charge, token and pagination data fails closed instead of partial totals', async () => {
+  const [first, second] = cursorEventPages;
+  const tokenEvent = first.usageEvents[0];
+  const { tokenUsage, ...noTokens } = tokenEvent;
+  const { cacheReadTokens, ...missingCacheRead } = tokenUsage!;
+  const lastPage = (usageEvents: unknown[]) => ({ ...second, usageEvents: [second.usageEvents[0], ...usageEvents] });
+  const bad: [string, unknown[]][] = [
+    ['missing charge', [first, lastPage([(({ chargedCents, ...e }) => e)(tokenEvent)])]],
+    ['null charge', [first, lastPage([{ ...tokenEvent, chargedCents: null }])]],
+    ['token call without tokenUsage', [first, lastPage([noTokens])]],
+    ['token call missing a count', [first, lastPage([{ ...tokenEvent, tokenUsage: missingCacheRead }])]],
+    ['missing isTokenBasedCall', [first, lastPage([(({ isTokenBasedCall, ...e }) => e)(tokenEvent)])]],
+    ['next page past numPages', [first, { ...second, pagination: { ...second.pagination, hasNextPage: true } }]],
+    ['last page before numPages', [{ ...first, pagination: { ...first.pagination, hasNextPage: false } }, second]],
+    ['numPages changes', [first, { ...second, pagination: { ...second.pagination, numPages: 3 } }]],
+    ['wrong currentPage', [first, { ...second, pagination: { ...second.pagination, currentPage: 1 } }]],
+    ['total count mismatch', [first, { ...second, totalUsageEventsCount: 5 }]],
+    ['total count changes', [{ ...first, totalUsageEventsCount: 3 }, second]],
+    ['missing total count', [first, (({ totalUsageEventsCount, ...p }) => p)(second)]],
+  ];
+  for (const [name, pages] of bad) {
+    const { admin } = fakeAdmin((path, body) => ({ status: 200, body: JSON.stringify(path === '/teams/spend' ? cursorSpendPages[body.page - 1] : pages[body.page - 1]) }));
+    const snapshot = await collect(null, teamsRun, cursorNow, admin);
+    assert.deepEqual([snapshot.tools[1].status, snapshot.tools[1].reason, snapshot.tools[1].balances], ['unknown', FORMAT_CHANGED, []], name);
+    assert.equal(snapshot.cursor_admin!.data, null, name);
+  }
+  // A request-based event (isTokenBasedCall false) without tokenUsage stays valid.
+  const ok = fakeAdmin((path, body) => ({ status: 200, body: JSON.stringify(path === '/teams/spend' ? cursorSpendPages[body.page - 1] : [first, lastPage([{ ...noTokens, isTokenBasedCall: false, model: 'request-model', chargedCents: 4 }])][body.page - 1]) }));
+  const snapshot = await collect(null, teamsRun, cursorNow, ok.admin);
+  assert.equal(snapshot.tools[1].status, 'ok');
+  assert.deepEqual(snapshot.tools[1].breakdown?.find(i => i.label === 'request-model'), { label: 'request-model', amount: '0.04' });
+});
+
+test('a trickling Admin response hits the wall-clock deadline; other tools still complete', async () => {
+  const { createServer } = await import('node:http');
+  const server = createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.write('{"teamMemberSpend":[');
+    const timer = setInterval(() => res.write(' '), 20);
+    res.on('close', () => clearInterval(timer));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const real = (await import('./cursor.ts')).defaultAdmin({ FACTORY_CURSOR_API_BASE: base });
+    let started = Date.now();
+    await assert.rejects(real.post('/teams/spend', { page: 1 }, ADMIN_KEY, 200), { message: 'timeout' });
+    assert.ok(Date.now() - started < 1_000);
+    const deps: AdminDeps = { ...real, readKey: async () => ({ key: ADMIN_KEY, id: '1:2:3:4' }), budgetMs: 300 };
+    started = Date.now();
+    const snapshot = await collect(null, teamsRun, cursorNow, () => deps);
+    assert.ok(Date.now() - started < 2_000);
+    assert.deepEqual([snapshot.tools[1].status, snapshot.tools[1].reason, snapshot.tools[1].plan], ['unknown', 'timeout', null]);
+    assert.deepEqual(snapshot.tools.filter(t => t.tool !== 'cursor').map(t => t.status), ['ok', 'ok', 'ok', 'ok', 'ok']);
+    // An injected transport that never settles is bounded by the fetch budget too.
+    started = Date.now();
+    await assert.rejects(fetchCursor({ ...deps, post: () => new Promise(() => {}), budgetMs: 200 }, ADMIN_KEY, cursorNow), { message: 'timeout' });
+    assert.ok(Date.now() - started < 1_000);
+  } finally { server.closeAllConnections(); server.close(); }
+});
+
+test('installer-style preflight hands its one Admin fetch to the first collection; a replaced key refetches', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'usage-cursor-handoff-'));
+  const { createServer } = await import('node:http');
+  const { rename } = await import('node:fs/promises');
+  const good = `Basic ${Buffer.from(`${ADMIN_KEY}:`).toString('base64')}`;
+  const seen: string[] = [];
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', () => {
+      seen.push(`${req.url} ${req.headers.authorization === good ? 'good' : 'other'}`);
+      if (req.headers.authorization !== good) { res.writeHead(401); res.end('{}'); return; }
+      const page = JSON.parse(body).page;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(req.url === '/teams/spend' ? cursorSpendPages[page - 1] : cursorEventPages[page - 1]));
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await writeFile(join(dir, 'agent'), `#!${process.execPath}\nconsole.log(process.argv[2]==='--version'?'2026.10.16-e3cb207':${JSON.stringify(JSON.stringify(cursorTeams))});\n`, { mode: 0o700 });
+    const snapshotPath = join(dir, 'usage.json'), keyFile = join(dir, 'cursor-admin-key');
+    const run = async (args: string[], key: string) => {
+      const { spawn } = await import('node:child_process');
+      const env = { HOME: dir, PATH: `${dir}:/usr/bin:/bin`, FACTORY_USAGE_SNAPSHOT: snapshotPath, FACTORY_CURSOR_ADMIN_KEY_FILE: key, FACTORY_CURSOR_API_BASE: `http://127.0.0.1:${(server.address() as { port: number }).port}` };
+      const child = spawn(process.execPath, ['scripts/usage/collect.ts', ...args], { cwd: fileURLToPath(new URL('../..', import.meta.url)), env });
+      let stdout = '', stderr = '';
+      child.stdout.on('data', c => { stdout += c; }); child.stderr.on('data', c => { stderr += c; });
+      assert.equal(await new Promise(resolve => child.on('close', resolve)), 0, stderr);
+      assert.equal(stderr, '');
+      return stdout;
+    };
+    const stage = async (name: string, key: string) => {
+      const path = join(dir, name);
+      await writeFile(path, `${key}\n`, { mode: 0o640 }); await chmod(path, 0o640);
+      return path;
+    };
+    // Cold preflight: dry-run with the staged key, then move it into place (same inode).
+    const staged = await stage('.staged-key', ADMIN_KEY);
+    const preview = await run(['--dry-run'], staged);
+    assert.equal(seen.length, 4);
+    assert.ok(!preview.includes(ADMIN_KEY)); assert.doesNotMatch(preview, /private|@|user_private|bc-/);
+    await assert.rejects(readFile(snapshotPath));
+    await rename(staged, keyFile);
+    await writeFile(snapshotPath, preview);
+    await run([], keyFile);
+    assert.equal(seen.length, 4); // The first collection reused the preflight fetch.
+    const first = JSON.parse(await readFile(snapshotPath, 'utf8'));
+    assert.equal(first.tools[1].status, 'ok'); assert.equal(first.tools[1].balance.amount, '15.50875');
+    assert.equal(first.cursor_admin.attempted_at_ms, JSON.parse(preview).cursor_admin.attempted_at_ms);
+    // Warm cache plus a staged replacement key that Cursor rejects: no cache reuse.
+    const replacement = await stage('.replacement-key', 'key_rejected_replacement_01');
+    const rejected = JSON.parse(await run(['--dry-run'], replacement));
+    assert.deepEqual(seen.slice(4), ['/teams/spend other']);
+    assert.deepEqual([rejected.tools[1].status, rejected.tools[1].reason, rejected.tools[1].balances], ['unknown', 'admin key rejected', []]);
+    assert.equal(rejected.cursor_admin.data, null);
+    assert.ok(!JSON.stringify(rejected).includes('key_rejected_replacement_01'));
   } finally { server.close(); await rm(dir, { recursive: true, force: true }); }
 });

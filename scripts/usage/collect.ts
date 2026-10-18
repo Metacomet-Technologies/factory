@@ -189,10 +189,11 @@ export async function collect(previous: Previous | null, run: Run = command, now
         const key = await deps.readKey();
         if (key === null) cursorAdmin = null;
         else {
-          // At most one Admin fetch per hour, including failures; 15-minute runs reuse the cache.
-          if (cursorAdmin === null || now - cursorAdmin.attempted_at_ms >= ADMIN_INTERVAL_MS) {
-            cursorAdmin = { attempted_at_ms: now, reason: null, data: null };
-            try { cursorAdmin.data = await fetchCursor(deps, key, now); }
+          // At most one Admin fetch per hour per key file, including failures; 15-minute
+          // runs reuse the cache. A different key file never reuses another key's result.
+          if (cursorAdmin === null || cursorAdmin.key_id !== key.id || now - cursorAdmin.attempted_at_ms >= ADMIN_INTERVAL_MS) {
+            cursorAdmin = { attempted_at_ms: now, key_id: key.id, reason: null, data: null };
+            try { cursorAdmin.data = await fetchCursor(deps, key.key, now); }
             catch (error) { cursorAdmin.reason = reason(error); }
           }
           const observed_at_ms = previous?.tools.find(value => value.tool === tool)?.observed_at_ms ?? null;
