@@ -165,7 +165,7 @@ export function prompt(issue: Issue, runner = validate(issue).runner) {
 3. Read \`AGENTS.md\`, \`docs/agents/cloud.md\` and the README of each Isolation directory.
 4. Confirm \`get_issue\` works through the Linear MCP; otherwise stop and report.
 5. Never deploy, never touch production, never write dispatch or QA markers.
-Push your branch. Do not open a PR; Cursor opens it when your run ends. Do not post the Linear evidence comment; the dispatcher posts it. Title your work \`${issue.identifier} — ${issue.title}\`. End your reply with tests run and counts, deviations and unverified items.` : `Runner: factory-${runner}. Directory: /home/agent/work/factory-${branch}. Effort: ${effort}.
+Commit and push your branch when the work is complete; Cursor opens a draft PR from it. Do not post the Linear evidence comment; the dispatcher posts it. Title your work \`${issue.identifier} — ${issue.title}\`. End your reply with tests run and counts, deviations and unverified items.` : `Runner: factory-${runner}. Directory: /home/agent/work/factory-${branch}. Effort: ${effort}.
 
 ## 1. Start fresh
 The dispatcher already created branch ${branch} from origin/main in the directory above. Do not recreate it.

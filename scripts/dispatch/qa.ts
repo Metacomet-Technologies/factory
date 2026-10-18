@@ -258,7 +258,7 @@ export async function reviewPRs(ctx: Context) {
         }
         await comment(issue, `QA follow-up claimed; inspect interrupted delivery before recovery.\n\n${qa(`followup-claim ${start.key}`)}`);
         // Cursor builders receive the findings as a follow-up run on their agent; Cursor updates the PR.
-        const text = `Dispatcher QA findings for PR ${pr} at ${start.sha}. Check these findings against your current head, fix what remains, verify, ${cloud ? 'and push your branch. Cursor updates the PR; the dispatcher posts the Linear evidence comment. Do not open a PR' : 'push, and post the updated Linear diff comment'}. Never deploy or merge.\n\n${followup}`;
+        const text = `Dispatcher QA findings for PR ${pr} at ${start.sha}. Check these findings against your current head, fix what remains, verify, ${cloud ? 'and push your branch. Cursor updates the existing PR; the dispatcher posts the Linear evidence comment' : 'push, and post the updated Linear diff comment'}. Never deploy or merge.\n\n${followup}`;
         if (cloud) {
           if (dryRun) ctx.showCursor(issue, 'POST', `/v1/agents/${builder}/runs`);
           else if (await ctx.cursorRun(builder, text) === 'busy') {
