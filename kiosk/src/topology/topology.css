@@ -51,6 +51,7 @@
 }
 .topology-steps ol {
   display: grid;
+  list-style: decimal; /* the Tailwind preflight resets lists to none */
   gap: 8px;
   margin: 4px 0;
   padding-left: 1.3em;
