@@ -77,7 +77,9 @@ esac
 LATE = {
     "rustup": 'if [ "$*" = "toolchain install" ]; then : > "$FAKE_STATE/rust"; fi\n',
     "vp": """case "$*" in
-  "env install") : > "$FAKE_STATE/js" ;;
+  "env on "*) : > "$FAKE_STATE/managed-$3" ;;
+  # Like a real image with its own bun: the pin resolves only once Vite+ manages bun.
+  "env install") if [ -e "$FAKE_STATE/managed-bun" ]; then : > "$FAKE_STATE/js"; fi ;;
   "install --frozen-lockfile") mkdir -p node_modules ;;
   "exec playwright install chromium") : > "$FAKE_STATE/playwright" ;;
 esac
@@ -170,6 +172,8 @@ class SetupTest(unittest.TestCase):
         self.assertIn("rustup toolchain install", calls)
         self.assertIn("VP_VERSION=9.8.7", calls)
         self.assertIn("vp env install", calls)
+        self.assertLess(calls.index("vp env on bun"), calls.index("vp env install"))
+        self.assertIn("vp env on node", calls)
         self.assertIn("vp exec playwright install chromium", calls)
         self.assertNotIn("cargo", joined)
         with open(self.layout, encoding="utf-8") as handle:

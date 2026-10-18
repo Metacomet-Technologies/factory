@@ -64,7 +64,7 @@ version literals:
 | System packages | `apt-get install --no-install-recommends` (`DEBIAN_FRONTEND=noninteractive`), as root or through `sudo -n`; without either it stops and prints the administrator's command | the checker's `SYSTEM` list |
 | Rust | rustup (installed from `sh.rustup.rs` if missing), then `rustup toolchain install` in the repo root | `rust-toolchain.toml` (channel and components) |
 | Vite+ | the `vite.plus` installer, which verifies the npm package integrity; `VP_NODE_MANAGER=yes` | `kiosk/package.json` `catalog.vite-plus` |
-| Node, Bun | `vp env install` in `kiosk/` and the repo root | `devEngines`, `.node-version` |
+| Node, Bun | `vp env on <node|bun>` for each failing one (the Vite+ installer leaves a tool system-first when the image already has one, as orbs do with `/usr/local/bin/bun`), then `vp env install` in `kiosk/` and the repo root | `devEngines`, `.node-version` |
 | Playwright | `vp exec playwright install chromium` in `kiosk/`, into `PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright` | the kiosk's locked `@playwright/test` |
 | Layout | writes `/home/agent/.config/vite-plus/env` (sourcing the real Vite+ env) when missing. The checkout symlink stays with the environment | — |
 

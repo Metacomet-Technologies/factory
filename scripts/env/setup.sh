@@ -106,14 +106,16 @@ else
     read_failing
 fi
 
-packages=() rust=0 vite_plus='' js=0 playwright=0 vp_env_layout='' unmet=()
+packages=() rust=0 vite_plus='' js=0 managed=() playwright=0 vp_env_layout='' unmet=()
 for line in "${failing[@]}"; do
     IFS=$'\t' read -r name expected actual <<<"$line"
     case "$name" in
         os|layout:checkout) unmet+=("$name: expected $expected, found $actual") ;;
         rust|rust:*) rust=1 ;;
         vite-plus) vite_plus=$expected ;;
-        node|node:*|bun) js=1 ;;
+        node|node:*|bun)
+            js=1
+            [[ " ${managed[*]} " == *" ${name%%:*} "* ]] || managed+=("${name%%:*}") ;;
         playwright) ((ci)) || playwright=1 ;;
         layout:vite-plus-env) ((ci)) || vp_env_layout=$expected ;;
         layout:*) unmet+=("$name: expected $expected, found $actual") ;;
@@ -159,6 +161,11 @@ if [[ -n "$vite_plus" ]]; then
     fi
 fi
 
+# The Vite+ installer leaves a tool system-first when it finds one already on
+# PATH (orbs ship /usr/local/bin/bun), so the pin would stay shadowed.
+if ((${#managed[@]})) && would "let Vite+ manage ${managed[*]} (vp env on)"; then
+    for scope in "${managed[@]}"; do vp env on "$scope"; done
+fi
 if ((js)) && would 'install the pinned Node and Bun through Vite+ (kiosk devEngines, .node-version)'; then
     (cd "$root/kiosk" && vp env install)
     (cd "$root" && vp env install)
