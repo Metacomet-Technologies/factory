@@ -8,8 +8,8 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import re
 import sys
-import tomllib
 
 root = Path(sys.argv[1]).resolve()
 if len(sys.argv) != 3 or sys.argv[2] not in ("meter", "factory-api", "kiosk"):
@@ -28,9 +28,12 @@ if component == "kiosk":
 else:
     # Workspace settings matter, but membership does not: adding an unrelated
     # crate must not stale this one. Its own path closure and tree are below.
-    workspace = tomllib.loads((root / "Cargo.toml").read_text())
-    workspace["workspace"].pop("members", None)
-    workspace = json.dumps(workspace, sort_keys=True).encode()
+    # ponytail: textual drop of the first top-level `members = [...]` (the root
+    # manifest's only one); tomllib needs Python 3.11 and the sandbox CI has 3.10.
+    workspace = (root / "Cargo.toml").read_bytes()
+    workspace, dropped = re.subn(rb"(?ms)^members\s*=\s*\[.*?\][ \t]*\n?", b"", workspace, count=1)
+    if not dropped:
+        sys.exit("build-fingerprint: workspace Cargo.toml has no members list")
     metadata = json.loads(run("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"))
     packages = {p["name"]: p for p in metadata["packages"]}
     pending = [component]

@@ -2,6 +2,7 @@
 """Offline release contracts; all publication requests go to FakeGitHub."""
 import copy
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import io
 import json
 import os
@@ -962,6 +963,8 @@ class BuildMetadata(unittest.TestCase):
             (root / "shared/src/main.rs").write_text('fn main() { println!("{}|{}|{}|{}", env!("FACTORY_VERSION"), env!("FACTORY_GIT_SHA"), env!("FACTORY_GIT_DIRTY"), env!("FACTORY_BUILT_AT_MS")); }\n')
             shutil.copyfile(ROOT / "kiosk/scripts/build-info.ts", root / "kiosk/scripts/build-info.ts")
             (root / "kiosk/package.json").write_text('{"type":"module","version":"0.2.0"}')
+            (root / "factory-api").mkdir()
+            (root / "factory-api/openapi.json").write_text("{}\n")
             (root / "scripts/build-fingerprint.sh").write_text("printf '123456abcdef\\n'\n")
             (root / ".gitignore").write_text("target/\n")
             run(root, "cargo", "generate-lockfile")
@@ -982,6 +985,7 @@ class BuildMetadata(unittest.TestCase):
                 self.assertEqual(kiosk["git_sha"], rust[1])
                 self.assertEqual(rust[2], "false")
                 self.assertFalse(kiosk["git_dirty"])
+                self.assertEqual(kiosk["expected_openapi_sha256"], hashlib.sha256(b"{}\n").hexdigest()[:12])
                 if override:
                     self.assertEqual(int(rust[3]), kiosk["built_at_ms"])
             for invalid in ("", "0.1.99", "0.02.1", "1.2.3-rc1", "1.2.3+meta", "1.2.3\n", "4294967296.0.0"):
