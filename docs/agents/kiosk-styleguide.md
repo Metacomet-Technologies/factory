@@ -189,6 +189,15 @@ stacks; numbers get `tabular-nums` from `body`.
 - Details pages (`/ups`, `/llm`, `/network`, `/devices/<id>`): `PageHeader`
   then stacked Panels; the dashboard area scrolls there.
 - Navigation: plain `<a href="/…">`; `App.tsx` intercepts same-origin clicks.
+- Topology page (`/topology`, `kiosk/src/topology/`, MET-226): a static React
+  Flow map of the factory. Boxes, groups, edges and flows live in
+  `topology.ts`; edge geometry is routed at runtime by `router.ts` over that
+  data (`routes.ts` caches one routing per flow), so a new box is one entry in
+  the node list plus its id in a group's `nodes` and any edges that touch it.
+  `@xyflow/react` loads only on this route (`lazy()` in `App.tsx`), so the
+  overview chunk stays free of it; `topology.test.ts` walks the static imports
+  to keep it that way. Colors come from tokens via `topology.css`; the
+  "How … works" steps open a native `popover`.
 
 ## Live data
 

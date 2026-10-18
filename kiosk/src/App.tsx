@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Activity, Cpu, Moon, Mountain, Server, Sun, Terminal, Info } from "lucide-react";
 import { useApi, useHeld } from "./api/client";
 import { useStream } from "./api/stream";
@@ -29,6 +29,9 @@ import { AmbientScene } from "./ambient/scene";
 import { pulse } from "./lib/motion";
 import { freshStatus, networkBadge } from "./lib/network";
 import { verdict } from "./lib/verdict";
+
+// React Flow loads with the topology route only, so the overview bundle stays without it.
+const TopologyPage = lazy(() => import("./topology/topology-map"));
 
 // Read once at load: `?ambient=none|static` is a diagnostic override, `?perf=1` samples frames.
 const ambient = parseAmbient(window.location.search);
@@ -202,6 +205,7 @@ export default function App() {
           </ol>
         </nav>
         <div className="header-actions">
+          <a href="/topology">Topology</a>
           <LiveIndicator status={live.status} />
           <UpsBadge current={upsCurrent} now={now} warnings={upsWarnings} />
           <Tooltip>
@@ -281,6 +285,10 @@ export default function App() {
           live={live}
           revision={live.snapshotRevision + live.upsEventRevision}
         />
+      ) : path === "/topology" ? (
+        <Suspense fallback={<p className="loading">Loading topology…</p>}>
+          <TopologyPage dark={dark} />
+        </Suspense>
       ) : (
         <main id="main" className="dashboard">
           <PageHeader
