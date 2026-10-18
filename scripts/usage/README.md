@@ -81,14 +81,20 @@ output or exception text. The collector kills only its own probe process group.
 * **Cursor Teams spend (MET-221):** with an Admin API key at
   `/etc/factory-usage/cursor-admin-key`, the Cursor row adds Teams cycle spend
   from `https://api.cursor.com`. No key keeps the plan-only row above. The file
-  must be a regular non-symlink, non-empty, owned by root, group the collector's
-  group (`agent`) and mode exactly `0640`; anything else fails the Cursor row
-  closed. The key is sent only as Basic auth and never logged or stored. At
-  most one Admin fetch per hour per key file, including failures
-  (`cursor_admin.attempted_at_ms`); runs between fetches reuse the cached
-  aggregate, and `observed_at_ms` is the fetch time. The cache records the key
-  file's device, inode, size and mtime (`cursor_admin.key_id`, never the key):
-  a replaced key always fetches afresh instead of reusing another key's result.
+  must be a regular non-symlink, non-empty (at most 1024 bytes), owned by root,
+  group the collector's group (`agent`) and mode exactly `0640`. It is opened
+  with `O_NOFOLLOW | O_NONBLOCK` and validated from that descriptor, so a FIFO
+  or other non-regular file fails only the Cursor row (`CLI failed`) at once,
+  without waiting for a writer. The key is sent only as Basic auth and never
+  logged or stored. At most one Admin fetch per hour in total, whatever the key
+  file, including failures (`cursor_admin.attempted_at_ms`); runs between
+  fetches reuse the cached aggregate, and `observed_at_ms` is the fetch time.
+  The cache records which key file it came from (device, inode, size and mtime
+  as `cursor_admin.key_id`, never the key). Inside the hour, a different key
+  file (a replaced key, or identical bytes in a new inode) does not fetch and
+  does not reuse that cache: the row stays plan-only until the next hourly
+  fetch, which uses the current key. A removed key keeps the hour's attempt;
+  after the hour it clears the cache.
   A fetch reads every `POST /teams/spend` page (3.1 s apart, under 20/min) and
   every `POST /teams/filtered-usage-events` page (1000 events, 1.05 s apart,
   under 60/min) from `subscriptionCycleStart` to now, in inclusive ranges of
@@ -340,10 +346,13 @@ After merge and the clean main-checkout handoff, install the key through stdin
 and never fails when it is absent. The installer stages the key at
 `root:agent 0640` beside the final path and runs its dry-run with it. The
 staged key is installed only if that preflight made a fresh, successful Admin
-fetch; a rejected, failed or cached result exits with the installed key
-unchanged and the staged file removed. It then hands that preflight snapshot to
-the first collection, which reuses its fetch (same key file inode) rather than
-fetching again:
+fetch. Because the hourly budget is shared by every key file, a preflight within
+an hour of the last attempt defers: the installer prints when to retry and
+exits. A deferred, rejected or failed result leaves the installed key unchanged
+and removes the staged file; cached success from another key never validates
+it. On success the installer hands that preflight snapshot to the first
+collection, which reuses its fetch (same key file inode) rather than fetching
+again:
 
 ```sh
 op read 'op://Factory/Cursor admin API key/credential' | gpu-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/install-usage.sh --cursor-admin-key-stdin'
@@ -352,12 +361,22 @@ curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/agents | jq '.tools[] | 
 ```
 
 Installing makes one Admin fetch in total; the manual collection above reuses it
-within the hour. Without `--cursor-admin-key-stdin`, an already installed key is
-reported and used as is, and its preflight snapshot is handed off the same way.
+within the hour. The first install has no earlier attempt and never defers. To
+replace an installed key, first stop the timer and refresh path so no
+collection takes the next hourly fetch, then rerun the installer at or after
+the printed retry time; it re-enables both:
+
+```sh
+gpu-ssh 'sudo systemctl stop factory-usage.timer factory-usage-refresh.path'
+```
+
+Without `--cursor-admin-key-stdin`, an already installed key is reported and
+used as is, and its preflight snapshot is handed off the same way.
 Rollback keeps the key unless asked:
 `gpu-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/rollback-usage.sh --remove-cursor-admin-key'`.
 To return to plan-only without removing units, delete only
-`/etc/factory-usage/cursor-admin-key`; the next run clears the cache.
+`/etc/factory-usage/cursor-admin-key`; the row is plan-only from the next run,
+and the cache clears once its hour has passed.
 
 ## Checks
 

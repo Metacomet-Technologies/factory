@@ -187,22 +187,27 @@ export async function collect(previous: Previous | null, run: Run = command, now
         reading = parseCursor(await run('agent', ['about', '--format', 'json']));
         const deps = admin();
         const key = await deps.readKey();
-        if (key === null) cursorAdmin = null;
+        // One logical Admin fetch per hour, whatever the key file: failures, a removed
+        // key and a replaced key all count against the same hourly attempt.
+        const due = cursorAdmin === null || now - cursorAdmin.attempted_at_ms >= ADMIN_INTERVAL_MS;
+        if (key === null) { if (due) cursorAdmin = null; }
         else {
-          // At most one Admin fetch per hour per key file, including failures; 15-minute
-          // runs reuse the cache. A different key file never reuses another key's result.
-          if (cursorAdmin === null || cursorAdmin.key_id !== key.id || now - cursorAdmin.attempted_at_ms >= ADMIN_INTERVAL_MS) {
+          if (due) {
             cursorAdmin = { attempted_at_ms: now, key_id: key.id, reason: null, data: null };
             try { cursorAdmin.data = await fetchCursor(deps, key.key, now); }
             catch (error) { cursorAdmin.reason = reason(error); }
           }
-          const observed_at_ms = previous?.tools.find(value => value.tool === tool)?.observed_at_ms ?? null;
-          // A rejected key keeps the plan visible; other Admin failures fail closed.
-          if (cursorAdmin.reason === ADMIN_REJECTED) return age({ tool, source, cli_version, status: 'unknown', reason: ADMIN_REJECTED, note: null, observed_at_ms, ...emptyReading(), plan: reading.plan }, now);
-          if (cursorAdmin.reason) throw new Error(cursorAdmin.reason);
-          const data = cursorAdmin.data!;
-          reading = cursorReading(reading, data, now);
-          if (reading.balances.length > 0) return { tool, source, cli_version, status: 'ok', reason: null, note: null, observed_at_ms: data.fetched_at_ms, ...reading };
+          // A result fetched with another key file is never shown or used to validate
+          // this one; until the next hourly fetch the row stays plan-only.
+          if (cursorAdmin!.key_id === key.id) {
+            const observed_at_ms = previous?.tools.find(value => value.tool === tool)?.observed_at_ms ?? null;
+            // A rejected key keeps the plan visible; other Admin failures fail closed.
+            if (cursorAdmin!.reason === ADMIN_REJECTED) return age({ tool, source, cli_version, status: 'unknown', reason: ADMIN_REJECTED, note: null, observed_at_ms, ...emptyReading(), plan: reading.plan }, now);
+            if (cursorAdmin!.reason) throw new Error(cursorAdmin!.reason);
+            const data = cursorAdmin!.data!;
+            reading = cursorReading(reading, data, now);
+            if (reading.balances.length > 0) return { tool, source, cli_version, status: 'ok', reason: null, note: null, observed_at_ms: data.fetched_at_ms, ...reading };
+          }
         }
       }
       else if (tool === 'claude-code') reading = parseClaude(await run('claude', CLAUDE_ARGS));

@@ -115,13 +115,20 @@ for (const name of ["amp", "cursor", "claude-code", "codex", "kimi", "opencode"]
 }' "$1"; }
 check_snapshot "$preview"
 if [[ -n "$staged_key" ]]; then
-    # The staged key must pass a fresh fetch in this preflight. A cached or failed
-    # result (including one made with an earlier key) leaves the installed key unchanged.
+    # The staged key must pass a fresh fetch in this preflight. The hourly Admin
+    # budget is shared by every key file, so inside the hour the dry-run defers
+    # instead of fetching; a deferred, cached or failed result (including one made
+    # with an earlier key) refuses installation and leaves the installed key unchanged.
     as_agent "$node" --input-type=module -e '
-const admin = JSON.parse(process.argv[1]).cursor_admin;
-if (!admin || admin.reason !== null || admin.data === null || !(admin.attempted_at_ms >= Number(process.argv[2]))) {
-  throw new Error("staged Cursor admin key was not validated by a fresh Admin fetch");
-}' "$preview" "$preflight_ms" || fail 'Staged Cursor admin key failed validation; installed key unchanged.'
+const admin = JSON.parse(process.argv[1]).cursor_admin, since = Number(process.argv[2]);
+if (admin && admin.attempted_at_ms < since) {
+  console.error("Deferred: an Admin fetch was already made at " + new Date(admin.attempted_at_ms).toISOString() + "; retry after " + new Date(admin.attempted_at_ms + 3600000).toISOString() + ".");
+  process.exit(1);
+}
+if (!admin || admin.reason !== null || admin.data === null) {
+  console.error("The staged key did not pass a fresh Admin fetch" + (admin && admin.reason ? " (" + admin.reason + ")" : "") + ".");
+  process.exit(1);
+}' "$preview" "$preflight_ms" || fail 'Staged Cursor admin key not installed; installed key unchanged.'
 fi
 
 # Snapshot units and state before any deployment mutation.

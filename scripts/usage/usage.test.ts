@@ -278,18 +278,23 @@ test('atomic replacement inherits the setgid directory group and preserves owner
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+// Fake binaries for all six CLIs; each prints decoy secrets on stderr.
+async function writeFakeClis(dir: string) {
+  const scripts: Record<string, string> = {
+    amp: `const o=${JSON.stringify({ version: '0.0.1791763306-ged595a (released 2026-10-12T00:01:46.000Z, 1d ago)', summary: amp, details })}; console.error('private-secret'); console.log(process.argv[2]==='--version'?o.version:process.argv.includes('--details')?o.details:o.summary);`,
+    claude: `const o=${JSON.stringify({ version: '2.1.296 (Claude Code)', summary: claude })}; console.error('private-secret'); console.log(process.argv[2]==='--version'?o.version:o.summary);`,
+    codex: `if(process.argv[2]==='--version') console.log('codex-cli 0.162.1'); else {require('node:readline').createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l); if(m.id===1) console.log(JSON.stringify({id:1,result:{}})); if(m.id===2) console.log(${JSON.stringify(JSON.stringify(codex))});});}`,
+    agent: `const body=${JSON.stringify(JSON.stringify(cursorAbout))}; console.error('redacted@example.invalid'); console.log(process.argv[2]==='--version'?'2026.10.16-e3cb207':body);`,
+    opencode: `console.error('12.5K'); console.log(process.argv[2]==='--version'?'1.19.3':${JSON.stringify(opencodeStats)});`,
+    kimi: `const http=require('node:http'),fs=require('node:fs'),path=require('node:path'); if(process.argv[2]==='--version'){console.log('2.2.0');process.exit(0)} if(process.argv[2]!=='web'||process.argv[3]!=='--no-open'||process.argv[4]!=='--port') process.exit(1); const token='fixturetokenvalue0001'; const dir=path.join(process.env.HOME,'.kimi-code'); fs.mkdirSync(dir,{recursive:true}); fs.writeFileSync(path.join(dir,'server.token'),token,{mode:0o600}); fs.chmodSync(path.join(dir,'server.token'),0o600); console.log('Token: '+token); const body=${JSON.stringify(JSON.stringify(kimiUsage))}; http.createServer((req,res)=>{ if(req.url!=='/api/v1/oauth/usage'||req.headers.authorization!=='Bearer '+token){res.writeHead(401);res.end('denied');return} res.writeHead(200,{'content-type':'application/json'}); res.end(body); }).listen(Number(process.argv[5]),'127.0.0.1');`,
+  };
+  for (const [program, script] of Object.entries(scripts)) await writeFile(join(dir, program), `#!${process.execPath}\n${script}\n`, { mode: 0o700 });
+}
+
 test('CLI dry-run writes nothing and logs only sanitized snapshot using fake binaries', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'usage-cli-'));
   try {
-    const scripts: Record<string, string> = {
-      amp: `const o=${JSON.stringify({ version: '0.0.1791763306-ged595a (released 2026-10-12T00:01:46.000Z, 1d ago)', summary: amp, details })}; console.error('private-secret'); console.log(process.argv[2]==='--version'?o.version:process.argv.includes('--details')?o.details:o.summary);`,
-      claude: `const o=${JSON.stringify({ version: '2.1.296 (Claude Code)', summary: claude })}; console.error('private-secret'); console.log(process.argv[2]==='--version'?o.version:o.summary);`,
-      codex: `if(process.argv[2]==='--version') console.log('codex-cli 0.162.1'); else {require('node:readline').createInterface({input:process.stdin}).on('line',l=>{const m=JSON.parse(l); if(m.id===1) console.log(JSON.stringify({id:1,result:{}})); if(m.id===2) console.log(${JSON.stringify(JSON.stringify(codex))});});}`,
-      agent: `const body=${JSON.stringify(JSON.stringify(cursorAbout))}; console.error('redacted@example.invalid'); console.log(process.argv[2]==='--version'?'2026.10.16-e3cb207':body);`,
-      opencode: `console.error('12.5K'); console.log(process.argv[2]==='--version'?'1.19.3':${JSON.stringify(opencodeStats)});`,
-      kimi: `const http=require('node:http'),fs=require('node:fs'),path=require('node:path'); if(process.argv[2]==='--version'){console.log('2.2.0');process.exit(0)} if(process.argv[2]!=='web'||process.argv[3]!=='--no-open'||process.argv[4]!=='--port') process.exit(1); const token='fixturetokenvalue0001'; const dir=path.join(process.env.HOME,'.kimi-code'); fs.mkdirSync(dir,{recursive:true}); fs.writeFileSync(path.join(dir,'server.token'),token,{mode:0o600}); fs.chmodSync(path.join(dir,'server.token'),0o600); console.log('Token: '+token); const body=${JSON.stringify(JSON.stringify(kimiUsage))}; http.createServer((req,res)=>{ if(req.url!=='/api/v1/oauth/usage'||req.headers.authorization!=='Bearer '+token){res.writeHead(401);res.end('denied');return} res.writeHead(200,{'content-type':'application/json'}); res.end(body); }).listen(Number(process.argv[5]),'127.0.0.1');`,
-    };
-    for (const [program, script] of Object.entries(scripts)) await writeFile(join(dir, program), `#!${process.execPath}\n${script}\n`, { mode: 0o700 });
+    await writeFakeClis(dir);
     const path = join(dir, 'usage.json');
     const env = { HOME: dir, PATH: `${dir}:/usr/bin:/bin`, FACTORY_USAGE_SNAPSHOT: path, FACTORY_KIMI_PORT: '58941', FACTORY_CURSOR_ADMIN_KEY_FILE: join(dir, 'no-cursor-key') };
     const invoke = (args: string[]) => spawnSync(process.execPath, ['scripts/usage/collect.ts', ...args], { cwd: fileURLToPath(new URL('../..', import.meta.url)), env, encoding: 'utf8', timeout: 5000 });
@@ -655,15 +660,34 @@ test('cursor admin key file is strict and dry-run against a fake Admin server le
   } finally { server.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
-test('a replaced admin key never reuses the earlier key cache, within the hour or after', async () => {
+test('one Admin fetch per hour regardless of key file; another key never reuses cached success', async () => {
   const warm = await collect(null, teamsRun, cursorNow, fakeAdmin(undefined, ADMIN_KEY, '1:2:3:4').admin);
   assert.equal(warm.tools[1].balance?.amount, '15.50875');
-  // Ten minutes later a different key file is rejected: the cached spend must not validate it.
-  const rejected = fakeAdmin(() => ({ status: 401, body: '{}' }), 'key_replacement_000000', '1:9:3:5');
-  const after = await collect(warm, teamsRun, cursorNow + 10 * 60_000, rejected.admin);
+  // Within the hour: identical bytes in another inode, then a different key Cursor would reject.
+  for (const [minutes, key, id] of [[10, ADMIN_KEY, '1:9:3:5'], [20, 'key_replacement_000000', '1:10:3:6']] as const) {
+    const other = fakeAdmin(() => ({ status: 401, body: '{}' }), key, id);
+    const snapshot = await collect(warm, teamsRun, cursorNow + minutes * 60_000, other.admin);
+    assert.equal(other.calls.length, 0);
+    // Plan-only: neither the cached spend nor a cached success validates the other key file.
+    assert.deepEqual([snapshot.tools[1].status, snapshot.tools[1].plan, snapshot.tools[1].balances, snapshot.tools[1].breakdown], ['ok', 'team', [], undefined]);
+    assert.deepEqual(snapshot.cursor_admin, warm.cursor_admin);
+  }
+  // Removing the key inside the hour keeps the attempt, so re-adding it cannot fetch early.
+  const removed = await collect(warm, teamsRun, cursorNow + 30 * 60_000, fakeAdmin(undefined, null).admin);
+  assert.deepEqual([removed.tools[1].balances, removed.cursor_admin], [[], warm.cursor_admin]);
+  const readded = fakeAdmin(undefined, ADMIN_KEY, '1:11:3:7');
+  await collect(removed, teamsRun, cursorNow + 40 * 60_000, readded.admin);
+  assert.equal(readded.calls.length, 0);
+  // The original key file still reads its own cache.
+  assert.equal((await collect(warm, teamsRun, cursorNow + 50 * 60_000, fakeAdmin(() => { throw new Error('no call'); }).admin)).tools[1].balance?.amount, '15.50875');
+  // After the hour the replacement key gets its own fetch, and its rejection is reported.
+  const rejected = fakeAdmin(() => ({ status: 401, body: '{}' }), 'key_replacement_000000', '1:10:3:6');
+  const after = await collect(warm, teamsRun, cursorNow + 60 * 60_000, rejected.admin);
   assert.equal(rejected.calls.length, 1);
-  assert.deepEqual([after.tools[1].status, after.tools[1].reason, after.tools[1].balances], ['unknown', 'admin key rejected', []]);
-  assert.equal(after.cursor_admin!.key_id, '1:9:3:5');
+  // Stale, not unknown: the last good reading is now over 45 minutes old.
+  assert.deepEqual([after.tools[1].status, after.tools[1].reason, after.cursor_admin!.key_id], ['stale', 'admin key rejected', '1:10:3:6']);
+  // A missing key after the hour clears the state.
+  assert.equal((await collect(warm, teamsRun, cursorNow + 60 * 60_000, fakeAdmin(undefined, null).admin)).cursor_admin, null);
 });
 
 test('malformed charge, token and pagination data fails closed instead of partial totals', async () => {
@@ -728,7 +752,7 @@ test('a trickling Admin response hits the wall-clock deadline; other tools still
   } finally { server.closeAllConnections(); server.close(); }
 });
 
-test('installer-style preflight hands its one Admin fetch to the first collection; a replaced key refetches', async () => {
+test('installer-style preflight hands its one Admin fetch to the first collection; restaging inside the hour defers', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'usage-cursor-handoff-'));
   const { createServer } = await import('node:http');
   const { rename } = await import('node:fs/promises');
@@ -777,12 +801,55 @@ test('installer-style preflight hands its one Admin fetch to the first collectio
     const first = JSON.parse(await readFile(snapshotPath, 'utf8'));
     assert.equal(first.tools[1].status, 'ok'); assert.equal(first.tools[1].balance.amount, '15.50875');
     assert.equal(first.cursor_admin.attempted_at_ms, JSON.parse(preview).cursor_admin.attempted_at_ms);
-    // Warm cache plus a staged replacement key that Cursor rejects: no cache reuse.
-    const replacement = await stage('.replacement-key', 'key_rejected_replacement_01');
-    const rejected = JSON.parse(await run(['--dry-run'], replacement));
-    assert.deepEqual(seen.slice(4), ['/teams/spend other']);
-    assert.deepEqual([rejected.tools[1].status, rejected.tools[1].reason, rejected.tools[1].balances], ['unknown', 'admin key rejected', []]);
-    assert.equal(rejected.cursor_admin.data, null);
-    assert.ok(!JSON.stringify(rejected).includes('key_rejected_replacement_01'));
+    // Warm snapshot, then within the hour re-stage identical key bytes (new inode) and a
+    // different key Cursor rejects. Neither fetches; neither validates from cached success,
+    // so the installer's fresh-fetch check refuses and the installed key stays.
+    const freshFetch = (preview: any, since: number) => preview.cursor_admin?.reason === null && preview.cursor_admin.data !== null && preview.cursor_admin.attempted_at_ms >= since;
+    for (const [name, key] of [['.restaged-key', ADMIN_KEY], ['.replacement-key', 'key_rejected_replacement_01']]) {
+      const since = Date.now();
+      const staged = await stage(name, key);
+      const deferred = await run(['--dry-run'], staged);
+      assert.equal(seen.length, 4, name);
+      const parsed = JSON.parse(deferred);
+      assert.deepEqual([parsed.tools[1].status, parsed.tools[1].plan, parsed.tools[1].balances], ['ok', 'team', []], name);
+      assert.equal(freshFetch(parsed, since), false, name);
+      assert.ok(!deferred.includes(key), name);
+      await rm(staged);
+    }
+    assert.equal(await readFile(keyFile, 'utf8'), `${ADMIN_KEY}\n`);
+    // The installed key keeps serving its own cached row, still without a fetch.
+    await run([], keyFile);
+    assert.equal(seen.length, 4);
+    assert.equal(JSON.parse(await readFile(snapshotPath, 'utf8')).tools[1].balance.amount, '15.50875');
+    assert.ok(freshFetch(JSON.parse(preview), 0));
   } finally { server.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('a FIFO credential fails only the Cursor row promptly, and the snapshot is still written', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'usage-cursor-fifo-'));
+  try {
+    await writeFakeClis(dir);
+    const fifo = join(dir, 'cursor-admin-key');
+    assert.equal(spawnSync('mkfifo', ['-m', '0640', fifo]).status, 0);
+    assert.ok((await stat(fifo)).isFIFO());
+    // Direct read: rejected without waiting for a writer.
+    let started = Date.now();
+    await assert.rejects(readAdminKey(fifo, false), { message: 'CLI failed' });
+    assert.ok(Date.now() - started < 1_000);
+    // Actual CLI: a full (non-dry) run completes, Cursor fails closed, the rest are ok.
+    const path = join(dir, 'usage.json');
+    const env = { HOME: dir, PATH: `${dir}:/usr/bin:/bin`, FACTORY_USAGE_SNAPSHOT: path, FACTORY_KIMI_PORT: '58943', FACTORY_CURSOR_ADMIN_KEY_FILE: fifo, FACTORY_CURSOR_API_BASE: 'http://127.0.0.1:9' };
+    started = Date.now();
+    const result = spawnSync(process.execPath, ['scripts/usage/collect.ts'], { cwd: fileURLToPath(new URL('../..', import.meta.url)), env, encoding: 'utf8', timeout: 15_000 });
+    assert.ok(Date.now() - started < 10_000);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, ''); assert.equal(result.stderr, '');
+    const snapshot = JSON.parse(await readFile(path, 'utf8'));
+    assert.deepEqual(snapshot.tools.map(t => [t.tool, t.status, t.reason]), [
+      ['amp', 'ok', null], ['cursor', 'unknown', 'CLI failed'], ['claude-code', 'ok', null],
+      ['codex', 'ok', null], ['kimi', 'ok', null], ['opencode', 'ok', null],
+    ]);
+    assert.deepEqual([snapshot.tools[1].plan, snapshot.tools[1].balances], [null, []]);
+    assert.equal(snapshot.cursor_admin, null);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

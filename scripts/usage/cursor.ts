@@ -88,7 +88,8 @@ export function defaultAdmin(env = process.env): AdminDeps {
 // root:agent 0640 credential (agent being the collector's group); otherwise fail closed.
 export async function readAdminKey(path: string, production = true): Promise<AdminKey | null> {
   let file;
-  try { file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW); } catch (error) {
+  // O_NONBLOCK: opening a FIFO must not wait for a writer before fstat rejects it.
+  try { file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     fail('CLI failed');
   }
@@ -96,8 +97,12 @@ export async function readAdminKey(path: string, production = true): Promise<Adm
     const info = await file.stat();
     const owner = info.uid === 0 || (!production && info.uid === process.getuid());
     if (!info.isFile() || !owner || info.gid !== process.getgid() || (info.mode & 0o7777) !== 0o640 || info.size === 0 || info.size > 1024) fail('CLI failed');
-    let key: string;
-    try { key = (await file.readFile('utf8')).trim(); } catch { fail('CLI failed'); }
+    // Read at most 1025 bytes from this descriptor, so growth after fstat is caught.
+    const buffer = Buffer.alloc(1025);
+    let length: number;
+    try { ({ bytesRead: length } = await file.read(buffer, 0, buffer.length, 0)); } catch { fail('CLI failed'); }
+    if (length === 0 || length > 1024) fail('CLI failed');
+    const key = buffer.subarray(0, length).toString('utf8').trim();
     if (!/^[\x21-\x7e]{8,512}$/.test(key)) fail('CLI failed');
     return { key, id: `${info.dev}:${info.ino}:${info.size}:${Math.trunc(info.mtimeMs)}` };
   } finally { await file.close(); }

@@ -13,7 +13,7 @@ shared/unattributed records. An OS user named `agent` does not identify a person
 Use vendor reporting APIs for billed usage, local supported telemetry for live
 activity, and account snapshots for quota. Keep these three views separate.
 Start with Amp workspace reporting, OpenAI/Anthropic API billing when applicable,
-and Cursor Admin API reporting (Teams and Enterprise; Teams verified 2026-10-17). Claude Code and
+and Cursor reporting **only if Devon has Enterprise access**. Claude Code and
 Codex have useful supported local interfaces, including subscription quota.
 Kimi Code has a documented but experimental local quota API; the older Kimi CLI
 has been archived. Do not equate subscription token estimates with money owed.
@@ -29,7 +29,7 @@ not zero usage.
 | Tool | Recommended source | Usage: tokens / requests / sessions | Limits or remaining | Cost | Confidence |
 | --- | --- | --- | --- | --- | --- |
 | Amp | External API: daily usage and thread usage | Yes / yes / thread IDs | Configured workspace entitlements; no documented balance API | Vendor USD usage; BYOK estimate separate | High for API usage; partial for quota |
-| Cursor CLI | Teams/Enterprise Admin API (Teams verified 2026-10-17); Enterprise Organization API and server-side OTel | Tokens when reported / usage events / conversation IDs; CLI JSON alone only sessions | Spend caps; Enterprise pooled budget remaining; individual pools unavailable | Vendor `chargedCents`; BYOK provider bill separate | High with Enterprise; low for individual billing automation |
+| Cursor CLI | Enterprise Admin/Organization API; Enterprise server-side OTel | Tokens when reported / usage events / conversation IDs; CLI JSON alone only sessions | Spend caps; Enterprise pooled budget remaining; individual pools unavailable | Vendor `chargedCents`; BYOK provider bill separate | High with Enterprise; low for individual billing automation |
 | Cursor cloud agents | Cloud Agents usage API plus Enterprise Admin/Organization API | Tokens / partial request count / agent and run IDs | Spend caps and Enterprise pooled remaining; no universal quota read | Admin API billed usage; cloud usage route has no USD cost | High for cloud tokens; cost conditional on access |
 | Claude Code | OTel + status-line JSON; Anthropic reporting APIs for eligible organizations | Yes / API events / session count | Pro/Max 5h and 7d percentages via status line; API configured limits | Local estimates; API cost report for billing | High for documented telemetry; estimated local cost |
 | OpenAI Codex CLI | Exec JSON / app-server; OpenAI organization APIs for API-key billing | Yes / API reporting or telemetry / thread IDs | App-server ChatGPT windows and optional credits; API rate-limit headers | API cost report; subscription per-session USD not supplied | High for public interfaces; medium for disk parser |
