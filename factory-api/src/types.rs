@@ -10,6 +10,9 @@ pub struct Health {
     pub git_dirty: bool,
     pub built_at_ms: u64,
     pub inputs_fingerprint: String,
+    /// SHA-256 (first 12 hex) of the served `/openapi.json`, byte-identical to
+    /// the committed `factory-api/openapi.json` snapshot: the kiosk's API contract.
+    pub openapi_sha256: String,
     pub uptime_ms: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

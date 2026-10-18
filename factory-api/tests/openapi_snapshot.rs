@@ -21,6 +21,11 @@ async fn openapi_snapshot() -> Result<()> {
         .error_for_status()?
         .json::<serde_json::Value>()
         .await;
+    let health = reqwest::get(format!("http://{address}/v1/health"))
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await;
     server.abort();
     let spec = response?;
     // Every security requirement names a defined scheme; the device ingest one is bearer.
@@ -53,9 +58,14 @@ async fn openapi_snapshot() -> Result<()> {
         std::fs::write(&path, &snapshot)?;
     }
     assert_eq!(
-        std::fs::read_to_string(path).unwrap_or_default(),
+        std::fs::read_to_string(&path).unwrap_or_default(),
         snapshot,
         "OpenAPI snapshot drift. Regenerate with: UPDATE_OPENAPI=1 cargo test -p factory-api --test openapi_snapshot"
     );
+    // The kiosk embeds this hash of the committed file; health must report the same.
+    use sha2::Digest;
+    let committed = sha2::Sha256::digest(std::fs::read(&path)?);
+    let committed: String = committed[..6].iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(health?["openapi_sha256"], committed.as_str());
     Ok(())
 }

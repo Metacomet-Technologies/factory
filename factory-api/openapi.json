@@ -1168,6 +1168,10 @@
           "inputs_fingerprint": {
             "type": "string"
           },
+          "openapi_sha256": {
+            "description": "SHA-256 (first 12 hex) of the served `/openapi.json`, byte-identical to\nthe committed `factory-api/openapi.json` snapshot: the kiosk's API contract.",
+            "type": "string"
+          },
           "status": {
             "type": "string"
           },
@@ -1187,6 +1191,7 @@
           "git_dirty",
           "built_at_ms",
           "inputs_fingerprint",
+          "openapi_sha256",
           "uptime_ms"
         ],
         "type": "object"

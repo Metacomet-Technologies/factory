@@ -14,6 +14,7 @@ use axum::{
     http::{Method, Request, StatusCode},
     response::{IntoResponse, Response, Sse, sse::Event},
 };
+use sha2::Digest;
 use std::{convert::Infallible, time::Duration};
 use utoipa::OpenApi;
 
@@ -292,6 +293,17 @@ fn response<T: serde::Serialize>(result: anyhow::Result<T>) -> Response {
         ),
     }
 }
+/// Hash the bytes the snapshot test commits, so the kiosk can compare against
+/// the `openapi.json` it was built from.
+fn openapi_sha256() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
+        let snapshot = format!("{}\n", serde_json::to_string_pretty(&spec).unwrap());
+        let digest = sha2::Sha256::digest(snapshot);
+        digest[..6].iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
 #[utoipa::path(get, path="/v1/health", responses((status=200, body=Health)))]
 fn health(state: &AppState) -> Json<Health> {
     let build = shared::build_info(env!("FACTORY_INPUTS_FINGERPRINT"));
@@ -307,6 +319,7 @@ fn health(state: &AppState) -> Json<Health> {
         git_dirty: build.git_dirty,
         built_at_ms: build.built_at_ms,
         inputs_fingerprint: build.inputs_fingerprint,
+        openapi_sha256: openapi_sha256().into(),
         uptime_ms: state.started.elapsed().as_millis() as u64,
     })
 }

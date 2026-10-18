@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 
 root = Path(sys.argv[1]).resolve()
 if len(sys.argv) != 3 or sys.argv[2] not in ("meter", "factory-api", "kiosk"):
@@ -25,7 +26,11 @@ if component == "kiosk":
     # The Bun lockfile (bun.lock) is tracked inside kiosk/.
     files.add("factory-api/openapi.json")
 else:
-    files.add("Cargo.toml")
+    # Workspace settings matter, but membership does not: adding an unrelated
+    # crate must not stale this one. Its own path closure and tree are below.
+    workspace = tomllib.loads((root / "Cargo.toml").read_text())
+    workspace["workspace"].pop("members", None)
+    workspace = json.dumps(workspace, sort_keys=True).encode()
     metadata = json.loads(run("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"))
     packages = {p["name"]: p for p in metadata["packages"]}
     pending = [component]
@@ -51,6 +56,9 @@ for name in sorted(files):
     for value in (name.encode(), (root / name).read_bytes()):
         digest.update(len(value).to_bytes(8, "big"))
         digest.update(value)
+if component != "kiosk":
+    digest.update(len(workspace).to_bytes(8, "big"))
+    digest.update(workspace)
 digest.update(tree)
 print(digest.hexdigest()[:12])
 PY
