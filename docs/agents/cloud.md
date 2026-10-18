@@ -2,8 +2,14 @@
 
 ## Cursor Cloud specific instructions
 
-Boot runs `scripts/sandbox up --rows 1k --kiosk` when that synthetic stack is
-stopped, then returns. `scripts/sandbox status` prints the loopback URLs.
+On boot, the start script (`scripts/env/cursor-start.sh`) fast-forwards a
+stale checkout to `origin/main`, then runs
+`scripts/sandbox up --rows 1k --kiosk` when that synthetic stack is stopped.
+You can start before that
+finishes. If `scripts/sandbox status` prints "Another sandbox command is
+running", wait and retry every 15 s for up to 5 minutes before using the
+stack. Never start a second `sandbox up`. `scripts/sandbox status` prints the
+loopback URLs.
 `scripts/sandbox down` stops it. The stack stays inside Bubblewrap and does not
 call production.
 

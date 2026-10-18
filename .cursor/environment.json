@@ -1,0 +1,4 @@
+{
+  "install": "bash scripts/env/cursor-install.sh",
+  "start": "bash scripts/env/cursor-start.sh"
+}

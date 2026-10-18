@@ -119,7 +119,7 @@ Where kiosk UI checks run (the `verify-kiosk` skill):
 | Environment | Provisioned by | Exempt from |
 | -- | -- | -- |
 | `orb` (Amp) | `.agents/setup` on orb creation: `scripts/env/setup.sh --env orb` | Playwright, layout |
-| `cursor` (Cursor Cloud) | Team environment in the Cursor dashboard (`metacomet-technologies/factory`, id `d36f659b…`): its install script runs `scripts/env/setup.sh --prebuild` (default `cursor`) after the checkout symlink (below). No repo `.cursor/environment.json`, which would override it | nothing |
+| `cursor` (Cursor Cloud) | The repo's `.cursor/environment.json` (`scripts/env/cursor-install.sh`, `scripts/env/cursor-start.sh`, below) for every Cursor environment of this repo, personal or team. The repo file takes precedence over saved environments, and builds read it from main | nothing |
 | `sandbox` (`scripts/sandbox` host) | `scripts/env/setup.sh --env sandbox` on the host it runs on; CI's `sandbox` job runs it with `--ci` | Playwright, layout |
 | `ci` (GitHub Actions `kiosk` job, ubuntu-24.04) | `scripts/env/setup.sh --ci` in `.github/workflows/ci.yml` | Playwright, layout, bubblewrap (the `sandbox` job installs it) |
 | `factory-gpu` | `scripts/env/setup.sh --env factory-gpu`, run as `agent` by an administrator (below) | nothing |
@@ -188,24 +188,20 @@ baseline below, as `agent`:
 The repository side (this script, the orb wrapper, CI, the sandbox preflight)
 rolls back by reverting its merge commit.
 
-## Cursor Cloud install script
+## Cursor Cloud environment
 
-Paste into the team environment's install script in the Cursor dashboard (UI
-only, never the API), replacing the old script. Save a copy of the old script
-first; it is the rollback.
+`.cursor/environment.json` runs two scripts from `/workspace`:
 
-```bash
-set -euo pipefail
-# Layout: the checkout at /home/agent/work/factory, owned by this user.
-sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/agent /home/agent/work /home/agent/.config
-ln -sfn "$PWD" /home/agent/work/factory
-bash scripts/env/setup.sh --prebuild
-```
+* `scripts/env/cursor-install.sh` (snapshot build): removes the pre-MET-225
+  hand-rolled toolchain, symlinks the checkout to `/home/agent/work/factory`,
+  then runs `scripts/env/setup.sh --prebuild` (default `cursor`).
+* `scripts/env/cursor-start.sh` (each boot): fast-forwards a stale checkout to
+  `origin/main` (only when it has no local commits or edits), then runs
+  `scripts/sandbox up --rows 1k --kiosk` unless the sandbox is already running.
 
-The start script stays as it is. Then rebuild the snapshot from the
-environment's page, start a fresh agent whose first command is
-`scripts/env/check --env cursor`, and record its JSON on MET-222. To roll back,
-paste the saved script and rebuild, or select the previous snapshot.
+Changes land through a PR and take effect on each environment's next build.
+To roll back, revert the merge and trigger a build, or select the previous
+build in the dashboard.
 
 ## Prod baseline (MET-222, 2026-10-17)
 
