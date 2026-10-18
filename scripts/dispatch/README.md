@@ -517,6 +517,11 @@ State transitions under the existing exclusive dispatcher lock:
    --match-head-commit <sha>`. No admin bypass or auto-merge. GitHub's head match
    and required branch checks guard the final race. Isolation and substantive
    review remain agent judgments; comments alone cannot establish green CI.
+   The gate fails closed with the cause (MET-143): it first runs `gh --version`
+   and refuses below `MIN_GH` (2.48.0) with `gh <found> is older than <min>;
+   upgrade from cli.github.com/packages`, and any failing `gh`/`git` query names
+   the command and its first stderr line. Exit code and the success message are
+   unchanged.
 6. Existing merged-attachment wrap-up follows. Deploy steps get a Devon mention;
    otherwise no deploy ping. Linear takes no action on merge; Done comes from the
    dispatcher for simple flows or from Devon. QA never changes issue status.

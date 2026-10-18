@@ -230,8 +230,11 @@ if ('${program}' === 'git' && args[0] === 'ls-remote') {
       pr.headRefOid = pr.pushDuringChecks;
       fs.writeFileSync(process.env.FAKE_GITHUB, JSON.stringify(state));
     }
-    if (pr.checkExit) process.exit(pr.checkExit);
+    if (pr.checkExit) { console.error('${key} checks read failed'); process.exit(pr.checkExit); }
   }
+} else if ('${program}' === 'gh' && args[0] === '--version') {
+  if (process.env.FAKE_GH_VERSION_EXIT) process.exit(Number(process.env.FAKE_GH_VERSION_EXIT));
+  output = 'gh version ' + (process.env.FAKE_GH_VERSION ?? '2.102.0') + ' (2026-09-30)';
 } else if ('${program}' === 'gh' && args[0] === 'run' && args[1] === 'list') {
   if (args[args.indexOf('--repo') + 1] !== 'Metacomet-Technologies/factory-access') process.exit(99);
   output = JSON.stringify(state.runs ?? []);
@@ -1627,6 +1630,32 @@ test('QA merge gate refuses bad CI, skipped/missing checks, head races, drafts a
   const f = await fixture(t, [reviewed()], { github: { 90: githubPR() } });
   assert.equal((await f.run()).code, 0);
   assert.equal(f.calls().length, 1);
+});
+
+test('QA merge gate names its cause: old gh and failing queries', { timeout: 10_000 }, async t => {
+  const stale = await (await fixture(t, [reviewed()], { github: { 90: githubPR() } })).check('90', sha, { FAKE_GH_VERSION: '2.46.0' });
+  assert.equal(stale.code, 1);
+  assert.match(stale.stderr, /gh 2\.46\.0 is older than 2\.48\.0; upgrade from cli\.github\.com\/packages/);
+
+  const f = await fixture(t, [reviewed()], { github: { 90: githubPR() } });
+  const unreadable = await f.check('90', sha, { FAKE_GH_VERSION_EXIT: '7' });
+  assert.equal(unreadable.code, 1);
+  assert.match(unreadable.stderr, /gh --version failed \(exit 7\)/);
+
+  const failing = await fixture(t, [reviewed()], { github: { 90: githubPR({ checkExit: 8 }) } });
+  const result = await failing.check('90', sha);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /gh pr checks 90 --json name,bucket --repo Metacomet-Technologies\/factory failed \(exit 8\): .*checks read failed/);
+
+  const missing = await fixture(t, [reviewed()], { github: { 90: githubPR() } });
+  const absent = await missing.check('90', sha, { PATH: '/nonexistent' });
+  assert.equal(absent.code, 1);
+  assert.match(absent.stderr, /gh --version failed \(.*ENOENT\)/);
+
+  const good = await fixture(t, [reviewed()], { github: { 90: githubPR() } });
+  const passing = await good.check();
+  assert.equal(passing.code, 0);
+  assert.match(passing.stdout, /QA merge gate passed/);
 });
 
 test('QA self-deploying additions/deletions/renames on later file pages ping once, never merge', { timeout: 10_000 }, async t => {
