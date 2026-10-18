@@ -187,6 +187,10 @@ for dir in "$proc"/[0-9]*; do
   [[ $uid == "$console_uid" ]] || continue
   argv=()
   { mapfile -d '' -t argv <"$dir/cmdline"; } 2>/dev/null || continue
+  # Chrome can rewrite cmdline as one whitespace-joined process title.
+  if ((${#argv[@]} == 1)) && [[ ${argv[0]} == *' '* ]]; then
+    read -ra argv <<<"${argv[0]}"
+  fi
   ((${#argv[@]})) && [[ ${argv[0]##*/} == chrome ]] || continue
   kiosk=0
   for a in "${argv[@]:1}"; do
@@ -212,6 +216,17 @@ for entry in "${environ[@]}"; do
       ;;
   esac
 done
+if [[ " ${display_env[*]} " != *" XDG_RUNTIME_DIR="* ]]; then
+  systemd_env=$(runuser -u console -- env "XDG_RUNTIME_DIR=/run/user/$console_uid" systemctl --user show-environment) ||
+    die "cannot read the console systemd user environment"
+  while IFS= read -r entry; do
+    case $entry in
+      WAYLAND_DISPLAY=* | DISPLAY=* | XDG_RUNTIME_DIR=* | XAUTHORITY=* | DBUS_SESSION_BUS_ADDRESS=*)
+        display_env+=("$entry")
+        ;;
+    esac
+  done <<<"$systemd_env"
+fi
 [[ " ${display_env[*]} " == *" XDG_RUNTIME_DIR="* ]] || die "the kiosk has no XDG_RUNTIME_DIR"
 [[ " ${display_env[*]} " == *" WAYLAND_DISPLAY="* || " ${display_env[*]} " == *" DISPLAY="* ]] ||
   die "the kiosk has neither WAYLAND_DISPLAY nor DISPLAY"
