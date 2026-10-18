@@ -8,6 +8,21 @@ set -Eeuo pipefail
 umask 0077
 here=$(dirname "$(realpath "$0")")
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+# MET-239: refuse an artifact not built from this clean checkout. No override;
+# a mismatch means rebuild. Runs before any change.
+verify_artifact() {
+    local name=$1 info=$2 checkout=$3 sha dirty head status
+    sha=$(python3 -c 'import json, sys; v = json.loads(sys.argv[1]).get("git_sha"); print(v if isinstance(v, str) else "")' "$info" 2>/dev/null) \
+        || fail "Artifact $name build info is not a JSON object; rebuild from $checkout."
+    dirty=$(python3 -c 'import json, sys; print(json.dumps(json.loads(sys.argv[1]).get("git_dirty")))' "$info")
+    head=$(sudo -u agent git -C "$checkout" rev-parse --short=7 HEAD) || fail "Cannot read the checkout commit: $checkout"
+    status=$(sudo -u agent git -C "$checkout" status --porcelain) || fail "Cannot read the checkout status: $checkout"
+    [[ -n $sha && $sha != unknown ]] || fail "Artifact $name has no build SHA (missing or unknown); rebuild from $checkout."
+    [[ $dirty == false ]] || fail "Artifact $name was built from a dirty tree (git_dirty: $dirty); rebuild from a clean checkout."
+    [[ -z $status ]] || fail "Checkout $checkout is dirty; commit or discard changes, then rebuild."
+    [[ $sha == "$head" ]] || fail "Artifact $name built at $sha but checkout $checkout is at $head; rebuild at $head."
+    printf 'Artifact %s built at %s matches checkout\n' "$name" "$sha"
+}
 usage='Usage: install-devices-agent.sh BINARY [--check-only]'
 root=
 if (( EUID != 0 )); then
@@ -31,7 +46,7 @@ while (( $# )); do
     esac
 done
 [[ -n $binary ]] || fail "$usage"
-for tool in systemctl hostname install cmp getent groupadd useradd usermod id stat mktemp mv python3 sha256sum od realpath; do
+for tool in systemctl hostname install cmp getent groupadd useradd usermod id stat mktemp mv python3 sha256sum od realpath sudo git; do
     command -v "$tool" >/dev/null || fail "Required command missing: $tool"
 done
 [[ $(hostname -s) == "$node" ]] || fail "This host is $(hostname -s), not $node; nothing changed."
@@ -70,6 +85,10 @@ binary=$(realpath "$binary")
 [[ $binary != "$(realpath -m "$bin")" ]] || fail 'Use a separate prebuilt binary, not the installed destination.'
 [[ $(head -c 4 "$binary" | od -An -tx1 | tr -d ' \n') == 7f454c46 ]] || fail "Not an ELF binary: $binary"
 grep -qaF factory_devices_agent "$binary" || fail "Not the devices agent: $binary"
+# Run agent-built code as agent, never as root.
+checkout=$(dirname "$(dirname "$here")")
+info=$(sudo -u agent "$binary" --build-info) || fail "factory-devices-agent --build-info failed; rebuild from $checkout."
+verify_artifact factory-devices-agent "$info" "$checkout"
 version="sha256 $(sha256sum "$binary" | cut -c1-64)"
 artifacts[0]="$binary|$bin|0755"
 

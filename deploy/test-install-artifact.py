@@ -150,6 +150,7 @@ ARTIFACTS = {
     "factory-api": repo / "target/release/factory-api",
     "meter": repo / "target/release/meter",
     "kiosk": repo / "kiosk/dist",
+    "factory-devices-agent": repo / "target/release/factory-devices-agent",
 }
 FAKE_ROOT_SHIMS = {
     "sudo": 'echo "sudo $*" >> "$CALLS"; [[ $1 == -u ]] && shift 2; exec "$@"',
@@ -166,7 +167,7 @@ esac""",
     "curl": 'echo "curl $*" >> "$CALLS"; echo \'{"status":"ok"}\'',
     "tailscale": 'echo "{}"',
     "nvidia-smi": 'echo "GPU 0: fake"',
-    "hostname": "echo factory-gpu",
+    "hostname": 'echo "${FAKE_HOSTNAME:-factory-gpu}"',
     "id": 'if [[ $1 == -u ]]; then echo 999; else echo "uid=999($1) gid=999($1)"; fi',
     "getent": 'echo "$2:x:999:"',
 }
@@ -226,6 +227,8 @@ class FakeRootCheckOnlyTest(unittest.TestCase):
             "factory-api": ["deploy/install-factory-api.sh", str(ARTIFACTS["factory-api"]), "--check-only"],
             "meter": ["deploy/install-meter.sh", "--check-only", str(ARTIFACTS["meter"])],
             "kiosk": ["deploy/install-kiosk.sh", "--check-only", str(ARTIFACTS["kiosk"])],
+            "factory-devices-agent": ["deploy/devices-agent/install-devices-agent.sh",
+                                      str(ARTIFACTS["factory-devices-agent"]), "--check-only"],
         }[name]
         mounts = ["/var", "/run", "/srv", "/usr/local", "/etc/systemd/system", "/etc/factory-backup"]
         command = ["bwrap", "--unshare-user", "--uid", "0", "--gid", "0", "--unshare-net", "--unshare-pid",
@@ -233,6 +236,10 @@ class FakeRootCheckOnlyTest(unittest.TestCase):
         for mount in mounts:
             command += ["--tmpfs", mount]
         command += ["--bind", str(self.work), str(self.work)]
+        if name == "factory-devices-agent":
+            # As root this installer resets PATH, so shadow only what it must not reach.
+            for shim in ("sudo", "hostname", "systemctl"):
+                command += ["--ro-bind", str(self.work / "bin" / shim), f"/usr/bin/{shim}"]
         command += ["bash", str(self.work / "setup.sh"), "bash", str(checkout / script[0]), *script[1:]]
         env = {
             "PATH": f"{self.work / 'bin'}:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -240,6 +247,7 @@ class FakeRootCheckOnlyTest(unittest.TestCase):
             "TMPDIR": str(self.work / "tmp"),
             "CALLS": str(self.work / "calls"),
             "WORK": str(self.work),
+            "FAKE_HOSTNAME": "factory-console" if name == "factory-devices-agent" else "factory-gpu",
         }
         result = subprocess.run(command, env=env, text=True, capture_output=True, check=False)
         self.assertEqual((self.work / "before").read_text(), (self.work / "after").read_text(),
@@ -247,7 +255,7 @@ class FakeRootCheckOnlyTest(unittest.TestCase):
         return result
 
     def test_build_info_is_one_json_line_with_exactly_the_health_build_fields(self):
-        for name in ("factory-api", "meter"):
+        for name in ("factory-api", "meter", "factory-devices-agent"):
             result = subprocess.run([ARTIFACTS[name], "--build-info"], capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 0, name)
             self.assertEqual(len(result.stdout.splitlines()), 1, name)

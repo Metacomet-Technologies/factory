@@ -106,7 +106,7 @@ Settings → Mode Dial → Tune Modes (web) changes what low/medium/high run for
 1. Merge (squash, delete branch).
 2. Send the thread the wrap-up prompt (§4); it builds in the main checkout and cleans up its worktree.
 3. From the Mac: `gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-*.sh <prebuilt path>"` (use **full paths**: admins can't `cd` into `/home/agent`).
-4. The factory-api, meter and kiosk installers (and their `--check-only`) verify the artifact's build SHA against the checkout and refuse a mismatch, a dirty build or a dirty checkout; rebuild as `agent` at the checkout commit, then rerun. After install, the footer must show the same SHA for api, kiosk and meter.
+4. The factory-api, meter, devices-agent and kiosk installers (and their `--check-only`) verify the artifact's build SHA against the checkout and refuse a mismatch, a dirty build or a dirty checkout; rebuild as `agent` at the checkout commit, then rerun. After install, the footer must show the same SHA for api, kiosk and meter.
 5. Verify: `factory-status` (all green; usage/pricing < 2 s), kiosk self-reload, then mark the Linear issue Done. Then update Linear (status, Decided, Next) and, if `docs/PLAYBOOK.md` changed, re-sync the Linear playbook copy.
 
 ## 7. Operating the factory
