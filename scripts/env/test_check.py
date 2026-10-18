@@ -20,12 +20,13 @@ def repo_pins():
     with open(os.path.join(REPO, "rust-toolchain.toml"), encoding="utf-8") as handle:
         rust = re.search(r'channel\s*=\s*"([^"]+)"', handle.read()).group(1)
     with open(os.path.join(REPO, "kiosk", "package.json"), encoding="utf-8") as handle:
-        engines = json.load(handle)["devEngines"]
+        package = json.load(handle)
+    engines = package["devEngines"]
     return {
         "rust": rust,
         "node": engines["runtime"]["version"],
         "bun": engines["packageManager"]["version"],
-        "vp": "1.1.0",
+        "vp": package["catalog"]["vite-plus"],
     }
 
 
@@ -117,7 +118,7 @@ esac
         for tool in ("node", "bun", "vp"):
             self.link(os.path.join(home, "current", "bin", "vp"), tool)
 
-    def run_check(self, env_name):
+    def run_check(self, env_name, *extra):
         stubs = {}
         for command, text in self.outputs.items():
             name, _, sub = command.partition(" ")
@@ -129,10 +130,12 @@ esac
             write(os.path.join(self.bin, name), f'#!/bin/sh\ncase "$1" in\n{cases}esac\n', 0o755)
         env = {"PATH": self.bin, "HOME": self.home, "FACTORY_TEST_TOKEN": SENTINEL, **self.env}
         out = subprocess.run(
-            [sys.executable, CHECK, "--env", env_name, "--root", self.root],
+            [sys.executable, CHECK, "--env", env_name, "--root", self.root, *extra],
             env=env, capture_output=True, text=True, check=False,
         )
         self.assertNotIn(SENTINEL, out.stdout + out.stderr)
+        if extra:
+            return out.returncode, out.stdout
         report = json.loads(out.stdout)
         self.assertEqual(report["env"], env_name)
         return out.returncode, report, {item["name"]: item for item in report["items"]}
@@ -245,6 +248,20 @@ esac
         self.assertTrue(report["ok"])
         self.assertFalse(items["playwright"]["ok"])
         self.assertFalse(items["playwright"]["required"])
+
+    def test_failing_lists_only_failing_required_items(self):
+        self.outputs["rustc"] = "rustc 1.98.0 (aaaaaaaaa 2026-08-01)"
+        del self.outputs["shellcheck"]
+        shutil.rmtree(os.path.join(self.browsers, "chromium-1248"))
+        code, out = self.run_check("orb", "--failing")
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            out.splitlines(),
+            [f"rust\t{repo_pins()['rust']}\trustc 1.98.0 (aaaaaaaaa 2026-08-01)", "shellcheck\tshellcheck on PATH\tNone"],
+        )
+        self.outputs["rustc"] = f"rustc {repo_pins()['rust']} (b940084d7 2026-09-28)"
+        self.outputs["shellcheck"] = ""
+        self.assertEqual(self.run_check("orb", "--failing"), (0, ""))
 
     def test_unknown_env_is_a_usage_error(self):
         out = subprocess.run(
