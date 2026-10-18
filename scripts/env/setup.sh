@@ -11,8 +11,8 @@
 set -euo pipefail
 
 usage() {
-    echo 'Usage: scripts/env/setup.sh --env <name> [--prebuild] [--check-only]' >&2
-    echo '       scripts/env/setup.sh --ci [--env <name>] [--prebuild] [--check-only]' >&2
+    echo 'Usage: scripts/env/setup.sh [--env <name>] [--ci] [--prebuild] [--check-only]' >&2
+    echo 'Without --env: ci with --ci, otherwise cursor (the full contract, nothing exempt).' >&2
     exit 2
 }
 
@@ -30,9 +30,10 @@ while (($#)); do
         *) usage ;;
     esac
 done
+# The default never under-provisions: cursor exempts nothing, so a bare run
+# meets every environment's requirements.
 if [[ -z "$env_name" ]]; then
-    ((ci)) || usage
-    env_name=ci
+    if ((ci)); then env_name=ci; else env_name=cursor; fi
 fi
 export DEBIAN_FRONTEND=noninteractive
 initial_path=$PATH
@@ -47,23 +48,28 @@ would() {
     log "$*"
 }
 
+# Where the Vite+ installer puts its env file: VP_HOME, an existing
+# ~/.vite-plus, else the XDG split layout.
+vp_env_target() {
+    if [[ -n "${VP_HOME:-}" ]]; then echo "$VP_HOME/env"
+    elif [[ -d "$HOME/.vite-plus" ]]; then echo "$HOME/.vite-plus/env"
+    else echo "${XDG_CONFIG_HOME:-$HOME/.config}/vite-plus/env"
+    fi
+}
+
 vp_env=''
 load_tools() {
     # shellcheck source=/dev/null
     if [[ -f "$HOME/.cargo/env" ]]; then . "$HOME/.cargo/env"; fi
-    # Where the Vite+ installer puts its env file: VP_HOME, an existing
-    # ~/.vite-plus, else the XDG split layout.
     local file
-    for file in ${VP_HOME:+"$VP_HOME/env"} "$HOME/.vite-plus/env" "${XDG_CONFIG_HOME:-$HOME/.config}/vite-plus/env"; do
-        if [[ -f "$file" ]]; then
-            vp_env=$file
-            set +u
-            # shellcheck source=/dev/null
-            . "$file"
-            set -u
-            return
-        fi
-    done
+    file=$(vp_env_target)
+    if [[ -f "$file" ]]; then
+        vp_env=$file
+        set +u
+        # shellcheck source=/dev/null
+        . "$file"
+        set -u
+    fi
 }
 
 failing=()
@@ -81,7 +87,8 @@ login_file() {
     for file in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
         if [[ -f "$file" ]]; then echo "$file"; return; fi
     done
-    echo "$HOME/.bash_profile"
+    # None yet: rustup and the Vite+ installer create ~/.profile.
+    echo "$HOME/.profile"
 }
 
 persist() {
@@ -127,20 +134,29 @@ if ((${#packages[@]})) && would "install apt packages: ${packages[*]}"; then
     if [[ " ${packages[*]} " == *" python3 "* ]]; then exec "$0" "${args[@]}"; fi
 fi
 
+cargo_env=0
+if [[ -f "$HOME/.cargo/env" ]]; then cargo_env=1; fi
 if ((rust)); then
-    if ! command -v rustup >/dev/null && would 'install rustup'; then
-        curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
-        load_tools
+    if ! command -v rustup >/dev/null; then
+        cargo_env=1 # rustup-init creates ~/.cargo/env
+        if would 'install rustup'; then
+            curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            load_tools
+        fi
     fi
     # With no argument rustup installs the active toolchain: rust-toolchain.toml's channel and components.
     if would 'install the rust-toolchain.toml toolchain'; then (cd "$root" && rustup toolchain install); fi
 fi
 
-if [[ -n "$vite_plus" ]] && would "install Vite+ $vite_plus"; then
-    # The installer verifies the package integrity from the npm registry.
-    curl -fsSL --proto '=https' --tlsv1.2 https://vite.plus | VP_VERSION=$vite_plus VP_NODE_MANAGER=yes bash
-    load_tools
+if [[ -n "$vite_plus" ]]; then
     js=1
+    if would "install Vite+ $vite_plus"; then
+        # The installer verifies the package integrity from the npm registry.
+        curl -fsSL --proto '=https' --tlsv1.2 https://vite.plus | VP_VERSION=$vite_plus VP_NODE_MANAGER=yes bash
+        load_tools
+    else
+        vp_env=$(vp_env_target) # where the install would put it, for the plan
+    fi
 fi
 
 if ((js)) && would 'install the pinned Node and Bun through Vite+ (kiosk devEngines, .node-version)'; then
@@ -149,7 +165,7 @@ if ((js)) && would 'install the pinned Node and Bun through Vite+ (kiosk devEngi
 fi
 
 if ((!ci)); then
-    if [[ -f "$HOME/.cargo/env" ]]; then persist "\$HOME/.cargo/env"; fi
+    if ((cargo_env)); then persist "\$HOME/.cargo/env"; fi
     if [[ -n "$vp_env" ]]; then persist "$vp_env"; fi
     if [[ ! -d "$root/kiosk/node_modules" ]] && would 'install locked kiosk dependencies'; then
         (cd "$root/kiosk" && vp install --frozen-lockfile)

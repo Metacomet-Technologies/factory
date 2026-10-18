@@ -10,6 +10,7 @@ checker, so the tests follow the contract.
 import importlib.machinery
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -82,6 +83,16 @@ LATE = {
 esac
 """,
 }
+
+
+def actions(err):
+    """(planned or done, action) for each change setup announced."""
+    found = []
+    for line in err.splitlines():
+        match = re.match(r"\[setup \d+s\] (would )?(install|add|write|build)\b(.*)", line)
+        if match:
+            found.append((bool(match.group(1)), match.group(2) + match.group(3)))
+    return found
 
 
 def write(path, text, mode=0o644):
@@ -183,6 +194,52 @@ class SetupTest(unittest.TestCase):
                      "would install Playwright Chromium", "would build the release"):
             self.assertIn(plan, err)
 
+    def test_plan_names_every_effect_of_the_install(self):
+        self.mark(*(f"apt-{p}" for p in PACKAGES))
+        before = self.tree()
+        code, err, calls = self.run_setup("--env", "orb", "--check-only")
+        self.assertEqual((code, calls), (0, []), err)
+        self.assertEqual(self.tree(), before, "the dry run wrote something")
+        plan = actions(err)
+        self.assertTrue(plan and all(planned for planned, _ in plan), err)
+        plan = {action for _, action in plan}
+        profile = os.path.join(self.home, ".profile")
+        self.assertIn(f'add . "$HOME/.cargo/env" to {profile}', plan)
+        self.assertIn(f'add . "{self.home}/.config/vite-plus/env" to {profile}', plan)
+
+        code, err, _ = self.run_setup("--env", "orb")
+        self.assertEqual(code, 0, err)
+        done = actions(err)
+        self.assertFalse(any(planned for planned, _ in done), err)
+        # Everything the install did was planned ...
+        self.assertLessEqual({action for _, action in done}, plan)
+        # ... and every planned profile line is persisted, whether setup or an installer wrote it.
+        with open(profile, encoding="utf-8") as handle:
+            lines = set(handle.read().splitlines())
+        for action in plan:
+            if action.startswith("add "):
+                line, _, path = action[len("add "):].rpartition(" to ")
+                self.assertEqual(path, profile)
+                self.assertIn(line, lines)
+        added = {line for line in lines if line.startswith(". ")}
+        self.assertEqual({f"add {line} to {profile}" for line in added}, {a for a in plan if a.startswith("add ")})
+        self.assertEqual(self.run_setup("--env", "orb", "--check-only")[1].count("would "), 0)
+
+    def test_bare_entry_points_apply_the_full_contract(self):
+        before = self.tree()
+        code, err, calls = self.run_setup("--check-only")
+        self.assertEqual((code, calls), (0, []), err)
+        self.assertEqual(self.tree(), before)
+        self.assertIn("would install Playwright Chromium", err)
+        self.assertIn(f"would write {self.layout}", err)
+
+        code, err, calls = self.run_setup("--prebuild")
+        self.assertEqual(code, 0, err)
+        self.assertIn("vp exec playwright install chromium", calls)
+        self.assertTrue(os.path.isfile(self.layout))
+        self.assertTrue(any(c.startswith("cargo build") for c in calls), calls)
+        self.assertIn("vp build", calls)
+
     def test_exempt_items_are_left_alone(self):
         code, err, calls = self.run_setup("--env", "orb")
         self.assertEqual(code, 0, err)
@@ -234,7 +291,7 @@ class SetupTest(unittest.TestCase):
         self.assertFalse(any(c.startswith(("apt-get", "rustup", "vp")) for c in calls), calls)
 
     def test_usage_errors(self):
-        self.assertEqual(self.run_setup()[0], 2)
+        self.assertEqual(self.run_setup("--env")[0], 2)
         self.assertEqual(self.run_setup("--env", "nowhere")[0], 2)
         self.assertEqual(self.run_setup("--bogus")[0], 2)
 

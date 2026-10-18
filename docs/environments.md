@@ -46,9 +46,13 @@ The checker never installs or caches anything:
 ## Provisioning: `scripts/env/setup.sh`
 
 ```sh
-scripts/env/setup.sh --env <name> [--prebuild] [--check-only]
-scripts/env/setup.sh --ci [--env <name>] [--prebuild] [--check-only]
+scripts/env/setup.sh [--env <name>] [--ci] [--prebuild] [--check-only]
 ```
+
+Without `--env` it uses `ci` with `--ci`, otherwise `cursor`: the full
+contract, nothing exempt. That default never under-provisions; a bare
+`--check-only` or `--prebuild` works anywhere. Pass `--env` to apply an
+environment's exemptions and record its name in the checker JSON.
 
 It asks the checker which required items fail for that environment and acts
 only on those, so a converged host changes nothing on a rerun. It ends by
@@ -65,8 +69,8 @@ version literals:
 | Layout | writes `/home/agent/.config/vite-plus/env` (sourcing the real Vite+ env) when missing. The checkout symlink stays with the environment | — |
 
 Without `--ci` it also makes the login shell file bash reads
-(`~/.bash_profile`, `~/.bash_login` or `~/.profile`, the first that exists)
-source `~/.cargo/env` and the Vite+ env, and installs the kiosk's locked
+(`~/.bash_profile`, `~/.bash_login` or `~/.profile`, the first that exists,
+else `~/.profile`) source `~/.cargo/env` and the Vite+ env, and installs the kiosk's locked
 dependencies when `kiosk/node_modules` is missing (Playwright needs them).
 
 * `--ci`: the environment defaults to `ci`. Skips Playwright, the layout,
@@ -74,7 +78,8 @@ dependencies when `kiosk/node_modules` is missing (Playwright needs them).
   `GITHUB_PATH`.
 * `--prebuild`: adds the release `cargo build` of the sandbox binaries and the
   kiosk build (the same as `scripts/sandbox up --kiosk`), for snapshots.
-* `--check-only`: prints each change it would make (`would …`) and changes
+* `--check-only`: prints each change it would make (`would …`), including the
+  login-file lines for env files an install would create, and changes
   nothing. Exits 1 only when an item cannot be installed (`os`,
   `layout:checkout`).
 
@@ -114,7 +119,7 @@ Where kiosk UI checks run (the `verify-kiosk` skill):
 | Environment | Provisioned by | Exempt from |
 | -- | -- | -- |
 | `orb` (Amp) | `.agents/setup` on orb creation: `scripts/env/setup.sh --env orb` | Playwright, layout |
-| `cursor` (Cursor Cloud) | Team environment in the Cursor dashboard (`metacomet-technologies/factory`, id `d36f659b…`): its install script runs `scripts/env/setup.sh --env cursor --prebuild` after the checkout symlink (below). No repo `.cursor/environment.json`, which would override it | nothing |
+| `cursor` (Cursor Cloud) | Team environment in the Cursor dashboard (`metacomet-technologies/factory`, id `d36f659b…`): its install script runs `scripts/env/setup.sh --prebuild` (default `cursor`) after the checkout symlink (below). No repo `.cursor/environment.json`, which would override it | nothing |
 | `sandbox` (`scripts/sandbox` host) | `scripts/env/setup.sh --env sandbox` on the host it runs on; CI's `sandbox` job runs it with `--ci` | Playwright, layout |
 | `ci` (GitHub Actions `kiosk` job, ubuntu-24.04) | `scripts/env/setup.sh --ci` in `.github/workflows/ci.yml` | Playwright, layout, bubblewrap (the `sandbox` job installs it) |
 | `factory-gpu` | `scripts/env/setup.sh --env factory-gpu`, run as `agent` by an administrator (below) | nothing |
@@ -194,7 +199,7 @@ set -euo pipefail
 # Layout: the checkout at /home/agent/work/factory, owned by this user.
 sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/agent /home/agent/work /home/agent/.config
 ln -sfn "$PWD" /home/agent/work/factory
-bash scripts/env/setup.sh --env cursor --prebuild
+bash scripts/env/setup.sh --prebuild
 ```
 
 The start script stays as it is. Then rebuild the snapshot from the

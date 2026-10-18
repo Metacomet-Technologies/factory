@@ -7,7 +7,7 @@ stopped, then returns. `scripts/sandbox status` prints the loopback URLs.
 `scripts/sandbox down` stops it. The stack stays inside Bubblewrap and does not
 call production.
 
-The environment is provisioned by `scripts/env/setup.sh --env cursor --prebuild`
+The environment is provisioned by `scripts/env/setup.sh --prebuild`
 (`docs/environments.md`); `scripts/env/check --env cursor` proves it. Login
 shells source `~/.cargo/env` and the Vite+ env, so `node` and `bun` resolve to
 the kiosk's pinned versions. Inside `kiosk/`, `vp` is the project CLI. From
