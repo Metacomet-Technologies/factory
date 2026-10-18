@@ -1206,6 +1206,10 @@ export interface components {
         })
       | {
           /** @enum {string} */
+          availability: "not_published";
+        }
+      | {
+          /** @enum {string} */
           availability: "permission_denied";
           error: string;
         }

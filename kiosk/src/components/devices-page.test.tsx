@@ -609,6 +609,11 @@ describe("devices page", () => {
     expect(
       card.queryByLabelText("Warning: unattended auto-reboot enabled"),
     ).not.toBeInTheDocument();
+    data.maintenance = { availability: "not_published" };
+    rerender(page());
+    expect(card.getByText("Maintenance snapshot: not yet published")).toBeInTheDocument();
+    expect(card.queryByText("2 security · 7 other")).not.toBeInTheDocument();
+    expect(screen.getByText("healthy")).toBeInTheDocument();
     data.maintenance = { availability: "permission_denied", error: "snapshot not readable" };
     rerender(page());
     expect(card.getByText(/Maintenance snapshot: permission denied/)).toBeInTheDocument();

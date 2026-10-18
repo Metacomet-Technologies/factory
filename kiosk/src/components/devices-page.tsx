@@ -448,10 +448,14 @@ export default function DevicesPage({
               {!remote && (
                 <>
                   <p className="muted">
-                    Maintenance snapshot: {availabilityText(posture?.availability ?? "unsupported")}
-                    {node
-                      ? ` · observed ${seen(node.observed_at_ms, now)}`
-                      : " · no readable snapshot"}
+                    Maintenance snapshot:{" "}
+                    {posture?.availability === "not_published"
+                      ? "not yet published"
+                      : `${availabilityText(posture?.availability ?? "unsupported")}${
+                          node
+                            ? ` · observed ${seen(node.observed_at_ms, now)}`
+                            : " · no readable snapshot"
+                        }`}
                     {posture && "error" in posture ? ` · ${posture.error}` : ""}
                   </p>
                   <KeyValue

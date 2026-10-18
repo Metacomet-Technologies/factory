@@ -2680,6 +2680,20 @@
             "properties": {
               "availability": {
                 "enum": [
+                  "not_published"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "availability"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "availability": {
+                "enum": [
                   "permission_denied"
                 ],
                 "type": "string"

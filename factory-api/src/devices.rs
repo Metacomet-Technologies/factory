@@ -371,6 +371,7 @@ pub struct MaintenanceSnapshot {
 pub enum NodeMaintenance {
     Available(MaintenanceSnapshot),
     Stale(MaintenanceSnapshot),
+    NotPublished,
     PermissionDenied { error: String },
     Unsupported { error: String },
     Error { error: String },
@@ -1835,7 +1836,8 @@ fn load_maintenance(root: &Path, at: i64, timeout: Duration) -> NodeMaintenance 
         timeout,
     ) {
         Ok(text) => text,
-        Err(ProbeError::Missing | ProbeError::Denied) => {
+        Err(ProbeError::Missing) => return NodeMaintenance::NotPublished,
+        Err(ProbeError::Denied) => {
             return NodeMaintenance::PermissionDenied {
                 error: "snapshot not readable".into(),
             };
@@ -2481,10 +2483,11 @@ mod tests {
         };
         let path = "var/lib/factory-devices/maintenance.json";
         let missing = read(at);
-        assert!(matches!(
-            missing.maintenance,
-            Some(NodeMaintenance::PermissionDenied { .. })
-        ));
+        assert_eq!(missing.maintenance, Some(NodeMaintenance::NotPublished));
+        assert_eq!(
+            serde_json::to_value(&missing.maintenance).unwrap(),
+            json!({"availability": "not_published"})
+        );
         let payload = json!({
             "schema": 1, "observed_at_ms": at,
             "updates": {"availability":"available", "security":2, "other":7},
@@ -2512,6 +2515,7 @@ mod tests {
             MaintenanceServiceState::Disabled
         );
         assert_eq!(available.device.health, missing.device.health);
+        assert_eq!(available.warnings, missing.warnings);
         assert!(matches!(
             freshen(&available, at + MAINTENANCE_STALE_MS).maintenance,
             Some(NodeMaintenance::Available(_))

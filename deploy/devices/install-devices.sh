@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install read-only device snapshot helpers. Does not run probes.
+# Install read-only device snapshot helpers, then publish the first snapshots once.
 set -Eeuo pipefail
 umask 0027
 here=$(dirname "$(realpath "$0")")
@@ -88,5 +88,13 @@ fi
 systemctl daemon-reload
 systemctl enable --now factory-devices-smart.timer
 systemctl enable --now factory-devices-maintenance.timer
+# Oneshot units: start blocks until the first snapshot is written or fails.
+for kind in maintenance smart; do
+    systemctl start "factory-devices-$kind.service" || {
+        echo "ERROR: first $kind snapshot ($state/$kind.json) failed: factory-devices-$kind.service exited non-zero. See: journalctl -u factory-devices-$kind.service" >&2
+        echo "Rollback: sudo bash $here/rollback-devices.sh $snapshot" >&2
+        exit 1
+    }
+done
 echo "Installed factory device snapshot helpers. Snapshot directory $state"
 echo "Rollback: sudo bash $here/rollback-devices.sh $snapshot"
