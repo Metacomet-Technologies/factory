@@ -43,6 +43,8 @@ class InstallerTest(unittest.TestCase):
         (self.bin / "hostname").write_text('#!/bin/sh\necho "$FAKE_HOSTNAME"\n')
         (self.bin / "systemctl").write_text(
             '#!/bin/sh\necho "$*" >> "$DEVICES_TEST_ROOT/calls"\n'
+            '[ -n "$FAKE_SYSTEMCTL_FAIL" ] && [ "$*" = "$FAKE_SYSTEMCTL_FAIL" ] && exit 1\n'
+            'exit 0\n'
         )
         for name in ("hostname", "systemctl"):
             (self.bin / name).chmod(0o755)
@@ -66,6 +68,13 @@ class InstallerTest(unittest.TestCase):
     def test_install_is_idempotent_and_does_not_call_smartctl(self):
         first = self.run_install()
         self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual((self.root / "calls").read_text().splitlines(), [
+            "daemon-reload",
+            "enable --now factory-devices-smart.timer",
+            "enable --now factory-devices-maintenance.timer",
+            "start factory-devices-maintenance.service",
+            "start factory-devices-smart.service",
+        ])
         helper = self.root / "usr/local/lib/factory-devices/smart-snapshot.py"
         self.assertEqual(helper.read_bytes(), (here / "smart-snapshot.py").read_bytes())
         mode = stat.S_IMODE((self.root / "var/lib/factory-devices").stat().st_mode)
@@ -85,6 +94,17 @@ class InstallerTest(unittest.TestCase):
         installed = self.root / "etc/systemd/system/factory-devices-maintenance.timer"
         installed.write_text("changed\n")
         self.assertNotEqual(self.run_install("--preflight").returncode, 0)
+
+    def test_failed_first_snapshot_fails_the_install(self):
+        for kind in ("maintenance", "smart"):
+            with self.subTest(kind=kind):
+                self.env["FAKE_SYSTEMCTL_FAIL"] = f"start factory-devices-{kind}.service"
+                failed = self.run_install()
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn(f"first {kind} snapshot", failed.stderr)
+                self.assertIn(f"{kind}.json", failed.stderr)
+                self.assertIn("rollback-devices.sh", failed.stderr)
+                self.assertNotIn("Installed factory device", failed.stdout)
 
     def test_reinstall_restores_setgid_directory_and_snapshot_group(self):
         group = member_group()

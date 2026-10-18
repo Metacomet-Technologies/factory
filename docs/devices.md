@@ -93,7 +93,7 @@ not blank successful probes. Missing commands are `unsupported`.
 `GET /v1/devices/factory-gpu` adds optional response-level `maintenance` with
 these fields and overall `availability`. The existing `device.maintenance`
 still holds backup, reboot, clock, power, and fleet service readings unchanged.
-A missing or unreadable file returns `maintenance.availability: permission_denied`.
+A missing file is `not_published` (the installer runs both helpers once); an unreadable file is `permission_denied`.
 Malformed content is `error`; an unsupported schema is `unsupported`. File
 failure omits snapshot fields rather than inventing zero counts.
 
