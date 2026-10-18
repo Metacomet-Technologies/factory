@@ -217,7 +217,14 @@ the check.
 through the [Cloud Agents API v1](https://cursor.com/docs/cloud-agent/api/endpoints)
 (public beta, no webhooks) instead of an Amp thread on a factory runner. Claims,
 blockers, QA, the merge gate, wrap-up and Devon's deploy/verify are unchanged.
-**Billing:** the agent bills Cursor usage on Devon's Ultra plan; the claim says so.
+**Key:** a personal (user) API key with only "Run agents" (see Key below). Team
+keys are not supported: their agents run as a service token, are invisible to
+Devon and got no PR (verified 2026-10-18).
+**Environment:** `repos` launches resolve to Devon's personal environment,
+configured by the repo's `.cursor/environment.json` (MET-248).
+**Billing and usage:** the team plan (Devon's Ultra seat); the claim says the
+agent bills Cursor usage. Per-agent usage has returned 0 so far, so the
+`Cursor usage` comment is best-effort.
 Use it only when the task's checks run in CI or the cloud sandbox
 (`docs/agents/cloud.md`): cloud builders cannot reach factory-gpu.
 
@@ -249,12 +256,14 @@ Lifecycle and markers:
 3. Post `https://cursor.com/agents/<id>` with
    `<!-- factory-dispatch:thread <bc-id> runner:cursor -->`, then move to In Progress.
 
-Cursor opens the PR when a run ends (MET-216; MET-207's agent-opened PR only got
-"registered for approval"). The prompt tells the agent to push its branch, open
-no PR, post no evidence comment, title its work `MET-n — <issue title>` and end
-its reply with tests, deviations and unverified items. The dispatcher then
-normalizes that PR (below). Cursor's own title and body, and whether follow-up
-runs push to the same branch, are **unverified until the MET-216 live check**.
+**PR (verified 2026-10-18):** Cursor opens a draft PR as Devon after the agent
+pushes (`autoCreatePR`; PRs 133 and 134). A prompt that forbids PRs suppresses
+it, so Cursor prompts must never forbid PRs. The prompt tells the agent to commit
+and push its branch when the work is complete, post no evidence comment, title
+its work `MET-n — <issue title>` and end its reply with tests, deviations and
+unverified items; QA follow-ups say Cursor updates the existing PR. The
+dispatcher then normalizes that PR (below). Cursor's own title and body, and
+whether follow-up runs push to the same branch, remain **unverified**.
 
 Every thread-marker consumer accepts `bc-<uuid>` (Cursor's documented format)
 only with `runner:cursor`: capacity, QA builder lookup, wrap-up, labeling (skipped:
@@ -307,10 +316,10 @@ repos only log `cursor-pr-foreign`.
 
 QA: unchanged reviewer selection treats cursor like amp (Claude reviews at high
 effort on gpu/console). Delivered changes go to `POST /v1/agents/<id>/runs`
-instead of `amp threads continue`; the text tells the agent to push its branch,
-open no PR and leave the Linear evidence comment to the dispatcher. Round
-counting, the two-round stop and its Devon mention are unchanged; the merge
-continuation still goes to the local reviewer.
+instead of `amp threads continue`; the text tells the agent to push its branch
+(Cursor updates the existing PR) and leave the Linear evidence comment to the
+dispatcher. Round counting, the two-round stop and its Devon mention are
+unchanged; the merge continuation still goes to the local reviewer.
 
 - While the latest run is not terminal (`CREATING`, `RUNNING`, …) or its status
   is unreadable, the follow-up stays pending (`qa-pending`) with no claim.
@@ -366,7 +375,9 @@ agent fail closed. Cursor's v1 is beta and may change. Agent Linear comments use
 whatever identity Cursor's Linear MCP connection has (recorded by the live check).
 Test-only `DISPATCH_CURSOR_URL` accepts only a loopback HTTP origin.
 
-Key: `CURSOR_API_KEY_FILE`, default `/etc/factory-dispatch/cursor-api-key`,
+Key: Devon's personal (user) API key with only "Run agents"
+(`op://Factory/Cursor API Key/credential`); team keys are not supported.
+`CURSOR_API_KEY_FILE`, default `/etc/factory-dispatch/cursor-api-key`,
 `root:agent 0640`, read only when a cursor issue needs it. The installer reports
 it present (with owner/mode) or absent and never fails when it is absent; a present
 key must be a regular, non-empty root:agent 0640 file. Rollback never deletes it.
@@ -385,7 +396,7 @@ set +x
 umask 077
 temporary=$(mktemp)
 trap 'rm -f "$temporary"' EXIT
-opin read 'op://Factory/Cursor API key/credential' > "$temporary"
+opin read 'op://Factory/Cursor API Key/credential' > "$temporary"
 test -s "$temporary"
 sudo install -d -o root -g agent -m 0750 /etc/factory-dispatch
 sudo install -o root -g agent -m 0640 "$temporary" /etc/factory-dispatch/cursor-api-key
