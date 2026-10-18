@@ -1,12 +1,14 @@
 # Devices ingestion (phase 2 design)
 
 Status: decided 2026-10-17 (option A). Stage A, the server side (MET-196 Build
-items 5–8), is implemented in MET-219 and not yet deployed: the endpoint, auth,
-ingest semantics, per-device health and alerts, reads, SSE, the kiosk Devices
-pages, and the hash enrollment step. Stage B, the factory-console agent and its
-installer, is not built yet. No credential, tailnet policy, firewall, or Serve
-configuration has been created or changed. Operations are in
-[devices.md](devices.md#phase-2a-remote-devices).
+items 5–8), is implemented in MET-219: the endpoint, auth, ingest semantics,
+per-device health and alerts, reads, SSE, the kiosk Devices pages, and the
+hash enrollment step. Stage B, the factory-console agent and its installer, is
+implemented in MET-220 (`devices-agent/`, `deploy/devices-agent/`) and not yet
+installed; see [Stage B](#5-stage-b-factory-console-agent). No tailnet policy,
+firewall, or Serve configuration has been created or changed. Operations are in
+[devices.md](devices.md#phase-2a-remote-devices) and
+[devices.md](devices.md#phase-2b-factory-console-agent).
 
 Phase 1 ([devices.md](devices.md)) collects factory-gpu inside factory-api.
 Phase 2 lets another factory node, first factory-console, push its own host
@@ -1366,3 +1368,59 @@ Design of A:
   401 without a token, 200 with the enrolled one.
 - Which sensors factory-console exposes (CPU temperature, fans, T2 NVMe SMART,
   battery). The examples show plausible values, not readings from the host.
+
+## 5. Stage B: factory-console agent
+
+`factory-devices-agent` (crate `devices-agent/`) runs as the system user
+`factory-devices` on factory-console. It calls the phase-1 collector
+(`factory_api::devices::sample_timeout`) against its own `/proc` and `/sys`, so
+collection is not forked. It then:
+
+- sets the contract identity: `device_id` `factory-console`, a random v4
+  `session_id` per start, and `seq` from 1;
+- reports backup and reboot status as `unsupported` when no published file
+  exists (`/var/lib/factory-backup-status/status.json`,
+  `/var/lib/factory-reboot-status/status.json`), and `permission_denied` when
+  one exists but is unreadable;
+- reads clock sync from a read-only `adjtimex` (what `timedatectl` reports
+  as NTPSynchronized); a failed call is `error`, not unsynchronized;
+- drops filesystems it cannot see truthfully: its own PrivateTmp binds and
+  mountpoints covered by a later mount;
+- keeps every value inside this contract: an out-of-range, non-integer or
+  non-finite reading becomes `error` on that metric only, repeated sensor names
+  get ` #2`, and strings and lists are cut to the limits;
+- checks each sample with the server's own `devices_ingest::parse` before
+  queueing it; a sample that still fails is logged and dropped, never sent.
+
+The upload rules are section 1's. Three choices are not spelled out there:
+404 is treated like 401/403 (a rolled-back factory-api returns 404), every 5xx
+is retried (Serve answers 502 while factory-api is down), and `Retry-After` is a
+floor capped at 60 s. Logs never contain the token, the `Authorization`
+header, a URL with credentials, or a body. Request errors are logged only by
+kind (timeout, connect failed).
+
+### Console capability table
+
+Synthetic: the agent from this branch against the sandbox stack (stage A
+factory-api, fake Serve) and a console-shaped fixture root
+(`--discover --root`). It is not factory-console. The real table replaces the
+right-hand column after the install (`journalctl -u factory-devices-agent`
+logs a `discovered sources` line on each start).
+
+| Source | Agent reads | Sandbox (synthetic) | factory-console (real) | T2 note (not verified) |
+| --- | --- | --- | --- | --- |
+| CPU utilization, iowait, load | `/proc/stat`, `/proc/loadavg` | available | pending install | — |
+| CPU temperature | hwmon/thermal names containing package, tdie, tctl, cpu or x86_pkg | unsupported (fixture sensor is unlabeled) | pending install | Intel `coretemp` "Package id 0" is expected |
+| Memory | `/proc/meminfo` | available | pending install | — |
+| Filesystems | `/proc/self/mountinfo` + statvfs | available (`/`) | pending install | — |
+| Drives | `/sys/block` | available (`nvme0n1`) | pending install | Apple NVMe (ANS2) through the T2 |
+| SMART | `/var/lib/factory-devices/smart.json` from the root helper | unsupported (`tool: absent`) | pending install | `smartctl` may be absent or may not read the Apple controller's health log; either is `unsupported`, not healthy |
+| Disk I/O | `/proc/diskstats` | available | pending install | — |
+| Network | `/proc/net/dev`, all but `lo` | available | pending install | — |
+| Temperatures | `/sys/class/hwmon`, `/sys/class/thermal` | available (1 sensor) | pending install | whatever hwmon exposes |
+| Fans | hwmon `fan*_input` | unsupported | pending install | `applesmc` does not bind behind the T2 without t2linux patches; expect unsupported |
+| Battery | not in schema v1 | not reported | not reported | out of v1.0 (section 4) |
+| Clock | `adjtimex` | available | pending install | — |
+| Backup | published status file | unsupported (no file) | pending install | factory-console publishes none (`deploy/backup/nodes.conf`) |
+| Reboot | published status file | unsupported (no file) | pending install | published only where a `factory-api` group exists, so none today |
+

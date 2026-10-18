@@ -13,6 +13,7 @@ from pathlib import Path
 CAP = 1_048_576
 TIMEOUT = 8
 NAME = re.compile(r"^[A-Za-z0-9]+$")
+GROUP = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 SKIP = ("loop", "ram", "fd", "dm-", "md", "zram", "nbd", "sr", "zd")
 
 
@@ -114,7 +115,13 @@ def require_group(name: str) -> int:
 def publish_group() -> int | None:
     if os.geteuid() != 0:
         return None
-    return require_group("factory-api")
+    # factory-gpu publishes to factory-api; factory-console's unit drop-in sets
+    # factory-devices (deploy/devices-agent). Only a plain group name is accepted.
+    name = os.environ.get("FACTORY_DEVICES_GROUP", "factory-api")
+    if not GROUP.fullmatch(name):
+        print("FACTORY_DEVICES_GROUP is not a group name", file=sys.stderr)
+        raise SystemExit(1)
+    return require_group(name)
 
 
 def write_snapshot(destination: Path, payload: dict, group: int | None = None) -> None:

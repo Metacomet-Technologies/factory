@@ -1,0 +1,45 @@
+[Unit]
+Description=Factory devices agent (read-only host telemetry to factory-api)
+After=network-online.target time-sync.target tailscaled.service
+Wants=network-online.target
+# Restart on failure, but stop after 5 failures in 10 minutes.
+StartLimitIntervalSec=10min
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=factory-devices
+Group=factory-devices
+ExecStart=/usr/local/bin/factory-devices-agent --api https://factory-gpu.bearded-pompano.ts.net
+# The token is only in this root:root 0600 file and the per-service credential
+# directory; never in this unit, the environment, argv or logs.
+LoadCredential=token:/etc/factory-devices-agent/token
+Environment=RUST_LOG=factory_devices_agent=info
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Not ProtectClock=: its @clock filter also blocks the read-only adjtimex the
+# agent uses for clock sync state.
+
+[Install]
+WantedBy=multi-user.target

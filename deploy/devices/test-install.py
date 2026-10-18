@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 here = pathlib.Path(__file__).resolve().parent
 
@@ -156,6 +157,22 @@ class InstallerTest(unittest.TestCase):
             module.require_group("no-such-factory-api-group")
         self.assertEqual(caught.exception.code, 1)
         self.assertIn("no-such-factory-api-group group is missing", error.getvalue())
+
+    def test_publish_group_honors_the_console_override(self):
+        module = load_helper()
+        group = member_group()
+        original = os.geteuid
+        module.os.geteuid = lambda: 0
+        try:
+            with unittest.mock.patch.dict(os.environ, {"FACTORY_DEVICES_GROUP": group.gr_name}):
+                self.assertEqual(module.publish_group(), group.gr_gid)
+            error = io.StringIO()
+            with unittest.mock.patch.dict(os.environ, {"FACTORY_DEVICES_GROUP": "../root"}), \
+                    contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
+                module.publish_group()
+            self.assertIn("not a group name", error.getvalue())
+        finally:
+            module.os.geteuid = original
 
     def test_rollback_restores_the_previous_helper(self):
         helper = self.root / "usr/local/lib/factory-devices/smart-snapshot.py"
