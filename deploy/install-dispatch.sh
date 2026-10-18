@@ -4,8 +4,10 @@ umask 0077
 root=$(dirname "$(dirname "$(realpath "$0")")")
 key=/etc/factory-dispatch/linear-api-key
 cursor_key=/etc/factory-dispatch/cursor-api-key
+# The one accepted service drop-in (MET-215): runner caps, tuned without reinstalling.
+caps_dropin=/etc/systemd/system/factory-dispatch.service.d/cap.conf
 snapshot=
-rollback_hint() { printf 'Rollback: gpu-ssh '\''sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'\''\n' >&2; }
+rollback_hint() { printf 'Rollback: gpu-ssh '\''sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'\'' (leaves %s unchanged)\n' "$caps_dropin" >&2; }
 fail() { printf 'ERROR: %s\n' "$*" >&2; rollback_hint; exit 1; }
 [[ $EUID -eq 0 ]] || fail 'Run this installer as root on factory-gpu.'
 trap 'printf "ERROR: dispatcher install failed at line %s; snapshot: %s\n" "$LINENO" "${snapshot:-none}" >&2; rollback_hint' ERR
@@ -58,8 +60,48 @@ for file in scripts/dispatch/dispatch.ts scripts/dispatch/dispatch.lock scripts/
 done
 for unit in factory-dispatch.service factory-dispatch.timer; do
     [[ ! -L "/etc/systemd/system/$unit" ]] || fail "Refusing symlink unit: $unit"
-    [[ -z $(systemctl show "$unit" --property=DropInPaths --value) ]] || fail "Review/remove $unit drop-ins before installing."
 done
+[[ -z $(systemctl show factory-dispatch.timer --property=DropInPaths --value) ]] || fail 'Review/remove factory-dispatch.timer drop-ins before installing.'
+# Same grammar as DISPATCH_RUNNER_CAPS in scripts/dispatch/dispatch.ts: unique
+# gpu|console|cursor=<positive safe integer> entries separated by commas.
+valid_caps() {
+    local item seen=,
+    [[ $1 =~ ^(gpu|console|cursor)=[0-9]+(,(gpu|console|cursor)=[0-9]+)*$ ]] || return 1
+    for item in ${1//,/ }; do
+        [[ $seen != *",${item%%=*},"* && ${item#*=} =~ ^0*([1-9][0-9]{0,15})$ ]] || return 1
+        (( BASH_REMATCH[1] <= 9007199254740991 )) || return 1
+        seen+="${item%%=*},"
+    done
+}
+service_dropins=$(systemctl show factory-dispatch.service --property=DropInPaths --value)
+[[ -z $service_dropins || $service_dropins == "$caps_dropin" ]] ||
+    fail "Review/remove factory-dispatch.service drop-ins; only $caps_dropin is accepted. Found: $service_dropins"
+caps=absent
+# Also check an on-disk file that systemd has not loaded yet: daemon-reload below would load it.
+if [[ -e $caps_dropin || -L $caps_dropin ]]; then
+    [[ ! -L $caps_dropin && -f $caps_dropin ]] || fail "Require a regular file, not a symlink: $caps_dropin"
+    read -r owner mode < <(stat -c '%U %a' "$caps_dropin")
+    [[ $owner == root ]] || fail "Require root ownership: sudo chown root $caps_dropin"
+    (( (8#$mode & 8#022) == 0 )) || fail "Require no group/world write (mode $mode): sudo chmod go-w $caps_dropin"
+    header=0 caps='' number=0
+    while IFS= read -r line || [[ -n $line ]]; do
+        number=$((number + 1))
+        # A trailing backslash continues the line in systemd, even after a comment.
+        if [[ $line != *\\ && $line =~ ^[[:space:]]*(#.*)?$ ]]; then
+            continue
+        elif [[ $line == '[Service]' && $header == 0 ]]; then
+            header=1
+        elif [[ $line == Environment=DISPATCH_RUNNER_CAPS=* && $header == 1 && -z $caps ]]; then
+            caps=${line#Environment=DISPATCH_RUNNER_CAPS=}
+            valid_caps "$caps" || fail "Invalid DISPATCH_RUNNER_CAPS at $caps_dropin line $number: $caps (want unique gpu|console|cursor=<positive integer> entries separated by commas)"
+        else
+            # Print only the key: an unexpected Environment= line could hold a secret.
+            fail "Unexpected $caps_dropin line $number: ${line%%=*}; allowed are blank lines, # comments, one [Service] and one Environment=DISPATCH_RUNNER_CAPS=<caps> line"
+        fi
+    done < "$caps_dropin"
+    [[ -n $caps ]] || fail "Missing [Service] Environment=DISPATCH_RUNNER_CAPS=<caps> line in $caps_dropin"
+fi
+printf 'Runner caps drop-in: %s\n' "$caps"
 # A readable cwd is essential for the agent's Vite+ Node shim.
 cd /home/agent/work
 # Heredocs avoid sudo -i script quoting and preserve the runner JSON on stdin.
@@ -100,7 +142,9 @@ for unit in factory-dispatch.service factory-dispatch.timer; do
     systemctl is-enabled "$unit" > "$snapshot/$unit.enabled" 2>/dev/null || true
     systemctl is-active "$unit" > "$snapshot/$unit.active" 2>/dev/null || true
 done
-printf 'Snapshot: %s\n' "$snapshot"
+# Recorded for reference only; install and rollback never change the drop-in.
+if [[ $caps == absent ]]; then : > "$snapshot/cap.conf.missing"; else cp -p "$caps_dropin" "$snapshot/cap.conf"; fi
+printf 'Snapshot: %s (runner caps drop-in %s, recorded but never changed by install or rollback)\n' "$snapshot" "$caps"
 if [[ $(systemctl show factory-dispatch.timer --property=LoadState --value) != not-found ]]; then systemctl stop factory-dispatch.timer; fi
 # Wait for the existing pass; hold the same inode through installation.
 exec 9<"$root/scripts/dispatch/dispatch.lock"
