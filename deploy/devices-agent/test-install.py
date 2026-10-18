@@ -5,7 +5,6 @@ No sudo, no real users, units, tokens or smartctl.
 """
 
 import grp
-import json
 import os
 import pathlib
 import stat
@@ -33,17 +32,6 @@ esac""",
     'echo "$2" >> "$DEVICES_AGENT_TEST_ROOT/fake-members"',
     "id": 'echo factory-devices $(cat "$DEVICES_AGENT_TEST_ROOT/fake-members" 2>/dev/null)',
     "smartctl": "exit 0",
-    # MET-239: the binary and git run as agent; --build-info comes from the fixture.
-    "sudo": """[[ $1 == -u && $2 == agent ]] || exit 99
-shift 2
-if [[ ${*: -1} == --build-info ]]; then printf '%s\\n' "$FAKE_BUILD_INFO"; exit 0; fi
-exec "$@"
-""",
-    "git": """case $3 in
-  rev-parse) echo abc1234 ;;
-  status) printf '%s' "$FAKE_STATUS" ;;
-  *) exit 98 ;;
-esac""",
 }
 
 
@@ -77,8 +65,6 @@ class InstallerTest(unittest.TestCase):
         self.env.update(
             DEVICES_AGENT_TEST_ROOT=str(self.root),
             FAKE_HOSTNAME="factory-console",
-            FAKE_BUILD_INFO=json.dumps({"git_sha": "abc1234", "git_dirty": False}),
-            FAKE_STATUS="",
             PATH=f"{self.bin}:{self.env.get('PATH', '')}",
         )
 
@@ -118,7 +104,6 @@ class InstallerTest(unittest.TestCase):
     def test_check_only_reads_no_stdin_and_changes_nothing(self):
         result = self.install("--check-only")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Artifact factory-devices-agent built at abc1234 matches checkout", result.stdout)
         self.assertIn("Host factory-console, binary sha256 ", result.stdout)
         self.assertIn("User factory-devices will be created.", result.stdout)
         self.assertIn("Will install: /usr/local/bin/factory-devices-agent", result.stdout)
@@ -190,26 +175,6 @@ class InstallerTest(unittest.TestCase):
             result = self.install("--check-only")
             self.assertEqual(result.returncode, 1)
             self.assertRegex(result.stderr, "Not an ELF binary|Not the devices agent")
-
-    def test_refuses_an_artifact_not_built_from_the_clean_checkout(self):
-        cases = (
-            ({"git_sha": "def5678", "git_dirty": False}, "", "built at def5678 but checkout .* is at abc1234"),
-            ({"git_sha": "abc1234", "git_dirty": True}, "", "built from a dirty tree"),
-            ({"git_sha": "unknown", "git_dirty": False}, "", "no build SHA"),
-            ({"git_dirty": False}, "", "no build SHA"),
-            ({"git_sha": "abc1234", "git_dirty": False}, "?? stray\n", "Checkout .* is dirty"),
-        )
-        for info, status, message in cases:
-            self.env.update(FAKE_BUILD_INFO=json.dumps(info), FAKE_STATUS=status)
-            for args in ((), ("--check-only",)):
-                with self.subTest(info=info, args=args):
-                    result = self.install(*args)
-                    self.assertEqual(result.returncode, 1)
-                    self.assertRegex(result.stderr, message)
-                    self.assertNotIn("matches checkout", result.stdout)
-        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["etc"])
-        self.assertFalse((self.root / "etc/factory-devices-agent").exists())
-        self.assertEqual(self.calls(), "")
 
     def test_existing_login_user_is_refused(self):
         (self.root / "fake-passwd").write_text("factory-devices:x:1001:1001::/home/x:/bin/bash\n")

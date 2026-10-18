@@ -67,6 +67,13 @@ pub fn build_info(inputs_fingerprint: &str) -> Health {
     }
 }
 
+/// The health build fields (every field but `status`) as one JSON object.
+pub fn build_info_json(inputs_fingerprint: &str) -> serde_json::Value {
+    let mut info = serde_json::to_value(build_info(inputs_fingerprint)).unwrap();
+    info.as_object_mut().unwrap().remove("status");
+    info
+}
+
 /// `<binary> --build-info`: print the health build fields as one JSON line and
 /// exit 0. Call first in `main`, before any database, socket or config.
 pub fn exit_if_build_info(inputs_fingerprint: &str) {
@@ -74,9 +81,7 @@ pub fn exit_if_build_info(inputs_fingerprint: &str) {
         .nth(1)
         .is_some_and(|arg| arg == "--build-info")
     {
-        let mut info = serde_json::to_value(build_info(inputs_fingerprint)).unwrap();
-        info.as_object_mut().unwrap().remove("status");
-        println!("{info}");
+        println!("{}", build_info_json(inputs_fingerprint));
         std::process::exit(0);
     }
 }
@@ -113,4 +118,22 @@ pub struct MeterQuery {
 pub struct MeterRequestsQuery {
     pub limit: Option<usize>,
     pub after_id: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn build_info_json_is_exactly_the_health_build_fields() {
+        let health = super::build_info("0123456789ab");
+        assert_eq!(
+            super::build_info_json("0123456789ab"),
+            serde_json::json!({
+                "version": health.version,
+                "git_sha": health.git_sha,
+                "git_dirty": health.git_dirty,
+                "built_at_ms": health.built_at_ms,
+                "inputs_fingerprint": "0123456789ab",
+            })
+        );
+    }
 }
