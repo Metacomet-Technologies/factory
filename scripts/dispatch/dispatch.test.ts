@@ -405,6 +405,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
         else if (operation === 'Move') {
           i.stateId = v.input.stateId;
           if (i.stateId === 'done-id') i.state = { type: 'completed' };
+          if (i.stateId === 'started-id') i.state = { type: 'started' };
           data = { issueUpdate: { success: true } };
         }
         else if (operation === 'SyncPlaybook') { data = { documentUpdate: { success: true } }; }
@@ -585,7 +586,7 @@ test('worktree collisions and preparation failures comment, retain claims, and n
 
 test('unreachable console preserves explicit and overflow builders without claims or cleanup noise', { timeout: 10_000 }, async t => {
   for (const explicit of [false, true]) {
-    const busy = issue(1, { labels: [], comments: [threadComment()] });
+    const busy = issue(1, { labels: [], state: { type: 'started' }, comments: [threadComment()] });
     const pending = [issue(2), issue(3)];
     if (explicit) for (const i of pending) i.labels.push(group('runner', 'console'));
     const f = await fixture(t, [busy, ...pending]);
@@ -734,20 +735,91 @@ test('invalid and orb issues lose label with actionable reasons, without dispatc
 });
 
 test('per-runner cap includes claims; priority then age; completed wrap-ups release slots', { timeout: 10_000 }, async t => {
-  const existing = issue(1, { labels: [], comments: [threadComment()] });
-  const done = issue(2, { labels: [], comments: [threadComment(), { body: '<!-- factory-dispatch:wrapup -->' }] });
+  const existing = issue(1, { labels: [], state: { type: 'started' }, comments: [threadComment()] });
+  const done = issue(2, { labels: [], state: { type: 'started' }, comments: [threadComment(), { body: '<!-- factory-dispatch:wrapup -->' }] });
   const low = issue(3, { priority: 0, createdAt: '2020-01-01T00:00:00Z' });
   const later = issue(4, { priority: 1, createdAt: '2026-10-02T00:00:00Z' });
   const first = issue(5, { priority: 1 });
   for (const i of [low, later, first]) i.labels.push(group('runner', 'gpu'));
   const consoleIssue = issue(6); consoleIssue.labels.push(group('runner', 'console'));
-  const claimed = issue(7, { labels: [], comments: [{ body: '<!-- factory-dispatch:claim runner:gpu -->' }] });
+  const claimed = issue(7, { labels: [], state: { type: 'started' }, comments: [{ body: '<!-- factory-dispatch:claim runner:gpu -->' }] });
   const f = await fixture(t, [low, later, existing, done, first, consoleIssue, claimed]);
   await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '3' });
   assert.deepEqual(f.calls().map(args => args[args.indexOf('--title') + 1].split(' — ')[0]), ['MET-5', 'MET-6']);
   assert.equal(labeled(low), true); assert.equal(labeled(later), true);
   assert.equal(low.comments.length, 0); assert.equal(later.comments.length, 0);
   await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '3' }); assert.equal(f.calls().length, 2);
+});
+
+// MET-250: only In Progress (started) issues hold a builder slot.
+const slotThread = (n: number, runner?: string) => ({ body: `<!-- factory-dispatch:thread T-01234567-89ab-4cde-8fab-${String(n).padStart(12, '0')}${runner ? ` runner:${runner}` : ''} -->` });
+const capacityLogs = (stdout: string) => stdout.trim().split('\n').map(line => JSON.parse(line)).filter(line => line.decision === 'capacity');
+const pinned = (n: number, runner: string) => { const i = issue(n); i.labels.push(group('runner', runner)); return i; };
+
+test('issues that are not In Progress hold no slot whatever markers they carry, and are not written', { timeout: 30_000 }, async t => {
+  const zombie = (type: string) => issue(1, { labels: [], state: { type }, comments: [claimComment(), slotThread(1, 'gpu'), { body: '<!-- factory-dispatch:wrapup-claim -->' }] });
+  // Writes on the zombie itself (e.g. the existing Done-archive pass) must match a run without any candidate.
+  const writes = (f: any, i: any) => [i.comments.map((c: any) => c.body), f.mutations.filter((m: any) => [m.id, m.issueId, m.input?.issueId].includes(i.id)).map((m: any) => m.operation)];
+  for (const type of ['completed', 'canceled', 'backlog', 'unstarted', 'triage']) {
+    const alone = zombie(type), baseline = await fixture(t, [alone]);
+    assert.equal((await baseline.run(['poll'], { DISPATCH_RUNNER_CAPS: 'gpu=1' })).code, 0, type);
+    const stale = zombie(type), waiting = pinned(2, 'gpu');
+    const f = await fixture(t, [stale, waiting]);
+    const result = await f.run(['poll'], { DISPATCH_RUNNER_CAPS: 'gpu=1' });
+    assert.equal(result.code, 0, result.stdout);
+    assert.deepEqual(capacityLogs(result.stdout), [], type);
+    assert.ok(waiting.comments.some((c: any) => c.body.includes('<!-- factory-dispatch:claim runner:gpu -->')), type);
+    assert.deepEqual(writes(f, stale), writes(baseline, alone), type);
+  }
+});
+
+test('In Progress claims hold a slot on their runner until wrapup; unknown runners hold both; log shows held and cap', { timeout: 30_000 }, async t => {
+  const started = (comments: any[]) => issue(1, { labels: [], state: { type: 'started' }, comments });
+  const environment = { DISPATCH_RUNNER_CAPS: 'gpu=1,console=1' };
+  const cases = [
+    ['claim only', [claimComment()], ['gpu']],
+    ['claim and thread', [claimComment(), slotThread(1, 'gpu')], ['gpu']],
+    ['wrapup releases', [claimComment(), slotThread(1, 'gpu'), { body: '<!-- factory-dispatch:wrapup-claim -->' }, { body: '<!-- factory-dispatch:wrapup -->' }], []],
+    ['unknown runner', [slotThread(1)], ['gpu', 'console']],
+  ] as const;
+  for (const [name, comments, held] of cases) {
+    const gpu = pinned(2, 'gpu'), peer = pinned(3, 'console');
+    const f = await fixture(t, [started([...comments]), gpu, peer]);
+    const result = await f.run(['poll'], environment);
+    assert.equal(result.code, 0, result.stdout);
+    assert.deepEqual(capacityLogs(result.stdout), held.map(runner => ({ decision: 'capacity', issue: runner === 'gpu' ? 'MET-2' : 'MET-3', runner, held: 1, cap: 1 })), name);
+    assert.equal(labeled(gpu), held.includes('gpu'), name);
+    assert.equal(labeled(peer), held.includes('console'), name);
+  }
+});
+
+test('simple-flow In Progress orb builders still release their slot only on archive', { timeout: 30_000 }, async t => {
+  for (const archivedThread of [false, true]) {
+    const builder = issue(1, { labels: [accessLabel], state: { type: 'started' }, comments: [
+      { body: '<!-- factory-dispatch:claim runner:orb -->\n<!-- factory-dispatch:repo factory-access -->' }, slotThread(1, 'orb'),
+      { body: '<!-- factory-dispatch:wrapup -->' },
+      ...(archivedThread ? [{ body: `<!-- factory-dispatch:archived thread:${slotThread(1).body.match(/T-[\w-]+/)![0]} -->` }] : [])] });
+    const waiting = accessIssue(2);
+    const f = await fixture(t, [builder, waiting]);
+    const result = await f.run();
+    assert.equal(result.code, 0, result.stdout);
+    assert.deepEqual(capacityLogs(result.stdout), archivedThread ? [] : [{ decision: 'capacity', issue: 'MET-2', runner: 'orb', held: 1, cap: 1 }]);
+    assert.equal(labeled(waiting), !archivedThread);
+  }
+});
+
+test('a Done zombie no longer fills gpu: the next gpu candidate dispatches and is claimed exactly once', { timeout: 30_000 }, async t => {
+  const zombie = issue(1, { labels: [], state: { type: 'completed' }, comments: [claimComment(), slotThread(1, 'gpu'), { body: '<!-- factory-dispatch:wrapup-claim -->' }] });
+  const builders = [2, 3, 4].map(n => issue(n, { labels: [], state: { type: 'started' }, comments: [claimComment(), slotThread(n, 'gpu')] }));
+  const next = pinned(5, 'gpu'), after = pinned(6, 'gpu');
+  const f = await fixture(t, [zombie, ...builders, next, after]);
+  const environment = { DISPATCH_RUNNER_CAPS: 'gpu=4' };
+  const first = await f.run(['poll'], environment);
+  assert.equal(first.code, 0, first.stdout);
+  assert.equal((await f.run(['poll'], environment)).code, 0);
+  assert.deepEqual(f.calls().filter(args => args[0] === '-x').map(args => [args[args.indexOf('--title') + 1].split(' — ')[0], args[args.indexOf('--executor') + 1]]), [['MET-5', 'runner:factory-gpu']]);
+  assert.equal(next.comments.filter((c: any) => c.body.includes('<!-- factory-dispatch:claim runner:gpu -->')).length, 1);
+  assert.deepEqual(capacityLogs(first.stdout), [{ decision: 'capacity', issue: 'MET-6', runner: 'gpu', held: 4, cap: 4 }]);
 });
 
 test('crash after label removal has not submitted Amp; explicit retry may safely claim', { timeout: 10_000 }, async t => {
@@ -1049,7 +1121,7 @@ test('unlabeled queue fills each runner to its own cap, then waits without comme
 test('explicit grouped and flat runner labels never overflow even with spare peer capacity', { timeout: 10_000 }, async t => {
   for (const runner of ['gpu', 'console']) for (const label of [group('runner', runner), { id: 'runner', name: `runner/${runner}` }]) {
     const i = issue(); i.labels.push(label);
-    const f = await fixture(t, [issue(1, { labels: [], comments: [threadComment(runner)] }), i]);
+    const f = await fixture(t, [issue(1, { labels: [], state: { type: 'started' }, comments: [threadComment(runner)] }), i]);
     assert.equal((await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '1' })).code, 0);
     assert.equal(f.calls().length, 0);
     assert.equal(labeled(i), true);
@@ -2666,7 +2738,7 @@ test('cursor capacity counts its claims and markers separately and never overflo
   const environment = { DISPATCH_RUNNER_CAPS: 'gpu=1,cursor=1' };
   const first = await f.run(['poll'], environment);
   assert.equal(first.code, 0, first.stdout);
-  assert.ok(first.stdout.includes('{"decision":"capacity","issue":"MET-122","runner":"cursor"}'));
+  assert.ok(first.stdout.includes('{"decision":"capacity","issue":"MET-122","runner":"cursor","held":1,"cap":1}'));
   assert.equal(labeled(waiting), true);
   assert.equal(f.cursor.requests.length, 0);
   assert.ok(amp.comments.some((c: any) => c.body.includes('<!-- factory-dispatch:claim runner:console -->')), 'gpu full: amp overflows, ignoring cursor');
