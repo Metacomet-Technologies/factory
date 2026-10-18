@@ -299,9 +299,9 @@ Input fingerprints (MET-149) remain build provenance for `/health`, Fleet and
 release checks; they no longer drive the footer.
 `scripts/build-fingerprint.sh <meter|factory-api|kiosk>` hashes sorted tracked
 file names/content and transitive normal/build workspace path dependencies.
-Rust also includes the workspace `Cargo.toml` without `workspace.members`
-(adding an unrelated crate must not stale others) and the locked normal/build
-Cargo tree; `--target all --no-dedupe` and repository-relative paths keep the
+Rust also includes the locked normal/build Cargo tree, but not the workspace
+`Cargo.toml` (MET-247): unrelated members or workspace dependencies must not
+stale a component, and its resolved tree already records what it uses; `--target all --no-dedupe` and repository-relative paths keep the
 tree machine-independent, including when Cargo has a configured build target.
 Kiosk includes its tracked `bun.lock` and `factory-api/openapi.json`. All
 fingerprints include `VERSION` and the fingerprint script itself. Unrelated

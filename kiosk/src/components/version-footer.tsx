@@ -16,7 +16,7 @@ export function VersionFooter({
     { name: "meter", build: meter },
   ];
   // Only a contract difference is a mismatch; SHAs, versions and input fingerprints are provenance.
-  // ponytail: factory-api has no meter contract check yet, so only the kiosk↔API pair is compared.
+  // factory-api has no meter contract check yet, so only the kiosk↔API pair is compared.
   const served = api?.openapi_sha256;
   const mismatch = Boolean(served && served !== kiosk.expected_openapi_sha256);
   const dirty = components.some(({ build }) => build?.git_dirty);
