@@ -170,6 +170,17 @@ Run `sudo systemctl daemon-reload` and confirm with
 `systemctl show factory-dispatch.service -p Environment`. No timer or runner
 restart is required; the next service pass uses the new caps.
 
+`cap.conf` is the only drop-in the installer accepts (MET-215), so caps stay
+tunable without reinstalling and installer reruns keep working. Preflight passes
+when the service's `DropInPaths` is empty or exactly that path, and the file is a
+regular root-owned file (not a symlink, not group- or world-writable) holding only
+blank lines, `#` comments, one `[Service]` header and exactly one
+`Environment=DISPATCH_RUNNER_CAPS=<caps>` line in the grammar above. It prints
+`Runner caps drop-in: <caps>` or `Runner caps drop-in: absent`. Any other service
+drop-in, line or value, and any timer drop-in, fails preflight with the path or
+line number before the snapshot. Install and rollback never change `cap.conf`;
+the install snapshot only records it (`cap.conf` or `cap.conf.missing`).
+
 The committed `modes` map sends Amp low/medium/high unchanged; Claude always
 uses `external-agent:claude-code` with `--features model:claude-opus-5-5,effort:<low|medium|high>`
 (default medium); ChatGPT low uses `gpt56l`,
@@ -955,10 +966,13 @@ gpu-ssh 'systemctl is-enabled factory-dispatch.timer; systemctl is-active factor
 gpu-ssh 'sudo journalctl -u factory-dispatch -f'
 ```
 
+Reruns on an installed node use the same command, with `cap.conf` left in place.
+
 The pipe must transport JSON without a PTY or helper banner on stdout. If the Mac
 helper prints status, use PLAYBOOK §8's plain SSH transport with the same remote
 commands; invalid JSON stops preflight without installing anything. The installer
-checks root:agent 0640, resolves absolute Node/Amp paths as agent, bakes PATH into
+checks root:agent 0640, checks the `cap.conf` caps drop-in (see `DISPATCH_RUNNER_CAPS`),
+resolves absolute Node/Amp paths as agent, bakes PATH into
 the unit, prints `poll --dry-run`, snapshots units under
 `/var/backups/factory-dispatch`, and enables only the dispatcher timer. It never
 installs credentials, changes login/settings, or restarts either runner or any
@@ -1035,4 +1049,5 @@ cargo clippy --all-targets -- -D warnings
 cargo test --workspace
 bash -n deploy/install-dispatch.sh deploy/rollback-dispatch.sh
 shellcheck -x deploy/install-dispatch.sh deploy/rollback-dispatch.sh
+python3 -B deploy/test-install-dispatch.py
 ```
