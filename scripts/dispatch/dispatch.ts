@@ -581,6 +581,8 @@ export async function run(command: string, identifier: string | undefined, dryRu
     caps[`orb:${repo.name}`] = repo.maxActiveOrbs!;
   }
   for (const issue of issues) {
+    // MET-250: only In Progress (started) issues hold a slot, whatever stale markers they carry.
+    if (issue.state.type !== 'started') continue;
     const repo = claimedRepo(issue);
     const match = thread(issue);
     if (repo?.flow === 'simple' ? match && has(issue, `archived thread:${match[1]}`) : has(issue, 'wrapup')) continue;
@@ -613,7 +615,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
     const runner = overflow ? 'console' : requestedRunner;
     const capacityKey = runner === 'orb' ? `orb:${repo!.name}` : runner;
     const claimed = thread(issue) || issue.comments.some(comment => commentMarkers(comment.body).some(line => line.startsWith('<!-- factory-dispatch:claim runner:')));
-    if (active[capacityKey] >= caps[capacityKey] && (repo!.flow === 'full' || !claimed)) { log('capacity', { issue: issue.identifier, runner }); continue; }
+    if (active[capacityKey] >= caps[capacityKey] && (repo!.flow === 'full' || !claimed)) { log('capacity', { issue: issue.identifier, runner, held: active[capacityKey], cap: caps[capacityKey] }); continue; }
     if (claimed) {
       log('already-claimed', { issue: issue.identifier });
       await removeLabel(issue);

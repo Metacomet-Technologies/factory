@@ -659,10 +659,12 @@ the same rule; retained claims are exempt from stale-worktree cleanup.
 the label. A crash after Amp succeeds but before its URL comment would otherwise
 allow a second thread. The prior claim closes that gap. Crashes before the claim
 cannot have submitted Amp; crashes after it never retry automatically, including
-when someone re-adds the label. Confirmed threads and unresolved claims each
-reserve one slot until a wrap-up marker exists. This is conservative: a failed
-submission can hold a slot. Legacy thread markers without runner identity count
-against both runners rather than accidentally freeing capacity.
+when someone re-adds the label. Only In Progress (`started`) issues hold a slot
+(MET-250): there, confirmed threads and unresolved claims each reserve one until
+a wrap-up marker exists; Done, Canceled, Backlog, Todo and Triage issues never
+count, whatever markers they carry, and `capacity` logs report `held` and `cap`.
+Legacy thread markers without runner identity count against both runners rather
+than accidentally freeing capacity.
 
 Wrap-up uses the same pattern: await `<!-- factory-dispatch:wrapup-claim -->`,
 send `amp threads continue <id> -ox <prompt>`, then post
