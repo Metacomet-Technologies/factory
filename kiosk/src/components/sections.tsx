@@ -120,9 +120,7 @@ export function FleetSection({
                 </h3>
                 <span className="row chips">
                   {device && (
-                    <StatusChip
-                      tone={device.health === "unknown" ? "accent" : healthTone(device.health)}
-                    >
+                    <StatusChip tone={healthTone(device.health)}>
                       Host health{device.health === "unknown" ? "" : ` · ${device.health}`}
                     </StatusChip>
                   )}
@@ -180,9 +178,7 @@ export function FleetSection({
                       {device.device_id}
                       <ArrowUpRight aria-hidden="true" size={14} className="tile-link-hint" />
                     </h3>
-                    <StatusChip
-                      tone={device.health === "unknown" ? "accent" : healthTone(device.health)}
-                    >
+                    <StatusChip tone={healthTone(device.health)}>
                       Host health{device.health === "unknown" ? "" : ` · ${device.health}`}
                     </StatusChip>
                   </div>
@@ -245,6 +241,8 @@ export function GpuSection({
               label="Utilization"
               value={current?.utilization_percent ?? null}
               format={(n) => number(n, "%")}
+              tone="accent"
+              className="fk-hero"
             />
             <Stat
               label="Temperature"
@@ -284,7 +282,10 @@ export function UsageSection({
   index?: number;
 }) {
   const data = resource.data;
-  const pending = pricing.data?.families.filter((family) => family.pending) ?? [];
+  // Pending pricing is a pricing state; while this section itself errors, the alert speaks alone.
+  const pending = resource.error
+    ? []
+    : (pricing.data?.families.filter((family) => family.pending) ?? []);
   const warnings = [...(data?.warnings ?? []), ...(pricing.data?.warnings ?? [])];
   return (
     <a
@@ -402,7 +403,7 @@ export function AgentsSection({
           <Button
             variant="ghost"
             size="icon-sm"
-            className="accent-text disabled:opacity-100 disabled:pointer-events-auto"
+            className="accent-text disabled:bg-transparent disabled:text-muted-foreground disabled:pointer-events-auto"
             aria-label="Refresh usage"
             title={refresh.seconds > 0 ? `Next refresh in ${refresh.seconds} s` : "Refresh usage"}
             disabled={refresh.refreshing || refresh.seconds > 0}
@@ -525,6 +526,13 @@ export function TickerSection({
   connected: boolean;
   index?: number;
 }) {
+  // Rows that arrive after mount slide in once; the keys stay stable across arrivals so the
+  // existing rows keep still instead of remounting.
+  const [since] = useState(() => requests[0]?.ts_ms ?? null);
+  const keys = requests.map(
+    (event, index) =>
+      `${event.ts_ms}-${requests.slice(0, index).filter((prior) => prior.ts_ms === event.ts_ms).length}`,
+  );
   return (
     <Panel
       title="Live requests"
@@ -549,7 +557,10 @@ export function TickerSection({
         ) : (
           <ul className="ticker">
             {requests.map((event, index) => (
-              <li key={`${event.ts_ms}-${index}`}>
+              <li
+                key={keys[index]}
+                className={since != null && event.ts_ms > since ? "fk-new" : undefined}
+              >
                 <div className="row">
                   <h3>{event.data.model ?? "Non-model request"}</h3>
                   <span className="muted">{time(event.ts_ms)}</span>

@@ -14,6 +14,28 @@ export function useReducedMotion() {
 }
 
 /**
+ * Event pulse: fresh data landed. The Live chip throws one ripple and every `.fk-hero`
+ * number flashes once over `--dur-event`. Pure CSS; under reduced motion the keyframes are
+ * disabled, so the ripple is removed at once and the flash class is a no-op.
+ */
+export function pulse(root: ParentNode = document) {
+  if (snapshot()) return;
+  for (const live of root.querySelectorAll(".live-indicator")) {
+    const ripple = document.createElement("span");
+    ripple.className = "fk-ripple";
+    ripple.setAttribute("aria-hidden", "true");
+    ripple.addEventListener("animationend", () => ripple.remove(), { once: true });
+    live.append(ripple);
+  }
+  for (const hero of root.querySelectorAll<HTMLElement>(".fk-hero .stat-value")) {
+    hero.classList.remove("fk-flash");
+    void hero.offsetWidth; // restart the keyframes when a pulse lands mid-flash
+    hero.classList.add("fk-flash");
+    hero.addEventListener("animationend", () => hero.classList.remove("fk-flash"), { once: true });
+  }
+}
+
+/**
  * Tweens a numeric value toward `target` over `duration` ms with ease-out.
  * Null targets, the first value and reduced motion render immediately (no tween from a stale number).
  */

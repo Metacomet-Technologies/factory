@@ -1,164 +1,235 @@
 # Kiosk style guide
 
-How to build or change a kiosk page so it matches the rest of the dashboard.
-Read this before touching `kiosk/src`. The rules are short on purpose; the
-primitives do the heavy lifting, so prefer composing them over writing CSS.
+How to build or change a kiosk page so it matches design system v2, "Snake
+River dusk" (`docs/design/kiosk-v2/`). Read this before touching `kiosk/src`.
+The spec is design data: `tokens.json` is the source of the palette,
+`components/*/README.md` describes each primitive, and this file records how
+the kiosk applies them and where it deviates. The rules are short on purpose;
+the primitives do the heavy lifting, so prefer composing them over writing CSS.
 
 ## Golden rules
 
 1. Compose pages from the primitives in `kiosk/src/components/ui/`. Do not
    hand-roll cards, stats, chips, bars or range switches.
-2. Colors come from the tokens in `kiosk/src/index.css` (`:root` block). Never
-   write hex or oklch values in components, and never add a new hue.
-3. Purple is the brand accent only. Status is always `ok` / `warn` / `fail`
-   (green / amber / red) or `neutral`.
-4. Every text and icon color must reach WCAG AA (4.5:1) in both themes. Stale
-   data uses the muted color, never reduced opacity.
-5. Motion is CSS or Recharts only, no animation libraries. Every animation
-   must respect `prefers-reduced-motion`.
+2. Colors come from the tokens in `kiosk/src/index.css` (`:root` block; only
+   `--background` and `--foreground` live in `index.html` so the first frame
+   paints before the bundle). Never write hex values in components, and never
+   add a new hue.
+3. One brand hue. Teal (`--primary`) is for the mark, links, focus rings,
+   chart lines, glow and hero numbers. Status is always `ok` / `warn` / `fail`
+   (meadow green / gold / red-orange) or `neutral`; teal is never a status.
+   `fail` always renders as a filled chip with the triangle icon.
+4. Every text/background pair reaches 4.5:1 and every control boundary
+   reaches 3:1 in both themes, measured over the scene (the screenshot script
+   does this). Stale or disabled state uses `--muted-foreground` plus
+   `--border-control`, never opacity on text.
+5. Motion is CSS or Recharts only, no animation libraries. `prefers-reduced-
+   motion: reduce` stops everything: the scene, the pulses, the entrance
+   stagger, the chart draw and the number tweens.
 6. One page = one `<main className="dashboard …">` containing a `PageHeader`
-   followed by `Panel`s. The top bar and footer are owned by `App.tsx`; the
-   area between them scrolls.
-7. The 1728×1117 kiosk display must show the whole overview without
-   scrolling. Check the ≥1280 px density rules in `index.css` after adding
-   anything to the dashboard grid.
+   followed by `Panel`s. `App.tsx` owns the top bar, the Verdict strip, the
+   ambient scene and the footer.
+7. The 1728×1117 kiosk display shows the whole overview without scrolling in
+   every state (steady, loading, error, outage, reconnecting). The screenshot
+   script fails if the document or `.dashboard` overflows. Check the ≥1280 px
+   grid in `index.css` after adding anything to the overview.
 
 ## Tokens (`kiosk/src/index.css`)
 
-| Token | Use |
-| --- | --- |
-| `--background`, `--card`, `--muted` | page, panel and sub-surface backgrounds |
-| `--foreground`, `--muted-foreground` | primary and secondary text (both AA on all three surfaces) |
-| `--border`, `--border-strong` | resting and hover borders |
-| `--primary`, `--primary-foreground` | filled buttons and the brand mark |
-| `--accent-text`, `--accent-soft` | links, focus rings, chart series, soft accent fills |
-| `--ok`, `--warn`, `--fail` | status only |
-| `--radius-sm/md/lg/xl` | 6 / 8 / 12 / 14 px corners |
-| `--dur-fast`, `--dur`, `--dur-slow`, `--ease-out` | 160 / 320 / 640 ms and the shared easing curve |
+Light ("dawn") and dark are equals: every token is one `light-dark()`
+declaration, so a new token needs both values at once. The theme follows the
+system; the top-bar toggle writes the sticky `factory-theme` override and
+`index.html` applies it before the first paint.
 
-Resolved values and measured WCAG contrast (text colour against `--card`):
+| Token | Light | Dark | Use |
+| --- | --- | --- | --- |
+| `--background` | `#f2f6f7` | `#0d1218` | page ground under the scene |
+| `--card` | `#ffffff` | `#101820` | panel glass tint (at `--glass-alpha`) |
+| `--muted` | `#e7eef0` | `#17222c` | sub-surfaces, meter tracks, disabled fills |
+| `--foreground` | `#102026` | `#eef4f6` | primary text |
+| `--muted-foreground` | `#4f6169` | `#9fb0ba` | secondary text, stale readings |
+| `--border` / `--border-strong` | 10% / 18% ink | 9% / 18% white | resting and hover edges on tiles and rows |
+| `--border-control` | `#718389` | `#728894` | the only border that must read alone (≥ 3:1): buttons, toggles, inputs, disabled controls |
+| `--primary` / `--primary-foreground` | `#00756c` / `#ffffff` | `#3fd1c2` / `#06201d` | brand teal, filled buttons, the mark |
+| `--accent-text`, `--accent-soft` | `= --primary`, 12% teal | `= --primary`, 14% teal | links, focus rings, chart line, soft accent fills |
+| `--glow` | `#e0895a` | `#f2a477` | alpenglow; scene only |
+| `--ok` | `#25661a` | `#7ee081` | status only |
+| `--warn` | `#7a5800` | `#ffd447` | status only |
+| `--fail` | `#ad2d17` | `#ff6a4f` | status only |
+| `--on-status` | `#ffffff` | `#120b08` | text on a filled status chip |
+| `--sky-0…4`, `--ridge-far/mid/near`, `--snow` | see `:root` | | scene gradient stops and the ridgeline |
+| `--glass-*` | see below | | glass edge, sheen, glint, drop shadow, alpha, blur, saturation |
+| `--shadow-glass`, `--shadow-tone-warn/fail`, `--shadow-mark` | | | depth and tone rings; the old `--shadow-card`/`--glow` shadows are gone |
+| `--radius-glass` 14 px, `--radius-pill` | | | panel corners and chips |
+| `--dur-fast/-/-slow` 160/320/640 ms, `--dur-tween` 600, `--dur-draw` 900, `--dur-event` 1200, `--dur-ping` 1800, `--dur-sweep` 60 s, `--dur-aurora` 48 s, `--dur-twinkle` 6 s, `--ease-out`, `--stagger` 60 ms | | | motion |
 
-| Token | Light | Dark |
+Deviations from `tokens.json`, each one step away to clear AA over the scene
+(the screenshot audit measures them; comments in `index.css` repeat the why):
+
+- dark `--glass-alpha` 78% (spec 68%): status text on a tile over the lit
+  snow peaks.
+- dark `--fail` `#ff6a4f` (spec `#ff5a3d`) and light `--ok` `#25661a` (spec
+  `#286d1a`): "Failing" / "OK" text on chips and tiles.
+- dark `--border-control` `#728894` (spec `#6a808c`): toggle and button
+  outlines at 3:1 on glass.
+- Top bar and footer tint at `--glass-alpha`, not 60%, so the footer SHAs
+  stay above 4.5:1 over the sky.
+
+Measured minimums with the current tokens (`kiosk/screenshots/checks.json`):
+text 4.54:1 ("Failing · —" at 1024 and 390 dark), 5.09:1 at 1728 dark,
+5.15:1 at 1728 light; controls 3.09:1 (pressed "1h" border at 390 light),
+3.66:1 / 3.53:1 at 1728 dark / light. If you change a token, run the
+screenshot script and keep every pair above its floor.
+
+## Surfaces: liquid glass
+
+`.panel` (and `.ups-panel`, the top bar, the footer) is frosted glass over
+the scene: `color-mix(var(--card) var(--glass-alpha))` tint,
+`backdrop-filter: blur(18px) saturate(170%)`, a 1 px `--glass-edge` border,
+a `::before` specular glint in the top-left corner, and `--shadow-glass` (an
+inner sheen line top and bottom plus a soft depth drop). Warning and failure
+panels add `--shadow-tone-warn/fail`: a 1 px inset ring and a glow in the
+status color. Nothing else draws its own shadow.
+
+The scene is fixed behind `#root` (`isolation: isolate`) so the glass blurs
+it. `?ambient=static` turns the blur off and paints a pre-rendered, blurred
+sky into the panels instead (`--fk-static-sky`); keep new glass surfaces in
+the `:root[data-ambient="static"]` rule.
+
+## Scene and ambient motion (`kiosk/src/ambient/`)
+
+`AmbientScene` renders the sky gradient, the night layer and the Teton
+ridgeline band (far ridge, near ridge with snow on the high peaks, teal rim
+light) at the bottom of the frame. The ridgeline is generated from hand-placed
+points in `scene.tsx`; do not trace a photo. Modes (`mode.ts`):
+
+| Mode | What runs | How to get it |
 | --- | --- | --- |
-| `--background` / `--card` / `--muted` | `#f3f4f8` / `#ffffff` / `#eaecf2` | `#0d0f14` / `#151821` / `#1e222d` |
-| `--foreground` | `#171923` (17.5:1) | `#eef0f5` (15.6:1) |
-| `--muted-foreground` | `#5c6271` (6.1:1; 5.2:1 on muted) | `#a3a9b8` (7.5:1; 6.8:1 on muted) |
-| `--accent-text` | `#5234bc` (8.2:1) | `#a8a3ff` (7.9:1) |
-| `--primary` (+ white text) | `#5e45cd` (6.5:1) | same |
-| `--ok` | `#007a46` (5.4:1) | `#5ed99e` (10.0:1) |
-| `--warn` | `#975800` (5.7:1) | `#fac053` (10.8:1) |
-| `--fail` | `#be2132` (6.1:1) | `#ff8d8f` (8.0:1) |
+| `both` (default) | 60 s alpenglow sweep; at night, 50 twinkling stars and two aurora ellipses. Dawn shows the sweep only. | the plain URL |
+| `sweep` | the sweep alone | `?ambient=sweep` |
+| `static` | the sweep; `backdrop-filter` off, panels paint the pre-blurred sky | `?ambient=static` |
+| `none` | still scene, no sweep | `?ambient=none` |
 
-Status chips tint their background with 14% of the semantic colour; the text
-on that tint stays at 4.4:1 or better in light and 6.3:1 or better in dark.
-If you change a token, re-measure every row (any contrast checker that
-accepts hex works) and keep each one at or above 4.5:1.
+Unknown values fall back to `both`. `?perf=1` starts the frame sampler
+(`perf.ts`, `window.__ambientPerf`) for `kiosk/scripts/ambient-trial.sh`.
+"Night" means the dark theme, so dawn mode never shows stars or aurora. The
+v1 look no longer exists.
 
-Light and dark values live in one `light-dark()` declaration per token, so a
-new token needs both values at once. Theme follows the system unless the user
-toggles it; never force a default.
+Event pulses (`lib/motion.ts` `pulse()`, called once per data refresh in
+`App.tsx`): the Live chip throws one `.fk-ripple`, every `.fk-hero
+.stat-value` flashes once over `--dur-event`, and new request-ticker rows
+slide in (`.ticker li.fk-new`, `row-in`). All of it is CSS keyframes;
+`pulse()` returns early under reduced motion and the global
+`@media (prefers-reduced-motion: reduce)` block disables every keyframe, so
+`document.getAnimations()` is empty. The screenshot and ambient scripts assert
+that.
 
 ## Primitives
 
 All optional props accept `undefined` explicitly (`exactOptionalPropertyTypes`
 is on).
 
-- `Panel` (`ui/panel.tsx`): the card. `title`, `subtitle`, `icon`, `action`
-  (right-aligned control or chip), `tone` tints the border for alarms,
-  `index` staggers the entrance animation. Renders a `<section
-  aria-label={title}>`, so tests can use `getByRole("region", { name })`.
-  Pass `aria-label` to override. `Tile` is the bordered sub-surface inside a
-  Panel (fleet node, spend card, model card).
-- `Stat` / `StatGrid` (`ui/stat.tsx`): label above a tabular number. Pass a
-  numeric `value` plus `format` so live changes tween; strings render as-is.
-  `size` is `lg` for hero totals, `md` for card metrics, `sm` for dense rows.
-  `StatGrid columns={n}` lays Stats out in equal columns.
+- `Panel` (`ui/panel.tsx`): the glass card. `title`, `subtitle`, `icon`,
+  `action` (right-aligned control or chip), `tone="warn" | "fail"` adds the
+  tone ring, `index` staggers the entrance. Renders `<section
+  aria-label={title}>`, so tests use `getByRole("region", { name })`. `Tile`
+  is the bordered sub-surface inside a Panel (fleet node, spend card).
+- `Verdict` (`ui/verdict.tsx`, data from `lib/verdict.ts`): the strip under
+  the header. "N need attention" with one chip per issue (failures first) and
+  "M other checks OK", or one calm line when nothing is wrong. Add a new
+  overview signal to `verdict()`, not to the component.
+- `Stat` / `StatGrid` (`ui/stat.tsx`): label above a Geist Mono number. Pass a
+  numeric `value` plus `format` so live changes tween. `size` is `lg` for hero
+  totals (give the container `fk-hero` so it flashes on a pulse), `md` for
+  card metrics, `sm` for dense rows. `tone="accent"` is the only teal number.
 - `StatusChip` / `StatusText` (`ui/status-chip.tsx`): pill or inline text
-  with a `Tone` (`ok | warn | fail | neutral | accent`). `dot` adds the
-  status dot, `pulse` animates it for active alarms.
-- `MeterBar` (`ui/meter-bar.tsx`): native `<progress>` with optional
-  threshold markers; `tone="muted"` for stale readings.
-- `RangeToggle` (`ui/range-toggle.tsx`): segmented control for time ranges;
-  buttons expose `aria-pressed`.
-- `KeyValue` (`ui/key-value.tsx`): definition list of label/value rows.
-- `PageHeader` (`ui/page-header.tsx`): eyebrow + title on the left, aside on
-  the right. Every routed page starts with one.
-- `LiveIndicator` (`ui/live-indicator.tsx`): the stream status pill in the top
-  bar; takes `useStream().status`.
-- `TrendChart` (`charts/trend-chart.tsx`): one accent area over time with
-  gradient fill and tooltip. Import it only from a lazily loaded module so
-  Recharts stays out of the main bundle (see `gpu-chart.tsx`).
-- shadcn/Base UI components (`ui/button.tsx`, `ui/alert.tsx`, `ui/table.tsx`,
-  `ui/tooltip.tsx`, `ui/tabs.tsx`, `ui/chart.tsx`) for anything interactive.
+  with a `Tone` (`ok | warn | fail | neutral | accent`). `fail` is filled with
+  the triangle icon (`icon={false}` only inside a tile that already shows
+  one); `ok` and `warn` are tinted. `dot` adds the status dot, `pulse`
+  animates it for active alarms. Unknown host health is `neutral`.
+- `MeterBar` (`ui/meter-bar.tsx`): native `<progress>` for semantics under a
+  `.meter-fill` sized by `--fill`, with optional threshold markers;
+  `tone="muted"` for stale readings. Give it a grid cell or a block, not a
+  flex row with other content, or it collapses to zero width (the filesystem
+  rows on the device page are a grid for this reason).
+- `RangeToggle` (`ui/range-toggle.tsx`): segmented control; the pressed
+  segment gets a `--border-control` outline so the state reads at 3:1.
+- `KeyValue`, `PageHeader`, `LiveIndicator` (`.live-indicator`, the ripple
+  target), `Button`, `Alert`, `Table`, `Tooltip`, `Tabs` as before. `Badge`,
+  `Card` and `Tabs` cleanup is MET-228.
+- `TrendChart` (`charts/trend-chart.tsx`): the comet trail by default: a teal
+  stroke fading in from the left with a bright "now" head and halo; no fill.
+  `variant="area"` keeps the gradient area for distributions (devices
+  chart). Import it only from a lazily loaded module so Recharts stays out of
+  the main bundle.
 
-Formatting helpers live in `kiosk/src/lib/format.ts` (`count`, `usd`, `ms`,
-`number`, `seen`, `time`). Use them instead of ad-hoc `toFixed`.
+Formatting helpers live in `kiosk/src/lib/format.ts`. Use them instead of
+ad-hoc `toFixed`.
+
+## Type
+
+Geist for UI and Geist Mono for numbers, from `@fontsource/geist` and
+`@fontsource/geist-mono` (exact versions in `package.json`, latin 400–700,
+`font-display: swap`, imported in `main.tsx`). `index.html` preloads the 400
+and 600 WOFF2 files for both families; Vite rewrites the `node_modules` paths
+to hashed assets. No CDN. `--font-sans` / `--font-mono` are the only font
+stacks; numbers get `tabular-nums` from `body`.
 
 ## Layout
 
-- Top bar: brand mark + `factory` link home, then breadcrumbs derived from
-  the path (`crumbs()` in `App.tsx`). Every crumb except the last is a link to
-  the higher level; `devices` returns to the dashboard because devices live in
-  the Fleet grid.
-- Dashboard overview (`/`): the `.dashboard-grid`. Sections that have a
-  details page render as a `<a className="panel-link">` wrapping a compact
-  `Panel` with KPIs only (see `UsageSection`, `UpsSection`, `NetworkSection`). Put tables,
-  charts with controls and long lists on the details page, not the overview.
-- Details pages (`/ups`, `/llm`, `/network`, `/devices/<id>`): `PageHeader` then
-  stacked Panels. Add `className="<name>-page"` and extend the
-  `.ups-page, .devices-page, .llm-page, .network-page` rule when you need
-  page-level spacing.
-- Fleet node tiles that match a device from `/v1/devices` render as
-  `<a className="tile-link">` to the device page. There is no separate
-  devices list page.
-- Navigation: plain `<a href="/…">`. `App.tsx` intercepts same-origin clicks
-  at the document level and pushes history, so components never call
-  `history.pushState` themselves.
-
-## Motion
-
-- Entrance: Panels fade and rise with `index`-based stagger
-  (`.panel { animation: panel-in … }`). Keep new sections in the same scheme.
-- Live numbers: `useAnimatedNumber` tweens Stats over 600 ms with ease-out.
-- Charts: Recharts `isAnimationActive={!reduced}` with `animationDuration={900}`.
-- Bars: `MeterBar` width transitions on `--dur`.
-- Hover: `.panel-link` and `.tile-link` lift 1 px and strengthen the border.
-- `useReducedMotion()` (`lib/motion.ts`) must gate every animation; the
-  global `@media (prefers-reduced-motion: reduce)` block disables CSS
-  animations, and components pass `!reduced` to Recharts and tweens.
+- Top bar: brand mark (teal, one hue) + `factory` link home, then breadcrumbs
+  derived from the path (`crumbs()` in `App.tsx`). Crumb separators use
+  `--muted-foreground`, not opacity.
+- Overview (`/`): `.dashboard-grid`. At ≥1280 px it is three columns plus a
+  1.38fr sidebar, rows `auto auto auto 1fr`: Fleet, GPU, then UPS / Local LLM
+  / Network on one row (the spec draws two columns there; three keeps the
+  overview from scrolling at the kiosk size), with Frontier CLIs and Live
+  requests in the sidebar. Sections with a details page render as `<a
+  className="panel-link">` wrapping a compact `Panel`.
+- Details pages (`/ups`, `/llm`, `/network`, `/devices/<id>`): `PageHeader`
+  then stacked Panels; the dashboard area scrolls there.
+- Navigation: plain `<a href="/…">`; `App.tsx` intercepts same-origin clicks.
 
 ## Live data
 
 - `useApi(path, query, revision)` fetches JSON and refetches when `revision`
   changes; `useStream()` owns the SSE connection and returns `status`
   (`connecting | live | reconnecting`), revision counters and the latest
-  samples.
-- `useApi` returns the loading state while a revision refetch runs. When a
-  frequent stream event bumps the revision, wrap the resource in `useHeld` so
-  the last response stays on screen (see the `/v1/network` snapshot in
-  `App.tsx`).
+  samples. Each refresh calls `pulse()` once.
+- Wrap frequently bumped resources in `useHeld` so the last response stays on
+  screen during a refetch.
 - The stream reconnects on `error`, after 45 s of silence, and on
-  `online` / `visibilitychange` / `pageshow`, with jittered backoff from 1 s
-  to 30 s. Do not add a second EventSource; bump a revision in
-  `streamReducer` instead and let `useApi` refetch.
-- Show `ResourceState` (loading skeleton, error alert, empty text) at the top
-  of any Panel that renders a `Resource`.
+  `online` / `visibilitychange` / `pageshow`, with jittered backoff. Do not
+  add a second EventSource.
+- Show `ResourceState` (skeleton, error alert, empty text) at the top of any
+  Panel that renders a `Resource`. Error and reconnecting states must not
+  grow the overview past the viewport.
 
-## Contrast check
+## Checks
 
-1. Render both themes at 1728×1117 (`agent-browser set viewport 1728 1117 1`,
-   toggle with `localStorage.setItem('factory-theme','dark')`).
-2. Compute WCAG ratios for every new text/background pair; the measured values
-   for the current tokens are listed in `kiosk/README.md` under "Accent and
-   contrast". Anything below 4.5:1 (3:1 for large text) is a bug.
-3. Never use opacity on text to indicate stale or disabled state.
+From `kiosk/` after `source /home/agent/.config/vite-plus/env`:
+
+- `vp check` (`OPENAPI_URL=file:///…/factory-api/openapi.json vp check`
+  offline), `vp test --run`, `vp build`.
+- `vp run screenshots` (`PLAYWRIGHT_BROWSERS_PATH` to the Playwright cache;
+  about five minutes): regenerates `kiosk/screenshots/`, asserts the first
+  frame paints the right theme, no scroll at 1728×1117 in light and dark for
+  steady, loading, error, outage and reconnecting, every text pair ≥ 4.5:1 and
+  every control boundary ≥ 3:1 measured in the browser over the worst-case
+  scene, and zero running animations under reduced motion. Results in
+  `screenshots/checks.json`.
+- `vp run ambient:check` against the mock preview or this worktree's sandbox:
+  the default URL is `both`, every `?ambient=` override renders its scene,
+  panels keep the glass blur and tone rings, nothing scrolls, and reduced
+  motion stops everything. Results in `.amp/in/artifacts/ambient/`.
+- `kiosk/scripts/ambient-trial.sh both` on the console for the 15%-of-all-cores
+  rule (MET-237).
 
 ## Checklist before opening a PR
 
-- `vp fmt`, `vp check`, `vp test --run`, `vp build` from `kiosk/`
-  (`OPENAPI_URL=file:///…/factory-api/openapi.json vp check` when offline).
+- The three `vp` commands plus both scripts above pass.
 - Screenshots of every changed page in light and dark at 1728×1117 and at a
-  narrow width (≤ 640 px), inspected, saved under `.amp/in/artifacts/`.
-- Tests assert through roles and visible text (`getByRole("region", { name })`,
-  `getByText`), not class names.
-- No new dependencies, no inline colors, no `history.pushState` in components.
+  narrow width, inspected.
+- Tests assert through roles and visible text, not class names.
+- No new dependencies, no inline colors, no opacity on text, no second hue,
+  no `history.pushState` in components.

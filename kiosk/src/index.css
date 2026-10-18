@@ -1,12 +1,14 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "./ambient/ambient.css";
 @custom-variant dark (&:is(.dark *));
 
-/* Tokens are documented in docs/agents/kiosk-styleguide.md. Change them there first. */
+/* Design system v2 (Snake River dusk). Tokens come from docs/design/kiosk-v2/tokens.json and
+   are documented in docs/agents/kiosk-styleguide.md. Change them there first. */
 @theme inline {
-  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-sans:
+    "Geist", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   --font-heading: var(--font-sans);
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -25,7 +27,8 @@
   --color-accent-foreground: var(--foreground);
   --color-destructive: var(--fail);
   --color-border: var(--border);
-  --color-input: var(--border);
+  --color-border-control: var(--border-control);
+  --color-input: var(--border-control);
   --color-ring: var(--accent-text);
   --radius-sm: 6px;
   --radius-md: 8px;
@@ -34,48 +37,85 @@
   --radius-4xl: 14px;
 }
 :root {
-  /* Surfaces */
-  --card: light-dark(#ffffff, #151821);
-  --muted: light-dark(#eaecf2, #1e222d);
-  --border: light-dark(#d9dce5, #2a2f3c);
-  --border-strong: light-dark(#c3c7d3, #3a4050);
+  /* Ground and surfaces */
+  --card: light-dark(#ffffff, #101820);
+  --muted: light-dark(#e7eef0, #17222c);
+  --border: light-dark(#10202619, #ffffff17);
+  --border-strong: light-dark(#1020262e, #ffffff2e);
+  /* Control outlines: the only border that must read on its own (≥ 3:1). */
+  --border-control: light-dark(#718389, #728894);
   /* Text */
-  --muted-foreground: light-dark(#5c6271, #a3a9b8);
-  /* Brand: one purple hue. Never used to signal status. */
-  --primary: oklch(0.5 0.2 285);
-  --primary-foreground: #ffffff;
-  --accent-text: light-dark(oklch(0.45 0.2 285), oklch(0.76 0.14 285));
-  --accent-soft: color-mix(in oklab, var(--accent-text) 12%, transparent);
-  /* Status */
-  --ok: light-dark(oklch(0.47 0.14 160), oklch(0.8 0.14 160));
-  --warn: light-dark(oklch(0.52 0.13 70), oklch(0.84 0.14 80));
-  --fail: light-dark(oklch(0.52 0.19 22), oklch(0.78 0.15 20));
+  --muted-foreground: light-dark(#4f6169, #9fb0ba);
+  /* Brand: one teal hue, for the mark, links, glow and hero numbers. Never status. */
+  --primary: light-dark(#00756c, #3fd1c2);
+  --primary-foreground: light-dark(#ffffff, #06201d);
+  --accent-text: var(--primary);
+  --accent-soft: light-dark(#00756c1f, #3fd1c224);
+  /* Alpenglow: the apricot dusk light, used only by the scene. */
+  --glow: light-dark(#e0895a, #f2a477);
+  /* Status: ok is meadow green, warn is gold, fail is red-orange. Light ok and dark fail sit
+     one step off tokens.json (#286d1a, #ff5a3d) so chips and "Failing" text clear 4.5:1 over
+     the lit ridge and the aurora. */
+  --ok: light-dark(#25661a, #7ee081);
+  --warn: light-dark(#7a5800, #ffd447);
+  --fail: light-dark(#ad2d17, #ff6a4f);
+  --on-status: light-dark(#ffffff, #120b08);
+  /* Scene: sky (top to bottom), ridges (far to near), snow. */
+  --sky-0: light-dark(#f7fafb, #0b1016);
+  --sky-1: light-dark(#ebf2f4, #0f1820);
+  --sky-2: light-dark(#e2ecee, #16252f);
+  --sky-3: light-dark(#efe0d6, #2f3740);
+  --sky-4: light-dark(#f2cdb5, #6b4c42);
+  --ridge-far: light-dark(#cfe0e3, #1e2c35);
+  --ridge-mid: light-dark(#a9c3c9, #141f27);
+  --ridge-near: light-dark(#8fb0b8, #0c141a);
+  --snow: light-dark(#ffffff, #f7e0d0);
+  /* Glass */
+  --glass-edge: light-dark(#ffffffbf, #ffffff24);
+  --glass-sheen: light-dark(#fffffff2, #ffffff38);
+  --glass-glint: light-dark(#ffffff8c, #ffffff12);
+  --glass-drop: light-dark(#5a3c1e38, #000000a6);
+  --glass-alpha: 86%;
+  --glass-blur: 18px;
+  --glass-saturate: 170%;
+  --snow-opacity: 0.95;
+  --sweep-opacity: 0.5;
   /* Depth */
-  --shadow-card: light-dark(
-    0 1px 2px rgb(23 25 35 / 6%),
-    0 8px 24px -16px rgb(23 25 35 / 10%),
-    0 0 0 1px rgb(0 0 0 / 0%),
-    0 10px 30px -18px rgb(0 0 0 / 60%)
-  );
-  --glow: light-dark(
-    radial-gradient(900px 420px at 12% -10%, oklch(0.9 0.06 285 / 45%), transparent 70%),
-    radial-gradient(900px 420px at 12% -10%, oklch(0.45 0.14 285 / 22%), transparent 70%)
-  );
+  --shadow-glass:
+    inset 0 1px 0 var(--glass-sheen), inset 0 -1px 0 #0000001f, 0 22px 44px -28px var(--glass-drop);
+  --shadow-tone-warn:
+    inset 0 0 0 1px color-mix(in srgb, var(--warn) 70%, transparent), 0 0 22px -10px var(--warn);
+  --shadow-tone-fail:
+    inset 0 0 0 1px color-mix(in srgb, var(--fail) 70%, transparent), 0 0 24px -8px var(--fail);
+  --shadow-mark: 0 0 18px -4px var(--primary);
+  /* Radii */
+  --radius-glass: 14px;
+  --radius-pill: 999px;
   /* Motion */
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
   --dur-fast: 160ms;
   --dur: 320ms;
   --dur-slow: 640ms;
+  --dur-tween: 600ms;
+  --dur-draw: 900ms;
+  --dur-event: 1200ms;
+  --dur-ping: 1800ms;
+  --dur-sweep: 60s;
+  --dur-aurora: 48s;
+  --dur-twinkle: 6s;
+  --stagger: 60ms;
+  --panel-pad: 18px;
+}
+:root[data-theme="dark"] {
+  /* tokens.json says 68%; 78% keeps status text at 4.5:1 on a tile over the lit snow peaks. */
+  --glass-alpha: 78%;
+  --snow-opacity: 0.75;
+  --sweep-opacity: 0.42;
 }
 @layer base {
   * {
     @apply border-border;
     box-sizing: border-box;
-  }
-  html {
-    background-image: var(--glow);
-    background-repeat: no-repeat;
-    background-attachment: fixed;
   }
   body {
     @apply text-foreground font-sans;
@@ -84,7 +124,6 @@
     line-height: 1.45;
     font-variant-numeric: tabular-nums;
     -webkit-font-smoothing: antialiased;
-    background: transparent;
   }
   button {
     cursor: pointer;
@@ -178,10 +217,10 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px 24px;
-  background: color-mix(in oklab, var(--background) 82%, transparent);
-  backdrop-filter: blur(14px) saturate(140%);
-  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  padding: 12px 28px;
+  background: color-mix(in srgb, var(--background) var(--glass-alpha), transparent);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   border-bottom: 1px solid var(--border);
 }
 .brand,
@@ -230,7 +269,6 @@
 }
 .crumb-sep {
   color: var(--muted-foreground);
-  opacity: 0.6;
 }
 .crumbs a {
   color: var(--muted-foreground);
@@ -247,12 +285,12 @@
 .brand-mark {
   display: grid;
   place-items: center;
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
-  color: #fff;
-  background: linear-gradient(135deg, oklch(0.62 0.2 285), oklch(0.45 0.22 290));
-  box-shadow: 0 6px 16px -8px oklch(0.5 0.2 285 / 70%);
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  color: var(--primary-foreground);
+  background: var(--primary);
+  box-shadow: var(--shadow-mark);
   transition: transform var(--dur) var(--ease-out);
 }
 .header-actions a:not(.chip) {
@@ -272,6 +310,15 @@
 .header-actions [data-slot="button"]:hover {
   color: var(--foreground);
 }
+.header-actions [data-slot="button"].status-ok {
+  color: var(--ok);
+}
+.header-actions [data-slot="button"].status-warn {
+  color: var(--warn);
+}
+.header-actions [data-slot="button"].status-fail {
+  color: var(--fail);
+}
 
 /* ---- Page frame --------------------------------------------------------- */
 .dashboard {
@@ -280,7 +327,7 @@
   width: 100%;
   max-width: 1728px;
   margin: 0 auto;
-  padding: 24px 32px;
+  padding: 24px 28px;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -293,9 +340,54 @@
 }
 .page-title {
   font-size: 26px;
-  font-weight: 600;
-  letter-spacing: -0.6px;
-  line-height: 1.15;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+/* ---- Verdict strip (overview only) -------------------------------------- */
+.panel.verdict {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 18px;
+  padding: 10px 16px;
+  margin-bottom: 16px;
+}
+.verdict-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  white-space: nowrap;
+}
+.verdict-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--v, var(--ok));
+  box-shadow: 0 0 14px var(--v, var(--ok));
+}
+.verdict[data-tone="warn"] {
+  --v: var(--warn);
+}
+.verdict[data-tone="fail"] {
+  --v: var(--fail);
+}
+.verdict-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+.verdict-rest {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  white-space: nowrap;
 }
 .page-aside {
   display: flex;
@@ -329,25 +421,36 @@
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: var(--panel-pad, 18px);
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-card);
+  padding: var(--panel-pad);
+  isolation: isolate;
+  /* Frosted liquid glass: the panel tints and blurs whatever sky or ridge is behind it. */
+  background: color-mix(in srgb, var(--card) var(--glass-alpha), transparent);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--radius-glass);
+  box-shadow: var(--shadow-glass);
   animation: panel-in var(--dur-slow) var(--ease-out) both;
-  animation-delay: calc(var(--i, 0) * 60ms);
+  animation-delay: calc(var(--i, 0) * var(--stagger));
+}
+/* Specular glint: a soft highlight top-left and along the top edge. */
+.panel::before,
+.ups-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  background:
+    radial-gradient(120% 70% at 12% -10%, var(--glass-glint), transparent 55%),
+    linear-gradient(180deg, var(--glass-glint) 0, transparent 22%);
 }
 .panel[data-tone="warn"] {
-  border-color: var(--warn);
-  box-shadow:
-    var(--shadow-card),
-    0 0 0 3px color-mix(in oklab, var(--warn) 18%, transparent);
+  box-shadow: var(--shadow-glass), var(--shadow-tone-warn);
 }
 .panel[data-tone="fail"] {
-  border-color: var(--fail);
-  box-shadow:
-    var(--shadow-card),
-    0 0 0 3px color-mix(in oklab, var(--fail) 18%, transparent);
+  box-shadow: var(--shadow-glass), var(--shadow-tone-fail);
 }
 .panel-header {
   display: flex;
@@ -411,7 +514,7 @@
   height: 100%;
   color: inherit;
   text-decoration: none;
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-glass);
 }
 .panel-link:hover {
   text-decoration: none;
@@ -423,7 +526,7 @@
     box-shadow var(--dur) var(--ease-out);
 }
 .panel-link:hover > .panel {
-  border-color: var(--border-strong);
+  border-color: var(--accent-text);
   transform: translateY(-1px);
 }
 /* Fleet node tile that opens a device page. */
@@ -462,7 +565,7 @@
 .tile {
   min-width: 0;
   padding: 14px;
-  background: color-mix(in oklab, var(--muted) 55%, var(--card));
+  background: color-mix(in srgb, var(--foreground) 3%, transparent);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
 }
@@ -497,19 +600,19 @@
   line-height: 1.4;
 }
 .stat-value {
-  font-weight: 650;
+  font-family: var(--font-mono);
+  font-weight: 600;
   letter-spacing: -0.02em;
-  line-height: 1.15;
+  line-height: 1.05;
   margin-top: 2px;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
 .stat[data-size="lg"] .stat-value {
-  font-size: 32px;
-  letter-spacing: -0.03em;
+  font-size: 30px;
 }
 .stat[data-size="md"] .stat-value {
-  font-size: 22px;
+  font-size: 20px;
 }
 .stat[data-size="sm"] .stat-value {
   font-size: 15px;
@@ -540,9 +643,9 @@
   align-items: center;
   gap: 6px;
   padding: 2px 9px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   font-size: 12px;
-  font-weight: 550;
+  font-weight: 600;
   line-height: 18px;
   white-space: nowrap;
   color: var(--chip);
@@ -555,11 +658,20 @@
 .chip[data-tone="warn"] {
   --chip: var(--warn);
 }
+/* Fail is always solid and always carries an icon (StatusChip adds it); the brand never fills. */
 .chip[data-tone="fail"] {
   --chip: var(--fail);
+  background: var(--fail);
+  color: var(--on-status);
+  border-color: transparent;
 }
 .chip[data-tone="accent"] {
   --chip: var(--accent-text);
+}
+.chip > svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
 }
 .chip-dot {
   position: relative;
@@ -567,6 +679,7 @@
   height: 7px;
   border-radius: 50%;
   background: currentColor;
+  box-shadow: 0 0 8px currentColor;
 }
 .chip-dot-pulse::after {
   content: "";
@@ -575,7 +688,23 @@
   border-radius: 50%;
   border: 1.5px solid currentColor;
   opacity: 0;
-  animation: ping 1.8s var(--ease-out) infinite;
+  animation: ping var(--dur-ping) var(--ease-out) infinite;
+}
+/* Event pulse: pulse() in lib/motion.ts appends the ripple to the Live chip and flashes
+   every .fk-hero value once per data refresh. */
+.live-indicator {
+  position: relative;
+}
+.fk-ripple {
+  position: absolute;
+  inset: -6px;
+  border-radius: var(--radius-pill);
+  border: 2px solid var(--accent-text);
+  pointer-events: none;
+  animation: ripple var(--dur-event) var(--ease-out) forwards;
+}
+.fk-flash {
+  animation: flash var(--dur-event) var(--ease-out);
 }
 
 /* ---- Meter --------------------------------------------------------------- */
@@ -583,8 +712,8 @@
   --meter: var(--accent-text);
   position: relative;
   height: 7px;
-  border-radius: 999px;
-  background: var(--muted);
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--foreground) 9%, transparent);
   overflow: visible;
 }
 .meter[data-tone="ok"] {
@@ -615,21 +744,22 @@
   inset: 0 auto 0 0;
   width: var(--fill, 0%);
   border-radius: inherit;
-  background: linear-gradient(
-    90deg,
-    color-mix(in oklab, var(--meter) 70%, transparent),
-    var(--meter)
-  );
+  background: var(--meter);
   transition: width var(--dur-slow) var(--ease-out);
 }
+:root[data-theme="dark"] .meter-fill {
+  box-shadow: 0 0 10px -1px var(--meter);
+}
+/* Thresholds are reference lines, not status: foreground with a ground-coloured outline. */
 .meter-marker {
   position: absolute;
   top: -3px;
   bottom: -3px;
   width: 2px;
-  background: var(--warn);
+  background: var(--foreground);
   border-radius: 1px;
   transform: translateX(-50%);
+  box-shadow: 0 0 0 1px var(--background);
 }
 
 /* ---- Key / value --------------------------------------------------------- */
@@ -652,16 +782,17 @@
 
 /* ---- Range toggle / shadcn overrides ----------------------------------- */
 [data-slot="toggle-group"] {
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-control);
   padding: 2px;
   gap: 2px;
-  background: var(--muted);
+  background: color-mix(in srgb, var(--foreground) 5%, transparent);
   border-radius: 9px;
 }
 [data-slot="toggle-group-item"] {
   font-size: 12px;
   min-width: 38px;
   height: 26px;
+  border: 1px solid transparent;
   border-radius: 7px !important;
   color: var(--muted-foreground);
   transition:
@@ -671,21 +802,23 @@
 [data-slot="toggle-group-item"]:hover {
   color: var(--foreground);
 }
+/* The pressed segment is outlined in the control border so the state reads at 3:1. */
 [data-slot="toggle-group-item"][data-pressed] {
   background: var(--card);
   color: var(--foreground);
+  border-color: var(--border-control);
   box-shadow: 0 1px 2px rgb(0 0 0 / 12%);
 }
 [data-slot="card"] {
   height: 100%;
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-card);
+  border: 1px solid var(--glass-edge);
+  box-shadow: var(--shadow-glass);
   --card-spacing: 18px;
   --tw-ring-shadow: 0 0 #0000;
 }
 [data-slot="alert"] {
   border-color: var(--border);
-  background: color-mix(in oklab, var(--muted) 55%, var(--card));
+  background: color-mix(in srgb, var(--foreground) 3%, transparent);
 }
 [data-slot="alert"][data-variant="destructive"],
 [data-slot="alert"].destructive {
@@ -736,6 +869,40 @@
 .chart-caption {
   font-size: 10px;
   margin-top: 2px;
+}
+/* Comet trail: the stroke fades in from the left and ends in a lit "now" head with a halo.
+   The gradient stops are defined by TrendChart; the head is a ReferenceDot at the last sample. */
+.chart-wrap {
+  position: relative;
+  min-width: 0;
+}
+.trend-chart .comet {
+  fill: none;
+  stroke-width: 2.5px;
+}
+.trend-chart .stop-c0 {
+  stop-color: var(--accent-text);
+  stop-opacity: 0;
+}
+.trend-chart .stop-c1 {
+  stop-color: var(--accent-text);
+  stop-opacity: 0.35;
+}
+.trend-chart .stop-c2 {
+  stop-color: var(--accent-text);
+  stop-opacity: 1;
+}
+.comet-head {
+  fill: var(--accent-text);
+  filter: drop-shadow(0 0 6px var(--accent-text));
+}
+.comet-ring {
+  fill: none;
+  stroke: var(--accent-text);
+  stroke-width: 2px;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: ping var(--dur-ping) var(--ease-out) infinite;
 }
 [data-slot="chart"] .recharts-cartesian-grid line {
   stroke: var(--border);
@@ -919,7 +1086,8 @@
 .agent-balances {
   overflow-wrap: anywhere;
 }
-.ticker li {
+/* Only rows that arrived after mount slide in, so a reconnect never replays the list. */
+.ticker li.fk-new {
   animation: row-in var(--dur) var(--ease-out) both;
 }
 .ticker p {
@@ -1028,7 +1196,7 @@
   padding: 9px 10px;
   color: var(--foreground);
   background: var(--background);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border-control);
   border-radius: 8px;
 }
 .ups-trend {
@@ -1186,10 +1354,10 @@
   gap: 6px;
   font-size: 13px;
 }
+/* A grid, not flex: the filesystem MeterBar below the row needs the full width. */
 .device-list li {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
+  display: grid;
+  gap: 6px 12px;
   padding: 8px 0;
   border-bottom: 1px solid var(--border);
 }
@@ -1213,10 +1381,10 @@
   flex-wrap: wrap;
   gap: 4px 16px;
   min-height: 40px;
-  padding: 8px 32px;
-  background: color-mix(in oklab, var(--background) 86%, transparent);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  padding: 8px 28px;
+  background: color-mix(in srgb, var(--background) var(--glass-alpha), transparent);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   border-top: 1px solid var(--border);
   font-size: 11px;
 }
@@ -1272,6 +1440,193 @@
     opacity: 0;
     transform: translate(-50%, -48%) scale(0.98);
   }
+}
+@keyframes ripple {
+  from {
+    opacity: 0.9;
+    transform: scale(0.9);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.6);
+  }
+}
+@keyframes flash {
+  0% {
+    color: var(--accent-text);
+  }
+  30% {
+    text-shadow: 0 0 18px var(--accent-text);
+  }
+  100% {
+    text-shadow: 0 0 0 transparent;
+  }
+}
+@keyframes sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100vw);
+  }
+}
+@keyframes aurora {
+  from {
+    transform: translateX(-6%) scaleY(1);
+  }
+  to {
+    transform: translateX(8%) scaleY(1.2);
+  }
+}
+@keyframes twinkle {
+  0%,
+  100% {
+    opacity: 0.2;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+/* ---- Scene: sky, night layer, Teton ridgeline band (AmbientScene) ------- */
+/* The backdrop is fixed behind #root's own stacking context, so the glass panels blur it. */
+#root {
+  isolation: isolate;
+}
+.fk-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    var(--sky-0) 0%,
+    var(--sky-1) 40%,
+    var(--sky-2) 66%,
+    var(--sky-3) 84%,
+    var(--sky-4) 100%
+  );
+}
+.fk-night {
+  position: absolute;
+  inset: 0;
+}
+/* Stars and the aurora only come out at night (dark theme). */
+:root:not([data-theme="dark"]) .fk-night {
+  display: none;
+}
+.fk-aurora {
+  position: absolute;
+  left: 6%;
+  top: 30%;
+  width: 58%;
+  height: 34%;
+  border-radius: 50%;
+  background: radial-gradient(
+    closest-side,
+    color-mix(in srgb, var(--ok) 32%, transparent),
+    transparent
+  );
+  animation: aurora var(--dur-aurora) var(--ease-out) infinite alternate;
+  will-change: transform;
+}
+.fk-aurora-b {
+  left: 38%;
+  top: 20%;
+  width: 52%;
+  height: 28%;
+  animation-delay: -24s;
+}
+.fk-star {
+  position: absolute;
+  border-radius: 50%;
+  background: var(--foreground);
+  opacity: 0.2;
+  animation: twinkle var(--dur-twinkle) ease-in-out infinite;
+}
+.fk-band {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 360px;
+}
+.fk-band svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.fk-ridge-far {
+  fill: var(--ridge-far);
+  opacity: 0.75;
+}
+.fk-near-0 {
+  stop-color: var(--ridge-mid);
+}
+.fk-near-1 {
+  stop-color: var(--ridge-near);
+}
+.fk-snow-0 {
+  stop-color: var(--snow);
+  stop-opacity: var(--snow-opacity);
+}
+.fk-snow-1 {
+  stop-color: var(--snow);
+  stop-opacity: 0;
+}
+.fk-rim {
+  fill: none;
+  stroke: var(--accent-text);
+  stroke-opacity: 0.55;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+/* The alpenglow sweep is an HTML layer masked to the near range, so its transform animates
+   on the compositor instead of repainting the SVG every frame. */
+.fk-sweep-clip {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  mask-size: 100% 100%;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: 100% 100%;
+  -webkit-mask-repeat: no-repeat;
+}
+.fk-sweep {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 760px;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--glow) 0%, transparent),
+    color-mix(in srgb, var(--accent-text) calc(var(--sweep-opacity) * 100%), transparent),
+    color-mix(in srgb, var(--glow) 0%, transparent)
+  );
+  transform: translateX(-100%);
+  animation: sweep var(--dur-sweep) linear infinite;
+  will-change: transform;
+}
+.fk-still,
+.fk-still * {
+  animation: none !important;
+}
+/* ?ambient=static (diagnostic): no live blur anywhere. Panels show the pre-blurred sky image
+   (--fk-static-sky, viewport-sized) as a fixed background under the same glass tint. */
+:root[data-ambient="static"] :where(.panel, .ups-panel, .topbar, .version-footer) {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+:root[data-ambient="static"] :where(.panel, .ups-panel) {
+  background:
+    linear-gradient(
+      color-mix(in srgb, var(--card) var(--glass-alpha), transparent),
+      color-mix(in srgb, var(--card) var(--glass-alpha), transparent)
+    ),
+    var(--fk-static-sky) fixed 0 0 no-repeat;
 }
 
 /* ---- Breakpoints --------------------------------------------------------- */
@@ -1345,6 +1700,9 @@
   .page-title {
     font-size: 22px;
   }
+  .verdict {
+    margin-bottom: 10px;
+  }
   .panel,
   .ups-panel {
     --panel-pad: 14px;
@@ -1353,27 +1711,76 @@
   .panel-body {
     gap: 8px;
   }
+  /* Rows hug their content; the spare height falls to the last row, so the ridgeline stays
+     open below the panels (docs/design/kiosk-v2/1-patterns.md). The spec's two-column
+     rows 3 become three (UPS, Local LLM, Network) so the Network panel does not add a row;
+     the sidebar keeps the spec's 0.92 / 2.92 share of the width. */
   .dashboard-grid {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(300px, 0.8fr);
+    grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(0, 1.38fr);
+    grid-template-rows: auto auto auto 1fr;
     gap: 12px;
   }
   .sidebar {
-    grid-column: 3;
-    grid-row: 2 / 5;
+    grid-column: 4;
+    grid-row: 1 / -1;
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto 1fr;
+    align-content: start;
     gap: 12px;
   }
   .fleet {
-    grid-column: 1 / 3;
+    grid-column: 1 / 4;
+    grid-row: 1;
   }
   .gpu {
-    grid-column: 3;
+    grid-column: 1 / 4;
+    grid-row: 2;
   }
-  .ups,
-  .network,
+  .gpu .panel-body {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+    gap: 4px 20px;
+    align-items: end;
+  }
+  .gpu .panel-body > .stat-grid {
+    grid-column: 1;
+    grid-row: 1 / 3;
+    align-self: center;
+  }
+  .gpu .panel-body > .chart-wrap,
+  .gpu .panel-body > .caption {
+    grid-column: 2;
+  }
+  .gpu .panel-body > .loaded-models,
+  .gpu .panel-body > .loading,
+  .gpu .panel-body > [role="alert"] {
+    grid-column: 1 / -1;
+  }
+  .ups {
+    grid-column: 1;
+    grid-row: 3;
+  }
   .usage {
-    grid-column: 1 / 3;
+    grid-column: 2;
+    grid-row: 3;
+  }
+  .network {
+    grid-column: 3;
+    grid-row: 3;
+  }
+  .network .network-readings {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .network .trend-chart {
+    height: 44px;
+  }
+  /* Sparkline captions sit under a 170px column; the reading label already names the series. */
+  .network .chart-caption {
+    flex-wrap: nowrap;
+    white-space: nowrap;
+  }
+  .network .chart-caption > span:nth-child(2) {
+    display: none;
   }
   .node-grid {
     grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
@@ -1394,14 +1801,18 @@
     gap: 8px 12px;
   }
   .gpu .stat-grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .trend-chart {
-    height: 44px;
+    height: 92px;
   }
   .ups .ups-readings {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, auto));
+    justify-content: space-between;
     gap: 8px 16px;
+  }
+  .ups .ups-readings > :first-child {
+    grid-column: 1 / -1;
   }
   .ups .panel-body {
     gap: 4px;

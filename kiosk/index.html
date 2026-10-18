@@ -17,11 +17,39 @@
         (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
       root.classList.toggle("dark", root.dataset.theme === "dark");
     </script>
+    <link
+      rel="preload"
+      as="font"
+      type="font/woff2"
+      crossorigin
+      href="/node_modules/@fontsource/geist/files/geist-latin-400-normal.woff2"
+    />
+    <link
+      rel="preload"
+      as="font"
+      type="font/woff2"
+      crossorigin
+      href="/node_modules/@fontsource/geist/files/geist-latin-600-normal.woff2"
+    />
+    <link
+      rel="preload"
+      as="font"
+      type="font/woff2"
+      crossorigin
+      href="/node_modules/@fontsource/geist-mono/files/geist-mono-latin-400-normal.woff2"
+    />
+    <link
+      rel="preload"
+      as="font"
+      type="font/woff2"
+      crossorigin
+      href="/node_modules/@fontsource/geist-mono/files/geist-mono-latin-600-normal.woff2"
+    />
     <style>
       :root {
         color-scheme: light dark;
-        --background: light-dark(#f3f4f8, #0d0f14);
-        --foreground: light-dark(#171923, #eef0f5);
+        --background: light-dark(#f2f6f7, #0d1218);
+        --foreground: light-dark(#102026, #eef4f6);
       }
       :root[data-theme="light"] {
         color-scheme: light;
