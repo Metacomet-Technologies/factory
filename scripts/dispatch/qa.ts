@@ -86,7 +86,8 @@ function command(program: string, args: string[]) {
   const result = spawnSync(program, args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 8_000_000 });
   if (result.status !== 0) {
     const reason = result.error?.message ?? `exit ${result.status}`;
-    const stderrLine = result.stderr.trim().split('\n')[0] ?? '';
+    // A failed spawn (ENOENT, timeout) can leave stderr null; treat it as empty.
+    const stderrLine = (result.stderr ?? '').trim().split('\n')[0] ?? '';
     throw new Error(`${[program, ...args].join(' ')} failed (${reason})${stderrLine ? `: ${stderrLine}` : ''}`);
   }
   return result.stdout.trim();

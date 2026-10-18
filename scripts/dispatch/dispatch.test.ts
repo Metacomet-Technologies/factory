@@ -1647,6 +1647,11 @@ test('QA merge gate names its cause: old gh and failing queries', { timeout: 10_
   assert.equal(result.code, 1);
   assert.match(result.stderr, /gh pr checks 90 --json name,bucket --repo Metacomet-Technologies\/factory failed \(exit 8\): .*checks read failed/);
 
+  const missing = await fixture(t, [reviewed()], { github: { 90: githubPR() } });
+  const absent = await missing.check('90', sha, { PATH: '/nonexistent' });
+  assert.equal(absent.code, 1);
+  assert.match(absent.stderr, /gh --version failed \(.*ENOENT\)/);
+
   const good = await fixture(t, [reviewed()], { github: { 90: githubPR() } });
   const passing = await good.check();
   assert.equal(passing.code, 0);
