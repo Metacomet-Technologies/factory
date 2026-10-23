@@ -80,9 +80,16 @@ export function reviewerEngine(issue: Issue) {
   return engine?.name.replace(/^engine\//, '') === 'claude' ? 'amp' : 'claude';
 }
 
+// The command argv carries only flags, repo slugs and PR numbers; gh auth comes
+// from agent's own login, never argv, so the argv is safe to publish in a refusal.
 function command(program: string, args: string[]) {
   const result = spawnSync(program, args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 8_000_000 });
-  if (result.status !== 0) throw new Error(`${program} QA read failed`);
+  if (result.status !== 0) {
+    const reason = result.error?.message ?? `exit ${result.status}`;
+    // A failed spawn (ENOENT, timeout) can leave stderr null; treat it as empty.
+    const stderrLine = (result.stderr ?? '').trim().split('\n')[0] ?? '';
+    throw new Error(`${[program, ...args].join(' ')} failed (${reason})${stderrLine ? `: ${stderrLine}` : ''}`);
+  }
   return result.stdout.trim();
 }
 function gh(args: string[]) { return command('gh', [...args, '--repo', config.repository]); }
@@ -157,6 +164,19 @@ export async function mergeCheck(pr: string, sha: string, restRead = false) {
     || after.headRefOid !== sha || head(pr) !== sha) throw new Error('QA head changed during checks');
 }
 
+// gh api --slurp and gh pr checks --json need gh 2.48.0; older versions (Ubuntu ESM
+// 2.46.0) hid PR 55's refusal cause. Fail closed with the version in the message.
+const MIN_GH = '2.48.0';
+function ghPreflight() {
+  const found = command('gh', ['--version']).match(/^gh version (\d+)\.(\d+)\.(\d+)\b/m)?.slice(1).map(Number);
+  if (!found) throw new Error('gh --version output unreadable');
+  const [requiredMajor, requiredMinor, requiredPatch] = MIN_GH.split('.').map(Number);
+  const [major, minor, patch] = found;
+  if (major < requiredMajor || (major === requiredMajor
+    && (minor < requiredMinor || (minor === requiredMinor && patch < requiredPatch))))
+    throw new Error(`gh ${found.join('.')} is older than ${MIN_GH}; upgrade from cli.github.com/packages`);
+}
+
 type Context = {
   issues: Issue[]; dryRun: boolean; runners: Record<string, string>;
   runnerAvailable: (runner: string) => boolean;
@@ -227,7 +247,17 @@ export async function reviewPRs(ctx: Context) {
       && (!original || a.url.match(/\/pull\/(\d+)/)![1] === original));
     for (const attachment of attachments) {
       const pr = attachment.url.match(/\/pull\/(\d+)/)![1];
-      if (attachment.metadata.status !== 'open') continue;
+      if (attachment.metadata.status !== 'open') {
+        // MET-177: a merge or close that QA did not submit supersedes its open claims, which
+        // then archive and clean up like any finished round.
+        if (['merged', 'closed'].includes(attachment.metadata.status as string)) for (const start of starts(issue).filter(start => start.pr === pr)) {
+          if (has(issue, `retired ${start.key}`) || has(issue, `human ${start.key}`) || has(issue, `merge-claim ${start.key}`)
+            || (verdict(issue, start.key)?.value === 'changes' && has(issue, `round ${start.key}`))) continue;
+          await comment(issue, `QA claim superseded: PR ${pr} was ${attachment.metadata.status}; no merge was submitted.\n\n${qa(`retired ${start.key}`)}`);
+          log('qa-superseded', { issue: issue.identifier, pr, sha: start.sha, reason: attachment.metadata.status });
+        }
+        continue;
+      }
       let sha: string;
       try {
         sha = head(pr);
@@ -236,9 +266,12 @@ export async function reviewPRs(ctx: Context) {
       if (has(issue, `stopped pr:${pr}`) || has(issue, `human ${key}`)) continue;
       for (const start of starts(issue).filter(start => start.pr === pr)) {
         const result = verdict(issue, start.key);
-        if (start.sha !== sha && result?.value === 'ready' && !has(issue, `merge-claim ${start.key}`)
+        // MET-177: a new head supersedes a ready verdict or a review still without one. A
+        // changes verdict stays: its findings are still delivered against the current head.
+        if (start.sha !== sha && (result === undefined || result.value === 'ready') && !has(issue, `merge-claim ${start.key}`)
           && !has(issue, `human ${start.key}`) && !has(issue, `retired ${start.key}`)) {
-          await comment(issue, `Ready verdict superseded by a new head; no merge was submitted.\n\n${qa(`retired ${start.key}`)}`);
+          await comment(issue, `${result ? 'Ready verdict' : 'QA claim'} superseded by a new head; no merge was submitted.\n\n${qa(`retired ${start.key}`)}`);
+          log('qa-superseded', { issue: issue.identifier, pr, sha: start.sha, reason: 'new head' });
           active[start.runner]--;
         }
         if (result?.value !== 'changes' || has(issue, `round ${start.key}`)) continue;
@@ -258,7 +291,7 @@ export async function reviewPRs(ctx: Context) {
         }
         await comment(issue, `QA follow-up claimed; inspect interrupted delivery before recovery.\n\n${qa(`followup-claim ${start.key}`)}`);
         // Cursor builders receive the findings as a follow-up run on their agent; Cursor updates the PR.
-        const text = `Dispatcher QA findings for PR ${pr} at ${start.sha}. Check these findings against your current head, fix what remains, verify, ${cloud ? 'and push your branch. Cursor updates the PR; the dispatcher posts the Linear evidence comment. Do not open a PR' : 'push, and post the updated Linear diff comment'}. Never deploy or merge.\n\n${followup}`;
+        const text = `Dispatcher QA findings for PR ${pr} at ${start.sha}. Check these findings against your current head, fix what remains, verify, ${cloud ? 'and push your branch. Cursor updates the existing PR; the dispatcher posts the Linear evidence comment' : 'push, and post the updated Linear diff comment'}. Never deploy or merge.\n\n${followup}`;
         if (cloud) {
           if (dryRun) ctx.showCursor(issue, 'POST', `/v1/agents/${builder}/runs`);
           else if (await ctx.cursorRun(builder, text) === 'busy') {
@@ -285,7 +318,14 @@ export async function reviewPRs(ctx: Context) {
       }
       if (has(issue, `human ${key}`) || has(issue, `retired ${key}`)) continue;
       const result = verdict(issue, key);
-      if (result?.value === 'changes') continue;
+      if (result?.value === 'changes') {
+        // MET-233: a second moot verdict on the same head would wait forever; hand it to Devon once.
+        if (key.endsWith(' round:2') && moot(issue, key)) {
+          await comment(issue, `${devonMention}: the second QA review of PR ${pr} at ${sha} again asked only for evidence that already exists. The dispatcher starts no third review; inspect, then merge or restart QA by hand.\n\n${qa(`human ${key}`)}`);
+          log('qa-moot-escalated', { issue: issue.identifier, pr, sha });
+        }
+        continue;
+      }
       if (result?.value === 'ready') {
         if (has(issue, `merge-claim ${key}`)) continue;
         let deploys: boolean;
@@ -294,7 +334,13 @@ export async function reviewPRs(ctx: Context) {
           if (data.state !== 'OPEN' || data.isDraft !== false || data.baseRefName !== 'main' || data.headRefOid !== sha) continue;
           deploys = selfDeploying(await files(pr, true));
           if (!deploys) await mergeCheck(pr, sha, true);
-        } catch { log('qa-pending', { issue: issue.identifier, pr, reason: 'Merge gate not green' }); continue; }
+        } catch (error) {
+          // MET-143: name the refusal in the log and, once per review, on the issue.
+          const cause = (error as Error).message.slice(0, 200);
+          log('qa-pending', { issue: issue.identifier, pr, reason: 'Merge gate not green', cause });
+          if (!has(issue, `merge-refused ${key}`)) await comment(issue, `QA merge gate refused PR ${pr} at ${sha}: ${cause}. No merge was submitted; the dispatcher rechecks each poll.\n\n${qa(`merge-refused ${key}`)}`);
+          continue;
+        }
         if (deploys) {
           await comment(issue, `${devonMention} ready; merging deploys it. PR ${pr}, head ${sha}. Merge and deploy remain your gates.\n\n${qa(`human ${key}`)}`);
           continue;
@@ -487,7 +533,12 @@ export async function syncPlaybook(ctx: Context) {
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
     if (process.argv.length !== 5 || process.argv[2] !== 'check') throw new Error('Usage: qa.ts check PR SHA');
+    ghPreflight();
     await mergeCheck(process.argv[3], process.argv[4]);
     console.log('QA merge gate passed; use --match-head-commit for the merge.');
-  } catch { console.error('QA merge gate refused; inspect current head, CI and self-deploying paths.'); process.exitCode = 1; }
+  } catch (error) {
+    // Fail closed, but name the cause; the generic refusal hid gh 2.46.0's missing --slurp.
+    console.error(`QA merge gate refused: ${(error as Error).message}`);
+    process.exitCode = 1;
+  }
 }

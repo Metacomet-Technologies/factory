@@ -325,7 +325,7 @@ Install Vite+ in user space with `curl -fsSL https://vite.plus | bash`, then loa
 `/home/agent/.config/vite-plus/env` in this runner's shell. From `kiosk/`:
 
 ```sh
-vp env install       # Node 24.22.0, pinned in package.json devEngines.runtime
+vp env install       # Node 24.22.1, pinned in package.json devEngines.runtime
 vp install --frozen-lockfile  # Bun 1.4.2 (devEngines.packageManager), downloaded on demand
 vp run mock-dev     # Native Node TypeScript mock :4179 + vp dev :4181
 ```

@@ -116,7 +116,12 @@ export default defineConfig({
           this.emitFile({
             type: "asset",
             fileName: "version.json",
-            source: JSON.stringify({ build }),
+            // Installers compare git_sha with the checkout and refuse dirty builds.
+            source: JSON.stringify({
+              build,
+              git_sha: identity.git_sha,
+              git_dirty: identity.git_dirty,
+            }),
           });
         },
       },

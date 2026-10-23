@@ -14,7 +14,7 @@ estimates). Meter contains no pricing logic; factory-api is not built yet.
 `scripts/dispatch/dispatch.ts` turns Linear's `dispatch` label into a private
 Amp runner thread, with task validation, blocker checks, per-runner caps and
 crash-safe claims. After a linked PR merges, it submits the playbook wrap-up once;
-Devon still owns merge and deploy. Node 24.21.0, no npm dependencies. Start with
+Devon still owns merge and deploy. Node 24.22.1, no npm dependencies. Start with
 `node scripts/dispatch/dispatch.ts issue MET-123 --dry-run`. Installation is an
 administrator action, not part of development; see the
 [dispatcher README](scripts/dispatch/README.md) for verification gaps, key setup,
@@ -25,7 +25,7 @@ timer installation, recovery and rollback.
 `scripts/usage/collect.ts` reads Amp usage, Claude's zero-inference `/usage`, and
 ChatGPT/Codex account quota on factory-gpu every 15 minutes. It atomically writes
 a sanitized snapshot for `/v1/agents`; source failures remain independent and
-last-good readings age stale after 45 minutes. Node 24.21.0, no npm dependencies.
+last-good readings age stale after 45 minutes. Node 24.22.1, no npm dependencies.
 Use `node scripts/usage/collect.ts --dry-run` for a read-only preview. See the
 [collector README](scripts/usage/README.md) for balance units, strict parser
 limits, privacy, fixtures and ordered Mac deployment/rollback commands.

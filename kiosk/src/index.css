@@ -75,7 +75,7 @@
   --glass-sheen: light-dark(#fffffff2, #ffffff38);
   --glass-glint: light-dark(#ffffff8c, #ffffff12);
   --glass-drop: light-dark(#5a3c1e38, #000000a6);
-  --glass-alpha: 86%;
+  --glass-alpha: 84%;
   --glass-blur: 18px;
   --glass-saturate: 170%;
   --snow-opacity: 0.95;
@@ -107,7 +107,7 @@
   --panel-pad: 18px;
 }
 :root[data-theme="dark"] {
-  /* tokens.json says 68%; 78% keeps status text at 4.5:1 on a tile over the lit snow peaks. */
+  /* 78% keeps status text at 4.5:1 on a tile over the lit snow peaks. */
   --glass-alpha: 78%;
   --snow-opacity: 0.75;
   --sweep-opacity: 0.42;
