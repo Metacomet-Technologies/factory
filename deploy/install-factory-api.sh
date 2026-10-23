@@ -24,6 +24,21 @@ rollback_hint() {
     fi
 }
 fail() { printf 'ERROR: %s\n' "$*" >&2; rollback_hint; exit 1; }
+# MET-239: refuse an artifact not built from this clean checkout. No override;
+# a mismatch means rebuild. Runs before the root check and any change.
+verify_artifact() {
+    local name=$1 info=$2 checkout=$3 sha dirty head status
+    sha=$(python3 -c 'import json, sys; v = json.loads(sys.argv[1]).get("git_sha"); print(v if isinstance(v, str) else "")' "$info" 2>/dev/null) \
+        || fail "Artifact $name build info is not a JSON object; rebuild from $checkout."
+    dirty=$(python3 -c 'import json, sys; print(json.dumps(json.loads(sys.argv[1]).get("git_dirty")))' "$info")
+    head=$(sudo -u agent git -C "$checkout" rev-parse --short=7 HEAD) || fail "Cannot read the checkout commit: $checkout"
+    status=$(sudo -u agent git -C "$checkout" status --porcelain) || fail "Cannot read the checkout status: $checkout"
+    [[ -n $sha && $sha != unknown ]] || fail "Artifact $name has no build SHA (missing or unknown); rebuild from $checkout."
+    [[ $dirty == false ]] || fail "Artifact $name was built from a dirty tree (git_dirty: $dirty); rebuild from a clean checkout."
+    [[ -z $status ]] || fail "Checkout $checkout is dirty; commit or discard changes, then rebuild."
+    [[ $sha == "$head" ]] || fail "Artifact $name built at $sha but checkout $checkout is at $head; rebuild at $head."
+    printf 'Artifact %s built at %s matches checkout\n' "$name" "$sha"
+}
 wait_ready() {
     local url=$1 deadline=$((SECONDS + 45)) remaining
     while (( SECONDS < deadline )); do
@@ -34,15 +49,17 @@ wait_ready() {
     done
     sudo -u factory-api curl -fsS --max-time 2 "$url" | jq -e '.status == "ok"' >/dev/null || fail "Service health is not OK: $url"
 }
-[[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-factory-api.sh <prebuilt-binary>.'
 [[ $# -eq 1 || ( $# -eq 2 && ( $2 == --prepare-only || $2 == --check-only ) ) ]] || fail 'Supply a prebuilt binary path and optional --prepare-only or --check-only.'
+[[ -f "$binary" && -x "$binary" ]] || fail "Prebuilt binary missing or not executable: $binary"
+info=$(sudo -u agent "$binary" --build-info) || fail "factory-api --build-info failed; rebuild from $root."
+verify_artifact factory-api "$info" "$root"
+[[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-factory-api.sh <prebuilt-binary>.'
 trap 'printf "ERROR: factory-api install failed at line %s.\n" "$LINENO" >&2; rollback_hint' ERR
 
 # Complete preflight before creating the account or changing deployment files.
 for command in systemctl curl sudo tailscale useradd getent id install cp touch date mktemp realpath ss sqlite3 mv jq flock stat df awk sha256sum cmp find rm rmdir; do
     command -v "$command" >/dev/null || fail "Required command missing: $command"
 done
-[[ -f "$binary" && -x "$binary" ]] || fail "Prebuilt binary missing or not executable: $binary"
 [[ -f "$unit" && -r "$unit" ]] || fail "Unit template missing or unreadable: $unit"
 binary=$(realpath "$binary")
 [[ "$binary" != "$destination" ]] || fail 'Use a separate prebuilt binary, not the installed destination.'

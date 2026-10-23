@@ -24,9 +24,11 @@ const proxy = proxyTarget
     )
   : {};
 
+const identity = buildInfo();
+
 // https://vite.dev/config/
 export default defineConfig({
-  define: { __BUILD_INFO__: JSON.stringify(buildInfo()) },
+  define: { __BUILD_INFO__: JSON.stringify(identity) },
   test: {
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
@@ -108,7 +110,12 @@ export default defineConfig({
           this.emitFile({
             type: "asset",
             fileName: "version.json",
-            source: JSON.stringify({ build }),
+            // Installers compare git_sha with the checkout and refuse dirty builds.
+            source: JSON.stringify({
+              build,
+              git_sha: identity.git_sha,
+              git_dirty: identity.git_dirty,
+            }),
           });
         },
       },
