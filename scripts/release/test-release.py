@@ -188,6 +188,13 @@ class Releases(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
 
+    def test_checked_in_inventory_classifies_tracked_units(self):
+        r.inventory_check(INVENTORY)
+        tracked = subprocess.check_output(["git", "-C", str(ROOT), "ls-files", "deploy", "scripts"], text=True).splitlines()
+        units = {Path(p).name for p in tracked if p.startswith("deploy/") and p.endswith((".service", ".timer", ".path", ".service.in"))}
+        self.assertLessEqual(units, {s for c in INVENTORY["components"] for s in c["services"]})
+        self.assertLessEqual(set(INVENTORY["required_files"]), set(tracked))
+
     def test_allocation_and_intent(self):
         tags = ["v0.2.9", "v0.2.11", "other"]
         self.assertEqual(r.allocate(tags, "0.2.0", "patch"), "v0.2.12")
