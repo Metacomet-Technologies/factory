@@ -434,7 +434,7 @@ mod api {
         ("after_id" = Option<i64>, Query, description = "Nonnegative cursor: return id > after_id in ascending order. Omit for legacy newest-first behavior.")
     ), responses((status = 200, body = [RequestRecord], headers(
         ("next_after_id" = i64, description = "Present only with after_id: last returned ID, or the supplied cursor for an empty page."),
-        ("oldest_retained_id" = i64, description = "Present only with after_id on a nonempty page: the lowest request ID meter still stores, read in the same snapshot. Lower IDs were removed by 365-day retention.")
+        ("oldest_retained_id" = i64, description = "Present only with after_id on a nonempty page: the lowest request ID meter still stores, read in the same snapshot. Lower IDs were removed by 365-day retention, which never removes a higher ID.")
     )), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
     async fn requests_doc(
         state: &AppState,

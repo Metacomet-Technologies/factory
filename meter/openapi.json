@@ -425,7 +425,7 @@
         "type": "object"
       },
       "Retention": {
-        "description": "Raw request retention (MET-206): rows older than 365 days, only inside\nthe verified request rollup. Runs after each rollup run.",
+        "description": "Raw request retention (MET-206): the lowest-ID run of rows older than\n365 days, only inside the verified request rollup. Runs after each rollup run.",
         "properties": {
           "checked_at_ms": {
             "format": "int64",
@@ -450,7 +450,7 @@
             ]
           },
           "oldest_retained_id": {
-            "description": "Lowest request ID still stored after the last run; null when empty.\nIDs below it were removed by retention.",
+            "description": "Lowest request ID still stored after the last run; null when empty.\nIDs below it were removed by retention; IDs above it never are.",
             "format": "int64",
             "type": [
               "integer",
@@ -674,7 +674,7 @@
                 }
               },
               "oldest_retained_id": {
-                "description": "Present only with after_id on a nonempty page: the lowest request ID meter still stores, read in the same snapshot. Lower IDs were removed by 365-day retention.",
+                "description": "Present only with after_id on a nonempty page: the lowest request ID meter still stores, read in the same snapshot. Lower IDs were removed by 365-day retention, which never removes a higher ID.",
                 "schema": {
                   "format": "int64",
                   "type": "integer"

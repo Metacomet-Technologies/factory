@@ -371,37 +371,40 @@ pub enum Prune {
     Deleted(usize),
 }
 
-/// One bounded retention batch. Deletes requests with `ts_ms < cutoff_ms`
-/// only when every such row is inside the verified request rollup, so stats
-/// for every range stay identical. Late rows above the checkpoint wait.
+/// One bounded retention batch over the lowest IDs. Deletes the contiguous
+/// run of rows, starting at the lowest stored ID, whose `ts_ms < cutoff_ms`
+/// and which the verified request rollup includes. The first row that is
+/// newer, or above the checkpoint, ends the run, so every ID below the oldest
+/// stored ID was removed by retention and every ID above it is intact. An
+/// expired row above a newer one waits until the run reaches it.
 pub fn prune_requests(db: &mut Connection, cutoff_ms: i64) -> Result<Prune> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let Some(expired) = tx.query_row(
-        "SELECT MAX(id) FROM requests INDEXED BY requests_ts WHERE ts_ms<?1",
-        [cutoff_ms],
-        |r| r.get::<_, Option<i64>>(0),
-    )?
-    else {
+    let lowest: Vec<(i64, i64)> = tx
+        .prepare_cached("SELECT id,ts_ms FROM requests ORDER BY id LIMIT ?1")?
+        .query_map([PRUNE_BATCH as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let Some(&(first, _)) = lowest.first().filter(|(_, ts)| *ts < cutoff_ms) else {
         return Ok(Prune::Nothing);
     };
-    match rollup::state(&tx, "requests")? {
-        Some(s) if s.verified_at_ms.is_some() && s.last_id >= expired => {}
-        Some(s) if s.verified_at_ms.is_some() => {
-            return Ok(Prune::Refused(format!(
-                "rollup behind: expired request id {expired} is above the verified checkpoint {}",
-                s.last_id
-            )));
-        }
+    let checkpoint = match rollup::state(&tx, "requests")? {
+        Some(s) if s.verified_at_ms.is_some() => s.last_id,
         _ => {
             return Ok(Prune::Refused(
                 "rollup unverified: the request rollup has not passed its raw comparison".into(),
             ));
         }
-    }
-    let deleted = tx.execute(
-        "DELETE FROM requests WHERE id IN (SELECT id FROM requests INDEXED BY requests_ts WHERE ts_ms<?1 AND id<=?2 LIMIT ?3)",
-        params![cutoff_ms, expired, PRUNE_BATCH as i64],
-    )?;
+    };
+    let Some(end) = lowest
+        .iter()
+        .take_while(|(id, ts)| *ts < cutoff_ms && *id <= checkpoint)
+        .last()
+        .map(|(id, _)| *id)
+    else {
+        return Ok(Prune::Refused(format!(
+            "rollup behind: expired request id {first} is above the verified checkpoint {checkpoint}"
+        )));
+    };
+    let deleted = tx.execute("DELETE FROM requests WHERE id<=?1", [end])?;
     tx.commit()?;
     Ok(Prune::Deleted(deleted))
 }

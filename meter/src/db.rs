@@ -53,8 +53,8 @@ impl Default for Maintenance {
     }
 }
 
-/// Raw request retention (MET-206): rows older than 365 days, only inside
-/// the verified request rollup. Runs after each rollup run.
+/// Raw request retention (MET-206): the lowest-ID run of rows older than
+/// 365 days, only inside the verified request rollup. Runs after each rollup run.
 #[derive(Clone, Serialize, utoipa::ToSchema)]
 pub struct Retention {
     /// "pending" before the first run; "ok"; "skipped" when a gate is unmet;
@@ -66,7 +66,7 @@ pub struct Retention {
     /// Rows with `ts_ms` strictly below this were eligible in the last run.
     pub cutoff_ms: Option<i64>,
     /// Lowest request ID still stored after the last run; null when empty.
-    /// IDs below it were removed by retention.
+    /// IDs below it were removed by retention; IDs above it never are.
     pub oldest_retained_id: Option<i64>,
     /// Last run that was allowed to prune, and the rows it deleted.
     pub pruned_at_ms: Option<i64>,
@@ -369,13 +369,10 @@ impl Db {
                     .pool
                     .write(&scope, move |db| rollup::prune_requests(db, cutoff))
                     .await?;
+                // A short run ends at a newer row (Nothing next) or at the
+                // checkpoint (Refused next); the next call reports which.
                 match outcome {
-                    rollup::Prune::Deleted(n) => {
-                        deleted += n as u64;
-                        if n < rollup::PRUNE_BATCH {
-                            break;
-                        }
-                    }
+                    rollup::Prune::Deleted(n) if n > 0 => deleted += n as u64,
                     _ => break,
                 }
             }
@@ -393,7 +390,7 @@ impl Db {
         let (status, detail) = match (&result, outcome) {
             (Err(e), _) => ("failed", Some(format!("request retention failed: {e:#}"))),
             (Ok(_), rollup::Prune::Refused(reason)) => ("skipped", Some(reason)),
-            (Ok(_), rollup::Prune::Deleted(n)) if n == rollup::PRUNE_BATCH => (
+            (Ok(_), rollup::Prune::Deleted(n)) if n > 0 => (
                 "ok",
                 Some("more expired rows remain; pruning continues next run".into()),
             ),

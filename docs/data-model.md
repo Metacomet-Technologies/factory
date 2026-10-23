@@ -252,16 +252,27 @@ the `database` collector (same schedule). Each run uses `cutoff = now - 365 days
 and deletes requests with `ts_ms < cutoff`. A row at exactly the cutoff is kept,
 which matches the inclusive start of the `365d` range. A run is at most 50
 transactions of at most 2,000 requests. Each transaction is its own writer job,
-so ingestion and sync writes run between batches. In one transaction, a batch
-reads the highest expired ID E through `requests_ts`, checks every gate against
-E, then deletes up to 2,000 expired rows with `id <= E`. A refused batch commits
-nothing. API deletes cascade to `request_costs`. The jobs never modify rollups,
+so ingestion and sync writes run between batches. A refused batch commits
+nothing.
+
+- **Meter prunes only from its lowest ID upward.** A batch reads the 2,000
+  lowest IDs (a rowid walk), keeps the run that is expired and at or below the
+  verified checkpoint, and deletes `id <= end` of that run. The first newer row
+  ends the run. So every ID below meter's oldest stored ID was removed by
+  retention, and no ID above it ever is. Meter assigns IDs at request time, so
+  in practice this is every expired row. An expired row above a newer one (an
+  import with old timestamps) waits until the run reaches it.
+- **factory-api prunes every expired row.** A batch reads the highest expired
+  ID E through `requests_ts`, checks every gate against E, then deletes up to
+  2,000 expired rows with `id <= E`. Holes in the API copy do not affect sync.
+  Deletes cascade to `request_costs`.
+ The jobs never modify rollups,
 spend rollups, `rollup_state`, `cost_backfill`, `sync_state` or warnings.
 
 | Gate | Meter | factory-api | Reason prefix |
 | --- | --- | --- | --- |
 | Rollup verified | `rollup_state` `requests` has `verified_at_ms` | Same, API job | `rollup unverified` |
-| Rollup covers E | `last_id >= E` | Same | `rollup behind` |
+| Rollup covers the rows | Lowest stored ID, when expired, `<= last_id` (the run stops at `last_id`) | `last_id >= E` | `rollup behind` |
 | Backfill complete | — | Every configured family has `completed_at_ms` | `backfill incomplete` |
 | Costs frozen | — | Per family: no walk pending at or below E (`after_id >= target_id` or `after_id >= E`) and `unpriced_from_id` is NULL or above E | `costs not frozen` |
 
@@ -301,7 +312,7 @@ restart restarts the 24-hour clock.
 
 **Sync.** Meter cursor pages (`after_id`) add header `oldest_retained_id`. It is
 `MIN(id)` from the page's own statement, so the budget stays one statement per
-page. It is absent on empty pages and in newest-first mode. When the API sees
+page. Because meter prunes only from its lowest ID, the header is exact. It is absent on empty pages and in newest-first mode. When the API sees
 IDs `previous+1..id-1` missing, IDs below the oldest retained ID were pruned by
 retention. Only `max(previous+1, oldest)..id-1` raises the existing
 `gap: meter ids a..b` warning. A page whose oldest ID is above its first row is
@@ -312,8 +323,8 @@ never moves it (the C1 hazard). Rows that meter pruned before the API fetched
 them are also missing from the API's rollups. That requires an API outage of
 more than 365 days.
 
-**Budgets.** Meter: 3 data statements per batch (expired-ID read, rollup state,
-DELETE) plus one `MIN(id)` read per run. factory-api: 4 per batch (adds the cost
+**Budgets.** Meter: 3 data statements per deleting batch (lowest-ID walk, rollup
+state, DELETE), one walk for the batch that stops, plus one `MIN(id)` read per run. factory-api: 4 per batch (adds the cost
 state read) plus one. Usage, stats, health and sync budgets are unchanged.
 
 **Limits.**
@@ -323,10 +334,23 @@ state read) plus one. Usage, stats, health and sync budgets are unchanged.
   retention prunes rows, that comparison fails. Installers do not run these
   commands on v2/v6. A future migration that re-verifies must compare from the
   retained boundary, as GPU verification does.
+- Sandbox finding (2026-10-23): with per-row pruning, meter left holes above
+  rows it kept. The API had not fetched those rows yet, so it reported 4,386
+  pruned IDs as gaps. Pruning only from the lowest ID removes that case.
 - A reference family added after pruning is classified only for retained rows,
   so older buckets lack it. Pruned unpriced rows stay unpriced, as decided.
 - Pruned rows are recoverable only from MET-74 backups taken before the prune.
   No VACUUM runs; SQLite reuses freed pages.
+
+Sandbox (2026-10-23, `scripts/sandbox`): meter's 1k seed requests were replaced
+by 150,000 synthetic requests over 400 days in ID order (13,126 expired). At
+startup, before the rollups had caught up, meter recorded `rollup unverified` and
+the API `rollup behind`. On the five-minute tick each side pruned 13,127 rows.
+Meter's oldest retained ID went 1028 → 14155. The API, whose cursor (1018) was
+already below meter's oldest ID, synced to 151027 with no new gap warning. Only
+the three real seed gaps remained. At one fixed instant, meter stats and API
+usage and spend (both families) for 24h/7d/30d/365d equaled the pre-prune copy
+plus the rows that arrived later.
 
 Tests: `meter/tests/rollups.rs` and `factory-api/tests/rollups.rs` cover the
 strict cutoff, each gate, late rows, failure, restart idempotence and identical
