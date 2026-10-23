@@ -1931,8 +1931,12 @@
   .crumbs {
     font-size: 15px;
   }
+  /* Tighter on phones: since the Topology link (MET-226) the top bar overflowed 390 px. */
+  .topbar {
+    gap: 8px;
+  }
   .header-actions {
-    gap: 2px;
+    gap: 0;
   }
   .header-actions a:not(.chip, [data-slot="button"]) {
     padding: 6px;
