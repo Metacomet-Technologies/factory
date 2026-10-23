@@ -8,6 +8,15 @@ import type {
   UsageRange,
   GpuRange,
 } from "../src/api/types.ts";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+// The mock serves the committed contract, as a matching factory-api would.
+const openapi_sha256 = createHash("sha256")
+  .update(readFileSync(join(import.meta.dirname, "../../factory-api/openapi.json")))
+  .digest("hex")
+  .slice(0, 12);
 
 const build = {
   version: "0.2.0",
@@ -171,7 +180,7 @@ export function fixtures(
   gpuRange: GpuRange = "1h",
   now = Date.now(),
 ) {
-  const health: Health = { status: "ok", ...build, uptime_ms: 9_840_000 };
+  const health: Health = { status: "ok", ...build, openapi_sha256, uptime_ms: 9_840_000 };
   const fleet: Fleet = {
     generated_at_ms: now,
     nodes: [

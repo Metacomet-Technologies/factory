@@ -286,6 +286,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             "git_dirty",
             "built_at_ms",
             "inputs_fingerprint",
+            "openapi_sha256",
             "uptime_ms",
         ],
     );

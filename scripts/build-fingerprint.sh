@@ -25,7 +25,8 @@ if component == "kiosk":
     # The Bun lockfile (bun.lock) is tracked inside kiosk/.
     files.add("factory-api/openapi.json")
 else:
-    files.add("Cargo.toml")
+    # No workspace Cargo.toml: unrelated members or workspace dependencies must
+    # not stale this crate. Its path closure and locked tree below cover it.
     metadata = json.loads(run("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"))
     packages = {p["name"]: p for p in metadata["packages"]}
     pending = [component]

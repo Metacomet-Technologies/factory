@@ -44,7 +44,7 @@ The working agreement and hard-won lessons for building and operating the factor
 - **Database rules (MET-92, see [agent DB rules](agents/db.md)):** no N+1 (query-count tests), `EXPLAIN` tests on hot queries, versioned migrations, `STRICT` tables, all times `*_ms` UTC, money as integers (rates in micro-dollars per Mtok; per-request costs and totals in nano-dollars; priced costs frozen, `cost_status` priced/estimated/unpriced), the shared PRAGMA/pool helper, retention per table (raw requests 365 days + rollups), no blocking tokio threads, no lock held across network I/O.
 - **API style:** contract-first REST + generated OpenAPI; live data via **SSE named events** with a `{type, ts_ms, data}` envelope; additive changes only within v1; outages return 200 with nulls + warnings. Graceful shutdown within seconds (SSE streams closed).
 - **Kiosk:** React 19, strict TS, Vite+ (`vp`), Tailwind v4 CSS-first, shadcn on Base UI, dark purple accent (one hue, AA contrast). **Theme follows the system**; never force a default. Self-updates on build change; the reload guard gives up on stuck requests after ~20 s.
-- **Versioning (MET-107):** one repo-wide SemVer (0.x) from the root `VERSION` file; every component reports version + git SHA; the kiosk footer shows them and warns on mismatch.
+- **Versioning (MET-107):** one repo-wide SemVer (0.x) from the root `VERSION` file; every component reports version + git SHA; the kiosk footer shows them and warns only on an API contract (OpenAPI hash) mismatch (MET-247).
 
 ## 4. Agent prompt template
 

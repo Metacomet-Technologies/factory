@@ -782,6 +782,11 @@ export interface components {
       git_dirty: boolean;
       git_sha: string;
       inputs_fingerprint: string;
+      /**
+       * @description SHA-256 (first 12 hex) of the served `/openapi.json`, byte-identical to
+       *     the committed `factory-api/openapi.json` snapshot: the kiosk's API contract.
+       */
+      openapi_sha256: string;
       status: string;
       /** Format: int64 */
       uptime_ms: number;
