@@ -303,7 +303,11 @@ describe("remote devices", () => {
     ];
     rerender(remotePage(limited, t + 1_000));
     expect(screen.getByText("factory-console", { selector: "p" })).toBeInTheDocument();
-    expect(link.getByRole("alert")).toHaveTextContent("Identity conflict");
+    expect(link.getByRole("alert")).toHaveAttribute("data-slot", "alert");
+    expect(link.getByRole("alert")).toHaveTextContent(
+      "Identity conflict: two agents are using this credential.",
+    );
+    expect(link.getByRole("alert")).not.toHaveTextContent("Retrying");
     expect(link.getByText(/sessions from factory-console and imposter/)).toBeInTheDocument();
     expect(link.getByText("3")).toBeInTheDocument();
     expect(link.getByText(/SMART unsupported · fans unsupported/)).toBeInTheDocument();

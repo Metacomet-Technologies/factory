@@ -106,9 +106,14 @@ function Settings({
       <p id="ups-settings-help" className="muted">
         Up to 6 decimals, $0–$10/kWh. Clear a field to unset it. Dates use UTC.
       </p>
-      <p id="ups-settings-error" role={error ? "alert" : undefined} className="status-fail">
-        {error}
-      </p>
+      <div id="ups-settings-error">
+        <ResourceState
+          loading={false}
+          error={error}
+          title="Settings not saved"
+          retry="Nothing was saved; select Save settings to try again."
+        />
+      </div>
       <Button type="submit" disabled={saving}>
         {saving ? "Saving…" : "Save settings"}
       </Button>

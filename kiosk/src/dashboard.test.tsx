@@ -239,9 +239,13 @@ describe("UPS telemetry", () => {
     for (const invalid of ["0.1234567", "-0.1"]) {
       fireEvent.change(rate, { target: { value: invalid } });
       fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
-      expect(screen.getByRole("alert")).toHaveTextContent(
-        "nonnegative USD rate with at most 6 decimals",
-      );
+      const alert = screen.getByRole("alert");
+      expect(alert).toHaveAttribute("data-slot", "alert");
+      expect(alert).toHaveTextContent("nonnegative USD rate with at most 6 decimals");
+      expect(alert).toHaveTextContent("Nothing was saved; select Save settings to try again.");
+      expect(alert.textContent).not.toContain("..");
+      expect(alert).not.toHaveTextContent("Retrying");
+      expect(rate).toHaveAccessibleDescription(/nonnegative USD rate with at most 6 decimals/);
     }
     fireEvent.change(rate, { target: { value: "0.123456" } });
     fireEvent.change(screen.getByLabelText("Battery installed date"), {

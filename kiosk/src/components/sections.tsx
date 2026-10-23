@@ -31,6 +31,8 @@ type ResourceStateProps = {
   empty?: string | undefined;
   /** Alert title; defaults to "Unable to load this section". */
   title?: string | undefined;
+  /** What happens next, after the message. Defaults to the automatic refresh; null omits it. */
+  retry?: string | null | undefined;
 } & (
   | { resource: Resource<unknown> }
   /** For state that is not a `Resource`: the device view, paged events, lazy chunks. */
@@ -55,7 +57,9 @@ export function ResourceState(props: ResourceStateProps) {
         <AlertTitle>{props.title ?? "Unable to load this section"}</AlertTitle>
         <AlertDescription>
           {/* The server's message stays verbatim in its own element. */}
-          <span data-slot="resource-error">{error}</span>. Retrying on the next refresh.
+          <span data-slot="resource-error">{error}</span>
+          {/[.!?]$/.test(error) ? "" : "."}
+          {props.retry === null ? null : ` ${props.retry ?? "Retrying on the next refresh."}`}
         </AlertDescription>
       </Alert>
     );

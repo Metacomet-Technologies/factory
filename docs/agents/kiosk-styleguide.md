@@ -243,7 +243,9 @@ stacks; numbers get `tabular-nums` from `body`.
   loading and error UI. Pass `resource={…}` for a `Resource`, or
   `loading` / `error` for anything else (the device view, paged events, a
   lazy chunk's `Suspense` fallback); `title` names a partial failure ("GPU
-  overlay unavailable"). Put it at the top of the Panel or section it
+  overlay unavailable"); `retry` replaces "Retrying on the next refresh." when
+  the refresh does not recover the state (a failed save, an older audit page)
+  and `retry={null}` omits it. Put it at the top of the Panel or section it
   describes. Never write "Loading…" text or a hand-rolled `role="alert"`
   paragraph; `details-states.test.tsx` checks every details page. Each
   request owns its state where it is shown: Live UPS shows `/v1/ups`, Battery

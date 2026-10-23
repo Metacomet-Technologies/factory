@@ -175,6 +175,9 @@ describe("UPS Controls loading and error states", () => {
     const alert = within(region).getByRole("alert");
     expect(alert).toHaveTextContent("Unable to load older audit rows");
     expect(within(alert).getByText("audit store busy")).toBeInTheDocument();
+    // Only another click retries an older page; the 30-second refresh never does.
+    expect(alert).toHaveTextContent("select Older audit to try again");
+    expect(alert).not.toHaveTextContent("Retrying on the next refresh");
     expect(within(region).queryByLabelText("Loading section")).not.toBeInTheDocument();
     // The newest rows stay readable.
     expect(within(region).getByText("row 0")).toBeInTheDocument();

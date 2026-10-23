@@ -148,9 +148,12 @@ function AgentLink({ view, now }: { view: DeviceView; now: number }) {
         <p className="status-ok">Recovered {seen(recoveredAt, now)}.</p>
       )}
       {ingest.identity_conflict && (
-        <p role="alert" className="status-fail">
-          Identity conflict: two agents are using this credential.
-        </p>
+        <ResourceState
+          loading={false}
+          error="Identity conflict: two agents are using this credential"
+          title="Agent identity conflict"
+          retry={null}
+        />
       )}
       {view.warnings.map((warning) => (
         <p key={warning} className="status-warn">

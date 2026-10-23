@@ -458,6 +458,7 @@ export default function UpsControls() {
               loading={auditPage.loading}
               error={auditPage.error}
               title="Unable to load older audit rows"
+              retry="The refresh does not reload older rows; select Older audit to try again."
             />
             {!rows.length && <p className="muted">No audit rows.</p>}
             <ol
