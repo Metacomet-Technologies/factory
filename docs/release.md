@@ -66,9 +66,10 @@ publishing it. This covers queued, in-progress, waiting, requested and pending
 runs, including a CI rerun starting between build and publication. Missing CI,
 mismatched evidence, missing required jobs and completed failed/cancelled runs
 still fail with actionable errors; none permit skipping to a later SHA.
-Existing CI cancels superseded main runs: Devon must inspect and rerun the printed
-exact-SHA CI run (`gh run rerun RUN_ID --repo Metacomet-Technologies/factory`) when
-appropriate, then reconcile. The publisher has actions:read, not CI-rerun power.
+Main pushes run CI in one concurrency group per SHA, so a later merge no longer
+cancels an earlier SHA's CI. A failed or older cancelled run still needs Devon to
+inspect and rerun the printed exact-SHA CI run (`gh run rerun RUN_ID --repo
+Metacomet-Technologies/factory`) when appropriate, then reconcile. The publisher has actions:read, not CI-rerun power.
 
 Main updates, successful or failed main CI completion events, and manual reconcile
 are wakeups. One fixed non-cancelling concurrency group serializes publication.

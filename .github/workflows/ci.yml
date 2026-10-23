@@ -15,8 +15,10 @@ on:
 permissions:
   contents: read
 
+# Pushes to main get one group per SHA: the release publisher needs successful
+# CI for every first-parent main commit, so a later merge must not cancel it.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ inputs.ref || github.ref }}
+  group: ci-${{ github.workflow }}-${{ inputs.ref || (github.event_name == 'push' && github.sha) || github.ref }}
   cancel-in-progress: true
 
 jobs:
