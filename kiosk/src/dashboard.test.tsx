@@ -242,7 +242,9 @@ describe("UPS telemetry", () => {
       const alert = screen.getByRole("alert");
       expect(alert).toHaveAttribute("data-slot", "alert");
       expect(alert).toHaveTextContent("nonnegative USD rate with at most 6 decimals");
-      expect(alert).toHaveTextContent("Nothing was saved; select Save settings to try again.");
+      expect(alert).toHaveTextContent(
+        "Settings may not have been saved; select Save settings to try again.",
+      );
       expect(alert.textContent).not.toContain("..");
       expect(alert).not.toHaveTextContent("Retrying");
       expect(rate).toHaveAccessibleDescription(/nonnegative USD rate with at most 6 decimals/);
@@ -262,6 +264,36 @@ describe("UPS telemetry", () => {
       ),
     );
     expect(await screen.findByText("Settings saved.")).toBeInTheDocument();
+  });
+  it("shows a failed settings PUT in the shared Alert with the server's exact message", async () => {
+    window.history.replaceState(null, "", "/ups");
+    const fetch = api();
+    const defaults = fetch.getMockImplementation()!;
+    fetch.mockImplementation((path: string, init?: RequestInit) =>
+      path === "/v1/settings/ups" && init?.method === "PUT"
+        ? Promise.resolve(
+            new Response(JSON.stringify({ error: { message: "settings store is read-only" } }), {
+              status: 503,
+            }),
+          )
+        : defaults(path),
+    );
+    render(<App />);
+    const rate = await screen.findByLabelText("Electricity rate · USD per kWh");
+    fireEvent.change(rate, { target: { value: "0.123456" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveAttribute("data-slot", "alert");
+    expect(alert).toHaveTextContent("Settings not saved");
+    expect(alert).toHaveTextContent("settings store is read-only");
+    expect(alert).toHaveTextContent(
+      "Settings may not have been saved; select Save settings to try again.",
+    );
+    expect(alert).not.toHaveTextContent("Retrying");
+    expect(rate).toHaveAccessibleDescription(/settings store is read-only/);
+    expect(rate).toHaveAttribute("aria-invalid", "true");
+    expect(screen.queryByText("Settings saved.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save settings" })).toBeEnabled();
   });
   it("never shows a negative duration for an event newer than the UI clock", async () => {
     window.history.replaceState(null, "", "/ups");

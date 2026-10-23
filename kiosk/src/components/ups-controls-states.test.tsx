@@ -182,4 +182,48 @@ describe("UPS Controls loading and error states", () => {
     // The newest rows stay readable.
     expect(within(region).getByText("row 0")).toBeInTheDocument();
   });
+
+  it("keeps an older-audit failure through state refreshes until Older audit is clicked again", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      respond.audit = () => json({ error: "audit store busy" }, 503);
+      render(<UpsControls />);
+      fireEvent.click(await screen.findByRole("button", { name: "Older audit" }));
+      const region = screen.getByRole("region", { name: "Controls" });
+      expect(await within(region).findByRole("alert")).toHaveTextContent("audit store busy");
+      const fetch = vi.mocked(globalThis.fetch);
+      const calls = (prefix: string) =>
+        fetch.mock.calls.filter(([path]) => typeof path === "string" && path.startsWith(prefix))
+          .length;
+      const audits = calls("/control/v1/audit");
+      const states = calls("/control/v1/state");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      // The refresh reads state only; it never re-fetches older audit rows or clears the error.
+      expect(calls("/control/v1/state")).toBeGreaterThan(states);
+      expect(calls("/control/v1/audit")).toBe(audits);
+      expect(within(region).getByRole("alert")).toHaveTextContent("audit store busy");
+
+      respond.audit = () =>
+        json({
+          rows: [
+            {
+              id: 1,
+              ts_ms: 1,
+              login: "audit@github",
+              action: "test.quick",
+              value: null,
+              result: "older row",
+            },
+          ],
+        });
+      fireEvent.click(within(region).getByRole("button", { name: "Older audit" }));
+      expect(await within(region).findByText("older row")).toBeInTheDocument();
+      expect(calls("/control/v1/audit")).toBe(audits + 1);
+      expect(within(region).queryByRole("alert")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

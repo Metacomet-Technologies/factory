@@ -111,7 +111,7 @@ function Settings({
           loading={false}
           error={error}
           title="Settings not saved"
-          retry="Nothing was saved; select Save settings to try again."
+          retry="Settings may not have been saved; select Save settings to try again."
         />
       </div>
       <Button type="submit" disabled={saving}>
