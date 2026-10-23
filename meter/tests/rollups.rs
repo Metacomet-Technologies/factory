@@ -479,6 +479,168 @@ async fn seven_day_history_uses_the_request_time_not_the_read_time() {
     db.close().await.unwrap();
 }
 
+/// Every public stats range, with and without a model filter.
+async fn public_stats(db: &Db, now: i64) -> Vec<(i64, Option<&'static str>, bool, Value)> {
+    let mut out = vec![];
+    for (days, model) in [
+        (1, None),
+        (7, Some("b")),
+        (30, None),
+        (30, Some("")),
+        (365, None),
+        (365, Some("b")),
+    ] {
+        let since = now - days * DAY;
+        let exact = days != 365;
+        let stats = db.stats(since, model.map(Into::into), exact).await.unwrap();
+        out.push((since, model, exact, serde_json::to_value(stats).unwrap()));
+    }
+    out
+}
+
+#[tokio::test]
+async fn request_retention_prunes_only_verified_rows_older_than_365_days() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meter.db");
+    let now = meter::now_ms();
+    let cutoff = now - 365 * DAY;
+    // 400 days of history (later IDs are often older), with half the rows in
+    // the last 35 expired days so pruning needs several batches.
+    let mut rows: Vec<_> = (1..=8_000)
+        .map(|id| RequestRecord {
+            ts: if id % 2 == 0 {
+                cutoff - 1 - lcg(id) % (35 * DAY)
+            } else {
+                record(id, now).ts
+            },
+            ..record(id, now)
+        })
+        .collect();
+    // Strict cutoff: exactly 365 days is kept, 365 days + 1 ms is pruned.
+    rows[10].ts = cutoff;
+    rows[11].ts = cutoff - 1;
+    let db = open(&path);
+    db.import(rows.clone(), vec![]).await.unwrap();
+    let retention = || db.maintenance().retention;
+
+    // Unverified rollup: refuse, even with one batch committed.
+    assert_eq!(db.retain(now).await.unwrap(), 0);
+    assert_eq!(retention().status, "skipped");
+    assert!(retention().detail.unwrap().starts_with("rollup unverified"));
+    assert_eq!(retention().skipped_since_ms, Some(now));
+    let mut raw = connection(&path);
+    assert_eq!(rollup::request_batch(&mut raw, 1).unwrap(), 5_000);
+    drop(raw);
+    assert_eq!(db.retain(now + 1).await.unwrap(), 0);
+    assert!(retention().detail.unwrap().starts_with("rollup unverified"));
+    let progress = db.rollups().await.unwrap();
+    assert!(progress.caught_up && progress.verified, "{progress:?}");
+
+    // A late row older than the cutoff but above the checkpoint blocks the job.
+    let late = RequestRecord {
+        ts: cutoff - 5 * DAY,
+        ..record(8_001, now)
+    };
+    db.import(vec![late.clone()], vec![]).await.unwrap();
+    rows.push(late);
+    assert_eq!(db.retain(now + 2).await.unwrap(), 0);
+    let skipped = retention();
+    assert_eq!(skipped.status, "skipped");
+    assert_eq!(
+        skipped.detail.as_deref(),
+        Some("rollup behind: expired request id 8001 is above the verified checkpoint 8000")
+    );
+    // The streak keeps its first skip time for the 24-hour alert.
+    assert_eq!(skipped.skipped_since_ms, Some(now));
+    let raw = connection(&path);
+    assert_eq!(scalar(&raw, "SELECT COUNT(*) FROM requests"), 8_001);
+    let before = public_stats(&db, now).await;
+    assert!(db.rollups().await.unwrap().verified);
+
+    // Gates met: bounded batches delete exactly the expired rows.
+    let expired: Vec<i64> = rows
+        .iter()
+        .filter(|r| r.ts < cutoff)
+        .map(|r| r.id)
+        .collect();
+    assert!(
+        expired.len() > 2 * rollup::PRUNE_BATCH
+            && !expired.len().is_multiple_of(rollup::PRUNE_BATCH)
+    );
+    let scope = factory_db::Scope::recording();
+    let mut scoped = db.clone();
+    scoped.scope = Some(scope.clone());
+    assert_eq!(scoped.retain(now).await.unwrap(), expired.len() as u64);
+    // Per batch: expired-ID read, rollup state, DELETE; then one MIN(id) read.
+    let batches = expired.len().div_ceil(rollup::PRUNE_BATCH);
+    assert_eq!(scope.counts().data, 3 * batches + 1);
+    let ok = retention();
+    assert_eq!((ok.status.as_str(), ok.detail), ("ok", None));
+    assert_eq!(ok.pruned_rows, expired.len() as u64);
+    assert_eq!((ok.pruned_at_ms, ok.cutoff_ms), (Some(now), Some(cutoff)));
+    assert_eq!(ok.skipped_since_ms, None);
+    let kept: Vec<_> = rows.iter().filter(|r| r.ts >= cutoff).collect();
+    assert_eq!(ok.oldest_retained_id, kept.iter().map(|r| r.id).min());
+    assert_eq!(
+        scalar(&raw, "SELECT COUNT(*) FROM requests"),
+        kept.len() as i64
+    );
+    assert_eq!(scalar(&raw, "SELECT COUNT(*) FROM requests WHERE id=11"), 1);
+    assert_eq!(scalar(&raw, "SELECT COUNT(*) FROM requests WHERE id=12"), 0);
+    // Rollups keep everything; every public range is unchanged and still
+    // matches an independent computation over the full history.
+    assert_eq!(
+        scalar(&raw, "SELECT SUM(requests) FROM request_daily"),
+        rows.len() as i64
+    );
+    let after = public_stats(&db, now).await;
+    assert_eq!(after, before);
+    for (since, model, exact, _) in &after {
+        let stats = db
+            .stats(*since, model.map(Into::into), *exact)
+            .await
+            .unwrap();
+        check(&stats, &rows, *since, *model, *exact);
+    }
+    // The cursor page reports the same oldest ID.
+    let (page, oldest) = db.requests_page(10, Some(0)).await.unwrap();
+    assert_eq!(oldest, ok.oldest_retained_id);
+    assert_eq!(page[0].id, oldest.unwrap());
+
+    // Idempotent: a second run and a restart prune nothing more.
+    assert_eq!(db.retain(now).await.unwrap(), 0);
+    db.close().await.unwrap();
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.retain(now).await.unwrap(), 0);
+    assert_eq!(db.maintenance().retention.status, "ok");
+    assert_eq!(
+        scalar(&raw, "SELECT COUNT(*) FROM requests"),
+        kept.len() as i64
+    );
+
+    // A failed prune deletes nothing and is reported.
+    let later = now + 30 * DAY;
+    let newly: i64 = kept.iter().filter(|r| r.ts < later - 365 * DAY).count() as i64;
+    assert!(newly > 0);
+    raw.execute_batch(
+        "CREATE TRIGGER fail_prune BEFORE DELETE ON requests BEGIN SELECT RAISE(ABORT,'injected prune failure'); END",
+    )
+    .unwrap();
+    let error = format!("{:#}", db.retain(later).await.unwrap_err());
+    assert!(error.contains("injected prune failure"), "{error}");
+    let failed = db.maintenance().retention;
+    assert_eq!(failed.status, "failed");
+    assert!(failed.detail.unwrap().contains("injected prune failure"));
+    assert_eq!(failed.skipped_since_ms, Some(later));
+    assert_eq!(
+        scalar(&raw, "SELECT COUNT(*) FROM requests"),
+        kept.len() as i64
+    );
+    raw.execute_batch("DROP TRIGGER fail_prune").unwrap();
+    assert_eq!(db.retain(later).await.unwrap(), newly as u64);
+    db.close().await.unwrap();
+}
+
 fn rollup_floor(ts: i64) -> i64 {
     ts - ts.rem_euclid(HOUR)
 }

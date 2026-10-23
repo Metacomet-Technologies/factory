@@ -311,6 +311,7 @@ async fn request_cursor_pages_without_gaps_and_preserves_legacy_behavior() {
                 .error_for_status()
                 .unwrap();
             assert!(response.headers().get("next_after_id").is_none());
+            assert!(response.headers().get("oldest_retained_id").is_none());
             let rows: Vec<RequestRecord> = response.json().await.unwrap();
             assert_eq!(rows.len(), count);
             assert_eq!(
@@ -333,6 +334,14 @@ async fn request_cursor_pages_without_gaps_and_preserves_legacy_behavior() {
                 .unwrap()
                 .parse()
                 .unwrap();
+            // Lowest stored ID, from the page's own snapshot; absent when empty.
+            assert_eq!(
+                response
+                    .headers()
+                    .get("oldest_retained_id")
+                    .map(|v| v.to_str().unwrap().to_owned()),
+                (count > 0).then(|| "1".to_owned())
+            );
             let rows: Vec<RequestRecord> = response.json().await.unwrap();
             assert_eq!(rows.len(), count);
             assert_eq!(next, cursor + count as i64);
@@ -427,6 +436,7 @@ async fn request_cursor_pages_without_gaps_and_preserves_legacy_behavior() {
                 .any(|parameter| parameter["name"] == "after_id")
         );
         assert!(request_schema["responses"]["200"]["headers"]["next_after_id"].is_object());
+        assert!(request_schema["responses"]["200"]["headers"]["oldest_retained_id"].is_object());
         task.abort();
     })
     .await

@@ -34,6 +34,7 @@ notice below, which uses the exact counter-transition text.
 | `network:dns_down` | the same for `Down { dns }` | critical | `net_events` |
 | `network:throughput_low` | the 3 most recent `ok` speed tests are all below `--network-throughput-low-mbps` (500 Mb/s) in either direction, skipping failed and timed-out tests between them; clears when the newest `ok` test is at or above it both ways | warning | `net_speed_tests` |
 | `network:speedtest_failing` | the 3 most recent speed tests all failed or timed out; clears on the next `ok` test | warning | `net_speed_tests` |
+| `retention:api`, `retention:meter` | 365-day request retention has skipped or failed for 24 h (`skipped_since_ms`); clears on a run that is allowed to prune | warning | API `/v1/health` `retention`; meter `/meter/health` `maintenance.retention` |
 | watchdog | factory-gpu health fails 5 consecutive minutes | — | factory-console |
 
 ### Unclean shutdown notice (MET-217)

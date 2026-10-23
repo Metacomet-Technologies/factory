@@ -355,6 +355,57 @@ pub fn gpu_raw_sql() -> String {
     )
 }
 
+/// Raw requests are kept 365 days; strictly older rows are pruned (MET-206).
+pub const REQUEST_RETENTION_MS: i64 = 365 * 86_400_000;
+/// Rows per retention statement. Each batch is its own writer job, so
+/// ingestion interleaves between batches.
+pub const PRUNE_BATCH: usize = 2_000;
+pub const PRUNE_BATCHES_PER_RUN: usize = 50;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Prune {
+    /// No request is older than the cutoff.
+    Nothing,
+    /// A gate is unmet; nothing was deleted.
+    Refused(String),
+    Deleted(usize),
+}
+
+/// One bounded retention batch. Deletes requests with `ts_ms < cutoff_ms`
+/// only when every such row is inside the verified request rollup, so stats
+/// for every range stay identical. Late rows above the checkpoint wait.
+pub fn prune_requests(db: &mut Connection, cutoff_ms: i64) -> Result<Prune> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(expired) = tx.query_row(
+        "SELECT MAX(id) FROM requests INDEXED BY requests_ts WHERE ts_ms<?1",
+        [cutoff_ms],
+        |r| r.get::<_, Option<i64>>(0),
+    )?
+    else {
+        return Ok(Prune::Nothing);
+    };
+    match rollup::state(&tx, "requests")? {
+        Some(s) if s.verified_at_ms.is_some() && s.last_id >= expired => {}
+        Some(s) if s.verified_at_ms.is_some() => {
+            return Ok(Prune::Refused(format!(
+                "rollup behind: expired request id {expired} is above the verified checkpoint {}",
+                s.last_id
+            )));
+        }
+        _ => {
+            return Ok(Prune::Refused(
+                "rollup unverified: the request rollup has not passed its raw comparison".into(),
+            ));
+        }
+    }
+    let deleted = tx.execute(
+        "DELETE FROM requests WHERE id IN (SELECT id FROM requests INDEXED BY requests_ts WHERE ts_ms<?1 AND id<=?2 LIMIT ?3)",
+        params![cutoff_ms, expired, PRUNE_BATCH as i64],
+    )?;
+    tx.commit()?;
+    Ok(Prune::Deleted(deleted))
+}
+
 /// Seven-day raw deletion, restricted to verified rolled-up samples.
 pub fn prune_gpu(db: &Connection, now_ms: i64) -> Result<usize> {
     Ok(db.execute(

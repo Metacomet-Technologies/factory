@@ -186,7 +186,7 @@ the resolution is chosen from the request time the range was parsed at, so a
 slow read cannot turn a 7d request into hourly means.
 Longer ranges return hourly means (`samples` set; ts is the hour start) before
 the first whole raw hour, then raw samples. Meter's existing seven-day GPU
-deletion now removes only verified, rolled-up IDs. No other pruning exists; that is MET-206.
+deletion now removes only verified, rolled-up IDs. Request pruning followed in MET-206 (below).
 
 **Fill-ins.** Cost backfill pages carry the rollup checkpoint in their page read.
 A page containing rolled-up requests reads their prior statuses once. Unpriced →
@@ -240,6 +240,99 @@ v1 `meter.db` is upgraded in place by `meter migrate --db` (log in
 `.sandbox/meter-upgrade.json`); a failed upgrade stops startup with a clear
 message. A reused pre-MET-205 requests cache (v5) still needs the offline
 `factory-api migrate --requests-db`; the API refuses it with that instruction.
+
+## Gated raw request retention implementation (MET-206)
+
+MET-206 adds no schema change: meter stays v2 and API `requests.db` stays v6.
+Meter's seven-day GPU deletion (`rollup::prune_gpu`, MET-205) is unchanged.
+
+**Jobs.** Meter runs request retention after each rollup run on its maintenance
+tick (startup, then every five minutes). factory-api runs it after `roll_up` on
+the `database` collector (same schedule). Each run uses `cutoff = now - 365 days`
+and deletes requests with `ts_ms < cutoff`. A row at exactly the cutoff is kept,
+which matches the inclusive start of the `365d` range. A run is at most 50
+transactions of at most 2,000 requests. Each transaction is its own writer job,
+so ingestion and sync writes run between batches. In one transaction, a batch
+reads the highest expired ID E through `requests_ts`, checks every gate against
+E, then deletes up to 2,000 expired rows with `id <= E`. A refused batch commits
+nothing. API deletes cascade to `request_costs`. The jobs never modify rollups,
+spend rollups, `rollup_state`, `cost_backfill`, `sync_state` or warnings.
+
+| Gate | Meter | factory-api | Reason prefix |
+| --- | --- | --- | --- |
+| Rollup verified | `rollup_state` `requests` has `verified_at_ms` | Same, API job | `rollup unverified` |
+| Rollup covers E | `last_id >= E` | Same | `rollup behind` |
+| Backfill complete | — | Every configured family has `completed_at_ms` | `backfill incomplete` |
+| Costs frozen | — | Per family: no walk pending at or below E (`after_id >= target_id` or `after_id >= E`) and `unpriced_from_id` is NULL or above E | `costs not frozen` |
+
+factory-api joins every unmet reason with `; `. A late row that is older than
+the cutoff but above the checkpoint gives `rollup behind`, and pruning waits
+until a rollup run includes it. Because retention runs right after a rollup
+run, this normally clears in the same tick.
+
+Reads do not change after a prune. Rollups keep every request. The raw part of
+a range needs only rows with `ts_ms >= since` or `id > checkpoint`. Here `since`
+is the request time minus the range, which is never earlier than any past
+prune's cutoff. Rows above the checkpoint are never pruned. Ranges up to 365 days,
+spend totals and exact ≤30-day percentiles are therefore identical. Only
+non-public reads before the 365-day window, such as `since=0` exact
+percentiles, lose raw rows.
+
+**Health.** Meter `/meter/health` `maintenance.retention` and factory-api
+`/v1/health` `retention` have the same fields:
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `pending` before the first run; `ok`; `skipped` (a gate is unmet); `failed` (job error, rows intact) |
+| `detail` | Skip reasons or error; for a full run, a note that pruning continues next run |
+| `checked_at_ms`, `cutoff_ms` | Last run and its strict cutoff |
+| `oldest_retained_id` | Lowest stored request ID after that run; null when empty |
+| `pruned_at_ms`, `pruned_rows` | Last run that was allowed to prune, and the rows it deleted (including 0) |
+| `pruned_rows_since_start` | Rows deleted since the process started |
+| `skipped_since_ms` | Start of the current streak of skipped or failed runs |
+
+Meter `maintenance.status` still reports only the rollup job. A failed batch
+rolls back, the job records `failed` with the error, and the next run retries.
+The `retention:api` and `retention:meter` warning alerts open when
+`skipped_since_ms` is at least 24 hours old (see `docs/alerts.md`). The API
+reads meter's state from `/meter/health` on each 30-second alert cycle. An
+unreadable meter keeps an open alert open. The streak is held in memory, so a
+restart restarts the 24-hour clock.
+
+**Sync.** Meter cursor pages (`after_id`) add header `oldest_retained_id`. It is
+`MIN(id)` from the page's own statement, so the budget stays one statement per
+page. It is absent on empty pages and in newest-first mode. When the API sees
+IDs `previous+1..id-1` missing, IDs below the oldest retained ID were pruned by
+retention. Only `max(previous+1, oldest)..id-1` raises the existing
+`gap: meter ids a..b` warning. A page whose oldest ID is above its first row is
+invalid: nothing is written and the cursor stays. A meter without the header
+keeps the earlier behavior. The API cursor is the persisted
+`sync_state.last_after_id` (MET-203), not `MAX(id)`, so pruning the API copy
+never moves it (the C1 hazard). Rows that meter pruned before the API fetched
+them are also missing from the API's rollups. That requires an API outage of
+more than 365 days.
+
+**Budgets.** Meter: 3 data statements per batch (expired-ID read, rollup state,
+DELETE) plus one `MIN(id)` read per run. factory-api: 4 per batch (adds the cost
+state read) plus one. Usage, stats, health and sync budgets are unchanged.
+
+**Limits.**
+
+- Offline `meter migrate --db` on v2 and `factory-api migrate --requests-db` on
+  v6 rerun the full raw comparison (`factory_db::rollup::verify`). After
+  retention prunes rows, that comparison fails. Installers do not run these
+  commands on v2/v6. A future migration that re-verifies must compare from the
+  retained boundary, as GPU verification does.
+- A reference family added after pruning is classified only for retained rows,
+  so older buckets lack it. Pruned unpriced rows stay unpriced, as decided.
+- Pruned rows are recoverable only from MET-74 backups taken before the prune.
+  No VACUUM runs; SQLite reuses freed pages.
+
+Tests: `meter/tests/rollups.rs` and `factory-api/tests/rollups.rs` cover the
+strict cutoff, each gate, late rows, failure, restart idempotence and identical
+public ranges on a 400-day fixture. `factory-api/tests/cache_recovery.rs` covers
+sync past meter's pruning and a real gap. The `alerts` unit tests cover the
+24-hour threshold.
 
 ## Scope, evidence, and decisions
 
@@ -639,7 +732,8 @@ STRICT singleton, initialized to zero for migration 3's empty rebuild, not
 recalculated after pruning. Commit cache rows and cursor in one transaction; emit SSE only afterward.
 Use ascending cursor pages and a bounded catch-up loop. Numeric ID discontinuities
 are diagnostic, not conclusive proof of lost committed rows after AUTOINCREMENT;
-meter must expose its oldest retained ID for retention-loss detection. A restored
+meter must expose its oldest retained ID for retention-loss detection (MET-206:
+`oldest_retained_id` on cursor pages). A restored
 meter whose maximum ID is below the API cursor requires explicit reconciliation,
 not automatic cursor advancement or silently treating it as an empty page.
 Before costs/rollups activate, backfill missing retained history using cursor
@@ -833,8 +927,8 @@ deferred to step 5; they must be fixed, versioned and additive.
 
 | Database/table | Retention | Delete/aggregation gate |
 | --- | --- | --- |
-| meter + API `requests` | 365 days raw | `ts_ms < now_ms - 365*86400000`, only IDs included in committed rollups |
-| API `request_costs` | Same 365 days as parent | Cascade only after spend rollups include every family classification |
+| meter + API `requests` | 365 days raw | `ts_ms < now_ms - 365*86400000`, only IDs included in the verified rollup; API also needs complete, frozen costs (MET-206) |
+| API `request_costs` | Same 365 days as parent | Cascades with its request, only after spend rollups include every family classification (MET-206) |
 | Both `request_hourly`, `request_daily`; API `spend_hourly`, `spend_daily` | Indefinite | No scheduled deletion; late arrivals correct affected buckets |
 | meter `gpu_samples` | Seven days raw | Same strict `<` cutoff; only committed rolled-up IDs |
 | meter `gpu_hourly` | Indefinite | No scheduled deletion |
@@ -933,7 +1027,7 @@ maintenance statements are counted separately, never hidden in data ceilings.
 | API meter-sync page | MET-204 measured job ceiling **2 + ceil(n/100) + ceil(g/100) + 3F + ceil(F·n/200)** for pages with inference rows (F families, 3 pricing-history reads each; cost rows batch 200), plus **1 cursor read per sync run**; raw/warning inserts batch 100 rows, no per-row SELECT. Target after step 5: **≤10 + 2*ceil(n/100)** including pricing history and separate raw/cost batches; n≤5,000 (current wire pages ≤500) |
 | API cost backfill | MET-204 measured **≤ 2 + ceil(F·500/200) + F** per ≤500-row transaction (9 at F=2), F more when an estimate fill-in rewinds, **1 + 2F** at completion, 3F pricing reads per poll, **1** when idle; at most 20 transactions per 30 s poll |
 | Pricing refresh | **P6 fixed and enforced:** ≤6 + ceil(M/100) + ceil(B/100) + ceil(I/100) for two configured families. Measured **9 / 29** with 3 / 1,001 fallback source rows, two pending rows and 10 / 1,008 items. One bulk release-history read, no S per-model reads; M is total source rows, B pending rows, I items |
-| Rollup/retention | ≤16 per ≤5,000-row batch per database; pruning chunk ≤5,000; cost families fixed by input configuration |
+| Rollup/retention | ≤16 per ≤5,000-row batch per database; pruning chunk ≤5,000 (MET-206: 2,000-row batches; measured meter 3 and API 4 per batch plus one oldest-ID read per run); cost families fixed by input configuration |
 | GPU sampling | G+1 data statements, plus one transaction; G physical GPUs |
 
 API budget fixtures exercise 3 and 1,001 successful request rows, two pricing

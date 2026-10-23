@@ -313,11 +313,134 @@ async fn catch_up_is_bounded_and_resumes_on_the_next_poll() -> Result<()> {
     Ok(())
 }
 
+/// Meter's retention moving its oldest ID past the API cursor is not a gap;
+/// a hole above that oldest ID still is, and so is any hole from a meter
+/// that does not report its oldest ID.
+#[tokio::test]
+async fn meter_retention_past_the_cursor_is_not_a_gap() -> Result<()> {
+    type Ids = Arc<std::sync::Mutex<(Vec<i64>, Option<i64>)>>;
+    let serve = |ids: Ids| async move {
+        let app = Router::new().route(
+            "/meter/requests",
+            get(move |Query(q): Query<BTreeMap<String, String>>| {
+                let ids = ids.clone();
+                async move {
+                    let cursor: i64 = q["after_id"].parse().unwrap();
+                    let (stored, oldest) = ids.lock().unwrap().clone();
+                    let rows: Vec<_> = stored
+                        .iter()
+                        .copied()
+                        .filter(|id| *id > cursor)
+                        .take(500)
+                        .map(record)
+                        .collect();
+                    let next = rows.last().map_or(cursor, |r| r.id);
+                    let mut headers = vec![("next_after_id", next.to_string())];
+                    if let Some(oldest) = oldest.filter(|_| !rows.is_empty()) {
+                        headers.push(("oldest_retained_id", oldest.to_string()));
+                    }
+                    let mut response = Json(rows).into_response();
+                    for (name, value) in headers {
+                        response.headers_mut().insert(name, value.parse().unwrap());
+                    }
+                    response
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        (
+            url,
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+        )
+    };
+    let state = |url: String, temp: &Path| {
+        let temp = temp.to_owned();
+        async move {
+            pricing::migrate(temp.join("pricing.db"))?;
+            let state = AppState::new(
+                url,
+                temp.join("requests.db"),
+                temp.join("pricing.db"),
+                fleet::Config { nodes: vec![] },
+            )
+            .await?;
+            state.db.clock_synchronized.store(true, Ordering::Release);
+            anyhow::Ok(state)
+        }
+    };
+    let gaps = |usage: &factory_api::types::Usage| {
+        usage
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("gap:"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // Meter already pruned 1..100 and lost 150..152.
+    let held: Vec<i64> = (101..=200).filter(|id| !(150..=152).contains(id)).collect();
+    let ids: Ids = Arc::new(std::sync::Mutex::new((held.clone(), Some(101))));
+    let (url, server) = serve(ids.clone()).await;
+    let temp = tempfile::tempdir()?;
+    let api = state(url, temp.path()).await?;
+    assert_eq!(api.retention().status, "pending");
+    api.sync_meter().await?;
+    let usage = api.usage("30d".into(), 0).await?;
+    assert_eq!(usage.totals.requests, 97);
+    assert_eq!(
+        gaps(&usage),
+        ["gap: meter ids 150..152 are absent from cursor history"]
+    );
+    // While the API is behind, meter prunes past its cursor: still no gap.
+    *ids.lock().unwrap() = ((301..=350).collect(), Some(301));
+    api.sync_meter().await?;
+    let usage = api.usage("30d".into(), 0).await?;
+    assert_eq!(usage.totals.requests, 147);
+    assert_eq!(gaps(&usage).len(), 1);
+    // An oldest ID above the page's first row is an invalid page.
+    *ids.lock().unwrap() = ((351..=360).collect(), Some(352));
+    let error = api.sync_meter().await.unwrap_err().to_string();
+    assert!(error.contains("invalid meter cursor page"), "{error}");
+    assert_eq!(api.usage("30d".into(), 0).await?.totals.requests, 147);
+    // Health reports the API copy's own retention after a run.
+    assert_eq!(api.retain_requests().await?, 0);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let health_url = format!("http://{}/v1/health", listener.local_addr()?);
+    let app = router(api.clone());
+    let http = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let health: serde_json::Value = reqwest::get(health_url).await?.json().await?;
+    let retention = &health["retention"];
+    assert_eq!(retention["status"], "ok");
+    assert_eq!(retention["oldest_retained_id"], 101);
+    assert_eq!(retention["pruned_rows"], 0);
+    assert!(retention["skipped_since_ms"].is_null());
+    http.abort();
+    api.db.close().await?;
+    server.abort();
+
+    // A meter without the header: the same history is a gap from 1.
+    let ids: Ids = Arc::new(std::sync::Mutex::new((held, None)));
+    let (url, server) = serve(ids).await;
+    let temp = tempfile::tempdir()?;
+    let api = state(url, temp.path()).await?;
+    api.sync_meter().await?;
+    assert_eq!(
+        gaps(&api.usage("30d".into(), 0).await?),
+        [
+            "gap: meter ids 1..100 are absent from cursor history",
+            "gap: meter ids 150..152 are absent from cursor history"
+        ]
+    );
+    api.db.close().await?;
+    server.abort();
+    Ok(())
+}
+
 #[test]
 fn invalid_page_rolls_back_rows_warnings_and_cursor() -> Result<()> {
     let mut db = Connection::open_in_memory()?;
     data::initialize(&mut db)?;
-    data::sync(&mut db, vec![record(1)], &[])?;
+    data::sync(&mut db, vec![record(1)], &[], None)?;
     for invalid in [
         record(1),
         record(2),
@@ -334,14 +457,14 @@ fn invalid_page_rolls_back_rows_warnings_and_cursor() -> Result<()> {
             ..record(5)
         },
     ] {
-        assert!(data::sync(&mut db, vec![record(2), invalid], &[]).is_err());
+        assert!(data::sync(&mut db, vec![record(2), invalid], &[], None).is_err());
         assert_eq!(scalar(&db, "SELECT COUNT(*) FROM requests"), 1);
         assert_eq!(scalar(&db, "SELECT last_after_id FROM sync_state"), 1);
         assert_eq!(scalar(&db, "SELECT COUNT(*) FROM warnings"), 0);
     }
     // A deleted cache row must never regress the durable cursor or create a false gap.
     db.execute("DELETE FROM requests", [])?;
-    data::sync(&mut db, vec![record(2)], &[])?;
+    data::sync(&mut db, vec![record(2)], &[], None)?;
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM warnings"), 0);
     assert_eq!(scalar(&db, "SELECT last_after_id FROM sync_state"), 2);
     Ok(())

@@ -538,6 +538,7 @@ describe("dashboard contract", () => {
       openapi_sha256: "9ece56431fd2",
       status: "ok",
       uptime_ms: 123,
+      retention: { status: "pending", pruned_rows: 0, pruned_rows_since_start: 0 },
     };
     const meter = {
       ...fixtures().fleet.nodes[0]!.services[0]!,

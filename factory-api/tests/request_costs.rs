@@ -1013,7 +1013,7 @@ fn backfill_statement_budgets_and_query_plans() -> Result<()> {
         let records: Vec<_> = (1..=n as i64)
             .map(|id| request(id, 3, Some(3), (id % 7 != 0).then_some(7)))
             .collect();
-        data::sync(&mut db, records, &[])?;
+        data::sync(&mut db, records, &[], None)?;
         db.execute_batch(
             "UPDATE cost_backfill SET after_id=0,target_id=(SELECT MAX(id) FROM requests),completed_at_ms=NULL",
         )?;

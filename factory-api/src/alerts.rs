@@ -41,6 +41,8 @@ const GPU_SAMPLE_MAX_AGE_MS: i64 = 2 * 60_000;
 /// Meter sync runs every 30 s; ten missed cycles is a gap.
 const METER_GAP_MS: i64 = 5 * 60_000;
 const BACKUP_STALE_MS: i64 = 36 * 3_600_000;
+/// Request retention may skip transiently while rollups or costs catch up.
+const RETENTION_SKIP_MS: i64 = 24 * 3_600_000;
 /// factory-backup.service TimeoutStartSec: in-run "pending" markers older than this are stuck.
 const BACKUP_RUN_MS: i64 = 2 * 3_600_000;
 const DISPATCH_STALE_MS: i64 = 5 * 60_000;
@@ -48,9 +50,20 @@ const DISPATCH_STALE_MS: i64 = 5 * 60_000;
 const USAGE_STALE_MS: i64 = crate::usage::STALE_MS;
 const MAX_BACKOFF_MS: i64 = 15 * 60_000;
 const MAX_RECOVERY_ATTEMPTS: u32 = 12;
-const SOURCES: [&str; 12] = [
-    "node", "service", "gpu", "meter", "pricing", "backup", "clock", "dispatch", "usage", "ups",
-    "devices", "network",
+const SOURCES: [&str; 13] = [
+    "node",
+    "service",
+    "gpu",
+    "meter",
+    "pricing",
+    "backup",
+    "clock",
+    "dispatch",
+    "usage",
+    "ups",
+    "devices",
+    "network",
+    "retention",
 ];
 const NETWORK_DOWN_MS: i64 = 2 * 60_000;
 const NETWORK_SPEED_TESTS: usize = crate::network_history::ALERT_SPEED_TESTS as usize;
@@ -187,6 +200,8 @@ pub struct Signals {
     pub remote_devices: Vec<(String, crate::devices::DeviceAlertInput)>,
     /// None when network storage cannot be read.
     pub network: Option<NetworkAlertInput>,
+    /// Request retention per side ("api", "meter"); None when unreadable.
+    pub retention: Vec<(&'static str, Option<crate::types::RequestRetention>)>,
 }
 
 enum Verdict {
@@ -1058,6 +1073,29 @@ impl Engine {
                     );
                 }
             }
+            "retention" => {
+                for (side, read) in &signals.retention {
+                    let key = format!("retention:{side}");
+                    let Some(retention) = read else {
+                        if self.alert_open(&key) {
+                            out.insert(key, Verdict::Hold);
+                        }
+                        continue;
+                    };
+                    if let Some(since) = retention
+                        .skipped_since_ms
+                        .filter(|since| now - since >= RETENTION_SKIP_MS)
+                    {
+                        let summary = format!(
+                            "{side} request retention not pruning for {} ({}): {}",
+                            duration(now - since),
+                            retention.status,
+                            one_line(retention.detail.as_deref().unwrap_or("no detail"), 200)
+                        );
+                        out.insert(key, Verdict::Fire(AlertSeverity::Warning, summary));
+                    }
+                }
+            }
             "pricing" => {
                 for (family, model) in signals.pricing_pending.as_ref()? {
                     let summary = format!(
@@ -1435,13 +1473,26 @@ impl AppState {
                 .await
                 .ok()
         };
-        let (backup, clock_synchronized, dispatch_last_trigger_ms, pricing_pending, usage, network) = tokio::join!(
+        let meter_retention = async {
+            let health: serde_json::Value = self.get("/meter/health").await.ok()?;
+            serde_json::from_value(health["maintenance"]["retention"].clone()).ok()
+        };
+        let (
+            backup,
+            clock_synchronized,
+            dispatch_last_trigger_ms,
+            pricing_pending,
+            usage,
+            network,
+            meter_retention,
+        ) = tokio::join!(
             backup,
             clock,
             dispatch,
             pricing,
             crate::usage::observations(&self.usage_snapshot, now),
-            network
+            network,
+            meter_retention
         );
         let ups = Some(self.ups_latest.read().await.clone());
         let gpu = *self.gpu_latest.lock().expect("GPU sample lock");
@@ -1469,6 +1520,7 @@ impl AppState {
             devices,
             remote_devices,
             network,
+            retention: vec![("api", Some(self.retention())), ("meter", meter_retention)],
         }
     }
     pub(crate) fn start_alerts(&self) -> Option<tokio::task::JoinHandle<()>> {
@@ -2505,6 +2557,60 @@ mod tests {
             "meter:sync".into(),
             "meter sync gap: no successful sync for 6 min".into()
         )));
+    }
+
+    #[test]
+    fn retention_alerts_only_after_a_day_of_not_pruning() {
+        let mut engine = Engine::load(Config::default());
+        let h = 3_600_000;
+        let retention = |status: &str, since: Option<i64>| crate::types::RequestRetention {
+            status: status.into(),
+            detail: since.map(|_| "rollup unverified: the request rollup has not passed".into()),
+            skipped_since_ms: since,
+            ..Default::default()
+        };
+        let signals = |api, meter| Signals {
+            retention: vec![("api", Some(api)), ("meter", meter)],
+            ..Default::default()
+        };
+        let active = |engine: &Engine| {
+            engine
+                .view()
+                .active
+                .into_iter()
+                .map(|a| (a.key, a.summary))
+                .collect::<Vec<_>>()
+        };
+        engine.evaluate(
+            T0,
+            &signals(
+                retention("skipped", Some(T0 - 24 * h + 1)),
+                Some(retention("ok", None)),
+            ),
+        );
+        assert!(active(&engine).is_empty());
+        engine.evaluate(
+            T0,
+            &signals(
+                retention("ok", None),
+                Some(retention("failed", Some(T0 - 26 * h))),
+            ),
+        );
+        assert_eq!(
+            active(&engine),
+            [(
+                "retention:meter".into(),
+                "meter request retention not pruning for 26 h (failed): rollup unverified: the request rollup has not passed".into()
+            )]
+        );
+        // An unreadable meter keeps the alert open; a pruning run clears it.
+        engine.evaluate(T0 + h, &signals(retention("ok", None), None));
+        assert_eq!(active(&engine).len(), 1);
+        engine.evaluate(
+            T0 + 2 * h,
+            &signals(retention("ok", None), Some(retention("ok", None))),
+        );
+        assert!(active(&engine).is_empty());
     }
 
     #[test]

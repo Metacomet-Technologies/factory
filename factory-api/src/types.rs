@@ -14,6 +14,45 @@ pub struct Health {
     /// the committed `factory-api/openapi.json` snapshot: the kiosk's API contract.
     pub openapi_sha256: String,
     pub uptime_ms: u64,
+    pub retention: RequestRetention,
+}
+/// Raw request retention of the API copy (MET-206): rows older than 365 days,
+/// only when the verified rollup, the cost backfill and frozen costs cover them.
+/// Runs after each five-minute rollup run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct RequestRetention {
+    /// "pending" before the first run; "ok"; "skipped" when a gate is unmet;
+    /// "failed" when the job errored, leaving every row in place.
+    pub status: String,
+    /// Skip reasons, error, or a note that pruning continues next run.
+    pub detail: Option<String>,
+    pub checked_at_ms: Option<i64>,
+    /// Rows with `ts_ms` strictly below this were eligible in the last run.
+    pub cutoff_ms: Option<i64>,
+    /// Lowest request ID still cached after the last run; null when empty.
+    pub oldest_retained_id: Option<i64>,
+    /// Last run that was allowed to prune, and the rows it deleted.
+    pub pruned_at_ms: Option<i64>,
+    pub pruned_rows: u64,
+    /// Rows deleted by every run since this process started.
+    pub pruned_rows_since_start: u64,
+    /// Start of the current streak of skipped or failed runs; alerts after 24 h.
+    pub skipped_since_ms: Option<i64>,
+}
+impl Default for RequestRetention {
+    fn default() -> Self {
+        Self {
+            status: "pending".into(),
+            detail: None,
+            checked_at_ms: None,
+            cutoff_ms: None,
+            oldest_retained_id: None,
+            pruned_at_ms: None,
+            pruned_rows: 0,
+            pruned_rows_since_start: 0,
+            skipped_since_ms: None,
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorDetail {
