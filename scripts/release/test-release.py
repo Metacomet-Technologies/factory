@@ -723,6 +723,34 @@ class Releases(unittest.TestCase):
         run(root, "git", "update-ref", "refs/remotes/origin/main", second)
         return root, inventory, first, second
 
+    def test_moved_baseline_skips_unreleased_history_and_keeps_existing_tags(self):
+        root, old, first, second = self.history()
+        api = FakeGitHub()
+        api.eligible(first, 1)
+        api.eligible(second, 2)
+        api.runs[2]["conclusion"] = "cancelled"
+        # Under the old baseline, a cancelled exact-SHA CI run blocks everything after it.
+        with self.assertRaisesRegex(ValueError, "inspect/rerun CI run 2"):
+            list(r.planned(api, root, old))
+        r.reserve(api, plan(first, "v0.2.3"))  # An existing release tag before the move.
+        moved = {**old, "activation_baseline": second}
+        (root / "deploy/components.json").write_bytes(r.canonical(moved))
+        commit(root, "move baseline")
+        third = r.git(root, "rev-parse", "HEAD")
+        run(root, "git", "update-ref", "refs/remotes/origin/main", third)
+        api.eligible(third, 3)
+        writes, tags = api.writes, api.tags()
+        plans = list(r.planned(api, root, moved))
+        self.assertEqual([(p["source_sha"], p["release_tag"], p["pull_request"]) for p in plans],
+                         [(third, "v0.2.4", 3)])
+        self.assertEqual((api.writes, api.tags()), (writes, tags))
+        # A later merge still carrying the old baseline fails closed rather than skipping.
+        (root / "deploy/components.json").write_bytes(r.canonical(old))
+        commit(root, "stale baseline")
+        run(root, "git", "update-ref", "refs/remotes/origin/main", r.git(root, "rev-parse", "HEAD"))
+        with self.assertRaisesRegex(ValueError, "activation baseline changed"):
+            list(r.planned(api, root, moved))
+
     def test_pending_ci_is_a_clean_wait(self):
         root, inventory, first, second = self.history()
         for reserved in (False, True):
