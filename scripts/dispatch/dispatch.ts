@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { reviewPRs, cleanupQAWorktrees, fastForwardMain, syncPlaybook, qaArchives, devonMention } from './qa.ts';
 import { repos, issueRepo } from './repos.ts';
 import { observeStagePolicy } from './policy.ts';
+import { openLedger, markerConflicts, commentId, type Ledger } from './ledger.ts';
 
 export const mainCheckout = '/home/agent/work/factory';
 export function runnerCommand(runner: string, args: string[]) {
@@ -72,8 +73,8 @@ export type Issue = {
   id: string; identifier: string; title: string; description: string | null;
   priority: number; createdAt: string; team: { id: string; key: string };
   state: { type: string };
-  completedAt?: string | null; canceledAt?: string | null;
-  labels: Label[]; comments: { body: string; createdAt?: string }[];
+  completedAt?: string | null; canceledAt?: string | null; archivedAt?: string | null; updatedAt?: string;
+  labels: Label[]; comments: { id?: string; body: string; createdAt?: string }[];
   inverseRelations: { type: string; issue: { identifier: string; state: { type: string } } }[];
   attachments: { url: string; metadata: Record<string, unknown>; createdAt: string }[];
 };
@@ -277,12 +278,12 @@ const evidencePattern = /^<!-- factory-dispatch:cursor-evidence pr:(\d+) sha:[a-
 
 const page = 'pageInfo { hasNextPage endCursor }';
 const fields = {
-  labels: 'id name parent { name }', comments: 'body createdAt',
+  labels: 'id name parent { name }', comments: 'id body createdAt',
   inverseRelations: 'type issue { identifier state { type } }',
   attachments: 'url metadata createdAt',
 };
-const issueFields = `id identifier title description priority createdAt completedAt canceledAt team { id key } state { type }
-  ${Object.entries(fields).map(([name, selection]) => `${name}(first: 20) { nodes { ${selection} } ${page} }`).join('\n')}`;
+const issueFields = `id identifier title description priority createdAt updatedAt completedAt canceledAt archivedAt team { id key } state { type }
+  ${Object.entries(fields).map(([name, selection]) => `${name}(first: ${name === 'comments' ? 100 : 20}) { nodes { ${selection} } ${page} }`).join('\n')}`;
 
 async function amp(args: string[]) {
   return new Promise<string>((resolve, reject) => {
@@ -314,7 +315,51 @@ async function searchThreads(args: string[], requireTitle: boolean) {
   return entries as { id: string; title: string }[];
 }
 
+export const ledgerPath = () => process.env.DISPATCH_LEDGER ?? `${homedir()}/.local/state/factory-dispatch/dispatch.db`;
+type Budget = { requests: number; remaining: number | null; reset_ms: number | null };
+
 export async function run(command: string, identifier: string | undefined, dryRun: boolean) {
+  // Reconcile and dry-runs work on an in-memory copy: they never write the ledger.
+  const ledger = openLedger(ledgerPath(), dryRun || command === 'reconcile');
+  if (command === 'reconcile') return reconcile(ledger);
+  // A persisted rate-limit window skips the whole poll: zero Linear requests, one line.
+  const blocked = Number(ledger.get('blocked_until') ?? 0);
+  if (Date.now() < blocked) {
+    console.log(JSON.stringify({ decision: 'linear-blocked', until: new Date(blocked).toISOString() }));
+    return;
+  }
+  const budget: Budget = { requests: 0, remaining: null, reset_ms: null };
+  try { await runPass(command, identifier, dryRun, budget, ledger); }
+  finally { console.log(JSON.stringify({ decision: 'linear-budget', ...budget })); }
+}
+
+// Lists In Progress issues whose claim has no live builder thread and what it would
+// release. Reads the ledger and Amp only; it never writes Linear, Amp or the ledger.
+async function reconcile(ledger: Ledger) {
+  let count = 0;
+  for (const issue of ledger.issues()) {
+    if (issue.state.type !== 'started' || issue.archivedAt) continue;
+    const lines = issue.comments.flatMap(c => commentMarkers(c.body));
+    const match = lines.map(line => line.match(threadPattern)).find(Boolean);
+    const runner = match?.[2] ?? lines.map(line => line.match(claimPattern)).find(Boolean)?.[1];
+    if (!match && !runner) continue;
+    let reason: string;
+    if (!match) reason = 'claim has no thread marker';
+    else if (match[1].startsWith('bc-')) { console.log(JSON.stringify({ decision: 'reconcile-unchecked', issue: issue.identifier, thread: match[1], reason: 'Cursor agent' })); continue; }
+    else {
+      try {
+        if (await listedThread(match[1], false)) continue;
+        reason = await listedThread(match[1], true) ? 'thread archived' : 'thread not found';
+      } catch { console.log(JSON.stringify({ decision: 'reconcile-unchecked', issue: issue.identifier, thread: match[1], reason: 'Amp thread listing unreadable' })); continue; }
+    }
+    count++;
+    console.log(JSON.stringify({ decision: 'would-release', issue: issue.identifier, runner: runner ?? 'unknown', thread: match?.[1] ?? null, reason,
+      release: `${runner ?? 'gpu and console'} slot held by the claim; Devon releases it by moving ${issue.identifier} out of In Progress after inspecting the claim` }));
+  }
+  console.log(JSON.stringify({ decision: 'reconcile', dryRun: true, applied: 0, wouldRelease: count }));
+}
+
+async function runPass(command: string, identifier: string | undefined, dryRun: boolean, budget: Budget, ledger: Ledger) {
   if (!supportedNode(process.versions.node)) throw new Error(`Use Node 24.x (>= 24.12.0); found ${process.versions.node}`);
   const team = process.env.DISPATCH_TEAM ?? 'MET';
   const cap = Number(process.env.DISPATCH_MAX_ACTIVE_PER_RUNNER ?? 2);
@@ -391,14 +436,40 @@ export async function run(command: string, identifier: string | undefined, dryRu
   }
   async function query(document: string, variables: object = {}) {
     let response;
+    budget.requests++;
     try {
       response = await fetch(endpoint, { method: 'POST', headers: { Authorization: key, 'Content-Type': 'application/json' }, body: JSON.stringify({ query: document, variables }), signal: AbortSignal.timeout(30_000) });
     } catch { throw new Error('Linear request failed; outcome may be unknown'); }
-    if (!response.ok) throw new Error(`Linear HTTP ${response.status}; outcome may be unknown`);
+    for (const [field, header] of [['remaining', 'x-ratelimit-requests-remaining'], ['reset_ms', 'x-ratelimit-requests-reset']] as const) {
+      const value = response.headers.get(header);
+      if (value !== null) budget[field] = /^\d+$/.test(value) && Number.isSafeInteger(Number(value))
+        && (field !== 'reset_ms' || Number(value) <= 8.64e15) ? Number(value) : null;
+    }
+    const limit = response.headers.get('x-ratelimit-requests-limit');
+    if (limit !== null && /^\d{1,9}$/.test(limit) && Number(limit) > 0) requestLimit = Number(limit);
     let result;
-    try { result = await response.json(); }
-    catch { throw new Error('Linear returned invalid JSON; outcome may be unknown'); }
-    if (result.errors?.length || !result.data) throw new Error('Linear GraphQL error; outcome may be unknown');
+    try { result = await response.json(); } catch { result = undefined; }
+    if (!response.ok || result?.errors?.length || !result?.data) {
+      const errors = Array.isArray(result?.errors) ? result.errors.map(error => ({
+        code: typeof error?.extensions?.code === 'string' ? redact(error.extensions.code) : null,
+        message: typeof error?.message === 'string' ? redact(error.message).slice(0, 200) : null,
+      })) : [];
+      log('linear-error', { status: response.status, errors });
+      if (response.status === 429 || errors.some(error => error.code === 'RATELIMITED')) {
+        // Skip polls until the reset, or back off 60 s doubling to 1 h when no reset is known.
+        // Positive jitter of 1..1000 ms; a successful poll clears the backoff.
+        const backoff = Math.min(3600, Math.max(60, Number(ledger.get('backoff_s') ?? 0) * 2));
+        const base = budget.reset_ms !== null && budget.reset_ms > Date.now() ? budget.reset_ms : Date.now() + backoff * 1000;
+        const until = base + 1 + Math.floor(Math.random() * 1000);
+        ledger.set('blocked_until', until);
+        ledger.set('backoff_s', backoff);
+        log('linear-backoff', { until: new Date(until).toISOString(), backoff_s: backoff });
+        throw new Error(`Linear rate limited; resets ${budget.reset_ms === null ? 'unknown' : new Date(budget.reset_ms).toISOString()}`);
+      }
+      if (!response.ok) throw new Error(`Linear HTTP ${response.status}; outcome may be unknown`);
+      if (result === undefined) throw new Error('Linear returned invalid JSON; outcome may be unknown');
+      throw new Error('Linear GraphQL error; outcome may be unknown');
+    }
     return result.data;
   }
   async function pages(document: string, variables: object, select: (data: any) => any) {
@@ -425,15 +496,29 @@ export async function run(command: string, identifier: string | undefined, dryRu
     const result = await query(document, variables);
     if (!Object.values(result).every((value: any) => value?.success === true)) throw new Error('Linear mutation unsuccessful; stopping pass');
   }
+  // The caller-supplied ID makes the ledger row and the Linear comment one record, so a
+  // later delta read of the same comment updates rather than duplicates it.
   async function comment(issue: Issue, body: string) {
-    await mutate(issue, 'mutation Comment($input: CommentCreateInput!) { commentCreate(input: $input) { success } }', { input: { issueId: issue.id, body } });
-    issue.comments.push({ body });
+    const id = commentId(issue.id, body, issue.comments.filter(c => c.body === body).length);
+    await mutate(issue, 'mutation Comment($input: CommentCreateInput!) { commentCreate(input: $input) { success } }', { input: { id, issueId: issue.id, body } });
+    issue.comments.push({ id, body });
+    ledger.saveComment(issue.id, { id, body }, true);
   }
   async function removeLabel(issue: Issue) {
     const label = issue.labels.find(label => label.name === 'dispatch');
     if (!label) return;
     await mutate(issue, 'mutation RemoveLabel($id: String!, $labelId: String!) { issueRemoveLabel(id: $id, labelId: $labelId) { success } }', { id: issue.id, labelId: label.id });
     issue.labels = issue.labels.filter(value => value.id !== label.id);
+    ledger.saveIssue(issue);
+  }
+  // Headroom: below 10% of the request budget, non-lifecycle work waits for a later poll.
+  let requestLimit = 2500;
+  const deferred = new Set<string>();
+  function defer(work: string) {
+    if (budget.remaining === null || budget.remaining > requestLimit / 10) return false;
+    if (!deferred.has(work)) log('linear-headroom', { deferred: work, remaining: budget.remaining, limit: requestLimit });
+    deferred.add(work);
+    return true;
   }
   const has = (issue: Issue, name: string) => issue.comments.some(comment => commentMarkers(comment.body).includes(marker(name)));
   const thread = (issue: Issue) => issue.comments.flatMap(comment => commentMarkers(comment.body)).map(line => line.match(threadPattern)).find(Boolean);
@@ -443,7 +528,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
   }
   const labelAttempts = new Set<string>();
   async function labelThread(issue: Issue, id: string) {
-    if (has(issue, `labeled ${id} factory`) || has(issue, `label-skipped-archived ${id}`) || labelAttempts.has(`${issue.id}:${id}`)) return;
+    if (has(issue, `labeled ${id} factory`) || has(issue, `label-skipped-archived ${id}`) || labelAttempts.has(`${issue.id}:${id}`) || defer('thread labels')) return;
     labelAttempts.add(`${issue.id}:${id}`);
     if (dryRun) { showAmp(issue, ['amp', 'threads', 'label', id, 'factory']); return; }
     try { await amp(['threads', 'label', id, 'factory']); }
@@ -547,12 +632,86 @@ export async function run(command: string, identifier: string | undefined, dryRu
     log('cursor-usage', { issue: issue.identifier, agent: id, final: !!text });
   }
 
-  const raw = await pages(`query Queue($filter: IssueFilter!, $after: String) { issues(filter: $filter, first: 20, after: $after, includeArchived: true) { nodes { ${issueFields} } ${page} } }`, {
-    filter: { team: { key: { eq: team } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }, { comments: { some: { body: { contains: '<!-- factory-qa:' } } } }] },
-  }, data => data.issues);
-  const issues = await Promise.all(raw.map(hydrate));
+  const startedAt = Date.now();
+  const since = new Date(startedAt - 7 * 24 * 60 * 60_000).toISOString();
+  const markerText = /<!-- factory-(?:dispatch|qa):/;
+  const tracked = (i: Issue) => i.labels.some(label => label.name === 'dispatch') || i.comments.some(c => markerText.test(c.body));
+  const read = (name: string, filter: object, order = '') => pages(`query ${name}($filter: IssueFilter!, $after: String) { issues(filter: $filter, first: 20, after: $after${order}) { nodes { ${issueFields} } ${page} } }`, { filter }, data => data.issues);
+  const importing = ledger.get('imported') === undefined;
+  if (importing || command === 'import') {
+    if (ledger.get('imported') !== undefined) { log('import-skip', { reason: 'ledger already imported', ...ledger.counts() }); return; }
+    // One-time import: the former full queue, read once, seeds the ledger from Linear's markers.
+    const fetched: Issue[] = [];
+    // Keep overflow reads sequential so a failed request stops all further Linear work.
+    for (const item of await read('Import', { team: { key: { eq: team } }, or: [{ labels: { some: { name: { eq: 'dispatch' } } } }, { comments: { some: { body: { contains: '<!-- factory-dispatch:' } } } }, { comments: { some: { body: { contains: '<!-- factory-qa:' } } } }],
+      and: [{ or: [{ state: { type: { nin: ['completed', 'canceled'] } } }, { completedAt: { gte: since } }, { canceledAt: { gte: since } }] }] })) fetched.push(await hydrate(item));
+    const conflicts = fetched.flatMap(i => markerConflicts(i.comments).map(conflict => ({ issue: i.identifier, ...conflict })));
+    if (conflicts.length) {
+      log('import-conflict', { conflicts });
+      throw new Error('Ledger import found conflicting markers; nothing imported, stopping for manual review');
+    }
+    ledger.transaction(() => {
+      for (const i of fetched) ledger.store(i);
+      ledger.set('imported', startedAt);
+      ledger.set('cursor', startedAt);
+    });
+    if (command === 'import') for (const i of fetched) {
+      log(dryRun ? 'would-import' : 'imported', { issue: i.identifier, state: i.state.type, dispatchLabel: i.labels.some(label => label.name === 'dispatch'),
+        markers: ledger.markers(i.id).map(m => [m.kind, m.thread, m.pr, m.sha && m.sha.slice(0, 12)].filter(Boolean).join(' ')) });
+    }
+    log('import', { dryRun, ...ledger.counts() });
+    if (command === 'import') return;
+  } else {
+    // Delta: team issues whose own fields, comments or attachments changed since the cursor
+    // minus a two-minute overlap. Overlapping pages and polls dedupe by issue and comment ID.
+    const gt = new Date(Number(ledger.get('cursor')) - 2 * 60_000).toISOString();
+    const nodes = new Map<string, any>();
+    for (const item of await read('Delta', { team: { key: { eq: team } }, or: [{ updatedAt: { gt } },
+      { comments: { some: { updatedAt: { gt } } } }, { attachments: { some: { updatedAt: { gt } } } }] }, ', orderBy: updatedAt')) nodes.set(item.id, item);
+    const changed: Issue[] = [];
+    for (const item of nodes.values()) {
+      if (!ledger.has(item.id) && !item.labels.pageInfo.hasNextPage && !item.comments.pageInfo.hasNextPage && !item.labels.nodes.some((label: Label) => label.name === 'dispatch')
+        && !item.comments.nodes.some((c: { body: string }) => markerText.test(c.body))) continue;
+      const full = await hydrate(item);
+      if (ledger.has(full.id) || tracked(full)) changed.push(full);
+    }
+    // A blocker's change advances only the blocker; refresh it on the issues it blocks.
+    ledger.transaction(() => {
+      for (const i of changed) ledger.store(i);
+      ledger.patchBlockers(new Map([...nodes.values()].map(i => [i.identifier, i.state])));
+    });
+  }
+  // Reconciliation sweep every 15 minutes: re-read the ledger's open claims by ID, including
+  // archived issues (delete and archive do not advance updatedAt), and the In Progress state.
+  const swept = !ledger.get('started_state') || startedAt - Number(ledger.get('swept_at') ?? 0) >= 15 * 60_000;
+  if (swept) {
+    const statesFilter = { team: { key: { eq: team } }, name: { eq: 'In Progress' } };
+    // Issues the import just read need no second read this poll.
+    const open = importing ? [] : ledger.issues().filter(i => !i.archivedAt && !['completed', 'canceled'].includes(i.state.type)
+      && i.comments.some(c => commentMarkers(c.body).some(line => claimPattern.test(line) || threadPattern.test(line))));
+    let states: any[] | undefined;
+    const refreshed: Issue[] = [];
+    for (let n = 0; n < open.length; n += 20) {
+      const ids = open.slice(n, n + 20).map(i => i.id);
+      const data = await query(`query Sweep($filter: IssueFilter!, $states: WorkflowStateFilter!) { issues(filter: $filter, first: 20, includeArchived: true) { nodes { ${issueFields} } ${page} } workflowStates(filter: $states, first: 100) { nodes { id name type } ${page} } }`,
+        { filter: { id: { in: ids } }, states: statesFilter });
+      if (data.issues.pageInfo.hasNextPage || data.workflowStates.pageInfo.hasNextPage) throw new Error('Linear sweep page overflowed');
+      states ??= data.workflowStates.nodes;
+      for (const item of data.issues.nodes) refreshed.push(await hydrate(item));
+      const missing = open.slice(n, n + 20).filter(i => !data.issues.nodes.some((node: any) => node.id === i.id)).map(i => i.identifier);
+      if (missing.length) log('sweep-missing', { issues: missing });
+    }
+    states ??= await pages(`query States($filter: WorkflowStateFilter!, $after: String) { workflowStates(filter: $filter, first: 100, after: $after) { nodes { id name type } ${page} } }`, { filter: statesFilter }, data => data.workflowStates);
+    if (states.length !== 1 || states[0].type !== 'started') throw new Error('Team must have one In Progress state of type started');
+    ledger.transaction(() => { for (const i of refreshed) ledger.store(i); ledger.set('started_state', states![0].id); });
+  }
+  const startedState = ledger.get('started_state')!;
+  const issues = ledger.issues().filter(i => !i.archivedAt && tracked(i) && (!['completed', 'canceled'].includes(i.state.type)
+    || Date.parse(i.completedAt ?? '') >= Date.parse(since) || Date.parse(i.canceledAt ?? '') >= Date.parse(since)));
   if (identifier && !issues.some(issue => issue.identifier === identifier)) {
-    issues.push(await hydrate((await query(`query OneIssue($id: String!) { issue(id: $id) { ${issueFields} } }`, { id: identifier })).issue));
+    const one = await hydrate((await query(`query OneIssue($id: String!) { issue(id: $id) { ${issueFields} } }`, { id: identifier })).issue);
+    if (one.team.key === team) ledger.transaction(() => ledger.store(one));
+    issues.push(one);
   }
   if (identifier && !issues.some(issue => issue.identifier === identifier && issue.team.key === team)) throw new Error('Issue does not belong to DISPATCH_TEAM');
   try {
@@ -572,9 +731,6 @@ export async function run(command: string, identifier: string | undefined, dryRu
       classification: 'unknown', dispatchSnapshot: 'unknown', policyRevision: 'unknown', trustedMainSha: 'unknown',
       requiredMode: 'unknown', mandatoryChecks: [], blockers: ['observer-unavailable'], nextAction: 'blocked' });
   }
-  const states = await pages(`query States($filter: WorkflowStateFilter!, $after: String) { workflowStates(filter: $filter, first: 100, after: $after) { nodes { id name type } ${page} } }`, { filter: { team: { key: { eq: team } }, name: { eq: 'In Progress' } } }, data => data.workflowStates);
-  if (states.length !== 1 || states[0].type !== 'started') throw new Error('Team must have one In Progress state of type started');
-
   const active: Record<string, number> = { gpu: 0, console: 0, cursor: 0 };
   for (const repo of repos.filter(repo => repo.defaultRunner === 'orb')) {
     active[`orb:${repo.name}`] = 0;
@@ -600,7 +756,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
     const blockers = issue.inverseRelations.filter(relation => relation.type === 'blocks' && !['completed', 'canceled'].includes(relation.issue.state.type)).map(relation => relation.issue.identifier);
     if (blockers.length) {
       log('blocked', { issue: issue.identifier, blockers });
-      if (!has(issue, 'waiting')) await comment(issue, `Waiting on ${blockers.join(', ')}\n\n${marker('waiting')}`);
+      if (!has(issue, 'waiting') && !defer('waiting comments')) await comment(issue, `Waiting on ${blockers.join(', ')}\n\n${marker('waiting')}`);
       continue;
     }
     const { errors, runner: requestedRunner, engine, effort, repo } = validate(issue);
@@ -643,7 +799,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
         }
       }
       await comment(issue, `https://cursor.com/agents/${id}\n\n${marker(`thread ${id} runner:cursor`)}`);
-      await mutate(issue, 'mutation Move($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }', { id: issue.id, input: { stateId: states[0].id } });
+      await mutate(issue, 'mutation Move($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }', { id: issue.id, input: { stateId: startedState } });
       log('dispatched', { issue: issue.identifier, thread: dryRun ? '<new-agent-id>' : id, runner });
       continue;
     }
@@ -677,7 +833,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
       }
     }
     await comment(issue, `https://ampcode.com/threads/${id}\n\n${marker(`thread ${id} runner:${runner}`)}`);
-    await mutate(issue, 'mutation Move($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }', { id: issue.id, input: { stateId: states[0].id } });
+    await mutate(issue, 'mutation Move($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }', { id: issue.id, input: { stateId: startedState } });
     log('dispatched', { issue: issue.identifier, thread: dryRun ? '<new-thread-id>' : id, runner });
     await labelThread(issue, id);
   }
@@ -958,7 +1114,7 @@ export async function run(command: string, identifier: string | undefined, dryRu
     finally { rmSync(temporary, { force: true }); }
   }
   for (const { issue, id, claim, done } of archiveCandidates) {
-    if (archives >= 5) break;
+    if (archives >= 5 || defer('archive sweep')) break;
     if (id.startsWith('bc-')) {
       // Cursor's documented archive is idempotent; quiet time comes from the agent and its latest run.
       if (dryRun) {
@@ -1051,6 +1207,12 @@ export async function run(command: string, identifier: string | undefined, dryRu
     }
     await comment(issue, `Archived builder worktree removed.\n\n${marker('worktree-removed')}`);
   }
+  // Only a fully successful poll advances the cursor; a failure rereads the same window.
+  ledger.transaction(() => {
+    ledger.set('cursor', startedAt);
+    if (swept) ledger.set('swept_at', startedAt);
+    ledger.set('backoff_s', 0);
+  });
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
@@ -1058,8 +1220,10 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
     const args = process.argv.slice(2);
     const dryRun = args.includes('--dry-run');
-    const positional = args.filter(arg => arg !== '--dry-run');
-    if (!((positional.length === 1 && positional[0] === 'poll') || (positional.length === 2 && positional[0] === 'issue' && /^[A-Z][A-Z0-9]*-\d+$/.test(positional[1])))) throw new Error('Usage: dispatch.ts poll|issue MET-123 [--dry-run]');
+    const reconcileOnly = args.includes('--reconcile');
+    const positional = args.filter(arg => arg !== '--dry-run' && arg !== '--reconcile');
+    if (reconcileOnly ? positional.length !== 0 : !((positional.length === 1 && ['poll', 'import'].includes(positional[0])) || (positional.length === 2 && positional[0] === 'issue' && /^[A-Z][A-Z0-9]*-\d+$/.test(positional[1])))) throw new Error('Usage: dispatch.ts poll|import|issue MET-123 [--dry-run] | dispatch.ts --reconcile');
+    if (reconcileOnly) positional.push('reconcile');
     // Existing, dedicated inode: even dry-run acquires the lock without writes.
     fd = openSync(process.env.DISPATCH_LOCK_FILE ?? '/home/agent/work/factory/scripts/dispatch/dispatch.lock', 'r');
     const lock = spawnSync('flock', ['--exclusive', '3'], { stdio: ['ignore', 'ignore', 'ignore', fd] });

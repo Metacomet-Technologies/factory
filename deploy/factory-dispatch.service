@@ -11,6 +11,7 @@ WorkingDirectory=/home/agent/work
 Environment=HOME=/home/agent
 Environment="PATH=@PATH@"
 Environment="DISPATCH_RUNNERS=gpu=factory-gpu,console=factory-console"
+Environment="DISPATCH_LEDGER=/home/agent/.local/state/factory-dispatch/dispatch.db"
 ExecStart=@NODE@ /home/agent/work/factory/scripts/dispatch/dispatch.ts poll
 NoNewPrivileges=true
 TimeoutStartSec=1h

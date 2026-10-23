@@ -1,6 +1,6 @@
 # Account usage collector (MET-125)
 
-Run on factory-gpu as its already authenticated `agent`. Node **24.21.0** in
+Run on factory-gpu as its already authenticated `agent`. Node **24.22.1** in
 `.node-version` remains the preferred and CI version; runtime accepts Node 24.x at
 **24.12.0** or newer. No npm dependencies, inference, login/logout, reset-credit
 consumption, runner changes, settings changes, transcript reads or DB writes.
@@ -146,7 +146,7 @@ codex, kimi, opencode. Existing `tool`, `status`, `note` fields remain; note is 
 and writes, including scheduling reads during `--dry-run`. The production default
 is unchanged. Tests always use temporary paths; no test reads or writes `/var/lib`.
 The parent directory must already exist. CI runs both Node suites with the pinned
-Node 24.21.0 runtime: `node --test scripts/dispatch scripts/usage`.
+Node 24.22.1 runtime: `node --test scripts/dispatch scripts/usage`.
 
 Each tracked entry adds `reason`, `observed_at_ms`, `source`, `cli_version`,
 nullable `plan`, `windows`, nullable `balance`, `balances`, and nullable
