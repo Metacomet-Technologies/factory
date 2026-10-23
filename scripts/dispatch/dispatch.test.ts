@@ -594,8 +594,16 @@ test('agent contract and prompt byte budgets, scoped reads and single startup ch
     'After opening a PR and each later push', 'only PR URL', 'head SHA',
     'complete `git diff --name-only origin/main...HEAD` file list', 'Markdown',
     'deletions and renames, including sources', 'No diff/contents',
-    'redact sensitive data and identify omissions']) assert.ok(agents.includes(text), text);
-  for (const area of ['db', 'kiosk', 'cloud']) {
+    'redact sensitive data and identify omissions',
+    'Orchestrator only: `docs/agents/orchestrator.md`']) assert.ok(agents.includes(text), text);
+  const orchestrator = readFileSync(new URL('../../docs/agents/orchestrator.md', import.meta.url), 'utf8');
+  for (const text of ['Builders and\nQA keep every limit in `AGENTS.md`', 'Merge PRs that pass the merge gate',
+    'Set Linear status on any MET issue', 'Close PRs superseded', 'resolve conflicts or fix review findings',
+    'Continue any builder thread', 'up to four orb worker threads',
+    '`node scripts/dispatch/qa.ts check <PR> <SHA>`', '`gh pr merge <PR> --squash --match-head-commit <SHA>`',
+    'Never use `--admin` or `--auto`', 'markers stay off limits', 'Stop and ask Devon before irreversible'])
+    assert.ok(orchestrator.includes(text), text);
+  for (const area of ['db', 'kiosk', 'cloud', 'orchestrator']) {
     const text = readFileSync(new URL(`../../docs/agents/${area}.md`, import.meta.url));
     assert.ok(Buffer.byteLength(text) <= 4000, `${area}.md is ${Buffer.byteLength(text)} bytes`);
   }
