@@ -1195,27 +1195,55 @@
   background: var(--muted);
   cursor: not-allowed;
 }
-.select-wrapper {
-  position: relative;
-  display: block;
-  width: 100%;
-  min-width: 0;
+.select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+  cursor: pointer;
 }
-.select-wrapper > select {
-  appearance: none;
-  padding-right: 34px;
-}
-.select-wrapper > select option {
-  color: var(--foreground);
-  background: var(--card);
-}
-.select-wrapper > svg {
-  position: absolute;
-  top: 50%;
-  right: 10px;
-  transform: translateY(-50%);
+.select-icon {
+  display: flex;
   color: var(--muted-foreground);
-  pointer-events: none;
+}
+.select-positioner {
+  z-index: 62;
+  outline: 0;
+}
+.select-content {
+  min-width: var(--anchor-width);
+  max-height: var(--available-height);
+  overflow: auto;
+  padding: 4px;
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--card) 94%, transparent);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-md);
+  box-shadow:
+    var(--shadow-glass),
+    0 16px 32px -16px rgb(0 0 0 / 45%);
+}
+.select-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
+  padding: 6px 10px;
+  font-size: 14px;
+  border-radius: var(--radius-sm);
+  cursor: default;
+  outline: 0;
+}
+.select-item[data-highlighted] {
+  background: var(--muted);
+}
+.select-item-indicator {
+  display: flex;
+  color: var(--accent-text);
 }
 
 /* ---- Dialog (ui/dialog) -------------------------------------------------- */
@@ -1241,7 +1269,8 @@
   background: color-mix(in srgb, var(--card) 94%, transparent);
   -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  border: 1px solid var(--glass-edge);
+  /* The modal's edge must read on its own over the dimmed backdrop (≥ 3:1). */
+  border: 1px solid var(--border-control);
   border-radius: var(--radius-lg);
   box-shadow:
     var(--shadow-glass),
@@ -1316,8 +1345,7 @@
 .ups-control-setting p {
   font-size: 13px;
 }
-.ups-control-setting .field,
-.ups-control-setting .select-wrapper {
+.ups-control-setting .field {
   max-width: 320px;
 }
 .ups-controls [data-slot="button"] {

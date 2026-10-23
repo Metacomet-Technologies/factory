@@ -387,8 +387,13 @@ describe("remote devices", () => {
       expect(link.getByText("Live")).toBeInTheDocument();
       expect(summary).toHaveTextContent("Host summary · Live");
       expect(within(summary).getByText("critical")).toBeInTheDocument();
-      if (gets === "failed")
-        expect(screen.getByText("HTTP 503. Retrying on the next refresh.")).toBeInTheDocument();
+      if (gets === "failed") {
+        // The current view and its history each fail on their own.
+        expect(screen.getAllByText("HTTP 503")).toHaveLength(2);
+        expect(
+          within(screen.getByRole("region", { name: "CPU history" })).getByText("HTTP 503"),
+        ).toBeInTheDocument();
+      }
 
       // The agent stops. At 46 s the cached frame is stale, not Live, with no current readings.
       clock = t + 46_000;

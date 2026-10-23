@@ -169,6 +169,8 @@ export default function DevicesPage({
   deviceId,
   view: received,
   history,
+  historyLoading = false,
+  historyError = null,
   range,
   setRange,
   error,
@@ -180,6 +182,8 @@ export default function DevicesPage({
   deviceId: string;
   view: DeviceView | null;
   history: DeviceHistory | null;
+  historyLoading?: boolean | undefined;
+  historyError?: string | null | undefined;
   range: DeviceRange;
   setRange: (range: DeviceRange) => void;
   error: string | null;
@@ -295,7 +299,9 @@ export default function DevicesPage({
               />
             }
           >
-            {!history || history.points.length === 0 ? (
+            {historyLoading || historyError ? (
+              <ResourceState loading={historyLoading} error={historyError} />
+            ) : !history || history.points.length === 0 ? (
               <p className="empty">No samples in this range.</p>
             ) : (
               <Suspense fallback={<ResourceState loading error={null} />}>

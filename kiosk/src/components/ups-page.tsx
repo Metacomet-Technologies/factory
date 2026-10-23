@@ -222,12 +222,15 @@ function Timeline({ now, index }: { now: number; index: number }) {
 
 export default function UpsPage({
   current,
+  status = { loading: false, error: null },
   now,
   warnings,
   live,
   revision,
 }: {
   current: UpsCurrent | null | undefined;
+  /** The /v1/ups request: telemetry may also arrive over the stream. */
+  status?: { loading: boolean; error: string | null } | undefined;
   now: number;
   warnings: string[];
   live: LiveState;
@@ -329,6 +332,7 @@ export default function UpsPage({
         }
         aria-label="Live UPS"
       >
+        <ResourceState loading={status.loading} error={status.error} />
         <div className="ups-live-grid">
           <div>
             <Stat
@@ -444,12 +448,17 @@ export default function UpsPage({
           index={3}
           aria-label="Battery health"
         >
+          <ResourceState
+            loading={eventHistory.loading}
+            error={eventHistory.error}
+            title="Unable to load the self-test history"
+          />
           <KeyValue
             rows={[
               [
                 "Last self-test",
                 `${selfTest?.detail ?? fresh?.test_result ?? "—"} · ${
-                  eventHistory.loading
+                  eventHistory.loading || eventHistory.error
                     ? "—"
                     : selfTest
                       ? date(selfTest.started_ms)
@@ -467,11 +476,6 @@ export default function UpsPage({
                 `${replace ? replace.toLocaleDateString(undefined, { timeZone: "UTC" }) : "—"} · estimate (installed date + 3 years)`,
               ],
             ]}
-          />
-          <ResourceState
-            loading={false}
-            error={eventHistory.error}
-            title="Unable to load the self-test history"
           />
           <h4>Minimum runtime trend · hourly, 70–110 W average load</h4>
           {hourly.loading || hourly.error ? (

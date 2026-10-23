@@ -1,4 +1,4 @@
-import { AlertTriangle, CircleCheck } from "lucide-react";
+import { AlertTriangle, CircleCheck, Info } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiUrl } from "../api/client";
 import type {
@@ -16,6 +16,7 @@ import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "./ui/dialog";
 import { Input } from "./ui/input";
 import { Select } from "./ui/select";
+import { cn } from "@/lib/utils";
 
 const denied = "Controls available from Devon's or David's devices";
 
@@ -29,6 +30,18 @@ class ControlError extends Error {
     this.validJson = validJson;
   }
 }
+
+/** How a result reads: executed, accepted but unverified, refused or not executed, or unknown. */
+type Outcome = "ok" | "info" | "refused" | "unknown";
+type Message = { text: string; outcome: Outcome } | null;
+const trackingOutcome = (status: string): Outcome =>
+  status === "SUCCESS"
+    ? "ok"
+    : status === "FSD_SET"
+      ? "info"
+      : status === "PENDING"
+        ? "unknown"
+        : "refused";
 
 function consequence(action: string) {
   if (action === "power.off_stay") return "Recovery needs the physical power button.";
@@ -74,12 +87,9 @@ function SettingForm({
           id={id}
           value={value}
           aria-describedby={`${id}-help`}
-          onChange={(event) => setValue(event.target.value)}
-        >
-          {setting.allowed_values.map((option) => (
-            <option key={option}>{option}</option>
-          ))}
-        </Select>
+          options={setting.allowed_values}
+          onValueChange={setValue}
+        />
       ) : (
         <Input
           id={id}
@@ -103,7 +113,11 @@ function SettingForm({
 export default function UpsControls() {
   const [state, setState] = useState<ControlState | null>(null);
   const [loading, setLoading] = useState(true);
-  const [message, setMessage] = useState("");
+  const [message, setMessage] = useState<Message>(null);
+  const [auditPage, setAuditPage] = useState<{ loading: boolean; error: string | null }>({
+    loading: false,
+    error: null,
+  });
   const [busy, setBusy] = useState(false);
   const [dialog, setDialog] = useState<{
     action: ControlAction;
@@ -140,7 +154,7 @@ export default function UpsControls() {
         if (stateTimer.current !== null) clearInterval(stateTimer.current);
         setState(null);
         setStateError(denied);
-        setMessage("");
+        setMessage(null);
         setLoading(false);
         setDialog(null);
       } else if (forbidden.current) {
@@ -258,7 +272,7 @@ export default function UpsControls() {
   const prepare = useCallback(
     async (action: ControlAction, value: string | null = null) => {
       setBusy(true);
-      setMessage("");
+      setMessage(null);
       try {
         const confirmation = await controlRequest<Confirmation>("actions", {
           action: action.action,
@@ -269,7 +283,10 @@ export default function UpsControls() {
         setDialog({ action, value, confirmation });
       } catch (error) {
         if (!forbidden.current)
-          setMessage(error instanceof Error ? error.message : "Request failed");
+          setMessage({
+            text: error instanceof Error ? error.message : "Request failed",
+            outcome: "refused",
+          });
       } finally {
         setBusy(false);
         void refresh();
@@ -291,7 +308,10 @@ export default function UpsControls() {
         `actions/${dialog.confirmation.id}/confirm`,
         { phrase: typed },
       );
-      setMessage([result.result, result.expected_downtime].filter(Boolean).join(" · "));
+      setMessage({
+        text: [result.result, result.expected_downtime].filter(Boolean).join(" · "),
+        outcome: trackingOutcome(result.tracking_status),
+      });
       if (
         dialog.action.tier === "power" &&
         ["FSD_SET", "SUCCESS", "PENDING"].includes(result.tracking_status)
@@ -310,8 +330,11 @@ export default function UpsControls() {
       if (!forbidden.current)
         setMessage(
           error instanceof ControlError && error.validJson
-            ? error.message
-            : `Confirmation failed; outcome unknown. Check audit before retrying. ${error instanceof Error ? error.message : String(error)}`,
+            ? { text: error.message, outcome: "refused" }
+            : {
+                text: `Confirmation failed; outcome unknown. Check audit before retrying. ${error instanceof Error ? error.message : String(error)}`,
+                outcome: "unknown",
+              },
         );
     } finally {
       setDialog(null);
@@ -337,10 +360,22 @@ export default function UpsControls() {
       </AlertDescription>
     </Alert>
   );
+  // Only an executed action gets the check; refusals are destructive and unknown outcomes warn.
   const result = message && (
-    <Alert className="ups-control-result" role="status">
-      <CircleCheck aria-hidden="true" />
-      <AlertDescription>{message}</AlertDescription>
+    <Alert
+      className={cn("ups-control-result", message.outcome === "unknown" && "pending")}
+      variant={message.outcome === "refused" ? "destructive" : "default"}
+      data-outcome={message.outcome}
+      role="status"
+    >
+      {message.outcome === "ok" ? (
+        <CircleCheck aria-hidden="true" className="status-ok" />
+      ) : message.outcome === "info" ? (
+        <Info aria-hidden="true" />
+      ) : (
+        <AlertTriangle aria-hidden="true" />
+      )}
+      <AlertDescription>{message.text}</AlertDescription>
     </Alert>
   );
 
@@ -358,12 +393,11 @@ export default function UpsControls() {
           {pendingBanner}
           {result}
           <section className="ups-panel" aria-label="Controls">
-            <p
-              className={stateError === denied ? "muted" : "status-fail"}
-              role={stateError === denied ? undefined : "alert"}
-            >
-              {stateError}
-            </p>
+            {stateError === denied ? (
+              <p className="muted">{denied}</p>
+            ) : (
+              <ResourceState loading={false} error={stateError} title="Controls unavailable" />
+            )}
           </section>
         </div>
       ) : (
@@ -420,6 +454,11 @@ export default function UpsControls() {
           ))}
           <div className="ups-control-tier">
             <h4>Audit log</h4>
+            <ResourceState
+              loading={auditPage.loading}
+              error={auditPage.error}
+              title="Unable to load older audit rows"
+            />
             {!rows.length && <p className="muted">No audit rows.</p>}
             <ol
               className="ups-events ups-control-audit"
@@ -445,6 +484,7 @@ export default function UpsControls() {
                   disabled={busy}
                   onClick={() => {
                     setAudit(null);
+                    setAuditPage({ loading: false, error: null });
                     void refresh();
                   }}
                 >
@@ -457,14 +497,24 @@ export default function UpsControls() {
                   disabled={busy}
                   onClick={() => {
                     setBusy(true);
+                    setAuditPage({ loading: true, error: null });
                     void controlRequest<{ rows: AuditRow[] }>(
                       `audit?limit=20&before_ms=${rows[rows.length - 1]!.ts_ms}`,
                     )
-                      .then((page) => setAudit(page.rows))
-                      .catch((error: unknown) => {
-                        if (!forbidden.current)
-                          setMessage(error instanceof Error ? error.message : "Audit unavailable");
+                      .then((page) => {
+                        setAudit(page.rows);
+                        setAuditPage({ loading: false, error: null });
                       })
+                      .catch((error: unknown) =>
+                        setAuditPage({
+                          loading: false,
+                          error: forbidden.current
+                            ? null
+                            : error instanceof Error
+                              ? error.message
+                              : "Audit unavailable",
+                        }),
+                      )
                       .finally(() => setBusy(false));
                   }}
                 >

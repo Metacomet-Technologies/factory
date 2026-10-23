@@ -154,21 +154,25 @@ is on).
   rows on the device page are a grid for this reason).
 - `RangeToggle` (`ui/range-toggle.tsx`): segmented control; the pressed
   segment gets a `--border-control` outline so the state reads at 3:1.
-- `Input` (`ui/input.tsx`, Base UI) and `Select` (`ui/select.tsx`): glass
-  fields (`.field`): the card tint at `--glass-alpha`, a `--border-control`
-  outline (≥ 3:1), `radius-md`, the teal focus ring, `--fail` border when
-  `aria-invalid`, and the muted fill when disabled. `Select` is a native
-  `<select>` with a chevron so phones get the system picker and the value
-  stays a form value. Label every field with `<label htmlFor>`.
+- `Input` (`ui/input.tsx`) and `Select` (`ui/select.tsx`), both Base UI:
+  glass fields (`.field`): the card tint at `--glass-alpha`, a
+  `--border-control` outline (≥ 3:1), `radius-md`, the teal focus ring,
+  `--fail` border when `aria-invalid`, and the muted fill when disabled.
+  `Select` takes `options`, `value` and `onValueChange`; its trigger is a
+  `combobox` and its glass popup a listbox of `option`s (`name` submits the
+  value). Label every field with `<label htmlFor>`.
 - `Dialog`, `DialogContent`, `DialogTitle`, `DialogDescription`
   (`ui/dialog.tsx`, Base UI): a modal glass sheet (`radius-lg`, glass blur,
-  `--shadow-glass`) over a dimmed backdrop; focus is trapped while open and
+  a `--border-control` outline, `--shadow-glass`) over a dimmed backdrop; focus is trapped while open and
   Escape closes it through `onOpenChange`. UPS Controls' typed confirmation
   is the only dialog; keep any new one read-only unless it is a control.
-- `Alert` (`radius-lg`): `variant="destructive"` for errors (via
-  `ResourceState`); the default for results; add `className="pending"` for the
-  warn tone (UPS pending power banner, pricing pending). Pass `role="status"`
-  for non-error announcements.
+- `Alert` (`radius-lg`, sets `data-variant`): `variant="destructive"` for
+  errors and refusals; the default for results; add `className="pending"` for
+  the warn tone (UPS pending power banner, unknown outcomes, pricing pending).
+  Pass `role="status"` for non-error announcements. In UPS Controls only an
+  executed action (`SUCCESS`) shows the check icon; `FSD_SET` shows info,
+  refusals are destructive and unknown or `PENDING` outcomes warn. The
+  server's text is always shown verbatim.
 - `Separator` (`ui/separator.tsx`): the hairline between blocks inside a
   Tile (fleet nodes). There is no `.divider` class.
 - `KeyValue`, `PageHeader`, `LiveIndicator` (`.live-indicator`, the ripple
@@ -241,8 +245,12 @@ stacks; numbers get `tabular-nums` from `body`.
   lazy chunk's `Suspense` fallback); `title` names a partial failure ("GPU
   overlay unavailable"). Put it at the top of the Panel or section it
   describes. Never write "Loading…" text or a hand-rolled `role="alert"`
-  paragraph; `details-states.test.tsx` checks every details page. The UPS
-  Controls error view stays verbatim (MET-168) and is the one exception.
+  paragraph; `details-states.test.tsx` checks every details page. Each
+  request owns its state where it is shown: Live UPS shows `/v1/ups`, Battery
+  health the self-test history, CPU history the device history. The server's
+  message renders verbatim inside the Alert. UPS Controls uses it for its
+  first load, state errors ("Controls unavailable") and older audit pages;
+  the 403 view stays the plain denied text only, with polling stopped.
   Error and reconnecting states must not grow the overview past the
   viewport.
 

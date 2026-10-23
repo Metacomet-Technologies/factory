@@ -34,28 +34,37 @@ describe("Input", () => {
 });
 
 describe("Select", () => {
-  it("is a native, labelled combobox whose value is a form value", () => {
+  it("is a labelled combobox whose picked option is the value and a form value", async () => {
     let submitted: FormDataEntryValue | null = null;
-    render(
-      <form
-        onSubmit={(event) => {
-          event.preventDefault();
-          submitted = new FormData(event.currentTarget).get("sensitivity");
-        }}
-      >
-        <label htmlFor="sensitivity">Sensitivity</label>
-        <Select id="sensitivity" name="sensitivity" defaultValue="normal">
-          <option>low</option>
-          <option>normal</option>
-          <option>high</option>
-        </Select>
-        <button type="submit">Save</button>
-      </form>,
-    );
+    function Field() {
+      const [value, setValue] = useState("normal");
+      return (
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            submitted = new FormData(event.currentTarget).get("sensitivity");
+          }}
+        >
+          <label htmlFor="sensitivity">Sensitivity</label>
+          <Select
+            id="sensitivity"
+            name="sensitivity"
+            value={value}
+            onValueChange={setValue}
+            options={["low", "normal", "high"]}
+          />
+          <button type="submit">Save</button>
+        </form>
+      );
+    }
+    render(<Field />);
     const select = screen.getByRole("combobox", { name: "Sensitivity" });
-    expect(select).toHaveValue("normal");
-    expect(screen.getAllByRole("option")).toHaveLength(3);
-    fireEvent.change(select, { target: { value: "high" } });
+    expect(select).toHaveTextContent("normal");
+    fireEvent.click(select);
+    expect(await screen.findAllByRole("option")).toHaveLength(3);
+    // Keyboard pick: jsdom clicks skip Base UI's pointer handling; ups-controls:check clicks.
+    fireEvent.keyDown(screen.getByRole("option", { name: "high" }), { key: "Enter" });
+    await waitFor(() => expect(select).toHaveTextContent("high"));
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     expect(submitted).toBe("high");
   });

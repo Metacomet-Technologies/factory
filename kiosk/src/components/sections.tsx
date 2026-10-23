@@ -53,7 +53,10 @@ export function ResourceState(props: ResourceStateProps) {
       <Alert variant="destructive">
         <AlertTriangle />
         <AlertTitle>{props.title ?? "Unable to load this section"}</AlertTitle>
-        <AlertDescription>{error}. Retrying on the next refresh.</AlertDescription>
+        <AlertDescription>
+          {/* The server's message stays verbatim in its own element. */}
+          <span data-slot="resource-error">{error}</span> Retrying on the next refresh.
+        </AlertDescription>
       </Alert>
     );
   return props.empty ? <p className="empty">{props.empty}</p> : null;

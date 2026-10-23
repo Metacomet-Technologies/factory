@@ -2,6 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import App from "./App";
 import { fixtures } from "../mock/fixtures";
+import { siteFixtures } from "../mock/site-fixtures";
 
 class MockSource extends EventTarget {
   onopen: (() => void) | null = null;
@@ -59,6 +60,7 @@ function serve(owns: (path: string) => boolean, answer: () => Promise<Response>)
     "/v1/ups": { generated_at_ms: Date.now(), current: null, warnings: [] },
     "/v1/agents": data.agents,
     "/v1/devices": { generated_at_ms: Date.now(), devices: [] },
+    "/v1/devices/factory-gpu": siteFixtures().deviceView,
   };
   vi.stubGlobal(
     "fetch",
@@ -110,4 +112,85 @@ describe.each(pages)("$path", ({ path, owns, regions }) => {
       expect(screen.queryByLabelText("Loading section")).not.toBeInTheDocument();
     });
   });
+});
+
+describe("states a page owns only in part", () => {
+  const pending = () => new Promise<Response>(() => {});
+  const failed = () =>
+    Promise.resolve(
+      new Response(JSON.stringify({ error: { code: "x", message: "HTTP 503" } }), {
+        status: 503,
+      }),
+    );
+  async function open(
+    path: string,
+    owns: (path: string) => boolean,
+    answer: () => Promise<Response>,
+  ) {
+    serve(owns, answer);
+    window.history.replaceState(null, "", path);
+    render(<App />);
+    await screen.findByRole("main");
+  }
+
+  it("shows a skeleton in Battery health while only the self-test history is pending", async () => {
+    // limit=200 is the self-test/outage history; limit=20 is the timeline, which answers.
+    await open("/ups", (path) => path.startsWith("/v1/ups/events?limit=200"), pending);
+    const health = screen.getByRole("region", { name: "Battery health" });
+    await waitFor(() =>
+      expect(within(health).getByLabelText("Loading section")).toBeInTheDocument(),
+    );
+    expect(
+      within(screen.getByRole("region", { name: "Power events" })).queryByLabelText(
+        "Loading section",
+      ),
+    ).toBeNull();
+  });
+
+  it("shows the self-test history failure in Battery health", async () => {
+    await open("/ups", (path) => path.startsWith("/v1/ups/events?limit=200"), failed);
+    const health = screen.getByRole("region", { name: "Battery health" });
+    const alert = await within(health).findByRole("alert");
+    expect(alert).toHaveTextContent("Unable to load the self-test history");
+    expect(within(alert).getByText("Event history: HTTP 503")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["pending", pending, "Loading section"],
+    ["failed", failed, null],
+  ] as const)(
+    "shows the /v1/ups request state in Live UPS when %s",
+    async (_name, answer, label) => {
+      await open("/ups", (path) => path === "/v1/ups", answer);
+      const live = screen.getByRole("region", { name: "Live UPS" });
+      if (label)
+        await waitFor(() => expect(within(live).getByLabelText(label)).toBeInTheDocument());
+      else
+        expect(
+          within(await within(live).findByRole("alert")).getByText("HTTP 503"),
+        ).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["pending", pending],
+    ["failed", failed],
+  ] as const)(
+    "shows the CPU history state, not an empty chart, when history is %s",
+    async (name, answer) => {
+      await open(
+        "/devices/factory-gpu",
+        (path) => path.startsWith("/v1/devices/factory-gpu/history"),
+        answer,
+      );
+      const history = await screen.findByRole("region", { name: "CPU history" });
+      if (name === "pending")
+        expect(within(history).getByLabelText("Loading section")).toBeInTheDocument();
+      else
+        expect(
+          within(await within(history).findByRole("alert")).getByText("HTTP 503"),
+        ).toBeInTheDocument();
+      expect(within(history).queryByText("No samples in this range.")).toBeNull();
+    },
+  );
 });

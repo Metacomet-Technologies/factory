@@ -124,18 +124,18 @@ try {
   await expect(page).toHaveURL(`${origin}/ups`);
   await page.goBack();
   await expect(page).toHaveURL(`${origin}/`);
-  await page.getByRole("link", { name: "UPS: Online" }).click();
+  await page.getByRole("button", { name: "UPS: Online" }).click();
   await expect(page).toHaveURL(`${origin}/ups`);
   await page.goBack();
   await mode("ERR DATA-STALE");
   await expect(page.getByRole("region", { name: "UPS", exact: true })).toContainText("DATA-STALE", {
     timeout: 25_000,
   });
-  await page.getByRole("link", { name: "UPS: No data" }).focus();
+  await page.getByRole("button", { name: "UPS: No data" }).focus();
   await expect(page.locator('[data-slot="tooltip-content"]')).toContainText("DATA-STALE");
   await screenshot("390-dark-ups-warning.png");
   await mode("OL");
-  await expect(page.getByRole("link", { name: "UPS: Online" })).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByRole("button", { name: "UPS: Online" })).toBeVisible({ timeout: 20_000 });
   await expect(page.getByRole("region", { name: "UPS", exact: true })).not.toContainText(
     "DATA-STALE",
   );
