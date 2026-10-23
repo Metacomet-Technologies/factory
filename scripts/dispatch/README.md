@@ -1,8 +1,9 @@
 # Linear factory dispatcher (MET-80)
 
 Single-user, outbound-only automation of [PLAYBOOK §4](../../docs/PLAYBOOK.md#4-agent-prompt-template).
-No dependencies, database, webhook, OAuth app, new credential, or runner changes
-(MET-207 adds one optional Cursor key for `engine/cursor`).
+No dependencies, webhook, OAuth app, new credential, or runner changes
+(MET-207 adds one optional Cursor key for `engine/cursor`). The one database is
+Node's built-in `node:sqlite` ledger (MET-261).
 Node **24.22.1** in `.node-version` remains the preferred and CI version; runtime
 accepts Node 24.x at **24.12.0** or newer. Requires Linux `flock` and the agent's
 existing Amp login. This is not the MET-120 hardening project.
@@ -10,8 +11,70 @@ existing Amp login. This is not the MET-120 hardening project.
 ```sh
 node scripts/dispatch/dispatch.ts poll --dry-run
 node scripts/dispatch/dispatch.ts issue MET-123 --dry-run
+node scripts/dispatch/dispatch.ts import --dry-run
+node scripts/dispatch/dispatch.ts --reconcile
 node --test scripts/dispatch
 ```
+
+## Local ledger, delta polling and Linear budget governor (MET-261)
+
+**Ledger.** `dispatch.db` (SQLite through `node:sqlite`, no dependency) sits next to
+the other dispatcher state at `~/.local/state/factory-dispatch/dispatch.db`; the
+unit sets `DISPATCH_LEDGER` to that path. It stores each tracked issue's snapshot
+and every comment by Linear comment ID, and indexes control markers (claims,
+builder threads, QA starts, claims and verdicts, archive steps) with issue ID,
+thread, PR, head SHA and timestamp. The ledger is the source of truth for every
+decision. Linear comments remain the human-readable, write-only audit trail: each
+write uses a deterministic caller-supplied comment ID, so the ledger row and the
+Linear comment are one record and a later read of it updates, never duplicates.
+Deleting a Linear comment no longer changes dispatcher state.
+
+**One-time import.** The first run (or `import`) reads the former MET-256 queue
+once: team issues with the `dispatch` label or a dispatch/QA marker that are not
+finished or finished within seven days. It refuses to import if any issue carries
+conflicting markers (two builder threads, claims, repos or worktrees, two QA
+reviewers for one review key, or two different verdicts from one reviewer), logs
+`import-conflict`, exits 1 and writes nothing. `import --dry-run` prints one
+`would-import` line per issue and the totals, and never creates the file. A rerun
+logs `import-skip` and makes no request.
+
+**Delta polling.** Every later poll asks only for team issues whose own fields,
+comments or attachments changed after the cursor minus two minutes
+(`updatedAt`/`comments.some.updatedAt`/`attachments.some.updatedAt`,
+`orderBy: updatedAt`, 20 per page), stores the relevant ones, and refreshes the
+blocker state of issues they block. The overlap is deduped by issue and comment
+ID. The cursor advances to the poll's start only after the whole poll succeeds;
+any failure rereads the same window next time. The historical queue scan is gone.
+
+**Reconciliation sweep.** Every 15 minutes the poll rereads the ledger's open
+claims (unfinished issues with a claim or thread marker) by ID, 20 per request,
+with `includeArchived: true` because archiving and deletion do not advance
+`updatedAt`, and refreshes the cached In Progress state in the same request.
+
+**Budget governor.** All Linear calls go through one wrapper that parses
+`x-ratelimit-requests-remaining`, `-reset` and `-limit`.
+
+- Headroom: when remaining requests are at most 10% of the limit (2,500 if
+  unknown), thread labels, `waiting` comments and the archive sweep wait for a
+  later poll and log `linear-headroom` once each. Claims, thread markers, state
+  moves, QA and wrap-up continue.
+- `RATELIMITED` or HTTP 429 stores `blocked_until` in the ledger: the reset time
+  if Linear sent one, otherwise a backoff of 60 s doubling to 1 h, plus 1-1000 ms
+  of jitter, and logs `linear-backoff`. Polls before then log one
+  `{"decision":"linear-blocked","until":…}` line, make no request and exit 0.
+  A successful poll clears the backoff.
+- MET-256's fail-closed behavior, `linear-error`/`linear-budget` records and
+  exit codes are unchanged.
+
+Offline fixture (150 marker-bearing issues: 120 finished more than seven days ago,
+25 finished this week, 5 live): MET-256 made 3 requests on every poll. Now the
+import costs 2, the first poll after it 2 (delta and sweep), and each idle poll 1
+(delta). A busy poll with all five live issues changed also costs 1.
+
+**Stuck claims.** `dispatch.ts --reconcile` lists In Progress issues whose claim
+has no live Amp thread (no thread marker, thread archived or not found) as
+`would-release` lines and what slot they hold. It reads only the ledger and Amp's
+thread listing, never Linear, and changes nothing; Devon releases by hand.
 
 ## Linear request budget (MET-256)
 
@@ -522,9 +585,20 @@ https://github.com/Metacomet-Technologies/factory refs/pull/<n>/head` resolves t
 head. Each PR/SHA gets a fresh review, GPU first then console, with a separate
 cap of **one review per runner** regardless of builder labels/capacity. An
 unconfirmed start reserves a slot. Changes release it; ready retains it until
-merge, handoff to Devon, or a new head before any merge continuation. Unresolved
-older reviews retain their slot; a new head may use the other runner. Finished QA
-threads use the shared archive path described below, including legacy claims.
+merge, handoff to Devon, or a new head before any merge continuation.
+MET-177: a new head retires every older review of the PR that has no verdict or a
+ready verdict (a changes verdict is still delivered against the new head), and a
+merge or close QA did not submit retires every open review of that PR. Each gets
+one `retired` marker (`QA claim superseded …`, logged `qa-superseded`), frees its
+slot, and then archives and has its worktree cleaned like any finished review.
+Finished QA threads use the shared archive path described below, including
+legacy claims.
+
+MET-233: if the fresh same-head review that follows a moot verdict is itself moot,
+the dispatcher mentions Devon once with a `human` marker for that round and starts
+no third review (`qa-moot-escalated`). MET-143: a merge-gate refusal logs its
+`cause` with `qa-pending` and posts it once per review on the issue with a
+`merge-refused` marker; the gate is rechecked every poll.
 
 After a delivered changes round, a Linear diff comment newer than the round's
 delivery comment can trigger one fresh review without a push. It must contain
@@ -967,6 +1041,46 @@ GitHub auth is preconfigured for agent (gh + git credential helper); don't set G
 The AGENTS.md contract owns auth restrictions without naming token variables.
 Each generated prompt checks `gh auth status` exactly once. Issue sections pass
 through unchanged; their text is not counted against the fixed prompt budget.
+
+### MET-261 rollout: Node, ledger import and reinstall
+
+Artifacts only; not executed in development. Run after Devon merges, with the
+timer still stopped. Step 1 goes to both nodes, so it is one labeled loop.
+
+```sh
+set -euo pipefail
+# 1. Node 24.22.1 (security release) on both nodes; expect v24.22.1 from /home/agent/work.
+for host in gpu console; do
+  echo "== factory-$host"
+  "$host-ssh" 'sudo -iu agent bash -lc '\''vp env install 24.22.1 && cd /home/agent/work && node --version'\'''
+done
+# 2. Fast-forward the clean, idle main checkout on factory-gpu.
+gpu-ssh 'sudo -iu agent bash -lc '\''set -e; cd /home/agent/work/factory; test "$(git branch --show-current)" = main; test -z "$(git status --porcelain)"; git fetch origin; git merge --ff-only origin/main'\'''
+# 3. Ledger import: preview, then the real import (a rerun is a no-op).
+gpu-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts import --dry-run'
+gpu-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts import'
+# 4. Stuck claims: read-only list of what a release would cover.
+gpu-ssh 'sudo -iu agent node /home/agent/work/factory/scripts/dispatch/dispatch.ts --reconcile'
+```
+
+Stop if the import logs `import-conflict`; nothing was written. Then install
+(unchanged console runner-list pipe) and watch:
+
+```sh
+set -o pipefail
+console-ssh 'sudo -iu agent amp runner list --json' |
+  gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-dispatch.sh'
+gpu-ssh 'sudo journalctl -u factory-dispatch -n 30'
+```
+
+Done after three consecutive timer polls each log `linear-budget` with
+`requests` at most 10 and no `error`/`linear-error`, and MET-255 dispatches and
+lands as the canary.
+
+Rollback: revert this PR's merge through the reviewed GitHub workflow, fast-forward
+main as in step 2 and rerun the install. Every ledger write is also a Linear
+comment, so the reverted dispatcher reads complete markers; it ignores
+`dispatch.db`. Emergency stop: `gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-dispatch.sh'`.
 
 ### MET-256 recovery of the stopped dispatcher
 
