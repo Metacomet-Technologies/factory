@@ -33,7 +33,13 @@
     "deploy/ups/control-state.sh", "deploy/ups/install-ups-control.sh", "deploy/ups/rollback-ups-control.sh",
     "deploy/ups/install-nut.sh", "deploy/ups/rollback-nut.sh", "deploy/ups/render.py",
     "deploy/ups/nut.conf.in", "deploy/ups/ups.conf.in", "deploy/ups/upsd.conf.in",
-    "deploy/ups/upsd.users.in", "deploy/ups/upsmon.conf.in"
+    "deploy/ups/upsd.users.in", "deploy/ups/upsmon.conf.in",
+    "deploy/devices/factory-devices-smart.service", "deploy/devices/factory-devices-smart.timer",
+    "deploy/devices/factory-devices-maintenance.service", "deploy/devices/factory-devices-maintenance.timer",
+    "deploy/devices/smart-snapshot.py", "deploy/devices/maintenance-snapshot.py",
+    "deploy/devices/install-devices.sh", "deploy/devices/rollback-devices.sh",
+    "deploy/devices-agent/factory-devices-agent.service", "deploy/devices-agent/smart-console.conf",
+    "deploy/devices-agent/install-devices-agent.sh", "deploy/devices-agent/rollback-devices-agent.sh"
   ],
   "components": [
     {
@@ -126,11 +132,12 @@
     },
     {
       "id": "migration-and-host-tools", "artifact": "deployment.tar.gz", "sources": ["deploy", "scripts/release", "scripts/build-fingerprint.sh", "scripts/bump-version.sh"],
-      "nodes": ["factory-gpu", "factory-console"], "services": [],
+      "nodes": ["factory-gpu", "factory-console"],
+      "services": ["factory-devices-smart.service", "factory-devices-smart.timer", "factory-devices-maintenance.service", "factory-devices-maintenance.timer", "factory-devices-agent.service"],
       "installer": null, "health": "No automatic health contract for migration, relocation or host changes",
       "rollback": "Procedure-specific human recovery; no automatic data restore",
       "eligibility": "ineligible", "reversible_candidate": false,
-      "constraints": "Packaging a script is not authority to execute it. Unknown components fail closed."
+      "constraints": "Packaging a script is not authority to execute it. Unknown components fail closed. deploy/devices and deploy/devices-agent installers are human-run; the devices-agent binary is not a release artifact."
     },
     {
       "id": "external-host-services", "artifact": null, "sources": [],
