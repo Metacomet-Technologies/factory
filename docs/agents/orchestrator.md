@@ -36,18 +36,15 @@ For every merge:
 3. Require QA ready at that SHA, or the orchestrator's own review with no
    blocking findings.
 4. Run `node scripts/dispatch/qa.ts check <PR> <SHA>` from a worktree at
-   trusted `origin/main`.
+   trusted `origin/main`. It must exit 0. Any refusal blocks the merge.
 5. Merge only with `gh pr merge <PR> --squash --match-head-commit <SHA>`.
    Never use `--admin` or `--auto`.
 6. Explain the merge on the issue, then continue the builder for wrap-up.
 
-PRs that touch `scripts/dispatch/` or `scripts/usage/` deploy on merge: the
-dispatcher fast-forwards `/home/agent/work/factory`, and the next poll runs that
-code. For these PRs, `qa.ts check` passes its head, open, draft and base checks
-and then stops with `Ready; merging deploys it`, before it checks CI. Accept only
-that refusal, then require `gh pr checks <PR>` to show every check passing at
-`<SHA>`. Read the deploy path before merging, and check
-`journalctl -u factory-dispatch` after the next poll.
+PRs that touch `scripts/dispatch/` or `scripts/usage/` deploy on merge, and
+`qa.ts check` always refuses them with `Ready; merging deploys it`. The
+orchestrator does not merge them. Review them, then hand them to Devon with the
+head SHA and the deploy path.
 
 ## Deploys and limits
 
