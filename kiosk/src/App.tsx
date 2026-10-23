@@ -250,6 +250,8 @@ export default function App() {
           deviceId={remote}
           view={remoteView}
           history={deviceHistory.data}
+          historyLoading={deviceHistory.loading}
+          historyError={deviceHistory.error}
           range={deviceRange}
           setRange={setDeviceRange}
           error={deviceCurrent.error}
@@ -265,6 +267,8 @@ export default function App() {
           deviceId="factory-gpu"
           view={deviceView}
           history={deviceHistory.data}
+          historyLoading={deviceHistory.loading}
+          historyError={deviceHistory.error}
           range={deviceRange}
           setRange={setDeviceRange}
           error={deviceError}
@@ -280,8 +284,9 @@ export default function App() {
       ) : path === "/ups" ? (
         <UpsPage
           current={upsCurrent}
+          status={{ loading: ups.loading && upsCurrent == null, error: ups.error }}
           now={now}
-          warnings={upsWarnings}
+          warnings={ups.data?.warnings ?? []}
           live={live}
           revision={live.snapshotRevision + live.upsEventRevision}
         />

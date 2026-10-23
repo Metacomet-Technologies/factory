@@ -33,8 +33,6 @@
   --radius-sm: 6px;
   --radius-md: 8px;
   --radius-lg: 12px;
-  --radius-xl: 14px;
-  --radius-4xl: 14px;
 }
 :root {
   /* Ground and surfaces */
@@ -293,14 +291,14 @@
   box-shadow: var(--shadow-mark);
   transition: transform var(--dur) var(--ease-out);
 }
-.header-actions a:not(.chip) {
+.header-actions a:not(.chip, [data-slot="button"]) {
   padding: 6px 10px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   color: var(--foreground);
   font-size: 13px;
   font-weight: 500;
 }
-.header-actions a:not(.chip):hover {
+.header-actions a:not(.chip, [data-slot="button"]):hover {
   background: var(--muted);
   text-decoration: none;
 }
@@ -471,7 +469,7 @@
   flex-shrink: 0;
   width: 28px;
   height: 28px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   color: var(--accent-text);
   background: var(--accent-soft);
 }
@@ -575,14 +573,12 @@
 .tile[data-tone="warn"] {
   border-color: color-mix(in oklab, var(--warn) 45%, var(--border));
 }
+.node-separator {
+  margin: 2px 0;
+}
 .tile h3,
 .tile h4 {
   font-size: 13px;
-}
-.divider {
-  height: 1px;
-  background: var(--border);
-  margin: 2px 0;
 }
 
 /* ---- Stat ---------------------------------------------------------------- */
@@ -786,14 +782,14 @@
   padding: 2px;
   gap: 2px;
   background: color-mix(in srgb, var(--foreground) 5%, transparent);
-  border-radius: 9px;
+  border-radius: var(--radius-md);
 }
 [data-slot="toggle-group-item"] {
   font-size: 12px;
   min-width: 38px;
   height: 26px;
   border: 1px solid transparent;
-  border-radius: 7px !important;
+  border-radius: var(--radius-sm) !important;
   color: var(--muted-foreground);
   transition:
     background var(--dur-fast),
@@ -809,13 +805,6 @@
   border-color: var(--border-control);
   box-shadow: 0 1px 2px rgb(0 0 0 / 12%);
 }
-[data-slot="card"] {
-  height: 100%;
-  border: 1px solid var(--glass-edge);
-  box-shadow: var(--shadow-glass);
-  --card-spacing: 18px;
-  --tw-ring-shadow: 0 0 #0000;
-}
 [data-slot="alert"] {
   border-color: var(--border);
   background: color-mix(in srgb, var(--foreground) 3%, transparent);
@@ -823,9 +812,6 @@
 [data-slot="alert"][data-variant="destructive"],
 [data-slot="alert"].destructive {
   border-color: color-mix(in oklab, var(--fail) 40%, var(--border));
-}
-[data-slot="badge"] {
-  border-color: var(--border);
 }
 .pending {
   border-color: color-mix(in oklab, var(--warn) 40%, var(--border));
@@ -842,7 +828,7 @@
   background: var(--card);
   color: var(--accent-text);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
 }
 .skip-link:focus {
   top: 10px;
@@ -917,7 +903,7 @@
 }
 [data-slot="chart-tooltip"],
 [data-slot="chart"] .recharts-tooltip-wrapper > div {
-  border-radius: 8px;
+  border-radius: var(--radius-md);
 }
 
 /* ---- Fleet --------------------------------------------------------------- */
@@ -952,15 +938,6 @@
 .spend-card {
   display: grid;
   gap: 2px;
-  position: relative;
-  overflow: hidden;
-}
-.spend-card::before {
-  content: "";
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 3px;
-  background: linear-gradient(180deg, var(--accent-text), transparent);
 }
 .stat-suffix {
   font-size: 12px;
@@ -1187,17 +1164,130 @@
   font-size: 12px;
   font-weight: 550;
 }
-.ups-settings input,
-.ups-control-setting input,
-.ups-control-setting select,
-.ups-confirm input {
+/* ---- Form fields (ui/input, ui/select) ---------------------------------- */
+.field {
   width: 100%;
   min-width: 0;
+  min-height: 40px;
   padding: 9px 10px;
   color: var(--foreground);
-  background: var(--background);
+  font: inherit;
+  font-size: 14px;
+  background: color-mix(in srgb, var(--card) var(--glass-alpha), transparent);
   border: 1px solid var(--border-control);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
+  box-shadow: inset 0 1px 0 var(--glass-sheen);
+  transition: border-color var(--dur-fast);
+}
+.field:hover {
+  border-color: var(--foreground);
+}
+.field:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
+  border-radius: var(--radius-md);
+}
+.field[aria-invalid="true"] {
+  border-color: var(--fail);
+}
+.field:disabled {
+  color: var(--muted-foreground);
+  background: var(--muted);
+  cursor: not-allowed;
+}
+.select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+  cursor: pointer;
+}
+.select-icon {
+  display: flex;
+  color: var(--muted-foreground);
+}
+.select-positioner {
+  z-index: 62;
+  outline: 0;
+}
+.select-content {
+  min-width: var(--anchor-width);
+  max-height: var(--available-height);
+  overflow: auto;
+  padding: 4px;
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--card) 94%, transparent);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-md);
+  box-shadow:
+    var(--shadow-glass),
+    0 16px 32px -16px rgb(0 0 0 / 45%);
+}
+.select-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
+  padding: 6px 10px;
+  font-size: 14px;
+  border-radius: var(--radius-sm);
+  cursor: default;
+  outline: 0;
+}
+.select-item[data-highlighted] {
+  background: var(--muted);
+}
+.select-item-indicator {
+  display: flex;
+  color: var(--accent-text);
+}
+
+/* ---- Dialog (ui/dialog) -------------------------------------------------- */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgb(0 0 0 / 60%);
+  backdrop-filter: blur(3px);
+  animation: fade-in var(--dur-fast) both;
+}
+.dialog-content {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 61;
+  width: min(480px, calc(100% - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+  padding: 20px;
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--card) 94%, transparent);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  /* The modal's edge must read on its own over the dimmed backdrop (≥ 3:1). */
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-lg);
+  /* A --card halo outside the --border-control edge keeps it ≥ 3:1 over any scene or scrim. */
+  box-shadow:
+    0 0 0 3px var(--card),
+    var(--shadow-glass),
+    0 30px 60px -20px rgb(0 0 0 / 50%);
+  overflow-wrap: anywhere;
+  animation: dialog-in var(--dur) var(--ease-out) both;
+}
+.dialog-title {
+  font-size: 17px;
+  font-weight: 600;
+}
+.dialog-description {
+  margin-top: 6px;
+  color: var(--muted-foreground);
+  font-size: 13px;
 }
 .ups-trend {
   max-height: 240px;
@@ -1257,8 +1347,7 @@
 .ups-control-setting p {
   font-size: 13px;
 }
-.ups-control-setting input,
-.ups-control-setting select {
+.ups-control-setting .field {
   max-width: 320px;
 }
 .ups-controls [data-slot="button"] {
@@ -1274,37 +1363,7 @@
 .ups-pending,
 .ups-control-result {
   margin-top: 12px;
-  padding: 12px;
-  border: 1px solid color-mix(in oklab, var(--warn) 50%, var(--border));
-  background: color-mix(in oklab, var(--warn) 8%, transparent);
-  border-radius: 8px;
   overflow-wrap: anywhere;
-}
-.ups-confirm-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-  background: rgb(0 0 0 / 60%);
-  backdrop-filter: blur(3px);
-  animation: fade-in var(--dur-fast) both;
-}
-.ups-confirm {
-  position: fixed;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  z-index: 61;
-  width: min(480px, calc(100% - 32px));
-  max-height: calc(100dvh - 32px);
-  overflow: auto;
-  padding: 20px;
-  color: var(--foreground);
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  box-shadow: 0 30px 60px -20px rgb(0 0 0 / 50%);
-  overflow-wrap: anywhere;
-  animation: dialog-in var(--dur) var(--ease-out) both;
 }
 .ups-confirm form {
   display: grid;
@@ -1902,10 +1961,14 @@
   .crumbs {
     font-size: 15px;
   }
-  .header-actions {
-    gap: 2px;
+  /* Tighter on phones: since the Topology link (MET-226) the top bar overflowed 390 px. */
+  .topbar {
+    gap: 8px;
   }
-  .header-actions a:not(.chip) {
+  .header-actions {
+    gap: 0;
+  }
+  .header-actions a:not(.chip, [data-slot="button"]) {
     padding: 6px;
   }
   .live-indicator {

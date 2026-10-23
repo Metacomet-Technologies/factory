@@ -17,6 +17,7 @@ import { KeyValue } from "./ui/key-value";
 import { MeterBar } from "./ui/meter-bar";
 import { PageHeader } from "./ui/page-header";
 import { Panel } from "./ui/panel";
+import { ResourceState } from "./sections";
 import { RangeToggle } from "./ui/range-toggle";
 import { Stat, StatGrid } from "./ui/stat";
 import { StatusChip, type Tone } from "./ui/status-chip";
@@ -147,9 +148,12 @@ function AgentLink({ view, now }: { view: DeviceView; now: number }) {
         <p className="status-ok">Recovered {seen(recoveredAt, now)}.</p>
       )}
       {ingest.identity_conflict && (
-        <p role="alert" className="status-fail">
-          Identity conflict: two agents are using this credential.
-        </p>
+        <ResourceState
+          loading={false}
+          error="Identity conflict: two agents are using this credential"
+          title="Agent identity conflict"
+          retry={null}
+        />
       )}
       {view.warnings.map((warning) => (
         <p key={warning} className="status-warn">
@@ -168,6 +172,8 @@ export default function DevicesPage({
   deviceId,
   view: received,
   history,
+  historyLoading = false,
+  historyError = null,
   range,
   setRange,
   error,
@@ -179,6 +185,8 @@ export default function DevicesPage({
   deviceId: string;
   view: DeviceView | null;
   history: DeviceHistory | null;
+  historyLoading?: boolean | undefined;
+  historyError?: string | null | undefined;
   range: DeviceRange;
   setRange: (range: DeviceRange) => void;
   error: string | null;
@@ -213,13 +221,11 @@ export default function DevicesPage({
           </>
         }
       />
-      {error && (
-        <p role="alert" className="status-fail">
-          {error}
-        </p>
-      )}
-      {loading && !host && <p className="muted">Loading devices…</p>}
-      {!loading && !error && !host && <p className="muted">No device sample yet.</p>}
+      <ResourceState
+        loading={loading && !host && !error}
+        error={error}
+        empty={!loading && !error && !host ? "No device sample yet." : undefined}
+      />
       {host && (
         <div className="device-grid">
           <Panel
@@ -296,10 +302,12 @@ export default function DevicesPage({
               />
             }
           >
-            {!history || history.points.length === 0 ? (
+            {historyLoading || historyError ? (
+              <ResourceState loading={historyLoading} error={historyError} />
+            ) : !history || history.points.length === 0 ? (
               <p className="empty">No samples in this range.</p>
             ) : (
-              <Suspense fallback={<p className="loading">Loading chart…</p>}>
+              <Suspense fallback={<ResourceState loading error={null} />}>
                 <DevicesChart history={history.points} />
               </Suspense>
             )}

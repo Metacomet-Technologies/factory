@@ -329,8 +329,9 @@ describe("UPS controls", () => {
   it("uses the server's enums and disjoint ranges and reviews the entered value", async () => {
     render(<UpsControls />);
     const select = await screen.findByRole("combobox", { name: "input.sensitivity" });
-    expect(select).toHaveValue("normal");
-    fireEvent.change(select, { target: { value: "high" } });
+    expect(select).toHaveTextContent("normal");
+    fireEvent.click(select);
+    fireEvent.keyDown(await screen.findByRole("option", { name: "high" }), { key: "Enter" });
     fireEvent.click(screen.getByRole("button", { name: "Review input.sensitivity" }));
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toHaveTextContent("Value: high");

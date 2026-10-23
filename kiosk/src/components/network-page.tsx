@@ -111,13 +111,10 @@ function Events({ now, index }: { now: number; index: number }) {
       index={index}
       aria-label="Network events"
     >
-      {events.error && (
-        <p role="alert" className="status-fail">
-          {events.error}
-        </p>
-      )}
-      {events.loading && <p className="loading">Loading events…</p>}
-      {page?.events.length === 0 && <p className="empty">No network events.</p>}
+      <ResourceState
+        resource={events}
+        empty={page?.events.length === 0 ? "No network events." : undefined}
+      />
       {!!page?.events.length && (
         <Table>
           <Head
@@ -297,25 +294,11 @@ export default function NetworkPage({
             label="History range"
           />
         </div>
-        {history.error && (
-          <p role="alert" className="status-fail">
-            History: {history.error}
-          </p>
-        )}
-        {speed.error && (
-          <p role="alert" className="status-fail">
-            Speed tests: {speed.error}
-          </p>
-        )}
-        {episodes.error && (
-          <p role="alert" className="status-warn">
-            Event bands unavailable: {episodes.error}
-          </p>
-        )}
-        {history.loading ? (
-          <p className="loading">Loading history…</p>
-        ) : (
-          <Suspense fallback={<p className="loading">Loading charts…</p>}>
+        <ResourceState resource={history} title="Unable to load history" />
+        <ResourceState loading={false} error={speed.error} title="Unable to load speed tests" />
+        <ResourceState loading={false} error={episodes.error} title="Event bands unavailable" />
+        {!history.loading && (
+          <Suspense fallback={<ResourceState loading error={null} />}>
             <NetworkCharts
               series={history.data?.series ?? []}
               tests={speed.data?.tests ?? (speed.loading ? null : [])}

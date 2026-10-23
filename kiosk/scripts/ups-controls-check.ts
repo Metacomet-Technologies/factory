@@ -81,7 +81,11 @@ async function contrast() {
   });
 }
 async function complete(name: string, value?: string) {
-  if (value) await controls.getByLabel(name, { exact: true }).selectOption(value);
+  if (value) {
+    // Base UI Select: open the listbox, then pick the option.
+    await controls.getByLabel(name, { exact: true }).click();
+    await page.getByRole("option", { name: value, exact: true }).click();
+  }
   await controls
     .getByRole("button", { name: value ? `Review ${name}` : name, exact: true })
     .click();
@@ -130,7 +134,7 @@ try {
   await expect(controls).toContainText("Disabled: the final NUT shutdown hook");
   expect((await complete("test.quick")).tracking_status).toBe("SUCCESS");
   expect((await complete("input.sensitivity", "high")).tracking_status).toBe("SUCCESS");
-  await expect(controls.getByLabel("input.sensitivity", { exact: true })).toHaveValue("high");
+  await expect(controls.getByLabel("input.sensitivity", { exact: true })).toHaveText("high");
   await expect(controls.locator(".ups-control-audit")).toContainText("input.sensitivity · high");
   await contrast();
   await page.evaluate(() => {
@@ -196,7 +200,10 @@ try {
   );
   await page.emulateMedia({ colorScheme: "dark" });
   await page.reload();
-  await expect(controls).toHaveText("ups snapshot unavailable");
+  // The server's message stays verbatim, in its own element inside the destructive Alert.
+  await expect(
+    controls.getByRole("alert").getByText("ups snapshot unavailable", { exact: true }),
+  ).toBeVisible();
   await expect(controls.getByRole("button")).toHaveCount(0);
   await controls.scrollIntoViewIfNeeded();
   await capture("390-dark-ups-controls-error.png");

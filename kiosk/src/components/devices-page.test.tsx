@@ -303,7 +303,11 @@ describe("remote devices", () => {
     ];
     rerender(remotePage(limited, t + 1_000));
     expect(screen.getByText("factory-console", { selector: "p" })).toBeInTheDocument();
-    expect(link.getByRole("alert")).toHaveTextContent("Identity conflict");
+    expect(link.getByRole("alert")).toHaveAttribute("data-slot", "alert");
+    expect(link.getByRole("alert")).toHaveTextContent(
+      "Identity conflict: two agents are using this credential.",
+    );
+    expect(link.getByRole("alert")).not.toHaveTextContent("Retrying");
     expect(link.getByText(/sessions from factory-console and imposter/)).toBeInTheDocument();
     expect(link.getByText("3")).toBeInTheDocument();
     expect(link.getByText(/SMART unsupported · fans unsupported/)).toBeInTheDocument();
@@ -387,7 +391,13 @@ describe("remote devices", () => {
       expect(link.getByText("Live")).toBeInTheDocument();
       expect(summary).toHaveTextContent("Host summary · Live");
       expect(within(summary).getByText("critical")).toBeInTheDocument();
-      if (gets === "failed") expect(screen.getByText("HTTP 503")).toBeInTheDocument();
+      if (gets === "failed") {
+        // The current view and its history each fail on their own.
+        expect(screen.getAllByText("HTTP 503")).toHaveLength(2);
+        expect(
+          within(screen.getByRole("region", { name: "CPU history" })).getByText("HTTP 503"),
+        ).toBeInTheDocument();
+      }
 
       // The agent stops. At 46 s the cached frame is stale, not Live, with no current readings.
       clock = t + 46_000;

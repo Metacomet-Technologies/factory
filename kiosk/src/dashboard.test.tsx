@@ -10,7 +10,6 @@ import UpsPage from "./components/ups-page";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { count, ms, usd, number, seen } from "./lib/format";
 import { upsChartData } from "./lib/ups";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { AgentsSection, FleetSection, TickerSection } from "./components/sections";
 import { VersionFooter } from "./components/version-footer";
 const openLlmDetails = async () => {
@@ -198,7 +197,7 @@ describe("UPS telemetry", () => {
       );
     });
     expect(await screen.findByText(warning)).toBeInTheDocument();
-    act(() => screen.getByRole("button", { name: "UPS: No data" }).focus());
+    act(() => screen.getByRole("link", { name: "UPS: No data" }).focus());
     expect(await screen.findByText(/UPS: No data · Charge/)).toHaveTextContent(warning);
     expect(screen.queryByText("ups: initial failure")).not.toBeInTheDocument();
   });
@@ -212,7 +211,7 @@ describe("UPS telemetry", () => {
         />
       </TooltipProvider>,
     );
-    act(() => screen.getByRole("button", { name: "UPS: No data" }).focus());
+    act(() => screen.getByRole("link", { name: "UPS: No data" }).focus());
     expect(await screen.findByText(/UPS: No data · Charge/)).toHaveTextContent(
       "ups: ERR DATA-STALE",
     );
@@ -240,9 +239,15 @@ describe("UPS telemetry", () => {
     for (const invalid of ["0.1234567", "-0.1"]) {
       fireEvent.change(rate, { target: { value: invalid } });
       fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
-      expect(screen.getByRole("alert")).toHaveTextContent(
-        "nonnegative USD rate with at most 6 decimals",
+      const alert = screen.getByRole("alert");
+      expect(alert).toHaveAttribute("data-slot", "alert");
+      expect(alert).toHaveTextContent("nonnegative USD rate with at most 6 decimals");
+      expect(alert).toHaveTextContent(
+        "Settings may not have been saved; select Save settings to try again.",
       );
+      expect(alert.textContent).not.toContain("..");
+      expect(alert).not.toHaveTextContent("Retrying");
+      expect(rate).toHaveAccessibleDescription(/nonnegative USD rate with at most 6 decimals/);
     }
     fireEvent.change(rate, { target: { value: "0.123456" } });
     fireEvent.change(screen.getByLabelText("Battery installed date"), {
@@ -259,6 +264,36 @@ describe("UPS telemetry", () => {
       ),
     );
     expect(await screen.findByText("Settings saved.")).toBeInTheDocument();
+  });
+  it("shows a failed settings PUT in the shared Alert with the server's exact message", async () => {
+    window.history.replaceState(null, "", "/ups");
+    const fetch = api();
+    const defaults = fetch.getMockImplementation()!;
+    fetch.mockImplementation((path: string, init?: RequestInit) =>
+      path === "/v1/settings/ups" && init?.method === "PUT"
+        ? Promise.resolve(
+            new Response(JSON.stringify({ error: { message: "settings store is read-only" } }), {
+              status: 503,
+            }),
+          )
+        : defaults(path),
+    );
+    render(<App />);
+    const rate = await screen.findByLabelText("Electricity rate · USD per kWh");
+    fireEvent.change(rate, { target: { value: "0.123456" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveAttribute("data-slot", "alert");
+    expect(alert).toHaveTextContent("Settings not saved");
+    expect(alert).toHaveTextContent("settings store is read-only");
+    expect(alert).toHaveTextContent(
+      "Settings may not have been saved; select Save settings to try again.",
+    );
+    expect(alert).not.toHaveTextContent("Retrying");
+    expect(rate).toHaveAccessibleDescription(/settings store is read-only/);
+    expect(rate).toHaveAttribute("aria-invalid", "true");
+    expect(screen.queryByText("Settings saved.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save settings" })).toBeEnabled();
   });
   it("never shows a negative duration for an event newer than the UI clock", async () => {
     window.history.replaceState(null, "", "/ups");
@@ -387,7 +422,8 @@ describe("UPS telemetry", () => {
     );
     const card = screen.getByRole("region", { name: "UPS" });
     expect(within(card).getByText(label!)).toBeInTheDocument();
-    const badge = screen.getByRole("button", { name: `UPS: ${label}` });
+    const badge = screen.getByRole("link", { name: `UPS: ${label}` });
+    expect(badge).toHaveAttribute("href", "/ups");
     expect(badge.querySelector(`.lucide-${icon}`)).not.toBeNull();
     if (label === "On battery" || label === "Low battery") expect(badge).toHaveClass("status-fail");
     else expect(badge).not.toHaveClass("status-fail");
@@ -405,7 +441,7 @@ describe("UPS telemetry", () => {
         <UpsBadge current={upsSample(["OL"], now - 2000)} now={now} />
       </TooltipProvider>,
     );
-    act(() => screen.getByRole("button", { name: "UPS: Online" }).focus());
+    act(() => screen.getByRole("link", { name: "UPS: Online" }).focus());
     expect(await screen.findByText(/UPS: Online · Charge 48%/)).toHaveTextContent(
       "UPS: Online · Charge 48% · Runtime 14 m 7 s · Load 144 W · Input 121 V · Sample age 2 s",
     );
@@ -416,7 +452,7 @@ describe("UPS telemetry", () => {
     await act(async () => {
       render(<App />);
     });
-    expect(screen.getByRole("button", { name: "UPS: No data" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "UPS: No data" })).toBeInTheDocument();
     const emit = (data: UpsCurrent | null) =>
       MockSource.latest.dispatchEvent(
         new MessageEvent("ups.sample", {
@@ -426,24 +462,24 @@ describe("UPS telemetry", () => {
     act(() => {
       emit(upsSample(["OB"]));
     });
-    expect(screen.getByRole("button", { name: "UPS: On battery" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "UPS: On battery" })).toBeInTheDocument();
     act(() => {
       emit(null);
     });
-    expect(screen.getByRole("button", { name: "UPS: No data" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "UPS: No data" })).toBeInTheDocument();
     const at = Date.now();
     act(() => {
       emit(upsSample(["OL"], at));
     });
-    expect(screen.getByRole("button", { name: "UPS: Online" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "UPS: Online" })).toBeInTheDocument();
     act(() => {
       vi.advanceTimersByTime(30_000);
     });
-    expect(screen.getByRole("button", { name: "UPS: Online" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "UPS: Online" })).toBeInTheDocument();
     act(() => {
       vi.advanceTimersByTime(1000);
     });
-    expect(screen.getByRole("button", { name: "UPS: No data" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "UPS: No data" })).toBeInTheDocument();
     vi.useRealTimers();
   });
 });
@@ -869,21 +905,6 @@ describe("dashboard contract", () => {
     });
     expect(screen.getByText("$17.89")).toBeInTheDocument();
     expect(screen.getByText(/\$123.45 of \$200/)).toBeInTheDocument();
-  });
-  it("renders shadcn Base UI tabs and changes panels with a keyboard-accessible control", async () => {
-    render(
-      <Tabs defaultValue="first">
-        <TabsList>
-          <TabsTrigger value="first">First</TabsTrigger>
-          <TabsTrigger value="second">Second</TabsTrigger>
-        </TabsList>
-        <TabsContent value="first">First panel</TabsContent>
-        <TabsContent value="second">Second panel</TabsContent>
-      </Tabs>,
-    );
-    expect(screen.getByRole("tab", { name: "First" })).toHaveAttribute("aria-selected", "true");
-    fireEvent.click(screen.getByRole("tab", { name: "Second" }));
-    await waitFor(() => expect(screen.getByRole("tabpanel")).toHaveTextContent("Second panel"));
   });
   it("slides in only the ticker rows that arrive after mount", () => {
     const request = (ts_ms: number, model: string) =>

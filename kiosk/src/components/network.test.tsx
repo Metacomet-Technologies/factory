@@ -256,15 +256,18 @@ describe("network page", () => {
     fireEvent.click(await events.findByRole("button", { name: "Newest events" }));
     expect(await events.findByRole("button", { name: "Older events" })).toBeInTheDocument();
   });
-  it("shows loading text while history and events are pending", async () => {
+  it("shows skeletons while history and events are pending", async () => {
     serve(networkFixtures(), (path) =>
       path.startsWith("/v1/network/history") || path === "/v1/network/events?limit=20"
         ? new Promise(() => {})
         : null,
     );
     await open();
-    expect(screen.getByText("Loading history…")).toBeInTheDocument();
-    expect(screen.getByText("Loading events…")).toBeInTheDocument();
+    for (const name of ["Network history", "Network events"])
+      expect(
+        within(screen.getByRole("region", { name })).getByLabelText("Loading section"),
+      ).toBeInTheDocument();
+    expect(screen.queryByText(/Loading .*…/)).not.toBeInTheDocument();
   });
   it("shows empty states before any sample, test or event exists", async () => {
     serve(networkFixtures("healthy", true));
@@ -284,8 +287,12 @@ describe("network page", () => {
         : null,
     );
     await open();
-    expect(await screen.findByText("History: HTTP 503")).toBeInTheDocument();
-    expect(await screen.findByText("Event bands unavailable: HTTP 503")).toBeInTheDocument();
+    const history = screen.getByRole("region", { name: "Network history" });
+    await waitFor(() => expect(within(history).getAllByRole("alert")).toHaveLength(2));
+    const [historyAlert, bandsAlert] = within(history).getAllByRole("alert");
+    expect(historyAlert).toHaveTextContent("Unable to load history");
+    expect(historyAlert).toHaveTextContent("HTTP 503");
+    expect(bandsAlert).toHaveTextContent("Event bands unavailable");
     expect(
       within(screen.getByRole("region", { name: "Network events" })).getByRole("alert"),
     ).toHaveTextContent("HTTP 503");

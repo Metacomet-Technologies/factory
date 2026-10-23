@@ -60,7 +60,7 @@ system; the top-bar toggle writes the sticky `factory-theme` override and
 | `--sky-0…4`, `--ridge-far/mid/near`, `--snow` | see `:root` | | scene gradient stops and the ridgeline |
 | `--glass-*` | see below | | glass edge, sheen, glint, drop shadow, alpha, blur, saturation |
 | `--shadow-glass`, `--shadow-tone-warn/fail`, `--shadow-mark` | | | depth and tone rings; the old `--shadow-card`/`--glow` shadows are gone |
-| `--radius-glass` 14 px, `--radius-pill` | | | panel corners and chips |
+| `--radius-sm` 6 / `-md` 8 / `-lg` 12 px, `--radius-glass` 14 px, `--radius-pill` | | | the only radii: `sm` toggle items, `md` controls and fields (shadcn `rounded-md`; buttons no longer use `rounded-lg`), tiles and icon chips, `lg` alerts and dialogs, `glass` panels, `pill` chips. `radius-xl` / `radius-4xl` are gone; never write a pixel radius |
 | `--dur-fast/-/-slow` 160/320/640 ms, `--dur-tween` 600, `--dur-draw` 900, `--dur-event` 1200, `--dur-ping` 1800, `--dur-sweep` 60 s, `--dur-aurora` 48 s, `--dur-twinkle` 6 s, `--ease-out`, `--stagger` 60 ms | | | motion |
 
 Deviations from `tokens.json`, each one step away to clear AA over the scene
@@ -154,9 +154,35 @@ is on).
   rows on the device page are a grid for this reason).
 - `RangeToggle` (`ui/range-toggle.tsx`): segmented control; the pressed
   segment gets a `--border-control` outline so the state reads at 3:1.
+- `Input` (`ui/input.tsx`) and `Select` (`ui/select.tsx`), both Base UI:
+  glass fields (`.field`): the card tint at `--glass-alpha`, a
+  `--border-control` outline (≥ 3:1), `radius-md`, the teal focus ring,
+  `--fail` border when `aria-invalid`, and the muted fill when disabled.
+  `Select` takes `options`, `value` and `onValueChange`; its trigger is a
+  `combobox` and its glass popup a listbox of `option`s (`name` submits the
+  value). Label every field with `<label htmlFor>`.
+- `Dialog`, `DialogContent`, `DialogTitle`, `DialogDescription`
+  (`ui/dialog.tsx`, Base UI): a modal glass sheet (`radius-lg`, glass blur,
+  a `--border-control` outline, `--shadow-glass`) over a dimmed backdrop; focus is trapped while open and
+  Escape closes it through `onOpenChange`. UPS Controls' typed confirmation
+  is the only dialog; keep any new one read-only unless it is a control.
+- `Alert` (`radius-lg`, sets `data-variant`): `variant="destructive"` for
+  errors and refusals; the default for results; add `className="pending"` for
+  the warn tone (UPS pending power banner, unknown outcomes, pricing pending).
+  Pass `role="status"` for non-error announcements. In UPS Controls only an
+  executed action (`SUCCESS`) shows the check icon; `FSD_SET` shows info,
+  refusals are destructive and unknown or `PENDING` outcomes warn. The
+  server's text is always shown verbatim.
+- `Separator` (`ui/separator.tsx`): the hairline between blocks inside a
+  Tile (fleet nodes). There is no `.divider` class.
 - `KeyValue`, `PageHeader`, `LiveIndicator` (`.live-indicator`, the ripple
-  target), `Button`, `Alert`, `Table`, `Tooltip`, `Tabs` as before. `Badge`,
-  `Card` and `Tabs` cleanup is MET-228.
+  target), `Button`, `Table`, `Tooltip` as before. `Badge`, `Card` and `Tabs`
+  were deleted in MET-228: use `StatusChip`, `Panel` / `Tile` and
+  `RangeToggle`. A test in `ui/primitives.test.tsx` fails if they, the old
+  radius tokens or `.divider` come back.
+- ↗ (`ArrowUpRight`) only ever marks navigation: a tile or panel that is a
+  link. Never use it as decoration (the spend cards no longer carry it or
+  their accent bar).
 - `TrendChart` (`charts/trend-chart.tsx`): the comet trail by default: a teal
   stroke fading in from the left with a bright "now" head and halo; no fill.
   `variant="area"` keeps the gradient area for distributions (devices
@@ -189,6 +215,9 @@ stacks; numbers get `tabular-nums` from `body`.
 - Details pages (`/ups`, `/llm`, `/network`, `/devices/<id>`): `PageHeader`
   then stacked Panels; the dashboard area scrolls there.
 - Navigation: plain `<a href="/…">`; `App.tsx` intercepts same-origin clicks.
+  An icon that navigates (the UPS badge in the top bar) is an `<a>` styled
+  with `buttonVariants({ variant: "ghost", size: "icon" })`, never a button
+  calling `window.location`.
 - Topology page (`/topology`, `kiosk/src/topology/`, MET-226): a static React
   Flow map of the factory. Boxes, groups, edges and flows live in
   `topology.ts`; edge geometry is routed at runtime by `router.ts` over that
@@ -210,9 +239,22 @@ stacks; numbers get `tabular-nums` from `body`.
 - The stream reconnects on `error`, after 45 s of silence, and on
   `online` / `visibilitychange` / `pageshow`, with jittered backoff. Do not
   add a second EventSource.
-- Show `ResourceState` (skeleton, error alert, empty text) at the top of any
-  Panel that renders a `Resource`. Error and reconnecting states must not
-  grow the overview past the viewport.
+- `ResourceState` (skeleton, destructive `Alert`, empty text) is the only
+  loading and error UI. Pass `resource={…}` for a `Resource`, or
+  `loading` / `error` for anything else (the device view, paged events, a
+  lazy chunk's `Suspense` fallback); `title` names a partial failure ("GPU
+  overlay unavailable"); `retry` replaces "Retrying on the next refresh." when
+  the refresh does not recover the state (a failed save, an older audit page)
+  and `retry={null}` omits it. Put it at the top of the Panel or section it
+  describes. Never write "Loading…" text or a hand-rolled `role="alert"`
+  paragraph; `details-states.test.tsx` checks every details page. Each
+  request owns its state where it is shown: Live UPS shows `/v1/ups`, Battery
+  health the self-test history, CPU history the device history. The server's
+  message renders verbatim inside the Alert. UPS Controls uses it for its
+  first load, state errors ("Controls unavailable") and older audit pages;
+  the 403 view stays the plain denied text only, with polling stopped.
+  Error and reconnecting states must not grow the overview past the
+  viewport.
 
 ## Checks
 

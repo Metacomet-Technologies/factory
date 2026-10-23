@@ -1,4 +1,4 @@
-import { Dialog } from "@base-ui/react/dialog";
+import { AlertTriangle, CircleCheck, Info } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiUrl } from "../api/client";
 import type {
@@ -10,7 +10,13 @@ import type {
   ControlState,
   PendingPower,
 } from "../api/ups-control";
+import { ResourceState } from "./sections";
+import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
 import { Button } from "./ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "./ui/dialog";
+import { Input } from "./ui/input";
+import { Select } from "./ui/select";
+import { cn } from "@/lib/utils";
 
 const denied = "Controls available from Devon's or David's devices";
 
@@ -24,6 +30,18 @@ class ControlError extends Error {
     this.validJson = validJson;
   }
 }
+
+/** How a result reads: executed, accepted but unverified, refused or not executed, or unknown. */
+type Outcome = "ok" | "info" | "refused" | "unknown";
+type Message = { text: string; outcome: Outcome } | null;
+const trackingOutcome = (status: string): Outcome =>
+  status === "SUCCESS"
+    ? "ok"
+    : status === "FSD_SET"
+      ? "info"
+      : status === "PENDING"
+        ? "unknown"
+        : "refused";
 
 function consequence(action: string) {
   if (action === "power.off_stay") return "Recovery needs the physical power button.";
@@ -65,18 +83,15 @@ function SettingForm({
         · {setting.range_source}
       </p>
       {setting.allowed_values.length ? (
-        <select
+        <Select
           id={id}
           value={value}
           aria-describedby={`${id}-help`}
-          onChange={(event) => setValue(event.target.value)}
-        >
-          {setting.allowed_values.map((option) => (
-            <option key={option}>{option}</option>
-          ))}
-        </select>
+          options={setting.allowed_values}
+          onValueChange={setValue}
+        />
       ) : (
-        <input
+        <Input
           id={id}
           type="text"
           inputMode="numeric"
@@ -98,7 +113,11 @@ function SettingForm({
 export default function UpsControls() {
   const [state, setState] = useState<ControlState | null>(null);
   const [loading, setLoading] = useState(true);
-  const [message, setMessage] = useState("");
+  const [message, setMessage] = useState<Message>(null);
+  const [auditPage, setAuditPage] = useState<{ loading: boolean; error: string | null }>({
+    loading: false,
+    error: null,
+  });
   const [busy, setBusy] = useState(false);
   const [dialog, setDialog] = useState<{
     action: ControlAction;
@@ -135,7 +154,7 @@ export default function UpsControls() {
         if (stateTimer.current !== null) clearInterval(stateTimer.current);
         setState(null);
         setStateError(denied);
-        setMessage("");
+        setMessage(null);
         setLoading(false);
         setDialog(null);
       } else if (forbidden.current) {
@@ -253,7 +272,7 @@ export default function UpsControls() {
   const prepare = useCallback(
     async (action: ControlAction, value: string | null = null) => {
       setBusy(true);
-      setMessage("");
+      setMessage(null);
       try {
         const confirmation = await controlRequest<Confirmation>("actions", {
           action: action.action,
@@ -264,7 +283,10 @@ export default function UpsControls() {
         setDialog({ action, value, confirmation });
       } catch (error) {
         if (!forbidden.current)
-          setMessage(error instanceof Error ? error.message : "Request failed");
+          setMessage({
+            text: error instanceof Error ? error.message : "Request failed",
+            outcome: "refused",
+          });
       } finally {
         setBusy(false);
         void refresh();
@@ -286,7 +308,10 @@ export default function UpsControls() {
         `actions/${dialog.confirmation.id}/confirm`,
         { phrase: typed },
       );
-      setMessage([result.result, result.expected_downtime].filter(Boolean).join(" · "));
+      setMessage({
+        text: [result.result, result.expected_downtime].filter(Boolean).join(" · "),
+        outcome: trackingOutcome(result.tracking_status),
+      });
       if (
         dialog.action.tier === "power" &&
         ["FSD_SET", "SUCCESS", "PENDING"].includes(result.tracking_status)
@@ -305,8 +330,11 @@ export default function UpsControls() {
       if (!forbidden.current)
         setMessage(
           error instanceof ControlError && error.validJson
-            ? error.message
-            : `Confirmation failed; outcome unknown. Check audit before retrying. ${error instanceof Error ? error.message : String(error)}`,
+            ? { text: error.message, outcome: "refused" }
+            : {
+                text: `Confirmation failed; outcome unknown. Check audit before retrying. ${error instanceof Error ? error.message : String(error)}`,
+                outcome: "unknown",
+              },
         );
     } finally {
       setDialog(null);
@@ -319,21 +347,42 @@ export default function UpsControls() {
     ? Math.max(0, Math.ceil((dialog.confirmation.expires_ms - now) / 1000))
     : 0;
   const pendingBanner = banner && banner.audit_id !== recoveredId && (
-    <div className="ups-pending" role="status">
-      <strong>
+    <Alert className="ups-pending pending" role="status">
+      <AlertTriangle aria-hidden="true" />
+      <AlertTitle>
         {banner.expected_return_ms == null
           ? "Factory going down; return time unavailable"
           : `Factory going down; expect it back at about ${new Date(banner.expected_return_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`}
-      </strong>
-      <p>{banner.result}</p>
-      <p>Watching API health for disconnect and recovery.</p>
-    </div>
+      </AlertTitle>
+      <AlertDescription>
+        <p>{banner.result}</p>
+        <p>Watching API health for disconnect and recovery.</p>
+      </AlertDescription>
+    </Alert>
+  );
+  // Only an executed action gets the check; refusals are destructive and unknown outcomes warn.
+  const result = message && (
+    <Alert
+      className={cn("ups-control-result", message.outcome === "unknown" && "pending")}
+      variant={message.outcome === "refused" ? "destructive" : "default"}
+      data-outcome={message.outcome}
+      role="status"
+    >
+      {message.outcome === "ok" ? (
+        <CircleCheck aria-hidden="true" className="status-ok" />
+      ) : message.outcome === "info" ? (
+        <Info aria-hidden="true" />
+      ) : (
+        <AlertTriangle aria-hidden="true" />
+      )}
+      <AlertDescription>{message.text}</AlertDescription>
+    </Alert>
   );
 
   if (loading)
     return (
       <section className="ups-panel ups-controls" aria-label="Controls">
-        <p className="muted">Loading controls…</p>
+        <ResourceState loading error={null} />
       </section>
     );
   const rows = audit ?? state?.audit ?? [];
@@ -342,18 +391,13 @@ export default function UpsControls() {
       {!state ? (
         <div className="ups-controls">
           {pendingBanner}
-          {message && (
-            <p role="status" className="ups-control-result">
-              {message}
-            </p>
-          )}
+          {result}
           <section className="ups-panel" aria-label="Controls">
-            <p
-              className={stateError === denied ? "muted" : "status-fail"}
-              role={stateError === denied ? undefined : "alert"}
-            >
-              {stateError}
-            </p>
+            {stateError === denied ? (
+              <p className="muted">{denied}</p>
+            ) : (
+              <ResourceState loading={false} error={stateError} title="Controls unavailable" />
+            )}
           </section>
         </div>
       ) : (
@@ -361,11 +405,7 @@ export default function UpsControls() {
           <h3>Controls</h3>
           <p className="muted">Signed in as {state.login}</p>
           {pendingBanner}
-          {message && (
-            <p role="status" className="ups-control-result">
-              {message}
-            </p>
-          )}
+          {result}
           {(["safe", "settings", "power"] as const).map((tier) => (
             <div className="ups-control-tier" key={tier}>
               <h4>{tier === "safe" ? "Safe" : tier === "settings" ? "Settings" : "Power"}</h4>
@@ -414,6 +454,12 @@ export default function UpsControls() {
           ))}
           <div className="ups-control-tier">
             <h4>Audit log</h4>
+            <ResourceState
+              loading={auditPage.loading}
+              error={auditPage.error}
+              title="Unable to load older audit rows"
+              retry="The refresh does not reload older rows; select Older audit to try again."
+            />
             {!rows.length && <p className="muted">No audit rows.</p>}
             <ol
               className="ups-events ups-control-audit"
@@ -439,6 +485,7 @@ export default function UpsControls() {
                   disabled={busy}
                   onClick={() => {
                     setAudit(null);
+                    setAuditPage({ loading: false, error: null });
                     void refresh();
                   }}
                 >
@@ -451,14 +498,24 @@ export default function UpsControls() {
                   disabled={busy}
                   onClick={() => {
                     setBusy(true);
+                    setAuditPage({ loading: true, error: null });
                     void controlRequest<{ rows: AuditRow[] }>(
                       `audit?limit=20&before_ms=${rows[rows.length - 1]!.ts_ms}`,
                     )
-                      .then((page) => setAudit(page.rows))
-                      .catch((error: unknown) => {
-                        if (!forbidden.current)
-                          setMessage(error instanceof Error ? error.message : "Audit unavailable");
+                      .then((page) => {
+                        setAudit(page.rows);
+                        setAuditPage({ loading: false, error: null });
                       })
+                      .catch((error: unknown) =>
+                        setAuditPage({
+                          loading: false,
+                          error: forbidden.current
+                            ? null
+                            : error instanceof Error
+                              ? error.message
+                              : "Audit unavailable",
+                        }),
+                      )
                       .finally(() => setBusy(false));
                   }}
                 >
@@ -469,65 +526,60 @@ export default function UpsControls() {
           </div>
         </section>
       )}
-      <Dialog.Root
+      <Dialog
         open={dialog !== null}
         onOpenChange={(open) => {
           if (!open && !busy) setDialog(null);
         }}
       >
-        <Dialog.Portal>
-          <Dialog.Backdrop className="ups-confirm-backdrop" />
-          <Dialog.Popup className="ups-confirm" aria-describedby="ups-confirm-detail">
-            <Dialog.Title>Confirm {dialog?.action.label ?? dialog?.action.action}</Dialog.Title>
-            <Dialog.Description id="ups-confirm-detail">
-              Value: {dialog?.value ?? "—"}.{" "}
-              {dialog?.action.tier === "power" && consequence(dialog.action.action)}
-            </Dialog.Description>
-            <form
-              onSubmit={(event) => {
-                event.preventDefault();
-                void confirm();
-              }}
-            >
-              <label htmlFor="ups-confirm-typed">
-                Type exactly: <strong>{dialog?.confirmation.confirm_phrase}</strong>
-              </label>
-              <input
-                id="ups-confirm-typed"
-                autoComplete="off"
-                value={typed}
+        <DialogContent className="ups-confirm" aria-describedby="ups-confirm-detail">
+          <DialogTitle>Confirm {dialog?.action.label ?? dialog?.action.action}</DialogTitle>
+          <DialogDescription id="ups-confirm-detail">
+            Value: {dialog?.value ?? "—"}.{" "}
+            {dialog?.action.tier === "power" && consequence(dialog.action.action)}
+          </DialogDescription>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void confirm();
+            }}
+          >
+            <label htmlFor="ups-confirm-typed">
+              Type exactly: <strong>{dialog?.confirmation.confirm_phrase}</strong>
+            </label>
+            <Input
+              id="ups-confirm-typed"
+              autoComplete="off"
+              value={typed}
+              disabled={busy}
+              onChange={(event) => setTyped(event.target.value)}
+              aria-describedby="ups-confirm-expiry"
+            />
+            <p id="ups-confirm-expiry">
+              {remaining > 0
+                ? `${remaining} s remaining`
+                : "Confirmation expired. Close and request again."}
+            </p>
+            <div className="row">
+              <Button
+                type="button"
+                variant="outline"
                 disabled={busy}
-                onChange={(event) => setTyped(event.target.value)}
-                aria-describedby="ups-confirm-expiry"
-              />
-              <p id="ups-confirm-expiry">
-                {remaining > 0
-                  ? `${remaining} s remaining`
-                  : "Confirmation expired. Close and request again."}
-              </p>
-              <div className="row">
-                <Button
-                  type="button"
-                  variant="outline"
-                  disabled={busy}
-                  onClick={() => setDialog(null)}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  type="submit"
-                  variant={dialog?.action.tier === "power" ? "destructive" : "default"}
-                  disabled={
-                    busy || remaining === 0 || typed !== dialog?.confirmation.confirm_phrase
-                  }
-                >
-                  {busy ? "Confirming…" : "Confirm"}
-                </Button>
-              </div>
-            </form>
-          </Dialog.Popup>
-        </Dialog.Portal>
-      </Dialog.Root>
+                onClick={() => setDialog(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                variant={dialog?.action.tier === "power" ? "destructive" : "default"}
+                disabled={busy || remaining === 0 || typed !== dialog?.confirmation.confirm_phrase}
+              >
+                {busy ? "Confirming…" : "Confirm"}
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

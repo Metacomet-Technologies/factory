@@ -23,17 +23,26 @@ import { RangeToggle } from "./ui/range-toggle";
 import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
 import { Skeleton } from "./ui/skeleton";
 import { Button } from "./ui/button";
+import { Separator } from "./ui/separator";
 
 const GpuChart = lazy(() => import("./gpu-chart"));
 
-export function ResourceState({
-  resource,
-  empty,
-}: {
-  resource: Resource<unknown>;
+type ResourceStateProps = {
   empty?: string | undefined;
-}) {
-  if (resource.loading)
+  /** Alert title; defaults to "Unable to load this section". */
+  title?: string | undefined;
+  /** What happens next, after the message. Defaults to the automatic refresh; null omits it. */
+  retry?: string | null | undefined;
+} & (
+  | { resource: Resource<unknown> }
+  /** For state that is not a `Resource`: the device view, paged events, lazy chunks. */
+  | { loading: boolean; error: string | null | undefined }
+);
+
+/** The only loading, error and empty UI for a section: skeletons, a destructive Alert, or text. */
+export function ResourceState(props: ResourceStateProps) {
+  const { loading, error } = "resource" in props ? props.resource : props;
+  if (loading)
     return (
       <div aria-label="Loading section" className="loading">
         <Skeleton className="h-8 w-2/3" />
@@ -41,15 +50,20 @@ export function ResourceState({
         <Skeleton className="h-4 w-1/2" />
       </div>
     );
-  if (resource.error)
+  if (error)
     return (
       <Alert variant="destructive">
         <AlertTriangle />
-        <AlertTitle>Unable to load this section</AlertTitle>
-        <AlertDescription>{resource.error}. Retrying on the next refresh.</AlertDescription>
+        <AlertTitle>{props.title ?? "Unable to load this section"}</AlertTitle>
+        <AlertDescription>
+          {/* The server's message stays verbatim in its own element. */}
+          <span data-slot="resource-error">{error}</span>
+          {/[.!?]$/.test(error) ? "" : "."}
+          {props.retry === null ? null : ` ${props.retry ?? "Retrying on the next refresh."}`}
+        </AlertDescription>
       </Alert>
     );
-  return empty ? <p className="empty">{empty}</p> : null;
+  return props.empty ? <p className="empty">{props.empty}</p> : null;
 }
 export function Warnings({ warnings }: { warnings: string[] }) {
   return warnings.length ? (
@@ -133,7 +147,7 @@ export function FleetSection({
                 {node.tailscale_ip ?? "—"} · {node.os ?? "—"} · seen{" "}
                 {node.online && node.last_seen_ms == null ? "now" : seen(node.last_seen_ms)}
               </p>
-              <div className="divider" />
+              <Separator className="node-separator" />
               {node.services.length === 0 ? (
                 <p className="muted">No services reported.</p>
               ) : (
