@@ -321,6 +321,7 @@ fn health(state: &AppState) -> Json<Health> {
         inputs_fingerprint: build.inputs_fingerprint,
         openapi_sha256: openapi_sha256().into(),
         uptime_ms: state.started.elapsed().as_millis() as u64,
+        retention: state.retention(),
     })
 }
 #[utoipa::path(get, path="/v1/fleet", responses((status=200, body=Fleet)))]
@@ -1084,6 +1085,7 @@ async fn confirm_selection(state: &AppState, family: String) -> Response {
     ),
     components(schemas(
         Health,
+        RequestRetention,
         ApiError,
         Fleet,
         Usage,

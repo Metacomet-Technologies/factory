@@ -13,6 +13,7 @@ pub mod network_diagnosis;
 pub mod network_history;
 pub mod network_speed;
 pub mod pool;
+pub mod retention;
 pub mod rollups;
 pub mod types;
 pub mod ups;
@@ -86,6 +87,7 @@ pub struct AppState {
     devices_latest: Arc<RwLock<Option<devices::DeviceView>>>,
     devices_guard: Arc<AtomicBool>,
     meter_synced_at_ms: Arc<AtomicI64>,
+    retention: Arc<std::sync::Mutex<RequestRetention>>,
     warnings: Arc<RwLock<BTreeMap<String, String>>>,
     events: broadcast::Sender<StreamEvent>,
 }
@@ -161,6 +163,7 @@ impl AppState {
             devices_latest: Default::default(),
             devices_guard: Default::default(),
             meter_synced_at_ms: Arc::new(AtomicI64::new(now_ms())),
+            retention: Default::default(),
             warnings: Default::default(),
             events: broadcast::channel(1024).0,
         })
@@ -254,6 +257,12 @@ impl AppState {
                     .ok_or_else(|| anyhow::anyhow!("meter missing next_after_id"))?
                     .to_str()?
                     .parse()?;
+                // Meters before MET-206 omit it; their ID gaps all stay warnings.
+                let oldest: Option<i64> = response
+                    .headers()
+                    .get("oldest_retained_id")
+                    .map(|v| anyhow::Ok(v.to_str()?.parse()?))
+                    .transpose()?;
                 let records: Vec<RequestRecord> = response.json().await?;
                 anyhow::ensure!(
                     records.len() <= 500
@@ -261,7 +270,10 @@ impl AppState {
                             .iter()
                             .map(|r| r.id)
                             .try_fold(cursor, |previous, id| { (id > previous).then_some(id) })
-                            == Some(next),
+                            == Some(next)
+                        && records
+                            .first()
+                            .is_none_or(|r| oldest.is_none_or(|o| o <= r.id)),
                     "invalid meter cursor page"
                 );
                 let finished = records.is_empty();
@@ -285,7 +297,7 @@ impl AppState {
                 } else {
                     self.db
                         .write(&self.query_scope, move |db| {
-                            data::sync(db, records, &frozen)
+                            data::sync(db, records, &frozen, oldest)
                         })
                         .await?
                 };
@@ -399,6 +411,73 @@ impl AppState {
         };
         self.warning("rollups", warning).await;
         result
+    }
+    /// 365-day retention of the request copy, after the rollup run: bounded
+    /// batches, each its own writer job. A refusal or failure deletes nothing
+    /// in that batch and is recorded in `/v1/health` `retention`.
+    pub async fn retain_requests(&self) -> Result<u64> {
+        let now = now_ms();
+        let cutoff = now - retention::RETENTION_MS;
+        let mut deleted = 0u64;
+        let mut outcome = retention::Prune::Nothing;
+        let result = async {
+            for _ in 0..retention::BATCHES_PER_RUN {
+                outcome = self
+                    .db
+                    .write(&self.query_scope, move |db| retention::prune(db, cutoff))
+                    .await?;
+                match outcome {
+                    retention::Prune::Deleted(n) => {
+                        deleted += n as u64;
+                        if n < retention::BATCH {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            self.db
+                .requests
+                .read(&self.query_scope, |db| {
+                    Ok(db.query_row("SELECT MIN(id) FROM requests", [], |r| r.get(0))?)
+                })
+                .await
+        }
+        .await;
+        let mut retention = self.retention.lock().expect("retention lock");
+        retention.checked_at_ms = Some(now);
+        retention.cutoff_ms = Some(cutoff);
+        let (status, detail) = match (&result, outcome) {
+            (Err(e), _) => ("failed", Some(format!("request retention failed: {e:#}"))),
+            (Ok(_), retention::Prune::Refused(reason)) => ("skipped", Some(reason)),
+            (Ok(_), retention::Prune::Deleted(retention::BATCH)) => (
+                "ok",
+                Some("more expired rows remain; pruning continues next run".into()),
+            ),
+            (Ok(_), _) => ("ok", None),
+        };
+        retention.pruned_rows_since_start += deleted;
+        if status == "ok" {
+            (retention.pruned_at_ms, retention.pruned_rows) = (Some(now), deleted);
+            retention.skipped_since_ms = None;
+        } else {
+            retention.skipped_since_ms.get_or_insert(now);
+        }
+        if let Ok(oldest) = &result {
+            retention.oldest_retained_id = *oldest;
+        }
+        retention.status = status.into();
+        retention.detail = detail;
+        match status {
+            "ok" if deleted > 0 => tracing::info!(deleted, cutoff, "pruned expired requests"),
+            "ok" => {}
+            _ => tracing::warn!(detail = ?retention.detail, "request retention {status}"),
+        }
+        drop(retention);
+        result.map(|_| deleted)
+    }
+    pub fn retention(&self) -> RequestRetention {
+        self.retention.lock().expect("retention lock").clone()
     }
     pub async fn collect_fleet(&self) {
         let next = fleet::collect(self).await;
@@ -944,6 +1023,8 @@ impl AppState {
                             }
                             "database" => {
                                 let _ = state.roll_up().await;
+                                // Prunes only rows the run above has verifiably rolled up.
+                                let _ = state.retain_requests().await;
                                 let optimize =
                                     last_optimize.elapsed() >= Duration::from_secs(86400);
                                 let retention = state

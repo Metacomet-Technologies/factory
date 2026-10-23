@@ -3,7 +3,7 @@
 //! restarts and failed batches; STRICT rejections; and the offline v5 -> v6
 //! migration with its backup-gated rollback.
 use anyhow::Result;
-use factory_api::{costs, data, rollups, types::Usage};
+use factory_api::{costs, data, retention, rollups, types::Usage};
 use factory_db::rollup::{DAY_MS, HOUR_MS};
 use rusqlite::{Connection, params};
 use std::{collections::BTreeMap, path::Path};
@@ -408,6 +408,166 @@ fn rollups_plus_raw_edge_match_raw_across_windows_restarts_and_late_rows() -> Re
         scalar(&db, "SELECT SUM(requests) FROM request_latency_hourly"),
         scalar(&db, "SELECT SUM(requests) FROM request_hourly")
     );
+    Ok(())
+}
+
+/// Every public usage range at `now`, without the response time.
+fn public_usage(
+    db: &Connection,
+    store: &pricing::Store,
+    now: i64,
+) -> Result<Vec<(i64, bool, serde_json::Value)>> {
+    [1, 7, 30, 365]
+        .into_iter()
+        .map(|days| {
+            let (since, exact) = (now - days * DAY_MS, days != 365);
+            let mut value = serde_json::to_value(usage(db, store, since, exact)?)?;
+            value.as_object_mut().unwrap().remove("generated_at_ms");
+            Ok((since, exact, value))
+        })
+        .collect()
+}
+
+/// Prune to completion; returns the rows deleted, or the first refusal.
+fn prune_all(db: &mut Connection, cutoff: i64) -> Result<std::result::Result<usize, String>> {
+    let mut deleted = 0;
+    loop {
+        match retention::prune(db, cutoff)? {
+            retention::Prune::Deleted(n) => {
+                deleted += n;
+                if n < retention::BATCH {
+                    return Ok(Ok(deleted));
+                }
+            }
+            retention::Prune::Nothing => return Ok(Ok(deleted)),
+            retention::Prune::Refused(reason) => return Ok(Err(reason)),
+        }
+    }
+}
+
+#[test]
+fn retention_gates_and_unchanged_usage_and_spend_after_pruning() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("requests.db");
+    let pricing_path = temp.path().join("pricing.db");
+    pricing::migrate(&pricing_path)?;
+    let store = pricing::Store::open(&pricing_path)?;
+    let families = costs::families()?;
+    // The 400-day fixture ends at `now`; its first 35 days are expired.
+    let now = ANCHOR + SPAN;
+    let cutoff = now - retention::RETENTION_MS;
+    let mut rows: Vec<Row> = (1..=8_000).map(row).collect();
+    // Strict cutoff: exactly 365 days is kept, 365 days + 1 ms is pruned.
+    rows[10].ts = cutoff;
+    rows[11].ts = cutoff - 1;
+    let mut db = data::open(&path)?;
+    insert(&mut db, &rows, &families)?;
+    let count = |db: &Connection| scalar(db, "SELECT COUNT(*) FROM requests");
+    let refused = |db: &mut Connection| prune_all(db, cutoff).map(|r| r.unwrap_err());
+
+    let reason = refused(&mut db)?;
+    assert!(reason.starts_with("rollup unverified"), "{reason}");
+    assert_eq!(rollups::batch(&mut db, 1)?, rollups::Step::Rolled(5_000));
+    assert!(refused(&mut db)?.starts_with("rollup unverified"));
+    assert!(rollups::run(&mut db, 2, rollups::BATCHES_PER_RUN)?.verified);
+
+    // A late expired row above the checkpoint waits for the next rollup run.
+    let late = Row {
+        ts: cutoff - 5 * DAY_MS,
+        endpoint: INFERENCE[0],
+        ..row(8_001)
+    };
+    insert(&mut db, std::slice::from_ref(&late), &families)?;
+    rows.push(late);
+    assert_eq!(
+        refused(&mut db)?,
+        "rollup behind: expired request id 8001 is above the verified checkpoint 8000"
+    );
+    assert!(rollups::run(&mut db, 3, rollups::BATCHES_PER_RUN)?.caught_up);
+
+    // Cost gates, one family at a time, then together.
+    let family = &families[0];
+    let set = |db: &Connection, sql: &str| {
+        db.execute(
+            &format!("UPDATE cost_backfill SET {sql} WHERE family=?1"),
+            [family],
+        )
+        .unwrap()
+    };
+    set(&db, "completed_at_ms=NULL");
+    assert_eq!(
+        refused(&mut db)?,
+        format!("backfill incomplete: {family} cost backfill has no completion time")
+    );
+    set(&db, "completed_at_ms=1,unpriced_from_id=12");
+    let reason = refused(&mut db)?;
+    assert!(
+        reason.starts_with(&format!(
+            "costs not frozen: {family} classifications through id "
+        )),
+        "{reason}"
+    );
+    // A walk still classifying expired IDs is not frozen either.
+    set(&db, "unpriced_from_id=NULL,after_id=100,target_id=200");
+    assert!(refused(&mut db)?.starts_with("costs not frozen"));
+    // Pending work entirely above the expired IDs does not block.
+    set(&db, "after_id=8001,target_id=9000,unpriced_from_id=8500");
+    db.execute("UPDATE rollup_state SET verified_at_ms=NULL", [])?;
+    let both = refused(&mut db)?;
+    assert!(
+        both.starts_with("rollup unverified") && !both.contains("costs not frozen"),
+        "{both}"
+    );
+    db.execute("UPDATE rollup_state SET verified_at_ms=3", [])?;
+    set(&db, "after_id=0,target_id=0,unpriced_from_id=NULL");
+    assert_eq!(count(&db), 8_001);
+
+    // Gates met: delete exactly the expired rows and their classifications.
+    let before = public_usage(&db, &store, now)?;
+    let costs_before = scalar(&db, "SELECT COUNT(*) FROM request_costs");
+    let expired: Vec<&Row> = rows.iter().filter(|r| r.ts < cutoff).collect();
+    assert!(!expired.is_empty());
+    assert_eq!(prune_all(&mut db, cutoff)?, Ok(expired.len()));
+    assert_eq!(count(&db), (rows.len() - expired.len()) as i64);
+    let inference = expired
+        .iter()
+        .filter(|r| INFERENCE.contains(&r.endpoint))
+        .count();
+    assert_eq!(
+        scalar(&db, "SELECT COUNT(*) FROM request_costs"),
+        costs_before - (inference * families.len()) as i64
+    );
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM requests WHERE id=11"), 1);
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM requests WHERE id=12"), 0);
+    // Rollups and spend rollups are untouched; every range's usage and spend
+    // is identical and still matches the full raw history.
+    assert_eq!(
+        scalar(&db, "SELECT SUM(requests) FROM request_daily"),
+        rows.len() as i64
+    );
+    let after = public_usage(&db, &store, now)?;
+    assert_eq!(after, before);
+    for (since, exact, _) in &after {
+        check(
+            &usage(&db, &store, *since, *exact)?,
+            &rows,
+            &families,
+            *since,
+            *exact,
+        );
+    }
+    // Idempotent: nothing more is pruned on a rerun or after reopening.
+    assert_eq!(
+        retention::prune(&mut db, cutoff)?,
+        retention::Prune::Nothing
+    );
+    drop(db);
+    let mut db = data::open(&path)?;
+    assert_eq!(
+        retention::prune(&mut db, cutoff)?,
+        retention::Prune::Nothing
+    );
+    assert_eq!(count(&db), (rows.len() - expired.len()) as i64);
     Ok(())
 }
 

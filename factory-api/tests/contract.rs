@@ -288,9 +288,11 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             "inputs_fingerprint",
             "openapi_sha256",
             "uptime_ms",
+            "retention",
         ],
     );
     assert_eq!(health["status"], "ok");
+    assert_eq!(health["retention"]["status"], "pending");
     assert!(health["uptime_ms"].is_u64());
     assert_eq!(health["version"], include_str!("../../VERSION").trim());
     assert!(!health["git_sha"].as_str().unwrap().is_empty());
@@ -1049,6 +1051,7 @@ async fn sixty_second_pricing_source_and_sqlite_writer_do_not_stall_reads() -> R
                         ..Default::default()
                     }],
                     &[],
+                    None,
                 )
             })
             .await
@@ -1759,7 +1762,7 @@ async fn benchmark_100k() -> Result<()> {
                 .collect();
             let (costs, stopped) = factory_api::costs::freeze(&histories, &mut records);
             anyhow::ensure!(stopped.is_none());
-            factory_api::data::sync(db, records, &costs)?;
+            factory_api::data::sync(db, records, &costs, None)?;
             Ok(())
         })
         .await?;

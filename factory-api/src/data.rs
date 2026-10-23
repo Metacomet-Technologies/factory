@@ -124,10 +124,13 @@ pub fn initialize(db: &mut Connection) -> Result<()> {
 pub const REQUEST_COLUMNS: &str = "id,ts_ms,endpoint,model,prompt_eval_count,eval_count,load_duration_ns,prompt_eval_duration_ns,eval_duration_ns,total_duration_ns,usage_json,latency_ms,status,stream,error,client_ip,client_hostname,user_key,actor_kind";
 
 /// Store one meter page with its frozen costs (see costs::freeze) atomically.
+/// `oldest` is meter's lowest stored ID from the page's snapshot: IDs below
+/// it were removed by meter's retention, so skipping them is not a gap.
 pub fn sync(
     db: &mut Connection,
     records: Vec<RequestRecord>,
     costs: &[crate::costs::Cost],
+    oldest: Option<i64>,
 ) -> Result<Vec<RequestRecord>> {
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (watermark, rebuilding, replay_through): (i64, bool, i64) = tx.query_row(
@@ -143,14 +146,14 @@ pub fn sync(
             record.id > previous && record.latency_ms.is_finite(),
             "invalid meter record"
         );
-        if record.id > previous.saturating_add(1) {
+        let first = previous.saturating_add(1).max(oldest.unwrap_or(0));
+        if record.id > first {
             warnings.push((
                 format!(
-                    "gap: meter ids {}..{} are absent from cursor history",
-                    previous + 1,
+                    "gap: meter ids {first}..{} are absent from cursor history",
                     record.id - 1
                 ),
-                previous + 1,
+                first,
                 record.id - 1,
             ));
         }
@@ -750,7 +753,7 @@ mod tests {
             let (frozen, stopped) = costs::freeze(&histories, &mut page);
             assert!(stopped.is_none());
             db.run(&Scope::default(), Category::Setup, |db| {
-                sync(db, page, &frozen)
+                sync(db, page, &frozen, None)
             })?;
             after = count;
             let scope = Scope::recording();

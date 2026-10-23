@@ -433,24 +433,27 @@ mod api {
         ("limit" = Option<usize>, Query, description = "Without after_id: 1..10000, default 100. With after_id: 1..5000, default 500."),
         ("after_id" = Option<i64>, Query, description = "Nonnegative cursor: return id > after_id in ascending order. Omit for legacy newest-first behavior.")
     ), responses((status = 200, body = [RequestRecord], headers(
-        ("next_after_id" = i64, description = "Present only with after_id: last returned ID, or the supplied cursor for an empty page.")
+        ("next_after_id" = i64, description = "Present only with after_id: last returned ID, or the supplied cursor for an empty page."),
+        ("oldest_retained_id" = i64, description = "Present only with after_id on a nonempty page: the lowest request ID meter still stores, read in the same snapshot. Lower IDs were removed by 365-day retention, which never removes a higher ID.")
     )), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
     async fn requests_doc(
         state: &AppState,
         limit: usize,
         after_id: Option<i64>,
     ) -> Result<Response<Body>, String> {
-        let rows = state
+        let (rows, oldest) = state
             .db
-            .requests(limit, after_id)
+            .requests_page(limit, after_id)
             .await
             .map_err(|e| e.to_string())?;
         let next = after_id.map(|cursor| rows.last().map_or(cursor, |row| row.id));
         let mut response = Json(rows).into_response();
-        if let Some(next) = next {
-            response
-                .headers_mut()
-                .insert("next_after_id", next.to_string().parse().unwrap());
+        for (name, value) in [("next_after_id", next), ("oldest_retained_id", oldest)] {
+            if let Some(value) = value {
+                response
+                    .headers_mut()
+                    .insert(name, value.to_string().parse().unwrap());
+            }
         }
         Ok(response)
     }
@@ -483,6 +486,7 @@ mod api {
             MeterHealth,
             db::QueueStatus,
             db::Maintenance,
+            db::Retention,
             rollup::GpuPoint,
             ModelStats,
             ApiError,

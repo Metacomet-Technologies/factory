@@ -180,7 +180,13 @@ export function fixtures(
   gpuRange: GpuRange = "1h",
   now = Date.now(),
 ) {
-  const health: Health = { status: "ok", ...build, openapi_sha256, uptime_ms: 9_840_000 };
+  const health: Health = {
+    status: "ok",
+    ...build,
+    openapi_sha256,
+    uptime_ms: 9_840_000,
+    retention: { status: "ok", oldest_retained_id: 1, pruned_rows: 0, pruned_rows_since_start: 0 },
+  };
   const fleet: Fleet = {
     generated_at_ms: now,
     nodes: [

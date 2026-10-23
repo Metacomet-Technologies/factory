@@ -39,6 +39,7 @@ pub struct Maintenance {
     pub status: String,
     pub detail: Option<String>,
     pub checked_at_ms: Option<i64>,
+    pub retention: Retention,
 }
 
 impl Default for Maintenance {
@@ -47,6 +48,47 @@ impl Default for Maintenance {
             status: "pending".into(),
             detail: None,
             checked_at_ms: None,
+            retention: Default::default(),
+        }
+    }
+}
+
+/// Raw request retention (MET-206): the lowest-ID run of rows older than
+/// 365 days, only inside the verified request rollup. Runs after each rollup run.
+#[derive(Clone, Serialize, utoipa::ToSchema)]
+pub struct Retention {
+    /// "pending" before the first run; "ok"; "skipped" when a gate is unmet;
+    /// "failed" when the job errored, leaving every row in place.
+    pub status: String,
+    /// Skip reason, error, or a note that pruning continues next run.
+    pub detail: Option<String>,
+    pub checked_at_ms: Option<i64>,
+    /// Rows with `ts_ms` strictly below this were eligible in the last run.
+    pub cutoff_ms: Option<i64>,
+    /// Lowest request ID still stored after the last run; null when empty.
+    /// IDs below it were removed by retention; IDs above it never are.
+    pub oldest_retained_id: Option<i64>,
+    /// Last run that was allowed to prune, and the rows it deleted.
+    pub pruned_at_ms: Option<i64>,
+    pub pruned_rows: u64,
+    /// Rows deleted by every run since this process started.
+    pub pruned_rows_since_start: u64,
+    /// Start of the current streak of skipped or failed runs.
+    pub skipped_since_ms: Option<i64>,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Self {
+            status: "pending".into(),
+            detail: None,
+            checked_at_ms: None,
+            cutoff_ms: None,
+            oldest_retained_id: None,
+            pruned_at_ms: None,
+            pruned_rows: 0,
+            pruned_rows_since_start: 0,
+            skipped_since_ms: None,
         }
     }
 }
@@ -215,13 +257,29 @@ impl Db {
     }
 
     pub async fn requests(&self, limit: usize, after: Option<i64>) -> Result<Vec<RequestRecord>> {
+        Ok(self.requests_page(limit, after).await?.0)
+    }
+
+    /// Cursor pages also return the lowest stored ID from the same statement,
+    /// so a client can tell retention from lost rows. None for an empty page
+    /// and for the legacy newest-first mode.
+    pub async fn requests_page(
+        &self,
+        limit: usize,
+        after: Option<i64>,
+    ) -> Result<(Vec<RequestRecord>, Option<i64>)> {
         self.read(move |db| {
             let (order, cursor) = match after {
                 Some(id) => ("WHERE id > ?2 ORDER BY id ASC", id),
                 None => ("ORDER BY id DESC", 0),
             };
+            let oldest = if after.is_some() {
+                ",(SELECT MIN(id) FROM requests)"
+            } else {
+                ",NULL"
+            };
             let mut query = db.prepare(&format!(
-                "SELECT {} FROM requests {order} LIMIT ?1",
+                "SELECT {}{oldest} FROM requests {order} LIMIT ?1",
                 storage::REQUEST_COLUMNS
             ))?;
             let values = if after.is_some() {
@@ -229,9 +287,15 @@ impl Db {
             } else {
                 vec![limit as i64]
             };
-            Ok(query
-                .query_map(rusqlite::params_from_iter(values), storage::request)?
-                .collect::<rusqlite::Result<_>>()?)
+            let width = storage::REQUEST_COLUMNS.split(',').count();
+            let mut oldest = None;
+            let rows = query
+                .query_map(rusqlite::params_from_iter(values), |r| {
+                    oldest = r.get(width)?;
+                    storage::request(r)
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok((rows, oldest))
         })
         .await
     }
@@ -270,27 +334,87 @@ impl Db {
                 rollup::run(db, crate::now_ms(), rollup::BATCHES_PER_RUN)
             })
             .await;
-        let maintenance = Maintenance {
-            status: match &result {
-                Ok(p) if p.caught_up && p.verified => "ok",
-                _ => "unhealthy",
-            }
-            .into(),
-            detail: match &result {
-                Ok(p) if p.caught_up && p.verified => None,
-                Ok(p) => Some(format!(
-                    "rollup catch-up incomplete after {} batches; continuing on next run",
-                    p.batches
-                )),
-                Err(e) => Some(format!("rollup job failed: {e:#}")),
-            },
-            checked_at_ms: Some(crate::now_ms()),
+        let status = match &result {
+            Ok(p) if p.caught_up && p.verified => "ok",
+            _ => "unhealthy",
         };
-        if let Some(detail) = &maintenance.detail {
+        let detail = match &result {
+            Ok(p) if p.caught_up && p.verified => None,
+            Ok(p) => Some(format!(
+                "rollup catch-up incomplete after {} batches; continuing on next run",
+                p.batches
+            )),
+            Err(e) => Some(format!("rollup job failed: {e:#}")),
+        };
+        if let Some(detail) = &detail {
             tracing::warn!(%detail, "meter rollups");
         }
-        state.lock().unwrap().maintenance = maintenance;
+        let maintenance = &mut state.lock().unwrap().maintenance;
+        (maintenance.status, maintenance.detail) = (status.into(), detail);
+        maintenance.checked_at_ms = Some(crate::now_ms());
         result
+    }
+
+    /// 365-day request retention after the rollup run: bounded batches, each
+    /// its own writer job. Returns the rows deleted. A refusal or failure
+    /// deletes nothing in that batch and is recorded in maintenance health.
+    pub async fn retain(&self, now_ms: i64) -> Result<u64> {
+        let scope = self.scope.clone().unwrap_or_default();
+        let cutoff = now_ms - rollup::REQUEST_RETENTION_MS;
+        let mut deleted = 0u64;
+        let mut outcome = rollup::Prune::Nothing;
+        let result = async {
+            for _ in 0..rollup::PRUNE_BATCHES_PER_RUN {
+                outcome = self
+                    .pool
+                    .write(&scope, move |db| rollup::prune_requests(db, cutoff))
+                    .await?;
+                // A short run ends at a newer row (Nothing next) or at the
+                // checkpoint (Refused next); the next call reports which.
+                match outcome {
+                    rollup::Prune::Deleted(n) if n > 0 => deleted += n as u64,
+                    _ => break,
+                }
+            }
+            self.pool
+                .read(&scope, |db| {
+                    Ok(db.query_row("SELECT MIN(id) FROM requests", [], |r| r.get(0))?)
+                })
+                .await
+        }
+        .await;
+        let mut state = self.state.lock().unwrap();
+        let retention = &mut state.maintenance.retention;
+        retention.checked_at_ms = Some(now_ms);
+        retention.cutoff_ms = Some(cutoff);
+        let (status, detail) = match (&result, outcome) {
+            (Err(e), _) => ("failed", Some(format!("request retention failed: {e:#}"))),
+            (Ok(_), rollup::Prune::Refused(reason)) => ("skipped", Some(reason)),
+            (Ok(_), rollup::Prune::Deleted(n)) if n > 0 => (
+                "ok",
+                Some("more expired rows remain; pruning continues next run".into()),
+            ),
+            (Ok(_), _) => ("ok", None),
+        };
+        retention.pruned_rows_since_start += deleted;
+        if status == "ok" {
+            (retention.pruned_at_ms, retention.pruned_rows) = (Some(now_ms), deleted);
+            retention.skipped_since_ms = None;
+        } else {
+            retention.skipped_since_ms.get_or_insert(now_ms);
+        }
+        if let Ok(oldest) = &result {
+            retention.oldest_retained_id = *oldest;
+        }
+        retention.status = status.into();
+        retention.detail = detail;
+        match status {
+            "ok" if deleted > 0 => tracing::info!(deleted, cutoff, "pruned expired requests"),
+            "ok" => {}
+            _ => tracing::warn!(detail = ?retention.detail, "request retention {status}"),
+        }
+        drop(state);
+        result.map(|_| deleted)
     }
 
     pub fn maintenance(&self) -> Maintenance {

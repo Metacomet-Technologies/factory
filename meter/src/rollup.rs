@@ -355,6 +355,60 @@ pub fn gpu_raw_sql() -> String {
     )
 }
 
+/// Raw requests are kept 365 days; strictly older rows are pruned (MET-206).
+pub const REQUEST_RETENTION_MS: i64 = 365 * 86_400_000;
+/// Rows per retention statement. Each batch is its own writer job, so
+/// ingestion interleaves between batches.
+pub const PRUNE_BATCH: usize = 2_000;
+pub const PRUNE_BATCHES_PER_RUN: usize = 50;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Prune {
+    /// No request is older than the cutoff.
+    Nothing,
+    /// A gate is unmet; nothing was deleted.
+    Refused(String),
+    Deleted(usize),
+}
+
+/// One bounded retention batch over the lowest IDs. Deletes the contiguous
+/// run of rows, starting at the lowest stored ID, whose `ts_ms < cutoff_ms`
+/// and which the verified request rollup includes. The first row that is
+/// newer, or above the checkpoint, ends the run, so every ID below the oldest
+/// stored ID was removed by retention and every ID above it is intact. An
+/// expired row above a newer one waits until the run reaches it.
+pub fn prune_requests(db: &mut Connection, cutoff_ms: i64) -> Result<Prune> {
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let lowest: Vec<(i64, i64)> = tx
+        .prepare_cached("SELECT id,ts_ms FROM requests ORDER BY id LIMIT ?1")?
+        .query_map([PRUNE_BATCH as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let Some(&(first, _)) = lowest.first().filter(|(_, ts)| *ts < cutoff_ms) else {
+        return Ok(Prune::Nothing);
+    };
+    let checkpoint = match rollup::state(&tx, "requests")? {
+        Some(s) if s.verified_at_ms.is_some() => s.last_id,
+        _ => {
+            return Ok(Prune::Refused(
+                "rollup unverified: the request rollup has not passed its raw comparison".into(),
+            ));
+        }
+    };
+    let Some(end) = lowest
+        .iter()
+        .take_while(|(id, ts)| *ts < cutoff_ms && *id <= checkpoint)
+        .last()
+        .map(|(id, _)| *id)
+    else {
+        return Ok(Prune::Refused(format!(
+            "rollup behind: expired request id {first} is above the verified checkpoint {checkpoint}"
+        )));
+    };
+    let deleted = tx.execute("DELETE FROM requests WHERE id<=?1", [end])?;
+    tx.commit()?;
+    Ok(Prune::Deleted(deleted))
+}
+
 /// Seven-day raw deletion, restricted to verified rolled-up samples.
 pub fn prune_gpu(db: &Connection, now_ms: i64) -> Result<usize> {
     Ok(db.execute(

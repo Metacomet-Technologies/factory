@@ -22,6 +22,10 @@ back to their IP string when unknown. Existing database rows are not rewritten.
   Invalid cursors or limits return HTTP 400.
 - Cursor responses include the `next_after_id` header. It contains the last
   returned ID, or the supplied cursor if the page is empty.
+- Nonempty cursor responses also include `oldest_retained_id`, the lowest
+  stored ID from the same read. Lower IDs were removed by 365-day retention,
+  not lost; retention deletes only from the lowest ID upward (see
+  `docs/data-model.md`, MET-206).
 
 Start with `after_id=0`, persist the response's cursor only after storing every
 record in that page, and repeat until the response array is empty. Resume from

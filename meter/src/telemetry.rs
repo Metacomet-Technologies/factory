@@ -87,6 +87,8 @@ pub fn start(state: AppState, seconds: u64) -> tokio::task::JoinHandle<()> {
                 _ = maintenance.tick() => {
                     // Startup catch-up (first tick is immediate), then every five minutes.
                     let _ = state.db.rollups().await;
+                    // Prunes only rows the run above has verifiably rolled up.
+                    let _ = state.db.retain(crate::now_ms()).await;
                     let optimize = optimized.elapsed().as_secs() >= 86_400;
                     match state.db.maintain(optimize).await {
                         Ok(()) if optimize => optimized = std::time::Instant::now(),

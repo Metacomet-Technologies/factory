@@ -787,6 +787,7 @@ export interface components {
        *     the committed `factory-api/openapi.json` snapshot: the kiosk's API contract.
        */
       openapi_sha256: string;
+      retention: components["schemas"]["RequestRetention"];
       status: string;
       /** Format: int64 */
       uptime_ms: number;
@@ -1270,6 +1271,49 @@ export interface components {
       /** Format: int64 */
       pending_since_ms?: number | null;
       reboot_required?: boolean | null;
+    };
+    /**
+     * @description Raw request retention of the API copy (MET-206): rows older than 365 days,
+     *     only when the verified rollup, the cost backfill and frozen costs cover them.
+     *     Runs after each five-minute rollup run.
+     */
+    RequestRetention: {
+      /** Format: int64 */
+      checked_at_ms?: number | null;
+      /**
+       * Format: int64
+       * @description Rows with `ts_ms` strictly below this were eligible in the last run.
+       */
+      cutoff_ms?: number | null;
+      /** @description Skip reasons, error, or a note that pruning continues next run. */
+      detail?: string | null;
+      /**
+       * Format: int64
+       * @description Lowest request ID still cached after the last run; null when empty.
+       */
+      oldest_retained_id?: number | null;
+      /**
+       * Format: int64
+       * @description Last run that was allowed to prune, and the rows it deleted.
+       */
+      pruned_at_ms?: number | null;
+      /** Format: int64 */
+      pruned_rows: number;
+      /**
+       * Format: int64
+       * @description Rows deleted by every run since this process started.
+       */
+      pruned_rows_since_start: number;
+      /**
+       * Format: int64
+       * @description Start of the current streak of skipped or failed runs; alerts after 24 h.
+       */
+      skipped_since_ms?: number | null;
+      /**
+       * @description "pending" before the first run; "ok"; "skipped" when a gate is unmet;
+       *     "failed" when the job errored, leaving every row in place.
+       */
+      status: string;
     };
     /** @enum {string} */
     Resolution: "raw" | "hourly";

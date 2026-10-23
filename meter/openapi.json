@@ -142,13 +142,17 @@
               "null"
             ]
           },
+          "retention": {
+            "$ref": "#/components/schemas/Retention"
+          },
           "status": {
             "description": "\"ok\", \"unhealthy\", or \"pending\" before the first rollup run.",
             "type": "string"
           }
         },
         "required": [
-          "status"
+          "status",
+          "retention"
         ],
         "type": "object"
       },
@@ -419,6 +423,78 @@
           "client_hostname"
         ],
         "type": "object"
+      },
+      "Retention": {
+        "description": "Raw request retention (MET-206): the lowest-ID run of rows older than\n365 days, only inside the verified request rollup. Runs after each rollup run.",
+        "properties": {
+          "checked_at_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cutoff_ms": {
+            "description": "Rows with `ts_ms` strictly below this were eligible in the last run.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "Skip reason, error, or a note that pruning continues next run.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "oldest_retained_id": {
+            "description": "Lowest request ID still stored after the last run; null when empty.\nIDs below it were removed by retention; IDs above it never are.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pruned_at_ms": {
+            "description": "Last run that was allowed to prune, and the rows it deleted.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pruned_rows": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pruned_rows_since_start": {
+            "description": "Rows deleted by every run since this process started.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped_since_ms": {
+            "description": "Start of the current streak of skipped or failed runs.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "\"pending\" before the first run; \"ok\"; \"skipped\" when a gate is unmet;\n\"failed\" when the job errored, leaving every row in place.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "pruned_rows",
+          "pruned_rows_since_start"
+        ],
+        "type": "object"
       }
     }
   },
@@ -592,6 +668,13 @@
             "headers": {
               "next_after_id": {
                 "description": "Present only with after_id: last returned ID, or the supplied cursor for an empty page.",
+                "schema": {
+                  "format": "int64",
+                  "type": "integer"
+                }
+              },
+              "oldest_retained_id": {
+                "description": "Present only with after_id on a nonempty page: the lowest request ID meter still stores, read in the same snapshot. Lower IDs were removed by 365-day retention, which never removes a higher ID.",
                 "schema": {
                   "format": "int64",
                   "type": "integer"
