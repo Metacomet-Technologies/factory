@@ -3,7 +3,7 @@
 Single-user, outbound-only automation of [PLAYBOOK §4](../../docs/PLAYBOOK.md#4-agent-prompt-template).
 No dependencies, database, webhook, OAuth app, new credential, or runner changes
 (MET-207 adds one optional Cursor key for `engine/cursor`).
-Node **24.21.0** in `.node-version` remains the preferred and CI version; runtime
+Node **24.22.1** in `.node-version` remains the preferred and CI version; runtime
 accepts Node 24.x at **24.12.0** or newer. Requires Linux `flock` and the agent's
 existing Amp login. This is not the MET-120 hardening project.
 

@@ -46,7 +46,7 @@ items = [("os", "ubuntu", not have("bad-os")), ("layout:checkout", "checkout", h
          ("layout:vite-plus-env", layout, os.path.isfile(layout)), ("playwright", "chromium", have("playwright")),
          ("vite-plus", "9.8.7", have("vite-plus"))]
 items += [(name, "1.99.0", have("rust")) for name in ("rust", "rust:rustfmt", "rust:clippy")]
-items += [(name, "24.22.0", have("js")) for name in ("node", "node:repo-root")]
+items += [(name, "24.22.1", have("js")) for name in ("node", "node:repo-root")]
 # Bun resolves like the real checker: whichever `bun` PATH finds in kiosk/, and its version.
 import shutil, subprocess
 bun = shutil.which("bun")

@@ -95,7 +95,7 @@ refuses to start, naming each failing item, until the host meets the contract.
 | -- | -- | -- |
 | OS | Ubuntu (Debian family) LTS, x86_64 | — |
 | Rust | 1.99.0 with `rustfmt` and `clippy`, as `rustc` resolves inside the repo | `rust-toolchain.toml` |
-| Node | 24.22.0, as `node` resolves in `kiosk/` and the repo root | `kiosk/package.json` `devEngines.runtime`, `.node-version` |
+| Node | 24.22.1, as `node` resolves in `kiosk/` and the repo root | `kiosk/package.json` `devEngines.runtime`, `.node-version` |
 | Package manager | Bun 1.4.2 in `kiosk/` (package manager only; Node stays the runtime) | `kiosk/package.json` `devEngines.packageManager` |
 | Vite+ | `vp` v1.1.0 on PATH in `kiosk/` | `kiosk/package.json` `catalog.vite-plus` |
 | Playwright | an installed Chromium executable (`chromium-*/chrome-linux*/chrome` with `INSTALLATION_COMPLETE`) in Playwright's effective location: `PLAYWRIGHT_BROWSERS_PATH` when set (no fallback), otherwise `~/.cache/ms-playwright`; required where kiosk UI checks run | — |
@@ -103,7 +103,7 @@ refuses to start, naming each failing item, until the host meets the contract.
 
 System packages are checked by the command each provides, not by package
 manager records. `scripts/dispatch` and `scripts/usage` keep their own
-`.node-version` (24.21.0) for the dispatcher and usage collector services.
+`.node-version` (24.22.1) for the dispatcher and usage collector services.
 
 ## Layout
 
