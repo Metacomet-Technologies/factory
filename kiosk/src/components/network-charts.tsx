@@ -11,6 +11,7 @@ import {
 import type { NetworkLayer, NetworkRange, NetworkSeries, NetworkSpeedTest } from "../api/types";
 import { count } from "../lib/format";
 import { useReducedMotion } from "../lib/motion";
+import { ResourceState } from "./sections";
 import {
   LAYERS,
   chartStart,
@@ -220,11 +221,11 @@ function Throughput({
           />
         </LineChart>
       </ChartContainer>
-      {tests === null ? (
-        <p className="loading">Loading speed tests…</p>
-      ) : (
-        !rows.length && <p className="empty">No speed tests in this range.</p>
-      )}
+      <ResourceState
+        loading={tests === null}
+        error={null}
+        empty={tests && !rows.length ? "No speed tests in this range." : undefined}
+      />
     </Panel>
   );
 }

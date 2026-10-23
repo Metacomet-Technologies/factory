@@ -6,6 +6,7 @@ import type { Endpoints, UpsCurrent, UpsEvent, UpsRange, UpsSettings } from "../
 import { ms, number, usd } from "../lib/format";
 import { electricityRate, rateInput } from "../lib/ups";
 import { Button } from "./ui/button";
+import { Input } from "./ui/input";
 import { KeyValue } from "./ui/key-value";
 import { MeterBar } from "./ui/meter-bar";
 import { PageHeader } from "./ui/page-header";
@@ -13,6 +14,7 @@ import { Panel, Tile } from "./ui/panel";
 import { RangeToggle } from "./ui/range-toggle";
 import { Stat } from "./ui/stat";
 import { StatusChip } from "./ui/status-chip";
+import { ResourceState } from "./sections";
 import { runtime, upsState, upsTone } from "./ups";
 import UpsControls from "./ups-controls";
 
@@ -83,7 +85,7 @@ function Settings({
       }}
     >
       <label htmlFor="ups-rate">Electricity rate · USD per kWh</label>
-      <input
+      <Input
         id="ups-rate"
         inputMode="decimal"
         value={rate}
@@ -92,7 +94,7 @@ function Settings({
         aria-invalid={!!error}
       />
       <label htmlFor="ups-installed">Battery installed date</label>
-      <input
+      <Input
         id="ups-installed"
         type="date"
         value={installed}
@@ -120,12 +122,8 @@ function Energy({ range, revision }: { range: Exclude<UpsRange, "1h">; revision:
   return (
     <Tile className="ups-energy-period">
       <h3 className="eyebrow">{range}</h3>
-      {energy.error ? (
-        <p role="alert" className="status-fail">
-          {energy.error}
-        </p>
-      ) : !data ? (
-        <p className="loading">Loading…</p>
+      {!data ? (
+        <ResourceState resource={energy} />
       ) : (
         <>
           <Stat
@@ -166,13 +164,10 @@ function Timeline({ now, index }: { now: number; index: number }) {
       index={index}
       aria-label="Power events"
     >
-      {events.error && (
-        <p role="alert" className="status-fail">
-          {events.error}
-        </p>
-      )}
-      {events.loading && <p className="loading">Loading events…</p>}
-      {events.data?.events.length === 0 && <p className="empty">No power events.</p>}
+      <ResourceState
+        resource={events}
+        empty={events.data?.events.length === 0 ? "No power events." : undefined}
+      />
       <ol className="ups-events">
         {events.data?.events.map((event) => (
           <li key={event.id}>
@@ -427,20 +422,10 @@ export default function UpsPage({
           <h3>History</h3>
           <RangeToggle value={range} options={ranges} onChange={setRange} label="History range" />
         </div>
-        {history.error && (
-          <p role="alert" className="status-fail">
-            History: {history.error}
-          </p>
-        )}
-        {gpu.error && (
-          <p role="alert" className="status-warn">
-            GPU overlay unavailable: {gpu.error}
-          </p>
-        )}
-        {history.loading ? (
-          <p className="loading">Loading history…</p>
-        ) : (
-          <Suspense fallback={<p className="loading">Loading charts…</p>}>
+        <ResourceState resource={history} title="Unable to load history" />
+        <ResourceState loading={false} error={gpu.error} title="GPU overlay unavailable" />
+        {!history.loading && (
+          <Suspense fallback={<ResourceState loading error={null} />}>
             <UpsCharts
               history={history.data ?? []}
               gpu={gpu.data?.history ?? []}
@@ -465,7 +450,7 @@ export default function UpsPage({
                 "Last self-test",
                 `${selfTest?.detail ?? fresh?.test_result ?? "—"} · ${
                   eventHistory.loading
-                    ? "Loading test date…"
+                    ? "—"
                     : selfTest
                       ? date(selfTest.started_ms)
                       : "Date not recorded"
@@ -483,19 +468,14 @@ export default function UpsPage({
               ],
             ]}
           />
-          {eventHistory.error && (
-            <p role="alert" className="status-fail">
-              {eventHistory.error}
-            </p>
-          )}
+          <ResourceState
+            loading={false}
+            error={eventHistory.error}
+            title="Unable to load the self-test history"
+          />
           <h4>Minimum runtime trend · hourly, 70–110 W average load</h4>
-          {hourly.error && (
-            <p role="alert" className="status-fail">
-              {hourly.error}
-            </p>
-          )}
-          {hourly.loading ? (
-            <p className="loading">Loading hourly history…</p>
+          {hourly.loading || hourly.error ? (
+            <ResourceState resource={hourly} />
           ) : trend.length ? (
             <div className="ups-trend" tabIndex={0} role="region" aria-label="Hourly runtime trend">
               <table>
@@ -542,11 +522,6 @@ export default function UpsPage({
           index={5}
           aria-label="UPS settings"
         >
-          {settings.error && (
-            <p role="alert" className="status-fail">
-              {settings.error}
-            </p>
-          )}
           {settings.data ? (
             <Settings
               settings={settings.data}
@@ -554,7 +529,7 @@ export default function UpsPage({
               saved={() => setSettingsRevision((value) => value + 1)}
             />
           ) : (
-            <p className="loading">Loading settings…</p>
+            <ResourceState resource={settings} />
           )}
           {settingsRevision > 0 && (
             <p role="status" className="status-ok">

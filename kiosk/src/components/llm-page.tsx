@@ -1,4 +1,4 @@
-import { Activity, AlertTriangle, ArrowUpRight, Gauge, Receipt } from "lucide-react";
+import { Activity, AlertTriangle, Gauge, Receipt } from "lucide-react";
 import type { Resource } from "../api/client";
 import type { ModelUsage, Pricing, Usage, UsageRange } from "../api/types";
 import { count, ms, number, usd } from "../lib/format";
@@ -93,10 +93,7 @@ export default function LlmPage({
           <div className="spend-grid">
             {data.spend_avoided.map((family) => (
               <Tile key={family.family} className="spend-card">
-                <div className="row">
-                  <h4>{family.family}</h4>
-                  <ArrowUpRight aria-hidden="true" size={16} className="accent-text" />
-                </div>
+                <h4>{family.family}</h4>
                 <Stat
                   label={null}
                   value={family.usd}

@@ -17,6 +17,7 @@ import { KeyValue } from "./ui/key-value";
 import { MeterBar } from "./ui/meter-bar";
 import { PageHeader } from "./ui/page-header";
 import { Panel } from "./ui/panel";
+import { ResourceState } from "./sections";
 import { RangeToggle } from "./ui/range-toggle";
 import { Stat, StatGrid } from "./ui/stat";
 import { StatusChip, type Tone } from "./ui/status-chip";
@@ -213,13 +214,11 @@ export default function DevicesPage({
           </>
         }
       />
-      {error && (
-        <p role="alert" className="status-fail">
-          {error}
-        </p>
-      )}
-      {loading && !host && <p className="muted">Loading devices…</p>}
-      {!loading && !error && !host && <p className="muted">No device sample yet.</p>}
+      <ResourceState
+        loading={loading && !host && !error}
+        error={error}
+        empty={!loading && !error && !host ? "No device sample yet." : undefined}
+      />
       {host && (
         <div className="device-grid">
           <Panel
@@ -299,7 +298,7 @@ export default function DevicesPage({
             {!history || history.points.length === 0 ? (
               <p className="empty">No samples in this range.</p>
             ) : (
-              <Suspense fallback={<p className="loading">Loading chart…</p>}>
+              <Suspense fallback={<ResourceState loading error={null} />}>
                 <DevicesChart history={history.points} />
               </Suspense>
             )}

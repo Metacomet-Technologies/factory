@@ -5,7 +5,8 @@ import { Panel } from "./ui/panel";
 import { Stat } from "./ui/stat";
 import { StatusChip } from "./ui/status-chip";
 import { MeterBar } from "./ui/meter-bar";
-import { Button } from "./ui/button";
+import { buttonVariants } from "./ui/button";
+import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
 type Props = { current: UpsCurrent | null | undefined; now: number; warnings?: string[] };
@@ -42,20 +43,20 @@ export function UpsBadge(props: Props) {
     <Tooltip>
       <TooltipTrigger
         render={
-          <Button
-            variant="ghost"
-            size="icon"
+          <a
+            href="/ups"
+            data-slot="button"
             aria-label={`UPS: ${label}`}
-            onClick={() => window.location.assign("/ups")}
-            className={
+            className={cn(
+              buttonVariants({ variant: "ghost", size: "icon" }),
               alarm
                 ? "status-fail"
                 : label === "Replace battery"
                   ? "status-warn"
                   : label === "No data"
                     ? "muted"
-                    : "status-ok"
-            }
+                    : "status-ok",
+            )}
           >
             {label === "No data" ? (
               <span className="ups-unknown-icon" aria-hidden="true">
@@ -67,7 +68,7 @@ export function UpsBadge(props: Props) {
             ) : (
               <Plug aria-hidden="true" />
             )}
-          </Button>
+          </a>
         }
       />
       <TooltipContent>
