@@ -1272,7 +1272,9 @@
   /* The modal's edge must read on its own over the dimmed backdrop (≥ 3:1). */
   border: 1px solid var(--border-control);
   border-radius: var(--radius-lg);
+  /* A --card halo outside the --border-control edge keeps it ≥ 3:1 over any scene or scrim. */
   box-shadow:
+    0 0 0 3px var(--card),
     var(--shadow-glass),
     0 30px 60px -20px rgb(0 0 0 / 50%);
   overflow-wrap: anywhere;

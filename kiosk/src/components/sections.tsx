@@ -55,7 +55,7 @@ export function ResourceState(props: ResourceStateProps) {
         <AlertTitle>{props.title ?? "Unable to load this section"}</AlertTitle>
         <AlertDescription>
           {/* The server's message stays verbatim in its own element. */}
-          <span data-slot="resource-error">{error}</span> Retrying on the next refresh.
+          <span data-slot="resource-error">{error}</span>. Retrying on the next refresh.
         </AlertDescription>
       </Alert>
     );

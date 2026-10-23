@@ -200,7 +200,10 @@ try {
   );
   await page.emulateMedia({ colorScheme: "dark" });
   await page.reload();
-  await expect(controls).toHaveText("ups snapshot unavailable");
+  // The server's message stays verbatim, in its own element inside the destructive Alert.
+  await expect(
+    controls.getByRole("alert").getByText("ups snapshot unavailable", { exact: true }),
+  ).toBeVisible();
   await expect(controls.getByRole("button")).toHaveCount(0);
   await controls.scrollIntoViewIfNeeded();
   await capture("390-dark-ups-controls-error.png");
