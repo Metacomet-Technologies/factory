@@ -968,6 +968,35 @@ and run console rollback only. The old console unit may bind 0.0.0.0 again;
 MET-84 is not deployed while rolled back. A rollback error prints its retry
 command and leaves DBs intact; keep clients off until checks pass.
 
+### MET-118 console cleanup
+
+After 7 daily new-layout GPU snapshots, `deploy/cleanup-console-rollback.sh`
+removes console's rollback copy: the disabled `factory-api` unit and binary,
+`/var/lib/factory-api` (requests/pricing DBs and old kiosk files),
+`/var/backups/factory-api-move/` and the pre-move archives under
+`/var/backups/factory-db/factory-console/{requests,pricing}`. This ends
+MET-114 rollback. Every mode first checks the gate: in the console replicas,
+at least 7 distinct days of checksum-valid meter, requests and pricing copies
+since 2026-10-12, and `restore-check.sh all` passing. The old API must be
+disabled and stopped, console Serve must not proxy `:8080`, and nothing
+unlisted may sit in a deleted directory. `--apply` first writes a final
+archive to `/var/backups/factory-met-118/archive`: the MET-74 snapshot of each
+DB, its SHA-256, an integrity check and a match of every table's row count
+against the live DB. It runs under the backup lock and can be rerun. The
+`factory-api` user and group are removed only when no process, unit, group
+member or file outside the deleted paths uses them. Replicas, the backup lock
+and config, the kiosk autostart file, the Amp runner and factory-gpu are
+never touched. Installer snapshots in `/var/backups/factory-api` and
+`/var/backups/factory-kiosk` are reported but kept.
+
+```sh
+console-ssh 'sudo bash /home/agent/work/factory/deploy/cleanup-console-rollback.sh --dry-run'
+console-ssh 'sudo bash /home/agent/work/factory/deploy/cleanup-console-rollback.sh --apply'
+console-ssh 'sudo bash /home/agent/work/factory/deploy/cleanup-console-rollback.sh --verify'
+```
+
+Tests: `python3 -B deploy/test-cleanup-console-rollback.py` (fake root, no root).
+
 No-root development checks additionally include `python3 -B deploy/test-move.py`,
 the move artifact preflight/`--dry-run`, both rollback `--dry-run` modes, and
 the sandbox snapshot/restore response comparison. Dry-run checks artifacts
