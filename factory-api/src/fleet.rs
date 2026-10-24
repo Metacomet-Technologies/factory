@@ -23,6 +23,12 @@ pub struct Config {
 pub struct NodeConfig {
     pub name: String,
     pub services: Vec<ServiceConfig>,
+    /// MET-260 per-service interval cache and in-flight probe sharing for this
+    /// node's services; not part of the config text. Lives on the node because
+    /// entries are per (node, service) and `fleet::Config` has struct literals
+    /// in test helpers outside this file's reach.
+    #[serde(skip)]
+    pub cache: CheckCache,
 }
 #[derive(Clone, Deserialize)]
 pub struct ServiceConfig {
@@ -413,7 +419,7 @@ pub async fn collect(state: &AppState) -> Fleet {
             futures_util::future::join_all(config.services.iter().map(|service| async {
                 match tokio::time::timeout(
                     Duration::from_secs(5),
-                    state.fleet_cache.get_or_check(&config.name, service, state),
+                    config.cache.get_or_check(&config.name, service, state),
                 )
                 .await
                 {

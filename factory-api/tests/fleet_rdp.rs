@@ -69,38 +69,45 @@ async fn play(mut socket: TcpStream, script: Script, stats: &FakeStats) {
     stats.connections.fetch_add(1, Ordering::Relaxed);
     let mut request = [0u8; 19];
     let read = socket.read_exact(&mut request).await;
-    if let Script::ImmediateEof = script {
-        // Half-close before reading anything: the client sees EOF, not an RST race.
-        let _ = socket.shutdown().await;
-        if read.is_ok() {
-            *stats.request.lock().unwrap() = request.to_vec();
-        }
-        return;
+    if read.is_ok() {
+        *stats.request.lock().unwrap() = request.to_vec();
     }
-    if read.is_err() {
-        return;
-    }
-    *stats.request.lock().unwrap() = request.to_vec();
     match script {
         Script::Reply(bytes, delay_ms) => {
+            if read.is_err() {
+                return;
+            }
             if delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
             if socket.write_all(&bytes).await.is_err() {
                 return;
             }
-            // The client must hang up without sending anything further.
-            let clean = matches!(socket.read(&mut [0u8; 1]).await, Ok(0));
-            stats
-                .clean_closes
-                .fetch_add(usize::from(clean), Ordering::Relaxed);
         }
         Script::PartialReply(bytes) => {
+            if read.is_err() {
+                return;
+            }
             let _ = socket.write_all(&bytes).await;
+            // Half-close the write side so the client sees EOF on its next
+            // read; the read half stays open to observe the hangup.
+            let _ = socket.shutdown().await;
         }
-        Script::Silent => std::future::pending::<()>().await,
-        Script::ImmediateEof => {}
+        Script::ImmediateEof => {
+            if read.is_ok() {
+                // Half-close the write side only: the client reads EOF while
+                // the fake keeps its read half open to observe the hangup.
+                let _ = socket.shutdown().await;
+            }
+        }
+        Script::Silent => {}
     }
+    // Every connection ends the same way: wait for the client to hang up and
+    // count it as clean only when the first read is EOF with no extra bytes.
+    let clean = matches!(socket.read(&mut [0u8; 1]).await, Ok(0));
+    stats
+        .clean_closes
+        .fetch_add(usize::from(clean), Ordering::Relaxed);
 }
 
 async fn serve(listener: TcpListener, script: Script, stats: Arc<FakeStats>) {
@@ -118,14 +125,14 @@ async fn spawn_fake(script: Script) -> (String, Arc<FakeStats>, tokio::task::Joi
 }
 
 /// The fake task observes the client's close on its own schedule; wait for it.
-async fn clean_close(stats: &FakeStats) {
+async fn clean_closes(stats: &FakeStats, count: usize) {
     for _ in 0..200 {
-        if stats.clean_closes.load(Ordering::Relaxed) == 1 {
+        if stats.clean_closes.load(Ordering::Relaxed) >= count {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("the fake never observed a clean client close");
+    panic!("the fake never observed {count} clean client closes");
 }
 
 async fn state_for(target: &str, interval_s: u64) -> Result<(AppState, tempfile::TempDir)> {
@@ -147,7 +154,7 @@ async fn state_for(target: &str, interval_s: u64) -> Result<(AppState, tempfile:
 /// An injected clock so cache tests can travel without waiting.
 fn with_fake_clock(state: &AppState) -> Arc<AtomicI64> {
     let clock = Arc::new(AtomicI64::new(1_000_000));
-    state.fleet_cache.set_now({
+    state.config.nodes[0].cache.set_now({
         let clock = clock.clone();
         move || clock.load(Ordering::Relaxed)
     });
@@ -173,7 +180,7 @@ async fn confirm_with_response_negotiates_for_each_protocol() -> Result<()> {
         let detail = fleet::probe_rdp(&target).await?;
         assert_eq!(detail, format!("RDP_NEG_RSP: {expected}"));
         assert_eq!(stats.connections.load(Ordering::Relaxed), 1);
-        clean_close(&stats).await;
+        clean_closes(&stats, 1).await;
         assert_eq!(stats.clean_closes.load(Ordering::Relaxed), 1);
         assert_eq!(*stats.request.lock().unwrap(), hex(REQUEST_HEX));
         server.abort();
@@ -190,7 +197,7 @@ async fn gnome_remote_desktop_confirm_parses_as_credssp() -> Result<()> {
         "RDP_NEG_RSP: CredSSP (hybrid)"
     );
     assert_eq!(*stats.request.lock().unwrap(), hex(REQUEST_HEX));
-    clean_close(&stats).await;
+    clean_closes(&stats, 1).await;
     assert_eq!(stats.clean_closes.load(Ordering::Relaxed), 1);
     server.abort();
     Ok(())
@@ -208,6 +215,7 @@ async fn negotiation_failure_is_not_ok_and_names_the_code() -> Result<()> {
         let error = fleet::probe_rdp(&target).await.unwrap_err();
         assert_eq!(error.to_string(), format!("RDP_NEG_FAILURE: {expected}"));
         assert_eq!(*stats.request.lock().unwrap(), hex(REQUEST_HEX));
+        clean_closes(&stats, 1).await;
         server.abort();
     }
     Ok(())
@@ -218,6 +226,7 @@ async fn confirm_without_negotiation_block_is_legacy() -> Result<()> {
     let (target, stats, server) = spawn_fake(Script::Reply(confirm(None), 0)).await;
     assert_eq!(fleet::probe_rdp(&target).await?, "legacy negotiation");
     assert_eq!(*stats.request.lock().unwrap(), hex(REQUEST_HEX));
+    clean_closes(&stats, 1).await;
     server.abort();
     Ok(())
 }
@@ -230,6 +239,7 @@ async fn wrong_tpkt_version_and_length_bounds_are_refused() -> Result<()> {
     let error = fleet::probe_rdp(&target).await.unwrap_err();
     assert_eq!(error.to_string(), "TPKT version 0x04 instead of 3");
     assert_eq!(*stats.request.lock().unwrap(), hex(REQUEST_HEX));
+    clean_closes(&stats, 1).await;
     server.abort();
 
     // TPKT total length 10 is below the 11-byte minimum, 65 above the cap.
@@ -244,6 +254,7 @@ async fn wrong_tpkt_version_and_length_bounds_are_refused() -> Result<()> {
             format!("TPKT length {length} outside 11-64")
         );
         assert_eq!(*stats.request.lock().unwrap(), hex(REQUEST_HEX));
+        clean_closes(&stats, 1).await;
         server.abort();
     }
     Ok(())
@@ -261,6 +272,7 @@ async fn truncated_body_reports_how_far_the_connection_got() -> Result<()> {
         "connection closed after 10 of 15 bytes of the X.224 body"
     );
     assert_eq!(*stats.request.lock().unwrap(), hex(REQUEST_HEX));
+    clean_closes(&stats, 1).await;
     server.abort();
     Ok(())
 }
@@ -274,6 +286,7 @@ async fn immediate_eof_is_not_ok() -> Result<()> {
         "connection closed after 0 of 4 bytes of the TPKT header"
     );
     assert_eq!(*stats.request.lock().unwrap(), hex(REQUEST_HEX));
+    clean_closes(&stats, 1).await;
     server.abort();
     Ok(())
 }
@@ -286,6 +299,7 @@ async fn silent_server_times_out_with_a_specific_detail() -> Result<()> {
         .unwrap_err();
     assert_eq!(error.to_string(), "no response within 0.3 s");
     assert_eq!(*stats.request.lock().unwrap(), hex(REQUEST_HEX));
+    clean_closes(&stats, 1).await;
     server.abort();
     Ok(())
 }
@@ -299,7 +313,7 @@ async fn cached_ok_result_is_reused_until_interval_expires() -> Result<()> {
     let first = service_of(&fleet::collect(&state).await);
     assert_eq!(stats.connections.load(Ordering::Relaxed), 1);
     assert_eq!(*stats.request.lock().unwrap(), hex(REQUEST_HEX));
-    clean_close(&stats).await;
+    clean_closes(&stats, 1).await;
     assert_eq!(stats.clean_closes.load(Ordering::Relaxed), 1);
     assert!(first.ok);
     assert_eq!(
@@ -322,6 +336,7 @@ async fn cached_ok_result_is_reused_until_interval_expires() -> Result<()> {
     let fresh = service_of(&fleet::collect(&state).await);
     assert_eq!(stats.connections.load(Ordering::Relaxed), 2);
     assert_eq!(fresh.checked_at_ms, 1_000_000 + 300_500);
+    clean_closes(&stats, 2).await;
     server.abort();
     Ok(())
 }
@@ -340,6 +355,8 @@ async fn failed_check_is_retested_after_30_s() -> Result<()> {
     );
     assert_eq!(first.checked_at_ms, 1_000_000);
     assert_eq!(stats.connections.load(Ordering::Relaxed), 1);
+    assert_eq!(*stats.request.lock().unwrap(), hex(REQUEST_HEX));
+    clean_closes(&stats, 1).await;
 
     // 29 s later the failed result is still cached.
     clock.store(1_000_000 + 29_000, Ordering::Relaxed);
@@ -353,6 +370,7 @@ async fn failed_check_is_retested_after_30_s() -> Result<()> {
     assert_eq!(stats.connections.load(Ordering::Relaxed), 2);
     assert_eq!(retested.checked_at_ms, 1_000_000 + 30_500);
     assert!(!retested.ok);
+    clean_closes(&stats, 2).await;
     server.abort();
     Ok(())
 }
@@ -366,6 +384,8 @@ async fn concurrent_collects_share_one_in_flight_probe() -> Result<()> {
 
     let (first, second) = tokio::join!(fleet::collect(&state), fleet::collect(&state));
     assert_eq!(stats.connections.load(Ordering::Relaxed), 1);
+    assert_eq!(*stats.request.lock().unwrap(), hex(REQUEST_HEX));
+    clean_closes(&stats, 1).await;
     let (a, b) = (service_of(&first), service_of(&second));
     assert!(a.ok && b.ok);
     assert_eq!(a.checked_at_ms, b.checked_at_ms);
