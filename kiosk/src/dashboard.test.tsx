@@ -807,6 +807,58 @@ describe("dashboard contract", () => {
     expect(screen.getByLabelText("GPU utilization history")).toBe(chart);
     expect(fleet.getByRole("link", { name: /factory-gpu/ })).toBeVisible();
   });
+  it("keeps the verdict chip list in place when every issue clears and comes back", async () => {
+    const fetch = api();
+    const serve = fetch.getMockImplementation()!;
+    let recovered = false;
+    fetch.mockImplementation(async (path: string) => {
+      const response = await serve(path);
+      if (!recovered) return response;
+      if (path === "/v1/fleet") {
+        const fleet = (await response.json()) as ReturnType<typeof fixtures>["fleet"];
+        for (const node of fleet.nodes) {
+          node.online = true;
+          for (const service of node.services) Object.assign(service, { ok: true, detail: null });
+        }
+        return new Response(JSON.stringify(fleet));
+      }
+      if (path === "/v1/pricing") {
+        const pricing = (await response.json()) as ReturnType<typeof fixtures>["pricing"];
+        for (const family of pricing.families) family.pending = null;
+        return new Response(JSON.stringify(pricing));
+      }
+      return response;
+    });
+    render(<App />);
+    const fleet = within(screen.getByRole("region", { name: "Fleet" }));
+    await fleet.findByText("Unit is inactive");
+    const items = screen.getByRole("list", { name: "Attention items" });
+    const issues = within(items).getAllByRole("listitem").length;
+    const services = fleet.getAllByRole("listitem").length;
+    const change = (ok: boolean) =>
+      act(async () => {
+        const event = (type: string, data: unknown) =>
+          MockSource.latest.dispatchEvent(
+            new MessageEvent(type, { data: JSON.stringify({ type, ts_ms: Date.now(), data }) }),
+          );
+        event("fleet.change", { node: "factory-console", service: "backup", ok });
+        event("pricing.changed", { family: "Claude Sonnet", pending_model_id: null });
+      });
+    recovered = true;
+    await change(true);
+    expect(await screen.findByText("All systems nominal")).toBeVisible();
+    // The (now empty) chip list and the service rows stay; only their contents change.
+    expect(screen.getByRole("list", { name: "Attention items" })).toBe(items);
+    expect(within(items).queryAllByRole("listitem")).toHaveLength(0);
+    expect(fleet.queryByText("Unit is inactive")).not.toBeInTheDocument();
+    expect(fleet.getAllByRole("listitem")).toHaveLength(services);
+    recovered = false;
+    await change(false);
+    expect(await fleet.findByText("Unit is inactive")).toBeVisible();
+    expect(screen.getByRole("list", { name: "Attention items" })).toBe(items);
+    expect(within(items).getAllByRole("listitem")).toHaveLength(issues);
+    expect(fleet.getAllByRole("listitem")).toHaveLength(services);
+  });
   it("renders outage nulls and warnings without dropping other sections", async () => {
     api(true);
     render(<App />);

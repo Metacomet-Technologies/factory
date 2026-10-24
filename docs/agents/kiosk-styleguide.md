@@ -137,9 +137,17 @@ nothing on the page moves or resizes.
   `tabular-nums`, so a changing digit never changes width.
 - Anything whose content changes size gets a fixed or reserved box: chart
   heights are fixed in `index.css`, and the request log has one height at
-  every width and scrolls. When you change a live card, measure Cumulative
+  every width and scrolls. Status and warning content that comes and goes is
+  always rendered in its reserved slot, never conditionally: the Verdict chip
+  list (one row, two on phones; extra chips scroll inside it), each Fleet
+  service's detail line (inline on desktop), and `Warnings reserve` on overview
+  cards (three lines that scroll, full text on the details page). Panel headers
+  put the subtitle on its own full-width row, so a status chip changing width
+  never rewraps it. Never hide or clip that text to make it fit. Keep changing
+  labels at a stable width (`min-width`, left-anchored) where a width change
+  would slide neighbours. When you change a live card, measure Cumulative
   Layout Shift across three stream updates on the mock at 1512×982 and
-  430×932, and keep it at 0.
+  430×932, and keep it at 0 (below 0.01 only with the cause named).
 
 ## Primitives
 

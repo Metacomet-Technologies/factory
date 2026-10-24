@@ -65,8 +65,13 @@ export function ResourceState(props: ResourceStateProps) {
     );
   return props.empty ? <p className="empty">{props.empty}</p> : null;
 }
-export function Warnings({ warnings }: { warnings: string[] }) {
-  return warnings.length ? (
+/**
+ * Section warnings. `reserve` is for live overview cards: the list sits in one fixed box, so a
+ * warning appearing, wrapping or clearing never resizes the card; longer text scrolls inside
+ * it, and the card's details page lists every warning in full.
+ */
+export function Warnings({ warnings, reserve = false }: { warnings: string[]; reserve?: boolean }) {
+  const list = warnings.length ? (
     <ul className="warnings">
       {warnings.map((warning) => (
         <li key={warning}>
@@ -76,6 +81,7 @@ export function Warnings({ warnings }: { warnings: string[] }) {
       ))}
     </ul>
   ) : null;
+  return reserve ? <div className="warning-slot">{list}</div> : list;
 }
 const healthTone = (health: DeviceList["devices"][number]["health"]) =>
   health === "critical"
@@ -163,7 +169,11 @@ export function FleetSection({
                           {service.ok ? "OK" : "Failing"} · {ms(service.latency_ms)}
                         </StatusText>
                       </div>
-                      {!service.ok && <p className="muted">{service.detail ?? "—"}</p>}
+                      {/* Every service keeps its detail line, so a failure or recovery never
+                          resizes the tile and moves the cards below it. */}
+                      <p className="muted service-detail" aria-hidden={service.ok || undefined}>
+                        {service.ok ? null : (service.detail ?? "—")}
+                      </p>
                     </li>
                   ))}
                 </ul>
@@ -339,7 +349,7 @@ export function UsageSection({
             ))}
           </StatGrid>
         )}
-        <Warnings warnings={warnings} />
+        <Warnings warnings={warnings} reserve />
       </Panel>
     </a>
   );

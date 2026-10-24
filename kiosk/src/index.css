@@ -360,6 +360,8 @@
   letter-spacing: -0.02em;
   line-height: 1;
   white-space: nowrap;
+  /* Fits "All systems nominal", so the chips start in one place whatever the headline says. */
+  min-width: 10.5em;
 }
 .verdict-dot {
   width: 11px;
@@ -374,12 +376,18 @@
 .verdict[data-tone="fail"] {
   --v: var(--fail);
 }
+/* One fixed chip row (two on phones): chips arriving, clearing or wrapping never resize the
+   strip. More chips than fit scroll inside it; the title still counts every one. */
 .verdict-items {
   display: flex;
   flex-wrap: wrap;
+  align-content: start;
   gap: 8px;
   flex: 1;
   min-width: 0;
+  height: 24px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 .verdict-rest {
   color: var(--muted-foreground);
@@ -449,18 +457,49 @@
 .panel[data-tone="fail"] {
   box-shadow: var(--shadow-glass), var(--shadow-tone-fail);
 }
+/* Icon | title | action on the first row; the subtitle spans the full width beneath them, so
+   a status chip that grows or shrinks ("Details" to "Pricing update pending") never rewraps
+   the subtitle and resizes the card. */
 .panel-header {
-  display: flex;
-  align-items: start;
-  justify-content: space-between;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 10px;
   min-height: 32px;
 }
-.panel-heading {
-  display: flex;
-  align-items: center;
-  gap: 10px;
+.panel-heading,
+.panel-titles {
+  display: contents;
+}
+.panel-icon {
+  grid-row: 1 / span 2;
+  align-self: center;
+}
+.panel-title {
+  grid-column: 2;
+  grid-row: 1;
   min-width: 0;
+}
+.panel-subtitle {
+  grid-column: 2 / -1;
+  grid-row: 2;
+}
+.panel-action {
+  grid-column: 3;
+  grid-row: 1;
+}
+/* Narrow overview cards (three columns at 1280–1599 px) give the status chip its own row
+   under the subtitle, so "Pricing update pending" never wraps "Local LLM" onto two lines. */
+.panel-link {
+  container-type: inline-size;
+}
+@container (max-width: 359px) {
+  .panel-action {
+    grid-column: 2 / -1;
+    grid-row: 3;
+    justify-self: start;
+    margin-top: 6px;
+  }
 }
 .panel-icon {
   display: grid;
@@ -926,8 +965,14 @@
 .services li .row {
   gap: 4px 8px;
 }
+/* Left-anchored in a fixed-width box: a latency or OK/Failing change never slides it. */
 .service-state {
   white-space: nowrap;
+  min-width: 8em;
+}
+/* Reserved on every service, empty while it is OK (see FleetSection). */
+.service-detail {
+  min-height: 1lh;
 }
 
 /* ---- GPU / Usage --------------------------------------------------------- */
@@ -988,6 +1033,18 @@
 .warnings svg {
   flex-shrink: 0;
   margin-top: 2px;
+}
+/* Overview cards reserve three warning lines whether or not a warning is showing (Warnings
+   reserve); anything longer scrolls here, and the details page shows all of it. */
+.warning-slot {
+  height: 58px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+  font-size: 12px;
+  line-height: 18px;
+}
+.warning-slot .warnings {
+  gap: 4px;
 }
 
 /* ---- Agents (frontier CLIs) --------------------------------------------- */
@@ -1851,6 +1908,27 @@
   .services {
     gap: 3px;
   }
+  /* The detail shares its service's row (name · detail · state), so reserving it costs no
+     height at 1728×1117; narrower layouts keep it on its own reserved line. */
+  .services li {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: baseline;
+    gap: 0 8px;
+  }
+  .services li .row {
+    display: contents;
+  }
+  .services li .service-state {
+    grid-column: 3;
+    grid-row: 1;
+  }
+  .service-detail {
+    grid-column: 2;
+    grid-row: 1;
+    min-height: 0;
+    text-align: right;
+  }
   .stat[data-size="lg"] .stat-value {
     font-size: 26px;
   }
@@ -1976,6 +2054,19 @@
   }
   .dashboard {
     padding: 20px 14px 100px;
+  }
+  /* Phones: title and count on the first line, then two reserved chip rows. */
+  .panel.verdict {
+    flex-wrap: wrap;
+    row-gap: 8px;
+  }
+  .verdict-rest {
+    margin-left: auto;
+  }
+  .verdict-items {
+    order: 1;
+    flex-basis: 100%;
+    height: 56px;
   }
   .page-header {
     align-items: start;

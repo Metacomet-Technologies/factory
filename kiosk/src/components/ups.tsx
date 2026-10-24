@@ -5,6 +5,7 @@ import { Panel } from "./ui/panel";
 import { Stat } from "./ui/stat";
 import { StatusChip } from "./ui/status-chip";
 import { MeterBar } from "./ui/meter-bar";
+import { Warnings } from "./sections";
 import { buttonVariants } from "./ui/button";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
@@ -152,12 +153,7 @@ export function UpsSection(props: Props & { warnings: string[]; index?: number }
           />
         </div>
         <p className="muted">Last self-test: {current?.test_result ?? "—"}</p>
-        {label === "No data" &&
-          props.warnings.map((warning) => (
-            <p className="status-warn" key={warning}>
-              {warning}
-            </p>
-          ))}
+        <Warnings warnings={label === "No data" ? props.warnings : []} reserve />
       </Panel>
     </a>
   );

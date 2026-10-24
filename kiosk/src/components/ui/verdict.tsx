@@ -28,17 +28,21 @@ export function Verdict({ issues, okCount }: { issues: VerdictIssue[]; okCount: 
           ? `${sorted.length} need${sorted.length === 1 ? "s" : ""} attention`
           : "All systems nominal"}
       </p>
-      {sorted.length ? (
-        <ul className="verdict-items" aria-label="Attention items">
-          {sorted.map((issue) => (
-            <li key={`${issue.tone}:${issue.label}`}>
-              <StatusChip tone={issue.tone} dot={issue.tone === "warn"}>
-                {issue.label}
-              </StatusChip>
-            </li>
-          ))}
-        </ul>
-      ) : null}
+      {/* Always rendered at one fixed height (one chip row, two on phones), so chips arriving,
+          clearing or wrapping never resize the strip; more chips scroll inside it. */}
+      <ul
+        className="verdict-items"
+        aria-label="Attention items"
+        tabIndex={sorted.length ? 0 : undefined}
+      >
+        {sorted.map((issue) => (
+          <li key={`${issue.tone}:${issue.label}`}>
+            <StatusChip tone={issue.tone} dot={issue.tone === "warn"}>
+              {issue.label}
+            </StatusChip>
+          </li>
+        ))}
+      </ul>
       <p className="verdict-rest">
         {sorted.length ? `${okCount} other checks OK` : `${okCount} checks OK`}
       </p>

@@ -108,7 +108,7 @@ export function NetworkSection({
             </div>
           </div>
         )}
-        <Warnings warnings={status.data?.warnings ?? []} />
+        <Warnings warnings={status.data?.warnings ?? []} reserve />
       </Panel>
     </a>
   );
