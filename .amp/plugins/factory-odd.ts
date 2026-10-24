@@ -152,7 +152,10 @@ export default async function (amp: PluginAPI) {
 		},
 	})
 
-	type ArmContext = Pick<PluginEventContext<'agent.end'>, 'thread' | 'ui' | 'logger' | 'tools'>
+	// What arming and the Slack poll need from a context; event, tool and webhook contexts all
+	// provide it. Evaluating an issue also shells out to gh, which tool contexts cannot do.
+	type ArmContext = Pick<WebhookHandlerContext, 'thread' | 'ui' | 'logger' | 'tools'>
+	type EvalContext = ArmContext & Pick<WebhookHandlerContext, '$'>
 
 	async function arm(ctx: ArmContext, labels: readonly string[]) {
 		if (!labels.includes(controlLabel) || armState.has(ctx.thread.id)) return
@@ -181,32 +184,13 @@ export default async function (amp: PluginAPI) {
 		const handle = (source: 'linear' | 'github' | 'slack') => async (event: WebhookEvent, hctx: WebhookHandlerContext) => {
 			if (seen.has(event.id)) return
 			seen.add(event.id)
-			const entry = record(state, { at: event.receivedAt, source, issue: null, stage: 'received' })
-			try {
-				const identifier = issueFromEvent(source, new TextDecoder().decode(event.body))
-				if (!identifier) {
-					entry.stage = 'ignored'
-					return
-				}
-				entry.issue = identifier
-				const issue = await snapshotFor(hctx, identifier)
-				const action = nextAction(issue, await currentLoad(hctx))
-				hctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
-				entry.status = issue.status
-				entry.action = action
-				if (!(await hctx.thread.labels()).includes(performLabel)) {
-					hctx.logger.log(marker, 'dry run; add label', performLabel, 'to act')
-					entry.stage = 'dry-run'
-					return
-				}
-				await perform(hctx, issue, action)
-				entry.stage = 'performed'
-			} catch (error: unknown) {
-				entry.stage = 'failed'
-				entry.error = String(error)
-				hctx.logger.log(marker, source, 'handler failed', entry.error)
-				throw error
+			const identifier = issueFromEvent(source, new TextDecoder().decode(event.body))
+			if (!identifier) {
+				record(state, { at: event.receivedAt, source, issue: null, stage: 'ignored' })
+				return
 			}
+			const entry = await evaluate(hctx, state, source, identifier, event.receivedAt)
+			if (entry.stage === 'failed') throw new Error(entry.error)
 		}
 		for (const key of ['linear', 'github', 'slack'] as const) {
 			const { url } = await amp.createWebhook({ key, headers: ['x-hub-signature-256', 'linear-signature', 'x-slack-signature'], handler: handle(key) })
@@ -216,6 +200,41 @@ export default async function (amp: PluginAPI) {
 		// Not awaited: the dialog waits for a human and must not hold the turn boundary that
 		// armed it. odd_control_status({ show_urls: true }) shows it again on demand and waits.
 		void showUrls(ctx, state.urls).catch((error: unknown) => ctx.logger.log(marker, 'webhook dialog failed', String(error)))
+	}
+
+	// One evaluation of one issue: derive, decide, act (or dry-run). A webhook that arrives while
+	// the owning role thread is still running decides `wait`, and that thread's end raises no
+	// event here (its agent.end runs in its own orb), so the issue is re-evaluated after a delay
+	// until the owner is idle. One pending re-check per issue.
+	const recheckMs = 90_000
+	const rechecks = new Map<string, ReturnType<typeof setTimeout>>()
+	async function evaluate(ctx: EvalContext, state: ArmState, source: string, identifier: string, at: string): Promise<HandledEvent> {
+		const entry = record(state, { at, source, issue: identifier, stage: 'received' })
+		try {
+			const issue = await snapshotFor(ctx, identifier)
+			const action = nextAction(issue, await currentLoad(ctx))
+			ctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
+			entry.status = issue.status
+			entry.action = action
+			if (action.kind === 'wait' && action.reason.endsWith('running') && !rechecks.has(identifier)) {
+				rechecks.set(identifier, setTimeout(() => {
+					rechecks.delete(identifier)
+					void evaluate(ctx, state, 'recheck', identifier, new Date().toISOString())
+				}, recheckMs))
+			}
+			if (!(await ctx.thread.labels()).includes(performLabel)) {
+				ctx.logger.log(marker, 'dry run; add label', performLabel, 'to act')
+				entry.stage = 'dry-run'
+				return entry
+			}
+			await perform(ctx, issue, action)
+			entry.stage = 'performed'
+		} catch (error: unknown) {
+			entry.stage = 'failed'
+			entry.error = String(error)
+			ctx.logger.log(marker, source, 'evaluation failed', entry.error)
+		}
+		return entry
 	}
 
 	// Every fresh top-level message in #factory-intake gets its own Intake orb thread, then the
@@ -279,7 +298,7 @@ export default async function (amp: PluginAPI) {
 
 	// Phases 3-6 fill in `perform` stage by stage: phase 3 spawns intake and spec and moves
 	// issues between Triage and Todo; steer and page are wired; merge and deploy are deferred.
-	async function perform(ctx: WebhookHandlerContext, issue: IssueSnapshot, action: Action) {
+	async function perform(ctx: ArmContext, issue: IssueSnapshot, action: Action) {
 		switch (action.kind) {
 			case 'spawn': {
 				if (!liveRoles.has(action.role)) {
@@ -333,7 +352,7 @@ async function callJson<T>(tools: Tools, name: string, input: Record<string, unk
 	return JSON.parse(textBlock.text as string) as T
 }
 
-async function snapshotFor(ctx: WebhookHandlerContext, identifier: string): Promise<IssueSnapshot> {
+async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string): Promise<IssueSnapshot> {
 	const [issue, comments, pr, threads] = await Promise.all([
 		callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: identifier }),
 		callJson<{ comments?: { body: string }[] }>(ctx.tools, 'linear.list_comments', { issueId: identifier, limit: 50 }).then(result => result.comments ?? []),
@@ -344,7 +363,7 @@ async function snapshotFor(ctx: WebhookHandlerContext, identifier: string): Prom
 	return toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers: [] })
 }
 
-async function pullRequestFor(ctx: WebhookHandlerContext, identifier: string): Promise<GitHubPullRequest | undefined> {
+async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, identifier: string): Promise<GitHubPullRequest | undefined> {
 	const result = await ctx.$`gh pr list --search ${identifier} --state all --json number,headRefOid,state,mergeCommit,statusCheckRollup --limit 5`
 	if (result.exitCode !== 0) {
 		ctx.logger.log(marker, 'gh pr list failed', result.stderr.trim())
