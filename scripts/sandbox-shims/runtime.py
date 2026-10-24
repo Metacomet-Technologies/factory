@@ -418,6 +418,88 @@ def run():
         (STATE / "runtime.pid").unlink(missing_ok=True)
 
 
+def usage_snapshot():
+    return STATE / "usage.json"
+
+
+def usage_recheck(snapshot):
+    if (not isinstance(snapshot, dict)
+            or snapshot.get("schema_version") != 1
+            or not isinstance(snapshot.get("generated_at_ms"), int)
+            or not isinstance(snapshot.get("tools"), list)
+            or len(snapshot["tools"]) != 6):
+        raise RuntimeError(
+            "Not a usage snapshot (expected schema_version 1, generated_at_ms and six tools)")
+    return snapshot
+
+
+def usage_seed(source_arg):
+    source = Path(source_arg)
+    if not source.is_file():
+        raise RuntimeError(f"Snapshot file not found: {source}")
+    snapshot = usage_recheck(json.loads(source.read_text()))
+    # Replace in place: the factory-api collector watcher keys on mtime/inode.
+    atomic(usage_snapshot(), json.dumps(snapshot))
+    print(f"Seeded {usage_snapshot()}")
+
+
+def usage_rewrite():
+    usage_json = usage_snapshot()
+    if not usage_json.is_file():
+        raise RuntimeError("No .sandbox/usage.json; run scripts/sandbox usage seed <file> first")
+    snapshot = usage_recheck(json.loads(usage_json.read_text()))
+    now = int(time.time() * 1000)
+    snapshot["generated_at_ms"] = now
+    for tool in snapshot["tools"]:
+        if isinstance(tool, dict) and tool.get("observed_at_ms") is not None:
+            tool["observed_at_ms"] = now
+    atomic(usage_json, json.dumps(snapshot))
+    print(f"Refreshed {usage_json} at {now}")
+
+
+def usage_refresh(args):
+    delay = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "--delay":
+            if index >= len(args) or not args[index].isdigit():
+                raise RuntimeError("--delay requires a non-negative integer of seconds")
+            delay = int(args[index])
+            index += 1
+        elif not arg.startswith("--"):
+            raise RuntimeError(f"Unexpected argument: {arg}")
+    if not (STATE / "usage.json").is_file():
+        raise RuntimeError("No .sandbox/usage.json; run scripts/sandbox usage seed <file> first")
+    if delay:
+        # Detached so the command returns at once and the rewrite lands after
+        # the delay, while a POST /v1/agents/refresh returns 202 and the
+        # collector watcher emits agents.usage when the file changes.
+        with (STATE / "usage-refresh.log").open("ab") as log:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "usage-rewrite",
+                              str(ROOT), str(delay)],
+                             stdout=log, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        print(f"Scheduled .sandbox/usage.json rewrite in {delay}s")
+    else:
+        usage_rewrite()
+
+
+def usage(args):
+    if not args:
+        raise RuntimeError("Usage: scripts/sandbox usage seed <file>|refresh [--delay <s>]")
+    subcommand, rest = args[0], args[1:]
+    if subcommand == "seed":
+        if len(rest) != 1:
+            raise RuntimeError("Usage: scripts/sandbox usage seed <file>")
+        usage_seed(rest[0])
+    elif subcommand == "refresh":
+        usage_refresh(rest)
+    else:
+        raise RuntimeError(f"Unknown usage subcommand: {subcommand}")
+
+
 def down():
     pid = running()
     if pid is None:
@@ -476,6 +558,11 @@ if __name__ == "__main__":
             else:
                 down()
                 raise RuntimeError("Startup failed; see .sandbox/runtime.log and service logs")
+        elif MODE == "usage":
+            usage(sys.argv[3:])
+        elif MODE == "usage-rewrite":
+            time.sleep(int(sys.argv[3]))
+            usage_rewrite()
         elif MODE == "down":
             down()
         elif MODE == "status":
