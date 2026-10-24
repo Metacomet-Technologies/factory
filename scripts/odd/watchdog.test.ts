@@ -1,6 +1,6 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { digest, digestDue, localClock, overCaps, restoreStatus, staleThreads, sweepMs, staleMs, type DigestInput } from './watchdog.ts';
+import { blindMs, digest, digestDue, localClock, overCaps, restoreStatus, slackMessageMax, slackMessages, staleThreads, sweepMs, staleMs, type DigestInput } from './watchdog.ts';
 import { capacity, type Action } from './lifecycle.ts';
 import { receiptLabel, type LiveThread } from './snapshot.ts';
 import plugin from '../../.amp/plugins/factory-odd.ts';
@@ -75,17 +75,35 @@ test('the digest lists counts, identifiers and SHAs, and never a diff', () => {
   assert.doesNotMatch(text, /diff --git|ghp_|xox[abp]-|lin_api_/);
 });
 
+test('a digest longer than one Slack message is split on line breaks', () => {
+  const merged = Array.from({ length: 46 }, (_, i) => ({ number: 140 + i, title: `ODD phase ${i}: a title about as long as the real ones are`, headSha: 'a'.repeat(40), mergeSha: 'b'.repeat(40) }));
+  const text = digest({ day: '2026-10-24', merged, done: [], bugs: [], escalated: [], load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, cancelled: [] });
+  assert.ok(text.length > slackMessageMax, 'the fixture must need more than one message');
+  const parts = slackMessages(text);
+  assert.ok(parts.length > 1);
+  assert.ok(parts.every(part => part.length <= slackMessageMax));
+  assert.match(parts[0], /^ODD digest 2026-10-24\n/);
+  assert.match(parts[1], new RegExp(`^\\(2/${parts.length}\\)\\n- #`));
+  assert.equal(parts.map(part => part.replace(/^\(\d+\/\d+\)\n/, '')).join('\n'), text, 'nothing is lost or cut mid-line');
+  assert.deepEqual(slackMessages('short'), ['short']);
+});
+
 /** Linear, thread search and #factory-alerts shared by every plugin instance; each `start()` is a fresh plugin load arming the control thread. */
-function controlOrb() {
+function controlOrb(override: (name: string, input: Record<string, unknown>) => unknown = () => undefined) {
   const evaluated: string[] = [];
   const alerts: string[] = [];
+  const dms: string[] = [];
+  const calls: string[] = [];
   let alertReads = 0;
-  const backlog = Array.from({ length: 101 }, (_, i) => ({ id: `MET-${i + 1}` }));
+  const triage = Array.from({ length: 101 }, (_, i) => ({ id: `MET-${i + 1}` }));
   const tools = { call: async (name: string, input: Record<string, unknown>) => {
+    calls.push(name);
+    const overridden = await override(name, input);
+    if (overridden !== undefined) return overridden;
     switch (name) {
       case 'linear.list_issues':
-        if (input.state !== 'Backlog') return { issues: [], hasNextPage: false, cursor: '' };
-        return input.cursor === 'page-2' ? { issues: backlog.slice(100), hasNextPage: false, cursor: 'end' } : { issues: backlog.slice(0, 100), hasNextPage: true, cursor: 'page-2' };
+        if (input.state !== 'Triage') return { issues: [], hasNextPage: false, cursor: '' };
+        return input.cursor === 'page-2' ? { issues: triage.slice(100), hasNextPage: false, cursor: 'end' } : { issues: triage.slice(0, 100), hasNextPage: true, cursor: 'page-2' };
       case 'linear.get_issue': evaluated.push(String(input.id)); return { id: input.id, status: 'Done', labels: [], description: '', relations: { blockedBy: [] } };
       case 'linear.list_comments': return { comments: [] };
       case 'find_thread':
@@ -98,7 +116,7 @@ function controlOrb() {
         const terms = (input.filter as { containsAll: string[] }).containsAll;
         return { messages: alerts.filter(text => terms.every(term => text.includes(term))).map(text => ({ text })) };
       }
-      case 'slack_write': alerts.push(String(input.text)); return {};
+      case 'slack_write': (input.channelName === 'factory-alerts' ? alerts : dms).push(String(input.text)); return {};
       default: return {};
     }
   } };
@@ -115,7 +133,7 @@ function controlOrb() {
     const thread = { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] };
     await handlers.get('session.start')!({}, { thread, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools });
   };
-  return { start, evaluated, alerts, reads: () => alertReads };
+  return { start, evaluated, alerts, dms, calls, reads: () => alertReads };
 }
 
 const until = async (done: () => boolean) => {
@@ -129,7 +147,7 @@ test('the sweep reads every page of issues and threads, and a plugin reload does
   const orb = controlOrb();
   await orb.start();
   await until(() => orb.alerts.length > 0);
-  assert.ok(orb.evaluated.includes('MET-101'), 'issue on the second Backlog page');
+  assert.ok(orb.evaluated.includes('MET-101'), 'issue on the second Triage page');
   assert.ok(orb.evaluated.includes('MET-200'), 'thread on the second search page');
   assert.equal(orb.alerts.filter(text => text.startsWith('ODD digest 2026-10-24')).length, 1);
   // Reload: a fresh plugin instance arms the same control thread and sweeps at once.
@@ -137,4 +155,51 @@ test('the sweep reads every page of issues and threads, and a plugin reload does
   await until(() => orb.reads() === 2);
   for (let i = 0; i < 200; i++) await new Promise(resolve => setImmediate(resolve));
   assert.equal(orb.alerts.length, 1);
+});
+
+test('the sweep records a cancellation on the issue before it archives the stale thread', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  let commentFailures = 1;
+  const orb = controlOrb((name, input) => {
+    switch (name) {
+      case 'linear.list_issues': return { issues: [], hasNextPage: false, cursor: '' };
+      case 'find_thread': return /odd-role-builder|odd-issue-met-1 /.test(String(input.query)) ? { threads: [{ id: 'T-1', updatedAt: new Date(Date.now() - staleMs - 60_000).toISOString() }] } : { threads: [] };
+      case 'linear.get_issue': return { id: 'MET-1', status: 'In Progress', labels: ['odd'], description: '', relations: { blockedBy: [] } };
+      case 'linear.save_comment':
+        if (commentFailures-- > 0) throw new Error('503 Service Unavailable');
+        return {};
+      default: return undefined;
+    }
+  });
+  await orb.start();
+  await until(() => orb.calls.includes('linear.save_comment'));
+  for (let i = 0; i < 200; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.ok(!orb.calls.includes('update_thread'), 'a cancellation that failed to record must not archive the thread');
+  mock.timers.tick(90_000);
+  await until(() => orb.calls.includes('update_thread'));
+  assert.ok(orb.calls.lastIndexOf('linear.save_comment') < orb.calls.indexOf('update_thread'));
+  await until(() => orb.calls.includes('linear.save_issue'));
+});
+
+test('a digest that Slack keeps rejecting leaves the control plane blind until it pages', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  let digests = 0;
+  const orb = controlOrb((name, input) => {
+    if (name === 'linear.list_issues') return { issues: [], hasNextPage: false, cursor: '' };
+    if (name === 'find_thread') return { threads: [] };
+    if (name === 'slack_write' && input.channelName === 'factory-alerts') { digests += 1; throw new Error('Failed to post message: invalid_blocks'); }
+    return undefined;
+  });
+  await orb.start();
+  await until(() => digests === 1);
+  // Sweeps until one runs at least `blindMs` after the first failure.
+  for (let sweeps = 2; (sweeps - 2) * sweepMs < blindMs; sweeps++) {
+    mock.timers.tick(sweepMs);
+    await until(() => digests === sweeps);
+  }
+  await until(() => orb.dms.length === 1);
+  assert.match(orb.dms[0], /control-plane-blind/);
+  assert.match(orb.dms[0], /invalid_blocks/);
 });

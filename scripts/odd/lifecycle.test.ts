@@ -32,10 +32,13 @@ test('spec is complete only when every Done-means item has an Evidence line', ()
 });
 
 test('status drives the role; capacity gates orb spawns but not deterministic stages', () => {
-  assert.deepEqual(nextAction(issue({ status: 'Backlog' }), idle), { kind: 'spawn', role: 'intake', executor: 'orb', reason: 'no triage yet', round: 1 });
-  assert.equal(nextAction(issue({ status: 'Triage', description: 'one line' }), idle).kind, 'spawn');
-  assert.deepEqual(nextAction(issue({ status: 'Triage' }), idle), { kind: 'set-status', status: 'Todo', reason: 'spec complete' });
-  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', risk: 'security' }), idle).kind, 'wait');
+  // Backlog is on demand: nothing runs until Devon moves the idea to Triage.
+  assert.deepEqual(nextAction(issue({ status: 'Backlog' }), idle), { kind: 'wait', reason: 'backlog: triage on demand' });
+  const triaged = ['Bug', 'area:kiosk'];
+  assert.deepEqual(nextAction(issue({ status: 'Triage', description: 'one line' }), idle), { kind: 'spawn', role: 'intake', executor: 'orb', reason: 'exactly one of Bug, Feature, Improvement; an area:* label', round: 1 });
+  assert.deepEqual(nextAction(issue({ status: 'Triage', description: 'one line', labels: triaged }), idle), { kind: 'spawn', role: 'spec', executor: 'orb', reason: 'spec incomplete', round: 1 });
+  assert.deepEqual(nextAction(issue({ status: 'Triage', labels: triaged }), idle), { kind: 'set-status', status: 'Todo', reason: 'spec complete' });
+  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', labels: triaged, risk: 'security' }), idle).kind, 'wait');
   assert.deepEqual(nextAction(issue({}), idle), { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'ready to build', round: 1 });
   assert.equal(nextAction(issue({}), { orbs: capacity.orbs, runnerSlots: 0, buildIssues: 0 }).kind, 'wait');
   assert.deepEqual(nextAction(issue({}), { ...idle, buildIssues: capacity.buildIssues }), { kind: 'wait', reason: 'build capacity (2/2 issues)' });
@@ -48,10 +51,10 @@ test('status drives the role; capacity gates orb spawns but not deterministic st
 
 test('a role that ended without reaching its stop condition is not respawned past its rounds', () => {
   const intake = { role: 'intake' as const, threadID: 'T-1', round: 1, state: 'idle' as const };
-  assert.deepEqual(nextAction(issue({ status: 'Backlog', owner: intake, openRounds: { intake: 1 } }), idle), { kind: 'wait', reason: 'intake round budget spent (1/1)', stuck: 'intake' });
-  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', owner: intake, openRounds: { intake: 1 } }), idle).kind, 'spawn');
+  assert.deepEqual(nextAction(issue({ status: 'Triage', owner: intake, openRounds: { intake: 1 } }), idle), { kind: 'wait', reason: 'intake round budget spent (1/1)', stuck: 'intake' });
+  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', labels: ['Bug', 'area:kiosk'], owner: intake, openRounds: { intake: 1 } }), idle).kind, 'spawn');
   const spec = { ...intake, role: 'spec' as const };
-  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', owner: spec, openRounds: { spec: 1 } }), idle).kind, 'wait');
+  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', labels: ['Bug', 'area:kiosk'], owner: spec, openRounds: { spec: 1 } }), idle).kind, 'wait');
   const builder = { ...intake, role: 'builder' as const, state: 'error' as const };
   assert.deepEqual(nextAction(issue({ status: 'In Progress', owner: builder, openRounds: { builder: 1 } }), idle), { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'builder round 2', round: 2 });
 });

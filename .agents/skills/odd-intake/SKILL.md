@@ -42,8 +42,8 @@ Use `code_exec` with `import { get_issue, list_issues, list_templates, save_issu
 duplicate check. Do not pass `fields`; the default shape has `status`,
 `labels`, `description`.
 
-Create a new issue in one call so it never sits in `Backlog`, where the
-control plane would start a second Intake for it:
+Create a new issue in one call, directly in `Triage` with type and area, so
+the control plane does not start a second Intake for it:
 `save_issue({ team: "Metacomet", template: "Agent task", title, description,
 labels: ["Bug", "area:kiosk"], state: "Triage" })`. Fill a bare issue with
 `save_issue({ id, description, state: "Triage", labels: [...] })`. The
@@ -54,7 +54,8 @@ issue if the bare issue lacks them.
 ## Authority
 
 Create and edit only the issue you created, or the bare issue the control
-plane handed you (Intake owns Backlog issues, `docs/odd/README.md` §5.1);
+plane handed you (a `Triage` issue lacking type or area, `docs/odd/README.md`
+§5.1; Backlog is Devon's and is never triaged unless he moves it);
 comment and link on duplicates. Never edit another issue's status, labels,
 assignee or priority.
 

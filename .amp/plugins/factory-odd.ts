@@ -30,7 +30,7 @@ import {
 } from '../../scripts/odd/lifecycle.ts'
 import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
 import { finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, receiptLabel, roleLabelQueries, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
-import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, digestHeading, overCaps, restoreStatus, staleThreads, sweepMs, type DigestInput } from '../../scripts/odd/watchdog.ts'
+import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, digestHeading, overCaps, restoreStatus, slackMessages, staleThreads, sweepMs, type DigestInput } from '../../scripts/odd/watchdog.ts'
 
 export const description =
 	'Factory ODD control plane: Linear, GitHub and Slack webhooks drive a deterministic outcome lifecycle; role agents run in orbs; Ralph loops are bounded by external checks. See docs/odd/README.md.'
@@ -300,14 +300,16 @@ export default async function (amp: PluginAPI) {
 	// The Watchdog's cancel (§8): an idle thread the lifecycle waits on past `staleMs` is archived
 	// and the cancellation is recorded on the issue, so `spawn()` counts the next round from it. A
 	// builder that never opened a PR hands the issue back to Todo for a fresh builder.
+	// The comment is written before the thread is archived: an archived thread leaves the
+	// snapshot, so a cancellation that failed to record would hand the role a fresh budget.
 	async function cancelStale(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, role: Role, stale: readonly LiveThread[]) {
-		await archiveThreads(ctx, stale)
 		for (const thread of stale) {
 			const line = cancelledLine(role, thread.id, parseThreadLabels(thread.labels).round)
 			await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: line })
 			state.watchdog.cancelled.push(`${issue.identifier} ${line}`)
 			ctx.logger.log(marker, 'watchdog cancelled', issue.identifier, thread.id)
 		}
+		await archiveThreads(ctx, stale)
 		const status = restoreStatus(role, issue.status, issue.pr !== undefined)
 		if (status) await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: status })
 	}
@@ -334,7 +336,8 @@ export default async function (amp: PluginAPI) {
 				const { issue } = parseThreadLabels(thread.labels)
 				if (issue) identifiers.add(issue.toUpperCase())
 			}
-			for (const status of ['Backlog', 'Triage']) for (const id of await issueIds(ctx.tools, { state: status })) identifiers.add(id)
+			// Backlog is on demand (Devon moves an idea to Triage), so the sweep never enumerates it.
+			for (const id of await issueIds(ctx.tools, { state: 'Triage' })) identifiers.add(id)
 			for (const status of ['Todo', 'In Progress', 'Deploying']) for (const id of await issueIds(ctx.tools, { state: status, label: oddLabel })) identifiers.add(id)
 			watchdog.issues = identifiers.size
 			let failed = 0
@@ -342,9 +345,6 @@ export default async function (amp: PluginAPI) {
 				if ((await evaluate(ctx, state, 'watchdog', identifier, at)).stage === 'failed') failed += 1
 			}
 			if (identifiers.size && failed === identifiers.size) throw new Error(`all ${failed} evaluations failed`)
-			delete watchdog.error
-			delete watchdog.blindSince
-			watchdog.paged = false
 			const load = loadFrom(threads)
 			if (!overCaps(load)) {
 				delete watchdog.overSince
@@ -360,10 +360,16 @@ export default async function (amp: PluginAPI) {
 			// durable record: a digest already posted for the day is not posted again.
 			const day = digestDue(watchdog.digestDay, now)
 			if (day && performing) {
-				if (!(await digestPosted(ctx.tools, day))) await ctx.tools.call('slack_write', { channelName: alertsChannel, text: digest(await digestInput(ctx, day, now, load, watchdog.cancelled)) })
+				if (!(await digestPosted(ctx.tools, day))) {
+					for (const text of slackMessages(digest(await digestInput(ctx, day, now, load, watchdog.cancelled)))) await ctx.tools.call('slack_write', { channelName: alertsChannel, text })
+				}
 				watchdog.digestDay = day
 				watchdog.cancelled = []
 			}
+			// A blind episode ends only when a whole sweep, digest included, succeeds.
+			delete watchdog.error
+			delete watchdog.blindSince
+			watchdog.paged = false
 		} catch (error: unknown) {
 			watchdog.error = String(error)
 			entry.stage = 'failed'
@@ -496,7 +502,7 @@ export default async function (amp: PluginAPI) {
 
 	// Phases 3-6 fill in `perform` stage by stage: phase 3 spawns intake and spec and moves
 	// issues between Triage and Todo; phase 4 builds, reviews and merges; deploy is deferred.
-	// ODD owns Backlog and Triage for every issue. From Todo on, the dispatcher still owns an
+	// ODD owns Triage for every issue (Backlog waits for Devon). From Todo on, the dispatcher still owns an
 	// issue unless it carries the `odd` label (§6), so an issue the orchestrator created in Todo
 	// without an Evidence section is neither pulled back into Triage nor built twice.
 	// A steer is delivered once per (thread, message): the message names the head SHA, and the
@@ -504,7 +510,7 @@ export default async function (amp: PluginAPI) {
 	const steered = new Set<string>()
 	/** Returns false when nothing was done because the action is not this control plane's to take. */
 	async function perform(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, action: Action, threads: readonly LiveThread[]): Promise<boolean> {
-		const owned = issue.status === 'Backlog' || issue.status === 'Triage' || issue.labels.includes(oddLabel)
+		const owned = issue.status === 'Triage' || issue.labels.includes(oddLabel)
 		if (!owned) {
 			ctx.logger.log(marker, 'deferred: dispatcher owns', issue.identifier, issue.status, action.kind)
 			return false
@@ -652,7 +658,7 @@ export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 	ctx.logger.log(marker, 'paged', issue.identifier, action.reason)
 }
 
-// A rolled-back release returns its issues to Todo and files one Bug in Backlog per failed
+// A rolled-back release returns its issues to Todo and files one Bug in Triage per failed
 // release (the title carries the SHA; a second issue of the same release reuses it). Returns the Bug.
 export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, followUp: { title: string; body: string }): Promise<string | undefined> {
 	const existing = await callJson<{ issues?: { id?: string; title?: string }[] }>(ctx.tools, 'linear.list_issues', { team: 'Metacomet', query: followUp.title, limit: 10 })
@@ -662,7 +668,7 @@ export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logge
 		ctx.logger.log(marker, 'follow-up exists', issue.identifier, match.id)
 		return match.id
 	}
-	const created = await callJson<{ id?: string; identifier?: string }>(ctx.tools, 'linear.save_issue', { team: 'Metacomet', title: followUp.title, description: followUp.body, labels: ['Bug', 'area:agents'], state: 'Backlog', relatedTo: [issue.identifier] })
+	const created = await callJson<{ id?: string; identifier?: string }>(ctx.tools, 'linear.save_issue', { team: 'Metacomet', title: followUp.title, description: followUp.body, labels: ['Bug', 'area:agents'], state: 'Triage', relatedTo: [issue.identifier] })
 	ctx.logger.log(marker, 'follow-up filed', issue.identifier, created.identifier ?? created.id ?? '')
 	return created.identifier ?? created.id
 }

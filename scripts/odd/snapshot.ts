@@ -226,8 +226,8 @@ export function loadFrom(threads: readonly LiveThread[]): Load {
 
 /** The statuses in which each role's thread still matters; past them its idle threads are archived. */
 const roleStages: Partial<Record<keyof typeof contracts, readonly Status[]>> = {
-  intake: ['Backlog'],
-  spec: ['Backlog', 'Triage'],
+  intake: ['Triage'],
+  spec: ['Triage'],
   builder: ['Todo', 'In Progress'],
   reviewer: ['In Progress'],
   verifier: ['Deploying'],
