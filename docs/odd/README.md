@@ -343,6 +343,7 @@ by the previous one).
    guard on. Subscription engines and the launcher come later.
 
    First autonomous run: this issue, built, reviewed and merged by the control plane.
+   Second run: merged with no human nudge after the recheck-after-spawn fix.
 5. Shipper and Deployer: install the sudoers allowlist; the runner deploy job
    consumes `release.published`; canary + rollback; self-deploying paths
    merge through the same gate.
