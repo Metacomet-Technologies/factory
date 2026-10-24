@@ -51,7 +51,7 @@
       "constraints": "Existing compatible database only. Migration and legacy rollback require separate human approval."
     },
     {
-      "id": "factory-api", "artifact": "factory-api-linux-x86_64", "sources": ["factory-api", "shared", "factory-db", "pricing"],
+      "id": "factory-api", "artifact": "factory-api-linux-x86_64", "sources": ["factory-api", "shared", "factory-db", "pricing", "meter/openapi.json"],
       "nodes": ["factory-gpu"], "services": ["factory-api.service"],
       "installer": "deploy/install-factory-api.sh", "health": "GET /v1/health; exact release version, SHA, clean identity and inputs fingerprint",
       "rollback": "deploy/rollback-factory-api.sh with retained snapshot; preserve pricing and request databases",

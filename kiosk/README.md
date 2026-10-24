@@ -286,14 +286,15 @@ identity; legacy meter health without identity displays `meter unknown` rather
 than inventing a version. Native title text includes each component's version,
 dirty state, and UTC build time. Known versions also appear in Fleet.
 
-MET-247: "Build mismatch" means only that the kiosk was built against a
-different API contract than factory-api serves. The kiosk embeds the SHA-256
+MET-247 compares the kiosk↔API contracts. The kiosk embeds the SHA-256
 (first 12 hex) of the `factory-api/openapi.json` it was built from;
 `/v1/health` reports `openapi_sha256`, the same hash of the document it serves
 (the snapshot test keeps the two byte-identical). The warning's title names the
 two hashes. Different SHAs, versions or input fingerprints are not a mismatch,
-and an API without `openapi_sha256` asserts none. factory-api has no meter
-contract check, so the API↔meter pair is not compared.
+and an API without `openapi_sha256` asserts none. MET-254 also compares the
+API↔meter contracts using `/v1/health`'s `meter_openapi_expected` and
+`meter_openapi_sha256`. The footer warns when both hashes are known and differ,
+with a title naming the pair. An unknown value never triggers a mismatch.
 
 Input fingerprints (MET-149) remain build provenance for `/health`, Fleet and
 release checks; they no longer drive the footer.
@@ -303,9 +304,10 @@ Rust also includes the locked normal/build Cargo tree, but not the workspace
 `Cargo.toml` (MET-247): unrelated members or workspace dependencies must not
 stale a component, and its resolved tree already records what it uses; `--target all --no-dedupe` and repository-relative paths keep the
 tree machine-independent, including when Cargo has a configured build target.
-Kiosk includes its tracked `bun.lock` and `factory-api/openapi.json`. All
-fingerprints include `VERSION` and the fingerprint script itself. Unrelated
-lockfile entries do not stale Rust components; their resolved trees do.
+Factory-api also includes `meter/openapi.json`. Kiosk includes its tracked
+`bun.lock` and `factory-api/openapi.json`. All fingerprints include `VERSION`
+and the fingerprint script itself. Unrelated lockfile entries do not stale Rust
+components; their resolved trees do.
 
 Generate types and run the strict check against the updated isolated API using
 `OPENAPI_URL=http://127.0.0.1:18080/openapi.json`, not the still-deployed old schema.

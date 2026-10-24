@@ -21,6 +21,8 @@ def run(*args):
 files = {"VERSION", "scripts/build-fingerprint.sh"}
 directories = {component}
 tree = b""
+if component == "factory-api":
+    files.add("meter/openapi.json")
 if component == "kiosk":
     # The Bun lockfile (bun.lock) is tracked inside kiosk/.
     files.add("factory-api/openapi.json")
