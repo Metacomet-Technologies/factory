@@ -26,36 +26,33 @@ export const PROBES = 3;
 export const PROBE_GAP_MS = 20_000;
 export const LINEAR_KEY_FILE = '/etc/factory-dispatch/linear-api-key';
 
-export type Health = { kind: 'http'; url: string } | { kind: 'unit'; unit: string };
 export type Recipe = {
   name: string;
   /** Deploy inputs beyond the component's `sources` in deploy/components.json. */
   deployFiles: readonly string[];
-  /** Installer argument from the verified release directory; undefined installs from the checkout. */
-  artifact?: (releaseDir: string) => string;
+  /** Installer argument from the verified release directory. */
+  artifact: (releaseDir: string) => string;
   installer: string;
-  /** Restores the installer's snapshot; undefined when no script restores the previous release. */
-  rollback?: string;
-  health: Health;
+  /** Restores the installer's snapshot. */
+  rollback: string;
+  /** Health endpoint reporting `git_sha`. */
+  health: string;
 };
 
 /** Auto-deploy set settled by Devon 2026-10-24, in install order. The dispatcher's installer needs
- * a console runner list on stdin and retires in phase 7; pricing, ups, alerts, backup, reboot and
- * nut stay human-only (deploy/components.json). Usage has no rollback: deploy/rollback-usage.sh
- * removes the units rather than restoring the previous ones, so a red usage install pages. */
+ * a console runner list on stdin and retires in phase 7; usage waits for a rollback that restores
+ * the previous timer (deploy/rollback-usage.sh removes it); pricing, ups, alerts, backup, reboot
+ * and nut stay human-only (deploy/components.json). */
 export const recipes: readonly Recipe[] = [
   { name: 'meter', deployFiles: ['deploy/install-meter.sh', 'deploy/meter.service'], artifact: dir => join(dir, 'meter-linux-x86_64'),
     installer: 'deploy/install-meter.sh', rollback: 'deploy/rollback-meter-v1.sh',
-    health: { kind: 'http', url: 'http://127.0.0.1:11434/meter/health' } },
+    health: 'http://127.0.0.1:11434/meter/health' },
   { name: 'factory-api', deployFiles: ['deploy/install-factory-api.sh', 'deploy/factory-api.service'], artifact: dir => join(dir, 'factory-api-linux-x86_64'),
     installer: 'deploy/install-factory-api.sh', rollback: 'deploy/rollback-factory-api.sh',
-    health: { kind: 'http', url: 'http://127.0.0.1:8080/v1/health' } },
+    health: 'http://127.0.0.1:8080/v1/health' },
   { name: 'kiosk', deployFiles: ['deploy/install-kiosk.sh'], artifact: dir => join(dir, 'kiosk'),
     installer: 'deploy/install-kiosk.sh', rollback: 'deploy/rollback-kiosk.sh',
-    health: { kind: 'http', url: 'http://127.0.0.1:8080/version.json' } },
-  { name: 'usage', deployFiles: ['deploy/factory-usage.service', 'deploy/factory-usage.timer', 'deploy/factory-usage-refresh.path'],
-    installer: 'deploy/install-usage.sh',
-    health: { kind: 'unit', unit: 'factory-usage.timer' } },
+    health: 'http://127.0.0.1:8080/version.json' },
 ];
 
 export type ComponentRecord = { sha: string; tag: string; health: 'pass' | 'fail'; snapshot?: string };
@@ -89,7 +86,7 @@ export function issuesFromSubjects(subjects: readonly string[], prBody: (pr: num
   return [...issues];
 }
 
-/** Snapshot path an installer printed (`Rollback snapshot:` on the way in, `Snapshot:` from usage and the kiosk ERR trap). */
+/** Snapshot path an installer printed (`Rollback snapshot:` on the way in, `Snapshot:` from the kiosk ERR trap). */
 export function parseSnapshot(output: string): string | undefined {
   const paths = [...output.matchAll(/^(?:Rollback snapshot|Snapshot): (\/\S+)/gm)].map(match => match[1].replace(/\.$/, ''));
   return paths.at(-1);
@@ -104,16 +101,14 @@ export function healthySha(body: string): string | undefined {
   return 'status' in json && json.status !== 'ok' ? undefined : reported;
 }
 
-/** A probe passes when a healthy body reports the release SHA; a unit probe when the unit is active. */
-export function probeResult(health: Health, sha: string, body: string): 'pass' | 'fail' {
-  if (health.kind === 'unit') return body.trim() === 'active' ? 'pass' : 'fail';
+/** A probe passes when a healthy body reports the release SHA. */
+export function probeResult(sha: string, body: string): 'pass' | 'fail' {
   const reported = healthySha(body);
   return reported && sha.startsWith(reported) ? 'pass' : 'fail';
 }
 
 /** After a rollback the component must be healthy on a release other than the one rolled back. */
-export function restoredResult(health: Health, sha: string, body: string): 'pass' | 'fail' {
-  if (health.kind === 'unit') return 'fail';
+export function restoredResult(sha: string, body: string): 'pass' | 'fail' {
   const reported = healthySha(body);
   return reported && !sha.startsWith(reported) ? 'pass' : 'fail';
 }
@@ -163,7 +158,8 @@ export type Effects = {
   ok: (command: string, args: readonly string[]) => boolean;
   /** `sudo -n /usr/bin/bash <ROOT>/<script> args...`; returns combined output, `ok` false on non-zero exit. */
   sudo: (script: string, args: readonly string[]) => { ok: boolean; output: string };
-  probe: (health: Health) => string;
+  /** GET a health endpoint; throws when unreachable. */
+  probe: (url: string) => string;
   readLedger: () => Ledger;
   writeLedger: (ledger: Ledger) => void;
   linear: {
@@ -189,7 +185,6 @@ function newest(effects: Effects, candidates: readonly (string | undefined)[]): 
 
 /** The commit a healthy endpoint reports; a degraded, dirty or unreachable one is no baseline. */
 function healthSha(effects: Effects, recipe: Recipe): string | undefined {
-  if (recipe.health.kind !== 'http') return undefined;
   try {
     const reported = healthySha(effects.probe(recipe.health));
     return reported && effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `${reported}^{commit}`]).stdout.trim();
@@ -200,7 +195,7 @@ async function probeWindow(effects: Effects, recipe: Recipe, sha: string, check 
   for (let attempt = 1; attempt <= PROBES; attempt++) {
     let body = '';
     try { body = effects.probe(recipe.health); } catch (error) { body = String(error); }
-    const result = check(recipe.health, sha, body);
+    const result = check(sha, body);
     effects.log(event, { component: recipe.name, attempt, result });
     if (result === 'fail') return 'fail';
     if (attempt < PROBES) await effects.sleep(PROBE_GAP_MS);
@@ -210,7 +205,6 @@ async function probeWindow(effects: Effects, recipe: Recipe, sha: string, check 
 
 /** Run the rollback once, then re-probe: the snapshot when the previous release is back and healthy, else `none`. */
 async function rollback(effects: Effects, recipe: Recipe, sha: string, snapshot: string | undefined): Promise<string> {
-  if (!recipe.rollback) { effects.log('rollback-unavailable', { component: recipe.name }); return 'none'; }
   if (!snapshot) { effects.log('rollback-missing-snapshot', { component: recipe.name }); return 'none'; }
   const result = effects.sudo(recipe.rollback, [snapshot]);
   effects.log('rollback', { component: recipe.name, ok: result.ok, snapshot });
@@ -233,7 +227,7 @@ export async function deployComponent(effects: Effects, recipe: Recipe, tag: str
   }
   if (needInstall) {
     effects.writeLedger({ ...ledger, inFlight: { tag, sha, component: recipe.name, phase: 'installing' } });
-    const install = effects.sudo(recipe.installer, recipe.artifact ? [recipe.artifact(releaseDir)] : []);
+    const install = effects.sudo(recipe.installer, [recipe.artifact(releaseDir)]);
     snapshot = parseSnapshot(install.output);
     effects.log('install', { component: recipe.name, ok: install.ok, snapshot });
     if (!install.ok) {
@@ -277,8 +271,8 @@ function prepareRelease(effects: Effects, tag: string): { sha: string; dir: stri
   }
   // release.py writes assets without the execute bit; the meter and factory-api installers require -x.
   for (const recipe of recipes) {
-    const artifact = recipe.artifact?.(dir);
-    if (artifact && statSync(artifact).isFile()) chmodSync(artifact, statSync(artifact).mode | 0o100);
+    const artifact = recipe.artifact(dir);
+    if (statSync(artifact).isFile()) chmodSync(artifact, statSync(artifact).mode | 0o100);
   }
   if (effects.run('git', ['-C', ROOT, 'status', '--porcelain']).stdout.trim()) throw new Error(`${ROOT} is dirty; not deploying ${tag}`);
   effects.run('git', ['-C', ROOT, 'checkout', '--quiet', '--detach', sha]);
@@ -408,9 +402,7 @@ export function liveEffects(): Effects {
       const result = spawnSync('sudo', ['-n', '/usr/bin/bash', join(ROOT, script), ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
       return { ok: result.status === 0, output: `${result.stdout}${result.stderr}` };
     },
-    probe: health => health.kind === 'http'
-      ? run('curl', ['-fsS', '--max-time', '10', health.url]).stdout
-      : run('systemctl', ['is-active', health.unit]).stdout,
+    probe: url => run('curl', ['-fsS', '--max-time', '10', url]).stdout,
     readLedger: () => {
       try { return JSON.parse(readFileSync(LEDGER, 'utf8')) as Ledger; } catch { return emptyLedger(); }
     },

@@ -3,13 +3,12 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { deployComponent, emptyLedger, issuesFromSubjects, main, parseSnapshot, pendingTags, plan, probeResult, receiptLine, recipes, restoredResult, resume, type Effects, type Health, type Ledger } from './deploy.ts';
+import { deployComponent, emptyLedger, issuesFromSubjects, main, parseSnapshot, pendingTags, plan, probeResult, receiptLine, recipes, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
 import { nextAction, parseDeployReceipt, type Action } from './lifecycle.ts';
-import { diagnose, page } from '../../.amp/plugins/factory-odd.ts';
+import { diagnose, page, setStatus } from '../../.amp/plugins/factory-odd.ts';
 
 const sha = 'a'.repeat(40);
 const kiosk = recipes.find(recipe => recipe.name === 'kiosk')!;
-const usage = recipes.find(recipe => recipe.name === 'usage')!;
 const snapshot = '/var/backups/factory-kiosk/20261024T120000.000000Z.abc123';
 const idle = { orbs: 0, runnerSlots: 0, buildIssues: 0 };
 const deploying = (line: string) => nextAction({ identifier: 'MET-1', status: 'Deploying', labels: ['odd'], description: '', openBlockers: [], deployReceipt: parseDeployReceipt(line) }, idle);
@@ -59,24 +58,24 @@ test('an installer failure after its snapshot rolls back and re-probes; before a
   assert.deepEqual(await deployComponent(unchanged.effects, kiosk, 'v0.3.0', sha, '/tmp/rel'), { component: 'kiosk', sha, health: 'fail', rollback: 'none' });
 });
 
-test('usage has no restoring rollback: a red timer never runs the unit-removal script and the receipt says rollback=none', async () => {
-  const { effects, calls } = fixture({ bodies: ['active\n', 'inactive\n'] });
-  const receipt = await deployComponent(effects, usage, 'v0.3.0', sha, '/tmp/rel');
-  assert.deepEqual(receipt, { component: 'usage', sha, health: 'fail', rollback: 'none' });
-  assert.deepEqual(calls.filter(call => call.startsWith('sudo')), ['sudo deploy/install-usage.sh']);
-  assert.equal(deploying(receiptLine(receipt)).kind, 'page');
+test('the enabled set is meter, factory-api and kiosk in install order, each with a restoring rollback', () => {
+  assert.deepEqual(recipes.map(recipe => [recipe.name, recipe.rollback]), [
+    ['meter', 'deploy/rollback-meter-v1.sh'], ['factory-api', 'deploy/rollback-factory-api.sh'], ['kiosk', 'deploy/rollback-kiosk.sh'],
+  ]);
 });
 
 test('plan: changed inputs since the baseline, recipe order, skips components the ledger has at this SHA and ones with no changes', () => {
   const sources = { meter: ['meter', 'shared', 'factory-db'], 'factory-api': ['factory-api', 'shared', 'factory-db', 'pricing'], kiosk: ['kiosk', 'factory-api/openapi.json'], usage: ['scripts/usage'] };
-  const changed = ['kiosk/src/App.tsx', 'docs/x.md', 'shared/build.rs', 'deploy/factory-usage.timer'];
+  const changed = ['kiosk/src/App.tsx', 'docs/x.md', 'shared/build.rs', 'scripts/usage/collect.ts', 'deploy/factory-usage.timer'];
   const names = (ledger: Ledger, baselines: Record<string, string | undefined>) =>
     plan({ sha, sources, baselines, ledger, changedSince: () => changed }).map(recipe => recipe.name);
-  const all = { meter: 'base', 'factory-api': 'base', kiosk: 'base', usage: 'base' };
-  assert.deepEqual(names(emptyLedger(), all), ['meter', 'factory-api', 'kiosk', 'usage']);
-  assert.deepEqual(names({ components: { meter: { sha, tag: 'v', health: 'pass' } } }, all), ['factory-api', 'kiosk', 'usage']);
+  const all = { meter: 'base', 'factory-api': 'base', kiosk: 'base' };
+  // Usage changed too, but it is not in the enabled set.
+  assert.deepEqual(names(emptyLedger(), all), ['meter', 'factory-api', 'kiosk']);
+  assert.deepEqual(names({ components: { meter: { sha, tag: 'v', health: 'pass' } } }, all), ['factory-api', 'kiosk']);
   // A failed attempt at this SHA is retried; a component with no baseline installs; a prefix match needs a path boundary.
-  assert.deepEqual(names({ components: { meter: { sha, tag: 'v', health: 'fail' } } }, { ...all, usage: undefined }), ['meter', 'factory-api', 'kiosk', 'usage']);
+  assert.deepEqual(names({ components: { meter: { sha, tag: 'v', health: 'fail' } } }, { ...all, kiosk: undefined }), ['meter', 'factory-api', 'kiosk']);
+  assert.deepEqual(plan({ sha, sources, baselines: all, ledger: emptyLedger(), changedSince: () => ['kiosk/x.ts'] }).map(recipe => recipe.name), ['kiosk']);
   assert.deepEqual(plan({ sha, sources, baselines: all, ledger: emptyLedger(), changedSince: () => ['kiosk-docs/readme.md', 'docs/odd/README.md'] }), []);
 });
 
@@ -84,20 +83,17 @@ test('issues come from squash subjects and PR bodies; snapshots and probes parse
   const bodies: Record<number, string> = { 181: 'closes MET-302\nSee MET-999 for context', 180: 'contributes MET-279', 7: 'nothing' };
   assert.deepEqual(issuesFromSubjects(['MET-302: note (#181)', 'Phase 4 fixes (#180)', 'docs (#7)', 'no pr'], pr => bodies[pr] ?? ''), ['MET-302', 'MET-279']);
   assert.equal(parseSnapshot('Rollback snapshot: /var/backups/meter/20261024T1.abc\nmore\n'), '/var/backups/meter/20261024T1.abc');
-  assert.equal(parseSnapshot('Snapshot: /var/backups/factory-usage/20261024T1\nERROR: usage install failed'), '/var/backups/factory-usage/20261024T1');
   assert.equal(parseSnapshot('ERROR: kiosk install failed at line 9. Snapshot: not created (kiosk unchanged). Recover with: ...'), undefined);
-  const http = { kind: 'http' as const, url: 'http://127.0.0.1:8080/version.json' };
-  assert.equal(probeResult(http, sha, JSON.stringify({ git_sha: sha.slice(0, 7), git_dirty: false })), 'pass');
-  assert.equal(probeResult(http, sha, JSON.stringify({ git_sha: sha, status: 'degraded' })), 'fail');
-  assert.equal(probeResult(http, sha, JSON.stringify({ git_sha: sha, git_dirty: true })), 'fail');
-  assert.equal(probeResult(http, sha, JSON.stringify({ git_sha: 'abc' })), 'fail');
-  assert.equal(probeResult(http, sha, 'not json'), 'fail');
-  assert.equal(probeResult({ kind: 'unit', unit: 'factory-usage.timer' }, sha, 'active\n'), 'pass');
+  assert.equal(probeResult(sha, JSON.stringify({ git_sha: sha.slice(0, 7), git_dirty: false })), 'pass');
+  assert.equal(probeResult(sha, JSON.stringify({ git_sha: sha, status: 'degraded' })), 'fail');
+  assert.equal(probeResult(sha, JSON.stringify({ git_sha: sha, git_dirty: true })), 'fail');
+  assert.equal(probeResult(sha, JSON.stringify({ git_sha: 'abc' })), 'fail');
+  assert.equal(probeResult(sha, 'not json'), 'fail');
   // Restored means healthy on another release: still on the target, degraded or unreachable is not.
-  assert.equal(restoredResult(http, sha, previous), 'pass');
-  assert.equal(restoredResult(http, sha, green), 'fail');
-  assert.equal(restoredResult(http, sha, JSON.stringify({ git_sha: 'b'.repeat(40), status: 'degraded' })), 'fail');
-  assert.equal(restoredResult(http, sha, 'curl: (7) connection refused'), 'fail');
+  assert.equal(restoredResult(sha, previous), 'pass');
+  assert.equal(restoredResult(sha, green), 'fail');
+  assert.equal(restoredResult(sha, JSON.stringify({ git_sha: 'b'.repeat(40), status: 'degraded' })), 'fail');
+  assert.equal(restoredResult(sha, 'curl: (7) connection refused'), 'fail');
 });
 
 // --- Sandbox fixture: main() end to end against a fake host. -------------------------------
@@ -204,7 +200,7 @@ function world(options: {
       calls.push(`sudo ${script} ${args.join(' ')}`.trim());
       const component = /deploy\/(?:install|rollback)-(.+?)(?:-v1)?\.sh$/.exec(script)![1];
       if (script.includes('/install-')) {
-        const target = order.find(full => args[0]?.includes(`/releases/${tagOf(full)}/`)) ?? order.at(-1)!;
+        const target = order.find(full => args[0].includes(`/releases/${tagOf(full)}/`))!;
         before[component] = live[component];
         live[component] = target;
         return { ok: true, output: `Rollback snapshot: /var/backups/${component}/snap\n` };
@@ -213,10 +209,9 @@ function world(options: {
       if (options.rollbackRestores !== false) live[component] = before[component];
       return { ok: true, output: '' };
     },
-    probe: (health: Health) => {
+    probe: url => {
       calls.push('probe');
-      if (health.kind === 'unit') return 'active\n';
-      const component = Object.entries(ports).find(([key]) => health.url.includes(`:${key}`))![1];
+      const component = Object.entries(ports).find(([key]) => url.includes(`:${key}`))![1];
       if (options.unreachable?.includes(component) && live[component] === start[component]) throw new Error('curl: (7) Failed to connect');
       return healthBody(component);
     },
@@ -236,8 +231,8 @@ function world(options: {
   return { effects, calls, comments, live, ledger: () => ledger, stateDir, cleanup };
 }
 
-// Usage has no health SHA, so its baseline is the ledger record; the others read their endpoints.
-const baseline = (extra: Partial<Ledger> = {}): Ledger => ({ lastTag: 'v0.2.9', components: { usage: { sha: shas['v0.2.9'], tag: 'v0.2.9', health: 'pass' } }, ...extra });
+// Components have no ledger records yet; baselines come from the health endpoints.
+const baseline = (extra: Partial<Ledger> = {}): Ledger => ({ lastTag: 'v0.2.9', components: {}, ...extra });
 const sudoCalls = (calls: string[]) => calls.filter(call => call.startsWith('sudo'));
 const line = (fields: string) => `odd-deploy host=factory-gpu ${fields}`;
 
@@ -272,11 +267,19 @@ test('sandbox: a red probe runs the rollback once, the restored release is re-pr
   assert.equal(host.ledger().lastTag, 'v0.3.0');
 });
 
-/** Fake plugin context: records every tool call and gh command. */
-function pluginContext(found: { id: string }[] = []) {
+/** Fake plugin context: records every tool call; `fail` makes that tool's next call fail once. */
+function pluginContext(found: { id: string }[] = [], fail?: string) {
   const tools: [string, Record<string, unknown>][] = [];
+  const bugs: string[] = [];
   const ctx = {
-    tools: { call: async (name: string, input: Record<string, unknown>) => { tools.push([name, input]); return name === 'find_thread' ? { threads: found } : {}; } },
+    tools: { call: async (name: string, input: Record<string, unknown>) => {
+      tools.push([name, input]);
+      if (name === fail) { fail = undefined; throw new Error(`${name}: HTTP 503`); }
+      if (name === 'find_thread') return { threads: found };
+      if (name === 'linear.list_issues') return { issues: bugs.map(title => ({ id: 'MET-900', title })) };
+      if (name === 'linear.save_issue' && typeof input.title === 'string') bugs.push(input.title);
+      return name === 'linear.save_issue' && input.title ? { identifier: 'MET-900' } : {};
+    } },
     $: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
     logger: { log: () => {} },
   };
@@ -310,6 +313,48 @@ for (const [name, options] of [['exits non-zero', { rollbackOk: false }], ['exit
     assert.ok(spawned[0][1].includes(fail) && spawned[0][1].includes('MET-301') && spawned[0][1].includes('odd-deployer'), spawned[0][1]);
   });
 }
+
+const redIssue = (receiptSha: string, rollback: string) => ({ identifier: 'MET-311', status: 'Deploying' as const, labels: ['odd'], description: '', openBlockers: [],
+  deployReceipt: parseDeployReceipt(line(`component=kiosk sha=${receiptSha} health=fail rollback=${rollback}`)) });
+const flakySpawn = (fails: boolean) => {
+  const spawned: string[] = [];
+  const spawn = async (_labels: string[], content: string) => {
+    if (fails) { fails = false; throw new Error('runner factory-gpu offline'); }
+    spawned.push(content);
+    return 'T-deployer';
+  };
+  return { spawn, spawned };
+};
+
+for (const [what, receiptSha, failTool, spawnFails] of [['Bug lookup', 'c'.repeat(40), 'linear.list_issues', false], ['log-reader spawn', 'd'.repeat(40), undefined, true]] as const) {
+  test(`control plane: when the ${what} fails, the issue stays in Deploying; re-evaluating it files one Bug, starts one log reader and only then moves it to Todo`, async () => {
+    const issue = redIssue(receiptSha, '/var/backups/kiosk/snap');
+    const { ctx, tools } = pluginContext([], failTool);
+    const { spawn, spawned } = flakySpawn(spawnFails);
+    const statusCalls = () => tools.filter(([tool, input]) => tool === 'linear.save_issue' && input.id === 'MET-311' && 'state' in input);
+    const action = nextAction(issue, idle) as Extract<Action, { kind: 'set-status' }>;
+    await assert.rejects(setStatus(ctx, issue, action, spawn), /503|offline/);
+    assert.deepEqual(statusCalls(), [], 'still Deploying, so no builder can take it');
+    // The issue Linear reports is unchanged, so the next evaluation derives the same action.
+    assert.deepEqual(nextAction(issue, idle), action);
+    await setStatus(ctx, issue, action, spawn);
+    assert.deepEqual(tools.at(-1), ['linear.save_issue', { id: 'MET-311', state: 'Todo' }]);
+    assert.equal(statusCalls().length, 1);
+    assert.equal(tools.filter(([tool, input]) => tool === 'linear.save_issue' && input.title).length, 1, 'one Bug');
+    assert.equal(spawned.length, 1);
+    assert.ok(spawned[0].includes('MET-900'), spawned[0]);
+  });
+}
+
+test('control plane: a failed rollback pages even when its log reader cannot start, says so in the page, and sets escalated last', async () => {
+  const issue = redIssue('e'.repeat(40), 'none');
+  const action = nextAction(issue, idle) as Extract<Action, { kind: 'page' }>;
+  const { ctx, tools } = pluginContext();
+  await page(ctx, issue, action, flakySpawn(true).spawn);
+  const slack = tools.find(([tool]) => tool === 'slack_write')?.[1] as { text: string };
+  assert.match(slack.text, /log reader not started: Error: runner factory-gpu offline/);
+  assert.deepEqual(tools.at(-1), ['linear.save_issue', { id: 'MET-311', addLabels: ['escalated'] }]);
+});
 
 test('sandbox: a release that touches no enabled component posts component=none and its issues move to Done', async t => {
   const host = world({ tags: ['v0.2.9', 'v0.3.0'], changes: { 'v0.3.0': ['docs/odd/README.md', 'kiosk-docs/readme.md'] }, issues: { 'v0.3.0': ['MET-301'] }, ledger: baseline() });

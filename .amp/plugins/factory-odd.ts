@@ -364,12 +364,9 @@ export default async function (amp: PluginAPI) {
 				if (action.role === 'builder' && issue.status === 'Todo') await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: 'In Progress' })
 				return
 			}
-			case 'set-status': {
-				await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: action.status })
-				const bug = action.followUp ? await followUp(ctx, issue, action.followUp) : undefined
-				if (action.diagnose) await diagnose(ctx, issue, action.diagnose, bug, spawnDeployer(ctx))
+			case 'set-status':
+				await setStatus(ctx, issue, action, spawnDeployer(ctx))
 				return
-			}
 			case 'steer': {
 				const key = `${action.threadID}:${action.message}`
 				if (steered.has(key)) return
@@ -381,8 +378,7 @@ export default async function (amp: PluginAPI) {
 				await merge(ctx, issue, action.pr, action.sha)
 				return
 			case 'page':
-				await page(ctx, issue, action)
-				if (action.diagnose) await diagnose(ctx, issue, action.diagnose, undefined, spawnDeployer(ctx))
+				await page(ctx, issue, action, spawnDeployer(ctx))
 				return
 			default:
 				ctx.logger.log(marker, 'deferred to a later phase', action.kind)
@@ -418,17 +414,38 @@ export default async function (amp: PluginAPI) {
 		spawnThread(ctx.thread.id, 'deployer', labels, content, { type: 'runner', id: deployRunner })
 }
 
+type Spawn = (labels: string[], content: string) => Promise<string>
+
+// The status is the transition that hands the issue on, so it is written last: the Bug and the
+// log reader are both deduplicated, and a failure in either leaves the issue in Deploying for the
+// next evaluation to retry. Moving it to Todo first would hand it to a builder with neither.
+export async function setStatus(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, action: Extract<Action, { kind: 'set-status' }>, spawn: Spawn) {
+	const bug = action.followUp ? await followUp(ctx, issue, action.followUp) : undefined
+	if (action.diagnose) await diagnose(ctx, issue, action.diagnose, bug, spawn)
+	await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: action.status })
+}
+
 // Escalation (§8): the issue stays In Progress with the `escalated` label (the lifecycle waits
 // on it), the PR goes back to draft so nothing merges it, and Devon gets one Slack DM.
-// `slack_write` without a recipient DMs the thread owner.
-export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, issue: IssueSnapshot, action: Extract<Action, { kind: 'page' }>) {
-	await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, addLabels: [escalatedLabel] })
+// `slack_write` without a recipient DMs the thread owner. The label is written last, so a failed
+// step is retried by the next evaluation. A failed rollback starts its log reader first; a page
+// is never held back by that spawn, so its failure goes into the page instead.
+export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, issue: IssueSnapshot, action: Extract<Action, { kind: 'page' }>, spawn?: Spawn) {
+	let detail = action.detail
+	if (action.diagnose && spawn) {
+		try {
+			await diagnose(ctx, issue, action.diagnose, undefined, spawn)
+		} catch (error: unknown) {
+			detail += ` (log reader not started: ${String(error)}; read journalctl -u factory-deploy on ${action.diagnose.host})`
+		}
+	}
 	if (action.pr !== undefined) {
 		const draft = await ctx.$`gh pr ready ${String(action.pr)} --undo`
 		if (draft.exitCode !== 0) ctx.logger.log(marker, 'draft failed', action.pr, draft.stderr.trim())
 	}
-	await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-escalated reason=${action.reason}\n\n${action.detail}` })
-	await ctx.tools.call('slack_write', { text: `${marker} ${issue.identifier} escalated (${action.reason}): ${action.detail}. Remove the \`${escalatedLabel}\` label to resume.` })
+	await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-escalated reason=${action.reason}\n\n${detail}` })
+	await ctx.tools.call('slack_write', { text: `${marker} ${issue.identifier} escalated (${action.reason}): ${detail}. Remove the \`${escalatedLabel}\` label to resume.` })
+	await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, addLabels: [escalatedLabel] })
 	ctx.logger.log(marker, 'paged', issue.identifier, action.reason)
 }
 
@@ -451,7 +468,7 @@ export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logge
 // archived:false filter, plus this process's memory while the search index lags). It attaches the installer and
 // journal excerpts to the Bug, or to the issue when the rollback failed and no Bug exists.
 const diagnosed = new Set<string>()
-export async function diagnose(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, receipt: DeployReceipt, bug: string | undefined, spawn: (labels: string[], content: string) => Promise<string>) {
+export async function diagnose(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, receipt: DeployReceipt, bug: string | undefined, spawn: Spawn) {
 	const label = `odd-deploy-${receipt.sha.slice(0, 12)}`
 	const found = await callJson<{ threads: { id: string }[] }>(ctx.tools, 'find_thread', { query: `label:${label}`, limit: 1 })
 	if (diagnosed.has(label) || found.threads.length) {

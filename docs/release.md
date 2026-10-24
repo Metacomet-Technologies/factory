@@ -300,19 +300,18 @@ overlap, 30 minute cap). The job reads `gh release list`, verifies each release
 newer than the ledger's `lastTag` with `release.py verify --anonymous`, detaches
 `/home/agent/work/factory` at the release SHA, and installs each enabled
 component whose sources or installer changed since the SHA the host already
-runs: `meter`, `factory-api`, `kiosk`, `usage`, in that order, through the
+runs: `meter`, `factory-api`, `kiosk`, in that order, through the
 sudoers allowlist (`deploy/sudoers/README.md`). Three health probes 20 s apart
 must report the release SHA; red runs the component's rollback script once and
 re-probes, and the receipt names the snapshot only when the previous release is
-back and healthy. Usage has no restoring rollback (`rollback-usage.sh` removes
-the units), so a red usage install is never rolled back automatically and pages
-Devon. The result is one `odd-deploy` receipt per issue the release closes
+back and healthy. The result is one `odd-deploy` receipt per issue the release closes
 (`docs/odd/README.md` §7). The enabled set lives in `deploy.ts`, not in
 `deploy/components.json`, because `release.py inventory_check` keeps
 `enabled_auto_deploy` empty and eligibility human-only.
 
-Not deployed by the job: dispatcher, pricing, ups-control, alerts, backup,
-reboot, nut, devices-agent. Those stay with Devon.
+Not deployed by the job: dispatcher, usage (until it has a rollback that
+restores the previous timer; `rollback-usage.sh` removes the units), pricing,
+ups-control, alerts, backup, reboot, nut, devices-agent. Those stay with Devon.
 
 One-time install from the Mac, after the merge is on main and the host
 checkout is at or past it (the script refuses any other root path or host):
@@ -323,7 +322,7 @@ gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-deploy.sh'
 
 The first run only records the newest published tag as `lastTag`; the next
 release is the first automatic deploy. Expect that release to reinstall
-meter, factory-api, kiosk and usage once, because the host baselines predate
+meter, factory-api and kiosk once, because the host baselines predate
 it.
 
 Watch and recover:

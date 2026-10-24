@@ -33,16 +33,15 @@ an installer, a rollback script or `sudo`; the job owns those.
    `deploy/components.json`, or its installer and rollback scripts, changed
    between its baseline and the release SHA. The baseline is the newer of the
    ledger SHA and the SHA the live health endpoint reports. Enabled
-   components, in install order: `meter`, `factory-api`, `kiosk`, `usage`.
-   Everything else (dispatcher, pricing, ups-control, alerts, backup, reboot,
-   nut, devices) stays with Devon.
+   components, in install order: `meter`, `factory-api`, `kiosk`.
+   Everything else (dispatcher, usage until it has a rollback that restores
+   the previous timer, pricing, ups-control, alerts, backup, reboot, nut,
+   devices) stays with Devon.
 4. Install: `sudo -n /usr/bin/bash /home/agent/work/factory/deploy/install-<c>.sh <artifact>`,
    three health probes 20 s apart, all three must report the release SHA.
    Red: the listed rollback script runs once with the snapshot path the
    installer printed, then three more probes must find a healthy previous
-   release: `rollback=<snapshot>`, otherwise `rollback=none`. Usage has no
-   restoring rollback, so red usage is `rollback=none` without running
-   anything. The release stops at the first failed component. A failed
+   release: `rollback=<snapshot>`, otherwise `rollback=none`. The release stops at the first failed component. A failed
    component record is never a baseline; the next release retries it.
 5. Receipt, one line per issue the release closes
    (`(#N)` merge subjects → PR body `closes`/`contributes` lines), posted only
