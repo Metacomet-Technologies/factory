@@ -212,6 +212,7 @@ impl Collector {
             disk_io: host.disk_io,
             network: host.network,
             cooling: host.cooling,
+            power: host.power,
             maintenance,
             collector: host.collector,
         };
@@ -454,6 +455,25 @@ pub fn conform(sample: &mut DeviceSampleV1) {
     for (_, metric) in metrics_mut(sample) {
         conform_metric(metric, at);
     }
+    if let Some(power) = &mut sample.power {
+        power.observed_at_ms = power.observed_at_ms.min(at);
+        clip_opt(&mut power.detail);
+        if let Some(status) = &mut power.battery_status {
+            clip_to(status, 64);
+        }
+        power.battery_percent = power
+            .battery_percent
+            .filter(|v| v.is_finite() && (0.0..=100.0).contains(v));
+        power.battery_power_w = power
+            .battery_power_w
+            .filter(|v| v.is_finite() && (0.0..=1000.0).contains(v));
+        if power.availability != Availability::Available {
+            power.adapter_online = None;
+            power.battery_status = None;
+            power.battery_percent = None;
+            power.battery_power_w = None;
+        }
+    }
     let m = &mut sample.maintenance;
     // The server accepts integers 0 to 2^53-1 only; anything else fails that
     // source, not the whole sample.
@@ -542,6 +562,9 @@ pub fn capabilities(sample: &mut DeviceSampleV1) -> Vec<(String, Availability, O
             sample.maintenance.reboot.detail.clone(),
         ),
     ];
+    if let Some(power) = &sample.power {
+        rows.push(("power".into(), power.availability, None));
+    }
     for drive in &sample.drives {
         rows.push((
             format!("drives[{}].smart", drive.kernel),

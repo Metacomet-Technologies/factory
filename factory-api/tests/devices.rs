@@ -66,6 +66,218 @@ async fn serve(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
     (url, task)
 }
 
+fn sample(root: &Path, sampler: &mut devices::Sampler, at: i64) -> devices::HostSnapshot {
+    devices::sample_timeout(
+        root,
+        sampler,
+        &devices::Inputs {
+            now_ms: at,
+            gpu: None,
+            ups: None,
+            services: vec![],
+            backup_path: root.join("var/lib/factory-backup-status/status.json"),
+            reboot_path: root.join("var/lib/factory-reboot/status.json"),
+            clock_synchronized: true,
+        },
+        std::time::Duration::from_millis(100),
+    )
+    .device
+}
+
+fn applesmc(root: &Path) {
+    let node = root.join("sys/devices/platform/applesmc.768");
+    let acpi = root.join("sys/bus/acpi/devices/APP0001:00");
+    fs::create_dir_all(&node).unwrap();
+    fs::create_dir_all(&acpi).unwrap();
+    std::os::unix::fs::symlink(&node, acpi.join("physical_node")).unwrap();
+    write(
+        root,
+        "sys/devices/platform/applesmc.768/fan1_input",
+        "2200\n",
+    );
+    write(
+        root,
+        "sys/devices/platform/applesmc.768/fan2_input",
+        "2300\n",
+    );
+}
+
+fn battery(root: &Path) {
+    write(root, "sys/class/power_supply/BAT0/type", "Battery\n");
+    write(root, "sys/class/power_supply/BAT0/status", "Discharging\n");
+    write(root, "sys/class/power_supply/BAT0/capacity", "73\n");
+}
+
+#[test]
+fn applesmc_canonical_symlink_reads_two_fans_without_optional_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    applesmc(dir.path());
+    let mut sampler = devices::Sampler::default();
+    let host = sample(dir.path(), &mut sampler, 1_000_000);
+    assert_eq!(
+        host.cooling.fans_availability,
+        devices::Availability::Available
+    );
+    assert_eq!(host.cooling.fans.len(), 2);
+    for (fan, (name, rpm)) in host
+        .cooling
+        .fans
+        .iter()
+        .zip([("applesmc fan1", 2200.0), ("applesmc fan2", 2300.0)])
+    {
+        assert_eq!(fan.name, name);
+        assert_eq!(fan.metric.value, Some(rpm));
+        assert_eq!(fan.metric.unit, "rpm");
+        assert_eq!(fan.metric.observed_at_ms, 1_000_000);
+        assert_eq!(fan.metric.availability, devices::Availability::Available);
+        assert_eq!(fan.metric.detail, None);
+    }
+}
+
+#[test]
+fn applesmc_absence_preserves_hwmon_and_unsupported_empty_fans() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let empty = sample(dir.path(), &mut devices::Sampler::default(), 1_000_000);
+    assert!(empty.cooling.fans.is_empty());
+    assert_eq!(
+        empty.cooling.fans_availability,
+        devices::Availability::Unsupported
+    );
+    write(dir.path(), "sys/class/hwmon/hwmon0/fan1_input", "1500\n");
+    let host = sample(dir.path(), &mut devices::Sampler::default(), 1_000_000);
+    assert_eq!(host.cooling.fans.len(), 1);
+    assert_eq!(host.cooling.fans[0].name, "k10temp fan1");
+    assert_eq!(host.cooling.fans[0].metric.value, Some(1500.0));
+    assert_eq!(host.cooling.temperatures, empty.cooling.temperatures);
+}
+
+#[test]
+fn applesmc_deduplicates_existing_hwmon_names() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    applesmc(dir.path());
+    write(dir.path(), "sys/class/hwmon/hwmon1/name", "applesmc\n");
+    write(dir.path(), "sys/class/hwmon/hwmon1/fan1_input", "2100\n");
+    let host = sample(dir.path(), &mut devices::Sampler::default(), 1_000_000);
+    assert_eq!(host.cooling.fans.len(), 2);
+    assert_eq!(host.cooling.fans[0].name, "applesmc fan1");
+    assert_eq!(host.cooling.fans[0].metric.value, Some(2100.0));
+    assert_eq!(host.cooling.fans[1].name, "applesmc fan2");
+    assert_eq!(host.cooling.fans[1].metric.value, Some(2300.0));
+}
+
+#[test]
+fn power_supply_fallback_converts_signed_microamps_and_microvolts() {
+    for current in ["2000000", "-2000000"] {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        battery(dir.path());
+        write(
+            dir.path(),
+            "sys/class/power_supply/BAT0/current_now",
+            current,
+        );
+        write(
+            dir.path(),
+            "sys/class/power_supply/BAT0/voltage_now",
+            "12000000",
+        );
+        let host = sample(dir.path(), &mut devices::Sampler::default(), 1_000_000);
+        let power = host.power.unwrap();
+        assert_eq!(power.availability, devices::Availability::Available);
+        assert_eq!(power.battery_power_w, Some(24.0));
+        assert_eq!(power.battery_percent, Some(73.0));
+        assert_eq!(power.battery_status.as_deref(), Some("Discharging"));
+        assert_eq!(power.adapter_online, None);
+        assert_eq!(power.detail, None);
+    }
+}
+
+#[test]
+fn power_supply_direct_signed_wattage_wins_and_refreshes_each_sample() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    battery(dir.path());
+    write(dir.path(), "sys/class/power_supply/ADP1/type", "Mains\n");
+    write(dir.path(), "sys/class/power_supply/ADP1/online", "1\n");
+    write(
+        dir.path(),
+        "sys/class/power_supply/BAT0/current_now",
+        "2000000",
+    );
+    write(
+        dir.path(),
+        "sys/class/power_supply/BAT0/voltage_now",
+        "12000000",
+    );
+    let mut sampler = devices::Sampler::default();
+    for (at, raw, watts) in [
+        (1_000_000, "-18500000", 18.5),
+        (1_015_000, "25000000", 25.0),
+    ] {
+        write(dir.path(), "sys/class/power_supply/BAT0/power_now", raw);
+        let power = sample(dir.path(), &mut sampler, at).power.unwrap();
+        assert_eq!(power.battery_power_w, Some(watts));
+        assert_eq!(power.availability, devices::Availability::Available);
+        assert_eq!(power.observed_at_ms, at);
+        assert_eq!(power.adapter_online, Some(true));
+        assert_eq!(power.battery_status.as_deref(), Some("Discharging"));
+        assert_eq!(power.battery_percent, Some(73.0));
+    }
+}
+
+#[test]
+fn power_supply_absent_battery_is_unsupported_without_health_impact() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    for mains in [false, true] {
+        if mains {
+            write(dir.path(), "sys/class/power_supply/AC/type", "Mains\n");
+            write(dir.path(), "sys/class/power_supply/AC/online", "1\n");
+        }
+        let mut host = sample(dir.path(), &mut devices::Sampler::default(), 1_000_000);
+        let power = host.power.as_ref().unwrap();
+        assert_eq!(power.availability, devices::Availability::Unsupported);
+        assert_eq!(power.detail.as_deref(), Some("no battery"));
+        assert_eq!(power.adapter_online, None);
+        assert_eq!(power.battery_status, None);
+        assert_eq!(power.battery_percent, None);
+        assert_eq!(power.battery_power_w, None);
+        let health = host.health.clone();
+        host.power = None;
+        assert_eq!(devices::assess(&host, 1_000_000), health);
+    }
+}
+
+#[test]
+fn power_supply_unreadable_directory_is_not_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    battery(dir.path());
+    let path = dir.path().join("sys/class/power_supply");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let denied = fs::read_dir(&path).is_err();
+    let host = sample(dir.path(), &mut devices::Sampler::default(), 1_000_000);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(denied, "permission test requires an unprivileged runner");
+    let power = host.power.unwrap();
+    assert_eq!(power.availability, devices::Availability::PermissionDenied);
+    assert!(power.detail.is_some());
+    assert_eq!(power.adapter_online, None);
+    assert_eq!(power.battery_status, None);
+    assert_eq!(power.battery_percent, None);
+    assert_eq!(power.battery_power_w, None);
+    fs::remove_dir_all(&path).unwrap();
+    fs::write(&path, "not a directory").unwrap();
+    let power = sample(dir.path(), &mut devices::Sampler::default(), 1_000_000)
+        .power
+        .unwrap();
+    assert_eq!(power.availability, devices::Availability::Error);
+    assert!(power.detail.is_some());
+}
+
 #[tokio::test]
 async fn fixture_api_keeps_nulls_partial_failure_and_history_bounds() {
     let directory = tempfile::tempdir().unwrap();

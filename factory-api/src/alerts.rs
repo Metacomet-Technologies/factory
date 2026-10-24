@@ -263,6 +263,7 @@ pub struct Engine {
     client: reqwest::Client,
     stored: Stored,
     pending_since: HashMap<String, i64>,
+    device_sample_ms: HashMap<String, i64>,
     failures: HashMap<String, u32>,
     fleet_seen_ms: i64,
     unavailable: BTreeSet<&'static str>,
@@ -695,6 +696,7 @@ impl Engine {
                 ..stored
             },
             pending_since: HashMap::new(),
+            device_sample_ms: HashMap::new(),
             failures: HashMap::new(),
             fleet_seen_ms: 0,
             unavailable: BTreeSet::new(),
@@ -938,6 +940,53 @@ impl Engine {
             self.pending_since.remove(&warn_key);
         }
     }
+    fn device_timed(
+        &mut self,
+        key: &str,
+        now: i64,
+        reading: Option<(i64, bool, bool)>,
+        timing: (i64, i64, i64),
+        severity: AlertSeverity,
+        summary: String,
+    ) -> Option<Verdict> {
+        let (fire_ms, clear_ms, stale_ms) = timing;
+        let open = self.alert_open(key);
+        let clear_key = format!("{key}:clear");
+        let Some((at, fire, clear)) =
+            reading.filter(|(at, _, _)| (0..=stale_ms).contains(&now.saturating_sub(*at)))
+        else {
+            self.pending_since.remove(key);
+            self.pending_since.remove(&clear_key);
+            self.device_sample_ms.remove(key);
+            return open.then_some(Verdict::Hold);
+        };
+        if let Some(previous) = self.device_sample_ms.insert(key.into(), at) {
+            if at < previous || at - previous > stale_ms {
+                self.pending_since.remove(key);
+                self.pending_since.remove(&clear_key);
+            } else if at == previous {
+                return open.then_some(Verdict::Hold);
+            }
+        }
+        if fire {
+            self.pending_since.remove(&clear_key);
+            if self.held(key, at, fire_ms) {
+                return Some(Verdict::Fire(severity, summary));
+            }
+        } else {
+            self.pending_since.remove(key);
+            if open && clear {
+                if self.held(&clear_key, at, clear_ms) {
+                    self.pending_since.remove(&clear_key);
+                    return None;
+                }
+            } else {
+                self.pending_since.remove(&clear_key);
+            }
+        }
+        open.then_some(Verdict::Hold)
+    }
+
     /// factory-gpu uses prefix `devices:` and no label, as in phase 1. A remote device
     /// uses `devices:{id}:` and names itself in each summary. `node_offline` defers
     /// its telemetry alert to the fleet node alert, which already covers that case.
@@ -996,6 +1045,73 @@ impl Engine {
             &CPU_BAND,
             &format!("{label}CPU temperature"),
         );
+        let heat = input
+            .fast_success_ms
+            .zip(input.cpu_temp_c.flatten())
+            .map(|(at, value)| (at, value >= 85.0, value < 80.0));
+        let power = input
+            .power
+            .as_ref()
+            .filter(|p| p.availability == crate::devices::Availability::Available);
+        let discharging = power.and_then(|p| match p.battery_status.as_deref() {
+            Some("Discharging") => Some(true),
+            Some("Charging" | "Full" | "Not charging") => Some(false),
+            _ => None,
+        });
+        let mains = power.zip(discharging).and_then(|(p, discharging)| {
+            // Adapter loss is not recovery while the battery is still discharging.
+            if !discharging {
+                Some((p.observed_at_ms, false, true))
+            } else {
+                p.adapter_online
+                    .map(|online| (p.observed_at_ms, online, false))
+            }
+        });
+        let low = power.and_then(|p| {
+            if discharging == Some(false)
+                || p.battery_percent.is_some_and(|percent| percent >= 35.0)
+            {
+                Some((p.observed_at_ms, false, true))
+            } else if discharging == Some(true) {
+                p.battery_percent
+                    .map(|percent| (p.observed_at_ms, percent < 30.0, false))
+            } else {
+                None
+            }
+        });
+        for (suffix, reading, timing, severity, summary) in [
+            (
+                "cpu:temperature:sustained",
+                heat,
+                (15 * 60_000, 5 * 60_000, DEVICE_STALE_MS),
+                AlertSeverity::Critical,
+                format!("{label}CPU temperature at or above 85 C for 15 min"),
+            ),
+            (
+                "power:discharging-on-mains",
+                mains,
+                (
+                    10 * 60_000,
+                    5 * 60_000,
+                    crate::devices_ingest::REMOTE_STALE_MS,
+                ),
+                AlertSeverity::Warning,
+                format!("{label}battery discharging on mains for 10 min"),
+            ),
+            (
+                "power:battery-low",
+                low,
+                (0, 0, crate::devices_ingest::REMOTE_STALE_MS),
+                AlertSeverity::Critical,
+                format!("{label}battery below 30% while discharging"),
+            ),
+        ] {
+            let key = format!("{prefix}{suffix}");
+            if let Some(verdict) = self.device_timed(&key, now, reading, timing, severity, summary)
+            {
+                out.insert(key, verdict);
+            }
+        }
         let fs_prefix = format!("{prefix}fs:");
         match &input.filesystems {
             None => {
@@ -1848,15 +1964,6 @@ impl AppState {
         );
         let ups = Some(self.ups_latest.read().await.clone());
         let gpu = *self.gpu_latest.lock().expect("GPU sample lock");
-        let devices = Some(
-            self.devices_latest
-                .read()
-                .await
-                .clone()
-                .unwrap_or_else(|| crate::devices::unavailable(now))
-                .alert_input(now),
-        );
-        let remote_devices = self.remote_alert_inputs(now).await;
         Signals {
             fleet: (fleet.generated_at_ms != 0).then_some(fleet),
             fleet_discovered: self.fleet_discovered.load(Ordering::Acquire),
@@ -1869,10 +1976,9 @@ impl AppState {
             usage,
             ups,
             ups_events: vec![],
-            devices,
-            remote_devices,
             network,
             retention: vec![("api", Some(self.retention())), ("meter", meter_retention)],
+            ..Signals::default()
         }
     }
     pub(crate) fn start_alerts(&self) -> Option<tokio::task::JoinHandle<()>> {
@@ -1884,7 +1990,7 @@ impl AppState {
             .take()?;
         let mut state = self.clone();
         Some(tokio::spawn(async move {
-            // UPS follows its 10s collector; other source reads keep their 30s cadence.
+            // UPS and device snapshots refresh each tick; other sources keep their 30s cadence.
             let ups_interval = Duration::from_secs(10);
             let mut timer =
                 tokio::time::interval_at(tokio::time::Instant::now() + ups_interval, ups_interval);
@@ -1934,7 +2040,18 @@ impl AppState {
                             }
                         }
                     }
-                    engine.tick(now_ms(), &signals).await;
+                    let now = now_ms();
+                    signals.devices = Some(
+                        state
+                            .devices_latest
+                            .read()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| crate::devices::unavailable(now))
+                            .alert_input(now),
+                    );
+                    signals.remote_devices = state.remote_alert_inputs(now).await;
+                    engine.tick(now, &signals).await;
                     *state.alerts.view.write().await = engine.view();
                 };
                 // Shutdown (and main's abort) may drop `work` mid-post: every acknowledged
@@ -3522,6 +3639,426 @@ mod tests {
         );
     }
 
+    fn console_power_signals(at: i64, temperature: f64, status: &str, percent: f64) -> Signals {
+        use crate::devices::{Availability, DeviceAlertInput, Power};
+        Signals {
+            devices: Some(DeviceAlertInput::default()),
+            remote_devices: vec![(
+                "factory-console".into(),
+                DeviceAlertInput {
+                    fast_success_ms: Some(at),
+                    cpu_temp_c: Some(Some(temperature)),
+                    power: Some(Power {
+                        availability: Availability::Available,
+                        observed_at_ms: at,
+                        adapter_online: Some(true),
+                        battery_status: Some(status.into()),
+                        battery_percent: Some(percent),
+                        battery_power_w: Some(26.6),
+                        detail: None,
+                    }),
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        }
+    }
+
+    fn console_alert(engine: &Engine, suffix: &str) -> bool {
+        let view = engine.view();
+        let alert = view
+            .active
+            .iter()
+            .find(|alert| alert.key == format!("devices:factory-console:{suffix}"));
+        if let Some(alert) = alert {
+            assert_eq!(
+                alert.severity,
+                if suffix == "power:discharging-on-mains" {
+                    AlertSeverity::Warning
+                } else {
+                    AlertSeverity::Critical
+                }
+            );
+        }
+        alert.is_some()
+    }
+
+    fn console_samples(
+        engine: &mut Engine,
+        steps: std::ops::RangeInclusive<i64>,
+        temperature: f64,
+        status: &str,
+        percent: f64,
+    ) {
+        for step in steps {
+            let at = T0 + step * 30_000;
+            engine.evaluate(at, &console_power_signals(at, temperature, status, percent));
+        }
+    }
+
+    #[test]
+    fn sustained_heat_fires_at_fifteen_not_fourteen_minutes() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=28, 85.0, "Charging", 80.0);
+        assert!(!console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 29..=30, 85.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "cpu:temperature:sustained"));
+    }
+
+    #[test]
+    fn sustained_heat_eighty_four_restarts_count_at_minute_ten() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=19, 90.0, "Charging", 80.0);
+        console_samples(&mut engine, 20..=20, 84.0, "Charging", 80.0);
+        console_samples(&mut engine, 21..=50, 90.0, "Charging", 80.0);
+        assert!(!console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 51..=51, 90.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "cpu:temperature:sustained"));
+    }
+
+    #[test]
+    fn sustained_heat_clears_after_five_minutes_below_eighty() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=30, 85.0, "Charging", 80.0);
+        console_samples(&mut engine, 31..=42, 82.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 43..=51, 79.9, "Charging", 80.0);
+        assert!(console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 52..=53, 79.9, "Charging", 80.0);
+        assert!(!console_alert(&engine, "cpu:temperature:sustained"));
+    }
+
+    #[test]
+    fn sustained_heat_stale_gap_restarts_fire_and_clear() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=20, 90.0, "Charging", 80.0);
+        console_samples(&mut engine, 25..=54, 90.0, "Charging", 80.0);
+        assert!(!console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 55..=55, 90.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 56..=64, 70.0, "Charging", 80.0);
+        console_samples(&mut engine, 69..=78, 70.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 79..=79, 70.0, "Charging", 80.0);
+        assert!(!console_alert(&engine, "cpu:temperature:sustained"));
+    }
+
+    #[test]
+    fn discharging_on_mains_fires_at_ten_not_nine_minutes() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=18, 70.0, "Discharging", 80.0);
+        assert!(!console_alert(&engine, "power:discharging-on-mains"));
+        console_samples(&mut engine, 19..=20, 70.0, "Discharging", 80.0);
+        assert!(console_alert(&engine, "power:discharging-on-mains"));
+    }
+
+    #[test]
+    fn discharging_on_mains_clears_after_five_minutes_not_discharging() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=20, 70.0, "Discharging", 80.0);
+        console_samples(&mut engine, 21..=29, 70.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "power:discharging-on-mains"));
+        console_samples(&mut engine, 30..=31, 70.0, "Charging", 80.0);
+        assert!(!console_alert(&engine, "power:discharging-on-mains"));
+    }
+
+    #[test]
+    fn discharging_on_mains_stale_gap_restarts_fire_and_clear() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=18, 70.0, "Discharging", 80.0);
+        console_samples(&mut engine, 21..=40, 70.0, "Discharging", 80.0);
+        assert!(!console_alert(&engine, "power:discharging-on-mains"));
+        console_samples(&mut engine, 41..=41, 70.0, "Discharging", 80.0);
+        assert!(console_alert(&engine, "power:discharging-on-mains"));
+        console_samples(&mut engine, 42..=50, 70.0, "Charging", 80.0);
+        console_samples(&mut engine, 53..=62, 70.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "power:discharging-on-mains"));
+        console_samples(&mut engine, 63..=63, 70.0, "Charging", 80.0);
+        assert!(!console_alert(&engine, "power:discharging-on-mains"));
+    }
+
+    #[test]
+    fn battery_low_fires_below_thirty_and_clears_at_thirty_five() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=0, 70.0, "Discharging", 30.0);
+        assert!(!console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 1..=1, 70.0, "Discharging", 29.9);
+        assert!(console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 2..=2, 70.0, "Discharging", 34.9);
+        assert!(console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 3..=3, 70.0, "Discharging", 35.0);
+        assert!(!console_alert(&engine, "power:battery-low"));
+    }
+
+    #[test]
+    fn battery_low_requires_discharging_and_clears_when_charging() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=0, 70.0, "Charging", 25.0);
+        assert!(!console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 1..=1, 70.0, "Discharging", 25.0);
+        assert!(console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 2..=2, 70.0, "Charging", 25.0);
+        assert!(!console_alert(&engine, "power:battery-low"));
+    }
+
+    #[test]
+    fn battery_low_stale_gap_neither_fires_nor_clears() {
+        let mut engine = Engine::load(Config::default());
+        let stale = console_power_signals(T0, 70.0, "Discharging", 25.0);
+        engine.evaluate(T0 + 60_000, &stale);
+        assert!(!console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 3..=3, 70.0, "Discharging", 25.0);
+        assert!(console_alert(&engine, "power:battery-low"));
+        let stale = console_power_signals(T0 + 3 * 30_000, 70.0, "Charging", 40.0);
+        engine.evaluate(T0 + 5 * 30_000, &stale);
+        assert!(console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 6..=6, 70.0, "Charging", 40.0);
+        assert!(!console_alert(&engine, "power:battery-low"));
+    }
+
+    #[test]
+    fn console_heat_and_power_thresholds_and_recovery() {
+        let mut engine = Engine::load(Config::default());
+        let heat = "cpu:temperature:sustained";
+        let mains = "power:discharging-on-mains";
+        let low = "power:battery-low";
+        for step in -31..0 {
+            let at = T0 + step * 30_000;
+            let mut signals = console_power_signals(at, 84.9, "Discharging", 50.0);
+            signals.remote_devices[0]
+                .1
+                .power
+                .as_mut()
+                .unwrap()
+                .adapter_online = Some(false);
+            engine.evaluate(at, &signals);
+            assert!(!console_alert(&engine, heat));
+            assert!(!console_alert(&engine, mains));
+        }
+        engine.evaluate(T0, &console_power_signals(T0, 85.0, "Discharging", 30.0));
+        assert!(!console_alert(&engine, low));
+        for step in 1..=30 {
+            let at = T0 + step * 30_000;
+            engine.evaluate(at, &console_power_signals(at, 85.0, "Discharging", 29.9));
+            assert_eq!(console_alert(&engine, heat), step >= 30, "heat step {step}");
+            assert_eq!(
+                console_alert(&engine, mains),
+                step >= 20,
+                "mains step {step}"
+            );
+            assert!(console_alert(&engine, low));
+        }
+        // Neither the heat dead band nor losing mains while discharging is recovery.
+        for step in 31..=41 {
+            let at = T0 + step * 30_000;
+            let mut signals = console_power_signals(at, 80.0, "Discharging", 34.9);
+            signals.remote_devices[0]
+                .1
+                .power
+                .as_mut()
+                .unwrap()
+                .adapter_online = Some(false);
+            engine.evaluate(at, &signals);
+            assert!(console_alert(&engine, heat));
+            assert!(console_alert(&engine, mains));
+            assert!(console_alert(&engine, low));
+        }
+        let at = T0 + 42 * 30_000;
+        engine.evaluate(at, &console_power_signals(at, 79.9, "Discharging", 35.0));
+        assert!(!console_alert(&engine, low));
+        for step in 43..=53 {
+            let at = T0 + step * 30_000;
+            engine.evaluate(at, &console_power_signals(at, 79.9, "Charging", 25.0));
+            assert_eq!(console_alert(&engine, heat), step < 52);
+            assert_eq!(console_alert(&engine, mains), step < 53);
+            assert!(!console_alert(&engine, low));
+        }
+    }
+
+    #[test]
+    fn console_stale_and_unsupported_samples_reset_fire_and_clear_timers() {
+        for unavailable in [
+            crate::devices::Availability::Stale,
+            crate::devices::Availability::Unsupported,
+        ] {
+            let mut engine = Engine::load(Config::default());
+            for step in 0..=18 {
+                let at = T0 + step * 30_000;
+                engine.evaluate(at, &console_power_signals(at, 90.0, "Discharging", 25.0));
+            }
+            let at = T0 + 19 * 30_000;
+            let mut gap = console_power_signals(at, 90.0, "Charging", 90.0);
+            gap.remote_devices[0].1.cpu_temp_c = Some(None);
+            gap.remote_devices[0].1.power.as_mut().unwrap().availability = unavailable;
+            engine.evaluate(at, &gap);
+            assert!(console_alert(&engine, "power:battery-low"));
+            for step in 20..=50 {
+                let at = T0 + step * 30_000;
+                engine.evaluate(at, &console_power_signals(at, 90.0, "Discharging", 25.0));
+                assert_eq!(
+                    console_alert(&engine, "power:discharging-on-mains"),
+                    step >= 40
+                );
+                assert_eq!(
+                    console_alert(&engine, "cpu:temperature:sustained"),
+                    step >= 50
+                );
+            }
+            for step in 51..=59 {
+                let at = T0 + step * 30_000;
+                engine.evaluate(at, &console_power_signals(at, 79.0, "Charging", 25.0));
+            }
+            // No evaluation during a long sample gap must also restart recovery.
+            for step in 64..=74 {
+                let at = T0 + step * 30_000;
+                engine.evaluate(at, &console_power_signals(at, 79.0, "Charging", 25.0));
+                assert_eq!(
+                    console_alert(&engine, "cpu:temperature:sustained"),
+                    step < 74
+                );
+                assert_eq!(
+                    console_alert(&engine, "power:discharging-on-mains"),
+                    step < 74
+                );
+            }
+        }
+        let mut engine = Engine::load(Config::default());
+        let frozen = console_power_signals(T0, 90.0, "Discharging", 50.0);
+        for step in 0..=30 {
+            engine.evaluate(T0 + step * 30_000, &frozen);
+        }
+        assert!(!console_alert(&engine, "cpu:temperature:sustained"));
+        assert!(!console_alert(&engine, "power:discharging-on-mains"));
+    }
+
+    #[tokio::test]
+    async fn battery_low_background_loop_uses_latest_snapshot_between_collections() {
+        let dir = tempfile::tempdir().unwrap();
+        pricing::migrate(dir.path().join("pricing.db")).unwrap();
+        let mut state = AppState::new(
+            "http://127.0.0.1:1".into(),
+            dir.path().join("requests.db"),
+            dir.path().join("pricing.db"),
+            fleet::Config { nodes: vec![] },
+        )
+        .await
+        .unwrap();
+        state.backup_status = dir.path().join("backup.json");
+        state.usage_snapshot = dir.path().join("usage.json");
+        state.remote = Arc::new(crate::devices_ingest::Registry::new(
+            crate::device_auth::Tokens::new(dir.path().join("device-tokens")),
+        ));
+        let task = state.start_alerts().unwrap();
+        for (status, percent, expected) in [("Discharging", 25.0, true), ("Charging", 40.0, false)]
+        {
+            let now = now_ms();
+            let mut view = crate::devices::unavailable(now);
+            view.device.collector.fast_ok = true;
+            view.device.collector.last_fast_ms = Some(now);
+            view.device.power = console_power_signals(now, 70.0, status, percent)
+                .remote_devices
+                .remove(0)
+                .1
+                .power;
+            *state.devices_latest.write().await = Some(view);
+            state.ups_changed.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let alerts = state.alerts.view.read().await;
+                    let low = alerts
+                        .active
+                        .iter()
+                        .find(|alert| alert.key == "devices:power:battery-low");
+                    if let Some(alert) = low {
+                        assert_eq!(alert.severity, AlertSeverity::Critical);
+                    }
+                    if low.is_some() == expected {
+                        break;
+                    }
+                    drop(alerts);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            if result.is_err() {
+                task.abort();
+            }
+            assert!(
+                result.is_ok(),
+                "battery-low did not update before the next 30s collection"
+            );
+        }
+        state.shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn console_alerts_deliver_once_and_survive_restart() {
+        let (slack, url) = fake_slack().await;
+        let directory = tempfile::tempdir().unwrap();
+        let cfg = config(&url, Some(directory.path().join("alerts.json")), true);
+        let mut engine = Engine::load(cfg.clone());
+        for step in 0..=30 {
+            let at = T0 + step * 30_000;
+            engine
+                .tick(at, &console_power_signals(at, 90.0, "Discharging", 25.0))
+                .await;
+        }
+        for summary in [
+            "CPU temperature at or above 85 C",
+            "battery discharging on mains",
+            "battery below 30%",
+        ] {
+            assert_eq!(
+                slack
+                    .posts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|post| post.to_string().contains(summary))
+                    .count(),
+                1
+            );
+        }
+        let posts = slack.posts.lock().unwrap().len();
+        let mut engine = Engine::load(cfg);
+        engine
+            .tick(
+                T0 + 31 * 30_000,
+                &console_power_signals(T0 + 31 * 30_000, 90.0, "Discharging", 25.0),
+            )
+            .await;
+        assert_eq!(slack.posts.lock().unwrap().len(), posts);
+        for step in 32..=42 {
+            let at = T0 + step * 30_000;
+            engine
+                .tick(at, &console_power_signals(at, 70.0, "Full", 100.0))
+                .await;
+        }
+        for suffix in [
+            "cpu:temperature:sustained",
+            "power:discharging-on-mains",
+            "power:battery-low",
+        ] {
+            assert!(!console_alert(&engine, suffix));
+            assert!(
+                engine
+                    .view()
+                    .recent
+                    .iter()
+                    .any(|a| a.key == format!("devices:factory-console:{suffix}"))
+            );
+        }
+        assert!(
+            slack
+                .posts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|post| post.get("thread_ts").is_some())
+        );
+    }
+
     #[test]
     fn remote_device_alerts_are_per_device_and_defer_to_the_node_alert() {
         use crate::devices::{DeviceAlertInput, FsPressure};
@@ -3542,6 +4079,7 @@ mod tests {
             }]),
             smart: Some(vec![]),
             unsafe_shutdowns: BTreeMap::new(),
+            ..Default::default()
         };
         let signals = |gpu: DeviceAlertInput,
                        console: DeviceAlertInput,
@@ -3673,6 +4211,7 @@ mod tests {
             filesystems,
             smart,
             unsafe_shutdowns: BTreeMap::new(),
+            ..Default::default()
         };
         let quiet_fs = Some(vec![FsPressure {
             id: "root".into(),

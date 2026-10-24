@@ -4,7 +4,7 @@
 use crate::devices::{
     self, Availability, BackupView, ClockView, CollectorHealth, Cooling, Cpu, DeviceView, DiskIo,
     Drive, Filesystem, HealthReport, HealthStatus, HostIdentity, HostSnapshot, IngestView,
-    Maintenance, Metric, NamedMetric, Network, Ram, RebootView, SmartStatus, UpsSummary,
+    Maintenance, Metric, NamedMetric, Network, Power, Ram, RebootView, SmartStatus, UpsSummary,
 };
 use axum::http::StatusCode;
 use serde::Serialize;
@@ -213,6 +213,55 @@ struct Reader {
 }
 
 impl Reader {
+    fn power(&self, root: &Map<String, Value>) -> Result<Option<Power>, Rejection> {
+        let Some(value) = root.get("power").filter(|v| !v.is_null()) else {
+            return Ok(None);
+        };
+        let power = object(value, "power")?;
+        let get = |key: &str| field(power, "power", key);
+        let availability = availability(get("availability")?, "power.availability")?;
+        let observed_at_ms = self.not_newer(
+            integer(get("observed_at_ms")?, "power.observed_at_ms")?,
+            "power",
+        )?;
+        null_unless_available(
+            availability == Availability::Available,
+            &[
+                ("adapter_online", get("adapter_online")?),
+                ("battery_status", get("battery_status")?),
+                ("battery_percent", get("battery_percent")?),
+                ("battery_power_w", get("battery_power_w")?),
+            ],
+            "power",
+        )?;
+        let number = |key: &str, max: f64| -> Result<Option<f64>, Rejection> {
+            let value = get(key)?;
+            if value.is_null() {
+                return Ok(None);
+            }
+            value
+                .as_f64()
+                .filter(|n| n.is_finite() && (0.0..=max).contains(n))
+                .map(Some)
+                .ok_or_else(|| {
+                    bad(
+                        "invalid_field",
+                        &join("power", key),
+                        "power value outside range",
+                    )
+                })
+        };
+        Ok(Some(Power {
+            availability,
+            observed_at_ms,
+            adapter_online: opt_boolean(get("adapter_online")?, "power.adapter_online")?,
+            battery_status: opt_text(get("battery_status")?, "power.battery_status", 64)?,
+            battery_percent: number("battery_percent", 100.0)?,
+            battery_power_w: number("battery_power_w", 1000.0)?,
+            detail: opt_text(get("detail")?, "power.detail", MAX_TEXT)?,
+        }))
+    }
+
     fn not_newer(&self, at: i64, path: &str) -> Result<i64, Rejection> {
         if at > self.sample_at {
             let name = join(path, "observed_at_ms");
@@ -822,6 +871,7 @@ pub fn parse(body: &[u8], path_id: &str, received_at_ms: i64) -> Result<Sample, 
         disk_io,
         network,
         cooling,
+        power: reader.power(root)?,
         maintenance: Maintenance {
             services: vec![],
             backup,
@@ -929,6 +979,8 @@ pub struct DeviceSampleV1 {
     pub disk_io: DiskIo,
     pub network: Network,
     pub cooling: Cooling,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<Power>,
     pub maintenance: SampleMaintenance,
     pub collector: CollectorHealth,
 }
@@ -1277,6 +1329,98 @@ mod tests {
     fn rejected(body: &[u8]) -> (&'static str, Option<String>) {
         let error = parse(body, "factory-console", AT).unwrap_err();
         (error.code, error.field)
+    }
+
+    #[test]
+    fn optional_power_is_validated_and_preserved() {
+        assert!(
+            parse(
+                &edit(COMPLETE, |v| {
+                    v.as_object_mut().unwrap().remove("power");
+                }),
+                "factory-console",
+                AT
+            )
+            .unwrap()
+            .host
+            .power
+            .is_none()
+        );
+        assert!(
+            parse(
+                &edit(COMPLETE, |v| v["power"] = Value::Null),
+                "factory-console",
+                AT
+            )
+            .unwrap()
+            .host
+            .power
+            .is_none()
+        );
+        let body = edit(COMPLETE, |v| {
+            v["power"] = serde_json::json!({
+                "availability": "available", "observed_at_ms": v["observed_at_ms"],
+                "adapter_online": true, "battery_status": "Discharging",
+                "battery_percent": 25, "battery_power_w": 26.6, "detail": null
+            });
+        });
+        let sample = parse(&body, "factory-console", AT).unwrap();
+        let power = sample.host.power.as_ref().unwrap();
+        assert_eq!(power.adapter_online, Some(true));
+        assert_eq!(power.battery_status.as_deref(), Some("Discharging"));
+        assert_eq!(power.battery_percent, Some(25.0));
+        assert_eq!(power.battery_power_w, Some(26.6));
+        let original: Value = serde_json::from_slice(&body).unwrap();
+        for (key, bad_value) in [
+            ("battery_percent", serde_json::json!(-1)),
+            ("battery_percent", serde_json::json!(101)),
+            ("battery_percent", serde_json::json!("25")),
+            ("battery_power_w", serde_json::json!(-2)),
+            ("battery_power_w", serde_json::json!(1001)),
+            ("adapter_online", serde_json::json!(1)),
+            ("battery_status", serde_json::json!("x".repeat(65))),
+            ("detail", serde_json::json!("x".repeat(257))),
+            ("observed_at_ms", serde_json::json!(AT + 1)),
+            ("availability", serde_json::json!("unsupported")),
+        ] {
+            let mut invalid = original.clone();
+            invalid["power"][key] = bad_value;
+            assert!(
+                parse(
+                    &serde_json::to_vec(&invalid).unwrap(),
+                    "factory-console",
+                    AT
+                )
+                .is_err(),
+                "{key}"
+            );
+        }
+        let at = sample.observed_at_ms;
+        let mut view = DeviceView {
+            generated_at_ms: at,
+            warnings: vec![],
+            device: sample.host,
+            maintenance: None,
+            ingest: Some(
+                Remote {
+                    received_at_ms: Some(at),
+                    ..Default::default()
+                }
+                .ingest_view(),
+            ),
+        };
+        assert!(view.alert_input(at).power.is_some());
+        assert!(view.alert_input(at + REMOTE_STALE_MS + 1).power.is_none());
+        let stale =
+            devices::freshen_within(&view, at + REMOTE_STALE_MS + 1, REMOTE_STALE_MS, Some(at));
+        let power = stale.device.power.unwrap();
+        assert_eq!(power.availability, Availability::Stale);
+        assert_eq!(power.battery_percent, None);
+        // Current envelopes must not make cached readings current again.
+        view.device.observed_at_ms = at + 60_000;
+        view.device.collector.last_fast_ms = Some(at + 60_000);
+        view.ingest.as_mut().unwrap().last_received_at_ms = Some(at + 60_000);
+        assert!(view.alert_input(at + 60_000).power.is_none());
     }
 
     #[test]

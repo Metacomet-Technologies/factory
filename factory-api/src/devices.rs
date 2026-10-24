@@ -187,6 +187,17 @@ pub struct Cooling {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct Power {
+    pub availability: Availability,
+    pub observed_at_ms: i64,
+    pub adapter_online: Option<bool>,
+    pub battery_status: Option<String>,
+    pub battery_percent: Option<f64>,
+    pub battery_power_w: Option<f64>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct BackupView {
     pub availability: Availability,
     pub last_success_ms: Option<i64>,
@@ -260,6 +271,8 @@ pub struct HostSnapshot {
     pub disk_io: DiskIo,
     pub network: Network,
     pub cooling: Cooling,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<Power>,
     pub maintenance: Maintenance,
     pub collector: CollectorHealth,
     pub health: HealthReport,
@@ -409,6 +422,7 @@ pub struct DeviceAlertInput {
     pub fast_success_ms: Option<i64>,
     /// None: unreadable, hold. Some(None): sensor unsupported. Some(Some): celsius.
     pub cpu_temp_c: Option<Option<f64>>,
+    pub power: Option<Power>,
     pub filesystems: Option<Vec<FsPressure>>,
     pub smart: Option<Vec<SmartPressure>>,
     pub unsafe_shutdowns: BTreeMap<String, u64>,
@@ -681,6 +695,7 @@ pub fn unavailable(now: i64) -> DeviceView {
             temperatures_availability: Availability::Unsupported,
             fans_availability: Availability::Unsupported,
         },
+        power: None,
         maintenance: Maintenance {
             services: vec![],
             backup: BackupView {
@@ -789,6 +804,16 @@ pub fn freshen_within(
         mark_stale(&mut copy.device.network.rx, detail.clone());
         mark_stale(&mut copy.device.network.tx, detail);
     }
+    if let Some(power) = &mut copy.device.power
+        && power.availability == Availability::Available
+        && (now.saturating_sub(power.observed_at_ms) > stale_ms || quiet.is_some())
+    {
+        power.availability = Availability::Stale;
+        power.adapter_online = None;
+        power.battery_status = None;
+        power.battery_percent = None;
+        power.battery_power_w = None;
+    }
     if copy.collector_slow_age(now) > SLOW_INTERVAL_MS * 2 {
         let detail = "slow inventory is older than twice its interval".to_string();
         mark_stale(&mut copy.device.cpu.temperature, detail.clone());
@@ -830,6 +855,18 @@ impl DeviceView {
                 .collector
                 .last_fast_ms
                 .is_some_and(|at| now.saturating_sub(at) <= 120_000);
+        let fresh_ms = if self.ingest.is_some() {
+            crate::devices_ingest::REMOTE_STALE_MS
+        } else {
+            FAST_INTERVAL_MS * 2
+        };
+        let current = |at| (0..=fresh_ms).contains(&now.saturating_sub(at));
+        let sample_fresh = fast_fresh
+            && current(self.device.observed_at_ms)
+            && self
+                .ingest
+                .as_ref()
+                .is_none_or(|ingest| ingest.last_received_at_ms.is_some_and(current));
         let cpu_temp_c = if !fast_fresh
             && self.device.cpu.temperature.availability != Availability::Unsupported
         {
@@ -890,6 +927,12 @@ impl DeviceView {
                 .then_some(self.device.collector.last_fast_ms)
                 .flatten(),
             cpu_temp_c,
+            power: self
+                .device
+                .power
+                .as_ref()
+                .filter(|power| sample_fresh && current(power.observed_at_ms))
+                .cloned(),
             filesystems,
             smart,
             unsafe_shutdowns: self
@@ -1697,6 +1740,18 @@ fn sensor_group(
             }
         }
     }
+    let applesmc = child_path(root, "sys/bus/acpi/devices/APP0001:00/physical_node");
+    if applesmc.exists() {
+        for index in 1..=8 {
+            let name = format!("applesmc fan{index}");
+            if !fans.iter().any(|fan| fan.name == name)
+                && let Some(raw) = sys_string(&applesmc.join(format!("fan{index}_input")), timeout)
+            {
+                fans.push(named_count(&name, &raw, "rpm", at));
+                fan_availability = Availability::Available;
+            }
+        }
+    }
     if let Ok(zones) = read_dir_names(&thermal) {
         for zone in zones
             .into_iter()
@@ -1828,6 +1883,100 @@ fn load_slow(root: &Path, at: i64, timeout: Duration) -> Slow {
         cpu_temp,
         maintenance: load_maintenance(root, at, timeout),
     }
+}
+
+fn load_power(root: &Path, at: i64, timeout: Duration) -> Power {
+    let mut power = Power {
+        availability: Availability::Unsupported,
+        observed_at_ms: at,
+        adapter_online: None,
+        battery_status: None,
+        battery_percent: None,
+        battery_power_w: None,
+        detail: Some("no battery".into()),
+    };
+    let directory = child_path(root, "sys/class/power_supply");
+    let supplies = match read_dir_names(&directory) {
+        Ok(supplies) => supplies,
+        Err(ProbeError::Missing) => return power,
+        Err(error) => {
+            power.availability = availability_of(&error);
+            power.detail = Some(detail_of(&error));
+            return power;
+        }
+    };
+    let mut battery = None;
+    let mut mains = Vec::new();
+    for supply in supplies {
+        let path = directory.join(supply);
+        match read_text(&path.join("type"), timeout) {
+            Ok(kind) => match kind.trim() {
+                "Battery" if battery.is_none() => battery = Some(path),
+                "Mains" => mains.push(path),
+                _ => {}
+            },
+            Err(error) => {
+                power.availability = availability_of(&error);
+                power.detail = Some(detail_of(&error));
+            }
+        }
+    }
+    let Some(battery) = battery else {
+        return power;
+    };
+    let mut online = (!mains.is_empty()).then_some(false);
+    for path in mains {
+        match sys_string(&path.join("online"), timeout).as_deref() {
+            Some("1") => {
+                online = Some(true);
+                break;
+            }
+            Some("0") => {}
+            _ => online = None,
+        }
+    }
+    let number = |name: &str| -> Result<f64, ProbeError> {
+        read_text(&battery.join(name), timeout)?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .ok_or(ProbeError::Malformed)
+    };
+    let status = read_text(&battery.join("status"), timeout).and_then(|text| match text.trim() {
+        status @ ("Charging" | "Discharging" | "Not charging" | "Full" | "Unknown") => {
+            Ok(status.to_string())
+        }
+        _ => Err(ProbeError::Malformed),
+    });
+    let percent = number("capacity").and_then(|n| {
+        if (0.0..=100.0).contains(&n) {
+            Ok(n)
+        } else {
+            Err(ProbeError::Malformed)
+        }
+    });
+    let (status, percent) = match (status, percent) {
+        (Ok(status), Ok(percent)) => (status, percent),
+        (Err(error), _) | (_, Err(error)) => {
+            power.availability = availability_of(&error);
+            power.detail = Some(detail_of(&error));
+            return power;
+        }
+    };
+    power.battery_power_w = number("power_now")
+        .map(|n| n.abs() / 1e6)
+        .or_else(|_| {
+            Ok::<_, ProbeError>((number("current_now")? * number("voltage_now")?).abs() / 1e12)
+        })
+        .ok()
+        .filter(|n: &f64| n.is_finite() && (0.0..=1000.0).contains(n));
+    power.availability = Availability::Available;
+    power.adapter_online = online;
+    power.battery_status = Some(status);
+    power.battery_percent = Some(percent);
+    power.detail = None;
+    power
 }
 
 fn load_maintenance(root: &Path, at: i64, timeout: Duration) -> NodeMaintenance {
@@ -2321,6 +2470,7 @@ pub fn sample_timeout(
             tx: net_tx,
         },
         cooling: slow.cooling.clone(),
+        power: Some(load_power(root, at, timeout)),
         maintenance: Maintenance {
             services: inputs.services.clone(),
             backup,
