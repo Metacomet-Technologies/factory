@@ -202,7 +202,11 @@ export default async function (amp: PluginAPI) {
 				return
 			}
 			const entry = await evaluate(hctx, state, source, identifier, event.receivedAt)
-			if (entry.stage === 'failed') throw new Error(entry.error)
+			if (entry.stage === 'failed') {
+				// A redelivery of a failed event is evaluated again.
+				seen.delete(event.id)
+				throw new Error(entry.error)
+			}
 		}
 		for (const key of ['linear', 'github', 'slack'] as const) {
 			const { url } = await amp.createWebhook({ key, headers: ['x-hub-signature-256', 'linear-signature', 'x-slack-signature'], handler: handle(key) })
@@ -217,9 +221,20 @@ export default async function (amp: PluginAPI) {
 	// One evaluation of one issue: derive, decide, act (or dry-run). A role thread's end raises
 	// no event here (its agent.end runs in its own orb), and a reviewer's verdict changes neither
 	// Linear nor the PR head, so after a spawn, and while the owner is still running, the issue
-	// is re-evaluated after a delay until the owner is idle. One pending re-check per issue.
+	// is re-evaluated after a delay until the owner is idle. A failed evaluation may change
+	// nothing that raises another event (a Bug lookup failing before the status change), so it is
+	// re-evaluated too, with backoff, up to `failureRechecks` times. One pending re-check per issue.
 	const recheckMs = 90_000
+	const failureRechecks = 5
 	const rechecks = new Map<string, ReturnType<typeof setTimeout>>()
+	const failures = new Map<string, number>()
+	const recheck = (ctx: EvalContext, state: ArmState, identifier: string, delayMs: number) => {
+		if (rechecks.has(identifier)) return
+		rechecks.set(identifier, setTimeout(() => {
+			rechecks.delete(identifier)
+			void evaluate(ctx, state, 'recheck', identifier, new Date().toISOString())
+		}, delayMs))
+	}
 	// Linear sends several webhooks for one change and `find_thread` indexes a new thread with a
 	// lag, so evaluations of one issue run one at a time and remember the threads they spawned
 	// until the index returns them; otherwise two events seconds apart spawn two role threads.
@@ -241,12 +256,7 @@ export default async function (amp: PluginAPI) {
 			entry.status = issue.status
 			entry.action = action
 			const ownerBusy = action.kind === 'spawn' || (action.kind === 'wait' && action.reason.endsWith('running'))
-			if (ownerBusy && !rechecks.has(identifier)) {
-				rechecks.set(identifier, setTimeout(() => {
-					rechecks.delete(identifier)
-					void evaluate(ctx, state, 'recheck', identifier, new Date().toISOString())
-				}, recheckMs))
-			}
+			if (ownerBusy) recheck(ctx, state, identifier, recheckMs)
 			if (!(await ctx.thread.labels()).includes(performLabel)) {
 				ctx.logger.log(marker, 'dry run; add label', performLabel, 'to act')
 				entry.stage = 'dry-run'
@@ -254,10 +264,15 @@ export default async function (amp: PluginAPI) {
 			}
 			await perform(ctx, issue, action)
 			entry.stage = 'performed'
+			failures.delete(identifier)
 		} catch (error: unknown) {
 			entry.stage = 'failed'
 			entry.error = String(error)
 			ctx.logger.log(marker, source, 'evaluation failed', entry.error)
+			const count = (failures.get(identifier) ?? 0) + 1
+			failures.set(identifier, count)
+			if (count <= failureRechecks) recheck(ctx, state, identifier, recheckMs * 2 ** (count - 1))
+			else ctx.logger.log(marker, 'giving up rechecks after failures', identifier, count)
 		}
 		return entry
 	}

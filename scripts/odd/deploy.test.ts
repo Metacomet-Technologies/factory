@@ -1,11 +1,11 @@
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deployComponent, emptyLedger, issuesFromSubjects, main, parseSnapshot, pendingTags, plan, probeResult, receiptLine, recipes, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
 import { nextAction, parseDeployReceipt, type Action } from './lifecycle.ts';
-import { diagnose, page, setStatus } from '../../.amp/plugins/factory-odd.ts';
+import plugin, { diagnose, page, setStatus } from '../../.amp/plugins/factory-odd.ts';
 
 const sha = 'a'.repeat(40);
 const kiosk = recipes.find(recipe => recipe.name === 'kiosk')!;
@@ -345,6 +345,74 @@ for (const [what, receiptSha, failTool, spawnFails] of [['Bug lookup', 'c'.repea
     assert.ok(spawned[0].includes('MET-900'), spawned[0]);
   });
 }
+
+/** The registered plugin armed in a control thread, with fake Amp, Linear, GitHub and Slack. */
+async function controlPlane(options: { issue: string; receipt: string; failOnce: string }) {
+  const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+  const webhooks = new Map<string, (event: unknown, ctx: unknown) => Promise<void>>();
+  const calls: string[] = [];
+  const bugs: string[] = [];
+  let status = 'Deploying';
+  let failOnce: string | undefined = options.failOnce;
+  const tools = { call: async (name: string, input: Record<string, unknown>) => {
+    if (name === failOnce) { failOnce = undefined; calls.push(`${name} failed`); throw new Error(`${name}: HTTP 503`); }
+    switch (name) {
+      case 'linear.get_issue': return { id: options.issue, status, labels: ['odd'], description: '', relations: { blockedBy: [] } };
+      case 'linear.list_comments': return { comments: [{ body: options.receipt, createdAt: '2026-10-24T15:00:00Z' }, { body: 'odd-merge pr=1 head=a merge=b release=none', createdAt: '2026-10-24T14:00:00Z' }] };
+      case 'linear.list_issues': calls.push('Bug lookup'); return { issues: bugs.map(title => ({ id: 'MET-900', title })) };
+      case 'linear.save_issue':
+        if (typeof input.title === 'string') { bugs.push(input.title); calls.push('Bug created'); return { identifier: 'MET-900' }; }
+        if (typeof input.state === 'string') { status = input.state; calls.push(`status ${status}`); }
+        return {};
+      case 'find_thread': return { threads: [] };
+      case 'slack_read': return { messages: [] };
+      default: calls.push(name); return {};
+    }
+  } };
+  const thread = { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] };
+  const ui = { confirm: async () => true, notify: async () => {} };
+  const logger = { log: () => {} };
+  const agent = { definition: {}, createThread: async (options: { executor: unknown }) => ({
+    id: 'T-deployer', setLabels: async (labels: string[]) => { calls.push(`log reader ${JSON.stringify(options.executor)} ${labels.at(-1)}`); }, appendUserMessage: async () => {},
+  }) };
+  const amp = {
+    createAgent: () => agent, registerAgentMode: () => {}, registerTool: () => {},
+    on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
+    createWebhook: async ({ key, handler }: { key: string; handler: (event: unknown, ctx: unknown) => Promise<void> }) => { webhooks.set(key, handler); return { url: `https://hooks.example/${key}` }; },
+    system: { executor: { kind: 'remote', keepAlive: async () => {} } },
+  };
+  await (plugin as unknown as (api: unknown) => Promise<void>)(amp);
+  await handlers.get('session.start')!({}, { thread, ui, logger, tools });
+  const $ = async () => ({ exitCode: 0, stdout: '[]', stderr: '' });
+  const deliver = (id: string) => webhooks.get('linear')!(
+    { id, receivedAt: '2026-10-24T15:00:01Z', body: new TextEncoder().encode(JSON.stringify({ data: { identifier: options.issue } })) },
+    { thread, ui, logger, tools, $ });
+  return { deliver, calls, status: () => status };
+}
+
+const settle = async () => { for (let i = 0; i < 50; i++) await new Promise(resolve => setImmediate(resolve)); };
+
+test('control plane, through the registered webhook: a transient Bug-lookup failure is re-evaluated by itself, and a redelivery of the failed event is not ignored', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  t.after(() => mock.timers.reset());
+  const receipt = line(`component=kiosk sha=${'f'.repeat(40)} health=fail rollback=/var/backups/kiosk/snap`);
+  const host = await controlPlane({ issue: 'MET-312', receipt, failOnce: 'linear.list_issues' });
+  await assert.rejects(host.deliver('evt-1'), /HTTP 503/);
+  assert.deepEqual(host.calls, ['linear.list_issues failed']);
+  assert.equal(host.status(), 'Deploying');
+  // No new event arrives: the failure's own re-check (90 s) finishes the handoff.
+  mock.timers.tick(90_000);
+  await settle();
+  assert.deepEqual(host.calls.slice(1), ['Bug lookup', 'Bug created', 'log reader {"type":"runner","id":"factory-gpu"} odd-deploy-ffffffffffff', 'status Todo']);
+  assert.equal(host.status(), 'Todo');
+
+  // A redelivery of a failed event is evaluated again rather than dropped as seen.
+  const again = await controlPlane({ issue: 'MET-313', receipt: receipt.replace('f'.repeat(40), '9'.repeat(40)), failOnce: 'linear.list_issues' });
+  await assert.rejects(again.deliver('evt-2'), /HTTP 503/);
+  await again.deliver('evt-2');
+  assert.equal(again.status(), 'Todo');
+  assert.equal(again.calls.filter(call => call === 'Bug created').length, 1);
+});
 
 test('control plane: a failed rollback pages even when its log reader cannot start, says so in the page, and sets escalated last', async () => {
   const issue = redIssue('e'.repeat(40), 'none');
