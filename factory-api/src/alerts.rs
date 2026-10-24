@@ -241,6 +241,10 @@ struct Recovery {
     text: String,
     attempts: u32,
     next_post_ms: i64,
+    #[serde(default)]
+    update: bool,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
 }
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -330,38 +334,283 @@ impl UpsOutage {
         };
     }
 }
-pub fn open_text(severity: AlertSeverity, summary: &str) -> String {
-    let icon = match severity {
-        AlertSeverity::Critical => ":rotating_light:",
-        AlertSeverity::Warning => ":warning:",
-        AlertSeverity::Info => ":information_source:",
-    };
-    format!("{icon} {summary} · {DASHBOARD_URL}")
-}
-pub fn recovery_text(summary: &str, open_ms: i64) -> String {
-    format!(
-        ":white_check_mark: Recovered after {}: {summary} · {DASHBOARD_URL}",
-        duration(open_ms)
-    )
+fn escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
-/// `chat.postMessage`; returns the message `ts`.
-pub async fn post(
+struct Message {
+    title: String,
+    fields: Vec<(String, String)>,
+}
+
+impl Message {
+    fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            fields: vec![],
+        }
+    }
+
+    fn field(&mut self, label: &str, value: impl Into<String>) {
+        self.fields.push((label.into(), value.into()));
+    }
+
+    fn notice(config: &Config, key: &str, text: &str, at: i64) -> serde_json::Value {
+        let mut message = Self::new("factory-gpu unclean shutdown recorded");
+        message.field(
+            "Counter transition",
+            text.strip_prefix("factory-gpu: unclean shutdown recorded on ")
+                .unwrap_or(text),
+        );
+        let mut payload = message.payload(config, key, at, "warning", None);
+        payload["text"] = text.into();
+        payload
+    }
+
+    // Summaries remain the API/state contract, including alerts saved by older binaries.
+    fn alert(key: &str, summary: &str) -> Self {
+        let mut message = Self::new(summary);
+        if let Some(node) = key.strip_prefix("node:") {
+            message.title = format!("{node} offline");
+            message.field("Duration", "more than 5 min");
+        } else if let Some(service) = key.strip_prefix("service:") {
+            message.title = format!("{service} failing");
+            if let Some((checks, error)) = summary
+                .split_once(" failing for ")
+                .and_then(|(_, s)| s.split_once(": "))
+            {
+                message.field("Checks", checks);
+                message.field("Error", error);
+            } else {
+                message.field("Details", summary);
+            }
+        } else if key == "gpu:temperature" {
+            message.title = "GPU temperature high".into();
+            if let Some((value, threshold)) = summary
+                .strip_prefix("GPU temperature ")
+                .and_then(|s| s.split_once(", "))
+            {
+                message.field("Temperature", value);
+                message.field("Threshold", threshold);
+            }
+        } else if key.starts_with("ups:") {
+            let (title, detail) = summary.split_once(": ").unwrap_or((summary, ""));
+            message.title = title.into();
+            let readings = if key == "ups:comms_lost" || key.starts_with("ups:self_test:") {
+                let (reason, rest) = detail.split_once("; ").unwrap_or((detail, ""));
+                message.field(
+                    if key == "ups:comms_lost" {
+                        "Last read"
+                    } else {
+                        "Result"
+                    },
+                    reason,
+                );
+                rest
+            } else {
+                detail
+            };
+            let (readings, rest) = readings.split_once("; ").unwrap_or((readings, ""));
+            for (label, value) in ["charge", "runtime", "load", "input"]
+                .into_iter()
+                .zip(readings.split(", "))
+            {
+                message.field(label, value.strip_prefix(label).unwrap_or(value).trim());
+            }
+            if let Some(thresholds) = rest.strip_prefix("shutdown thresholds: ") {
+                for (label, value) in ["charge", "runtime"]
+                    .into_iter()
+                    .zip(thresholds.split(", "))
+                {
+                    message.field(
+                        &format!("Shutdown {label}"),
+                        value.strip_prefix(label).unwrap_or(value).trim(),
+                    );
+                }
+            } else if !rest.is_empty() {
+                message.field("Note", rest);
+            }
+        } else if key.starts_with("network:") && key.ends_with("_down") {
+            let (title, detail) = summary.split_once(" for ").unwrap_or((summary, ""));
+            message.title = title.into();
+            if let Some((elapsed, rest)) = detail.split_once(": ") {
+                message.field("Duration", elapsed);
+                let (cause, peaks) = rest.split_once("; ").unwrap_or((rest, ""));
+                message.field("Cause", cause);
+                for peak in peaks.split(", ").filter(|s| !s.is_empty()) {
+                    if let Some((label, value)) =
+                        peak.strip_prefix("peak ").and_then(|s| s.split_once(' '))
+                    {
+                        message.field(&format!("Peak {label}"), value);
+                    }
+                }
+            }
+        } else if key == "network:throughput_low" {
+            message.title = "Network throughput low".into();
+            if let Some((threshold, rates)) = summary.split_once(": ") {
+                message.field(
+                    "Threshold",
+                    threshold
+                        .strip_prefix("network throughput ")
+                        .unwrap_or(threshold),
+                );
+                if let Some((download, upload)) = rates.split_once("; ") {
+                    message.field("Download", download.trim_start_matches("download "));
+                    message.field("Upload", upload.trim_start_matches("upload "));
+                }
+            }
+        } else {
+            let (title, details) = match key {
+                "meter:sync" => (
+                    "Meter sync gap",
+                    summary.strip_prefix("meter sync gap: ").unwrap_or(summary),
+                ),
+                "backup:status" => (
+                    "Backup needs attention",
+                    summary.strip_prefix("backup: ").unwrap_or(summary),
+                ),
+                "clock:ntp" => (
+                    "factory-gpu clock not NTP-synchronized",
+                    summary.split_once("; ").map_or(summary, |(_, s)| s),
+                ),
+                "dispatch:timer" => ("factory-dispatch.timer stale", summary),
+                "usage:stale" => (
+                    "Usage snapshot stale",
+                    summary
+                        .strip_prefix("usage snapshot stale: ")
+                        .unwrap_or(summary),
+                ),
+                "network:speedtest_failing" => (
+                    "Network speed test failing",
+                    summary
+                        .strip_prefix("network speed test failing: ")
+                        .unwrap_or(summary),
+                ),
+                _ if key.starts_with("pricing:") => (
+                    "Pricing reference change pending",
+                    summary.strip_prefix("pricing.changed: ").unwrap_or(summary),
+                ),
+                _ => ("Factory alert", summary),
+            };
+            message.title = title.into();
+            message.field("Details", details);
+        }
+        message
+    }
+
+    fn payload(
+        &self,
+        config: &Config,
+        key: &str,
+        at: i64,
+        style: &str,
+        suffix: Option<&str>,
+    ) -> serde_json::Value {
+        use serde_json::json;
+        let node = key
+            .strip_prefix("node:")
+            .or_else(|| {
+                key.strip_prefix("service:")
+                    .and_then(|s| s.split_once('/').map(|(n, _)| n))
+            })
+            .unwrap_or("factory-gpu");
+        let (path, page) = if key.starts_with("node:")
+            || key == "gpu:temperature"
+            || key.starts_with("devices:unsafe_shutdowns:")
+        {
+            let segment: String = node
+                .bytes()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || b"-_.".contains(&b) {
+                        (b as char).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect();
+            (format!("/devices/{segment}"), "devices page")
+        } else if key.starts_with("ups:") {
+            ("/ups".into(), "UPS page")
+        } else if key.starts_with("network:") {
+            ("/network".into(), "network page")
+        } else if key == "meter:sync" || key.starts_with("pricing:") {
+            ("/llm".into(), "LLM page")
+        } else {
+            ("/".into(), "dashboard")
+        };
+        let link = format!("<{DASHBOARD_URL}{path}|Open {page}>");
+        let (icon, color) = match style {
+            "critical" => (":rotating_light:", "#ff6a4f"),
+            "warning" => (":warning:", "#ffd447"),
+            "resolved" => (":white_check_mark:", "#7ee081"),
+            _ => (":information_source:", "#728894"),
+        };
+        let title = escape(&self.title);
+        let mut body = json!({"channel":config.channel,"text":format!("{icon} {title}"),"unfurl_links":false,"unfurl_media":false});
+        if style == "info" {
+            let details = self
+                .fields
+                .iter()
+                .map(|(_, v)| escape(v))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            body["blocks"] = json!([{"type":"context","elements":[{"type":"mrkdwn","verbatim":true,"text":format!(":information_source: {title} · {details} · {link}")}]}]);
+            return body;
+        }
+        let utc = chrono::DateTime::from_timestamp_millis(at)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "unknown UTC time".into());
+        let mut context = format!(
+            "{} · {} · <!date^{}^{{date_short_pretty}} {{time}}|{utc}> · {link}",
+            escape(node),
+            escape(key),
+            at / 1000
+        );
+        if let Some(suffix) = suffix {
+            context.push_str(&format!(" · {}", escape(suffix)));
+        }
+        let mut blocks = vec![
+            json!({"type":"section","text":{"type":"mrkdwn","verbatim":true,"text":format!("*{title}*")}}),
+        ];
+        if !self.fields.is_empty() {
+            blocks.push(json!({"type":"section","fields":self.fields.iter().take(10).map(|(label, value)| json!({"type":"mrkdwn","verbatim":true,"text":format!("*{}*\n{}",escape(label),escape(value))})).collect::<Vec<_>>()}));
+        }
+        blocks.push(
+            json!({"type":"context","elements":[{"type":"mrkdwn","verbatim":true,"text":context}]}),
+        );
+        body["attachments"] = json!([{"color":color,"blocks":blocks}]);
+        body
+    }
+}
+
+fn style(severity: AlertSeverity) -> &'static str {
+    match severity {
+        AlertSeverity::Critical => "critical",
+        AlertSeverity::Warning => "warning",
+        AlertSeverity::Info => "info",
+    }
+}
+
+async fn send(
     client: &reqwest::Client,
     config: &Config,
     token: &Token,
-    thread_ts: Option<&str>,
-    text: &str,
+    update: bool,
+    body: &serde_json::Value,
 ) -> Result<String> {
-    let mut body = serde_json::json!({ "channel": config.channel, "text": text });
-    if let Some(ts) = thread_ts {
-        body["thread_ts"] = ts.into();
-    }
     let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.0))
         .map_err(|_| anyhow!("invalid Slack token characters"))?;
     authorization.set_sensitive(true);
+    let method = if update {
+        "chat.update"
+    } else {
+        "chat.postMessage"
+    };
     let response = client
-        .post(format!("{}/chat.postMessage", config.slack_url))
+        .post(format!("{}/{method}", config.slack_url))
         .header(reqwest::header::AUTHORIZATION, authorization)
         .header(
             reqwest::header::CONTENT_TYPE,
@@ -434,7 +683,7 @@ impl Engine {
                 }
             },
         };
-        Self {
+        let mut engine = Self {
             config,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -450,8 +699,69 @@ impl Engine {
             fleet_seen_ms: 0,
             unavailable: BTreeSet::new(),
             dirty: false,
+        };
+        engine.upgrade_outbox();
+        engine
+    }
+
+    fn upgrade_outbox(&mut self) {
+        for index in 0..self.stored.outbox.len() {
+            let item = self.stored.outbox[index].clone();
+            if item.payload.is_some() {
+                continue;
+            }
+            let payload = if let Some(ts) = &item.thread_ts {
+                let text = item
+                    .text
+                    .strip_prefix(":white_check_mark: Recovered after ")
+                    .unwrap_or(&item.text);
+                let text = text
+                    .strip_suffix(&format!(" · {DASHBOARD_URL}"))
+                    .unwrap_or(text);
+                let (elapsed, details) =
+                    text.split_once(": ").unwrap_or(("unknown duration", text));
+                let (summary, minima) = details
+                    .split_once("; minimum charge ")
+                    .unwrap_or((details, ""));
+                let recent = self
+                    .stored
+                    .recent
+                    .iter()
+                    .find(|a| a.key == item.key && a.summary == summary);
+                let opened_at = recent.map_or(item.next_post_ms, |a| a.opened_at_ms);
+                let cleared_at = recent.map_or(item.next_post_ms, |a| a.cleared_at_ms);
+                let mut parent = Message::alert(&item.key, summary);
+                let mut reply = Message::new(format!("Resolved after {elapsed}: {}", parent.title));
+                if let Some((charge, rest)) = minima.split_once(", minimum runtime ") {
+                    reply.field("Minimum charge", charge);
+                    let (runtime, reason) = rest.split_once("; ").unwrap_or((rest, ""));
+                    reply.field("Minimum runtime", runtime);
+                    if !reason.is_empty() {
+                        reply.field("Outage end reason", reason);
+                    }
+                }
+                parent.title = format!("Resolved: {}", parent.title);
+                let mut update = parent.payload(
+                    &self.config,
+                    &item.key,
+                    opened_at,
+                    "resolved",
+                    Some(&format!("resolved after {elapsed}")),
+                );
+                update["ts"] = ts.clone().into();
+                self.queue(&item.key, ts, update, true, item.next_post_ms);
+                let mut payload =
+                    reply.payload(&self.config, &item.key, cleared_at, "resolved", None);
+                payload["thread_ts"] = ts.clone().into();
+                payload
+            } else {
+                Message::notice(&self.config, &item.key, &item.text, item.next_post_ms)
+            };
+            self.stored.outbox[index].payload = Some(payload);
+            self.dirty = true;
         }
     }
+
     pub fn view(&self) -> Alerts {
         let mut active: Vec<_> = self
             .stored
@@ -473,9 +783,10 @@ impl Engine {
     /// Evaluate, post due messages and persist changes.
     pub async fn tick(&mut self, now: i64, signals: &Signals) {
         self.evaluate(now, signals);
-        // Try to save state before delivery; only shutdown notices require success.
         self.persist();
-        self.deliver(now).await;
+        if !self.dirty {
+            self.deliver(now).await;
+        }
         self.persist();
     }
     /// Applies one evaluation; returns sources newly reported unavailable.
@@ -488,15 +799,20 @@ impl Engine {
                 if let Some(previous) = self.stored.unsafe_shutdowns.insert(drive.clone(), count)
                     && count > previous
                 {
+                    let key = format!("devices:unsafe_shutdowns:{drive}:{count}");
+                    let text = format!(
+                        "factory-gpu: unclean shutdown recorded on {} ({previous} → {count})",
+                        one_line(drive, 160)
+                    );
+                    let payload = Message::notice(&self.config, &key, &text, now);
                     self.stored.outbox.push(Recovery {
-                        key: format!("devices:unsafe_shutdowns:{drive}:{count}"),
+                        key,
                         thread_ts: None,
-                        text: format!(
-                            "factory-gpu: unclean shutdown recorded on {} ({previous} → {count})",
-                            one_line(drive, 160)
-                        ),
+                        text,
                         attempts: 0,
                         next_post_ms: now,
+                        update: false,
+                        payload: Some(payload),
                     });
                 }
                 self.dirty = true;
@@ -1233,32 +1549,43 @@ impl Engine {
     }
     fn clear(&mut self, open: Open, now: i64) {
         tracing::info!(key = %open.key, summary = %open.summary, "alert cleared");
-        if open.severity != AlertSeverity::Info
-            && let Some(thread_ts) = open.slack_ts.clone()
-        {
-            let text = if let Some(outage) = &open.ups {
-                format!(
-                    ":white_check_mark: Recovered after {} s: {}; minimum charge {}, minimum runtime {}{} · {DASHBOARD_URL}",
-                    (now - outage.started_ms).max(0) / 1000,
-                    open.summary,
-                    reading(outage.min_charge, "%"),
-                    reading(outage.min_runtime, " s"),
+        if let Some(ts) = &open.slack_ts {
+            let mut parent = Message::alert(&open.key, &open.summary);
+            let elapsed = open.ups.as_ref().map_or_else(
+                || duration(now - open.opened_at_ms),
+                |outage| format!("{} s", (now - outage.started_ms).max(0) / 1000),
+            );
+            if open.severity != AlertSeverity::Info {
+                let mut reply = Message::new(format!("Resolved after {elapsed}: {}", parent.title));
+                if let Some(outage) = &open.ups {
+                    reply.field("Minimum charge", reading(outage.min_charge, "%"));
+                    reply.field("Minimum runtime", reading(outage.min_runtime, " s"));
                     if outage.restarted {
-                        "; factory shut down during the outage (UPS history end_reason=restart)"
-                    } else {
-                        ""
+                        reply.field(
+                            "Outage end reason",
+                            "factory shut down during the outage (UPS history end_reason=restart)",
+                        );
                     }
-                )
-            } else {
-                recovery_text(&open.summary, now - open.opened_at_ms)
-            };
-            self.stored.outbox.push(Recovery {
-                key: open.key.clone(),
-                thread_ts: Some(thread_ts),
-                text,
-                attempts: 0,
-                next_post_ms: now,
-            });
+                }
+                let mut payload = reply.payload(&self.config, &open.key, now, "resolved", None);
+                payload["thread_ts"] = ts.clone().into();
+                self.queue(&open.key, ts, payload, false, now);
+            }
+            let info = open.severity == AlertSeverity::Info;
+            parent.title = format!(
+                "{} {}",
+                if info { "Confirmed:" } else { "Resolved:" },
+                parent.title
+            );
+            let mut payload = parent.payload(
+                &self.config,
+                &open.key,
+                open.opened_at_ms,
+                if info { "info" } else { "resolved" },
+                Some(&format!("resolved after {elapsed}")),
+            );
+            payload["ts"] = ts.clone().into();
+            self.queue(&open.key, ts, payload, true, now);
         }
         self.stored.recent.insert(
             0,
@@ -1272,6 +1599,18 @@ impl Engine {
         );
         self.stored.recent.truncate(RECENT);
         self.dirty = true;
+    }
+
+    fn queue(&mut self, key: &str, ts: &str, payload: serde_json::Value, update: bool, now: i64) {
+        self.stored.outbox.push(Recovery {
+            key: key.into(),
+            thread_ts: Some(ts.into()),
+            text: payload["text"].as_str().unwrap().into(),
+            attempts: 0,
+            next_post_ms: now,
+            update,
+            payload: Some(payload),
+        });
     }
     /// Posts due openings and recoveries. Without a token nothing is ever posted.
     ///
@@ -1287,8 +1626,14 @@ impl Engine {
             if open.slack_ts.is_some() || open.next_post_ms > now {
                 continue;
             }
-            let text = open_text(open.severity, &open.summary);
-            let result = post(&self.client, &self.config, &token, None, &text).await;
+            let payload = Message::alert(&open.key, &open.summary).payload(
+                &self.config,
+                &open.key,
+                open.opened_at_ms,
+                style(open.severity),
+                None,
+            );
+            let result = send(&self.client, &self.config, &token, false, &payload).await;
             let open = &mut self.stored.active[index];
             match result {
                 Ok(ts) => open.slack_ts = Some(ts),
@@ -1300,21 +1645,25 @@ impl Engine {
             }
             self.dirty = true;
             self.persist();
+            if self.dirty {
+                return;
+            }
         }
+        // Deliver all replies before parent edits, including when an edit is retrying.
+        self.stored.outbox.sort_by_key(|item| item.update);
         let mut index = 0;
         while index < self.stored.outbox.len() {
             let recovery = &self.stored.outbox[index];
-            if recovery.next_post_ms > now || (recovery.thread_ts.is_none() && self.dirty) {
+            if recovery.next_post_ms > now {
                 index += 1;
                 continue;
             }
-            let (thread_ts, text) = (recovery.thread_ts.clone(), recovery.text.clone());
-            let result = post(
+            let result = send(
                 &self.client,
                 &self.config,
                 &token,
-                thread_ts.as_deref(),
-                &text,
+                recovery.update,
+                recovery.payload.as_ref().expect("outbox upgraded on load"),
             )
             .await;
             let recovery = &mut self.stored.outbox[index];
@@ -1336,6 +1685,9 @@ impl Engine {
             }
             self.dirty = true;
             self.persist();
+            if self.dirty {
+                return;
+            }
         }
     }
     fn persist(&mut self) {
@@ -1596,7 +1948,7 @@ impl AppState {
     }
 }
 
-/// One-time live check: an opening post plus a threaded reply.
+/// One-time live check: a neutral opening, resolved reply and parent update.
 pub async fn send_test(config: &Config) -> Result<String> {
     let token = config
         .token
@@ -1605,25 +1957,25 @@ pub async fn send_test(config: &Config) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
-    let ts = post(
-        &client,
+    let now = now_ms();
+    let mut message = Message::new("factory-api alert test");
+    message.field("Details", "from factory-gpu (no action needed)");
+    let payload = message.payload(config, "test", now, "neutral", None);
+    let ts = send(&client, config, token, false, &payload).await?;
+    let mut reply = Message::new("Resolved after 0 min: factory-api alert test")
+        .payload(config, "test", now, "resolved", None);
+    reply["thread_ts"] = ts.clone().into();
+    send(&client, config, token, false, &reply).await?;
+    message.title = "Resolved: factory-api alert test".into();
+    let mut update = message.payload(
         config,
-        token,
-        None,
-        &open_text(
-            AlertSeverity::Info,
-            "factory-api alert test from factory-gpu (no action needed)",
-        ),
-    )
-    .await?;
-    post(
-        &client,
-        config,
-        token,
-        Some(&ts),
-        &recovery_text("factory-api alert test", 0),
-    )
-    .await?;
+        "test",
+        now,
+        "resolved",
+        Some("resolved after 0 min"),
+    );
+    update["ts"] = ts.clone().into();
+    send(&client, config, token, true, &update).await?;
     Ok(ts)
 }
 
@@ -1639,6 +1991,8 @@ mod tests {
     struct FakeSlack {
         posts: Arc<Mutex<Vec<Value>>>,
         fail: Arc<Mutex<u32>>,
+        fail_updates: Arc<Mutex<u32>>,
+        make_unwritable: Arc<Mutex<Option<PathBuf>>>,
         /// Requests numbered at or after this (1-based) hang and are never acknowledged.
         block_from: Arc<Mutex<Option<usize>>>,
         received: Arc<std::sync::atomic::AtomicUsize>,
@@ -1646,6 +2000,7 @@ mod tests {
     }
     async fn chat(
         State(slack): State<FakeSlack>,
+        uri: axum::extract::OriginalUri,
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Json<Value> {
@@ -1660,10 +2015,23 @@ mod tests {
             slack.blocked.notify_one();
             std::future::pending::<()>().await;
         }
-        let mut fail = slack.fail.lock().unwrap();
+        let update = uri.path() == "/api/chat.update";
+        assert_eq!(body.get("ts").is_some(), update);
+        if update {
+            assert!(body.get("thread_ts").is_none());
+        }
+        let mut fail = if update {
+            slack.fail_updates.lock().unwrap()
+        } else {
+            slack.fail.lock().unwrap()
+        };
         if *fail > 0 {
             *fail -= 1;
             return Json(json!({"ok": false, "error": "ratelimited"}));
+        }
+        if let Some(path) = slack.make_unwritable.lock().unwrap().take() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
         }
         let mut posts = slack.posts.lock().unwrap();
         posts.push(body);
@@ -1675,6 +2043,7 @@ mod tests {
         let url = format!("http://{}/api", listener.local_addr().unwrap());
         let app = Router::new()
             .route("/api/chat.postMessage", post(chat))
+            .route("/api/chat.update", post(chat))
             .with_state(slack.clone());
         tokio::spawn(async move { axum::serve(listener, app).await });
         (slack, url)
@@ -1742,6 +2111,26 @@ mod tests {
     const T0: i64 = 1_791_900_000_000;
     const MIN: i64 = 60_000;
 
+    fn snapshot(title: &str, color: &str, fields: &[(&str, &str)], context: &str) -> Value {
+        let icon = match color {
+            "#ff6a4f" => ":rotating_light:",
+            "#ffd447" => ":warning:",
+            "#7ee081" => ":white_check_mark:",
+            "#728894" => ":information_source:",
+            _ => panic!("unknown snapshot color"),
+        };
+        let mut blocks = vec![
+            json!({"type":"section","text":{"type":"mrkdwn","verbatim":true,"text":format!("*{title}*")}}),
+        ];
+        if !fields.is_empty() {
+            blocks.push(json!({"type":"section","fields":fields.iter().map(|(k,v)|json!({"type":"mrkdwn","verbatim":true,"text":format!("*{k}*\n{v}")})).collect::<Vec<_>>()}));
+        }
+        blocks.push(
+            json!({"type":"context","elements":[{"type":"mrkdwn","verbatim":true,"text":context}]}),
+        );
+        json!({"channel":"C-test","text":format!("{icon} {title}"),"attachments":[{"color":color,"blocks":blocks}],"unfurl_links":false,"unfurl_media":false})
+    }
+
     fn ups(at: i64, status: &str, charge: f64, runtime: i64, result: &str) -> Signals {
         let sample = serde_json::from_value(json!({
             "ts_ms": at, "status": status, "flags": status.split_whitespace().collect::<Vec<_>>(),
@@ -1791,7 +2180,19 @@ mod tests {
         assert_eq!(engine.view().active[0].key, "ups:on_battery");
         assert_eq!(
             slack.posts.lock().unwrap()[0],
-            json!({"channel":"C-test", "text":format!(":warning: UPS on battery: charge 48%, runtime 600 s, load 144 W, input 121 V; shutdown thresholds: charge 10%, runtime 120 s · {DASHBOARD_URL}")})
+            snapshot(
+                "UPS on battery",
+                "#ffd447",
+                &[
+                    ("charge", "48%"),
+                    ("runtime", "600 s"),
+                    ("load", "144 W"),
+                    ("input", "121 V"),
+                    ("Shutdown charge", "10%"),
+                    ("Shutdown runtime", "120 s")
+                ],
+                "factory-gpu · ups:on_battery · <!date^1791900051^{date_short_pretty} {time}|2026-10-13 14:00:51 UTC> · <https://factory-gpu.bearded-pompano.ts.net/ups|Open UPS page>"
+            )
         );
         engine
             .tick(
@@ -1822,11 +2223,37 @@ mod tests {
         });
         restarted.tick(T0 + 111_000, &recovered).await;
         let posts = slack.posts.lock().unwrap().clone();
-        assert_eq!(posts.len(), 2);
-        assert_eq!(
-            posts[1],
-            json!({"channel":"C-test", "thread_ts":posts_ts(1), "text":format!(":white_check_mark: Recovered after 91 s: UPS on battery: charge 48%, runtime 600 s, load 144 W, input 121 V; shutdown thresholds: charge 10%, runtime 120 s; minimum charge 32%, minimum runtime 390 s; factory shut down during the outage (UPS history end_reason=restart) · {DASHBOARD_URL}")})
+        assert_eq!(posts.len(), 3);
+        let mut reply = snapshot(
+            "Resolved after 91 s: UPS on battery",
+            "#7ee081",
+            &[
+                ("Minimum charge", "32%"),
+                ("Minimum runtime", "390 s"),
+                (
+                    "Outage end reason",
+                    "factory shut down during the outage (UPS history end_reason=restart)",
+                ),
+            ],
+            "factory-gpu · ups:on_battery · <!date^1791900111^{date_short_pretty} {time}|2026-10-13 14:01:51 UTC> · <https://factory-gpu.bearded-pompano.ts.net/ups|Open UPS page>",
         );
+        reply["thread_ts"] = posts_ts(1).into();
+        assert_eq!(posts[1], reply);
+        let mut update = snapshot(
+            "Resolved: UPS on battery",
+            "#7ee081",
+            &[
+                ("charge", "48%"),
+                ("runtime", "600 s"),
+                ("load", "144 W"),
+                ("input", "121 V"),
+                ("Shutdown charge", "10%"),
+                ("Shutdown runtime", "120 s"),
+            ],
+            "factory-gpu · ups:on_battery · <!date^1791900051^{date_short_pretty} {time}|2026-10-13 14:00:51 UTC> · <https://factory-gpu.bearded-pompano.ts.net/ups|Open UPS page> · resolved after 91 s",
+        );
+        update["ts"] = posts_ts(1).into();
+        assert_eq!(posts[2], update);
         let reloaded = Engine::load(config(&url, Some(path), true));
         assert!(reloaded.view().active.is_empty());
         assert_eq!(reloaded.view().recent[0].key, "ups:on_battery");
@@ -1849,12 +2276,6 @@ mod tests {
             )
             .await;
         assert_eq!(engine.view().active[0].severity, AlertSeverity::Critical);
-        assert_eq!(
-            slack.posts.lock().unwrap()[0]["text"],
-            format!(
-                ":rotating_light: UPS low battery: charge 20%, runtime 800 s, load 144 W, input 121 V; shutdown thresholds: charge 10%, runtime 120 s · {DASHBOARD_URL}"
-            )
-        );
         engine
             .tick(
                 T0 + 2000,
@@ -1862,12 +2283,6 @@ mod tests {
             )
             .await;
         assert_eq!(engine.view().active.len(), 2);
-        assert_eq!(
-            slack.posts.lock().unwrap()[1]["text"],
-            format!(
-                ":warning: UPS replace battery: charge 80%, runtime 900 s, load 144 W, input 121 V · {DASHBOARD_URL}"
-            )
-        );
         let lost = Signals {
             ups: Some(UpsRead {
                 current: None,
@@ -1878,12 +2293,6 @@ mod tests {
         engine.tick(T0 + 61_999, &lost).await;
         assert_eq!(slack.posts.lock().unwrap().len(), 2);
         engine.tick(T0 + 62_000, &lost).await;
-        assert_eq!(
-            slack.posts.lock().unwrap()[2]["text"],
-            format!(
-                ":warning: UPS comms lost: no successful read for 60 s; charge unknown, runtime unknown, load unknown, input unknown · {DASHBOARD_URL}"
-            )
-        );
         assert_eq!(
             engine.view().active.len(),
             3,
@@ -1908,10 +2317,13 @@ mod tests {
             )
             .await;
         let posts = slack.posts.lock().unwrap().clone();
-        assert_eq!(posts.len(), 6);
+        assert_eq!(posts.len(), 9);
         assert_eq!(posts[3]["thread_ts"], posts_ts(1));
         assert_eq!(posts[4]["thread_ts"], posts_ts(2));
         assert_eq!(posts[5]["thread_ts"], posts_ts(3));
+        assert_eq!(posts[6]["ts"], posts_ts(1));
+        assert_eq!(posts[7]["ts"], posts_ts(2));
+        assert_eq!(posts[8]["ts"], posts_ts(3));
         assert!(engine.view().active.is_empty());
     }
 
@@ -1954,12 +2366,6 @@ mod tests {
                 "ups:self_test:Done and warning"
             );
         }
-        assert_eq!(
-            slack.posts.lock().unwrap()[0]["text"],
-            format!(
-                ":warning: UPS self-test failed: Done and warning; charge 80%, runtime 900 s, load 144 W, input 121 V; this is the replace-battery signal on NUT 2.8.4 (CyberPower RB reporting requires NUT >= 2.8.5) · {DASHBOARD_URL}"
-            )
-        );
         engine
             .tick(at, &ups(at, "OL", 80.0, 900, "In progress"))
             .await;
@@ -1980,13 +2386,13 @@ mod tests {
             .await;
         at += 1000;
         let posts = slack.posts.lock().unwrap().clone();
-        assert_eq!(posts.len(), 2);
+        assert_eq!(posts.len(), 3);
         assert_eq!(posts[1]["thread_ts"], posts_ts(1));
         assert!(
             posts[1]["text"]
                 .as_str()
                 .unwrap()
-                .starts_with(":white_check_mark: Recovered")
+                .starts_with(":white_check_mark: Resolved after")
         );
         assert!(engine.view().active.is_empty());
         for result in [
@@ -2012,8 +2418,9 @@ mod tests {
             .await;
         assert!(engine.view().active.is_empty());
         let posts = slack.posts.lock().unwrap();
-        assert_eq!(posts.len(), 8);
-        assert_eq!(posts[7]["thread_ts"], posts_ts(6));
+        assert_eq!(posts.len(), 12);
+        assert_eq!(posts[10]["thread_ts"], posts_ts(8));
+        assert_eq!(posts[11]["ts"], posts_ts(8));
     }
 
     #[tokio::test]
@@ -2038,7 +2445,12 @@ mod tests {
         assert_eq!(posts.len(), 1, "{posts:?}");
         assert_eq!(
             posts[0],
-            json!({"channel": "C-test", "text": format!(":rotating_light: factory-console offline for more than 5 min · {DASHBOARD_URL}")})
+            snapshot(
+                "factory-console offline",
+                "#ff6a4f",
+                &[("Duration", "more than 5 min")],
+                "factory-console · node:factory-console · <!date^1791900300^{date_short_pretty} {time}|2026-10-13 14:05:00 UTC> · <https://factory-gpu.bearded-pompano.ts.net/devices/factory-console|Open devices page>"
+            )
         );
         let view = engine.view();
         assert_eq!(view.active.len(), 1);
@@ -2052,15 +2464,17 @@ mod tests {
             .tick(back + MIN, &fleet(back + MIN, true, true))
             .await;
         let posts = slack.posts.lock().unwrap().clone();
-        assert_eq!(posts.len(), 2);
+        assert_eq!(posts.len(), 3);
         assert_eq!(posts[1]["thread_ts"], "1791900000.000001");
         assert_eq!(posts[1]["channel"], "C-test");
-        assert_eq!(
-            posts[1]["text"],
-            format!(
-                ":white_check_mark: Recovered after 22 min: factory-console offline for more than 5 min · {DASHBOARD_URL}"
-            )
+        let mut reply = snapshot(
+            "Resolved after 22 min: factory-console offline",
+            "#7ee081",
+            &[],
+            "factory-console · node:factory-console · <!date^1791901620^{date_short_pretty} {time}|2026-10-13 14:27:00 UTC> · <https://factory-gpu.bearded-pompano.ts.net/devices/factory-console|Open devices page>",
         );
+        reply["thread_ts"] = posts_ts(1).into();
+        assert_eq!(posts[1], reply);
         let view = engine.view();
         assert!(view.active.is_empty());
         assert_eq!(view.recent.len(), 1);
@@ -2069,7 +2483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unwritable_state_blocks_only_shutdown_notices() {
+    async fn unwritable_state_defers_delivery_until_state_is_durable() {
         use std::os::unix::fs::PermissionsExt;
         let (slack, url) = fake_slack().await;
         let directory = tempfile::tempdir().unwrap();
@@ -2103,16 +2517,9 @@ mod tests {
             .await;
         let restarted_posts = slack.posts.lock().unwrap().clone();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(blocked_posts.len(), 1);
-        assert!(
-            blocked_posts[0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("ollama-http failing")
-        );
-        assert_eq!(recovered_posts.len(), 2);
-        assert_eq!(recovered_posts[1]["thread_ts"], posts_ts(1));
-        assert_eq!(restarted_posts, recovered_posts);
+        assert!(blocked_posts.is_empty());
+        assert!(recovered_posts.is_empty());
+        assert!(restarted_posts.is_empty());
         engine
             .tick(T0 + 6 * MIN, &signals(T0 + 6 * MIN, true, 130))
             .await;
@@ -2122,11 +2529,15 @@ mod tests {
             .tick(T0 + 7 * MIN, &signals(T0 + 7 * MIN, true, 130))
             .await;
         let posts = slack.posts.lock().unwrap().clone();
-        assert_eq!(posts.len(), 3);
-        assert_eq!(
-            posts[2],
-            json!({"channel":"C-test", "text":"factory-gpu: unclean shutdown recorded on wwn-a (129 → 130)"})
+        assert_eq!(posts.len(), 1);
+        let mut notice = snapshot(
+            "factory-gpu unclean shutdown recorded",
+            "#ffd447",
+            &[("Counter transition", "wwn-a (129 → 130)")],
+            "factory-gpu · devices:unsafe_shutdowns:wwn-a:130 · <!date^1791900300^{date_short_pretty} {time}|2026-10-13 14:05:00 UTC> · <https://factory-gpu.bearded-pompano.ts.net/devices/factory-gpu|Open devices page>",
         );
+        notice["text"] = "factory-gpu: unclean shutdown recorded on wwn-a (129 → 130)".into();
+        assert_eq!(posts[0], notice);
     }
 
     #[tokio::test]
@@ -2153,12 +2564,14 @@ mod tests {
         engine.tick(T0 + 2, &signals(130, 4)).await;
         engine.tick(T0 + 3, &signals(130, 4)).await;
         let posts = slack.posts.lock().unwrap().clone();
-        assert_eq!(
-            posts,
-            vec![
-                json!({"channel":"C-test", "text":"factory-gpu: unclean shutdown recorded on wwn-a (129 → 130)"})
-            ]
+        let mut notice = snapshot(
+            "factory-gpu unclean shutdown recorded",
+            "#ffd447",
+            &[("Counter transition", "wwn-a (129 → 130)")],
+            "factory-gpu · devices:unsafe_shutdowns:wwn-a:130 · <!date^1791900000^{date_short_pretty} {time}|2026-10-13 14:00:00 UTC> · <https://factory-gpu.bearded-pompano.ts.net/devices/factory-gpu|Open devices page>",
         );
+        notice["text"] = "factory-gpu: unclean shutdown recorded on wwn-a (129 → 130)".into();
+        assert_eq!(posts, vec![notice]);
         drop(engine);
         let mut engine = Engine::load(cfg.clone());
         engine.tick(T0 + 4, &signals(130, 4)).await;
@@ -2210,8 +2623,9 @@ mod tests {
         let now = T0 + 10 * 30_000;
         second.tick(now, &fleet(now, true, true)).await;
         let posts = slack.posts.lock().unwrap().clone();
-        assert_eq!(posts.len(), 2);
+        assert_eq!(posts.len(), 3);
         assert_eq!(posts[1]["thread_ts"], "1791900000.000001");
+        assert_eq!(posts[2]["ts"], "1791900000.000001");
         let third = Engine::load(config(&url, Some(path), true));
         assert!(third.view().active.is_empty());
         assert_eq!(third.view().recent.len(), 1);
@@ -2270,15 +2684,12 @@ mod tests {
         restarted.tick(T0 + MIN, &firing).await;
         restarted.tick(T0 + 2 * MIN, &firing).await;
         assert_eq!(texts_containing(&slack, "clock not NTP-synchronized"), 1);
-        assert_eq!(
-            texts_containing(&slack, "factory-dispatch.timer has never fired"),
-            1
-        );
+        assert_eq!(texts_containing(&slack, "factory-dispatch.timer stale"), 1);
         restarted
             .tick(T0 + 3 * MIN, &clock_and_dispatch(true, Some(T0 + 3 * MIN)))
             .await;
         let posts = slack.posts.lock().unwrap().clone();
-        assert_eq!(posts.len(), 4, "{posts:?}");
+        assert_eq!(posts.len(), 6, "{posts:?}");
         assert_eq!(posts[2]["thread_ts"], posts_ts(1));
         assert!(posts[2]["text"].as_str().unwrap().contains("clock not NTP"));
         assert_eq!(posts[3]["thread_ts"], posts_ts(2));
@@ -2306,15 +2717,17 @@ mod tests {
 
         let mut restarted = Engine::load(config(&url, Some(path), true));
         assert!(restarted.stored.active.is_empty());
-        assert_eq!(restarted.stored.outbox.len(), 1);
+        assert_eq!(restarted.stored.outbox.len(), 3);
         assert_eq!(restarted.stored.outbox[0].thread_ts, Some(posts_ts(2)));
         restarted.tick(T0 + 2 * MIN, &cleared).await;
         restarted.tick(T0 + 3 * MIN, &cleared).await;
         let posts = slack.posts.lock().unwrap().clone();
-        assert_eq!(posts.len(), 4, "{posts:?}");
+        assert_eq!(posts.len(), 6, "{posts:?}");
         assert_eq!(posts[2]["thread_ts"], posts_ts(1));
         assert_eq!(posts[3]["thread_ts"], posts_ts(2));
-        assert_eq!(texts_containing(&slack, "Recovered"), 2);
+        assert_eq!(posts[4]["ts"], posts_ts(1));
+        assert_eq!(posts[5]["ts"], posts_ts(2));
+        assert_eq!(texts_containing(&slack, "Resolved after"), 2);
         assert_eq!(restarted.view().recent.len(), 2);
     }
 
@@ -2335,9 +2748,15 @@ mod tests {
         let posts = slack.posts.lock().unwrap().clone();
         assert_eq!(posts.len(), 1);
         assert_eq!(
-            posts[0]["text"],
-            format!(
-                ":warning: factory-gpu/ollama-http failing for 3 consecutive checks: HTTP 503 Service Unavailable · {DASHBOARD_URL}"
+            posts[0],
+            snapshot(
+                "factory-gpu/ollama-http failing",
+                "#ffd447",
+                &[
+                    ("Checks", "3 consecutive checks"),
+                    ("Error", "HTTP 503 Service Unavailable")
+                ],
+                "factory-gpu · service:factory-gpu/ollama-http · <!date^1791900150^{date_short_pretty} {time}|2026-10-13 14:02:30 UTC> · <https://factory-gpu.bearded-pompano.ts.net/|Open dashboard>"
             )
         );
         // Services on an offline node defer to the node alert.
@@ -2388,11 +2807,454 @@ mod tests {
         engine.tick(T0 + 8 * MIN, &clock(Some(true))).await;
         assert!(engine.view().active.is_empty());
         let posts = slack.posts.lock().unwrap().clone();
-        assert_eq!(posts.len(), 2);
+        assert_eq!(posts.len(), 3);
         assert_eq!(posts[1]["thread_ts"], posts_ts(1));
     }
     fn posts_ts(n: usize) -> String {
         format!("1791900000.{n:06}")
+    }
+
+    #[tokio::test]
+    async fn legacy_alerts_have_full_open_reply_and_update_payloads() {
+        // Literal old-format state: no new fields, and the API summaries remain unchanged.
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            &'a str,
+            &'a str,
+            &'a str,
+            &'a [(&'a str, &'a str)],
+        );
+        let cases: &[Case<'_>] = &[
+            (
+                "node:factory-console",
+                "critical",
+                "factory-console offline for more than 5 min",
+                "factory-console offline",
+                "/devices/factory-console|Open devices page",
+                &[("Duration", "more than 5 min")],
+            ),
+            (
+                "service:factory-gpu/ollama-http",
+                "warning",
+                "factory-gpu/ollama-http failing for 3 consecutive checks: <!channel> & <http://x|y> http://x @here",
+                "factory-gpu/ollama-http failing",
+                "/|Open dashboard",
+                &[
+                    ("Checks", "3 consecutive checks"),
+                    (
+                        "Error",
+                        "&lt;!channel&gt; &amp; &lt;http://x|y&gt; http://x @here",
+                    ),
+                ],
+            ),
+            (
+                "gpu:temperature",
+                "critical",
+                "GPU temperature 89 °C, above 85 °C for 2 min",
+                "GPU temperature high",
+                "/devices/factory-gpu|Open devices page",
+                &[
+                    ("Temperature", "89 °C"),
+                    ("Threshold", "above 85 °C for 2 min"),
+                ],
+            ),
+            (
+                "meter:sync",
+                "warning",
+                "meter sync gap: no successful sync for 6 min",
+                "Meter sync gap",
+                "/llm|Open LLM page",
+                &[("Details", "no successful sync for 6 min")],
+            ),
+            (
+                "backup:status",
+                "warning",
+                "backup: meter failed: disk full",
+                "Backup needs attention",
+                "/|Open dashboard",
+                &[("Details", "meter failed: disk full")],
+            ),
+            (
+                "clock:ntp",
+                "warning",
+                "factory-gpu clock not NTP-synchronized; pricing refreshes and data writes paused",
+                "factory-gpu clock not NTP-synchronized",
+                "/|Open dashboard",
+                &[("Details", "pricing refreshes and data writes paused")],
+            ),
+            (
+                "dispatch:timer",
+                "warning",
+                "factory-dispatch.timer last fired 6 min ago",
+                "factory-dispatch.timer stale",
+                "/|Open dashboard",
+                &[("Details", "factory-dispatch.timer last fired 6 min ago")],
+            ),
+            (
+                "usage:stale",
+                "warning",
+                "usage snapshot stale: no good amp, claude-code reading for over 45 min",
+                "Usage snapshot stale",
+                "/|Open dashboard",
+                &[(
+                    "Details",
+                    "no good amp, claude-code reading for over 45 min",
+                )],
+            ),
+            (
+                "network:lan_down",
+                "critical",
+                "network lan down for 2 min: gateway unreachable; peak loss 100%, peak RTT 10.2 ms, peak jitter 3.4 ms",
+                "network lan down",
+                "/network|Open network page",
+                &[
+                    ("Duration", "2 min"),
+                    ("Cause", "gateway unreachable"),
+                    ("Peak loss", "100%"),
+                    ("Peak RTT", "10.2 ms"),
+                    ("Peak jitter", "3.4 ms"),
+                ],
+            ),
+            (
+                "network:wan_down",
+                "critical",
+                "network wan down for 2 min: ISP outage, every wan target lost; peak loss 100%",
+                "network wan down",
+                "/network|Open network page",
+                &[
+                    ("Duration", "2 min"),
+                    ("Cause", "ISP outage, every wan target lost"),
+                    ("Peak loss", "100%"),
+                ],
+            ),
+            (
+                "network:dns_down",
+                "critical",
+                "network dns down for 2 min: name resolution failing; peak loss unknown",
+                "network dns down",
+                "/network|Open network page",
+                &[
+                    ("Duration", "2 min"),
+                    ("Cause", "name resolution failing"),
+                    ("Peak loss", "unknown"),
+                ],
+            ),
+            (
+                "network:throughput_low",
+                "warning",
+                "network throughput below 500 Mb/s in the last 3 ok speed tests: download 80, 90, 100 Mb/s; upload 10, 20, 30 Mb/s",
+                "Network throughput low",
+                "/network|Open network page",
+                &[
+                    ("Threshold", "below 500 Mb/s in the last 3 ok speed tests"),
+                    ("Download", "80, 90, 100 Mb/s"),
+                    ("Upload", "10, 20, 30 Mb/s"),
+                ],
+            ),
+            (
+                "network:speedtest_failing",
+                "warning",
+                "network speed test failing: the last 3 tests did not finish: failed: HTTP 503; timeout; failed: no route",
+                "Network speed test failing",
+                "/network|Open network page",
+                &[(
+                    "Details",
+                    "the last 3 tests did not finish: failed: HTTP 503; timeout; failed: no route",
+                )],
+            ),
+            (
+                "ups:on_battery",
+                "warning",
+                "UPS on battery: charge 48%, runtime 600 s, load 144 W, input 121 V; shutdown thresholds: charge 10%, runtime 120 s",
+                "UPS on battery",
+                "/ups|Open UPS page",
+                &[
+                    ("charge", "48%"),
+                    ("runtime", "600 s"),
+                    ("load", "144 W"),
+                    ("input", "121 V"),
+                    ("Shutdown charge", "10%"),
+                    ("Shutdown runtime", "120 s"),
+                ],
+            ),
+            (
+                "ups:low_battery",
+                "critical",
+                "UPS low battery: charge 20%, runtime 800 s, load 144 W, input 121 V; shutdown thresholds: charge 10%, runtime 120 s",
+                "UPS low battery",
+                "/ups|Open UPS page",
+                &[
+                    ("charge", "20%"),
+                    ("runtime", "800 s"),
+                    ("load", "144 W"),
+                    ("input", "121 V"),
+                    ("Shutdown charge", "10%"),
+                    ("Shutdown runtime", "120 s"),
+                ],
+            ),
+            (
+                "ups:replace_battery",
+                "warning",
+                "UPS replace battery: charge 80%, runtime 900 s, load 144 W, input 121 V",
+                "UPS replace battery",
+                "/ups|Open UPS page",
+                &[
+                    ("charge", "80%"),
+                    ("runtime", "900 s"),
+                    ("load", "144 W"),
+                    ("input", "121 V"),
+                ],
+            ),
+            (
+                "ups:comms_lost",
+                "warning",
+                "UPS comms lost: no successful read for 60 s; charge unknown, runtime unknown, load unknown, input unknown",
+                "UPS comms lost",
+                "/ups|Open UPS page",
+                &[
+                    ("Last read", "no successful read for 60 s"),
+                    ("charge", "unknown"),
+                    ("runtime", "unknown"),
+                    ("load", "unknown"),
+                    ("input", "unknown"),
+                ],
+            ),
+            (
+                "ups:self_test:Done and warning",
+                "warning",
+                "UPS self-test failed: Done and warning; charge 80%, runtime 900 s, load 144 W, input 121 V; this is the replace-battery signal on NUT 2.8.4 (CyberPower RB reporting requires NUT >= 2.8.5)",
+                "UPS self-test failed",
+                "/ups|Open UPS page",
+                &[
+                    ("Result", "Done and warning"),
+                    ("charge", "80%"),
+                    ("runtime", "900 s"),
+                    ("load", "144 W"),
+                    ("input", "121 V"),
+                    (
+                        "Note",
+                        "this is the replace-battery signal on NUT 2.8.4 (CyberPower RB reporting requires NUT &gt;= 2.8.5)",
+                    ),
+                ],
+            ),
+        ];
+        for &(key, severity, summary, title, page, fields) in cases {
+            let (slack, url) = fake_slack().await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("alerts.json");
+            let old = json!({"version":1,"active":[{"key":key,"severity":severity,"summary":summary,"opened_at_ms":T0,"slack_ts":null,"attempts":0,"next_post_ms":T0}],"recent":[],"outbox":[]});
+            std::fs::write(&path, old.to_string()).unwrap();
+            let cfg = config(&url, Some(path), true);
+            let mut engine = Engine::load(cfg.clone());
+            engine.tick(T0, &Signals::default()).await;
+            assert_eq!(engine.view().active[0].summary, summary);
+            let now = T0 + MIN;
+            let healthy = Signals {
+                gpu: Some((now, 60.0)),
+                pricing_pending: Some(vec![]),
+                backup: Some(vec![BackupEntry {
+                    name: "meter".into(),
+                    last_success_ms: Some(now),
+                    last_attempt_ms: Some(now),
+                    error: None,
+                }]),
+                clock_synchronized: Some(true),
+                dispatch_last_trigger_ms: Some(Some(now)),
+                usage: Some(vec![]),
+                ups: ups(now, "OL", 99.0, 1200, "Done and passed").ups,
+                network: Some(NetworkAlertInput::default()),
+                ..fleet(now, true, true)
+            };
+            engine.tick(now, &healthy).await;
+            drop(engine);
+            let mut engine = Engine::load(cfg);
+            engine.tick(now + MIN, &Signals::default()).await;
+            assert!(engine.view().active.is_empty(), "{key}");
+            let node = if key == "node:factory-console" {
+                "factory-console"
+            } else {
+                "factory-gpu"
+            };
+            let context = format!(
+                "{node} · {key} · <!date^1791900000^{{date_short_pretty}} {{time}}|2026-10-13 14:00:00 UTC> · <https://factory-gpu.bearded-pompano.ts.net{page}>"
+            );
+            let open = snapshot(
+                title,
+                if severity == "critical" {
+                    "#ff6a4f"
+                } else {
+                    "#ffd447"
+                },
+                fields,
+                &context,
+            );
+            let mut reply = snapshot(
+                &format!("Resolved after 1 min: {title}"),
+                "#7ee081",
+                &[],
+                &context
+                    .replace("1791900000", "1791900060")
+                    .replace("14:00:00", "14:01:00"),
+            );
+            reply["thread_ts"] = posts_ts(1).into();
+            let mut update = snapshot(
+                &format!("Resolved: {title}"),
+                "#7ee081",
+                fields,
+                &format!("{context} · resolved after 1 min"),
+            );
+            update["ts"] = posts_ts(1).into();
+            assert_eq!(
+                *slack.posts.lock().unwrap(),
+                vec![open, reply, update],
+                "{key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn acknowledged_parent_update_is_not_resent_after_interruption() {
+        let (slack, url) = fake_slack().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(&url, Some(dir.path().join("alerts.json")), true);
+        let mut engine = Engine::load(cfg.clone());
+        engine.tick(T0, &clock_and_dispatch(false, None)).await;
+        // Two openings, two replies, then the first update succeeds and the next hangs.
+        *slack.block_from.lock().unwrap() = Some(6);
+        let healthy = clock_and_dispatch(true, Some(T0 + MIN));
+        interrupted_tick(&slack, engine, T0 + MIN, healthy.clone()).await;
+        let mut engine = Engine::load(cfg);
+        engine.tick(T0 + 2 * MIN, &healthy).await;
+        engine.tick(T0 + 3 * MIN, &healthy).await;
+        let posts = slack.posts.lock().unwrap();
+        assert_eq!(posts.len(), 6);
+        assert_eq!(posts[2]["thread_ts"], posts_ts(1));
+        assert_eq!(posts[3]["thread_ts"], posts_ts(2));
+        assert_eq!(posts[4]["ts"], posts_ts(1));
+        assert_eq!(posts[5]["ts"], posts_ts(2));
+    }
+
+    #[tokio::test]
+    async fn old_queued_recovery_upgrades_once_and_retries_under_original_parent() {
+        let (slack, url) = fake_slack().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alerts.json");
+        let old = json!({"version":1,"active":[],"recent":[{"key":"node:factory-console","severity":"critical","summary":"factory-console offline for more than 5 min","opened_at_ms":T0,"cleared_at_ms":T0+MIN}],"outbox":[{"key":"node:factory-console","thread_ts":"original-ts","text":":white_check_mark: Recovered after 1 min: factory-console offline for more than 5 min · https://factory-gpu.bearded-pompano.ts.net","attempts":2,"next_post_ms":T0+MIN}]});
+        std::fs::write(&path, old.to_string()).unwrap();
+        let cfg = config(&url, Some(path), true);
+        let mut engine = Engine::load(cfg.clone());
+        *slack.fail.lock().unwrap() = 1;
+        engine.tick(T0 + MIN, &Signals::default()).await;
+        let context = "factory-console · node:factory-console · <!date^1791900000^{date_short_pretty} {time}|2026-10-13 14:00:00 UTC> · <https://factory-gpu.bearded-pompano.ts.net/devices/factory-console|Open devices page>";
+        let mut update = snapshot(
+            "Resolved: factory-console offline",
+            "#7ee081",
+            &[("Duration", "more than 5 min")],
+            &format!("{context} · resolved after 1 min"),
+        );
+        update["ts"] = "original-ts".into();
+        assert_eq!(*slack.posts.lock().unwrap(), vec![update.clone()]);
+        drop(engine);
+        let mut engine = Engine::load(cfg);
+        engine.tick(T0 + 3 * MIN - 1, &Signals::default()).await;
+        assert_eq!(slack.posts.lock().unwrap().len(), 1);
+        engine.tick(T0 + 3 * MIN, &Signals::default()).await;
+        engine.tick(T0 + 4 * MIN, &Signals::default()).await;
+        let mut reply = snapshot(
+            "Resolved after 1 min: factory-console offline",
+            "#7ee081",
+            &[],
+            &context
+                .replace("1791900000", "1791900060")
+                .replace("14:00:00", "14:01:00"),
+        );
+        reply["thread_ts"] = "original-ts".into();
+        assert_eq!(*slack.posts.lock().unwrap(), vec![update, reply]);
+        assert_eq!(engine.view().recent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_alert_posts_neutral_then_resolves_reply_and_parent() {
+        let (slack, url) = fake_slack().await;
+        let ts = send_test(&config(&url, None, true)).await.unwrap();
+        let posts = slack.posts.lock().unwrap();
+        assert_eq!(posts.len(), 3);
+        assert_eq!(posts[0]["attachments"][0]["color"], "#728894");
+        assert_eq!(posts[1]["thread_ts"], ts);
+        assert_eq!(posts[2]["ts"], ts);
+        assert_eq!(posts[1]["attachments"][0]["color"], "#7ee081");
+        assert_eq!(posts[2]["attachments"][0]["color"], "#7ee081");
+        assert_eq!(
+            posts[0]["text"],
+            ":information_source: factory-api alert test"
+        );
+        assert_eq!(
+            posts[1]["text"],
+            ":white_check_mark: Resolved after 0 min: factory-api alert test"
+        );
+        assert_eq!(
+            posts[2]["text"],
+            ":white_check_mark: Resolved: factory-api alert test"
+        );
+        for post in posts.iter() {
+            assert_eq!(post["unfurl_links"], false);
+            assert_eq!(post["unfurl_media"], false);
+            assert_eq!(post["attachments"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn state_write_failure_after_ack_stops_further_slack_calls() {
+        use std::os::unix::fs::PermissionsExt;
+        let (slack, url) = fake_slack().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(&url, Some(dir.path().join("alerts.json")), true);
+        let mut engine = Engine::load(cfg.clone());
+        *slack.make_unwritable.lock().unwrap() = Some(dir.path().to_owned());
+        let firing = clock_and_dispatch(false, None);
+        engine.tick(T0, &firing).await;
+        engine.tick(T0 + MIN, &firing).await;
+        assert_eq!(slack.received.load(Ordering::SeqCst), 1);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        engine.tick(T0 + 2 * MIN, &firing).await;
+        drop(engine);
+        let mut engine = Engine::load(cfg);
+        engine.tick(T0 + 3 * MIN, &firing).await;
+        assert_eq!(slack.posts.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn parent_retries_are_independent_persisted_and_capped() {
+        let (slack, url) = fake_slack().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(&url, Some(dir.path().join("alerts.json")), true);
+        let mut engine = Engine::load(cfg.clone());
+        engine.tick(T0, &clock_and_dispatch(false, None)).await;
+        *slack.fail_updates.lock().unwrap() = 100;
+        let healthy = clock_and_dispatch(true, Some(T0 + MIN));
+        engine.tick(T0 + MIN, &healthy).await;
+        assert_eq!(slack.posts.lock().unwrap().len(), 4); // both replies succeeded
+        assert_eq!(slack.received.load(Ordering::SeqCst), 6);
+        let mut now = T0 + MIN;
+        for delay in [
+            30_000, 60_000, 120_000, 240_000, 480_000, 900_000, 900_000, 900_000, 900_000, 900_000,
+            900_000,
+        ] {
+            drop(engine);
+            engine = Engine::load(cfg.clone());
+            let count = slack.received.load(Ordering::SeqCst);
+            engine.tick(now + delay - 1, &Signals::default()).await;
+            assert_eq!(slack.received.load(Ordering::SeqCst), count);
+            now += delay;
+            engine.tick(now, &Signals::default()).await;
+            assert_eq!(slack.received.load(Ordering::SeqCst), count + 2);
+        }
+        drop(engine);
+        let mut engine = Engine::load(cfg);
+        engine.tick(now + 900_000, &Signals::default()).await;
+        assert_eq!(slack.received.load(Ordering::SeqCst), 28);
+        assert_eq!(slack.posts.lock().unwrap().len(), 4);
     }
 
     #[tokio::test]
@@ -2418,13 +3280,16 @@ mod tests {
         let posts = slack.posts.lock().unwrap().clone();
         assert_eq!(posts.len(), 1);
         assert_eq!(
-            posts[0]["text"],
-            format!(
-                ":information_source: pricing.changed: new Claude Sonnet reference model pending: anthropic/claude-sonnet-5 (confirm on the dashboard) · {DASHBOARD_URL}"
-            )
+            posts[0],
+            json!({"channel":"C-test","text":":information_source: Pricing reference change pending","blocks":[{"type":"context","elements":[{"type":"mrkdwn","verbatim":true,"text":":information_source: Pricing reference change pending · new Claude Sonnet reference model pending: anthropic/claude-sonnet-5 (confirm on the dashboard) · <https://factory-gpu.bearded-pompano.ts.net/llm|Open LLM page>"}]}],"unfurl_links":false,"unfurl_media":false})
         );
         engine.tick(T0 + 60_000, &pending(vec![])).await;
-        assert_eq!(slack.posts.lock().unwrap().len(), 1);
+        let posts = slack.posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(
+            posts[1],
+            json!({"channel":"C-test","ts":posts_ts(1),"text":":information_source: Confirmed: Pricing reference change pending","blocks":[{"type":"context","elements":[{"type":"mrkdwn","verbatim":true,"text":":information_source: Confirmed: Pricing reference change pending · new Claude Sonnet reference model pending: anthropic/claude-sonnet-5 (confirm on the dashboard) · <https://factory-gpu.bearded-pompano.ts.net/llm|Open LLM page>"}]}],"unfurl_links":false,"unfurl_media":false})
+        );
         assert_eq!(engine.view().recent[0].severity, AlertSeverity::Info);
     }
 

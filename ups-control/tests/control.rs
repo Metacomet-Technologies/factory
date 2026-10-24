@@ -141,6 +141,10 @@ runpy.run_path(sys.argv.pop(1), run_name="__main__")
 
 impl Harness {
     async fn new(trusted: u32) -> Self {
+        Self::with_hostname(trusted, "synthetic-host").await
+    }
+
+    async fn with_hostname(trusted: u32, hostname: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("ups-status"), "OL").unwrap();
@@ -183,7 +187,7 @@ impl Harness {
             nut_addr: format!("127.0.0.1:{nut}").parse().unwrap(),
             trusted_peer_uid: trusted,
             allowed_logins: vec!["DGarbs51@github".into(), "metacometdave@github".into()],
-            hostname: "synthetic-host".into(),
+            hostname: hostname.into(),
             boot_id: "test-boot".into(),
             credential_dir: root.join("credentials"),
             slack_url: format!("http://127.0.0.1:{slack}/slack/chat.postMessage"),
@@ -248,6 +252,142 @@ impl Harness {
     }
     fn received(&self) -> String {
         fs::read_to_string(self.dir.path().join("ups-received.log")).unwrap_or_default()
+    }
+
+    fn posts(&self) -> Vec<Value> {
+        fs::read_to_string(self.dir.path().join("slack-posts.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn guard_notifications_have_complete_escaped_block_kit_payloads() {
+    for (login, expected_login) in [
+        (None, "unidentified"),
+        (
+            Some("<!channel> & <http://x|y> http://x @here"),
+            "&lt;!channel&gt; &amp; &lt;http://x|y&gt; http://x @here",
+        ),
+    ] {
+        let h = Harness::with_hostname(uid(), "host<&>").await;
+        assert_eq!(h.request("/v1/state", login, None).await.0, 403);
+        h.sql("UPDATE audit SET ts_ms=1709164800123");
+        h.control.flush_notifications().await.unwrap();
+        assert_eq!(
+            h.posts(),
+            vec![json!({
+                "channel":"C0C9N9HCRG8",
+                "text":"🚨 UPS guard-deny",
+                "unfurl_links":false,
+                "unfurl_media":false,
+                "attachments":[{"color":"#ff6a4f","blocks":[
+                    {"type":"section","text":{"type":"mrkdwn","verbatim":true,"text":"*UPS guard-deny*"}},
+                    {"type":"section","fields":[
+                        {"type":"mrkdwn","verbatim":true,"text":format!("*Login*\n{expected_login}")},
+                        {"type":"mrkdwn","verbatim":true,"text":"*Action*\nidentity guard"},
+                        {"type":"mrkdwn","verbatim":true,"text":"*Result*\nuntrusted peer or identity"}
+                    ]},
+                    {"type":"context","elements":[{"type":"mrkdwn","verbatim":true,"text":"host&lt;&amp;&gt; · audit #1 · <!date^1709164800^{date_short_pretty} {time}|2024-02-29 00:00:00 UTC> · <https://factory-gpu.bearded-pompano.ts.net/ups|Open UPS page>"}]}
+                ]}]
+            })]
+        );
+        h.control.flush_notifications().await.unwrap();
+        assert_eq!(h.posts().len(), 1, "delivered audit must not be reposted");
+    }
+}
+
+#[tokio::test]
+async fn outbox_notifications_escape_all_values_and_classify_outcomes() {
+    let h = Harness::new(uid()).await;
+    let row = factory_ups_control::store::Row {
+        id: 0,
+        ts_ms: 1_709_164_800_123,
+        event: "request".into(),
+        login: Some("login<&>".into()),
+        action: Some("action<&>".into()),
+        value: Some("value<&>".into()),
+        old_value: Some("old<&>".into()),
+        result: "result<&>".into(),
+        nut_response: None,
+        boot_id: "test-boot".into(),
+        attempted: false,
+        executed: false,
+        tracking_status: None,
+        tracking_id: None,
+    };
+    h.control.store.append(row.clone(), true).await.unwrap();
+    h.control.flush_notifications().await.unwrap();
+    assert_eq!(
+        h.posts(),
+        vec![json!({
+            "channel":"C0C9N9HCRG8",
+            "text":"ℹ️ UPS request",
+            "unfurl_links":false,
+            "unfurl_media":false,
+            "attachments":[{"color":"#728894","blocks":[
+                {"type":"section","text":{"type":"mrkdwn","verbatim":true,"text":"*UPS request*"}},
+                {"type":"section","fields":[
+                    {"type":"mrkdwn","verbatim":true,"text":"*Login*\nlogin&lt;&amp;&gt;"},
+                    {"type":"mrkdwn","verbatim":true,"text":"*Action*\naction&lt;&amp;&gt;"},
+                    {"type":"mrkdwn","verbatim":true,"text":"*Value*\nvalue&lt;&amp;&gt;"},
+                    {"type":"mrkdwn","verbatim":true,"text":"*Old value*\nold&lt;&amp;&gt;"},
+                    {"type":"mrkdwn","verbatim":true,"text":"*Result*\nresult&lt;&amp;&gt;"}
+                ]},
+                {"type":"context","elements":[{"type":"mrkdwn","verbatim":true,"text":"synthetic-host · audit #1 · <!date^1709164800^{date_short_pretty} {time}|2024-02-29 00:00:00 UTC> · <https://factory-gpu.bearded-pompano.ts.net/ups|Open UPS page>"}]}
+            ]}]
+        })]
+    );
+    for (event, result, executed, color) in [
+        ("guard-deny", "untrusted peer or identity", false, "#ff6a4f"),
+        (
+            "refuse",
+            "scheduled test requires one hour uptime",
+            false,
+            "#ff6a4f",
+        ),
+        (
+            "dispatch",
+            "outcome unknown (dispatching)",
+            false,
+            "#ff6a4f",
+        ),
+        (
+            "execute",
+            "executed: driver tracking SUCCESS",
+            true,
+            "#7ee081",
+        ),
+        (
+            "dispatch",
+            "FSD latch set; clean shutdown requested, physical completion unverified",
+            false,
+            "#728894",
+        ),
+        ("request", "requested", false, "#728894"),
+        ("confirm", "confirmed; ID consumed", false, "#728894"),
+    ] {
+        h.control
+            .store
+            .append(
+                factory_ups_control::store::Row {
+                    event: event.into(),
+                    result: result.into(),
+                    executed,
+                    ..row.clone()
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        h.control.flush_notifications().await.unwrap();
+        assert_eq!(
+            h.posts().last().unwrap()["attachments"][0]["color"],
+            color,
+            "{event}: {result}"
+        );
     }
 }
 
@@ -609,6 +749,12 @@ async fn power_preflight_rechecked_and_pending_survives_restart() {
             .unwrap()
             .contains("5–15")
     );
+    assert_eq!(result["executed"], false);
+    assert_eq!(result["tracking_status"], "FSD_SET");
+    assert_eq!(
+        h.posts().last().unwrap()["attachments"][0]["color"],
+        "#728894"
+    );
     assert_eq!(
         h.received()
             .lines()
@@ -804,6 +950,11 @@ async fn tracking_success_failure_pending_timeout_and_plain_ok() {
         } else {
             "not executed"
         }));
+        assert_eq!(
+            h.posts().last().unwrap()["attachments"][0]["color"],
+            if executed { "#7ee081" } else { "#ff6a4f" },
+            "{mode}"
+        );
         let received = h.received();
         assert!(received.contains("SET TRACKING ON"));
         if mode != "PLAIN_OK" {

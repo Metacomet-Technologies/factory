@@ -288,6 +288,36 @@ selection rule. Failed Slack delivery remains queued for retry.
 Delivery is at-least-once: a crash after posting but before acknowledgement can
 duplicate a post. Unknown dispatches are reported after 30 seconds.
 
+### UPS control Slack severity
+
+MET-253 uses the [shared Slack Block Kit contract](alerts.md#shared-slack-block-kit-contract-met-253).
+The title is `UPS <event>`. Fields contain login, action, optional value and old
+value, and result. The context identifies the node and `audit #<id>`, uses the
+audit timestamp, and links to `/ups`.
+
+`ups-control/src/lib.rs` chooses the style in this order:
+
+| Audit condition | Style |
+| --- | --- |
+| Event is `guard-deny` or `refuse`, or result is exactly `outcome unknown (dispatching)` | Critical |
+| Otherwise, `executed=true` | Resolved |
+| All other queued outcomes | Neutral |
+
+A `dispatch` with `FSD_SET` and `executed=false` is neutral. Setting the FSD
+latch requests clean shutdown; it does not confirm physical completion. Other
+unexecuted results are neutral unless they match the critical rule above.
+The resolved style records confirmed execution, not recovery from an alert.
+Control audit messages have no recovery reply or parent update. `request` and
+`confirm` audit rows remain unqueued.
+
+This changes presentation only. The audit schema, notification selection,
+guard-denial throttle, retry behavior, and Slack scopes are unchanged. Each
+accepted notification is marked delivered in the audit database before the
+next post. The existing crash-after-acceptance duplicate window remains.
+Rendered Slack appearance still requires Devon's check in `#factory-alerts`.
+
+### Existing timer and installer behavior
+
 `factory-ups-selftest.timer`: `Sat *-*-01..07 11:00:00`, host-local time,
 `Persistent=false`. It runs `factory-ups-control selftest --scheduled`, applies
 the same preflight/cooldown and refuses uptime under one hour. A busy action lock
@@ -312,6 +342,13 @@ snapshot, integrity, compression, checksum and replication checks include it.
 state, never DBs, archive trees, accounts or known_hosts.
 
 ## Ordered Mac deployment and rollback
+
+For an existing installation receiving only MET-253, use the
+[alerts upgrade and rollback commands](alerts.md#deploy-met-253-from-devons-mac).
+That procedure updates the API, console watchdog, and UPS control binary without
+reinstalling NUT or changing Serve and backup configuration. The commands below
+remain the full UPS installation procedure, not prerequisites to repeat for a
+message-format update.
 
 **Devon only, after merge and dispatcher build handoff.** Both clean checkouts
 must be at the approved commit under `/home/agent/work/factory`; the GPU release
