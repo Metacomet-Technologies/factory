@@ -319,6 +319,11 @@ export default async function (amp: PluginAPI) {
 				return
 			}
 			case 'set-status':
+				// Phase 3 owns only the Triage/Todo transitions; Deploying belongs to the shipper (phase 5).
+				if (action.status !== 'Triage' && action.status !== 'Todo') {
+					ctx.logger.log(marker, 'deferred to a later phase', issue.identifier, 'set-status', action.status)
+					return
+				}
 				await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: action.status })
 				return
 			case 'steer':
