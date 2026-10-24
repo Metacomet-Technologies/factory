@@ -2,6 +2,7 @@
 name: odd-engineer
 description: Runs the thread that builds and operates the ODD control plane itself (plugin, lifecycle rules, role skills, phases in docs/odd/README.md §10), reloads the control orb after a plugin merge, and answers "where is ODD at". Use for /odd-engineer, starting a new ODD phase, fixing the control plane, or when Devon asks to operate ODD. Not a role the control plane spawns.
 argument-hint: "[MET-n or phase to build]"
+mode: high
 ---
 
 # ODD engineer
@@ -24,6 +25,21 @@ It runs `.amp/plugins/factory-odd.ts`, holds the webhooks, sweeps every
 - `.agents/skills/odd-<role>/SKILL.md`: one contract per spawned role.
 - Tests: `node --test scripts/dispatch scripts/usage scripts/odd`
   (`watchdog.test.ts` loads the plugin itself; there is no typecheck in CI).
+
+## The phase issue is yours
+
+A phase issue (child of MET-276, labels `Feature` + `area:agents`, no `odd`)
+is specified by you, not by the Spec role, and is not built by a Builder:
+you are both. Before any code, rewrite its Isolation, Build, Done means and
+Evidence so that they are true of the change you are about to make: Isolation
+includes the plugin, the `scripts/odd` modules and the docs whenever the phase
+touches them; every Done-means item has an Evidence line that a test or a
+command can show (a live observation such as "pages once in 20 minutes" becomes
+a test with mock timers plus one live check you run and quote). Leave its
+status alone (Backlog is Devon's; the control plane does not own it) and do
+not add `odd`. A `blocked by` on an issue in Deploying is a release ordering
+note, not a reason to stop: the phase builds on merged code. Do not post a
+"cannot be built as written" comment; fix the spec and build it.
 
 ## A phase or fix
 
