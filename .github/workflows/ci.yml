@@ -126,6 +126,14 @@ jobs:
       - run: python3 -B deploy/test-install-dispatch.py
       - run: python3 -B deploy/backup/test-backup.py
       - run: python3 -B deploy/reboot/test-reboot.py
+      - name: Test device installers
+        run: |
+          primary_group=$(id -gn)
+          devices_test_group=$(id -Gn | tr ' ' '\n' | grep -vx "$primary_group" | head -n 1)
+          test -n "$devices_test_group"
+          echo "Using supplementary test group: $devices_test_group"
+          DEVICES_TEST_GROUP="$devices_test_group" python3 -B deploy/devices/test-install.py
+          python3 -B deploy/devices-agent/test-install.py
 
   sandbox:
     name: sandbox

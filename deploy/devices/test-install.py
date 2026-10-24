@@ -19,6 +19,12 @@ here = pathlib.Path(__file__).resolve().parent
 
 
 def member_group():
+    configured = os.environ.get("DEVICES_TEST_GROUP")
+    if configured:
+        group = grp.getgrnam(configured)
+        if group.gr_gid == os.getgid() or group.gr_gid not in os.getgroups():
+            raise AssertionError("DEVICES_TEST_GROUP must be a supplementary group")
+        return group
     extra = [group for group in os.getgroups() if group != os.getgid()]
     if not extra:
         raise AssertionError("need a supplementary group to prove snapshot chown")
@@ -49,6 +55,7 @@ class InstallerTest(unittest.TestCase):
         for name in ("hostname", "systemctl"):
             (self.bin / name).chmod(0o755)
         self.env = os.environ.copy()
+        self.env.pop("DEVICES_TEST_GROUP", None)
         self.env["DEVICES_TEST_ROOT"] = str(self.root)
         self.env["FAKE_HOSTNAME"] = "factory-gpu"
         self.env["PATH"] = f"{self.bin}:{self.env.get('PATH', '')}"
