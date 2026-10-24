@@ -88,21 +88,47 @@ export default async function (amp: PluginAPI) {
 	// --- Control plane: armed only in the labelled control thread inside an orb ---------------
 	// The label is usually set after the thread's first session.start, so every turn boundary
 	// re-checks it; `armed` keeps the webhooks and the one-time URL dialog from repeating.
-	const armed = new Set<ThreadID>()
+	type ArmState = { armed: boolean; error?: string; webhooks: string[] }
+	const armState = new Map<ThreadID, ArmState>()
 	amp.on('session.start', async (_event, ctx) => arm(ctx, await ctx.thread.labels()))
 	amp.on('agent.start', async (_event, ctx) => {
 		await arm(ctx, await ctx.thread.labels())
 		return {}
 	})
 
-	async function arm(ctx: PluginEventContext<'agent.end'>, labels: readonly string[]) {
-		if (!labels.includes(controlLabel) || armed.has(ctx.thread.id)) return
-		armed.add(ctx.thread.id)
-		if (ctx.system.executor.kind !== 'remote') {
-			await ctx.ui.notify(`${marker} control plane needs an Amp-managed orb; webhooks are unavailable here.`)
-			return
+	// Lets the control agent see why arming did or did not happen, and arm explicitly. Never
+	// returns webhook URLs.
+	amp.registerTool({
+		name: 'odd_control_status',
+		description: 'ODD control plane state for this thread: labels, executor kind, whether webhooks are armed, last arming error. Pass arm: true to arm now (control thread in an orb only).',
+		inputSchema: { type: 'object', properties: { arm: { type: 'boolean', description: 'Arm the control plane now if not armed' } } },
+		async execute(input, ctx) {
+			const labels = await ctx.thread.labels()
+			if (input.arm === true) await arm(ctx, labels)
+			const state = armState.get(ctx.thread.id) ?? { armed: false, webhooks: [] }
+			return JSON.stringify({ thread: ctx.thread.id, labels, executor: amp.system.executor.kind, ...state })
+		},
+	})
+
+	async function arm(ctx: Pick<PluginEventContext<'agent.end'>, 'thread' | 'ui' | 'logger'>, labels: readonly string[]) {
+		if (!labels.includes(controlLabel) || armState.has(ctx.thread.id)) return
+		const state: ArmState = { armed: false, webhooks: [] }
+		armState.set(ctx.thread.id, state)
+		try {
+			await armWebhooks(ctx, state)
+			state.armed = true
+		} catch (error: unknown) {
+			state.error = String(error)
+			ctx.logger.log(marker, 'arming failed', state.error)
+			await ctx.ui.notify(`${marker} control plane arming failed: ${state.error}`)
 		}
-		await ctx.system.executor.keepAlive().catch((error: unknown) => ctx.logger.log(marker, 'keepAlive failed', String(error)))
+	}
+
+	async function armWebhooks(ctx: Pick<PluginEventContext<'agent.end'>, 'thread' | 'ui' | 'logger'>, state: ArmState) {
+		if (amp.system.executor.kind !== 'remote') {
+			throw new Error(`control plane needs an Amp-managed orb; executor is ${amp.system.executor.kind}`)
+		}
+		await amp.system.executor.keepAlive().catch((error: unknown) => ctx.logger.log(marker, 'keepAlive failed', String(error)))
 		const seen = new Set<string>()
 		const handle = (source: 'linear' | 'github' | 'slack') => async (event: WebhookEvent, hctx: WebhookHandlerContext) => {
 			if (seen.has(event.id)) return
@@ -120,6 +146,7 @@ export default async function (amp: PluginAPI) {
 		}
 		const urls = await Promise.all((['linear', 'github', 'slack'] as const).map(async key => {
 			const { url } = await amp.createWebhook({ key, headers: ['x-hub-signature-256', 'linear-signature', 'x-slack-signature'], handler: handle(key) })
+			state.webhooks.push(key)
 			return `${key}: ${url}`
 		}))
 		// The URLs are credentials. They are shown once, in the control thread, for Devon to paste
