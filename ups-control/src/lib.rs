@@ -117,6 +117,13 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn slack_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn tier(action: &str) -> &'static str {
     if action.starts_with("power.") {
         "power"
@@ -693,27 +700,63 @@ impl Control {
         };
         let cutoff = now_ms() - 30_000;
         let rows = self.store.0.read(&Scope::default(), move |db| {
-            let mut query = db.prepare("SELECT id,ts_ms,event,login,action,value,old_value,result,nut_response,boot_id,attempted,executed,tracking_status,tracking_id FROM audit WHERE notify=1 AND (result != 'outcome unknown (dispatching)' OR ts_ms < ?) ORDER BY id LIMIT 20")?;
-            Ok(query.query_map([cutoff], store::read_row)?.collect::<rusqlite::Result<Vec<_>>>()?)
+            let mut query = db.prepare("SELECT id,ts_ms,event,login,action,value,old_value,result,nut_response,boot_id,attempted,executed,tracking_status,tracking_id,strftime('%Y-%m-%d %H:%M:%S',ts_ms / 1000,'unixepoch') FROM audit WHERE notify=1 AND (result != 'outcome unknown (dispatching)' OR ts_ms < ?) ORDER BY id LIMIT 20")?;
+            Ok(query.query_map([cutoff], |row| Ok((store::read_row(row)?, row.get::<_, String>(14)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
         }).await?;
-        for row in rows {
-            let text = format!(
-                "{} UPS audit #{}: {} · {} · {} · {}",
-                self.config.hostname,
+        for (row, timestamp) in rows {
+            let (emoji, color) = if matches!(row.event.as_str(), "guard-deny" | "refuse")
+                || row.result == "outcome unknown (dispatching)"
+            {
+                ("🚨", "#ff6a4f")
+            } else if row.executed {
+                ("✅", "#7ee081")
+            } else {
+                ("ℹ️", "#728894")
+            };
+            let event = slack_escape(&row.event);
+            let fields: Vec<_> = [
+                ("Login", Some(row.login.as_deref().unwrap_or("unidentified"))),
+                ("Action", Some(row.action.as_deref().unwrap_or("identity guard"))),
+                ("Value", row.value.as_deref()),
+                ("Old value", row.old_value.as_deref()),
+                ("Result", Some(row.result.as_str())),
+            ]
+            .into_iter()
+            .filter_map(|(label, value)| {
+                value.map(|value| json!({"type":"mrkdwn","verbatim":true,"text":format!("*{label}*\n{}", slack_escape(value))}))
+            })
+            .collect();
+            let context = format!(
+                "{} · audit #{} · <!date^{}^{{date_short_pretty}} {{time}}|{} UTC> · <https://factory-gpu.bearded-pompano.ts.net/ups|Open UPS page>",
+                slack_escape(&self.config.hostname),
                 row.id,
-                row.event,
-                row.login.as_deref().unwrap_or("unidentified"),
-                row.action.as_deref().unwrap_or("identity guard"),
-                row.result
-            )
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
+                row.ts_ms / 1000,
+                slack_escape(&timestamp),
+            );
+            let payload = json!({
+                "channel":"C0C9N9HCRG8",
+                "text":format!("{emoji} UPS {event}"),
+                "unfurl_links":false,
+                "unfurl_media":false,
+                "attachments":[{"color":color,"blocks":[
+                    {"type":"section","text":{"type":"mrkdwn","verbatim":true,"text":format!("*UPS {event}*")}},
+                    {"type":"section","fields":fields},
+                    {"type":"context","elements":[{"type":"mrkdwn","verbatim":true,"text":context}]}
+                ]}]
+            });
             let sent = async {
-                let response = self.client.post(&self.config.slack_url).bearer_auth(&self.slack_token)
-                    .json(&json!({"channel":"C0C9N9HCRG8","text":text,"mrkdwn":false,"unfurl_links":false,"unfurl_media":false})).send().await?;
-                Ok::<bool, reqwest::Error>(response.status().is_success() && response.json::<Value>().await?["ok"] == true)
-            }.await;
+                let response = self
+                    .client
+                    .post(&self.config.slack_url)
+                    .bearer_auth(&self.slack_token)
+                    .json(&payload)
+                    .send()
+                    .await?;
+                Ok::<bool, reqwest::Error>(
+                    response.status().is_success() && response.json::<Value>().await?["ok"] == true,
+                )
+            }
+            .await;
             if !matches!(sent, Ok(true)) {
                 eprintln!("Slack delivery failed; audit outbox retained");
                 break;

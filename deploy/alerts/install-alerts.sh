@@ -6,7 +6,7 @@
 # never printed. Before changing anything the installer saves a root-only
 # snapshot of the previous token, files and unit state; if any later step fails
 # it restores that snapshot automatically. --test-alert posts one live test
-# message plus a threaded reply.
+# message, a resolved threaded reply, and a resolved parent update.
 set -Eeuo pipefail
 umask 0077
 here=$(dirname "$(realpath "$0")")

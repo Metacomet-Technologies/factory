@@ -34,7 +34,8 @@ esac''',
     "journalctl": r'''echo "journalctl $*" >> "$ALERTS_TEST_ROOT/calls"
 [[ -e $ALERTS_TEST_ROOT/journal-fail ]] || echo "alerts: Slack token loaded; posting enabled"''',
     "curl": 'echo "curl $*" >> "$ALERTS_TEST_ROOT/calls"',
-    "systemd-run": 'echo "systemd-run $*" >> "$ALERTS_TEST_ROOT/calls"',
+    "systemd-run": '''echo "systemd-run $*" >> "$ALERTS_TEST_ROOT/calls"
+[[ ! -e $ALERTS_TEST_ROOT/test-alert-fail ]]''',
     "sleep": "true",
 }
 
@@ -201,6 +202,44 @@ class InstallerTest(unittest.TestCase):
         self.assertTrue((self.root / "enabled-factory-watchdog.timer").exists())
         self.assertTrue((self.root / "active-factory-watchdog.timer").exists())
         self.assertNotIn("clean --what=state", calls)
+
+    def test_test_alert_routes_both_nodes_without_installing_or_reading_stdin(self):
+        for node, command in [
+            ("factory-gpu", "-p User=factory-api -p LoadCredential=slack-bot-token:/etc/factory-alerts/slack-token "
+             "/usr/local/bin/factory-api alert-test"),
+            ("factory-console", "-p DynamicUser=yes -p LoadCredential=slack-bot-token:/etc/factory-alerts/slack-token "
+             "/usr/bin/python3 -I /usr/local/lib/factory-alerts/factory-watchdog.py --test-alert"),
+        ]:
+            with self.subTest(node=node):
+                self.env["FAKE_HOSTNAME"] = node
+                self.token.parent.mkdir(parents=True, exist_ok=True)
+                self.token.write_text(TOKEN + "\n")
+                output, calls = self.run_script("install-alerts.sh", "--node", node,
+                                               "--test-alert", stdin="")
+                self.assertEqual(calls, "systemd-run --wait --pipe --quiet --collect " + command + "\n")
+                self.assertEqual(self.token.read_text(), TOKEN + "\n")
+                self.assertNotIn("Snapshot", output)
+                self.assertFalse((self.root / "var/backups/factory-alerts").exists())
+                self.assertFalse(self.dropin.exists() or self.script.exists())
+
+    def test_test_alert_missing_token_and_failed_command_are_errors(self):
+        for node in ("factory-gpu", "factory-console"):
+            with self.subTest(node=node):
+                self.env["FAKE_HOSTNAME"] = node
+                self.token.unlink(missing_ok=True)
+                output, calls = self.run_script("install-alerts.sh", "--node", node,
+                                               "--test-alert", stdin="", ok=False)
+                self.assertIn("run the installer first", output)
+                self.assertEqual(calls, "")
+                self.token.parent.mkdir(parents=True, exist_ok=True)
+                self.token.write_text(TOKEN + "\n")
+                (self.root / "test-alert-fail").touch()
+                output, calls = self.run_script("install-alerts.sh", "--node", node,
+                                               "--test-alert", stdin="", ok=False)
+                self.assertIn("No deployment changes made", output)
+                self.assertEqual(len(calls.splitlines()), 1)
+                self.assertFalse((self.root / "var/backups/factory-alerts").exists())
+                self.assertEqual(self.token.read_text(), TOKEN + "\n")
 
 
 if __name__ == "__main__":
