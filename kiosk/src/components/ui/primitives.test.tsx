@@ -3,9 +3,32 @@ import { join, relative } from "node:path";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it } from "vite-plus/test";
+import { StatusChip } from "./status-chip";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "./dialog";
 import { Input } from "./input";
 import { Select } from "./select";
+
+describe("StatusChip", () => {
+  it("marks a pulse dot so it can draw the steady ring the plain dot does not", () => {
+    // jsdom does not implement getComputedStyle() for pseudo-elements, so the ring
+    // itself (border on ::after, no animation) is asserted by ambient:check in Chromium.
+    const { rerender } = render(
+      <StatusChip tone="ok" dot>
+        Live
+      </StatusChip>,
+    );
+    const plain = screen.getByText("Live").querySelector(".chip-dot");
+    expect(plain).not.toBeNull();
+    expect(plain).not.toHaveClass("chip-dot-pulse");
+
+    rerender(
+      <StatusChip tone="ok" dot pulse>
+        Live
+      </StatusChip>,
+    );
+    expect(screen.getByText("Live").querySelector(".chip-dot")).toHaveClass("chip-dot-pulse");
+  });
+});
 
 describe("Input", () => {
   it("is a labelled, controlled text field that forwards validity", () => {
