@@ -4,11 +4,11 @@ import { readFileSync } from 'node:fs';
 import { parsePolicy, evaluatePolicy, stages, modes, type Evaluation } from './policy.ts';
 
 const mainSha = 'a'.repeat(40), actionSha = 'b'.repeat(40);
-const defaults = { spec: 'Human', dispatch: 'Auto-pilot', merge: 'Agent', deploy: 'Agent', verify: 'Agent', recovery: 'Agent' } as const;
+const defaults = { spec: 'Agent', dispatch: 'Auto-pilot', merge: 'Agent', deploy: 'Agent', verify: 'Agent', recovery: 'Agent' } as const;
 const config = { version: 1, defaults, repositories: {} };
 const policy = parsePolicy(JSON.stringify(config), mainSha);
 const required = {
-  spec: ['specification', 'human-approval'], dispatch: ['task-valid', 'dependencies-clear'],
+  spec: ['specification', 'agent-review'], dispatch: ['task-valid', 'dependencies-clear'],
   merge: ['ci', 'independent-review', 'agent-review'], deploy: ['immutable-artifact', 'deployment-plan', 'agent-review'],
   verify: ['deployment-receipt', 'independent-verification', 'agent-review'], recovery: ['reconciled-outcome', 'safe-recovery-plan', 'agent-review'],
 };
@@ -52,7 +52,7 @@ test('strict policy rejects malformed schemas, unknowns, task overrides and deco
   ]) assert.throws(() => parsePolicy(JSON.stringify(value), mainSha), /^Error: Stage policy unavailable$/);
   const text = JSON.stringify(config);
   for (const content of ['{', `${text} trailing`, text.replace('"version":1', '"version":1,"version":1'),
-    text.replace('"spec":"Human"', '"spec":"Human","sp\\u0065c":"Human"'),
+    text.replace('"spec":"Agent"', '"spec":"Agent","sp\\u0065c":"Human"'),
     text.replace('"repositories":{}', '"repositories":{"factory":{},"factory":{}}'),
     text.replace('"repositories":{}', '"repositories":{"factory":{"merge":"Agent","merge":"Human"}}'),
     text.replace('"repositories":{}', '"repositories":{"__proto__":{}}'),

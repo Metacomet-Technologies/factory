@@ -1,7 +1,7 @@
 {
   "version": 1,
   "defaults": {
-    "spec": "Human",
+    "spec": "Agent",
     "dispatch": "Auto-pilot",
     "merge": "Agent",
     "deploy": "Agent",
