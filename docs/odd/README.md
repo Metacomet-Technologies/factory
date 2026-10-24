@@ -113,7 +113,7 @@ defines Amp-native agents for the roles that need Amp coordination tools.
 | Builder | Issue in `Todo` labelled `odd` with a free build slot. | A PR whose body carries the Evidence section filled with real output; the same thread and branch across review rounds. | Push to its own branch; open and update its PR; comment on its issue. | Amp medium (plugin agent); the engine table returns in a later phase (see §6). | 3 review rounds per PR. | Third `changes` verdict, or Isolation cannot be respected. |
 | Reviewer | PR head SHA with CI green and no verdict for that SHA. | Verdict `ready` or `changes` as a PR comment and the thread label `odd-verdict-<ready\|changes>-<sha12>`, findings bound to the SHA; reruns Evidence commands itself in its own orb. | Request changes; approve. Never pushes to the builder's branch. GitHub refuses a review on a PR the same account opened, so the verdict is a comment, not a review. | Amp high (plugin agent); opposite family returns with the engine table. | 1 per SHA. | Third `changes` verdict on one issue (page: third failed QA round). |
 | Shipper | Verdict `ready` on the current head. | Squash merge with `--match-head-commit`; merge receipt `odd-merge pr=<n> head=<sha> merge=<sha>` on the issue; release tag per `docs/release.md` from phase 5. | Merge; tag; close superseded PRs. | Deterministic (`qa.ts check --self-deploying-ok` + `gh pr merge` inside the control plane), no agent. | n/a | `qa.ts check` refuses: the refusal is posted once per head as `odd-merge-refused`; the builder's next push re-enters the loop. |
-| Deployer | Release published for a component with a deploy script. | Deploy receipt: host, script, SHA, health result, rollback used or not. | `sudo -n /usr/bin/bash <allowlisted script>` on the runner. | Deterministic job on the runner; an Amp low agent only to read logs when a health probe fails. | 1 deploy + 1 rollback. | Rollback fails, or health stays red after rollback (page: irreversible or failed rollback). |
+| Deployer | GitHub release newer than the host ledger's `lastTag` (`factory-deploy.timer` on factory-gpu, every 2 min). | Verified release unpacked under `~/.local/state/factory-odd/releases/<tag>`, each changed enabled component (`meter`, `factory-api`, `kiosk`) installed and probed at the exact SHA, one deploy receipt per issue the release closes. | `sudo -n /usr/bin/bash <allowlisted script>` on the runner; detaches `/home/agent/work/factory` at the release SHA. | Deterministic job (`scripts/odd/deploy.ts`); on a red receipt the control plane starts one Amp low agent on the factory-gpu runner (`odd-deployer`) that only reads logs and attaches them to the Bug. | 1 deploy + 1 rollback per component per release. | Rollback missing, fails, or leaves the component unhealthy on re-probe (`rollback=none`, page: failed rollback). |
 | Verifier | Deploy receipt posted. | `Done` on the issue, or a `Bug` issue filed with the receipt and probe output. | Set Done; file bugs. | Deterministic probes first; Amp low agent for the Done-means items that need judgement (screenshots, logs). | 1 turn + 2 continuations. | Never pages; files a bug and lets Intake handle it. |
 | Watchdog | Every 10 minutes (schedule) and on every webhook batch. | Reconciled state: released stuck claims, restarted idle loops, stale PR nudges, daily digest. | Cancel threads; relabel; reopen issues; restart the control-plane orb. | Deterministic sweep; Amp low agent only to write the digest. | n/a | Control plane cannot reach Linear or GitHub for 15 minutes; soft caps exceeded for an hour. |
 | Advisor | A role asks a bounded question (`advisor` label or in-thread). | A report-only opinion. | None. | Kimi K3 / Grok advisor tools (existing). | 1 call. | Never. |
@@ -203,8 +203,9 @@ keyed by `issue + stage + SHA`).
 | `check_suite.completed` success on a PR head | GitHub webhook | If no verdict for SHA: spawn Reviewer. | Reviewer |
 | `check_suite.completed` failure | GitHub webhook | Steer the builder thread with the failing job names; count a round. | — |
 | Reviewer thread ends (`agent.end` with `odd-role-reviewer`) | Plugin | Read verdict label. `ready` → Shipper; `changes` → steer builder, round+1 or page at 3. | Shipper |
-| `release.published` | GitHub webhook | Enqueue deploy on the runner for each component in the release. | Deployer (runner job) |
-| Deploy receipt comment | Linear webhook | Spawn Verifier. | Verifier |
+| Merge receipt (`odd-merge`) | Control plane | Status `Deploying`; wait `release not published` until a receipt newer than the merge receipt appears. | — |
+| Release published | `factory-deploy.timer` poll on factory-gpu (no webhook: the runner reads `gh release list`) | Verify, install changed components, probe, roll back on red, post one receipt per issue in `Deploying`. | Deployer (runner job) |
+| Deploy receipt comment | Linear webhook | `health=pass` → `Done`; `health=fail` with a rollback snapshot → `Todo` plus a Bug follow-up in Backlog (`Deploy failed: <component> at <sha12>`); `rollback=none` → page. Either red path also starts one log-reading Deployer on factory-gpu (thread label `odd-deploy-<sha12>`). The Bug and the log reader come before `Todo`, so a failure leaves the issue in `Deploying`; a failed evaluation re-checks the issue itself (90 s, doubling, up to 5 times) and a redelivered failed webhook is evaluated again; a page goes out even when its log reader cannot start, and `escalated` is set last. Phase 6 adds the Verifier's judgement before `Done`. | Verifier (phase 6) |
 | Verifier ends | Plugin | `Done`, or file Bug and link. | Intake (for the bug) |
 | Schedule tick (10 min) | Amp automation on the control thread | Watchdog sweep; backstop poll if no webhook in 20 min. | — |
 | `agent.end` on any `odd-role-*` thread | Plugin | Ralph guard: continue with the role's stop condition unless budget spent or an external check passed. | — |
@@ -272,7 +273,18 @@ Each artifact is machine-checkable before the next role starts.
   merge=<sha> release=<tag|none>`; from phase 5 a GitHub release whose notes
   list components and issues (`docs/release.md`).
 - Deployer → Verifier: deploy receipt comment `odd-deploy host=<h>
-  component=<c> sha=<s> health=<pass|fail> rollback=<none|sha>`.
+  component=<c> sha=<s> health=<pass|fail> rollback=<none|sha>`, one per
+  issue per release. `component` is `+`-joined install order (`meter+kiosk`),
+  `none` when the release changed nothing the host runs, or the failed
+  component. `rollback` is the snapshot the rollback restored, and only when
+  a re-probe finds the previous release healthy. Only receipts newer than the
+  issue's latest `odd-merge` comment (by creation time) count, so a stale
+  receipt from an earlier merge cannot close a later one.
+  Job state: ledger `~/.local/state/factory-odd/deploy.json` (`lastTag`,
+  per-component `sha`/`tag`/`health`/`snapshot`, `inFlight` for resume,
+  `receipt` with the issues already handled so a crashed delivery resumes
+  without redeploying), log `journalctl -u factory-deploy`. A failed
+  component record is never a baseline, so the next release retries it.
 - Verifier → Done: comment listing each Done-means item with its evidence
   link; status `Done`.
 
@@ -344,9 +356,17 @@ by the previous one).
 
    First autonomous run: this issue, built, reviewed and merged by the control plane.
    Second run: merged with no human nudge after the recheck-after-spawn fix.
-5. Shipper and Deployer: install the sudoers allowlist; the runner deploy job
-   consumes `release.published`; canary + rollback; self-deploying paths
-   merge through the same gate.
+5. Shipper and Deployer (MET-280): sudoers allowlist installed; Devon installs
+   `factory-deploy.timer` once (`deploy/install-deploy.sh`,
+   `docs/release.md` §"Automatic host deploy"); the job polls releases,
+   installs changed components in order with rollback on red, and posts the
+   receipt; the control plane sets `Done`, `Todo` + Bug, or pages from the
+   receipt. Dispatcher is not auto-deployed (its installer needs the runner
+   list on stdin; it retires in phase 7), nor is usage until it has a
+   rollback that restores the previous timer. Known consequence: meter and
+   factory-api installers run their DB migrations; a rollback restores
+   binaries only, so a release with a migration is Devon's call in the spec's
+   risk class.
 6. Verifier and Watchdog: Done set by evidence; stuck-claim release; daily
    digest; the old wrap-up flow retired.
 7. Retire the poller as primary; it stays as the backstop with the 20 minute

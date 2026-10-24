@@ -59,6 +59,7 @@ exemptions=(
     'deploy/reboot/rollback-reboot-policy.sh|health|Removal only; no service remains to probe.'
     'deploy/rollback-dispatch.sh|health|Removal only; no service remains to probe.'
     'deploy/rollback-usage.sh|health|Removal only; no service remains to probe.'
+    'deploy/rollback-deploy.sh|health|Removal only; no service remains to probe.'
 )
 
 repo=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")

@@ -16,12 +16,13 @@ verify_artifact() {
     sha=$(python3 -c 'import json, sys; v = json.loads(sys.argv[1]).get("git_sha"); print(v if isinstance(v, str) else "")' "$info" 2>/dev/null) \
         || fail "Artifact $name build info is not a JSON object; rebuild from $checkout."
     dirty=$(python3 -c 'import json, sys; print(json.dumps(json.loads(sys.argv[1]).get("git_dirty")))' "$info")
-    head=$(sudo -u agent git -C "$checkout" rev-parse --short=7 HEAD) || fail "Cannot read the checkout commit: $checkout"
+    head=$(sudo -u agent git -C "$checkout" rev-parse HEAD) || fail "Cannot read the checkout commit: $checkout"
     status=$(sudo -u agent git -C "$checkout" status --porcelain) || fail "Cannot read the checkout status: $checkout"
     [[ -n $sha && $sha != unknown ]] || fail "Artifact $name has no build SHA (missing or unknown); rebuild from $checkout."
     [[ $dirty == false ]] || fail "Artifact $name was built from a dirty tree (git_dirty: $dirty); rebuild from a clean checkout."
     [[ -z $status ]] || fail "Checkout $checkout is dirty; commit or discard changes, then rebuild."
-    [[ $sha == "$head" ]] || fail "Artifact $name built at $sha but checkout $checkout is at $head; rebuild at $head."
+    # Local builds embed the 7-char SHA, release artifacts the full one: accept either prefix of HEAD.
+    [[ ${#sha} -ge 7 && $head == "$sha"* ]] || fail "Artifact $name built at $sha but checkout $checkout is at $head; rebuild at $head."
     printf 'Artifact %s built at %s matches checkout\n' "$name" "$sha"
 }
 [[ $# -le 1 ]] || fail 'Expected at most one built dist directory.'

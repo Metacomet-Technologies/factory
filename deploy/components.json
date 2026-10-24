@@ -133,7 +133,7 @@
     {
       "id": "migration-and-host-tools", "artifact": "deployment.tar.gz", "sources": ["deploy", "scripts/release", "scripts/build-fingerprint.sh", "scripts/bump-version.sh"],
       "nodes": ["factory-gpu", "factory-console"],
-      "services": ["factory-devices-smart.service", "factory-devices-smart.timer", "factory-devices-maintenance.service", "factory-devices-maintenance.timer", "factory-devices-agent.service"],
+      "services": ["factory-devices-smart.service", "factory-devices-smart.timer", "factory-devices-maintenance.service", "factory-devices-maintenance.timer", "factory-devices-agent.service", "factory-deploy.service", "factory-deploy.timer"],
       "installer": null, "health": "No automatic health contract for migration, relocation or host changes",
       "rollback": "Procedure-specific human recovery; no automatic data restore",
       "eligibility": "ineligible", "reversible_candidate": false,

@@ -1,7 +1,7 @@
 // Outcome driven development: derive an IssueSnapshot from what Linear, GitHub and Amp
 // report (docs/odd/README.md §9). Pure functions; the control-plane plugin does the IO.
 
-import { capacity, contracts, parseDeployReceipt, parseThreadLabels, roles, type IssueSnapshot, type Load, type RiskClass, type Status, type Verdict } from './lifecycle.ts';
+import { capacity, contracts, parseDeployReceipt, parseThreadLabels, roles, type DeployReceipt, type IssueSnapshot, type Load, type RiskClass, type Status, type Verdict } from './lifecycle.ts';
 
 export type WebhookSource = 'linear' | 'github' | 'slack';
 
@@ -40,7 +40,8 @@ export type LinearIssue = {
   status: string;
   labels: readonly string[];
   description?: string | null;
-  comments?: readonly { body: string }[];
+  /** `list_comments` returns newest first; `createdAt` restores creation order. */
+  comments?: readonly { body: string; createdAt?: string }[];
   /** Present when fetched with `includeRelations: true`. */
   relations?: { blockedBy?: readonly { id: string }[] } | null;
 };
@@ -133,7 +134,13 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     const { role, round } = parseThreadLabels(owned.labels);
     return role ? { role, threadID: owned.id, round, state: ownerState(owned.state) } : undefined;
   })() : undefined;
-  const receipt = [...(issue.comments ?? [])].reverse().map(comment => parseDeployReceipt(comment.body)).find(Boolean);
+  // Only receipts after the latest merge count: an issue re-opened after a rollback and merged again starts clean.
+  let receipt: DeployReceipt | undefined;
+  const oldestFirst = [...issue.comments ?? []].sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''));
+  for (const comment of oldestFirst) {
+    if (/^odd-merge pr=/m.test(comment.body)) receipt = undefined;
+    receipt = parseDeployReceipt(comment.body) ?? receipt;
+  }
   return {
     identifier: issue.id.toUpperCase(),
     status,
