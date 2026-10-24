@@ -50,7 +50,9 @@ an installer, a rollback script or `sudo`; the job owns those.
    `odd-deploy host=factory-gpu component=<a+b|none|failed> sha=<sha>
    health=<pass|fail> rollback=<none|snapshot>`. The receipt is saved in the
    ledger before delivery, so a crashed run posts the rest without
-   redeploying. `parseDeployReceipt` in
+   redeploying; an issue that already carries the exact line is not posted
+   to again, and a failed PR lookup keeps the release pending. A killed
+   run's in-flight component finishes before anything else installs. `parseDeployReceipt` in
    `scripts/odd/lifecycle.ts` must parse it. The ledger `lastTag` advances
    even on failure so one broken release cannot block the next.
 
@@ -68,7 +70,7 @@ rollback failed: comment on the issue instead).
 `pending`, `checkout`, `baseline`, `plan`, `resume`, `install`,
 `installer-output`, `probe`, `rollback`, `rollback-probe`,
 `rollback-missing-snapshot`, `rollback-unavailable`, `receipt`,
-`receipt-resume`, `receipt-skipped`, `main-left-detached`; a failure ends the run
+`receipt-resume`, `receipt-exists`, `receipt-skipped`, `main-left-detached`; a failure ends the run
 with a non-zero exit and the receipt line in the error), the ledger, the
 receipt comment on the issue, and the component health endpoint.
 

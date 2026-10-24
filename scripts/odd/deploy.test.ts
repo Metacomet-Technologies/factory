@@ -33,7 +33,7 @@ function fixture(options: { installOk?: boolean; rollbackOk?: boolean; bodies: s
     probe: () => { calls.push('probe'); return bodies.shift() ?? 'unreachable'; },
     readLedger: () => structuredClone(ledger),
     writeLedger: next => { ledger = structuredClone(next); },
-    linear: { deploying: async () => true, comment: async () => {} },
+    linear: { deploying: async () => true, posted: async () => false, comment: async () => {} },
   };
   return { effects, calls, ledger: () => ledger };
 }
@@ -78,9 +78,6 @@ test('plan: changed inputs since the baseline, recipe order, skips components th
   // A failed attempt at this SHA is retried; a component with no baseline installs; a prefix match needs a path boundary.
   assert.deepEqual(names({ components: { meter: { sha, tag: 'v', health: 'fail' } } }, { ...all, usage: undefined }), ['meter', 'factory-api', 'kiosk', 'usage']);
   assert.deepEqual(plan({ sha, sources, baselines: all, ledger: emptyLedger(), changedSince: () => ['kiosk-docs/readme.md', 'docs/odd/README.md'] }), []);
-  // The in-flight component of a killed run is planned even when nothing changed since the live SHA.
-  const inFlight = { tag: 'v', sha, component: 'kiosk', phase: 'probing' as const };
-  assert.deepEqual(plan({ sha, sources, baselines: all, ledger: { components: {}, inFlight }, changedSince: () => [] }).map(recipe => recipe.name), ['kiosk']);
 });
 
 test('issues come from squash subjects and PR bodies; snapshots and probes parse installer and health output', () => {
@@ -130,7 +127,16 @@ function world(options: {
   /** Rollback exits 0 but leaves the broken release running. */
   rollbackRestores?: boolean;
   notDeploying?: string[];
+  /** Linear rejects this issue's comment once. */
   failComment?: string;
+  /** Linear stores this issue's comment once but the response is lost. */
+  lostComment?: string;
+  /** `gh pr view` fails once with a transient error. */
+  failPrView?: boolean;
+  /** Components whose endpoint is unreachable until they are installed. */
+  unreachable?: string[];
+  /** Comments already on the issues. */
+  comments?: [string, string][];
 }) {
   const stateDir = mkdtempSync(join(tmpdir(), 'odd-deploy-'));
   let ledger = structuredClone(options.ledger);
@@ -138,8 +144,10 @@ function world(options: {
   const before: Record<string, string> = {};
   const start = { ...live };
   const calls: string[] = [];
-  const comments: [string, string][] = [];
+  const comments: [string, string][] = [...options.comments ?? []];
   let failComment = options.failComment;
+  let lostComment = options.lostComment;
+  let failPrView = options.failPrView;
   const index = (value: string) => order.findIndex(full => full.startsWith(value));
   const changedBetween = (from: string, to: string) => order.slice(index(from) + 1, index(to) + 1)
     .flatMap(full => options.changes[(Object.keys(shas) as Tag[]).find(tag => shas[tag] === full)!] ?? []);
@@ -157,7 +165,11 @@ function world(options: {
     run: (command, args) => {
       const out = (stdout: string) => ({ stdout, stderr: '' });
       if (command === 'gh' && args[0] === 'release') return out(JSON.stringify(options.tags.map(tagName => ({ tagName }))));
-      if (command === 'gh' && args[0] === 'pr') return out(JSON.stringify({ body: `closes MET-${args[2]}` }));
+      if (command === 'gh' && args[0] === 'pr') {
+        if (failPrView) { failPrView = false; throw new Error(`gh pr view ${args[2]} exited 1\nHTTP 503: Service Unavailable`); }
+        if (args[2] === '404') throw new Error('gh pr view 404 exited 1\nGraphQL: Could not resolve to a PullRequest with the number of 404. (repository.pullRequest)');
+        return out(JSON.stringify({ body: `closes MET-${args[2]}` }));
+      }
       if (command === 'python3') {
         const dir = args[args.indexOf('--directory') + 1];
         calls.push(`verify ${args[args.indexOf('--tag') + 1]}`);
@@ -205,15 +217,18 @@ function world(options: {
       calls.push('probe');
       if (health.kind === 'unit') return 'active\n';
       const component = Object.entries(ports).find(([key]) => health.url.includes(`:${key}`))![1];
+      if (options.unreachable?.includes(component) && live[component] === start[component]) throw new Error('curl: (7) Failed to connect');
       return healthBody(component);
     },
     readLedger: () => structuredClone(ledger),
     writeLedger: next => { ledger = structuredClone(next); },
     linear: {
       deploying: async identifier => !options.notDeploying?.includes(identifier),
+      posted: async (identifier, body) => comments.some(([issue, text]) => issue === identifier && text === body),
       comment: async (identifier, body) => {
         if (failComment === identifier) { failComment = undefined; throw new Error('Linear 503'); }
         comments.push([identifier, body]);
+        if (lostComment === identifier) { lostComment = undefined; throw new Error('Linear request timed out'); }
       },
     },
   };
@@ -324,6 +339,14 @@ test('sandbox: killed between install and probe, the rerun resumes the in-flight
   await main(again.effects);
   assert.equal(sudoCalls(again.calls).length, 1);
   assert.equal(again.ledger().components.kiosk.health, 'pass');
+  // An earlier recipe that becomes eligible during recovery (meter: no record, endpoint down) waits
+  // until kiosk has resumed, so it cannot overwrite kiosk's inFlight entry or snapshot.
+  const earlier = world({ tags: ['v0.2.9', 'v0.3.0'], changes: { 'v0.3.0': ['kiosk/src/App.tsx'] }, issues: { 'v0.3.0': ['MET-301'] }, live: { kiosk: shas['v0.3.0'] }, unreachable: ['meter'], ledger: baseline({ inFlight }) });
+  t.after(earlier.cleanup);
+  await main(earlier.effects);
+  assert.deepEqual(sudoCalls(earlier.calls), [`sudo deploy/install-meter.sh ${earlier.stateDir}/releases/v0.3.0/meter-linux-x86_64`]);
+  assert.deepEqual(earlier.ledger().components.kiosk, { sha: shas['v0.3.0'], tag: 'v0.3.0', health: 'pass', snapshot: '/var/backups/kiosk/snap' });
+  assert.deepEqual(earlier.comments, [['MET-301', line(`component=meter+kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
 });
 
 test('sandbox: a rolled-back component is retried by the next release even when that release touches only docs', async t => {
@@ -356,6 +379,36 @@ test('sandbox: a receipt delivery that fails midway is resumed by the rerun with
   await assert.rejects(main(rerun.effects), /health=fail/);
   assert.deepEqual(sudoCalls(rerun.calls), []);
   assert.deepEqual(rerun.comments, [['MET-302', fail]]);
+  assert.equal(rerun.ledger().lastTag, 'v0.3.0');
+});
+
+test('sandbox: a comment Linear stored but whose response was lost is not posted again by the rerun', async t => {
+  const options = { tags: ['v0.2.9', 'v0.3.0'] as Tag[], changes: { 'v0.3.0': ['kiosk/src/App.tsx'] }, issues: { 'v0.3.0': ['MET-301'] } };
+  const host = world({ ...options, ledger: baseline(), lostComment: 'MET-301' });
+  t.after(host.cleanup);
+  await assert.rejects(main(host.effects), /timed out/);
+  assert.equal(host.ledger().lastTag, 'v0.2.9');
+  const rerun = world({ ...options, ledger: host.ledger(), comments: host.comments });
+  t.after(rerun.cleanup);
+  await main(rerun.effects);
+  assert.deepEqual(sudoCalls([...host.calls, ...rerun.calls]), [`sudo deploy/install-kiosk.sh ${host.stateDir}/releases/v0.3.0/kiosk`]);
+  assert.deepEqual(rerun.comments, [['MET-301', line(`component=kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
+  assert.equal(rerun.ledger().lastTag, 'v0.3.0');
+});
+
+test('sandbox: a transient PR lookup failure keeps the release pending; the rerun finds the issue and delivers without reinstalling', async t => {
+  // #404 is not a PR (no body, no issue); a 503 on #301 must not be mistaken for that.
+  const options = { tags: ['v0.2.9', 'v0.3.0'] as Tag[], changes: { 'v0.3.0': ['kiosk/src/App.tsx'] }, issues: { 'v0.3.0': ['MET-301', 'MET-404'] } };
+  const host = world({ ...options, ledger: baseline(), failPrView: true });
+  t.after(host.cleanup);
+  await assert.rejects(main(host.effects), /HTTP 503/);
+  assert.deepEqual(host.comments, []);
+  assert.equal(host.ledger().lastTag, 'v0.2.9');
+  const rerun = world({ ...options, ledger: host.ledger() });
+  t.after(rerun.cleanup);
+  await main(rerun.effects);
+  assert.deepEqual(sudoCalls(rerun.calls), []);
+  assert.deepEqual(rerun.comments, [['MET-301', line(`component=kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
   assert.equal(rerun.ledger().lastTag, 'v0.3.0');
 });
 

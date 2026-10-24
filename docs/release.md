@@ -338,6 +338,7 @@ A failed component stops the release and exits non-zero; `lastTag` still
 advances and the failed record is not a baseline, so the next release is the
 retry even when it touches only docs. A run killed mid-component resumes that
 component first; a run killed while posting receipts posts the rest without
-redeploying. Deleting the ledger makes the next
+redeploying, never twice to the same issue. A failed `gh pr view` keeps the
+release pending until the issues can be found. Deleting the ledger makes the next
 run bootstrap again without deploying. A dirty host checkout blocks every
 deploy until it is clean, and the job logs it each tick.

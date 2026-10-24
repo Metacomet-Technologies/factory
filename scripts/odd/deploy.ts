@@ -123,11 +123,11 @@ export const receiptLine = (receipt: Receipt) =>
   `odd-deploy host=${HOST} component=${receipt.component} sha=${receipt.sha} health=${receipt.health} rollback=${receipt.rollback}`;
 
 /**
- * Components to install for a release, in recipe order: the in-flight component of a killed run
- * at this SHA (it resumes whatever the health endpoint says), then enabled recipes whose sources
- * or deploy files changed since their baseline, skipping ones the ledger already records healthy
- * at this SHA. `changedSince(baseline)` lists the paths that changed in (baseline, release]; a
- * component with no baseline (never deployed, no health SHA) installs.
+ * Components to install for a release, in recipe order: enabled recipes whose sources or deploy
+ * files changed since their baseline, skipping ones the ledger already records healthy at this
+ * SHA. `changedSince(baseline)` lists the paths that changed in (baseline, release]; a component
+ * with no baseline (never deployed, no health SHA) installs. A killed run's in-flight component
+ * is resumed before planning (installRelease).
  */
 export function plan(input: {
   sha: string;
@@ -136,9 +136,7 @@ export function plan(input: {
   ledger: Ledger;
   changedSince: (baseline: string) => readonly string[];
 }): Recipe[] {
-  const inFlight = input.ledger.inFlight;
   return recipes.filter(recipe => {
-    if (inFlight?.sha === input.sha && inFlight.component === recipe.name) return true;
     const record = input.ledger.components[recipe.name];
     if (record?.sha === input.sha && record.health === 'pass') return false;
     const baseline = input.baselines[recipe.name];
@@ -168,7 +166,12 @@ export type Effects = {
   probe: (health: Health) => string;
   readLedger: () => Ledger;
   writeLedger: (ledger: Ledger) => void;
-  linear: { deploying: (identifier: string) => Promise<boolean>; comment: (identifier: string, body: string) => Promise<void> };
+  linear: {
+    deploying: (identifier: string) => Promise<boolean>;
+    /** Does the issue already carry a comment whose body is exactly `body`? */
+    posted: (identifier: string, body: string) => Promise<boolean>;
+    comment: (identifier: string, body: string) => Promise<void>;
+  };
 };
 
 export const emptyLedger = (): Ledger => ({ components: {} });
@@ -294,6 +297,13 @@ function restoreMain(effects: Effects): void {
 
 /** Install the release's changed components; the receipt is saved in the ledger before any delivery. */
 async function installRelease(effects: Effects, tag: string, sha: string, dir: string): Promise<Receipt> {
+  // A killed run's component finishes first: any other install would overwrite its inFlight entry and snapshot.
+  const inFlight = effects.readLedger().inFlight;
+  const resumed = inFlight?.sha === sha ? recipes.find(recipe => recipe.name === inFlight.component) : undefined;
+  if (resumed) {
+    const result = await deployComponent(effects, resumed, tag, sha, dir);
+    if (result.health === 'fail') return result;
+  }
   const inventory = JSON.parse(effects.run('git', ['-C', ROOT, 'show', `${sha}:deploy/components.json`]).stdout) as { components: { id: string; sources: string[] }[] };
   const sources = Object.fromEntries(inventory.components.map(component => [component.id, component.sources]));
   const ledger = effects.readLedger();
@@ -306,8 +316,9 @@ async function installRelease(effects: Effects, tag: string, sha: string, dir: s
     const result = await deployComponent(effects, recipe, tag, sha, dir);
     if (result.health === 'fail') return result;
   }
-  // A run killed after a component finished counts it from the ledger.
-  const installed = recipes.filter(recipe => changed.includes(recipe) || (ledger.components[recipe.name]?.sha === sha && ledger.components[recipe.name].health === 'pass'));
+  // Everything healthy at this SHA, including components a killed run finished.
+  const done = effects.readLedger().components;
+  const installed = recipes.filter(recipe => done[recipe.name]?.sha === sha && done[recipe.name].health === 'pass');
   const receipt: Receipt = { component: installed.length ? installed.map(recipe => recipe.name).join('+') : 'none', sha, health: 'pass', rollback: 'none' };
   effects.writeLedger({ ...effects.readLedger(), receipt: { tag, receipt, delivered: [] } });
   return receipt;
@@ -319,14 +330,20 @@ async function deployRelease(effects: Effects, tag: string, previousTag: string)
   const receipt = saved?.tag === tag ? saved.receipt : await installRelease(effects, tag, sha, dir);
   if (saved?.tag === tag) effects.log('receipt-resume', { tag, delivered: saved.delivered });
   const subjects = effects.run('git', ['-C', ROOT, 'log', '--first-parent', '--format=%s', `${previousTag}..${sha}`]).stdout.split('\n').filter(Boolean);
+  // A lookup failure propagates: the saved receipt keeps the release pending until discovery and delivery succeed.
   const issues = issuesFromSubjects(subjects, pr => {
-    try { return (JSON.parse(effects.run('gh', ['pr', 'view', String(pr), '--json', 'body'], { cwd: ROOT }).stdout) as { body?: string }).body ?? ''; } catch { return ''; }
+    try { return (JSON.parse(effects.run('gh', ['pr', 'view', String(pr), '--json', 'body'], { cwd: ROOT }).stdout) as { body?: string }).body ?? ''; } catch (error) {
+      if (/Could not resolve to a PullRequest/.test(String(error))) return '';
+      throw error;
+    }
   });
   const line = receiptLine(receipt);
   for (const identifier of issues) {
     const pending = effects.readLedger().receipt!;
     if (pending.delivered.includes(identifier)) continue;
-    if (await effects.linear.deploying(identifier)) {
+    // A comment whose response was lost (or a crash before the ledger write) is already there: never post twice.
+    if (await effects.linear.posted(identifier, line)) effects.log('receipt-exists', { issue: identifier, line });
+    else if (await effects.linear.deploying(identifier)) {
       await effects.linear.comment(identifier, line);
       effects.log('receipt', { issue: identifier, line });
     } else effects.log('receipt-skipped', { issue: identifier, reason: 'not Deploying' });
@@ -379,8 +396,8 @@ export function liveEffects(): Effects {
     if (!response.ok || payload.errors?.length || !payload.data) throw new Error(`Linear ${response.status}: ${payload.errors?.map(error => error.message).join('; ') ?? 'no data'}`);
     return payload.data;
   }
-  const issueQuery = 'query Issue($id: String!) { issue(id: $id) { id state { name } } }';
-  type IssueData = { issue: { id: string; state: { name: string } } };
+  const issueQuery = 'query Issue($id: String!) { issue(id: $id) { id state { name } comments(first: 250) { nodes { body } } } }';
+  type IssueData = { issue: { id: string; state: { name: string }; comments: { nodes: { body: string }[] } } };
   return {
     stateDir: STATE_DIR,
     log,
@@ -404,6 +421,7 @@ export function liveEffects(): Effects {
     },
     linear: {
       deploying: async identifier => (await graphql<IssueData>(issueQuery, { id: identifier })).issue.state.name === 'Deploying',
+      posted: async (identifier, body) => (await graphql<IssueData>(issueQuery, { id: identifier })).issue.comments.nodes.some(comment => comment.body.trim() === body),
       comment: async (identifier, body) => {
         const { issue } = await graphql<IssueData>(issueQuery, { id: identifier });
         await graphql('mutation Comment($input: CommentCreateInput!) { commentCreate(input: $input) { success } }', { input: { issueId: issue.id, body } });
