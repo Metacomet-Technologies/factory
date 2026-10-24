@@ -56,6 +56,7 @@ const out =
 const only = process.env.DEVICES?.split(",");
 const themes = (process.env.THEMES ?? "dark,light").split(",");
 const strict = process.env.DEVICES_STRICT !== "0";
+const journeyOnly = process.env.JOURNEY_ONLY === "1";
 await mkdir(out, { recursive: true });
 const browser = await chromium.launch();
 const reports = [];
@@ -153,8 +154,107 @@ async function explanation(device, theme) {
   });
   await context.close();
 }
+// The document is the page scroller, so an in-app link must open its page at the top with the
+// heading below the sticky bar, and Back/Forward must restore each page's own offset.
+// `JOURNEY_ONLY=1` runs just this journey.
+async function journey(device, theme) {
+  const name = `${device.name}-${theme}-network-journey`;
+  const context = await browser.newContext({
+    viewport: { width: device.width, height: device.height },
+    deviceScaleFactor: device.dpr,
+    isMobile: device.touch,
+    hasTouch: device.touch,
+    colorScheme: theme,
+    reducedMotion: "reduce",
+  });
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto(`${base}/`);
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Emulation.setSafeAreaInsetsOverride", { insets: device.insets });
+  const card = page.locator('a.panel-link[href="/network"]');
+  await card.waitFor();
+  await card.evaluate((node) => node.scrollIntoView({ block: "center", behavior: "instant" }));
+  await page.waitForTimeout(200);
+  const where = () =>
+    page.evaluate(() => {
+      const bar = document.querySelector(".topbar").getBoundingClientRect();
+      const title = document.querySelector("main .page-title").getBoundingClientRect();
+      return {
+        path: location.pathname,
+        scrollY: Math.round(scrollY),
+        heading: Math.round(title.top),
+        bar: Math.round(bar.bottom),
+        visible: title.top >= bar.bottom - 1 && title.bottom <= innerHeight,
+        card: (() => {
+          const link = document.querySelector('a.panel-link[href="/network"]');
+          const rect = link?.getBoundingClientRect();
+          return !!rect && rect.top < innerHeight && rect.bottom > bar.bottom;
+        })(),
+      };
+    });
+  const overview = await where();
+  const steps = [];
+  const problems = [];
+  const atPage = async (step, path, check) => {
+    await page.waitForFunction((want) => location.pathname === want, path);
+    await page.waitForTimeout(300);
+    const at = await where();
+    steps.push({ step, ...at });
+    const problem = check(at);
+    if (problem)
+      problems.push(
+        `${step}: ${problem} (scrollY ${at.scrollY}, heading at ${at.heading} px, bar ends ${at.bar} px)`,
+      );
+  };
+  const opensAtTop = (at) =>
+    at.scrollY > 1 || !at.visible ? "heading not visible below the sticky bar" : "";
+  if (overview.scrollY < 100)
+    problems.push(`overview did not scroll to the card (scrollY ${overview.scrollY})`);
+  if (device.touch) await card.tap();
+  else await card.click();
+  await atPage("tap Network", "/network", opensAtTop);
+  // Leave /network part-way down so Forward has its own offset to restore.
+  const left = await page.evaluate(() => {
+    scrollTo({
+      top: Math.min(240, document.scrollingElement.scrollHeight - innerHeight),
+      behavior: "instant",
+    });
+    return Math.round(scrollY);
+  });
+  await page.goBack();
+  await atPage("Back", "/", (at) =>
+    at.scrollY < overview.scrollY / 2 || !at.card
+      ? "overview did not return to the Network card"
+      : "",
+  );
+  await page.goForward();
+  await atPage("Forward", "/network", (at) =>
+    Math.abs(at.scrollY - left) > 2
+      ? `offset ${at.scrollY}, expected the ${left} it was left at`
+      : "",
+  );
+  problems.push(...errors.map((error) => `page error: ${error}`));
+  await page.screenshot({ path: `${out}/${name}.png` });
+  for (const problem of problems) failures.push(`${name}: ${problem}`);
+  console.log(
+    `${name}: overview at ${overview.scrollY}; ${steps.map((s) => `${s.step} → ${s.path} scrollY ${s.scrollY} heading ${s.heading}`).join("; ")}${problems.length ? ` — ${problems.length} problem(s)` : ""}`,
+  );
+  reports.push({
+    name,
+    device: device.name,
+    theme,
+    path: "/",
+    journey: "network",
+    overview,
+    steps,
+    problems,
+  });
+  await context.close();
+}
 try {
-  for (const device of DEVICES.filter((d) => !only || only.includes(d.name)))
+  for (const device of DEVICES.filter((d) => !journeyOnly && (!only || only.includes(d.name))))
     for (const theme of themes) {
       const context = await browser.newContext({
         viewport: { width: device.width, height: device.height },
@@ -344,9 +444,12 @@ try {
   // The topology explanation on a phone: select Linear dispatch, open "How … works" and
   // require every step to be reachable by scrolling the document, never an inner scroller.
   for (const device of DEVICES.filter(
-    (d) => d.name.startsWith("iphone") && (!only || only.includes(d.name)),
+    (d) => !journeyOnly && d.name.startsWith("iphone") && (!only || only.includes(d.name)),
   ))
     for (const theme of themes) await explanation(device, theme);
+  // Overview → Network card → Back → Forward on the iPhone and iPad, both orientations.
+  for (const device of DEVICES.filter((d) => d.touch && (!only || only.includes(d.name))))
+    await journey(device, themes[0]);
 } finally {
   await browser.close();
   await writeFile(

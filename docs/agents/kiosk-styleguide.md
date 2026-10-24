@@ -262,7 +262,11 @@ stacks; numbers get `tabular-nums` from `body`.
   keeps native momentum); the reserved MET-296 boxes (request log, Verdict
   chips, service details, warning slots) and tables wider than a phone
   (`overflow-x` on that element only) are the exceptions. `/topology` is an
-  app canvas: its frame is `max(100dvh, 560px)` tall.
+  app canvas: its frame is `max(100dvh, 560px)` tall. Because the document
+  scrolls, `App.tsx` keeps an offset per history entry: an in-app link opens
+  its page at the top, with the heading below the top bar, and Back/Forward
+  return each page to where it was left, holding that offset while the page
+  finishes loading.
 - Safe areas: `index.html` sets `viewport-fit=cover`. Side gutters are
   `--gutter-left/right` (`max(--gutter, env(safe-area-inset-*))`, `--gutter`
   14 / 28 / 40 px on phone / default / ≥ 1920 px); the top bar adds the top
@@ -369,7 +373,9 @@ From `kiosk/` after `source /home/agent/.config/vite-plus/env`:
   matrix viewport in both themes in Chromium device emulation with the
   safe-area insets, as rule 8 describes, then the topology "How linear
   dispatch works" explanation at 932×380 and 430×739 (no nested vertical
-  scroller, no horizontal overflow, every line reachable). Full-page
+  scroller, no horizontal overflow, every line reachable), then the
+  overview → Network card → Back → Forward journey on both iPhone and iPad
+  orientations (`JOURNEY_ONLY=1` runs only that). Full-page
   screenshots and `devices-check.json` go to `DEVICES_OUT` (default
   `$VERIFY_ROOT/evidence/devices`, else `.amp/in/artifacts/devices/`).
   `DEVICES=` and `THEMES=` narrow a run. WebKit is not covered: its system

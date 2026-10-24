@@ -1,4 +1,12 @@
-import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   Activity,
   Cpu,
@@ -46,6 +54,22 @@ const TopologyPage = lazy(() => import("./topology/topology-map"));
 // Read once at load: `?ambient=none|static` is a diagnostic override, `?perf=1` samples frames.
 const ambient = parseAmbient(window.location.search);
 
+// The document is the page scroller, so every history entry keeps its own offset: a link opens
+// its page at the top, and Back/Forward return to where that page was left. The browser's own
+// restoration would run before the routed page renders and replay the previous page's offset.
+history.scrollRestoration = "manual";
+const newEntry = () => `${Date.now()}-${Math.random()}`;
+const offsets = new Map<string, number>();
+/** The current entry's key; fragment links (the skip link) add entries without one. */
+function currentEntry() {
+  const state = history.state as { entry?: string } | null;
+  if (state?.entry) return state.entry;
+  const key = newEntry();
+  history.replaceState({ ...state, entry: key }, "");
+  return key;
+}
+let entry = currentEntry();
+
 /** Same-origin links without a modifier key route in-app; everything else falls through. */
 function followLink(event: globalThis.MouseEvent) {
   if (event.defaultPrevented || event.button !== 0) return;
@@ -56,7 +80,10 @@ function followLink(event: globalThis.MouseEvent) {
   if (anchor.origin !== window.location.origin || anchor.hash) return;
   event.preventDefault();
   if (anchor.pathname === window.location.pathname) return;
-  window.history.pushState(null, "", anchor.pathname);
+  entry = currentEntry();
+  const next = newEntry();
+  offsets.set(next, 0);
+  window.history.pushState({ entry: next }, "", anchor.pathname);
   window.dispatchEvent(new PopStateEvent("popstate"));
 }
 
@@ -99,8 +126,37 @@ export default function App() {
   const [usageRange, setUsageRange] = useState<UsageRange>("24h");
   const [gpuRange, setGpuRange] = useState<GpuRange>("1h");
   const [deviceRange, setDeviceRange] = useState<DeviceRange>("1h");
+  const [restore, setRestore] = useState<{ top: number } | null>(null);
+  useLayoutEffect(() => {
+    if (!restore) return;
+    const apply = () => window.scrollTo({ top: restore.top, behavior: "instant" });
+    apply();
+    if (restore.top === 0) return;
+    // The restored page may still be loading: hold the offset while the document grows (the
+    // first scroll clamps, then scroll anchoring drifts), until the reader scrolls or 2 s pass.
+    const growth = new ResizeObserver(apply);
+    growth.observe(document.documentElement);
+    const inputs = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
+    const stop = () => {
+      growth.disconnect();
+      clearTimeout(timer);
+      for (const input of inputs) window.removeEventListener(input, stop);
+    };
+    const timer = setTimeout(stop, 2000);
+    for (const input of inputs) window.addEventListener(input, stop, { passive: true });
+    return stop;
+  }, [restore]);
   useEffect(() => {
-    const sync = () => setPath(window.location.pathname);
+    const sync = () => {
+      setPath(window.location.pathname);
+      const next = currentEntry();
+      if (next === entry) return;
+      offsets.set(entry, window.scrollY);
+      entry = next;
+      // A fragment link's new entry has no offset yet: the browser has scrolled to its target.
+      const top = offsets.get(next);
+      if (top !== undefined) setRestore({ top });
+    };
     window.addEventListener("popstate", sync);
     document.addEventListener("click", followLink);
     return () => {
