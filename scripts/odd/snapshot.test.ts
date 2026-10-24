@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { changesRounds, ciState, finishedThreads, issueFromEvent, loadFrom, riskFrom, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { changesRounds, ciState, finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, riskFrom, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
 import { nextAction } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
@@ -18,6 +18,15 @@ test('webhook deliveries resolve to one issue or none', () => {
   assert.equal(issueFromEvent('github', JSON.stringify({ release: { tag_name: 'v1' } })), undefined);
   assert.equal(issueFromEvent('slack', JSON.stringify({ event: { text: 'MET-1 is broken' } })), undefined);
   assert.equal(issueFromEvent('linear', '{not json'), undefined);
+});
+
+test('a PR owns an issue by branch prefix or closes/contributes line, not by a mention in prose', () => {
+  assert.equal(prOwnsIssue({ headRefName: 'met-301-first-autonomous-run', body: '' }, 'MET-301'), true);
+  assert.equal(prOwnsIssue({ headRefName: 'fix-search', body: 'Explains it.\n\ncontributes MET-301\n' }, 'MET-301'), true);
+  assert.equal(prOwnsIssue({ headRefName: 'feature', body: 'Closes met-301' }, 'MET-301'), true);
+  assert.equal(prOwnsIssue({ headRefName: 'met-3010-other', body: 'closes MET-3010' }, 'MET-301'), false);
+  assert.equal(prOwnsIssue({ headRefName: 'met-279-recheck', body: 'contributes MET-279\n\nThe first live run (MET-301, PR #178) stalled.' }, 'MET-301'), false);
+  assert.equal(prOwnsIssue({}, 'MET-301'), false);
 });
 
 test('CI rollup: any failure beats pending, pending beats success, no checks is pending', () => {
