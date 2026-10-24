@@ -208,10 +208,10 @@ export default async function (amp: PluginAPI) {
 		void showUrls(ctx, state.urls).catch((error: unknown) => ctx.logger.log(marker, 'webhook dialog failed', String(error)))
 	}
 
-	// One evaluation of one issue: derive, decide, act (or dry-run). A webhook that arrives while
-	// the owning role thread is still running decides `wait`, and that thread's end raises no
-	// event here (its agent.end runs in its own orb), so the issue is re-evaluated after a delay
-	// until the owner is idle. One pending re-check per issue.
+	// One evaluation of one issue: derive, decide, act (or dry-run). A role thread's end raises
+	// no event here (its agent.end runs in its own orb), and a reviewer's verdict changes neither
+	// Linear nor the PR head, so after a spawn, and while the owner is still running, the issue
+	// is re-evaluated after a delay until the owner is idle. One pending re-check per issue.
 	const recheckMs = 90_000
 	const rechecks = new Map<string, ReturnType<typeof setTimeout>>()
 	// Linear sends several webhooks for one change and `find_thread` indexes a new thread with a
@@ -234,7 +234,8 @@ export default async function (amp: PluginAPI) {
 			ctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
 			entry.status = issue.status
 			entry.action = action
-			if (action.kind === 'wait' && action.reason.endsWith('running') && !rechecks.has(identifier)) {
+			const ownerBusy = action.kind === 'spawn' || (action.kind === 'wait' && action.reason.endsWith('running'))
+			if (ownerBusy && !rechecks.has(identifier)) {
 				rechecks.set(identifier, setTimeout(() => {
 					rechecks.delete(identifier)
 					void evaluate(ctx, state, 'recheck', identifier, new Date().toISOString())
@@ -457,8 +458,9 @@ async function archiveThreads(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger
 	}
 }
 
+// The identifier is quoted: an unquoted `MET-301` is tokenised and also matches `MET-30` and `301`.
 async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, identifier: string): Promise<GitHubPullRequest | undefined> {
-	const result = await ctx.$`gh pr list --search ${identifier} --state all --json number,headRefOid,state,mergeCommit,statusCheckRollup --limit 5`
+	const result = await ctx.$`gh pr list --search ${`"${identifier}"`} --state all --json number,headRefOid,state,mergeCommit,statusCheckRollup --limit 5`
 	if (result.exitCode !== 0) {
 		ctx.logger.log(marker, 'gh pr list failed', result.stderr.trim())
 		return undefined
@@ -496,7 +498,7 @@ async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools'>, rol
 		return { stopMet: missing.length === 0, missing }
 	}
 	if (role !== 'builder' && role !== 'reviewer') return { stopMet: true, missing: [] }
-	const pr = await ctx.$`gh pr list --search ${issue} --state open --json number,headRefOid,statusCheckRollup --limit 1`
+	const pr = await ctx.$`gh pr list --search ${`"${issue}"`} --state open --json number,headRefOid,statusCheckRollup --limit 1`
 	if (pr.exitCode !== 0 || pr.stdout.trim() === '[]') return { stopMet: false, missing: [`no open PR for ${issue}`] }
 	const [{ headRefOid, statusCheckRollup = [] }] = JSON.parse(pr.stdout) as Array<{ headRefOid: string; statusCheckRollup?: Array<{ name?: string; conclusion?: string; state?: string }> }>
 	if (role === 'reviewer') {
