@@ -1964,15 +1964,6 @@ impl AppState {
         );
         let ups = Some(self.ups_latest.read().await.clone());
         let gpu = *self.gpu_latest.lock().expect("GPU sample lock");
-        let devices = Some(
-            self.devices_latest
-                .read()
-                .await
-                .clone()
-                .unwrap_or_else(|| crate::devices::unavailable(now))
-                .alert_input(now),
-        );
-        let remote_devices = self.remote_alert_inputs(now).await;
         Signals {
             fleet: (fleet.generated_at_ms != 0).then_some(fleet),
             fleet_discovered: self.fleet_discovered.load(Ordering::Acquire),
@@ -1985,10 +1976,9 @@ impl AppState {
             usage,
             ups,
             ups_events: vec![],
-            devices,
-            remote_devices,
             network,
             retention: vec![("api", Some(self.retention())), ("meter", meter_retention)],
+            ..Signals::default()
         }
     }
     pub(crate) fn start_alerts(&self) -> Option<tokio::task::JoinHandle<()>> {
@@ -2000,7 +1990,7 @@ impl AppState {
             .take()?;
         let mut state = self.clone();
         Some(tokio::spawn(async move {
-            // UPS follows its 10s collector; other source reads keep their 30s cadence.
+            // UPS and device snapshots refresh each tick; other sources keep their 30s cadence.
             let ups_interval = Duration::from_secs(10);
             let mut timer =
                 tokio::time::interval_at(tokio::time::Instant::now() + ups_interval, ups_interval);
@@ -2050,7 +2040,18 @@ impl AppState {
                             }
                         }
                     }
-                    engine.tick(now_ms(), &signals).await;
+                    let now = now_ms();
+                    signals.devices = Some(
+                        state
+                            .devices_latest
+                            .read()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| crate::devices::unavailable(now))
+                            .alert_input(now),
+                    );
+                    signals.remote_devices = state.remote_alert_inputs(now).await;
+                    engine.tick(now, &signals).await;
                     *state.alerts.view.write().await = engine.view();
                 };
                 // Shutdown (and main's abort) may drop `work` mid-post: every acknowledged
@@ -3928,6 +3929,67 @@ mod tests {
         }
         assert!(!console_alert(&engine, "cpu:temperature:sustained"));
         assert!(!console_alert(&engine, "power:discharging-on-mains"));
+    }
+
+    #[tokio::test]
+    async fn battery_low_background_loop_uses_latest_snapshot_between_collections() {
+        let dir = tempfile::tempdir().unwrap();
+        pricing::migrate(dir.path().join("pricing.db")).unwrap();
+        let mut state = AppState::new(
+            "http://127.0.0.1:1".into(),
+            dir.path().join("requests.db"),
+            dir.path().join("pricing.db"),
+            fleet::Config { nodes: vec![] },
+        )
+        .await
+        .unwrap();
+        state.backup_status = dir.path().join("backup.json");
+        state.usage_snapshot = dir.path().join("usage.json");
+        state.remote = Arc::new(crate::devices_ingest::Registry::new(
+            crate::device_auth::Tokens::new(dir.path().join("device-tokens")),
+        ));
+        let task = state.start_alerts().unwrap();
+        for (status, percent, expected) in [("Discharging", 25.0, true), ("Charging", 40.0, false)]
+        {
+            let now = now_ms();
+            let mut view = crate::devices::unavailable(now);
+            view.device.collector.fast_ok = true;
+            view.device.collector.last_fast_ms = Some(now);
+            view.device.power = console_power_signals(now, 70.0, status, percent)
+                .remote_devices
+                .remove(0)
+                .1
+                .power;
+            *state.devices_latest.write().await = Some(view);
+            state.ups_changed.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let alerts = state.alerts.view.read().await;
+                    let low = alerts
+                        .active
+                        .iter()
+                        .find(|alert| alert.key == "devices:power:battery-low");
+                    if let Some(alert) = low {
+                        assert_eq!(alert.severity, AlertSeverity::Critical);
+                    }
+                    if low.is_some() == expected {
+                        break;
+                    }
+                    drop(alerts);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            if result.is_err() {
+                task.abort();
+            }
+            assert!(
+                result.is_ok(),
+                "battery-low did not update before the next 30s collection"
+            );
+        }
+        state.shutdown.cancel();
+        task.await.unwrap();
     }
 
     #[tokio::test]
