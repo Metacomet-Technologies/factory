@@ -20,7 +20,7 @@ import {
 	type Role,
 } from '../../scripts/odd/lifecycle.ts'
 import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { issueFromEvent, loadFrom, roleLabelQueries, toSnapshot, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
+import { finishedThreads, issueFromEvent, loadFrom, roleLabelQueries, toSnapshot, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
 
 export const description =
 	'Factory ODD control plane: Linear, GitHub and Slack webhooks drive a deterministic outcome lifecycle; role agents run in orbs; Ralph loops are bounded by external checks. See docs/odd/README.md.'
@@ -221,7 +221,9 @@ export default async function (amp: PluginAPI) {
 	async function evaluateNow(ctx: EvalContext, state: ArmState, source: string, identifier: string, at: string): Promise<HandledEvent> {
 		const entry = record(state, { at, source, issue: identifier, stage: 'received' })
 		try {
-			const issue = await snapshotFor(ctx, identifier, spawned.get(identifier) ?? [])
+			const { snapshot: issue, threads } = await snapshotFor(ctx, identifier, spawned.get(identifier) ?? [])
+			const finished = finishedThreads(issue.status, threads)
+			if (finished.length && (await ctx.thread.labels()).includes(performLabel)) await archiveThreads(ctx, finished)
 			const action = nextAction(issue, await currentLoad(ctx))
 			ctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
 			entry.status = issue.status
@@ -284,6 +286,12 @@ export default async function (amp: PluginAPI) {
 				}
 			}
 			delete state.slack.error
+			// A Slack-sourced intake thread has no issue label, so no issue evaluation archives it.
+			if (perform) {
+				const idle = (await threadsFor(ctx.tools, 'label:odd-role-intake archived:false'))
+					.filter(thread => thread.labels.some(label => label.startsWith('odd-slack-')) && thread.state === 'idle')
+				await archiveThreads(ctx, idle)
+			}
 		} catch (error: unknown) {
 			state.slack.error = String(error)
 			ctx.logger.log(marker, 'slack poll failed', state.slack.error)
@@ -370,7 +378,7 @@ async function callJson<T>(tools: Tools, name: string, input: Record<string, unk
 	return JSON.parse(textBlock.text as string) as T
 }
 
-async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, knownThreads: readonly string[]): Promise<IssueSnapshot> {
+async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, knownThreads: readonly string[]): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[] }> {
 	const [issue, comments, pr, threads] = await Promise.all([
 		callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: identifier }),
 		callJson<{ comments?: { body: string }[] }>(ctx.tools, 'linear.list_comments', { issueId: identifier, limit: 50 }).then(result => result.comments ?? []),
@@ -378,7 +386,16 @@ async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 		threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, knownThreads),
 	])
 	// Open blockers are not exposed by the Linear MCP; phase 4 (MET-279) adds them before builders spawn.
-	return toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers: [] })
+	return { snapshot: toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers: [] }), threads }
+}
+
+// Finished role threads are archived so the thread list shows only live work; an archived
+// thread keeps its labels, so a later `find_thread … archived:false` no longer counts it.
+async function archiveThreads(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, threads: readonly LiveThread[]) {
+	for (const thread of threads) {
+		await callJson(ctx.tools, 'update_thread', { thread: thread.id, archived: true })
+		ctx.logger.log(marker, 'archived finished thread', thread.id)
+	}
 }
 
 async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, identifier: string): Promise<GitHubPullRequest | undefined> {
