@@ -1,18 +1,20 @@
-// Devon's device matrix (MET-297): every page at every device viewport, both themes.
-// Fails on page-level horizontal scroll, content past the viewport or the safe area, an
-// unlisted inner scroller, a touch target under 44 px on touch devices, or a contrast pair
-// under AA. Screenshots and devices-check.json go to DEVICES_OUT.
+#!/usr/bin/env node
+// Devon's device matrix (MET-297): every page at every device viewport, both themes, then the
+// topology "How … works" explanation on both iPhone orientations. Fails on page-level
+// horizontal scroll, content past the viewport or the safe area, an unlisted inner scroller, a
+// touch target under 44 px on touch devices, a contrast pair under AA, or explanation text
+// that sits in a nested vertical scroller or cannot be reached. Full-page screenshots and
+// devices-check.json go to DEVICES_OUT. Read-only: drives an already running kiosk.
 import { mkdir, writeFile } from "node:fs/promises";
-import { auditContrast } from "./contrast.ts";
-
-process.env.PLAYWRIGHT_BROWSERS_PATH ??= `${process.cwd()}/.browsers`;
-const { chromium } = await import("@playwright/test");
-
-type Insets = { top: number; right: number; bottom: number; left: number };
-const NONE: Insets = { top: 0, right: 0, bottom: 0, left: 0 };
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import { auditContrast } from "./contrast.mjs";
+const repo = fileURLToPath(new URL("../../../", import.meta.url));
+const { chromium } = createRequire(`${repo}kiosk/package.json`)("@playwright/test");
+const NONE = { top: 0, right: 0, bottom: 0, left: 0 };
 // CSS viewports with Safari's toolbars showing. iPhone insets are the Dynamic Island and home
 // indicator; without `viewport-fit=cover` Safari letterboxes landscape to 932 − 2 × 59 px.
-export const DEVICES = [
+const DEVICES = [
   {
     name: "iphone-portrait",
     width: 430,
@@ -34,8 +36,8 @@ export const DEVICES = [
   { name: "macbook-14", width: 1512, height: 982, dpr: 2, touch: false, insets: NONE },
   { name: "monitor-27", width: 2560, height: 1440, dpr: 1, touch: false, insets: NONE },
   { name: "kiosk-console", width: 1728, height: 1117, dpr: 1, touch: false, insets: NONE },
-] as const;
-export const PAGES = ["/", "/ups", "/llm", "/network", "/devices/factory-gpu", "/topology"];
+];
+const PAGES = ["/", "/ups", "/llm", "/network", "/devices/factory-gpu", "/topology"];
 // Fixed-height boxes that scroll on purpose (styleguide, MET-296), plus React Flow's pane.
 const SCROLLERS = [
   "[role=log]",
@@ -45,17 +47,112 @@ const SCROLLERS = [
   ".select-content",
   ".react-flow",
 ];
-
 const base = process.env.BASE_URL ?? "http://127.0.0.1:4180";
-const out = process.env.DEVICES_OUT ?? "../.amp/in/artifacts/devices";
+const out =
+  process.env.DEVICES_OUT ??
+  (process.env.VERIFY_ROOT
+    ? `${process.env.VERIFY_ROOT}/evidence/devices`
+    : `${repo}.amp/in/artifacts/devices`);
 const only = process.env.DEVICES?.split(",");
-const themes = (process.env.THEMES ?? "dark,light").split(",") as ("dark" | "light")[];
+const themes = (process.env.THEMES ?? "dark,light").split(",");
 const strict = process.env.DEVICES_STRICT !== "0";
 await mkdir(out, { recursive: true });
 const browser = await chromium.launch();
-const reports: unknown[] = [];
-const failures: string[] = [];
-
+const reports = [];
+const failures = [];
+async function explanation(device, theme) {
+  const name = `${device.name}-${theme}-topology-explanation`;
+  const context = await browser.newContext({
+    viewport: { width: device.width, height: device.height },
+    deviceScaleFactor: device.dpr,
+    isMobile: device.touch,
+    hasTouch: device.touch,
+    colorScheme: theme,
+    reducedMotion: "reduce",
+  });
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto(`${base}/topology`);
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Emulation.setSafeAreaInsetsOverride", { insets: device.insets });
+  await page.locator(".react-flow__node").first().waitFor();
+  await page.getByRole("button", { name: "Linear dispatch", exact: true }).click();
+  await page.getByRole("button", { name: "How linear dispatch works" }).click();
+  await page.locator("#topology-steps").waitFor({ state: "visible" });
+  await page.waitForTimeout(400);
+  const result = await page.evaluate(() => {
+    const box = document.getElementById("topology-steps");
+    const label = (node) =>
+      `${node.tagName.toLowerCase()}${node.id ? `#${node.id}` : ""}.${String(node.className).split(" ")[0]} ${node.scrollHeight}/${node.clientHeight}`;
+    // The box itself or any ancestor that clips or scrolls its text vertically.
+    const nested = [];
+    for (let node = box; node && node !== document.documentElement; node = node.parentElement) {
+      const css = getComputedStyle(node);
+      if (
+        /(auto|scroll|hidden|clip)/.test(css.overflowY) &&
+        node.scrollHeight > node.clientHeight + 1
+      )
+        nested.push(label(node));
+    }
+    for (const node of box.querySelectorAll("*")) {
+      const css = getComputedStyle(node);
+      if (/(auto|scroll)/.test(css.overflowY) && node.scrollHeight > node.clientHeight + 1)
+        nested.push(label(node));
+    }
+    // Every heading, paragraph, step and legend line can be brought on screen by scrolling
+    // the document and is the topmost element there (not under the sticky bar or clipped).
+    const parts = [...box.querySelectorAll("h3, p, li, .topology-legend span")];
+    const unreachable = [];
+    for (const part of parts) {
+      part.scrollIntoView({ block: "center", behavior: "instant" });
+      const rect = part.getBoundingClientRect();
+      const x = Math.min(innerWidth - 1, Math.max(0, rect.left + Math.min(rect.width / 2, 40)));
+      const y = rect.top + rect.height / 2;
+      const hit = document.elementFromPoint(x, y);
+      if (y < 0 || y > innerHeight || !hit || !(part === hit || part.contains(hit)))
+        unreachable.push(
+          `${part.tagName.toLowerCase()} "${(part.textContent ?? "").trim().slice(0, 40)}" at y ${Math.round(y)}`,
+        );
+    }
+    scrollTo({ top: 0, behavior: "instant" });
+    return {
+      popover: box.hasAttribute("popover"),
+      viewport: { width: innerWidth, height: innerHeight },
+      scrollWidth: document.scrollingElement.scrollWidth,
+      scrollHeight: document.scrollingElement.scrollHeight,
+      parts: parts.length,
+      nested,
+      unreachable,
+    };
+  });
+  const problems = [
+    ...(result.viewport.width !== device.width
+      ? [`layout viewport ${result.viewport.width} px, expected ${device.width} px`]
+      : []),
+    ...(result.scrollWidth > result.viewport.width
+      ? [`page scrolls horizontally: ${result.scrollWidth} > ${result.viewport.width}`]
+      : []),
+    ...result.nested.map((entry) => `explanation in a nested vertical scroller: ${entry}`),
+    ...result.unreachable.map((entry) => `explanation text not reachable: ${entry}`),
+    ...errors.map((error) => `page error: ${error}`),
+  ];
+  await page.screenshot({ path: `${out}/${name}.png`, fullPage: true });
+  for (const problem of problems) failures.push(`${name}: ${problem}`);
+  console.log(
+    `${name}: ${result.viewport.width}×${result.viewport.height} doc ${result.scrollWidth}×${result.scrollHeight} ${result.parts} parts${problems.length ? ` — ${problems.length} problem(s)` : ""}`,
+  );
+  reports.push({
+    name,
+    device: device.name,
+    theme,
+    path: "/topology",
+    journey: "explanation",
+    ...result,
+    problems,
+  });
+  await context.close();
+}
 try {
   for (const device of DEVICES.filter((d) => !only || only.includes(d.name)))
     for (const theme of themes) {
@@ -69,7 +166,7 @@ try {
       });
       for (const path of PAGES) {
         const page = await context.newPage();
-        const errors: string[] = [];
+        const errors = [];
         page.on("pageerror", (error) => errors.push(error.message));
         await page.goto(`${base}${path}`);
         const cover = await page.evaluate(() =>
@@ -99,8 +196,8 @@ try {
         const layout = await page.evaluate(
           ({ insets, touch, scrollers }) => {
             const viewport = { width: innerWidth, height: innerHeight };
-            const scrolling = document.scrollingElement!;
-            const visible = (element: Element) => {
+            const scrolling = document.scrollingElement;
+            const visible = (element) => {
               if (
                 element.closest(
                   ".fk-backdrop, svg, [hidden], .skip-link, #recharts_measurement_span",
@@ -112,10 +209,10 @@ try {
               const rect = element.getBoundingClientRect();
               return rect.width > 0.5 && rect.height > 0.5;
             };
-            const label = (element: Element) =>
+            const label = (element) =>
               `${element.tagName.toLowerCase()}${element.className && typeof element.className === "string" ? "." + element.className.trim().split(/\s+/).slice(0, 2).join(".") : ""} "${(element.getAttribute("aria-label") ?? element.textContent ?? "").trim().slice(0, 30)}"`;
             // Inside an element that scrolls or clips horizontally on purpose (tables, React Flow).
-            const clippedX = (element: Element) => {
+            const clippedX = (element) => {
               for (
                 let node = element.parentElement;
                 node && node !== document.body;
@@ -126,8 +223,8 @@ try {
               }
               return false;
             };
-            const outside: string[] = [];
-            const safe: string[] = [];
+            const outside = [];
+            const safe = [];
             let minFont = Infinity;
             let minFontText = "";
             for (const element of document.querySelectorAll("body *")) {
@@ -156,7 +253,7 @@ try {
               if (insets.bottom && padding < insets.bottom)
                 safe.push(`footer padding-bottom ${padding} < ${insets.bottom}`);
             }
-            const inner: string[] = [];
+            const inner = [];
             for (const element of document.querySelectorAll("body *")) {
               const css = getComputedStyle(element);
               if (!/(auto|scroll)/.test(css.overflowY)) continue;
@@ -164,7 +261,7 @@ try {
               if (scrollers.some((selector) => element.closest(selector))) continue;
               inner.push(`${label(element)} ${element.scrollHeight}/${element.clientHeight}`);
             }
-            const small: string[] = [];
+            const small = [];
             if (touch)
               for (const element of document.querySelectorAll(
                 'a[href], button, input, select, textarea, [role="button"], [role="combobox"]',
@@ -223,7 +320,7 @@ try {
         try {
           contrast = await auditContrast(page, name);
         } catch (error) {
-          problems.push((error as Error).message);
+          problems.push(error.message);
         }
         for (const problem of problems) failures.push(`${name}: ${problem}`);
         console.log(
@@ -244,6 +341,12 @@ try {
       }
       await context.close();
     }
+  // The topology explanation on a phone: select Linear dispatch, open "How … works" and
+  // require every step to be reachable by scrolling the document, never an inner scroller.
+  for (const device of DEVICES.filter(
+    (d) => d.name.startsWith("iphone") && (!only || only.includes(d.name)),
+  ))
+    for (const theme of themes) await explanation(device, theme);
 } finally {
   await browser.close();
   await writeFile(
@@ -256,5 +359,5 @@ if (failures.length) {
   if (strict) process.exit(1);
 }
 console.log(
-  `Device matrix: ${reports.length} page × viewport × theme captures, ${failures.length} problem(s).`,
+  `Device matrix: ${reports.length} captures (pages × viewports × themes, plus the topology explanation), ${failures.length} problem(s).`,
 );

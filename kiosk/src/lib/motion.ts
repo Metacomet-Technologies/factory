@@ -66,6 +66,22 @@ export function useChartMotion() {
 /** Phone-sized viewports, both iPhone orientations: the scene holds and event pulses are off. */
 export const PHONE = "(max-width: 932px) and (max-height: 932px)";
 
+const subscribePhone = (callback: () => void) => {
+  if (typeof matchMedia !== "function") return () => {};
+  const media = matchMedia(PHONE);
+  media.addEventListener("change", callback);
+  return () => media.removeEventListener("change", callback);
+};
+
+/** True on a phone-sized viewport (`PHONE`), following rotation and resizes. */
+export function usePhone() {
+  return useSyncExternalStore(
+    subscribePhone,
+    () => typeof matchMedia === "function" && matchMedia(PHONE).matches,
+    () => false,
+  );
+}
+
 /**
  * Event pulse: fresh data landed. The Live chip throws one ripple and every `.fk-hero`
  * number flashes once over `--dur-event`. Pure CSS; under reduced motion and on phones it does

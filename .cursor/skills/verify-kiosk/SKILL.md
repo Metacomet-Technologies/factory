@@ -50,7 +50,7 @@ That command is the theme journey in [features/theme.md](features/theme.md). It 
 
 Other journeys are specified in `features/` and are not wrapped by the helper. Follow those files literally. Do not substitute a unit test or a direct `dataset.theme` write for a click.
 
-Any layout or CSS change must also pass the device matrix in [features/device-matrix.md](features/device-matrix.md): every page at Devon's iPhone, iPad, MacBook, 27-inch and kiosk viewports, both themes, through `vp run devices:check`.
+Any layout or CSS change must also pass the device matrix in [features/device-matrix.md](features/device-matrix.md): every page at Devon's iPhone, iPad, MacBook, 27-inch and kiosk viewports, both themes, plus the topology explanation on both iPhone orientations, through `node .cursor/skills/verify-kiosk/devices.mjs` (from the repo root). `devices.mjs` and `contrast.mjs` are the helpers; the contrast audit is a copy of the one in `kiosk/scripts/screenshots.ts`.
 
 ## Evidence
 

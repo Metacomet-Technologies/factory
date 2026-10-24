@@ -13,6 +13,23 @@
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
 }
+/* Phones (both iPhone orientations, PHONE in lib/motion.ts): the page grows with the inline
+   steps and the document scrolls; the map keeps a fixed share of the screen and its own
+   drag-to-pan and pinch-to-zoom. */
+@media (max-width: 932px) and (max-height: 932px) {
+  :root:has(.topology-page) #root {
+    height: auto;
+  }
+  .topology-page {
+    flex: 1 0 auto;
+    display: block;
+    overflow: visible;
+  }
+  .topology-page .topology-canvas {
+    flex: none;
+    height: clamp(300px, 70dvh, 560px);
+  }
+}
 .topology-page .page-header {
   margin-bottom: 12px;
 }
@@ -36,8 +53,12 @@
   overflow: hidden;
 }
 
-/* ---- Popover: the flow's steps, on the panel glass ---------------------------------- */
+/* ---- The flow's steps: a popover on the panel glass, inline on phones -------------- */
 .topology-steps {
+  gap: 8px;
+  color: var(--foreground);
+}
+.topology-steps[popover] {
   position: fixed;
   inset: auto;
   top: calc(112px + env(safe-area-inset-top));
@@ -45,11 +66,16 @@
   width: min(380px, calc(100vw - 32px));
   max-height: calc(100dvh - 160px);
   overflow: auto;
-  gap: 8px;
-  color: var(--foreground);
 }
-.topology-steps:not(:popover-open) {
+.topology-steps[popover]:not(:popover-open) {
   display: none;
+}
+/* Phones (topology-map.tsx usePhone): the steps sit in the panel above the map and the
+   document scrolls them; no height cap, no inner scroller. */
+.topology-steps-inline {
+  display: grid;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
 }
 .topology-steps h3 {
   font-size: 15px;

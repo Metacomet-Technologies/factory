@@ -33,7 +33,7 @@ the primitives do the heavy lifting, so prefer composing them over writing CSS.
    every state (steady, loading, error, outage, reconnecting). The screenshot
    script fails if the document or `.dashboard` overflows. Check the ≥1280 px
    grid in `index.css` after adding anything to the overview.
-8. Every page fits Devon's devices (see Layout): `vp run devices:check` fails
+8. Every page fits Devon's devices (see Layout): `node .cursor/skills/verify-kiosk/devices.mjs` fails
    on page-level horizontal scroll, content past the viewport or the safe
    area, an unlisted inner scroller, a touch target under 44 px or a contrast
    pair under AA at any matrix viewport.
@@ -88,12 +88,13 @@ Deviations from `tokens.json`, each one step away to clear AA over the scene
 - dark `--snow-opacity` 0.65 (was 0.75): headings and the power buttons that
   scroll over the lit peaks on phones and iPads keep 4.5:1.
 
-Measured minimums with the current tokens (`kiosk/screenshots/checks.json`):
+Measured minimums with the current tokens (`vp run screenshots` on the MET-297
+branch; the committed `kiosk/screenshots/` predate it):
 text 4.64:1 ("Pricing update pending" at 390 light), 4.71:1 ("Failing · —" at
 390 dark), 4.94:1 at 1728 dark, 5.04:1 at 1728 light; controls 3.85:1
 (pressed "1h" border at 390 light), 4.67:1 / 3.94:1 at 1728 dark / light.
 If you change a token, run the screenshot script and the device matrix
-(`vp run devices:check`) and keep every pair above its floor.
+(`node .cursor/skills/verify-kiosk/devices.mjs`) and keep every pair above its floor.
 
 ## Surfaces: liquid glass
 
@@ -266,7 +267,7 @@ stacks; numbers get `tabular-nums` from `body`.
   `--gutter-left/right` (`max(--gutter, env(safe-area-inset-*))`, `--gutter`
   14 / 28 / 40 px on phone / default / ≥ 1920 px); the top bar adds the top
   inset and the footer the bottom inset.
-- Device matrix (`kiosk/scripts/devices-check.ts`, `vp run devices:check`):
+- Device matrix (`node .cursor/skills/verify-kiosk/devices.mjs`, verify-kiosk skill):
   iPhone 15 Pro Max 430×739 portrait and 932×380 landscape (DPR 3, Dynamic
   Island and home-indicator insets), iPad Air 11" 820×1180 and 1180×820, MacBook
   Pro 14" 1512×982, 27" 2560×1440, kiosk 1728×1117.
@@ -306,7 +307,10 @@ stacks; numbers get `tabular-nums` from `body`.
   `@xyflow/react` loads only on this route (`lazy()` in `App.tsx`), so the
   overview chunk stays free of it; `topology.test.ts` walks the static imports
   to keep it that way. Colors come from tokens via `topology.css`; the
-  "How … works" steps open a native `popover`.
+  "How … works" steps open a native `popover`. On phones (`usePhone()`, the
+  `PHONE` query) the button is a disclosure (`aria-expanded`) and the steps
+  render inline above the map, so the document scrolls them; the map keeps a
+  `clamp(300px, 70dvh, 560px)` canvas with its own drag-to-pan and pinch-zoom.
 
 ## Live data
 
@@ -360,11 +364,14 @@ From `kiosk/` after `source /home/agent/.config/vite-plus/env`:
   motion stops everything. Results in `.amp/in/artifacts/ambient/`.
 - `kiosk/scripts/ambient-trial.sh both` on the console for the 15%-of-all-cores
   rule (MET-237).
-- `vp run devices:check` against the mock preview (`BASE_URL`, default
-  `http://127.0.0.1:4180`; about four minutes): every page at every matrix
-  viewport in both themes in Chromium device emulation with the safe-area
-  insets, as rule 8 describes. Full-page screenshots and `devices-check.json`
-  go to `DEVICES_OUT` (default `.amp/in/artifacts/devices/` at the repo root).
+- `node .cursor/skills/verify-kiosk/devices.mjs` from the repo root against a running mock (`BASE_URL`,
+  default `http://127.0.0.1:4180`; about four minutes): every page at every
+  matrix viewport in both themes in Chromium device emulation with the
+  safe-area insets, as rule 8 describes, then the topology "How linear
+  dispatch works" explanation at 932×380 and 430×739 (no nested vertical
+  scroller, no horizontal overflow, every line reachable). Full-page
+  screenshots and `devices-check.json` go to `DEVICES_OUT` (default
+  `$VERIFY_ROOT/evidence/devices`, else `.amp/in/artifacts/devices/`).
   `DEVICES=` and `THEMES=` narrow a run. WebKit is not covered: its system
   libraries are not part of the environment contract.
 
