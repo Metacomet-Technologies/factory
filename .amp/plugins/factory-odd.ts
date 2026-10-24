@@ -88,7 +88,8 @@ export default async function (amp: PluginAPI) {
 	// --- Control plane: armed only in the labelled control thread inside an orb ---------------
 	// The label is usually set after the thread's first session.start, so every turn boundary
 	// re-checks it; `armed` keeps the webhooks and the one-time URL dialog from repeating.
-	type ArmState = { armed: boolean; error?: string; webhooks: string[] }
+	// `urls` are credentials: kept in memory, shown only through the confirm dialog, never returned.
+	type ArmState = { armed: boolean; error?: string; webhooks: string[]; urls: string[] }
 	const armState = new Map<ThreadID, ArmState>()
 	amp.on('session.start', async (_event, ctx) => arm(ctx, await ctx.thread.labels()))
 	amp.on('agent.start', async (_event, ctx) => {
@@ -100,19 +101,27 @@ export default async function (amp: PluginAPI) {
 	// returns webhook URLs.
 	amp.registerTool({
 		name: 'odd_control_status',
-		description: 'ODD control plane state for this thread: labels, executor kind, whether webhooks are armed, last arming error. Pass arm: true to arm now (control thread in an orb only).',
-		inputSchema: { type: 'object', properties: { arm: { type: 'boolean', description: 'Arm the control plane now if not armed' } } },
+		description:
+			'ODD control plane state for this thread: labels, executor kind, whether webhooks are armed, last arming error. Pass arm: true to arm now (control thread in an orb only). Pass show_urls: true to show the webhook URLs to the human in a confirm dialog; the call blocks until they answer. URLs are never returned to the agent.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				arm: { type: 'boolean', description: 'Arm the control plane now if not armed' },
+				show_urls: { type: 'boolean', description: 'Show the webhook URLs to the human in a dialog and wait for them to confirm' },
+			},
+		},
 		async execute(input, ctx) {
 			const labels = await ctx.thread.labels()
 			if (input.arm === true) await arm(ctx, labels)
-			const state = armState.get(ctx.thread.id) ?? { armed: false, webhooks: [] }
-			return JSON.stringify({ thread: ctx.thread.id, labels, executor: amp.system.executor.kind, ...state })
+			const { urls, ...state } = armState.get(ctx.thread.id) ?? { armed: false, webhooks: [], urls: [] }
+			const dialog = input.show_urls === true && urls.length > 0 ? await showUrls(ctx, urls) : undefined
+			return JSON.stringify({ thread: ctx.thread.id, labels, executor: amp.system.executor.kind, ...state, dialog })
 		},
 	})
 
 	async function arm(ctx: Pick<PluginEventContext<'agent.end'>, 'thread' | 'ui' | 'logger'>, labels: readonly string[]) {
 		if (!labels.includes(controlLabel) || armState.has(ctx.thread.id)) return
-		const state: ArmState = { armed: false, webhooks: [] }
+		const state: ArmState = { armed: false, webhooks: [], urls: [] }
 		armState.set(ctx.thread.id, state)
 		try {
 			await armWebhooks(ctx, state)
@@ -144,17 +153,21 @@ export default async function (amp: PluginAPI) {
 			}
 			await perform(hctx, issue, action)
 		}
-		const urls = await Promise.all((['linear', 'github', 'slack'] as const).map(async key => {
+		for (const key of ['linear', 'github', 'slack'] as const) {
 			const { url } = await amp.createWebhook({ key, headers: ['x-hub-signature-256', 'linear-signature', 'x-slack-signature'], handler: handle(key) })
 			state.webhooks.push(key)
-			return `${key}: ${url}`
-		}))
-		// The URLs are credentials. They are shown once, in the control thread, for Devon to paste
-		// into Linear, GitHub and Slack. Never log or post them anywhere else. Not awaited: the
-		// dialog waits for a human and must not hold the turn boundary that armed it.
-		void ctx.ui
-			.confirm({ title: 'ODD webhook endpoints', message: urls.join('\n'), confirmButtonText: 'Configured', requireHuman: true })
-			.catch((error: unknown) => ctx.logger.log(marker, 'webhook dialog failed', String(error)))
+			state.urls.push(`${key}: ${url}`)
+		}
+		// Not awaited: the dialog waits for a human and must not hold the turn boundary that
+		// armed it. odd_control_status({ show_urls: true }) shows it again on demand and waits.
+		void showUrls(ctx, state.urls).catch((error: unknown) => ctx.logger.log(marker, 'webhook dialog failed', String(error)))
+	}
+
+	// The URLs are credentials, shown only in the control thread for Devon to paste into Linear,
+	// GitHub and Slack. Never log or post them anywhere else.
+	async function showUrls(ctx: Pick<PluginEventContext<'agent.end'>, 'ui'>, urls: readonly string[]) {
+		const confirmed = await ctx.ui.confirm({ title: 'ODD webhook endpoints', message: urls.join('\n'), confirmButtonText: 'Configured', requireHuman: true })
+		return confirmed ? 'configured' : 'dismissed'
 	}
 
 	// Phases 3-6 fill in `perform` stage by stage; today only spawn, steer and page are wired.
