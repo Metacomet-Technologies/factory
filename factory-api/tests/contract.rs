@@ -1161,8 +1161,8 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
     // warnings (5) plus one selected-model read; was 11 before MET-205 and
     // 16 with live history reads before MET-204.
     const USAGE: usize = 6;
-    const PRICING: usize = 9;
-    const CONFIRM: usize = 29;
+    const PRICING: usize = 2;
+    const CONFIRM: usize = 9;
     const NO_DATABASE: usize = 0;
     // Includes v1–v6 manifests, legacy warning adoption, cost-backfill seeding
     // (one row per family) and runner validation.
@@ -1338,6 +1338,25 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
                         );
                         assert_eq!(cost["unpriced_requests"], 0);
                     }
+                } else if path == "/v1/pricing" {
+                    let value: Value = serde_json::from_slice(&body)?;
+                    let start = at - 10_000_000;
+                    let (last_refresh, last_selection) = if n == 3 { (4, 3) } else { (31, 30) };
+                    assert_eq!(value["families"], json!([
+                            {
+                                "family": "Claude Sonnet",
+                                "selected": {"model_id": "anthropic/claude-sonnet-5.5", "effective_from_ms": start + last_selection},
+                                "pending": {"model_id": "anthropic/claude-sonnet-6", "effective_from_ms": at - 2000},
+                                "rates": {"input_per_mtok": 3.0, "output_per_mtok": 15.0, "source": "openrouter", "fetched_at_ms": start + last_refresh}
+                            },
+                            {
+                                "family": "ChatGPT mid-tier",
+                                "selected": {"model_id": "openai/gpt-5.6-sol", "effective_from_ms": start},
+                                "pending": {"model_id": "openai/gpt-6-sol", "effective_from_ms": at - 2000},
+                                "rates": {"input_per_mtok": 2.0, "output_per_mtok": 10.0, "source": "openrouter", "fetched_at_ms": start + last_refresh}
+                            }
+                    ]));
+                    assert_eq!(value["warnings"].as_array().unwrap().len(), 4);
                 } else if path.contains("confirm") {
                     let value: Value = serde_json::from_slice(&body)?;
                     assert_eq!(
@@ -1407,8 +1426,8 @@ async fn measured_endpoint_budgets_and_all_connection_settings() -> Result<()> {
                 .iter()
                 .all(|w| w.as_str().unwrap().contains("cross-check unavailable"))
         );
-        // Two views (8 before / 9 after), six fixed job statements, then batches.
-        assert_eq!(scope.counts().data, 17 + 6 + (2 * n).div_ceil(100) + 1 + 1);
+        // Two views (2 each), six fixed job statements, then batches.
+        assert_eq!(scope.counts().data, 4 + 6 + (2 * n).div_ceil(100) + 1 + 1);
         assert_eq!(scope.counts().transaction, 6);
         assert_eq!((scope.counts().setup, scope.counts().maintenance), (0, 0));
         eprintln!("n={n} /v1/pricing/refresh: {:?}", scope.counts());

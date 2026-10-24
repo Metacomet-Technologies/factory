@@ -200,9 +200,11 @@ rollup checkpoint. Rows are plain inserts, so a known ID is never rewritten.
 
 Measured budgets (enforced in tests): API usage **6** reads for every range,
 replacing 11. Meter stats **3**, GPU history **≤2**, health/requests 1. A full
-5,000-row API rollup batch is **≤16**. Pricing, confirm and refresh keep today's
-measured budgets: pricing **9**, confirm **29**, refresh view reads **17**. Their
-step-5 targets (≤3 / ≤12 / ≤6 view reads) moved to MET-230 and are not met here.
+5,000-row API rollup batch is **≤16**. MET-230 consolidates the API pricing view:
+pricing **2**, HTTP confirm **9**, refresh view reads **4**, meeting the step-5
+targets (≤3 / ≤12 / ≤6 view reads). The view batches indexed selection and rate
+lookups for all configured families and omits pending rates, which the API does
+not return. No schema or pricing-service change is needed.
 Sync pages keep MET-204's budget.
 A rewinding cost page adds at most one status read and three rewrite statements
 when its rows are already rolled up. Requests setup is 132 statements (116).
@@ -1045,9 +1047,9 @@ maintenance statements are counted separately, never hidden in data ceilings.
 | meter health / requests / stats / GPU history | 1 / 1 per page / ≤4 with rollups+raw quantile / ≤2 with raw+hourly history |
 | API health/fleet/agents/SSE/static/OpenAPI and GPU collector | Measured ceiling **0** local DB statements; target after step 5: **0** |
 | API GPU | Measured ceiling **0** local; target after step 5: **0 local, ≤2 upstream history** (upstream enforcement awaits meter adoption) |
-| API usage | Measured ceiling **11** total reads for 24h/7d/30d with two selected and pending families (16 before MET-204 froze costs); target after step 5: **≤8**, regardless of R |
-| API pricing / confirm | Measured ceilings **9 / 29** across all views and confirmation, including HTTP confirmation preflight; target after step 5: **≤3 / ≤12** |
-| API pricing refresh | Measured **26 / 46** for 3 / 1,001 models per source, two asymmetric families: 17 before/after view reads + job formula below. Worst view ceiling is 18. Target after step 5: **≤6 view reads** plus job budget |
+| API usage | Measured ceiling **6** total reads for 24h/7d/30d with two selected and pending families, regardless of R (11 before MET-205, 16 before MET-204 froze costs) |
+| API pricing / confirm | Measured ceilings **2 / 9** across all views and confirmation, including HTTP confirmation preflight (MET-230) |
+| API pricing refresh | Measured **13 / 33** for 3 / 1,001 models per source, two asymmetric families: **4** before/after view reads + job formula below (MET-230) |
 | API meter-sync page | MET-204 measured job ceiling **2 + ceil(n/100) + ceil(g/100) + 3F + ceil(F·n/200)** for pages with inference rows (F families, 3 pricing-history reads each; cost rows batch 200), plus **1 cursor read per sync run**; raw/warning inserts batch 100 rows, no per-row SELECT. Target after step 5: **≤10 + 2*ceil(n/100)** including pricing history and separate raw/cost batches; n≤5,000 (current wire pages ≤500) |
 | API cost backfill | MET-204 measured **≤ 2 + ceil(F·500/200) + F** per ≤500-row transaction (9 at F=2), F more when an estimate fill-in rewinds, **1 + 2F** at completion, 3F pricing reads per poll, **1** when idle; at most 20 transactions per 30 s poll |
 | Pricing refresh | **P6 fixed and enforced:** ≤6 + ceil(M/100) + ceil(B/100) + ceil(I/100) for two configured families. Measured **9 / 29** with 3 / 1,001 fallback source rows, two pending rows and 10 / 1,008 items. One bulk release-history read, no S per-model reads; M is total source rows, B pending rows, I items |
@@ -1059,7 +1061,7 @@ families with asymmetric history, NULL/non-NULL model groups, and both selected
 and pending rates. Usage costs/tokens and confirmation outcomes are asserted.
 All-gap sync fixtures measure 4 and 26 statements respectively (page jobs 3 and
 11/11/3, plus the initial cursor read). The inherited single-selected-family
-case remains 13 reads for 1 and 1,000 rows; it is not the worst successful view.
+usage case measures 6 reads for 1 and 1,000 rows too.
 Usage/pricing/HTTP confirm additionally count 4/2/8 transaction statements.
 Fresh API startup counts 72 requests-DB and 74 pricing-DB setup statements across
 all six connections, plus one startup optimize per writer and a separate read-only
