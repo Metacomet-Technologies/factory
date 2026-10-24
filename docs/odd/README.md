@@ -288,6 +288,7 @@ Each artifact is machine-checkable before the next role starts.
 ┌──────────────────────── Amp orb: thread "Factory ODD control" ───────────────────────┐
 │ .amp/plugins/factory-odd.ts                                                           │
 │  webhooks: /linear /github /slack  ─▶ dedupe ─▶ derive state ─▶ next action           │
+│  dry run unless the thread carries label odd-perform                                  │
 │  agents: odd-intake, odd-spec, odd-reviewer, odd-verifier, odd-watchdog (Amp-native)  │
 │  schedule: 10 min watchdog tick                                                       │
 └───────────────┬───────────────────────────────────────────────────────────┬───────────┘
@@ -348,9 +349,12 @@ by the previous one).
   root-owned checkout is the real boundary and is not in this plan.
 - Webhook burst limit (10/min) is fine for one team; a mass relabel would
   queue. The backstop covers it.
-- Plugin runtime secrets: the plugin needs a Linear API key and GitHub access
-  in the orb. GitHub comes through `gh`; Linear through a project secret.
-  Verified in phase 2.
+- Plugin runtime access: GitHub comes through `gh`; Linear through the
+  control thread's own Linear MCP (`ctx.tools.call('linear.get_issue')`), so
+  no API key lives in the orb. Thread state comes from `find_thread` and
+  `get_thread_status` the same way. Open blockers are not exposed by the
+  Linear MCP; until phase 4 adds them, `openBlockers` is empty and builders
+  are not spawned (dry run).
 - Decision-model classifications can be wrong or steered by issue text. They
   pick defaults only; anything that widens authority (risk downgrade, merge,
   deploy) is decided by deterministic evidence.
