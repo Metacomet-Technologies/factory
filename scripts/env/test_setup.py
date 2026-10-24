@@ -146,8 +146,13 @@ class SetupTest(unittest.TestCase):
             write(os.path.join(stubs, name), "#!/bin/sh\nexit 0\n", 0o755)
         for name, body in LATE.items():
             write(os.path.join(late, name), f'#!/bin/sh\necho "{name} $*" >> "$FAKE_LOG"\n{body}', 0o755)
+        # Do not expose host-installed convenience tools after removing a stub.
+        system = os.path.join(self.base, "system-bin")
+        os.makedirs(system)
+        for name in "bash sh dirname realpath python3 grep mkdir mktemp rm sha256sum tar unzip install ln cp mv chmod env true".split():
+            os.symlink(shutil.which(name), os.path.join(system, name))
         self.env = {
-            "PATH": f"{stubs}:/usr/bin:/bin",
+            "PATH": f"{stubs}:{system}",
             "HOME": self.home,
             "ENV_CHECK": os.path.join(self.base, "check"),
             "FAKE_STATE": self.state,
@@ -308,7 +313,7 @@ class SetupTest(unittest.TestCase):
         # and left the bun shim in fallback-bin, behind the system one.
         system = os.path.join(self.base, "system")
         write(os.path.join(system, "bun"), "#!/bin/sh\necho 1.3.10\n", 0o755)
-        self.env["PATH"] = self.env["PATH"].replace(":/usr/bin", f":{system}:/usr/bin")
+        self.env["PATH"] = f"{system}:{self.env['PATH']}"
         self.mark(*(f"apt-{p}" for p in PACKAGES), "rust", "js")
         subprocess.run(["bash", "-c", "curl -fsSL https://vite.plus | bash"], env=self.env, check=True)
         self.assertTrue(os.path.exists(os.path.join(self.home, "vp", "fallback-bin", "bun")))
