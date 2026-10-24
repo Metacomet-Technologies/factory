@@ -420,3 +420,22 @@ by the previous one).
 - Decision-model classifications can be wrong or steered by issue text. They
   pick defaults only; anything that widens authority (risk downgrade, merge,
   deploy) is decided by deterministic evidence.
+
+## 12. Operating ODD
+
+Three threads exist, with different jobs:
+
+| Thread | What it is | Started by | Lives |
+| --- | --- | --- | --- |
+| Control orb (label `odd-control-plane`) | The operator: plugin, webhooks, sweep, spawns, merges, pages. | Once; re-armed in place after each plugin merge. | Until the orb dies; then a new orb thread with the label (webhooks re-arm). |
+| Role threads (`odd-role-*`) | Intake, Spec, Builder, Reviewer, Verifier, Deployer (log reader). | The control orb. | One round each; the sweep archives finished ones. |
+| Engineer (`/odd-engineer`) | Changes ODD itself: a phase, a plugin fix, a role contract. Reloads the control orb after a plugin merge. | Devon, per phase: new thread on this repository with `/odd-engineer MET-n`. | Retire it when the phase is merged and the control orb runs the new HEAD. |
+
+Devon's inputs are: move an idea from Backlog to Triage, file a bug, answer a
+page in Slack, decide a non-ordinary risk sitting in Triage, and say "merge"
+for a plugin PR (the one path still merged by hand during the rollout).
+Status on demand comes from the control orb's `odd_control_status`.
+
+Off-switch: remove the `odd-perform` label from the control thread; it keeps
+evaluating and records `dry-run`. Re-add the label to resume. Never rotate or
+show the webhook URLs.
