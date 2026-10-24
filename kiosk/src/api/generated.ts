@@ -1379,7 +1379,7 @@ export interface components {
       version?: string | null;
     };
     /** @enum {string} */
-    ServiceKind: "http" | "tcp" | "systemd";
+    ServiceKind: "http" | "tcp" | "rdp" | "systemd";
     SmartStatus: {
       availability: components["schemas"]["Availability"];
       detail?: string | null;
