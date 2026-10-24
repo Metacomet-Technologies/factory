@@ -458,10 +458,17 @@ async function archiveThreads(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger
 	}
 }
 
-// The search is only a prefilter (quoted, since an unquoted `MET-301` also matches `301`); a PR
-// counts only if it owns the issue by branch name or `closes`/`contributes` line (prOwnsIssue).
-async function pullRequestsFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, identifier: string, state: 'all' | 'open'): Promise<GitHubPullRequest[]> {
-	const result = await ctx.$`gh pr list --search ${`"${identifier}"`} --state ${state} --json number,headRefName,headRefOid,state,mergeCommit,statusCheckRollup,body --limit 20`
+// A PR counts only if it owns the issue by branch name or `closes`/`contributes` line
+// (prOwnsIssue). Open PRs are listed directly, because GitHub's search index lags a just-opened
+// PR by minutes (MET-279 was moved to Deploying off an older merged PR while #180 was open);
+// merged ones were indexed while open, so the quoted search (an unquoted `MET-301` also matches
+// `301`) is a safe prefilter for them.
+const prFields = 'number,headRefName,headRefOid,state,mergeCommit,statusCheckRollup,body'
+
+async function pullRequestsFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, identifier: string, state: 'merged' | 'open'): Promise<GitHubPullRequest[]> {
+	const result = state === 'open'
+		? await ctx.$`gh pr list --state open --json ${prFields} --limit 100`
+		: await ctx.$`gh pr list --search ${`"${identifier}"`} --state merged --json ${prFields} --limit 20`
 	if (result.exitCode !== 0) {
 		ctx.logger.log(marker, 'gh pr list failed', result.stderr.trim())
 		return []
@@ -470,9 +477,11 @@ async function pullRequestsFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>,
 }
 
 async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, identifier: string): Promise<GitHubPullRequest | undefined> {
-	const prs = await pullRequestsFor(ctx, identifier, 'all')
 	// Prefer the open PR; otherwise the merged one, so a merged issue derives `Deploying`.
-	return prs.find(pr => pr.state === 'OPEN') ?? prs.find(pr => pr.state === 'MERGED')
+	const [open] = await pullRequestsFor(ctx, identifier, 'open')
+	if (open) return open
+	const [merged] = await pullRequestsFor(ctx, identifier, 'merged')
+	return merged
 }
 
 // `known` are thread IDs this control plane spawned that the search index may not return yet.
