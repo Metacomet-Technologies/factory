@@ -258,27 +258,91 @@ pub fn pricing_view(
             .filter(|i| i.kind == "warning")
             .map(|i| format!("{}: {}", i.family, i.message)),
     );
-    let families = store
-        .show(references, crate::now_ms())?
-        .into_iter()
-        .map(|s| Family {
-            family: s.family,
-            selected: s.selected.map(|s| Selection {
-                model_id: s.model_id,
-                effective_from_ms: s.effective_from_ms,
-            }),
-            pending: s.pending.map(|s| Selection {
-                model_id: s.model_id,
-                effective_from_ms: s.effective_from_ms,
-            }),
-            rates: s.rates.map(|r| Rates {
-                input_per_mtok: r.model.input_micro_usd_per_mtok as f64 / 1_000_000.0,
-                output_per_mtok: r.model.output_micro_usd_per_mtok as f64 / 1_000_000.0,
-                source: r.source,
-                fetched_at_ms: r.fetched_at_ms,
-            }),
-        })
-        .collect();
+    let mut families = Vec::with_capacity(references.len());
+    if !references.is_empty() {
+        // One bounded lookup per configured family, in one statement. Pending
+        // rates are not part of the API response. Keep the store's historical
+        // cutoffs and refresh/source/id tie-breaking without loading history.
+        let values = references
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("({i},?{})", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let at = references.len() + 1;
+        let sql = format!(
+            "WITH families(position,name) AS (VALUES {values})
+             SELECT families.position,families.name,s.model_id,s.effective_from_ms,
+                    p.model_id,p.effective_from_ms,r.input_micro_usd_per_mtok,
+                    r.output_micro_usd_per_mtok,r.source,r.fetched_at_ms
+             FROM families
+             LEFT JOIN reference_selection s ON s.id=(
+                 SELECT id FROM reference_selection
+                 WHERE family=families.name AND confirmed=1 AND effective_from_ms<=?{at}
+                 ORDER BY effective_from_ms DESC,id DESC LIMIT 1)
+             LEFT JOIN reference_selection p ON p.id=(
+                 SELECT id FROM reference_selection INDEXED BY selection_pending
+                 WHERE family=families.name AND confirmed=0
+                   AND refresh_id=(SELECT MAX(id) FROM refreshes)
+                   AND id>COALESCE((SELECT MAX(id) FROM reference_selection INDEXED BY selection_confirmed_id
+                                   WHERE family=families.name AND confirmed=1),0)
+                 ORDER BY effective_from_ms DESC,id DESC LIMIT 1)
+             LEFT JOIN price_snapshots r ON r.id=(
+                 SELECT id FROM price_snapshots INDEXED BY snapshot_lookup
+                 WHERE model_id=s.model_id AND fetched_at_ms<=?{at}
+                 ORDER BY fetched_at_ms DESC,refresh_id DESC,(source='openrouter') DESC,id DESC LIMIT 1)"
+        );
+        let mut parameters: Vec<rusqlite::types::Value> =
+            references.iter().map(|r| r.name.clone().into()).collect();
+        parameters.push(crate::now_ms().into());
+        let mut rows = store
+            .connection()
+            .prepare(&sql)?
+            .query_map(rusqlite::params_from_iter(parameters), |r| {
+                let selected = r
+                    .get::<_, Option<String>>(2)?
+                    .map(|model_id| -> rusqlite::Result<_> {
+                        Ok(Selection {
+                            model_id,
+                            effective_from_ms: r.get(3)?,
+                        })
+                    })
+                    .transpose()?;
+                let pending = r
+                    .get::<_, Option<String>>(4)?
+                    .map(|model_id| -> rusqlite::Result<_> {
+                        Ok(Selection {
+                            model_id,
+                            effective_from_ms: r.get(5)?,
+                        })
+                    })
+                    .transpose()?;
+                let rates = r
+                    .get::<_, Option<i64>>(6)?
+                    .map(|input| -> rusqlite::Result<_> {
+                        Ok(Rates {
+                            input_per_mtok: input as f64 / 1_000_000.0,
+                            output_per_mtok: r.get::<_, i64>(7)? as f64 / 1_000_000.0,
+                            source: r.get(8)?,
+                            fetched_at_ms: r.get(9)?,
+                        })
+                    })
+                    .transpose()?;
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    Family {
+                        family: r.get(1)?,
+                        selected,
+                        pending,
+                        rates,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // Preserve configuration order, not SQLite's CTE traversal order.
+        rows.sort_by_key(|(position, _)| *position);
+        families.extend(rows.into_iter().map(|(_, family)| family));
+    }
     Ok(Pricing { families, warnings })
 }
 /// Frozen spend for one family over a usage range, summed with checked arithmetic.
@@ -832,10 +896,11 @@ mod tests {
             let requests = ["FROM requests", "FROM request_", "FROM spend_"]
                 .iter()
                 .any(|t| sql.contains(t));
+            let family_view = sql.starts_with("WITH families(position,name)");
             if requests {
                 // Window bounds: since, then hour/day boundaries.
                 parameters.extend((0..count).map(|_| 0.into()));
-            } else if sql.starts_with("SELECT 1,(SELECT model_id") {
+            } else if family_view || sql.starts_with("SELECT 1,(SELECT model_id") {
                 // Selected models: every family, then the instant.
                 parameters.extend((1..count).map(|_| "Claude Sonnet".to_owned().into()));
                 parameters.push(60.into());
@@ -848,7 +913,11 @@ mod tests {
                     "Claude Sonnet".to_owned().into()
                 });
             }
-            if count > 1 && !requests && !sql.starts_with("SELECT 1,(SELECT model_id") {
+            if count > 1
+                && !requests
+                && !family_view
+                && !sql.starts_with("SELECT 1,(SELECT model_id")
+            {
                 parameters.push(60.into());
             }
             let plan =
@@ -898,6 +967,31 @@ mod tests {
                     table: "cost_backfill",
                     reason: "one state row per configured reference family",
                 });
+            } else if family_view {
+                for index in [
+                    "selection_lookup",
+                    "selection_pending",
+                    "selection_confirmed_id",
+                ] {
+                    required.push(RequiredSearch {
+                        table: "reference_selection",
+                        index: Some(index),
+                    });
+                }
+                required.push(RequiredSearch {
+                    table: "price_snapshots",
+                    index: Some("snapshot_lookup"),
+                });
+                for table in ["s", "p", "r", "refreshes"] {
+                    required.push(RequiredSearch { table, index: None });
+                }
+                for table in ["families", "2"] {
+                    exceptions.push(Exception {
+                        kind: ExceptionKind::SmallWholeSetRead,
+                        table,
+                        reason: "two constant configuration rows, independent of stored history",
+                    });
+                }
             } else if sql.contains("FROM price_snapshots") {
                 required.push(RequiredSearch {
                     table: "price_snapshots",
