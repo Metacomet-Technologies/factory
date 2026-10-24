@@ -2,7 +2,7 @@
 // The control-plane plugin runs the sweep on a timer and does the IO; nothing here calls out.
 
 import { capacity, parseThreadLabels, type Action, type Load, type Role, type Status } from './lifecycle.ts';
-import { verdictPattern, type LiveThread } from './snapshot.ts';
+import { delivered, type LiveThread } from './snapshot.ts';
 
 /** Sweep cadence: every issue with live work or in an ODD-owned status is re-evaluated this often. */
 export const sweepMs = 10 * 60_000;
@@ -20,14 +20,14 @@ export const alertsChannel = 'factory-alerts';
 /**
  * Threads to cancel: the action waits on an idle thread of `action.stuck`'s role, and that
  * thread has been idle longer than `staleMs`. A thread the search index has not dated yet
- * (`updatedAt` missing) is never stale; a reviewer thread with a verdict has delivered.
+ * (`updatedAt` missing) is never stale, and neither is one that delivered (a reviewer with a
+ * verdict, a verifier of another receipt than `receiptSha`).
  */
-export function staleThreads(action: Action, threads: readonly LiveThread[], now: Date): LiveThread[] {
+export function staleThreads(action: Action, threads: readonly LiveThread[], now: Date, receiptSha?: string): LiveThread[] {
   if (action.kind !== 'wait' || !action.stuck) return [];
   return threads.filter(thread => {
     const { role } = parseThreadLabels(thread.labels);
-    if (role !== action.stuck || thread.state !== 'idle' || !thread.updatedAt) return false;
-    if (role === 'reviewer' && thread.labels.some(label => verdictPattern.test(label))) return false;
+    if (role !== action.stuck || thread.state !== 'idle' || !thread.updatedAt || delivered(thread, receiptSha)) return false;
     return now.getTime() - Date.parse(thread.updatedAt) > staleMs;
   });
 }
@@ -62,13 +62,16 @@ export type DigestInput = {
   cancelled: readonly string[];
 };
 
+/** The digest's first line; the sweep searches `#factory-alerts` for it so a plugin reload does not post the day twice. */
+export const digestHeading = (day: string) => `ODD digest ${day}`;
+
 const short = (sha: string) => sha.slice(0, 12);
 const list = <T>(items: readonly T[], line: (item: T) => string) => (items.length ? items.map(item => `- ${line(item)}`).join('\n') : '- none');
 
 /** The daily digest for `#factory-alerts`: counts, identifiers and SHAs only; never diffs or secrets. */
 export function digest(input: DigestInput): string {
   return [
-    `ODD digest ${input.day}`,
+    digestHeading(input.day),
     `Merged PRs (${input.merged.length}):`,
     list(input.merged, pr => `#${pr.number} ${pr.title} head ${short(pr.headSha)} merge ${short(pr.mergeSha)}`),
     `Issues Done (${input.done.length}):`,

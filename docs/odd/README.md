@@ -387,7 +387,11 @@ by the previous one).
    retries one round and pages `budget-ceiling` after that; caps and blind
    alerts once per episode; daily digest at 08:00 America/New_York; one page
    format; `merge()` un-drafts the PR and rechecks after a refusal; a merged
-   PR satisfies the builder and reviewer stops. The sweep also evaluates
+   PR satisfies the builder and reviewer stops. A delivered thread (reviewer
+   with a verdict, verifier labelled `odd-receipt-<sha12>` for an older
+   receipt) holds no round; verifier rounds count per receipt. The sweep
+   reads every page of issues and threads, and the digest is not reposted
+   after a plugin reload (it checks `#factory-alerts`). The sweep also evaluates
    `Backlog`, so every untriaged issue gets an Intake thread as orb capacity
    allows. Intake over-spawn (MET-304) is not fixed here.
 7. Retire the poller as primary; it stays as the backstop with the 20 minute

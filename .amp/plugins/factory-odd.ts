@@ -29,8 +29,8 @@ import {
 	type Role,
 } from '../../scripts/odd/lifecycle.ts'
 import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, roleLabelQueries, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
-import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, overCaps, restoreStatus, staleThreads, sweepMs, type DigestInput } from '../../scripts/odd/watchdog.ts'
+import { finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, receiptLabel, roleLabelQueries, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
+import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, digestHeading, overCaps, restoreStatus, staleThreads, sweepMs, type DigestInput } from '../../scripts/odd/watchdog.ts'
 
 export const description =
 	'Factory ODD control plane: Linear, GitHub and Slack webhooks drive a deterministic outcome lifecycle; role agents run in orbs; Ralph loops are bounded by external checks. See docs/odd/README.md.'
@@ -276,7 +276,7 @@ export default async function (amp: PluginAPI) {
 				entry.stage = 'dry-run'
 				return entry
 			}
-			const stale = action.kind === 'wait' && action.stuck ? staleThreads(action, threads, new Date()) : []
+			const stale = action.kind === 'wait' && action.stuck ? staleThreads(action, threads, new Date(), issue.deployReceipt?.sha) : []
 			if (action.kind === 'wait' && action.stuck && stale.length) {
 				await cancelStale(ctx, state, issue, action.stuck, stale)
 				entry.stage = 'performed'
@@ -356,9 +356,11 @@ export default async function (amp: PluginAPI) {
 					watchdog.alerted = true
 				}
 			}
+			// `digestDay` is in memory and a plugin reload forgets it, so the channel itself is the
+			// durable record: a digest already posted for the day is not posted again.
 			const day = digestDue(watchdog.digestDay, now)
 			if (day && performing) {
-				await ctx.tools.call('slack_write', { channelName: alertsChannel, text: digest(await digestInput(ctx, day, now, load, watchdog.cancelled)) })
+				if (!(await digestPosted(ctx.tools, day))) await ctx.tools.call('slack_write', { channelName: alertsChannel, text: digest(await digestInput(ctx, day, now, load, watchdog.cancelled)) })
 				watchdog.digestDay = day
 				watchdog.cancelled = []
 			}
@@ -377,9 +379,27 @@ export default async function (amp: PluginAPI) {
 		}
 	}
 
+	// Slack filters each page after the limit, so every page of the last day is read.
+	async function digestPosted(tools: Tools, day: string): Promise<boolean> {
+		let cursor: string | undefined
+		do {
+			const page = await callJson<{ messages?: unknown[]; nextCursor?: string }>(tools, 'slack_read', { operation: 'read_messages', channelName: alertsChannel, lookback: 'P1D', limit: 100, filter: { containsAll: [digestHeading(day)] }, ...(cursor ? { cursor } : {}) })
+			if (page.messages?.length) return true
+			cursor = page.nextCursor
+		} while (cursor)
+		return false
+	}
+
+	// Every page: the sweep must see every issue in the status, not the first 100.
 	async function issueIds(tools: Tools, filter: { state: string; label?: string }): Promise<string[]> {
-		const result = await callJson<{ issues?: { id?: string }[] }>(tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields: ['id'] })
-		return (result.issues ?? []).flatMap(issue => (issue.id ? [issue.id] : []))
+		const ids: string[] = []
+		let cursor: string | undefined
+		do {
+			const page = await callJson<{ issues?: { id?: string }[]; hasNextPage?: boolean; cursor?: string }>(tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields: ['id'], ...(cursor ? { cursor } : {}) })
+			for (const issue of page.issues ?? []) if (issue.id) ids.push(issue.id)
+			cursor = page.hasNextPage ? page.cursor : undefined
+		} while (cursor)
+		return ids
 	}
 
 	// Yesterday's facts for the digest: identifiers, titles and SHAs only (digest() formats them).
@@ -500,10 +520,12 @@ export default async function (amp: PluginAPI) {
 					ctx.logger.log(marker, 'launch request for runner', issue.identifier, action.role)
 					return false
 				}
+				// A verifier is labelled with the receipt it verifies, so the next release's receipt starts a fresh budget.
+				const receipt = action.role === 'verifier' && issue.deployReceipt ? [receiptLabel(issue.deployReceipt.sha)] : []
 				const threadID = await spawnThread(
 					ctx.thread.id,
 					action.role,
-					threadLabels(issue.identifier, action.role, action.round),
+					[...threadLabels(issue.identifier, action.role, action.round), ...receipt],
 					`${marker} Outcome ${issue.identifier}. Role: ${action.role}. Reason: ${action.reason}.${spawnTarget(issue, action.role)} Load the \`${contracts[action.role].skill}\` skill and start.`,
 				)
 				spawned.set(issue.identifier, [...(spawned.get(issue.identifier) ?? []), threadID])
@@ -740,10 +762,17 @@ async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, 
 }
 
 // `known` are thread IDs this control plane spawned that the search index may not return yet.
+// Thread search pages at 100; every page is read so load and the sweep see every live thread.
 async function threadsFor(tools: Tools, query: string, known: readonly string[] = []): Promise<LiveThread[]> {
-	const found = await callJson<{ threads: { id: string; updatedAt?: string }[] }>(tools, 'find_thread', { query, limit: 100 })
-	const updated = new Map(found.threads.map(({ id, updatedAt }) => [id, updatedAt]))
-	const ids = new Set([...found.threads.map(({ id }) => id), ...known])
+	const found: { id: string; updatedAt?: string }[] = []
+	let cursor: string | undefined
+	do {
+		const page = await callJson<{ threads: { id: string; updatedAt?: string }[]; nextCursor?: string }>(tools, 'find_thread', { query, limit: 100, ...(cursor ? { cursor } : {}) })
+		found.push(...page.threads)
+		cursor = page.threads.length ? page.nextCursor : undefined
+	} while (cursor)
+	const updated = new Map(found.map(({ id, updatedAt }) => [id, updatedAt]))
+	const ids = new Set([...found.map(({ id }) => id), ...known])
 	const threads = await Promise.all([...ids].map(async id => {
 		const status = await callJson<{ metadata: { labels: string[]; archived?: boolean }; agentState?: { state?: string } }>(tools, 'get_thread_status', { thread: id })
 		return { id, labels: status.metadata.labels, state: status.agentState?.state ?? 'idle', archived: status.metadata.archived === true, updatedAt: updated.get(id) }

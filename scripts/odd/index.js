@@ -3,3 +3,4 @@ import './lifecycle.test.ts';
 import './snapshot.test.ts';
 import './intake.test.ts';
 import './deploy.test.ts';
+import './watchdog.test.ts';

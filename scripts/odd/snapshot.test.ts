@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { changesRounds, ciState, finishedThreads, issueFromEvent, loadFrom, openRounds, prOwnsIssue, riskFrom, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { changesRounds, ciState, delivered, finishedThreads, issueFromEvent, loadFrom, openRounds, prOwnsIssue, receiptLabel, riskFrom, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
 import { nextAction } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
@@ -149,4 +149,39 @@ test('after a third changes verdict and a cleared escalation, the spent reviewer
   assert.equal(nextAction(resumed, { orbs: 0, runnerSlots: 0, buildIssues: 1 }).kind, 'steer');
   assert.deepEqual(nextAction(toSnapshot({ issue, pr, threads: [changes(3, sha.slice(0, 12))] }), { orbs: 0, runnerSlots: 0, buildIssues: 0 }),
     { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'qa changes, round 2', round: 1 });
+});
+
+test('a reviewer that delivered changes for an older head does not hold a round: the new head is reviewed', () => {
+  const issue = { id: 'MET-1', status: 'In Progress', labels: ['odd'] };
+  const pr: GitHubPullRequest = { number: 9, headRefOid: sha, state: 'OPEN', statusCheckRollup: [check('SUCCESS')] };
+  const reviewer: LiveThread = { id: 'T-r2', labels: ['odd-issue-met-1', 'odd-role-reviewer', 'odd-round-2', `odd-verdict-changes-${'b'.repeat(12)}`], state: 'idle', updatedAt: '2026-10-24T11:00:00Z' };
+  const snapshot = toSnapshot({ issue, pr, threads: [reviewer] });
+  assert.equal(snapshot.owner?.threadID, 'T-r2');
+  assert.deepEqual(nextAction(snapshot, { orbs: 0, runnerSlots: 0, buildIssues: 0 }),
+    { kind: 'spawn', role: 'reviewer', executor: 'orb', reason: `no verdict at ${sha.slice(0, 12)}`, round: 1 });
+});
+
+test('a new release starts a fresh verifier budget despite the old receipt\'s verifier thread and cancellations', () => {
+  const [a, b] = ['a'.repeat(40), 'b'.repeat(40)];
+  const at = (minute: number) => `2026-10-24T15:${String(minute).padStart(2, '0')}:00Z`;
+  const comments = [
+    { body: 'odd-merge pr=9 head=c merge=d release=v1', createdAt: at(0) },
+    { body: `odd-deploy host=factory-gpu component=kiosk sha=${a} health=pass rollback=none`, createdAt: at(1) },
+    { body: 'odd-watchdog cancelled role=verifier thread=T-v1 round=1', createdAt: at(2) },
+    { body: `odd-verify sha=${a} result=fail bug=MET-2\n- fail chip pulses`, createdAt: at(3) },
+  ];
+  const old: LiveThread = { id: 'T-v2', labels: ['odd-issue-met-1', 'odd-role-verifier', 'odd-round-2', receiptLabel(a)], state: 'idle', updatedAt: at(3) };
+  const issue = (extra: typeof comments) => ({ id: 'MET-1', status: 'Deploying', labels: ['odd'], comments: [...comments, ...extra] });
+  const load = { orbs: 0, runnerSlots: 0, buildIssues: 0 };
+  // Same release: the failed verification waits on its Bug.
+  assert.equal(nextAction(toSnapshot({ issue: issue([]), threads: [old] }), load).kind, 'wait');
+  const next = toSnapshot({ issue: issue([{ body: `odd-deploy host=factory-gpu component=kiosk sha=${b} health=pass rollback=none`, createdAt: at(4) }]), threads: [old] });
+  assert.deepEqual(next.openRounds, {});
+  assert.deepEqual(next.cancelledRounds, {});
+  assert.deepEqual(nextAction(next, load), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify kiosk at bbbbbbbbbbbb', round: 1 });
+  // A verifier of the current receipt holds its round; an older verifier is delivered.
+  const current: LiveThread = { ...old, id: 'T-v3', labels: ['odd-issue-met-1', 'odd-role-verifier', 'odd-round-2', receiptLabel(b)] };
+  assert.deepEqual(openRounds([old, current], b), { verifier: 2 });
+  assert.equal(delivered(old, b), true);
+  assert.equal(delivered(current, b), false);
 });

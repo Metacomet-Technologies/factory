@@ -59,9 +59,9 @@ export type IssueSnapshot = {
   deployReceipt?: DeployReceipt;
   /** Latest `odd-verify` comment (the Verifier's judgement); it counts only when its SHA is the receipt's. */
   verify?: Verify;
-  /** Highest `odd-round-<n>` per role among live threads that have not produced their artifact (a reviewer thread with a verdict label is done). */
+  /** Highest `odd-round-<n>` per role among live threads that have not produced their artifact (snapshot.ts `delivered`). */
   openRounds?: Partial<Record<Role, number>>;
-  /** Rounds the Watchdog cancelled per role since the latest `odd-escalated` comment (`odd-watchdog cancelled` comments). */
+  /** Rounds the Watchdog cancelled per role since the latest `odd-escalated` comment (`odd-watchdog cancelled` comments); verifier rounds since the latest receipt. */
   cancelledRounds?: Partial<Record<Role, number>>;
 };
 
@@ -167,11 +167,13 @@ const free = (executor: Executor, load: Load) =>
  * be respawned forever; the Watchdog cancels it once it is stale, see scripts/odd/watchdog.ts).
  * Cancelled rounds count too; once the budget is spent and no thread of the role is live, the
  * issue pages instead of waiting silently. Both counts restart at the latest `odd-escalated`
- * comment, so a cleared escalation is a fresh budget.
+ * comment, so a cleared escalation is a fresh budget. Only `openRounds` counts live rounds: an
+ * owner that delivered its artifact (a reviewer with a verdict for an older head, a verifier of an
+ * older receipt) has finished its round and must not block the next one.
  */
 function spawn(role: Role, load: Load, reason: string, issue: IssueSnapshot): Action {
   const { executor, rounds } = contracts[role];
-  const live = Math.max(issue.openRounds?.[role] ?? 0, issue.owner?.role === role ? issue.owner.round : 0);
+  const live = issue.openRounds?.[role] ?? 0;
   const previous = Math.max(live, issue.cancelledRounds?.[role] ?? 0);
   if (previous >= rounds) {
     return live > 0

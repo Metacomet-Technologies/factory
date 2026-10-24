@@ -145,7 +145,10 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
   for (const comment of oldestFirst) {
     if (/^odd-merge pr=/m.test(comment.body)) receipt = undefined;
     if (/^odd-escalated reason=/m.test(comment.body)) cancelledRounds = {};
-    receipt = parseDeployReceipt(comment.body) ?? receipt;
+    // Verifier rounds belong to one release: a receipt for a new SHA is a fresh verification budget.
+    const next = parseDeployReceipt(comment.body);
+    if (next && next.sha !== receipt?.sha) delete cancelledRounds.verifier;
+    receipt = next ?? receipt;
     verify = parseVerify(comment.body) ?? verify;
     const cancelled = parseCancelled(comment.body);
     if (cancelled) cancelledRounds[cancelled.role] = Math.max(cancelledRounds[cancelled.role] ?? 0, cancelled.round);
@@ -169,17 +172,32 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     } : undefined,
     deployReceipt: receipt,
     verify,
-    openRounds: openRounds(roleThreads),
+    openRounds: openRounds(roleThreads, receipt?.sha),
     cancelledRounds,
   };
 }
 
-/** Highest round per role among live threads still owed their artifact; a reviewer thread carrying a verdict label has delivered. */
-export function openRounds(threads: readonly LiveThread[]): Partial<Record<Role, number>> {
+/** The label the control plane gives a verifier thread: the receipt SHA (12-character prefix) it verifies. */
+export const receiptLabel = (sha: string) => `odd-receipt-${sha.slice(0, 12)}`;
+
+/**
+ * A role thread that has finished its round: a reviewer carrying a verdict label, or a verifier
+ * spawned for another receipt than the current one (`receiptSha`). Delivered threads hold no
+ * round of the budget and are never stale.
+ */
+export function delivered(thread: LiveThread, receiptSha?: string): boolean {
+  const { role } = parseThreadLabels(thread.labels);
+  if (role === 'reviewer') return thread.labels.some(label => verdictPattern.test(label));
+  if (role === 'verifier') return receiptSha === undefined || !thread.labels.includes(receiptLabel(receiptSha));
+  return false;
+}
+
+/** Highest round per role among live threads still owed their artifact (not `delivered`). */
+export function openRounds(threads: readonly LiveThread[], receiptSha?: string): Partial<Record<Role, number>> {
   const rounds: Partial<Record<Role, number>> = {};
   for (const thread of threads) {
     const { role, round } = parseThreadLabels(thread.labels);
-    if (!role || (role === 'reviewer' && thread.labels.some(label => verdictPattern.test(label)))) continue;
+    if (!role || delivered(thread, receiptSha)) continue;
     rounds[role] = Math.max(rounds[role] ?? 0, round);
   }
   return rounds;

@@ -48,12 +48,12 @@ test('status drives the role; capacity gates orb spawns but not deterministic st
 
 test('a role that ended without reaching its stop condition is not respawned past its rounds', () => {
   const intake = { role: 'intake' as const, threadID: 'T-1', round: 1, state: 'idle' as const };
-  assert.deepEqual(nextAction(issue({ status: 'Backlog', owner: intake }), idle), { kind: 'wait', reason: 'intake round budget spent (1/1)', stuck: 'intake' });
-  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', owner: intake }), idle).kind, 'spawn');
+  assert.deepEqual(nextAction(issue({ status: 'Backlog', owner: intake, openRounds: { intake: 1 } }), idle), { kind: 'wait', reason: 'intake round budget spent (1/1)', stuck: 'intake' });
+  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', owner: intake, openRounds: { intake: 1 } }), idle).kind, 'spawn');
   const spec = { ...intake, role: 'spec' as const };
-  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', owner: spec }), idle).kind, 'wait');
+  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', owner: spec, openRounds: { spec: 1 } }), idle).kind, 'wait');
   const builder = { ...intake, role: 'builder' as const, state: 'error' as const };
-  assert.deepEqual(nextAction(issue({ status: 'In Progress', owner: builder }), idle), { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'builder round 2', round: 2 });
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', owner: builder, openRounds: { builder: 1 } }), idle), { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'builder round 2', round: 2 });
 });
 
 test('intake stop condition names what is missing', () => {

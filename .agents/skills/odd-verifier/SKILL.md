@@ -46,7 +46,9 @@ Done-means item has a verdict line. The Verifier never pages.
 
 ## Budget
 
-One turn plus two continuations, two rounds: the Watchdog cancels an idle
-thread after 15 minutes and the control plane starts one fresh round; a
-second spent round pages `budget-ceiling`. An Evidence command that cannot
-run against the deployed system is a `fail` with the exact error.
+One turn plus two continuations, two rounds per receipt: the Watchdog
+cancels an idle thread after 15 minutes and the control plane starts one
+fresh round; a second spent round pages `budget-ceiling`. Your thread carries
+the label `odd-receipt-<sha12>`; the next release's receipt starts a fresh
+budget. An Evidence command that cannot run against the deployed system is a
+`fail` with the exact error.

@@ -31,14 +31,20 @@ a sweep.
    on the issue, restores the status `restoreStatus` names (a builder with no
    PR goes back to `Todo`; everything else keeps its status) and re-evaluates
    at once, which starts the next round or pages `budget-ceiling` when the
-   role's rounds are spent. A reviewer thread that carries a verdict label is
-   never stale; a thread the search index has not dated yet is never stale.
+   role's rounds are spent. A delivered thread (a reviewer that carries a
+   verdict label, a verifier labelled `odd-receipt-<sha12>` for an older
+   receipt) holds no round and is never stale; a thread the search index has
+   not dated yet is never stale. Verifier rounds and cancellations count per
+   receipt: a new release's receipt starts a fresh verifier budget.
 2. Load over the soft caps (`overCaps`) for `capsAlertMs` (60 min) posts
    one message to `#factory-alerts`; the episode resets when load drops.
 3. Every sweep call failing for `blindMs` (15 min) pages
    `control-plane-blind` once per episode.
 4. The daily digest posts once per `America/New_York` day at 08:00
-   (`digestDue`).
+   (`digestDue`); before posting, the sweep searches `#factory-alerts` for
+   `ODD digest <day>`, so a plugin reload does not post the day twice.
+
+The sweep reads every page of the Linear issue lists and the thread search.
 
 Reviewer and verifier threads start from the lifecycle on the normal path;
 the sweep only cancels and restores. Dispatcher-owned issues (no `odd` label
