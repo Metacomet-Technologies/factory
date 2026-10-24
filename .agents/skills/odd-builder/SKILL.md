@@ -6,14 +6,16 @@ description: Implements one specced Linear issue as the smallest correct change 
 # ODD Builder
 
 Contract source: `docs/odd/README.md` §4, §7. Stop condition:
-`pr-open-ci-green`. Up to three build rounds per issue; a round ends when the
-Reviewer posts a verdict.
+`pr-open-ci-green`. Up to three review rounds per PR; a round ends when the
+Reviewer posts a verdict. You keep this thread and this branch for every
+round; the control plane steers you with each `changes` verdict.
 
 ## Inputs
 
-A Linear issue in `Todo` with `Isolation`, `Build`, `Done means` and
-`Evidence`. A worktree and branch assigned by the control plane
-(`met-<n>-<slug>`). Never the main checkout.
+A Linear issue labelled `odd` with `Isolation`, `Build`, `Done means` and
+`Evidence`; the control plane set it `In Progress` when it started you. Your
+orb checkout is yours alone: fetch `origin/main` and create the branch
+`met-<n>-<slug>` from it. Never work on `main`.
 
 ## Rules you inherit
 
@@ -40,8 +42,10 @@ Isolation before editing.
    type says). Then comment on the issue with only the PR URL, head SHA and the
    complete `git diff --name-only origin/main...HEAD` list in a fence; call out
    deletions and renames with their sources. Repeat after every push.
-6. When the Reviewer posts `changes`, address every finding bound to the head
-   SHA, push, and repeat step 5. Do not reply to findings you did not fix.
+6. When the control plane steers you with `QA requested changes at <sha>`,
+   read the `odd-verdict changes sha=<sha>` comment on your PR, address every
+   finding bound to that SHA on the same branch, push, and repeat step 5. Do
+   not reply to findings you did not fix. Never open a second PR.
 
 ## Authority
 
@@ -58,6 +62,7 @@ evidence; fix that and nothing else.
 
 ## Escalation
 
-Third `changes` verdict or an unresolvable Isolation conflict: comment the
-blocker on the issue and stop. Watchdog decides whether another engine tries
-or Devon is paged. Never page Devon yourself.
+An unresolvable Isolation conflict: comment the blocker on the issue and
+stop. After the third `changes` verdict the control plane labels the issue
+`escalated`, puts the PR in draft and pages Devon; you are not steered again
+until Devon removes the label. Never page Devon yourself.

@@ -38,8 +38,9 @@ When a Builder has used three rounds or a role has spent its continuations:
 
 - First time on this issue: start one fresh thread on a different engine
   family with the same spec and the previous findings in the prompt.
-- Second time: move the issue to `Todo`, add `odd:needs-devon`, pause the
-  thread, and page.
+- Second time: add the Linear label `escalated` (the control plane waits
+  while it is present), put the PR back to draft, and page. The issue keeps
+  its status; Devon removes the label to resume.
 
 ## Paging
 

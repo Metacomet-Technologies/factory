@@ -110,9 +110,9 @@ defines Amp-native agents for the roles that need Amp coordination tools.
 | --- | --- | --- | --- | --- | --- | --- |
 | Intake | Slack message in `#factory-intake`; Linear issue created without a spec. | A Linear issue in the template, or a comment on the existing issue, with `area:*`, type and a duplicate check. | Create and edit *its own* issue; link duplicates. | Amp low (plugin agent). | 1 turn + 2 continuations. | Never. Ambiguity becomes a question inside the spec. |
 | Spec | Issue reaches `Triage` with a type and area. | `## Isolation`, `## Build`, `## Done means`, `## Evidence`, size estimate, risk class. Status moves to `Todo`. | Edit its own issue; split into children; mark blocked-by. | Amp medium or Claude high for `security`/`data` areas. | 1 turn + 3 continuations. | Risk class is `irreversible` or `security` and no existing pattern covers it. |
-| Builder | Issue in `Todo` with a free slot. | A PR whose body carries the Evidence section filled with real output; thread labels `odd-round-N`. | Push to its own branch; open and update its PR; comment on its issue. | Routed by the engine table (see §6). | 3 build rounds per issue. | Round 3 fails, or Isolation cannot be respected. |
-| Reviewer | PR head SHA with CI green and no verdict for that SHA. | Verdict `ready` or `changes` with findings bound to the SHA; reruns Evidence commands itself. | Request changes; approve. Never pushes to the builder's branch. | Opposite family to the builder (`amp` builders get `claude`, others get `amp`). | 1 per SHA. | Third `changes` verdict on one issue (page: third failed QA round). |
-| Shipper | Verdict `ready` on the current head. | Squash merge with `--match-head-commit`; release tag per `docs/release.md`; merge receipt on the issue. | Merge; tag; close superseded PRs. | Deterministic (`qa.ts check` + `gh pr merge`), no agent. | n/a | `qa.ts check` refuses for a reason not in its known list. |
+| Builder | Issue in `Todo` labelled `odd` with a free build slot. | A PR whose body carries the Evidence section filled with real output; the same thread and branch across review rounds. | Push to its own branch; open and update its PR; comment on its issue. | Amp medium (plugin agent); the engine table returns in a later phase (see §6). | 3 review rounds per PR. | Third `changes` verdict, or Isolation cannot be respected. |
+| Reviewer | PR head SHA with CI green and no verdict for that SHA. | Verdict `ready` or `changes` as a PR comment and the thread label `odd-verdict-<ready\|changes>-<sha12>`, findings bound to the SHA; reruns Evidence commands itself in its own orb. | Request changes; approve. Never pushes to the builder's branch. GitHub refuses a review on a PR the same account opened, so the verdict is a comment, not a review. | Amp high (plugin agent); opposite family returns with the engine table. | 1 per SHA. | Third `changes` verdict on one issue (page: third failed QA round). |
+| Shipper | Verdict `ready` on the current head. | Squash merge with `--match-head-commit`; merge receipt `odd-merge pr=<n> head=<sha> merge=<sha>` on the issue; release tag per `docs/release.md` from phase 5. | Merge; tag; close superseded PRs. | Deterministic (`qa.ts check --self-deploying-ok` + `gh pr merge` inside the control plane), no agent. | n/a | `qa.ts check` refuses: the refusal is posted once per head as `odd-merge-refused`; the builder's next push re-enters the loop. |
 | Deployer | Release published for a component with a deploy script. | Deploy receipt: host, script, SHA, health result, rollback used or not. | `sudo -n /usr/bin/bash <allowlisted script>` on the runner. | Deterministic job on the runner; an Amp low agent only to read logs when a health probe fails. | 1 deploy + 1 rollback. | Rollback fails, or health stays red after rollback (page: irreversible or failed rollback). |
 | Verifier | Deploy receipt posted. | `Done` on the issue, or a `Bug` issue filed with the receipt and probe output. | Set Done; file bugs. | Deterministic probes first; Amp low agent for the Done-means items that need judgement (screenshots, logs). | 1 turn + 2 continuations. | Never pages; files a bug and lets Intake handle it. |
 | Watchdog | Every 10 minutes (schedule) and on every webhook batch. | Reconciled state: released stuck claims, restarted idle loops, stale PR nudges, daily digest. | Cancel threads; relabel; reopen issues; restart the control-plane orb. | Deterministic sweep; Amp low agent only to write the digest. | n/a | Control plane cannot reach Linear or GitHub for 15 minutes; soft caps exceeded for an hour. |
@@ -230,24 +230,26 @@ SHA x with this output; Done means item 3 has no evidence".
 
 ## 6. Routing and parallelism
 
-- Builder engine table is the one in `scripts/dispatch/dispatch.ts`
-  (`engine/{amp,claude,chatgpt,ultra,cursor,grok,go,docs}` ×
-  `agent-effort/*`). ODD adds a default when the issue has no `engine/*`
-  label: a round-robin over the available subscription engines weighted by
-  the usage collector's remaining headroom, so no family is preferred and
-  nothing is silently substituted. `ultra` still requires the explicit label.
+- Ownership from `Todo` on is per issue: the Linear label `odd` hands an
+  issue to the control plane; without it the dispatcher (`dispatch` label and
+  `factory-dispatch` markers) keeps it. ODD owns `Backlog` and `Triage` for
+  every issue. The two never act on the same issue.
+- Phase 4 builders are Amp medium plugin agents. The engine table in
+  `scripts/dispatch/dispatch.ts` (`engine/{amp,claude,chatgpt,ultra,cursor,
+  grok,go,docs}` × `agent-effort/*`) and the usage-weighted round-robin come
+  back with the runner launcher (`amp -x --mode <plugin mode> --executor
+  orb`, requested through a Linear label), because plugin agents created with
+  `Agent.createThread` can only use plugin-defined or built-in modes.
 - Executor: orb by default for Builder, Reviewer, Spec, Intake, Verifier
   (judgement part). Runner only for Deployer, hardware checks, and anything
   whose Isolation names a device, a production DB or Tailscale. Caps: 4 orbs,
-  2 runner slots, counted from live thread labels, not from a ledger.
-- Reviewer family is opposite to the builder family (existing rule), so no
-  change is approved by the model that wrote it.
-- Subscription engines are launched by the runner backstop (`amp -x --mode
-  <plugin mode> --executor orb`), because plugin agents created with
-  `Agent.createThread` can only use plugin-defined or built-in modes. The
-  control plane posts the launch request as a Linear label
-  (`odd:launch`); the runner launcher consumes it within one poll. Amp-native
-  roles are created directly by the plugin.
+  2 runner slots, 2 issues in build or review at once, counted from live
+  thread labels, not from a ledger. An issue holds its build slot from the
+  builder's spawn until the merge, including while it waits for review.
+- Reviewer family is opposite to the builder family once the engine table
+  returns, so no change is approved by the model that wrote it. Until then
+  the reviewer is a separate Amp high thread that reruns the Evidence in its
+  own orb.
 
 ## 7. Handoff contracts
 
@@ -260,11 +262,15 @@ Each artifact is machine-checkable before the next role starts.
 - Builder → Reviewer: PR body `## Evidence` with the actual output of each
   Evidence line at the head SHA, the issue comment with PR URL, head SHA and
   file list (AGENTS.md rule), PR open with CI green at the head SHA.
-- Reviewer → Shipper: thread label `odd-verdict-ready-<sha12>` or
-  `odd-verdict-changes-<sha12>` plus the `factory-qa` marker it already
-  posts. Findings bound to file and line.
-- Shipper → Deployer: GitHub release whose notes list components and
-  issues (`docs/release.md`); merge receipt comment with merge SHA.
+- Reviewer → Shipper or Builder: PR comment `odd-verdict ready|changes
+  sha=<sha>` with findings bound to file and line, plus the reviewer thread's
+  label `odd-verdict-ready-<sha12>` or `odd-verdict-changes-<sha12>`. The
+  control plane reads the label; `changes` steers the same builder thread
+  once per head SHA. Rounds are counted as distinct heads with a `changes`
+  verdict.
+- Shipper → Deployer: merge receipt comment `odd-merge pr=<n> head=<sha>
+  merge=<sha> release=<tag|none>`; from phase 5 a GitHub release whose notes
+  list components and issues (`docs/release.md`).
 - Deployer → Verifier: deploy receipt comment `odd-deploy host=<h>
   component=<c> sha=<s> health=<pass|fail> rollback=<none|sha>`.
 - Verifier → Done: comment listing each Done-means item with its evidence
@@ -275,7 +281,7 @@ Each artifact is machine-checkable before the next role starts.
 | Condition | Who notices | Channel | Default if Devon is silent |
 | --- | --- | --- | --- |
 | Spec risk `irreversible` or `security` with no precedent | Spec | Linear mention + `#factory-alerts` | Issue stays in `Triage`; nothing builds. |
-| Third `changes` verdict on one issue | Watchdog | Slack DM | Issue back to `Todo`, `odd:needs-devon` label, builder thread paused. |
+| Third `changes` verdict on one issue | Control plane | Slack DM, `escalated` label, `odd-escalated` comment, PR back to draft | Issue stays `In Progress` and nothing runs until Devon removes `escalated`. |
 | Health red after rollback | Deployer | Slack DM | Component left on previous release; all deploys of that component paused. |
 | Irreversible production action requested by a spec | Shipper or Deployer | Slack DM, `ui.confirm({ requireHuman: true })` in the control thread | Not executed. |
 | Soft caps exceeded for 60 min or usage collector shows an engine at its ceiling | Watchdog | `#factory-alerts` | Intake continues; launches of that engine pause. |
@@ -289,14 +295,14 @@ Each artifact is machine-checkable before the next role starts.
 │ .amp/plugins/factory-odd.ts                                                           │
 │  webhooks: /linear /github /slack  ─▶ dedupe ─▶ derive state ─▶ next action           │
 │  dry run unless the thread carries label odd-perform                                  │
-│  agents: odd-intake, odd-spec, odd-reviewer, odd-verifier, odd-watchdog (Amp-native)  │
+│  agents: odd-intake, odd-spec, odd-builder, odd-reviewer, odd-verifier (Amp-native)   │
 │  schedule: 10 min watchdog tick                                                       │
 └───────────────┬───────────────────────────────────────────────────────────┬───────────┘
-                │ Agent.createThread({executor:'orb'})                      │ Linear label odd:launch
+                │ Agent.createThread({executor:'orb'})                      │ Linear label (later phase)
                 ▼                                                           ▼
    ┌─────────────────────────┐                              ┌──────────────────────────────┐
    │ builder/reviewer orbs   │                              │ factory-gpu / factory-console │
-   │ (up to 4, any engine)   │                              │ backstop poller (60 s)        │
+   │ (4 orbs, 2 issues)      │                              │ backstop poller (60 s)        │
    └─────────────────────────┘                              │ launcher: amp -x --mode …     │
                                                             │ deployer: sudo allowlist      │
                                                             └──────────────────────────────┘
@@ -329,9 +335,12 @@ by the previous one).
    (URLs are secrets; the plugin prints them once to the control thread).
 3. Intake and Spec live: Slack and Linear events create specs; builds still
    go through the `dispatch` label so the poller remains in charge.
-4. Builder and Reviewer on orbs: the plugin spawns Amp-native builders for
-   `engine/amp`; the launcher consumes `odd:launch` for subscription engines;
-   caps enforced from thread labels; Ralph guard on.
+4. Builder and Reviewer on orbs (MET-279): for issues labelled `odd` the
+   plugin spawns an Amp medium builder from `Todo`, sets `In Progress`, spawns
+   an Amp high reviewer per head SHA, steers the builder on `changes`, merges
+   deterministically on `ready` (self-deploying paths included) and escalates
+   after the third rejected head; caps enforced from thread labels; Ralph
+   guard on. Subscription engines and the launcher come later.
 5. Shipper and Deployer: install the sudoers allowlist; the runner deploy job
    consumes `release.published`; canary + rollback; self-deploying paths
    merge through the same gate.

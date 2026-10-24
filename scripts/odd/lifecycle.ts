@@ -28,7 +28,13 @@ export const contracts: Record<Role, RoleContract> = Object.freeze({
   watchdog: { executor: 'none',   continuations: 0, rounds: 1, stop: 'none',                skill: 'odd-watchdog' },
 });
 
-export const capacity = Object.freeze({ orbs: 4, runnerSlots: 2 });
+/** Soft caps: orbs and runner slots count running role threads; buildIssues counts issues with a live builder thread. */
+export const capacity = Object.freeze({ orbs: 4, runnerSlots: 2, buildIssues: 2 });
+
+/** Linear label that hands an issue to ODD from Todo on; without it the dispatcher owns Todo and later. */
+export const oddLabel = 'odd';
+/** Linear label the control plane sets when a round budget is spent; it waits while the label is present. */
+export const escalatedLabel = 'escalated';
 
 export type Status = 'Backlog' | 'Triage' | 'Todo' | 'In Progress' | 'Deploying' | 'Done' | 'Canceled' | 'Duplicate';
 export type RiskClass = 'ordinary' | 'security' | 'authority' | 'irreversible';
@@ -43,14 +49,15 @@ export type IssueSnapshot = {
   risk?: RiskClass;
   /** Live thread owning the issue, derived from Amp thread labels odd-issue-<id>, odd-role-<role>, odd-round-<n>. */
   owner?: { role: Role; threadID: string; round: number; state: 'idle' | 'running' | 'awaiting-approval' | 'error' };
-  pr?: { number: number; headSha: string; ci: 'pending' | 'success' | 'failure'; verdict?: Verdict; merged: boolean; mergeSha?: string };
+  /** `changesRounds` counts the distinct `changes` verdicts on this issue: the builder thread persists across rounds, so rounds live on the reviewer side. */
+  pr?: { number: number; headSha: string; ci: 'pending' | 'success' | 'failure'; verdict?: Verdict; merged: boolean; mergeSha?: string; changesRounds?: number };
   release?: { tag: string; components: readonly string[] };
   deployReceipt?: DeployReceipt;
 };
 
 export type DeployReceipt = { host: string; component: string; sha: string; health: 'pass' | 'fail'; rollback: 'none' | string };
 
-export type Load = { orbs: number; runnerSlots: number };
+export type Load = { orbs: number; runnerSlots: number; buildIssues: number };
 
 export type Action =
   | { kind: 'spawn'; role: Role; executor: Executor; reason: string; round: number }
@@ -58,7 +65,7 @@ export type Action =
   | { kind: 'merge'; pr: number; sha: string }
   | { kind: 'deploy'; tag: string; components: readonly string[] }
   | { kind: 'set-status'; status: Status; reason: string }
-  | { kind: 'page'; reason: PageReason; detail: string }
+  | { kind: 'page'; reason: PageReason; detail: string; pr?: number }
   | { kind: 'wait'; reason: string };
 
 export type PageReason = 'third-failed-qa-round' | 'failed-rollback' | 'irreversible-action' | 'security-finding' | 'budget-ceiling' | 'control-plane-blind';
@@ -112,6 +119,8 @@ function spawn(role: Role, load: Load, reason: string, owner?: IssueSnapshot['ow
   const { executor, rounds } = contracts[role];
   const previous = owner?.role === role ? owner.round : 0;
   if (previous >= rounds) return { kind: 'wait', reason: `${role} round budget spent (${previous}/${rounds})` };
+  // An issue that already has a builder thread is inside the build count; only a new issue needs a free build slot.
+  if (role === 'builder' && previous === 0 && load.buildIssues >= capacity.buildIssues) return { kind: 'wait', reason: `build capacity (${load.buildIssues}/${capacity.buildIssues} issues)` };
   return free(executor, load) ? { kind: 'spawn', role, executor, reason, round: previous + 1 } : { kind: 'wait', reason: `${executor} capacity (${role})` };
 }
 
@@ -120,7 +129,7 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
   const { status, owner, pr } = issue;
   if (owner && owner.state !== 'idle' && owner.state !== 'error') return { kind: 'wait', reason: `${owner.role} running` };
   if (status === 'Done' || status === 'Canceled' || status === 'Duplicate') return { kind: 'wait', reason: status };
-  if (issue.labels.includes('odd:needs-devon')) return { kind: 'wait', reason: 'needs Devon' };
+  if (issue.labels.includes(escalatedLabel)) return { kind: 'wait', reason: 'escalated to Devon' };
 
   if (status === 'Backlog') return spawn('intake', load, 'no triage yet', owner);
   if (status === 'Triage') {
@@ -129,6 +138,8 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
     return spawn('spec', load, 'spec incomplete', owner);
   }
   if (status === 'Todo') {
+    // A builder was spawned but the status change did not land: converge instead of spawning a second builder.
+    if (owner?.role === 'builder') return { kind: 'set-status', status: 'In Progress', reason: `builder ${owner.threadID} owns it` };
     if (issue.openBlockers.length) return { kind: 'wait', reason: `blocked by ${issue.openBlockers.join(', ')}` };
     if (!specComplete(issue.description)) return { kind: 'set-status', status: 'Triage', reason: 'spec regressed' };
     return spawn('builder', load, 'ready to build', owner);
@@ -152,10 +163,10 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
     const verdict = pr.verdict?.sha === pr.headSha ? pr.verdict : undefined;
     if (!verdict) return spawn('reviewer', load, `no verdict at ${pr.headSha.slice(0, 12)}`);
     if (verdict.state === 'ready') return { kind: 'merge', pr: pr.number, sha: pr.headSha };
-    const round = owner?.round ?? 1;
-    if (round >= contracts.builder.rounds) return { kind: 'page', reason: 'third-failed-qa-round', detail: `${issue.identifier}: PR #${pr.number} rejected ${round} times` };
+    const round = pr.changesRounds ?? 1;
+    if (round >= contracts.builder.rounds) return { kind: 'page', reason: 'third-failed-qa-round', detail: `${issue.identifier}: PR #${pr.number} rejected ${round} times`, pr: pr.number };
     return owner?.role === 'builder'
-      ? { kind: 'steer', role: 'builder', threadID: owner.threadID, message: `QA requested changes at ${pr.headSha}. Address every finding, rerun the Evidence commands, push.` }
+      ? { kind: 'steer', role: 'builder', threadID: owner.threadID, message: `QA requested changes at ${pr.headSha}; see the odd-verdict comment on PR #${pr.number}. Address every finding, rerun the Evidence commands, push to the same branch.` }
       : spawn('builder', load, `qa changes, round ${round + 1}`);
   }
   if (status === 'Deploying') {
