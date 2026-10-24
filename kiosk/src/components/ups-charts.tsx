@@ -11,7 +11,7 @@ import {
   YAxis,
 } from "recharts";
 import type { Gpu, UpsEvent, UpsPoint } from "../api/types";
-import { useReducedMotion } from "../lib/motion";
+import { useChartMotion } from "../lib/motion";
 import { upsChartData } from "../lib/ups";
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from "./ui/chart";
 import { Panel } from "./ui/panel";
@@ -48,7 +48,6 @@ export default function UpsCharts({
   events: UpsEvent[];
   now: number;
 }) {
-  const reduced = useReducedMotion();
   const { data, scatter } = useMemo(() => {
     const data = upsChartData(history, gpu);
     return {
@@ -62,7 +61,7 @@ export default function UpsCharts({
       event.started_ms >= (history[0]?.ts_ms ?? Infinity) &&
       event.started_ms <= now,
   );
-  const animation = { isAnimationActive: !reduced, animationDuration: 900 } as const;
+  const animation = useChartMotion();
   return (
     <div className="ups-chart-grid">
       {(["load", "input", "charge"] as const).map((metric, index) => (

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Endpoints } from "./types";
 
 export const apiUrl = (path: string) =>
@@ -18,10 +18,13 @@ export function useApi<K extends keyof Endpoints>(
   path: K,
   query = "",
   revision = 0,
-): Resource<Endpoints[K]> {
-  const key = `${path}${query}:${revision}`;
-  const [resource, setResource] = useState<Resource<Endpoints[K]> & { key: string }>({
-    key,
+): Resource<Endpoints[K]> & { refreshing: boolean } {
+  const scope = `${path}${query}`;
+  const [resource, setResource] = useState<
+    Resource<Endpoints[K]> & { scope: string; revision: number }
+  >({
+    scope,
+    revision,
     data: null,
     error: null,
     loading: true,
@@ -34,11 +37,13 @@ export function useApi<K extends keyof Endpoints>(
         const response = await fetch(apiUrl(path + query), { signal: controller.signal });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = (await response.json()) as Endpoints[K];
-        if (!controller.signal.aborted) setResource({ key, data, error: null, loading: false });
+        if (!controller.signal.aborted)
+          setResource({ scope, revision, data, error: null, loading: false });
       } catch (error) {
         if (!controller.signal.aborted)
           setResource({
-            key,
+            scope,
+            revision,
             data: null,
             error: error instanceof Error ? error.message : "Request failed",
             loading: false,
@@ -54,16 +59,18 @@ export function useApi<K extends keyof Endpoints>(
       requests.delete(controller);
       clearInterval(timer);
     };
-  }, [path, query, key]);
-  return resource.key === key ? resource : { data: null, error: null, loading: true };
-}
-
-/**
- * Keeps the last response on screen while a revision bump refetches it, so a refresh
- * triggered every 30 s by the stream never flashes the loading state. Errors still show.
- */
-export function useHeld<T>(resource: Resource<T>): Resource<T> {
-  const [held, setHeld] = useState<T | null>(null);
-  if (resource.data !== null && resource.data !== held) setHeld(resource.data);
-  return resource.loading && held !== null ? { data: held, error: null, loading: false } : resource;
+  }, [path, query, scope, revision]);
+  // A revision bump refetches the same resource: the last response (or error) stays on
+  // screen, marked `refreshing`, until the new one lands, so a stream-driven refresh never
+  // flashes a skeleton, collapses a card or remounts its chart. A new path or query starts
+  // from loading.
+  const current = resource.scope === scope;
+  const refreshing = current && resource.revision !== revision;
+  return useMemo(
+    () =>
+      current
+        ? { data: resource.data, error: resource.error, loading: resource.loading, refreshing }
+        : { data: null, error: null, loading: true, refreshing: false },
+    [current, resource, refreshing],
+  );
 }

@@ -783,6 +783,30 @@ describe("dashboard contract", () => {
     await screen.findByText("Pricing provider unavailable. Reference rates are unknown.");
     expect(screen.getByText("Meter unavailable. Usage cannot be retrieved.")).toBeInTheDocument();
   });
+  it("keeps cards and the mounted GPU chart while stream-triggered refetches are pending", async () => {
+    const fetch = api();
+    render(<App />);
+    const chart = await screen.findByLabelText("GPU utilization history");
+    const fleet = within(screen.getByRole("region", { name: "Fleet" }));
+    await waitFor(() => expect(fleet.getByRole("link", { name: /factory-gpu/ })).toBeVisible());
+    const calls = (path: string) => fetch.mock.calls.filter(([url]) => url === path).length;
+    const before = [calls("/v1/gpu?range=1h"), calls("/v1/devices")];
+    fetch.mockImplementation(() => new Promise<Response>(() => {}));
+    act(() => {
+      MockSource.latest.onopen?.();
+      MockSource.latest.onopen?.(); // a reopen refetches every snapshot, GPU history included
+      MockSource.latest.dispatchEvent(
+        new MessageEvent("devices.sample", {
+          data: JSON.stringify({ type: "devices.sample", ts_ms: Date.now(), data: null }),
+        }),
+      );
+    });
+    expect([calls("/v1/gpu?range=1h"), calls("/v1/devices")]).toEqual(before.map((n) => n + 1));
+    expect(screen.queryByLabelText("Loading section")).not.toBeInTheDocument();
+    // Same node: the chart was not remounted, so Recharts tweens from its previous series.
+    expect(screen.getByLabelText("GPU utilization history")).toBe(chart);
+    expect(fleet.getByRole("link", { name: /factory-gpu/ })).toBeVisible();
+  });
   it("renders outage nulls and warnings without dropping other sections", async () => {
     api(true);
     render(<App />);

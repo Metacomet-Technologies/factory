@@ -10,7 +10,7 @@ import {
 } from "recharts";
 import type { NetworkLayer, NetworkRange, NetworkSeries, NetworkSpeedTest } from "../api/types";
 import { count } from "../lib/format";
-import { useReducedMotion } from "../lib/motion";
+import { useChartMotion } from "../lib/motion";
 import { ResourceState } from "./sections";
 import {
   LAYERS,
@@ -69,7 +69,7 @@ function LayerPanel({
   window: Window;
   index: number;
 }) {
-  const reduced = useReducedMotion();
+  const animation = useChartMotion();
   const lines = useMemo(() => layerRows(series, layer), [series, layer]);
   const targets = lines.map((line) => line.target);
   const empty = lines.every((line) => !line.points.length);
@@ -130,8 +130,7 @@ function LayerPanel({
                 strokeWidth={2}
                 dot={points.length === 1}
                 connectNulls={false}
-                isAnimationActive={!reduced}
-                animationDuration={900}
+                {...animation}
               />
             ))}
           </LineChart>
@@ -151,9 +150,8 @@ function Throughput({
   window: Window;
   index: number;
 }) {
-  const reduced = useReducedMotion();
   const rows = useMemo(() => speedRows(tests ?? []), [tests]);
-  const animation = { isAnimationActive: !reduced, animationDuration: 900 } as const;
+  const animation = useChartMotion();
   return (
     <Panel
       title="Throughput"

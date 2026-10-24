@@ -877,6 +877,12 @@
   stop-color: var(--accent-text);
   stop-opacity: 1;
 }
+/* The head follows the line's update tween (useChartMotion: 900 ms ease-in-out). */
+.comet-now circle {
+  transition:
+    cx 900ms ease-in-out,
+    cy 900ms ease-in-out;
+}
 .comet-head {
   fill: var(--accent-text);
   filter: drop-shadow(0 0 6px var(--accent-text));
@@ -1067,6 +1073,13 @@
 .ticker p {
   font-size: 12px;
   margin-top: 4px;
+}
+/* The request log keeps one height as rows arrive (about three rows, then it scrolls), so a
+   new request never resizes its panel or the page. */
+[role="log"] {
+  height: 300px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 /* ---- UPS ----------------------------------------------------------------- */
@@ -1930,9 +1943,7 @@
     text-align: right;
   }
   [role="log"] {
-    max-height: 40px;
-    overflow-y: auto;
-    scrollbar-gutter: stable;
+    height: 40px;
   }
 }
 @media (max-width: 639px) {
