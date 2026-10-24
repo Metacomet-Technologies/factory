@@ -14,9 +14,12 @@ import {
 	deployReceiptLine,
 	escalatedLabel,
 	issueTriaged,
+	heartbeatLine,
+	heartbeatProject,
 	nextAction,
 	oddLabel,
 	pageText,
+	parseHeartbeat,
 	parseThreadLabels,
 	ralphGuard,
 	specComplete,
@@ -130,7 +133,7 @@ export default async function (amp: PluginAPI) {
 		/** Slack intake poll: last run, last error, and the message timestamps handed to Intake. */
 		slack: { polledAt?: string; error?: string; spawned: string[] }
 		/** Watchdog sweep (scripts/odd/watchdog.ts): last run, issues swept, episodes in progress, digest day, cancellations today. */
-		watchdog: { sweptAt?: string; error?: string; issues?: number; overSince?: string; alerted?: boolean; blindSince?: string; paged?: boolean; digestDay?: string; cancelled: string[] }
+		watchdog: { sweptAt?: string; error?: string; issues?: number; overSince?: string; alerted?: boolean; blindSince?: string; paged?: boolean; digestDay?: string; heartbeatId?: string; cancelled: string[] }
 		timers: ReturnType<typeof setInterval>[]
 	}
 	const armState = new Map<ThreadID, ArmState>()
@@ -370,6 +373,10 @@ export default async function (amp: PluginAPI) {
 			delete watchdog.error
 			delete watchdog.blindSince
 			watchdog.paged = false
+			// The heartbeat is the poller's only view of this sweep (docs/odd/README.md §9). A failed
+			// sweep writes nothing, so the row aging past 20 minutes is the silence signal. Dry-run
+			// writes nothing either: a plane that is not performing must not look alive.
+			if (performing) await writeHeartbeat(ctx, state, at)
 		} catch (error: unknown) {
 			watchdog.error = String(error)
 			entry.stage = 'failed'
@@ -383,6 +390,22 @@ export default async function (amp: PluginAPI) {
 		} finally {
 			sweeping.delete(state)
 		}
+	}
+
+	// One Software Factory project status update, rewritten in place. The id is forgotten on a
+	// plugin reload, so the first write after a reload finds the row by its `odd-heartbeat` line.
+	async function writeHeartbeat(ctx: EvalContext, state: ArmState, at: string) {
+		const body = heartbeatLine(at)
+		if (!state.watchdog.heartbeatId) {
+			let cursor: string | undefined
+			do {
+				const page = await callJson<{ statusUpdates?: { id?: string; body?: string }[]; hasNextPage?: boolean; cursor?: string }>(ctx.tools, 'linear.get_status_updates', { type: 'project', project: heartbeatProject, orderBy: 'updatedAt', limit: 50, ...(cursor ? { cursor } : {}) })
+				state.watchdog.heartbeatId = page.statusUpdates?.find(update => parseHeartbeat(update.body ?? ''))?.id
+				cursor = page.hasNextPage ? page.cursor : undefined
+			} while (!state.watchdog.heartbeatId && cursor)
+		}
+		const saved = await callJson<{ id?: string }>(ctx.tools, 'linear.save_status_update', { type: 'project', project: heartbeatProject, health: 'onTrack', body, ...(state.watchdog.heartbeatId ? { id: state.watchdog.heartbeatId } : {}) })
+		if (saved.id) state.watchdog.heartbeatId = saved.id
 	}
 
 	// Slack filters each page after the limit, so every page of the last day is read.

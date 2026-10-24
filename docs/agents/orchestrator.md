@@ -9,8 +9,8 @@ grant is listed here.
 
 ## Outcome driven development
 
-`docs/odd/README.md` splits this thread into roles, phase by phase. Until a
-phase ships, this file stays authoritative.
+`docs/odd/README.md` is the authority for the control plane. Until a phase
+ships, this file stays authoritative for the orchestrator thread.
 
 ## Authority
 

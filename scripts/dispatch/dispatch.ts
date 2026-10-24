@@ -1,4 +1,5 @@
-import { readFileSync, openSync, closeSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { readFileSync, openSync, closeSync, mkdirSync, writeFileSync, renameSync, rmSync, existsSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -6,6 +7,7 @@ import { reviewPRs, cleanupQAWorktrees, fastForwardMain, syncPlaybook, qaArchive
 import { repos, issueRepo } from './repos.ts';
 import { observeStagePolicy } from './policy.ts';
 import { openLedger, markerConflicts, commentId, type Ledger } from './ledger.ts';
+import { controlPlaneSilent, heartbeatProjectId, pageText, parseHeartbeat, silenceMs } from '../odd/lifecycle.ts';
 
 export const mainCheckout = '/home/agent/work/factory';
 export function runnerCommand(runner: string, args: string[]) {
@@ -304,6 +306,17 @@ async function searchThreads(args: string[], requireTitle: boolean) {
 }
 
 export const ledgerPath = () => process.env.DISPATCH_LEDGER ?? `${homedir()}/.local/state/factory-dispatch/dispatch.db`;
+// The silence episode, beside the ledger. A dry-run's ledger is an in-memory copy, so the flag
+// cannot live there, and a dry-run must not create the directory a fresh checkout does not have.
+const backstopFlag = () => `${dirname(ledgerPath())}/backstop`;
+const backstopPaged = () => {
+  try { return readFileSync(backstopFlag(), 'utf8').trim() === '1'; }
+  catch { return false; }
+};
+const setBackstopPaged = (paged: boolean) => {
+  if (!existsSync(dirname(ledgerPath()))) return;
+  writeFileSync(backstopFlag(), paged ? '1\n' : '0\n', { mode: 0o600 });
+};
 type Budget = { requests: number; remaining: number | null; reset_ms: number | null };
 
 export async function run(command: string, identifier: string | undefined, dryRun: boolean) {
@@ -373,6 +386,34 @@ async function runPass(command: string, identifier: string | undefined, dryRun: 
   const redact = (text: string) => text.replaceAll(key, '[redacted]');
   const log = (decision: string, details: object = {}) => console.log(redact(JSON.stringify({ decision, ...details })));
   log('caps', { caps: { gpu: caps.gpu, console: caps.console } });
+  // The control plane's heartbeat is one project status update (docs/odd/README.md §9). A fresh
+  // one means the poller is the backstop and does not drive the lifecycle. A missing or failed
+  // read is silence: the lifecycle runs, and the next poll reads again.
+  if (command === 'poll') {
+    let heartbeats: string[] = [];
+    try {
+      const data = await query(`query Heartbeat($id: String!) { project(id: $id) { projectUpdates(first: 10, orderBy: updatedAt) { nodes { body updatedAt } } } }`, { id: heartbeatProjectId });
+      const nodes = data.project?.projectUpdates?.nodes;
+      if (!Array.isArray(nodes)) throw new Error('Heartbeat read returned no project updates');
+      heartbeats = nodes.map((node: { body?: unknown }) => (typeof node?.body === 'string' ? node.body : ''));
+    } catch (error) {
+      // A failed read is silence, not a dead poll: the lifecycle still runs and the next poll reads again.
+      heartbeats = [];
+      log('odd-backstop-unread', { message: (error as Error).message });
+    }
+    if (!controlPlaneSilent(heartbeats, Date.now())) {
+      log('odd-backstop', { silence_ms: silenceMs });
+      setBackstopPaged(false);
+      return;
+    }
+    if (!backstopPaged()) {
+      const times = heartbeats.map(parseHeartbeat).flatMap(value => (value === undefined ? [] : [Date.parse(value)]));
+      const at = times.length ? Math.max(...times) : undefined;
+      const age = at === undefined ? 'missing' : `${Math.floor((Date.now() - at) / 60_000)} min`;
+      log('odd-backstop-resume', { age, page: pageText('-', { kind: 'page', reason: 'control-plane-silent', detail: `heartbeat ${age}; the poller runs the lifecycle` }) });
+      setBackstopPaged(true);
+    }
+  }
   // Read once, only when a plugin-engine issue needs it; failure means unverified, never a fallback mode.
   let inventory: Promise<{ modes: Set<string>, tools: Set<string> } | undefined> | undefined;
   function pluginInventory() {

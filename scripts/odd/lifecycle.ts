@@ -83,7 +83,7 @@ export type Action =
   | { kind: 'wait'; reason: string; stuck?: Role };
 
 /** `diagnose` on a red deploy: after acting, the control plane starts one log-reading Deployer on the receipt's host (odd-deployer skill). */
-export type PageReason = 'third-failed-qa-round' | 'failed-rollback' | 'irreversible-action' | 'security-finding' | 'budget-ceiling' | 'control-plane-blind';
+export type PageReason = 'third-failed-qa-round' | 'failed-rollback' | 'irreversible-action' | 'security-finding' | 'budget-ceiling' | 'control-plane-blind' | 'control-plane-silent';
 
 /** What happens when Devon does not answer a page (docs/odd/README.md §8); every page states it. */
 export const pageDefaults: Record<PageReason, string> = Object.freeze({
@@ -93,6 +93,7 @@ export const pageDefaults: Record<PageReason, string> = Object.freeze({
   'security-finding': 'issue stays In Progress; nothing merges',
   'budget-ceiling': 'issue waits with no owner thread until the `escalated` label is removed',
   'control-plane-blind': 'the runner backstop poller runs the lifecycle at 60 s cadence',
+  'control-plane-silent': 'the runner backstop poller runs the lifecycle until a fresh heartbeat',
 });
 
 /** The one page format (§8): `ODD page: <condition> | issue MET-<n> | <pr or host> | <sha> | default if silent: <action>`. */
@@ -100,6 +101,32 @@ export function pageText(issue: string, action: Extract<Action, { kind: 'page' }
   const where = action.pr !== undefined ? `PR #${action.pr}` : action.diagnose ? `host ${action.diagnose.host}` : '-';
   const sha = action.sha ?? action.diagnose?.sha ?? '-';
   return `ODD page: ${action.reason} | issue ${issue} | ${where} | ${sha} | default if silent: ${pageDefaults[action.reason]}. ${action.detail}`;
+}
+
+/**
+ * The control plane's heartbeat (docs/odd/README.md §9). One Software Factory project status
+ * update, rewritten after each successful sweep. The runner poller reads it; plugin thread
+ * state is not readable from factory-gpu.
+ */
+export const heartbeatProject = 'Software Factory';
+export const heartbeatProjectId = '8f96ac34-a8ba-4328-933d-9f0ab063fa23';
+/** A heartbeat this old, or missing, means the control plane is silent and the poller runs the lifecycle. */
+export const silenceMs = 20 * 60_000;
+
+export const heartbeatLine = (at: string) => `odd-heartbeat at=${at}`;
+
+/** The timestamp of an `odd-heartbeat` line, or nothing when the body is not one. */
+export function parseHeartbeat(text: string): string | undefined {
+  const match = /^odd-heartbeat at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)$/m.exec(text);
+  if (!match || Number.isNaN(Date.parse(match[1]))) return undefined;
+  return match[1];
+}
+
+/** True when no heartbeat parses, or the newest one is `silenceMs` old or older. */
+export function controlPlaneSilent(heartbeats: readonly string[], now: number): boolean {
+  const times = heartbeats.map(parseHeartbeat).flatMap(at => (at === undefined ? [] : [Date.parse(at)]));
+  if (!times.length) return true;
+  return now - Math.max(...times) >= silenceMs;
 }
 
 export const verifyLine = (verify: Verify) => `odd-verify sha=${verify.sha} result=${verify.result} bug=${verify.bug ?? 'none'}`;

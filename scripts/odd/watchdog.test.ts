@@ -1,6 +1,7 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { blindMs, digest, digestDue, localClock, overCaps, restoreStatus, slackMessageMax, slackMessages, staleThreads, sweepMs, staleMs, type DigestInput } from './watchdog.ts';
+import { heartbeatLine, parseHeartbeat } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
 import { receiptLabel, type LiveThread } from './snapshot.ts';
 import plugin from '../../.amp/plugins/factory-odd.ts';
@@ -94,6 +95,7 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
   const alerts: string[] = [];
   const dms: string[] = [];
   const calls: string[] = [];
+  const updates: { id: string; body: string }[] = [];
   let alertReads = 0;
   const triage = Array.from({ length: 101 }, (_, i) => ({ id: `MET-${i + 1}` }));
   const tools = { call: async (name: string, input: Record<string, unknown>) => {
@@ -117,6 +119,13 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
         return { messages: alerts.filter(text => terms.every(term => text.includes(term))).map(text => ({ text })) };
       }
       case 'slack_write': (input.channelName === 'factory-alerts' ? alerts : dms).push(String(input.text)); return {};
+      case 'linear.get_status_updates': return { statusUpdates: updates.filter(update => parseHeartbeat(update.body)), hasNextPage: false, cursor: '' };
+      case 'linear.save_status_update': {
+        const existing = updates.find(update => update.id === input.id);
+        if (existing) existing.body = String(input.body);
+        else updates.push({ id: `update-${updates.length + 1}`, body: String(input.body) });
+        return { id: (existing ?? updates.at(-1)!).id };
+      }
       default: return {};
     }
   } };
@@ -133,7 +142,7 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
     const thread = { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] };
     await handlers.get('session.start')!({}, { thread, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools });
   };
-  return { start, evaluated, alerts, dms, calls, reads: () => alertReads };
+  return { start, evaluated, alerts, dms, calls, updates, reads: () => alertReads };
 }
 
 const until = async (done: () => boolean) => {
@@ -180,6 +189,37 @@ test('the sweep records a cancellation on the issue before it archives the stale
   await until(() => orb.calls.includes('update_thread'));
   assert.ok(orb.calls.lastIndexOf('linear.save_comment') < orb.calls.indexOf('update_thread'));
   await until(() => orb.calls.includes('linear.save_issue'));
+});
+
+test('a successful sweep writes one heartbeat and the next sweep updates it; a failing sweep writes nothing', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const orb = controlOrb((name) => {
+    if (name === 'linear.list_issues') return { issues: [], hasNextPage: false, cursor: '' };
+    if (name === 'find_thread') return { threads: [] };
+    return undefined;
+  });
+  await orb.start();
+  await until(() => orb.updates.length === 1);
+  assert.equal(parseHeartbeat(orb.updates[0].body), '2026-10-24T15:00:00.000Z');
+  const id = orb.updates[0].id;
+  mock.timers.tick(sweepMs);
+  await until(() => orb.updates[0].body.includes('15:10'));
+  assert.equal(orb.updates.length, 1, 'the second sweep updates the same row');
+  assert.equal(orb.updates[0].id, id);
+  assert.equal(heartbeatLine('2026-10-24T15:10:00.000Z'), orb.updates[0].body);
+
+  let failed = false;
+  const blind = controlOrb((name, input) => {
+    if (name === 'linear.list_issues') return { issues: [], hasNextPage: false, cursor: '' };
+    if (name === 'find_thread') return { threads: [] };
+    if (name === 'slack_write' && input.channelName === 'factory-alerts') { failed = true; throw new Error('invalid_blocks'); }
+    return undefined;
+  });
+  await blind.start();
+  await until(() => failed);
+  for (let i = 0; i < 200; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(blind.updates.length, 0, 'a sweep that failed writes no heartbeat');
 });
 
 test('a digest that Slack keeps rejecting leaves the control plane blind until it pages', async t => {

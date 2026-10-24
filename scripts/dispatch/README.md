@@ -1,5 +1,10 @@
 # Linear factory dispatcher (MET-80)
 
+The `dispatch` label is the legacy path for issues the ODD control plane does
+not own (`docs/odd/README.md`). The poller is the backstop: while the control
+plane's `odd-heartbeat` project status update is under 20 minutes old, a poll
+logs `odd-backstop` and does not run the lifecycle.
+
 Single-user, outbound-only automation of [PLAYBOOK §4](../../docs/PLAYBOOK.md#4-agent-prompt-template).
 No dependencies, webhook, OAuth app, new credential, or runner changes.
 The one database is

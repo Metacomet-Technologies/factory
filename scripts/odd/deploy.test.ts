@@ -370,6 +370,9 @@ async function controlPlane(options: { issue: string; receipt: string; failOnce:
         return {};
       case 'find_thread': return { threads: [] };
       case 'slack_read': return { messages: [] };
+      // The sweep writes the heartbeat on its own; this test pins the receipt handoff's calls.
+      case 'linear.get_status_updates': return { statusUpdates: [], hasNextPage: false, cursor: '' };
+      case 'linear.save_status_update': return { id: 'update-1' };
       default: calls.push(name); return {};
     }
   } };
