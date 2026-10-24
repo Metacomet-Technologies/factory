@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { nextAction, specComplete, ralphGuard, parseDeployReceipt, threadLabels, parseThreadLabels, capacity, issueTriaged, type IssueSnapshot } from './lifecycle.ts';
+import { nextAction, specComplete, ralphGuard, parseDeployReceipt, parseVerify, parseCancelled, pageText, verifyLine, cancelledLine, threadLabels, parseThreadLabels, capacity, issueTriaged, type Action, type IssueSnapshot, type PageReason } from './lifecycle.ts';
 
 const spec = `## Goal
 Ship it.
@@ -48,12 +48,12 @@ test('status drives the role; capacity gates orb spawns but not deterministic st
 
 test('a role that ended without reaching its stop condition is not respawned past its rounds', () => {
   const intake = { role: 'intake' as const, threadID: 'T-1', round: 1, state: 'idle' as const };
-  assert.deepEqual(nextAction(issue({ status: 'Backlog', owner: intake }), idle), { kind: 'wait', reason: 'intake round budget spent (1/1)' });
-  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', owner: intake }), idle).kind, 'spawn');
+  assert.deepEqual(nextAction(issue({ status: 'Backlog', owner: intake, openRounds: { intake: 1 } }), idle), { kind: 'wait', reason: 'intake round budget spent (1/1)', stuck: 'intake' });
+  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', owner: intake, openRounds: { intake: 1 } }), idle).kind, 'spawn');
   const spec = { ...intake, role: 'spec' as const };
-  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', owner: spec }), idle).kind, 'wait');
+  assert.equal(nextAction(issue({ status: 'Triage', description: 'x', owner: spec, openRounds: { spec: 1 } }), idle).kind, 'wait');
   const builder = { ...intake, role: 'builder' as const, state: 'error' as const };
-  assert.deepEqual(nextAction(issue({ status: 'In Progress', owner: builder }), idle), { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'builder round 2', round: 2 });
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', owner: builder, openRounds: { builder: 1 } }), idle), { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'builder round 2', round: 2 });
 });
 
 test('intake stop condition names what is missing', () => {
@@ -74,7 +74,7 @@ test('changes steer the live builder; the third rejected head pages instead of l
   assert.deepEqual(nextAction(issue({ status: 'In Progress', pr, owner }), idle),
     { kind: 'steer', role: 'builder', threadID: 'T-1', message: `QA requested changes at ${sha}; see the odd-verdict comment on PR #9. Address every finding, rerun the Evidence commands, push to the same branch.` });
   assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: { ...pr, changesRounds: 3 }, owner }), idle),
-    { kind: 'page', reason: 'third-failed-qa-round', detail: 'MET-1: PR #9 rejected 3 times', pr: 9 });
+    { kind: 'page', reason: 'third-failed-qa-round', detail: 'MET-1: PR #9 rejected 3 times', pr: 9, sha });
   assert.equal(nextAction(issue({ status: 'In Progress', pr, owner: { ...owner, state: 'running' } }), idle).kind, 'wait');
   assert.deepEqual(nextAction(issue({ status: 'In Progress', labels: ['escalated'], pr, owner }), idle), { kind: 'wait', reason: 'escalated to Devon' });
   // No live builder thread: the next round spawns one; the builder rounds are counted on the PR, not the thread.
@@ -85,9 +85,9 @@ test('deploy receipts: no receipt waits, healthy is Done, rolled back returns to
   assert.deepEqual(nextAction(issue({ status: 'Deploying' }), idle), { kind: 'wait', reason: 'release not published' });
   const receipt = parseDeployReceipt('note\nodd-deploy host=factory-gpu component=meter+kiosk sha=abcdef1234 health=pass rollback=none\n');
   assert.deepEqual(receipt, { host: 'factory-gpu', component: 'meter+kiosk', sha: 'abcdef1234', health: 'pass', rollback: 'none' });
-  assert.deepEqual(nextAction(issue({ status: 'Deploying', deployReceipt: receipt }), idle), { kind: 'set-status', status: 'Done', reason: 'deployed meter+kiosk at abcdef1234' });
+  assert.deepEqual(nextAction(issue({ status: 'Deploying', deployReceipt: receipt }), idle), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify meter+kiosk at abcdef1234', round: 1 });
   const none = parseDeployReceipt('odd-deploy host=factory-gpu component=none sha=abcdef1234 health=pass rollback=none');
-  assert.equal(nextAction(issue({ status: 'Deploying', deployReceipt: none }), idle).kind, 'set-status');
+  assert.equal(nextAction(issue({ status: 'Deploying', deployReceipt: none }), idle).kind, 'spawn');
   const red = { ...receipt!, component: 'kiosk', health: 'fail' as const, rollback: '/var/backups/factory-kiosk/20261024T120000.abc' };
   const rolledBack = nextAction(issue({ status: 'Deploying', deployReceipt: red }), idle);
   assert.equal(rolledBack.kind, 'set-status');
@@ -119,4 +119,49 @@ test('thread labels round-trip and obey Amp label syntax', () => {
   for (const label of labels) assert.match(label, /^[a-z0-9][a-z0-9-]{0,31}$/);
   assert.deepEqual(parseThreadLabels([...labels, 'other']), { issue: 'MET-276', role: 'builder', round: 2 });
   assert.deepEqual(parseThreadLabels(['odd-role-nope']), { issue: undefined, role: undefined, round: 1 });
+});
+
+test('a green receipt spawns the Verifier; its pass comment sets Done, its fail comment waits on the Bug; the next release is verified again', () => {
+  const receipt = parseDeployReceipt('odd-deploy host=factory-gpu component=kiosk sha=abcdef1234 health=pass rollback=none');
+  const deploying = (verify?: IssueSnapshot['verify']) => nextAction(issue({ status: 'Deploying', deployReceipt: receipt, verify }), idle);
+  assert.deepEqual(deploying(), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify kiosk at abcdef1234', round: 1 });
+  assert.deepEqual(deploying(parseVerify('odd-verify sha=abcdef1234 result=pass bug=none')), { kind: 'set-status', status: 'Done', reason: 'verified kiosk at abcdef1234' });
+  assert.deepEqual(deploying(parseVerify('odd-verify sha=abcdef1234 result=fail bug=met-9\n- pass kiosk shows the scene\n- fail chip pulses')),
+    { kind: 'wait', reason: 'verification failed at abcdef1234; bug MET-9' });
+  // A verdict for an older release does not count for this receipt.
+  assert.equal(deploying({ sha: '0123456789', result: 'pass' }).kind, 'spawn');
+  assert.equal(parseVerify('odd-verify sha=abcdef1234 result=maybe bug=none'), undefined);
+  assert.equal(verifyLine({ sha: 'abcdef1234', result: 'fail', bug: 'MET-9' }), 'odd-verify sha=abcdef1234 result=fail bug=MET-9');
+  assert.deepEqual(parseCancelled(cancelledLine('builder', 'T-1', 2)), { role: 'builder', threadID: 'T-1', round: 2 });
+});
+
+test('a spent round budget waits on the live thread (the Watchdog cancels it), and pages budget-ceiling once no thread is live', () => {
+  const spent = { role: 'builder' as const, threadID: 'T-1', round: 3, state: 'idle' as const };
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', owner: spent, openRounds: { builder: 3 } }), idle), { kind: 'wait', reason: 'builder has not opened a PR', stuck: 'builder' });
+  assert.deepEqual(nextAction(issue({ status: 'Todo', cancelledRounds: { builder: 2 } }), idle), { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'ready to build', round: 3 });
+  assert.deepEqual(nextAction(issue({ status: 'Todo', cancelledRounds: { builder: 3 } }), idle),
+    { kind: 'page', reason: 'budget-ceiling', detail: 'MET-1: builder spent 3/3 rounds (ready to build)', pr: undefined, sha: undefined });
+  const reviewer = { role: 'reviewer' as const, threadID: 'T-r', round: 2, state: 'idle' as const };
+  const pr = { number: 9, headSha: sha, ci: 'success' as const, merged: false };
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr, owner: reviewer, openRounds: { reviewer: 2 } }), idle), { kind: 'wait', reason: 'reviewer round budget spent (2/2)', stuck: 'reviewer' });
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr, cancelledRounds: { reviewer: 2 } }), idle),
+    { kind: 'page', reason: 'budget-ceiling', detail: `MET-1: reviewer spent 2/2 rounds (no verdict at ${sha.slice(0, 12)})`, pr: 9, sha });
+});
+
+test('every page uses the one format with the condition, issue, place, SHA and the default if Devon stays silent', () => {
+  const receipt = parseDeployReceipt('odd-deploy host=factory-gpu component=kiosk sha=abcdef1234 health=fail rollback=none')!;
+  const pages: Extract<Action, { kind: 'page' }>[] = [
+    { kind: 'page', reason: 'third-failed-qa-round', detail: 'MET-1: PR #9 rejected 3 times', pr: 9, sha },
+    { kind: 'page', reason: 'failed-rollback', detail: 'kiosk unhealthy', diagnose: receipt },
+    { kind: 'page', reason: 'irreversible-action', detail: 'wipe the meter db' },
+    { kind: 'page', reason: 'security-finding', detail: 'token in the diff' },
+    { kind: 'page', reason: 'budget-ceiling', detail: 'MET-1: builder spent 2/2 rounds' },
+    { kind: 'page', reason: 'control-plane-blind', detail: 'every sweep failed' },
+  ];
+  const reasons = new Set<PageReason>(pages.map(page => page.reason));
+  assert.equal(reasons.size, 6);
+  for (const page of pages) assert.match(pageText('MET-1', page), /^ODD page: [a-z-]+ \| issue MET-\d+ \| .+ \| .+ \| default if silent: .+$/);
+  assert.equal(pageText('MET-1', pages[0]), `ODD page: third-failed-qa-round | issue MET-1 | PR #9 | ${sha} | default if silent: issue stays In Progress and the PR stays a draft until the \`escalated\` label is removed. MET-1: PR #9 rejected 3 times`);
+  assert.match(pageText('MET-1', pages[1]), /\| host factory-gpu \| abcdef1234 \|/);
+  assert.match(pageText('MET-1', pages[2]), /\| - \| - \| default if silent: not executed\./);
 });

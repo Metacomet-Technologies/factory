@@ -1,64 +1,83 @@
 ---
 name: odd-watchdog
-description: Reconciles ODD threads, Linear issues, GitHub PRs and hosts on a schedule, releases stuck claims, restarts idle loops, decides between a retry on another engine and a page, and writes the daily digest. Use when acting as the ODD Watchdog role or writing the digest; the Watchdog is the only role that pages Devon.
+description: Describes the deterministic ODD Watchdog sweep in the control-plane plugin (stale-thread cancellation, caps and blind alerts, the one page format, the daily digest) so an agent reading its comments, alerts or pages can interpret them. Use when acting on a Watchdog cancellation comment, an alert in #factory-alerts, or a page; the Watchdog is the only role that pages Devon.
 ---
 
 # ODD Watchdog
 
-Contract source: `docs/odd/README.md` §4, §5.3, §8. No stop condition; the
-sweep is a deterministic job every 10 minutes and after every webhook batch.
-The agent loads this skill only to write the digest or to pick between a
-fresh thread on another engine and a page after a role spent its budget.
+Contract source: `docs/odd/README.md` §4, §5.3, §8. No stop condition and
+no agent thread: the sweep is deterministic code in
+`.amp/plugins/factory-odd.ts` (`sweep`) with its rules in
+`scripts/odd/watchdog.ts`. Agents load this skill only to interpret what the
+Watchdog wrote; nothing here is a step for an agent to perform.
 
 ## Inputs
 
 Live thread labels (`odd-issue-*`, `odd-role-*`, `odd-round-*`,
-`odd-verdict-*`), Linear issue states, open PRs with their head SHAs and CI
-results, deploy receipts, `capacity` and `nextAction` from
-`scripts/odd/lifecycle.ts`.
+`odd-verdict-*`) with each thread's state and `updatedAt`, Linear issue
+states and comments, open PRs with head SHAs and CI results, deploy
+receipts, `capacity` and `nextAction` from `scripts/odd/lifecycle.ts`.
 
-## Sweep (deterministic)
+## Sweep (deterministic, every `sweepMs` = 10 min)
 
-1. For each `odd-role-*` thread idle longer than its budget allows: cancel it,
-   drop its labels, and put the issue back to the state its last receipt
-   proves (`Todo` without a PR, PR open without a verdict, and so on).
-2. For each PR with CI green and no verdict for its head SHA for more than 30
-   minutes: start a Reviewer.
-3. For each issue in `Todo` with a free slot under the caps: start a Builder.
-4. For each `Deploying` issue with a receipt and no Verifier: start one.
-5. Count live orbs and runner slots from labels. Over the soft caps for 60
-   minutes, or an engine at its usage ceiling: post to `#factory-alerts` and
-   pause launches of that engine. Intake keeps running.
-6. If Linear or GitHub has been unreachable for 15 minutes: Slack DM Devon,
-   and let the runner backstop poller run the lifecycle at 60 s cadence.
+The control plane evaluates every issue with a live role thread, every
+`Backlog`/`Triage` issue, and every `odd` issue in `Todo`, `In Progress` or
+`Deploying`, running `nextAction` for each; a webhook batch does not trigger
+a sweep.
 
-## Budget spent (agent)
+1. When an action waits on an idle thread of the stuck role for longer than
+   `staleMs` (15 min, by thread `updatedAt`), the control plane archives the
+   thread, comments `odd-watchdog cancelled role=<role> thread=<id> round=<n>`
+   on the issue, restores the status `restoreStatus` names (a builder with no
+   PR goes back to `Todo`; everything else keeps its status) and re-evaluates
+   at once, which starts the next round or pages `budget-ceiling` when the
+   role's rounds are spent. A delivered thread (a reviewer that carries a
+   verdict label, a verifier labelled `odd-receipt-<sha12>` for an older
+   receipt) holds no round and is never stale; a thread the search index has
+   not dated yet is never stale. Verifier rounds and cancellations count per
+   receipt: a new release's receipt starts a fresh verifier budget.
+2. Load over the soft caps (`overCaps`) for `capsAlertMs` (60 min) posts
+   one message to `#factory-alerts`; the episode resets when load drops.
+3. Every sweep call failing for `blindMs` (15 min) pages
+   `control-plane-blind` once per episode.
+4. The daily digest posts once per `America/New_York` day at 08:00
+   (`digestDue`); before posting, the sweep searches `#factory-alerts` for
+   `ODD digest <day>`, so a plugin reload does not post the day twice.
 
-When a Builder has used three rounds or a role has spent its continuations:
+The sweep reads every page of the Linear issue lists and the thread search.
 
-- First time on this issue: start one fresh thread on a different engine
-  family with the same spec and the previous findings in the prompt.
-- Second time: add the Linear label `escalated` (the control plane waits
-  while it is present), put the PR back to draft, and page. The issue keeps
-  its status; Devon removes the label to resume.
+Reviewer and verifier threads start from the lifecycle on the normal path;
+the sweep only cancels and restores. Dispatcher-owned issues (no `odd` label
+past `Todo`) are recorded as `ignored`, never spawned.
+
+## Budget spent
+
+`rounds` in `contracts` is the whole budget: builder 3, reviewer 2, verifier
+2, intake and spec 1. When a round is spent the control plane adds the
+Linear label `escalated`, pages `budget-ceiling` (PR back to draft when one
+exists), and waits while the label is present. Devon removes the label to
+resume; the next evaluation starts a fresh round. There is no retry on
+another engine.
 
 ## Paging
 
-Every page comes from here, in one format, by Slack DM:
-`ODD page: <condition> | issue MET-<n> | <pr or host> | <sha> | default if
-silent: <action>`. Conditions that page: irreversible production action
-requested, failed rollback or health red after rollback, usage ceiling
-reached, third failed QA round, security finding. Everything else is a Linear
-comment or `#factory-alerts`.
+Every page comes from the control plane in one format, by Slack DM, built by
+`pageText` in `scripts/odd/lifecycle.ts`:
+`ODD page: <condition> | issue MET-<n> | <PR #n or host> | <sha> | default if
+silent: <action>. <detail>`. Conditions: `third-failed-qa-round`,
+`failed-rollback`, `irreversible-action`, `security-finding`,
+`budget-ceiling`, `control-plane-blind`; defaults are `pageDefaults`. A page
+is a no-op while `escalated` is already on the issue. Everything else is a
+Linear comment or `#factory-alerts`.
 
 ## Daily digest
 
-One post to `#factory-alerts` at 08:00 runner time: merged PRs with head and
-merge SHAs, deploys with receipts, issues set Done, bugs filed by the Verifier,
-issues waiting on Devon, caps and usage per engine, backstop activity. No
-diffs, no secrets.
+`digest` in `scripts/odd/watchdog.ts` renders one post to `#factory-alerts`:
+PRs merged that day with head and merge SHAs, issues set Done, Bugs filed,
+issues waiting on Devon (`escalated`), load against the caps, and that day's
+Watchdog cancellations. No diffs, no secrets.
 
 ## Authority
 
-Cancel threads, relabel, reopen issues, restart the control-plane orb. Never
-merge, deploy, or edit a spec.
+Archive threads, comment, restore issue status, add `escalated`, post
+alerts and pages. Never merge, deploy, or edit a spec.

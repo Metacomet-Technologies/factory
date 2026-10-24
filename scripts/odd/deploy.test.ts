@@ -245,7 +245,7 @@ test('sandbox: a kiosk release installs, three green probes report its SHA, Depl
   assert.equal(host.live.kiosk, shas['v0.3.0']);
   const pass = line(`component=kiosk sha=${shas['v0.3.0']} health=pass rollback=none`);
   assert.deepEqual(host.comments, [['MET-301', pass]]);
-  assert.deepEqual(deploying(pass), { kind: 'set-status', status: 'Done', reason: 'deployed kiosk at 111111111111' });
+  assert.deepEqual(deploying(pass), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify kiosk at 111111111111', round: 1 });
   assert.equal(host.ledger().lastTag, 'v0.3.0');
   assert.equal(host.ledger().receipt, undefined);
   // release.py downloads 0644; the meter and factory-api installers require -x.
@@ -354,7 +354,11 @@ async function controlPlane(options: { issue: string; receipt: string; failOnce:
   const bugs: string[] = [];
   let status = 'Deploying';
   let failOnce: string | undefined = options.failOnce;
+  const alerts: string[] = [];
   const tools = { call: async (name: string, input: Record<string, unknown>) => {
+    // The Watchdog sweep enumerates issues by status and posts to #factory-alerts; neither is the handoff under test.
+    if (name === 'linear.list_issues' && (input.state !== undefined || input.label !== undefined)) return { issues: [] };
+    if (name === 'slack_write' && input.channelName !== undefined) { alerts.push(String(input.text)); return {}; }
     if (name === failOnce) { failOnce = undefined; calls.push(`${name} failed`); throw new Error(`${name}: HTTP 503`); }
     switch (name) {
       case 'linear.get_issue': return { id: options.issue, status, labels: ['odd'], description: '', relations: { blockedBy: [] } };
@@ -375,19 +379,19 @@ async function controlPlane(options: { issue: string; receipt: string; failOnce:
   const agent = { definition: {}, createThread: async (options: { executor: unknown }) => ({
     id: 'T-deployer', setLabels: async (labels: string[]) => { calls.push(`log reader ${JSON.stringify(options.executor)} ${labels.at(-1)}`); }, appendUserMessage: async () => {},
   }) };
+  const $ = async () => ({ exitCode: 0, stdout: '[]', stderr: '' });
   const amp = {
-    createAgent: () => agent, registerAgentMode: () => {}, registerTool: () => {},
+    $, createAgent: () => agent, registerAgentMode: () => {}, registerTool: () => {},
     on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
     createWebhook: async ({ key, handler }: { key: string; handler: (event: unknown, ctx: unknown) => Promise<void> }) => { webhooks.set(key, handler); return { url: `https://hooks.example/${key}` }; },
     system: { executor: { kind: 'remote', keepAlive: async () => {} } },
   };
   await (plugin as unknown as (api: unknown) => Promise<void>)(amp);
   await handlers.get('session.start')!({}, { thread, ui, logger, tools });
-  const $ = async () => ({ exitCode: 0, stdout: '[]', stderr: '' });
   const deliver = (id: string) => webhooks.get('linear')!(
     { id, receivedAt: '2026-10-24T15:00:01Z', body: new TextEncoder().encode(JSON.stringify({ data: { identifier: options.issue } })) },
     { thread, ui, logger, tools, $ });
-  return { deliver, calls, status: () => status };
+  return { deliver, calls, alerts, status: () => status };
 }
 
 const settle = async () => { for (let i = 0; i < 50; i++) await new Promise(resolve => setImmediate(resolve)); };
@@ -431,7 +435,7 @@ test('sandbox: a release that touches no enabled component posts component=none 
   assert.deepEqual(sudoCalls(host.calls), []);
   const none = line(`component=none sha=${shas['v0.3.0']} health=pass rollback=none`);
   assert.deepEqual(host.comments, [['MET-301', none]]);
-  assert.equal((deploying(none) as { status: string }).status, 'Done');
+  assert.deepEqual(deploying(none), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify none at 111111111111', round: 1 });
 });
 
 test('sandbox: killed between install and probe, the rerun resumes the in-flight kiosk without a second install and finishes the probe', async t => {
