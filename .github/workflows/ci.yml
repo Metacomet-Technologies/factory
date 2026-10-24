@@ -109,6 +109,10 @@ jobs:
           mapfile -d '' scripts < <(find deploy scripts -type f -name '*.sh' -print0)
           for script in "${scripts[@]}"; do bash -n "$script"; done
           shellcheck -x "${scripts[@]}"
+      - name: Lint the installer and rollback contract
+        run: |
+          bash deploy/lint-installers.sh
+          python3 -B deploy/test-lint-installers.py
       - run: python3 -B deploy/test_set_ollama_host.py
       - run: python3 -B deploy/test-install-dispatch.py
       - run: python3 -B deploy/backup/test-backup.py
