@@ -124,12 +124,12 @@ fn applesmc(root: &Path) {
 }
 
 #[test]
-fn applesmc_symlink_fans_preserve_hwmon_and_refresh_on_slow_cadence() {
+fn applesmc_acpi_fans_preserve_hwmon_and_refresh_on_slow_cadence() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     console(root);
     applesmc(root);
-    let node = "sys/bus/acpi/devices/APP0001:00/physical_node";
+    let node = "sys/bus/acpi/devices/APP0001:00";
     write(root, &format!("{node}/fan1_input"), "2200\n");
     write(root, &format!("{node}/fan2_input"), "2300\n");
     write(root, &format!("{node}/fan1_label"), "Left\n");
@@ -143,7 +143,7 @@ fn applesmc_symlink_fans_preserve_hwmon_and_refresh_on_slow_cadence() {
     assert_eq!(fans.len(), 3);
     for (name, rpm) in [
         ("coretemp fan1", 1500.0),
-        ("applesmc fan1", 2200.0),
+        ("applesmc fan1 (Left)", 2200.0),
         ("applesmc fan2", 2300.0),
     ] {
         let metric = &fans.iter().find(|fan| fan.name == name).unwrap().metric;
@@ -162,7 +162,7 @@ fn applesmc_symlink_fans_preserve_hwmon_and_refresh_on_slow_cadence() {
     accepted(&next);
     let next = agent.sample(1_300_000);
     assert_eq!(next.cooling.fans.len(), 3);
-    for (name, rpm) in [("applesmc fan1", 2400.0), ("coretemp fan1", 1600.0)] {
+    for (name, rpm) in [("applesmc fan1 (Left)", 2400.0), ("coretemp fan1", 1600.0)] {
         let metric = &next
             .cooling
             .fans
@@ -192,6 +192,24 @@ fn absent_applesmc_leaves_hwmon_fans_unchanged() {
     assert_eq!(sample.cooling.fans[0].metric.value, Some(1500.0));
     assert_eq!(sample.cooling.fans_availability, Availability::Available);
     accepted(&sample);
+
+    applesmc(dir.path());
+    let unbound = collector(dir.path(), &new_session_id().unwrap()).sample(1_000_000);
+    assert_eq!(unbound.cooling.fans_availability, Availability::Unsupported);
+    assert_eq!(unbound.cooling.fans.len(), 2);
+    assert_eq!(unbound.cooling.fans[0], sample.cooling.fans[0]);
+    let missing = &unbound.cooling.fans[1];
+    assert_eq!(missing.name, "applesmc fans");
+    assert_eq!(missing.metric.value, None);
+    assert!(
+        missing
+            .metric
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("binding")
+    );
+    assert_eq!(accepted(&unbound).host.cooling, unbound.cooling);
 }
 
 #[test]
@@ -464,7 +482,17 @@ fn applesmc_and_power_reads_timeout_without_rejecting_sample() {
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     }
     let sample = sample_within(root, Duration::from_secs(5));
-    assert!(sample.cooling.fans.is_empty());
+    assert_eq!(sample.cooling.fans.len(), 1);
+    assert_eq!(sample.cooling.fans[0].name, "applesmc fans");
+    assert_eq!(sample.cooling.fans[0].metric.value, None);
+    assert!(
+        sample.cooling.fans[0]
+            .metric
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("no applesmc driver binding or readable fan inputs")
+    );
     assert_eq!(sample.cooling.fans_availability, Availability::Unsupported);
     assert_eq!(
         sample.power.as_ref().unwrap().availability,

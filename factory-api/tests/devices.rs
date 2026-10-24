@@ -168,6 +168,211 @@ fn applesmc_deduplicates_existing_hwmon_names() {
     assert_eq!(host.cooling.fans[1].metric.value, Some(2300.0));
 }
 
+fn t2_console(root: &Path) {
+    fixture(root);
+    let acpi = root.join("sys/bus/acpi/devices/APP0001:00");
+    let node = root.join("sys/devices/pci0000:00/0000:00:1f.0/APP0001:00");
+    fs::create_dir_all(acpi.join("hwmon/hwmon3")).unwrap();
+    fs::create_dir_all(&node).unwrap();
+    std::os::unix::fs::symlink(&node, acpi.join("physical_node")).unwrap();
+    std::os::unix::fs::symlink(
+        acpi.join("hwmon/hwmon3"),
+        root.join("sys/class/hwmon/hwmon3"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&acpi, acpi.join("hwmon/hwmon3/device")).unwrap();
+    write(root, "sys/class/hwmon/hwmon7/name", "amdgpu\n");
+    write(root, "sys/class/hwmon/hwmon7/fan1_input", "0\n");
+    write(
+        root,
+        "sys/bus/acpi/devices/APP0001:00/physical_node/waiting_for_supplier",
+        "0\n",
+    );
+}
+
+#[test]
+fn t2_fans_unbound_does_not_claim_gpu_fan_is_system_cooling() {
+    let dir = tempfile::tempdir().unwrap();
+    t2_console(dir.path());
+    let host = sample(dir.path(), &mut devices::Sampler::default(), 1_000_000);
+    assert_eq!(
+        host.cooling.fans_availability,
+        devices::Availability::Unsupported
+    );
+    let gpu = host
+        .cooling
+        .fans
+        .iter()
+        .find(|fan| fan.name == "amdgpu fan1")
+        .unwrap();
+    assert_eq!(gpu.metric.value, Some(0.0));
+    let missing = host
+        .cooling
+        .fans
+        .iter()
+        .find(|fan| fan.name == "applesmc fans")
+        .unwrap();
+    assert_eq!(
+        missing.metric.availability,
+        devices::Availability::Unsupported
+    );
+    assert_eq!(missing.metric.value, None);
+    assert!(
+        missing
+            .metric
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("APP0001:00")
+    );
+    assert!(
+        missing
+            .metric
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("binding")
+    );
+}
+
+#[test]
+fn t2_fans_acpi_driver_attributes_not_physical_node() {
+    let dir = tempfile::tempdir().unwrap();
+    t2_console(dir.path());
+    let root = dir.path();
+    let acpi = "sys/bus/acpi/devices/APP0001:00";
+    fs::create_dir_all(root.join("sys/bus/acpi/drivers/applesmc")).unwrap();
+    std::os::unix::fs::symlink(
+        root.join("sys/bus/acpi/drivers/applesmc"),
+        root.join(acpi).join("driver"),
+    )
+    .unwrap();
+    write(root, &format!("{acpi}/name"), "applesmc\n");
+    write(root, &format!("{acpi}/fan1_input"), "1824\n");
+    write(root, &format!("{acpi}/fan2_input"), "1699\n");
+    let host = sample(root, &mut devices::Sampler::default(), 1_000_000);
+    assert_eq!(
+        host.cooling.fans_availability,
+        devices::Availability::Available
+    );
+    assert_eq!(host.cooling.fans.len(), 3);
+    for (name, rpm) in [("applesmc fan1", 1824.0), ("applesmc fan2", 1699.0)] {
+        let fan = host
+            .cooling
+            .fans
+            .iter()
+            .find(|fan| fan.name == name)
+            .unwrap();
+        assert_eq!(fan.metric.value, Some(rpm));
+        assert_eq!(fan.metric.unit, "rpm");
+    }
+    for index in 1..=2 {
+        fs::remove_file(root.join(format!("{acpi}/fan{index}_input"))).unwrap();
+    }
+    let missing = sample(root, &mut devices::Sampler::default(), 1_000_000);
+    assert_eq!(
+        missing.cooling.fans_availability,
+        devices::Availability::Error
+    );
+    let diagnostic = missing
+        .cooling
+        .fans
+        .iter()
+        .find(|fan| fan.name == "applesmc fans")
+        .unwrap();
+    assert_eq!(diagnostic.metric.availability, devices::Availability::Error);
+    assert!(
+        diagnostic
+            .metric
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("bound but exposes no readable fan inputs")
+    );
+}
+
+#[test]
+fn t2_fans_hwmon_labels_and_aliases_are_unique() {
+    for (named, class_alias) in [(false, true), (true, true), (false, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        t2_console(dir.path());
+        let root = dir.path();
+        let acpi = "sys/bus/acpi/devices/APP0001:00";
+        if !class_alias {
+            fs::remove_file(root.join("sys/class/hwmon/hwmon3")).unwrap();
+        }
+        if named {
+            write(root, &format!("{acpi}/hwmon/hwmon3/name"), "applesmc\n");
+        }
+        for (index, rpm) in [(1, "1824"), (2, "1699")] {
+            write(root, &format!("{acpi}/hwmon/hwmon3/fan{index}_input"), rpm);
+            write(
+                root,
+                &format!("{acpi}/hwmon/hwmon3/fan{index}_label"),
+                "Side\n",
+            );
+            write(root, &format!("{acpi}/physical_node/fan{index}_input"), rpm);
+            if class_alias {
+                write(root, &format!("{acpi}/fan{index}_input"), rpm);
+            }
+        }
+        let host = sample(root, &mut devices::Sampler::default(), 1_000_000);
+        assert_eq!(
+            host.cooling.fans_availability,
+            devices::Availability::Available
+        );
+        assert_eq!(host.cooling.fans.len(), 3);
+        for (index, rpm) in [(1, 1824.0), (2, 1699.0)] {
+            let name = format!("applesmc fan{index} (Side)");
+            let fan = host
+                .cooling
+                .fans
+                .iter()
+                .find(|fan| fan.name == name)
+                .unwrap();
+            assert_eq!(fan.metric.value, Some(rpm));
+        }
+    }
+}
+
+#[test]
+fn t2_fans_only_valid_apple_rpm_makes_cooling_available() {
+    let dir = tempfile::tempdir().unwrap();
+    t2_console(dir.path());
+    for (raw, expected) in [
+        ("bad", devices::Availability::Error),
+        ("NaN", devices::Availability::Error),
+        ("-1", devices::Availability::Error),
+        ("30001", devices::Availability::Error),
+        ("0", devices::Availability::Available),
+        ("30000", devices::Availability::Available),
+    ] {
+        write(
+            dir.path(),
+            "sys/bus/acpi/devices/APP0001:00/fan1_input",
+            raw,
+        );
+        let host = sample(dir.path(), &mut devices::Sampler::default(), 1_000_000);
+        assert_eq!(host.cooling.fans_availability, expected, "{raw}");
+        let fan = host
+            .cooling
+            .fans
+            .iter()
+            .find(|fan| fan.name == "applesmc fan1")
+            .unwrap();
+        assert_eq!(fan.metric.availability, expected);
+        if expected == devices::Availability::Error {
+            assert_eq!(fan.metric.value, None);
+            assert!(fan.metric.detail.is_some());
+        } else {
+            assert_eq!(
+                fan.metric.value,
+                Some(if raw == "0" { 0.0 } else { 30000.0 })
+            );
+        }
+    }
+}
+
 #[test]
 fn power_supply_fallback_converts_signed_microamps_and_microvolts() {
     for current in ["2000000", "-2000000"] {

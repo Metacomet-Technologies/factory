@@ -454,6 +454,21 @@ console-ssh "sudo bash /home/agent/work/factory/deploy/devices-agent/install-dev
 op read 'op://Factory/factory-console devices token/credential' | console-ssh 'sudo bash /home/agent/work/factory/deploy/devices-agent/install-devices-agent.sh /home/agent/work/factory/target/release/factory-devices-agent'
 ```
 
+For the MET-312 fan-discovery update on an already enrolled console, build
+and preflight as above, then reuse the installed token:
+
+```sh
+console-ssh 'sudo bash /home/agent/work/factory/deploy/devices-agent/install-devices-agent.sh /home/agent/work/factory/target/release/factory-devices-agent' </dev/null
+curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/devices/factory-console | jq '.device.cooling | {fans_availability, fans}'
+```
+
+Wait for the first new sample. Expect `fans_availability: "available"` and
+at least one `applesmc fanN` with a non-zero RPM value. No kernel change,
+module reload, or reboot is required: the driver already exposes fan inputs
+on the ACPI device. See the [read-only probe evidence](devices-ingest.md#t2-fan-discovery-met-312).
+The installer and rollback scripts are unchanged. Rollback below removes
+the agent; it does not restore the previous agent binary or change the driver.
+
 Save the printed backup path. Then:
 
 ```sh

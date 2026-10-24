@@ -1466,8 +1466,54 @@ logs a `discovered sources` line on each start).
 | Disk I/O | `/proc/diskstats` | available | pending install | — |
 | Network | `/proc/net/dev`, all but `lo` | available | pending install | — |
 | Temperatures | `/sys/class/hwmon`, `/sys/class/thermal` | available (1 sensor) | pending install | whatever hwmon exposes |
-| Fans | hwmon `fan*_input`, plus `applesmc` via `/sys/bus/acpi/devices/APP0001:00/physical_node` | unsupported in the baseline sandbox | pending verification | MET-258 adds each ACPI fan unless hwmon already reported the same name |
+| Fans | hwmon `fan*_input`, plus the `APP0001:00` ACPI device, its `physical_node`, and their hwmon directories | unsupported in the baseline sandbox | sysfs reads 1824 and 1699 rpm; agent fix awaits deployment | MET-312 discovers the ACPI driver's attributes and deduplicates Apple fans by index before adding labels |
 | Battery | `/sys/class/power_supply`, including adapter online state | unsupported without a battery fixture | pending verification | MET-258 adds optional `power` readings in schema v1 |
 | Clock | `adjtimex` | available | pending install | — |
 | Backup | published status file | unsupported (no file) | pending install | factory-console publishes none (`deploy/backup/nodes.conf`) |
 | Reboot | published status file | unsupported (no file) | pending install | published only where a `factory-api` group exists, so none today |
+
+### T2 fan discovery (MET-312)
+
+Read-only probes as `agent` on factory-console on 2026-10-24 found that
+`7.2.9-2-t2-resolute` already binds `applesmc` on the ACPI bus:
+
+```text
+readlink /sys/bus/acpi/devices/APP0001:00/driver
+../../../../../../bus/acpi/drivers/applesmc
+cat /sys/bus/acpi/devices/APP0001:00/name
+applesmc
+cat /sys/bus/acpi/devices/APP0001:00/fan1_input
+1824
+cat /sys/bus/acpi/devices/APP0001:00/fan2_input
+1699
+cat /sys/bus/acpi/devices/APP0001:00/physical_node/waiting_for_supplier
+0
+```
+
+The empty platform `physical_node` is not the bound ACPI device. The nameless
+`hwmon3` points back to that ACPI device through `device`; its own directory
+has no fan attributes. MET-258 checked only the physical node and hwmon
+directories, missing the attributes on the ACPI device itself. The deployed
+API consequently reported only `amdgpu fan1 = 0`, with availability `available`.
+No kernel, package, module option, or supplier-ordering fix is indicated.
+`modinfo -F parm applesmc` returned no parameters. Both fan labels returned
+`Invalid argument`, so the collector must tolerate unreadable optional labels.
+
+Discovery accepts a hwmon named `applesmc` anywhere in the hwmon class, or
+one beneath `APP0001:00` or its physical node even without a name. It also
+reads fan attributes directly from both nodes. Duplicate Apple fan indices
+are reported once, with hwmon-class readings preferred. Readable labels add
+` (label)` to `applesmc fanN`; the index keeps repeated labels distinct.
+
+When an Apple source exists, unrelated fans do not make `fans_availability`
+available. At least one Apple fan must have a valid RPM reading. If no inputs
+are readable, an `applesmc fans` entry has a null value and a diagnostic in
+the existing metric `detail`. Availability is `unsupported` without a driver
+binding and `error` with a binding but no readable inputs. Malformed or
+out-of-range Apple readings remain individual errors. Non-Apple readings
+are retained. No ingest schema change is needed.
+
+The fix ships in the devices-agent binary through the existing installer.
+There is no new host configuration to install or undo, and no module reload
+or reboot is required. Live API acceptance remains pending Devon's install;
+see [console deployment](devices.md#deploy-devon-from-the-mac).
