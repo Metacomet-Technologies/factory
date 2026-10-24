@@ -41,6 +41,8 @@ export type LinearIssue = {
   labels: readonly string[];
   description?: string | null;
   comments?: readonly { body: string }[];
+  /** Present when fetched with `includeRelations: true`. */
+  relations?: { blockedBy?: readonly { id: string }[] } | null;
 };
 
 /** `gh pr list --json number,headRefOid,state,mergeCommit,statusCheckRollup`. */
@@ -76,6 +78,18 @@ export function verdictFor(threads: readonly LiveThread[], headSha: string): Ver
   return undefined;
 }
 
+/** Review rounds spent on the issue: distinct heads that received a `changes` verdict. */
+export function changesRounds(threads: readonly LiveThread[]): number {
+  const heads = new Set<string>();
+  for (const thread of threads) {
+    for (const label of thread.labels) {
+      const match = verdictPattern.exec(label);
+      if (match?.[1] === 'changes') heads.add(match[2]);
+    }
+  }
+  return heads.size;
+}
+
 export function riskFrom(description: string): RiskClass | undefined {
   const match = /^\s*risk:\s*(ordinary|security|authority|irreversible)\b/im.exec(description);
   return match ? match[1].toLowerCase() as RiskClass : undefined;
@@ -87,15 +101,19 @@ const ownerState = (state: string): NonNullable<IssueSnapshot['owner']>['state']
 };
 
 /**
- * Combine the three sources. `threads` are the live Amp threads labelled for this issue;
- * the owner is the most recently updated one with a role label. Open blockers are not
- * exposed by the Linear MCP; the caller passes what it knows (empty until phase 4).
+ * Combine the three sources. `threads` are the live Amp threads labelled for this issue. The
+ * owner is a running role thread if any (the issue waits for it), else the builder thread
+ * (steer targets it even while a reviewer thread is idle beside it), else the first role thread.
+ * Open blockers come from Linear relations; the caller resolves which are still open.
  */
 export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; threads?: readonly LiveThread[]; openBlockers?: readonly string[] }): IssueSnapshot {
   const { issue, pr, threads = [], openBlockers = [] } = input;
   const description = issue.description ?? '';
   const status = statuses.find(name => name === issue.status) ?? 'Backlog';
-  const owned = threads.find(thread => parseThreadLabels(thread.labels).role);
+  const roleThreads = threads.filter(thread => parseThreadLabels(thread.labels).role);
+  const owned = roleThreads.find(thread => ownerState(thread.state) === 'running')
+    ?? roleThreads.find(thread => parseThreadLabels(thread.labels).role === 'builder')
+    ?? roleThreads[0];
   const owner = owned ? (() => {
     const { role, round } = parseThreadLabels(owned.labels);
     return role ? { role, threadID: owned.id, round, state: ownerState(owned.state) } : undefined;
@@ -116,21 +134,30 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
       verdict: verdictFor(threads, pr.headRefOid),
       merged: pr.state === 'MERGED',
       mergeSha: pr.mergeCommit?.oid ?? undefined,
+      changesRounds: changesRounds(threads),
     } : undefined,
     deployReceipt: receipt,
   };
 }
 
-/** Live load from every running role thread, counted by the role's executor (§6). */
+/**
+ * Live load (§6): orbs and runner slots count running role threads by executor; buildIssues
+ * counts issues with a live builder thread in any state, since a builder waiting for review
+ * still holds its build slot.
+ */
 export function loadFrom(threads: readonly LiveThread[]): Load {
-  const load: Load = { orbs: 0, runnerSlots: 0 };
+  const load: Load = { orbs: 0, runnerSlots: 0, buildIssues: 0 };
+  const building = new Set<string>();
   for (const thread of threads) {
-    const { role } = parseThreadLabels(thread.labels);
-    if (!role || ownerState(thread.state) !== 'running') continue;
+    const { role, issue } = parseThreadLabels(thread.labels);
+    if (!role) continue;
+    if (role === 'builder' && issue) building.add(issue);
+    if (ownerState(thread.state) !== 'running') continue;
     const executor = contracts[role].executor;
     if (executor === 'orb') load.orbs += 1;
     else if (executor === 'runner') load.runnerSlots += 1;
   }
+  load.buildIssues = building.size;
   return load;
 }
 
@@ -138,6 +165,8 @@ export function loadFrom(threads: readonly LiveThread[]): Load {
 const roleStages: Partial<Record<keyof typeof contracts, readonly Status[]>> = {
   intake: ['Backlog'],
   spec: ['Backlog', 'Triage'],
+  builder: ['Todo', 'In Progress'],
+  reviewer: ['In Progress'],
 };
 
 /** Idle role threads whose stage the issue has left: finished work to archive (§7 handoff). */

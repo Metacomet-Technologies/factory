@@ -141,12 +141,14 @@ function selfDeploying(paths: string[]) {
 
 // The dispatcher prechecks SHA-specific CI with gh api. The merging reviewer must
 // independently run this with gh pr checks, then use --match-head-commit.
-export async function mergeCheck(pr: string, sha: string, restRead = false) {
+// `selfDeployingOk` is the ODD control plane's authority (docs/odd/README.md §1): under the
+// `odd` label a merge that deploys itself goes through the same gate as any other.
+export async function mergeCheck(pr: string, sha: string, restRead = false, selfDeployingOk = false) {
   if (!/^\d+$/.test(pr) || !shaPattern.test(sha)) throw new Error('Invalid QA PR or SHA');
   const before = await info(pr, restRead);
   if (before.state !== 'OPEN' || before.isDraft !== false || before.baseRefName !== 'main'
     || before.headRefOid !== sha || head(pr) !== sha) throw new Error('QA head is not mergeable');
-  if (selfDeploying(await files(pr, restRead))) throw new Error('Ready; merging deploys it');
+  if (!selfDeployingOk && selfDeploying(await files(pr, restRead))) throw new Error('Ready; merging deploys it');
   let checks;
   if (restRead) {
     const runs = await githubAPI(`commits/${sha}/check-runs?per_page=100&filter=latest`);
@@ -504,9 +506,11 @@ export async function syncPlaybook(ctx: Context) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
-    if (process.argv.length !== 5 || process.argv[2] !== 'check') throw new Error('Usage: qa.ts check PR SHA');
+    const [, , command, pr, sha, ...flags] = process.argv;
+    const selfDeployingOk = flags.length === 1 && flags[0] === '--self-deploying-ok';
+    if (command !== 'check' || !pr || !sha || (flags.length && !selfDeployingOk)) throw new Error('Usage: qa.ts check PR SHA [--self-deploying-ok]');
     ghPreflight();
-    await mergeCheck(process.argv[3], process.argv[4]);
+    await mergeCheck(pr, sha, false, selfDeployingOk);
     console.log('QA merge gate passed; use --match-head-commit for the merge.');
   } catch (error) {
     // Fail closed, but name the cause; the generic refusal hid gh 2.46.0's missing --slurp.

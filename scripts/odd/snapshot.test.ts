@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ciState, finishedThreads, issueFromEvent, loadFrom, riskFrom, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { changesRounds, ciState, finishedThreads, issueFromEvent, loadFrom, riskFrom, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
 import { nextAction } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
@@ -44,36 +44,51 @@ test('snapshot combines Linear, GitHub and thread state, and feeds nextAction', 
   });
   assert.equal(snapshot.identifier, 'MET-277');
   assert.deepEqual(snapshot.owner, { role: 'builder', threadID: 'T-b', round: 2, state: 'idle' });
-  assert.deepEqual(snapshot.pr, { number: 157, headSha: sha, ci: 'success', verdict: undefined, merged: false, mergeSha: undefined });
+  assert.deepEqual(snapshot.pr, { number: 157, headSha: sha, ci: 'success', verdict: undefined, merged: false, mergeSha: undefined, changesRounds: 0 });
   assert.equal(snapshot.deployReceipt?.health, 'pass');
   assert.equal(snapshot.risk, 'ordinary');
-  assert.deepEqual(nextAction(snapshot, { orbs: 0, runnerSlots: 0 }), { kind: 'spawn', role: 'reviewer', executor: 'orb', reason: `no verdict at ${sha.slice(0, 12)}`, round: 1 });
+  assert.deepEqual(nextAction(snapshot, { orbs: 0, runnerSlots: 0, buildIssues: 1 }), { kind: 'spawn', role: 'reviewer', executor: 'orb', reason: `no verdict at ${sha.slice(0, 12)}`, round: 1 });
   const unknown = toSnapshot({ issue: { id: 'MET-1', status: 'Nonsense', labels: [] } });
   assert.equal(unknown.status, 'Backlog');
   assert.equal(unknown.pr, undefined);
 });
 
-test('load counts only running role threads, by the role executor', () => {
+test('load counts running role threads by executor, and build issues by any live builder thread', () => {
   const threads: LiveThread[] = [
-    { id: '1', labels: ['odd-role-builder'], state: 'running' },
-    { id: '2', labels: ['odd-role-builder'], state: 'idle' },
+    { id: '1', labels: ['odd-role-builder', 'odd-issue-met-1'], state: 'running' },
+    { id: '2', labels: ['odd-role-builder', 'odd-issue-met-2'], state: 'idle' },
+    { id: '2b', labels: ['odd-role-builder', 'odd-issue-met-2', 'odd-round-2'], state: 'idle' },
     { id: '3', labels: ['odd-role-deployer'], state: 'tool-running' },
     { id: '4', labels: ['odd-role-shipper'], state: 'running' },
     { id: '5', labels: ['unrelated'], state: 'running' },
   ];
-  assert.deepEqual(loadFrom(threads), { orbs: 1, runnerSlots: 1 });
+  assert.deepEqual(loadFrom(threads), { orbs: 1, runnerSlots: 1, buildIssues: 2 });
 });
 
-test('finished threads: idle intake past Backlog and idle spec past Triage; running, later roles and unlabelled threads stay', () => {
+test('finished threads: idle role threads whose stage the issue has left; running, later roles and unlabelled threads stay', () => {
   const threads: LiveThread[] = [
     { id: 'intake-idle', labels: ['odd-role-intake', 'odd-issue-met-1'], state: 'idle' },
     { id: 'intake-running', labels: ['odd-role-intake', 'odd-issue-met-1'], state: 'streaming' },
     { id: 'spec-idle', labels: ['odd-role-spec', 'odd-issue-met-1'], state: 'idle' },
     { id: 'builder-idle', labels: ['odd-role-builder', 'odd-issue-met-1'], state: 'idle' },
+    { id: 'reviewer-idle', labels: ['odd-role-reviewer', 'odd-issue-met-1'], state: 'idle' },
+    { id: 'verifier-idle', labels: ['odd-role-verifier', 'odd-issue-met-1'], state: 'idle' },
     { id: 'plain', labels: ['odd-issue-met-1'], state: 'idle' },
   ];
-  assert.deepEqual(finishedThreads('Backlog', threads).map(t => t.id), []);
-  assert.deepEqual(finishedThreads('Triage', threads).map(t => t.id), ['intake-idle']);
-  assert.deepEqual(finishedThreads('Todo', threads).map(t => t.id), ['intake-idle', 'spec-idle']);
-  assert.deepEqual(finishedThreads('Duplicate', threads).map(t => t.id), ['intake-idle', 'spec-idle']);
+  // A builder or reviewer thread beside an issue that went back to Backlog or Triage is stale too.
+  assert.deepEqual(finishedThreads('Backlog', threads).map(t => t.id), ['builder-idle', 'reviewer-idle']);
+  assert.deepEqual(finishedThreads('Triage', threads).map(t => t.id), ['intake-idle', 'builder-idle', 'reviewer-idle']);
+  assert.deepEqual(finishedThreads('Todo', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'reviewer-idle']);
+  assert.deepEqual(finishedThreads('In Progress', threads).map(t => t.id), ['intake-idle', 'spec-idle']);
+  assert.deepEqual(finishedThreads('Deploying', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'builder-idle', 'reviewer-idle']);
+  assert.deepEqual(finishedThreads('Duplicate', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'builder-idle', 'reviewer-idle']);
+});
+
+test('the owner is the running thread, else the builder, so a steer targets the builder beside an idle reviewer', () => {
+  const builder: LiveThread = { id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1'], state: 'idle' };
+  const reviewer: LiveThread = { id: 'T-r', labels: ['odd-issue-met-1', 'odd-role-reviewer', 'odd-round-1', `odd-verdict-changes-${sha.slice(0, 12)}`], state: 'idle' };
+  const issue = { id: 'MET-1', status: 'In Progress', labels: [] };
+  assert.equal(toSnapshot({ issue, threads: [reviewer, builder] }).owner?.threadID, 'T-b');
+  assert.equal(toSnapshot({ issue, threads: [builder, { ...reviewer, state: 'running' }] }).owner?.threadID, 'T-r');
+  assert.equal(changesRounds([reviewer, { ...reviewer, id: 'T-r2' }, { ...builder, labels: [...builder.labels, 'odd-verdict-changes-' + 'e'.repeat(12)] }]), 2);
 });

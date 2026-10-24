@@ -1,5 +1,6 @@
 // @amp-agent-mode {"key":"odd-intake","label":"ODD Intake"}
 // @amp-agent-mode {"key":"odd-spec","label":"ODD Spec"}
+// @amp-agent-mode {"key":"odd-builder","label":"ODD Builder"}
 // @amp-agent-mode {"key":"odd-reviewer","label":"ODD Reviewer"}
 // @amp-agent-mode {"key":"odd-verifier","label":"ODD Verifier"}
 // @amp-agent-mode {"key":"odd-control","label":"ODD Control"}
@@ -8,8 +9,10 @@ import type { Agent, PluginAPI, PluginEventContext, ThreadID, WebhookEvent, Webh
 import {
 	capacity,
 	contracts,
+	escalatedLabel,
 	issueTriaged,
 	nextAction,
+	oddLabel,
 	parseThreadLabels,
 	ralphGuard,
 	specComplete,
@@ -28,11 +31,12 @@ export const description =
 // The plugin is armed only in the control thread (label odd-control-plane). Everywhere else it
 // registers the role modes and the Ralph guard and does nothing on its own. `perform` acts only
 // when the control thread also carries odd-perform, and only for the roles already live:
-// phase 3 (MET-278) spawns intake and spec and sets Triage/Todo; later phases add the rest.
+// phase 3 (MET-278) spawns intake and spec and sets Triage/Todo; phase 4 (MET-279) adds the
+// builder, the reviewer and the deterministic merge for issues labelled `odd`.
 const controlLabel = 'odd-control-plane'
 const performLabel = 'odd-perform'
 const marker = '[odd]'
-const liveRoles: ReadonlySet<Role> = new Set<Role>(['intake', 'spec'])
+const liveRoles: ReadonlySet<Role> = new Set<Role>(['intake', 'spec', 'builder', 'reviewer'])
 const slackPollMs = 5 * 60_000
 
 export default async function (amp: PluginAPI) {
@@ -46,14 +50,16 @@ export default async function (amp: PluginAPI) {
 				'Never write artifacts another role is supposed to check. Never edit Done means. Follow AGENTS.md.',
 				extra,
 			].join(' '),
-			tools: { add: ['mcp__linear__*', 'slack_read', 'slack_write', 'create_thread', 'get_thread_status', 'wait_for_threads'], ...tools },
+			// update_thread lets a role label its own thread (the reviewer's verdict is a label).
+			tools: { add: ['mcp__linear__*', 'slack_read', 'slack_write', 'create_thread', 'get_thread_status', 'wait_for_threads', 'update_thread'], ...tools },
 			display: { label, color: '#0f766e' },
 		})
 
 	const modes: { key: string; label: string; agent: Agent }[] = [
 		{ key: 'intake', label: 'ODD Intake', agent: roleAgent('intake', 'low', 'ODD Intake', 'Turn a message or bare issue into a Linear issue in the team template, with type and area labels and a duplicate check.') },
 		{ key: 'spec', label: 'ODD Spec', agent: roleAgent('spec', 'medium', 'ODD Spec', 'Write Isolation, Build, Done means and Evidence; one Evidence line per Done-means item; set priority and risk.') },
-		{ key: 'reviewer', label: 'ODD Reviewer', agent: roleAgent('reviewer', 'high', 'ODD Reviewer', 'Rerun the Evidence commands yourself at the exact head SHA. Verdict is bound to that SHA.', { exclude: ['edit_file', 'create_file'] }) },
+		{ key: 'builder', label: 'ODD Builder', agent: roleAgent('builder', 'medium', 'ODD Builder', 'Implement the smallest correct change on your own branch, open the PR with the Evidence output in its body, and keep the same thread and branch across review rounds.') },
+		{ key: 'reviewer', label: 'ODD Reviewer', agent: roleAgent('reviewer', 'high', 'ODD Reviewer', 'Rerun the Evidence commands yourself at the exact head SHA. Verdict is bound to that SHA: a PR comment plus the odd-verdict thread label.', { exclude: ['edit_file', 'create_file'] }) },
 		{ key: 'verifier', label: 'ODD Verifier', agent: roleAgent('verifier', 'low', 'ODD Verifier', 'Check each Done-means item against the deployed system using the Evidence lines and the deploy receipt.', { exclude: ['edit_file', 'create_file'] }) },
 	]
 	const agents: Partial<Record<Role, Agent>> = Object.fromEntries(modes.map((m) => [m.key, m.agent]))
@@ -80,7 +86,7 @@ export default async function (amp: PluginAPI) {
 		const { role, issue } = parseThreadLabels(labels)
 		if (!role || !issue || event.status !== 'done') return
 		const count = event.message.includes(marker) ? (chained.get(event.thread.id) ?? 0) : 0
-		const { stopMet, missing } = await externalStop(ctx, role, issue)
+		const { stopMet, missing } = await externalStop(ctx, role, issue, labels)
 		const verdict = ralphGuard({ role, chained: count, stopMet, missing })
 		if (verdict.action === 'stop') {
 			chained.delete(event.thread.id)
@@ -315,13 +321,17 @@ export default async function (amp: PluginAPI) {
 	}
 
 	// Phases 3-6 fill in `perform` stage by stage: phase 3 spawns intake and spec and moves
-	// issues between Triage and Todo; steer and page are wired; merge and deploy are deferred.
-	// While the dispatcher still owns Todo and later, ODD performs only on issues in the
-	// statuses it owns (Backlog, Triage); an issue the orchestrator created in Todo without an
-	// Evidence section must not be pulled back into Triage.
-	async function perform(ctx: ArmContext, issue: IssueSnapshot, action: Action) {
-		if (issue.status !== 'Backlog' && issue.status !== 'Triage') {
-			ctx.logger.log(marker, 'deferred to a later phase', issue.identifier, issue.status, action.kind)
+	// issues between Triage and Todo; phase 4 builds, reviews and merges; deploy is deferred.
+	// ODD owns Backlog and Triage for every issue. From Todo on, the dispatcher still owns an
+	// issue unless it carries the `odd` label (§6), so an issue the orchestrator created in Todo
+	// without an Evidence section is neither pulled back into Triage nor built twice.
+	// A steer is delivered once per (thread, message): the message names the head SHA, and the
+	// same evaluation repeats on every webhook until the builder pushes.
+	const steered = new Set<string>()
+	async function perform(ctx: EvalContext, issue: IssueSnapshot, action: Action) {
+		const owned = issue.status === 'Backlog' || issue.status === 'Triage' || issue.labels.includes(oddLabel)
+		if (!owned) {
+			ctx.logger.log(marker, 'deferred: dispatcher owns', issue.identifier, issue.status, action.kind)
 			return
 		}
 		switch (action.kind) {
@@ -335,28 +345,75 @@ export default async function (amp: PluginAPI) {
 					ctx.logger.log(marker, 'launch request for runner', issue.identifier, action.role)
 					return
 				}
+				const target = action.role === 'reviewer' && issue.pr ? ` Review PR #${issue.pr.number} at head ${issue.pr.headSha}.` : ''
 				const threadID = await spawnThread(
 					ctx.thread.id,
 					action.role,
 					threadLabels(issue.identifier, action.role, action.round),
-					`${marker} Outcome ${issue.identifier}. Role: ${action.role}. Reason: ${action.reason}. Load the \`${contracts[action.role].skill}\` skill and start.`,
+					`${marker} Outcome ${issue.identifier}. Role: ${action.role}. Reason: ${action.reason}.${target} Load the \`${contracts[action.role].skill}\` skill and start.`,
 				)
 				spawned.set(issue.identifier, [...(spawned.get(issue.identifier) ?? []), threadID])
+				// Todo -> In Progress is the builder's claim; the status change is the handoff artifact (§7).
+				if (action.role === 'builder' && issue.status === 'Todo') await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: 'In Progress' })
 				return
 			}
 			case 'set-status':
 				await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: action.status })
 				return
-			case 'steer':
+			case 'steer': {
+				const key = `${action.threadID}:${action.message}`
+				if (steered.has(key)) return
+				steered.add(key)
 				await amp.threads.get(action.threadID as ThreadID).appendUserMessage({ type: 'user-message', content: `${marker} ${action.message}` }, { steer: true })
 				return
+			}
+			case 'merge':
+				await merge(ctx, issue, action.pr, action.sha)
+				return
 			case 'page':
-				// Watchdog is the one voice (§8). Phase 6 posts to Slack; until then the control thread shows it.
-				await ctx.ui.notify(`${marker} PAGE ${action.reason}: ${action.detail}`)
+				await page(ctx, issue, action)
 				return
 			default:
 				ctx.logger.log(marker, 'deferred to a later phase', action.kind)
 		}
+	}
+
+	// The Shipper (§4) is this function: the dispatcher's merge gate at the exact head, then a
+	// head-pinned squash merge. Self-deploying paths pass because ODD merges them too (§1). A
+	// refusal is posted once per head so the builder sees it; the next push re-enters the loop.
+	const refused = new Set<string>()
+	async function merge(ctx: EvalContext, issue: IssueSnapshot, pr: number, sha: string) {
+		const root = (await ctx.$`git rev-parse --show-toplevel`).stdout.trim()
+		const check = await ctx.$`node ${`${root}/scripts/dispatch/qa.ts`} check ${String(pr)} ${sha} --self-deploying-ok`
+		if (check.exitCode !== 0) {
+			const cause = check.stderr.trim() || check.stdout.trim()
+			ctx.logger.log(marker, 'merge refused', issue.identifier, pr, sha, cause)
+			if (!refused.has(sha)) {
+				refused.add(sha)
+				await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-merge-refused pr=${pr} head=${sha}\n\n${cause}` })
+			}
+			return
+		}
+		const merged = await ctx.$`gh pr merge ${String(pr)} --squash --match-head-commit ${sha}`
+		if (merged.exitCode !== 0) throw new Error(`gh pr merge ${pr} at ${sha} failed: ${merged.stderr.trim()}`)
+		const view = await ctx.$`gh pr view ${String(pr)} --json mergeCommit --jq .mergeCommit.oid`
+		const mergeSha = view.exitCode === 0 ? view.stdout.trim() : 'unknown'
+		await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-merge pr=${pr} head=${sha} merge=${mergeSha} release=none` })
+		ctx.logger.log(marker, 'merged', issue.identifier, pr, sha, mergeSha)
+	}
+
+	// Escalation (§8): the issue stays In Progress with the `escalated` label (the lifecycle waits
+	// on it), the PR goes back to draft so nothing merges it, and Devon gets one Slack DM.
+	// `slack_write` without a recipient DMs the thread owner.
+	async function page(ctx: EvalContext, issue: IssueSnapshot, action: Extract<Action, { kind: 'page' }>) {
+		await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, addLabels: [escalatedLabel] })
+		if (action.pr !== undefined) {
+			const draft = await ctx.$`gh pr ready ${String(action.pr)} --undo`
+			if (draft.exitCode !== 0) ctx.logger.log(marker, 'draft failed', action.pr, draft.stderr.trim())
+		}
+		await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-escalated reason=${action.reason}\n\n${action.detail}` })
+		await ctx.tools.call('slack_write', { text: `${marker} ${issue.identifier} escalated (${action.reason}): ${action.detail}. Remove the \`${escalatedLabel}\` label to resume.` })
+		ctx.logger.log(marker, 'paged', issue.identifier, action.reason)
 	}
 }
 
@@ -380,13 +437,15 @@ async function callJson<T>(tools: Tools, name: string, input: Record<string, unk
 
 async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, knownThreads: readonly string[]): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[] }> {
 	const [issue, comments, pr, threads] = await Promise.all([
-		callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: identifier }),
+		callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: identifier, includeRelations: true }),
 		callJson<{ comments?: { body: string }[] }>(ctx.tools, 'linear.list_comments', { issueId: identifier, limit: 50 }).then(result => result.comments ?? []),
 		pullRequestFor(ctx, identifier),
 		threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, knownThreads),
 	])
-	// Open blockers are not exposed by the Linear MCP; phase 4 (MET-279) adds them before builders spawn.
-	return { snapshot: toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers: [] }), threads }
+	// `blockedBy` lists the relation's issues without their status; a blocker is open until closed.
+	const blockers = await Promise.all((issue.relations?.blockedBy ?? []).map(({ id }) => callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id })))
+	const openBlockers = blockers.filter(blocker => !['Done', 'Canceled', 'Duplicate'].includes(blocker.status)).map(blocker => blocker.id)
+	return { snapshot: toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers }), threads }
 }
 
 // Finished role threads are archived so the thread list shows only live work; an archived
@@ -428,7 +487,7 @@ async function currentLoad(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>)
 }
 
 // The Ralph guard's external checks: each is read from Linear or GitHub, never from the agent.
-async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools'>, role: Role, issue: string): Promise<{ stopMet: boolean; missing: string[] }> {
+async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools'>, role: Role, issue: string, labels: readonly string[]): Promise<{ stopMet: boolean; missing: string[] }> {
 	if (role === 'intake' || role === 'spec') {
 		const snapshot = await callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: issue })
 		const missing = role === 'intake'
@@ -436,10 +495,16 @@ async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools'>, rol
 			: specComplete(snapshot.description ?? '') ? [] : ['Goal, Isolation, Build, Done means and Evidence sections, with one Evidence line per Done-means item']
 		return { stopMet: missing.length === 0, missing }
 	}
-	if (role !== 'builder') return { stopMet: true, missing: [] }
+	if (role !== 'builder' && role !== 'reviewer') return { stopMet: true, missing: [] }
 	const pr = await ctx.$`gh pr list --search ${issue} --state open --json number,headRefOid,statusCheckRollup --limit 1`
 	if (pr.exitCode !== 0 || pr.stdout.trim() === '[]') return { stopMet: false, missing: [`no open PR for ${issue}`] }
-	const [{ statusCheckRollup = [] }] = JSON.parse(pr.stdout) as Array<{ statusCheckRollup?: Array<{ name?: string; conclusion?: string; state?: string }> }>
+	const [{ headRefOid, statusCheckRollup = [] }] = JSON.parse(pr.stdout) as Array<{ headRefOid: string; statusCheckRollup?: Array<{ name?: string; conclusion?: string; state?: string }> }>
+	if (role === 'reviewer') {
+		// The verdict is the reviewer thread's own label for the current head (snapshot.verdictFor).
+		const head = headRefOid.slice(0, 12)
+		const posted = labels.some(label => label === `odd-verdict-ready-${head}` || label === `odd-verdict-changes-${head}`)
+		return posted ? { stopMet: true, missing: [] } : { stopMet: false, missing: [`thread label odd-verdict-<ready|changes>-${head} for PR head ${headRefOid}`] }
+	}
 	const failing = statusCheckRollup.filter(check => (check.conclusion ?? check.state ?? '').toUpperCase() in { FAILURE: 1, ERROR: 1, CANCELLED: 1 }).map(check => check.name ?? 'check')
 	const pending = statusCheckRollup.some(check => !check.conclusion && (check.state ?? '').toUpperCase() !== 'SUCCESS')
 	if (failing.length) return { stopMet: false, missing: failing.map(name => `CI job ${name} failed on the PR head`) }
