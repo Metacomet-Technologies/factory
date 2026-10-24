@@ -342,9 +342,11 @@ each.
    - `engine/docs` is the first candidate for documentation-only work. Use a
      code-capable engine when the docs depend on running or changing code.
 
-   Devon's explicit family choice wins, and a family he chose is never
-   switched. Spread ordinary and harder work across Grok and Go where they
-   fit, but keep the existing families eligible. Never invent quota or balance
+   Grok, Go and Docs are additional options alongside Amp, ChatGPT and Claude
+   Code. They replace nothing, and none of the families is preferred by
+   default. Pick whichever fits the task and has capacity, so that work spreads
+   across all of Devon's subscriptions. Devon's explicit family choice wins,
+   and a family he chose is never switched. Never invent quota or balance
    figures; use only usage data you actually have.
 
 **Advisor.** Add `advisor` only when Context names a material unresolved
