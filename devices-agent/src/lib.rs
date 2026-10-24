@@ -5,7 +5,9 @@
 //! status files unsupported, keeps every value inside the contract so one bad
 //! sensor cannot get a whole sample rejected, and uploads one sample at a time.
 //! It is read-only: no commands, writes, self-tests or remediation.
-use factory_api::devices::{self, Availability, ClockView, Drive, Filesystem, Metric, NamedMetric};
+use factory_api::devices::{
+    self, Availability, ClockView, Drive, Filesystem, Metric, NamedMetric, Power, ProbeError,
+};
 use factory_api::devices_ingest::{self, DeviceSampleV1, SampleAgent, SampleMaintenance};
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
@@ -165,13 +167,14 @@ impl Collector {
             reboot_path: reboot_path.clone(),
             clock_synchronized: clock == Some(true),
         };
-        let host = devices::sample_timeout(
+        let mut host = devices::sample_timeout(
             &root,
             &mut self.sampler,
             &inputs,
             self.sources.probe_timeout,
         )
         .device;
+        applesmc_fans(&root, &mut host.cooling, now, self.sources.probe_timeout);
         self.seq += 1;
         let mut maintenance = SampleMaintenance {
             backup: host.maintenance.backup,
@@ -212,12 +215,150 @@ impl Collector {
             disk_io: host.disk_io,
             network: host.network,
             cooling: host.cooling,
+            power: Some(read_power(&root, now, self.sources.probe_timeout)),
             maintenance,
             collector: host.collector,
         };
         conform(&mut sample);
         sample
     }
+}
+
+fn applesmc_fans(root: &Path, cooling: &mut devices::Cooling, at: i64, timeout: Duration) {
+    let node = root.join("sys/bus/acpi/devices/APP0001:00/physical_node");
+    for index in 1..=8 {
+        let reading = devices::read_text(&node.join(format!("fan{index}_input")), timeout);
+        let metric = match reading {
+            Err(ProbeError::Missing) => continue,
+            Err(error) => devices::metric(
+                "rpm",
+                at,
+                devices::availability_of(&error),
+                None,
+                Some(devices::detail_of(&error)),
+            ),
+            Ok(raw) => {
+                let mut details = Vec::new();
+                for field in ["label", "min", "max"] {
+                    if let Ok(text) =
+                        devices::read_text(&node.join(format!("fan{index}_{field}")), timeout)
+                    {
+                        let mut text = text.trim().to_string();
+                        clip(&mut text);
+                        details.push(format!("{field}: {text}"));
+                    }
+                }
+                devices::metric(
+                    "rpm",
+                    at,
+                    Availability::Available,
+                    raw.trim().parse().ok(),
+                    (!details.is_empty()).then(|| details.join("; ")),
+                )
+            }
+        };
+        cooling.fans.push(NamedMetric {
+            name: format!("applesmc fan{index}"),
+            metric,
+        });
+        cooling.fans_availability = Availability::Available;
+    }
+}
+
+fn sys_number(path: &Path, timeout: Duration, max: f64) -> Result<f64, ProbeError> {
+    let text = devices::read_text(path, timeout)?;
+    text.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && (0.0..=max).contains(value))
+        .ok_or(ProbeError::Malformed)
+}
+
+fn read_power(root: &Path, at: i64, timeout: Duration) -> Power {
+    let mut power = Power {
+        availability: Availability::Unsupported,
+        observed_at_ms: at,
+        adapter_online: None,
+        battery_status: None,
+        battery_percent: None,
+        battery_power_w: None,
+    };
+    let supplies = match fs::read_dir(root.join("sys/class/power_supply")) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return power,
+        Err(error) => Err(error),
+    };
+    let mut supplies = match supplies {
+        Ok(entries) => entries,
+        Err(error) => {
+            power.availability = if error.kind() == io::ErrorKind::PermissionDenied {
+                Availability::PermissionDenied
+            } else {
+                Availability::Error
+            };
+            return power;
+        }
+    };
+    supplies.sort_by_key(|entry| entry.file_name());
+    let mut battery = None;
+    let mut mains = Vec::new();
+    for entry in supplies {
+        let path = entry.path();
+        match devices::read_text(&path.join("type"), timeout) {
+            Ok(kind) => match kind.trim() {
+                "Battery" if battery.is_none() => battery = Some(path),
+                "Mains" => mains.push(path),
+                _ => {}
+            },
+            Err(error) => power.availability = devices::availability_of(&error),
+        }
+    }
+    let Some(battery) = battery else {
+        return power;
+    };
+    let mut online = Some(false);
+    for path in mains {
+        match devices::read_text(&path.join("online"), timeout) {
+            Ok(text) if text.trim() == "1" => {
+                online = Some(true);
+                break;
+            }
+            Ok(text) if text.trim() == "0" => {}
+            _ => online = None,
+        }
+    }
+    let status = devices::read_text(&battery.join("status"), timeout).and_then(|text| {
+        let status = text.trim();
+        match status {
+            "Charging" | "Discharging" | "Not charging" | "Full" | "Unknown" => {
+                Ok(status.to_string())
+            }
+            _ => Err(ProbeError::Malformed),
+        }
+    });
+    let capacity = sys_number(&battery.join("capacity"), timeout, 100.0);
+    let (status, capacity) = match (status, capacity) {
+        (Ok(status), Ok(capacity)) => (status, capacity),
+        (Err(error), _) | (_, Err(error)) => {
+            power.availability = devices::availability_of(&error);
+            return power;
+        }
+    };
+    let watts = sys_number(&battery.join("power_now"), timeout, MAX_INT)
+        .map(|microwatts| microwatts / 1e6)
+        .or_else(|_| {
+            let current = sys_number(&battery.join("current_now"), timeout, MAX_INT)?;
+            let voltage = sys_number(&battery.join("voltage_now"), timeout, MAX_INT)?;
+            Ok::<_, ProbeError>(current * voltage / 1e12)
+        })
+        .ok()
+        .filter(|watts| watts.is_finite() && (0.0..=MAX_INT).contains(watts));
+    power.availability = Availability::Available;
+    power.adapter_online = online;
+    power.battery_status = Some(status);
+    power.battery_percent = Some(capacity);
+    power.battery_power_w = watts;
+    power
 }
 
 /// Only a missing path is absent. An unreadable parent is permission_denied,
@@ -454,6 +595,10 @@ pub fn conform(sample: &mut DeviceSampleV1) {
     for (_, metric) in metrics_mut(sample) {
         conform_metric(metric, at);
     }
+    if let Some(power) = &mut sample.power {
+        power.observed_at_ms = power.observed_at_ms.min(at);
+        clip_opt(&mut power.battery_status);
+    }
     let m = &mut sample.maintenance;
     // The server accepts integers 0 to 2^53-1 only; anything else fails that
     // source, not the whole sample.
@@ -542,6 +687,9 @@ pub fn capabilities(sample: &mut DeviceSampleV1) -> Vec<(String, Availability, O
             sample.maintenance.reboot.detail.clone(),
         ),
     ];
+    if let Some(power) = &sample.power {
+        rows.push(("power".into(), power.availability, None));
+    }
     for drive in &sample.drives {
         rows.push((
             format!("drives[{}].smart", drive.kernel),

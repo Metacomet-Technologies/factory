@@ -187,6 +187,16 @@ pub struct Cooling {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct Power {
+    pub availability: Availability,
+    pub observed_at_ms: i64,
+    pub adapter_online: Option<bool>,
+    pub battery_status: Option<String>,
+    pub battery_percent: Option<f64>,
+    pub battery_power_w: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct BackupView {
     pub availability: Availability,
     pub last_success_ms: Option<i64>,
@@ -260,6 +270,8 @@ pub struct HostSnapshot {
     pub disk_io: DiskIo,
     pub network: Network,
     pub cooling: Cooling,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<Power>,
     pub maintenance: Maintenance,
     pub collector: CollectorHealth,
     pub health: HealthReport,
@@ -409,6 +421,8 @@ pub struct DeviceAlertInput {
     pub fast_success_ms: Option<i64>,
     /// None: unreadable, hold. Some(None): sensor unsupported. Some(Some): celsius.
     pub cpu_temp_c: Option<Option<f64>>,
+    pub cpu_temp_observed_ms: Option<i64>,
+    pub power: Option<Power>,
     pub filesystems: Option<Vec<FsPressure>>,
     pub smart: Option<Vec<SmartPressure>>,
     pub unsafe_shutdowns: BTreeMap<String, u64>,
@@ -681,6 +695,7 @@ pub fn unavailable(now: i64) -> DeviceView {
             temperatures_availability: Availability::Unsupported,
             fans_availability: Availability::Unsupported,
         },
+        power: None,
         maintenance: Maintenance {
             services: vec![],
             backup: BackupView {
@@ -789,6 +804,16 @@ pub fn freshen_within(
         mark_stale(&mut copy.device.network.rx, detail.clone());
         mark_stale(&mut copy.device.network.tx, detail);
     }
+    if let Some(power) = &mut copy.device.power
+        && power.availability == Availability::Available
+        && (now.saturating_sub(power.observed_at_ms) > stale_ms || quiet.is_some())
+    {
+        power.availability = Availability::Stale;
+        power.adapter_online = None;
+        power.battery_status = None;
+        power.battery_percent = None;
+        power.battery_power_w = None;
+    }
     if copy.collector_slow_age(now) > SLOW_INTERVAL_MS * 2 {
         let detail = "slow inventory is older than twice its interval".to_string();
         mark_stale(&mut copy.device.cpu.temperature, detail.clone());
@@ -830,6 +855,18 @@ impl DeviceView {
                 .collector
                 .last_fast_ms
                 .is_some_and(|at| now.saturating_sub(at) <= 120_000);
+        let fresh_ms = if self.ingest.is_some() {
+            crate::devices_ingest::REMOTE_STALE_MS
+        } else {
+            FAST_INTERVAL_MS * 2
+        };
+        let current = |at| (0..=fresh_ms).contains(&now.saturating_sub(at));
+        let sample_fresh = fast_fresh
+            && current(self.device.observed_at_ms)
+            && self
+                .ingest
+                .as_ref()
+                .is_none_or(|ingest| ingest.last_received_at_ms.is_some_and(current));
         let cpu_temp_c = if !fast_fresh
             && self.device.cpu.temperature.availability != Availability::Unsupported
         {
@@ -890,6 +927,16 @@ impl DeviceView {
                 .then_some(self.device.collector.last_fast_ms)
                 .flatten(),
             cpu_temp_c,
+            cpu_temp_observed_ms: (sample_fresh
+                && self.device.cpu.temperature.availability == Availability::Available
+                && current(self.device.cpu.temperature.observed_at_ms))
+            .then_some(self.device.cpu.temperature.observed_at_ms),
+            power: self
+                .device
+                .power
+                .as_ref()
+                .filter(|power| sample_fresh && current(power.observed_at_ms))
+                .cloned(),
             filesystems,
             smart,
             unsafe_shutdowns: self
@@ -933,7 +980,7 @@ fn smart_unhealthy(drive: &Drive) -> Option<bool> {
 }
 
 #[derive(Debug)]
-enum ProbeError {
+pub enum ProbeError {
     Missing,
     Denied,
     Timeout,
@@ -965,12 +1012,12 @@ fn read_limited(path: &Path, timeout: Duration) -> Result<Vec<u8>, ProbeError> {
     }
 }
 
-fn read_text(path: &Path, timeout: Duration) -> Result<String, ProbeError> {
+pub fn read_text(path: &Path, timeout: Duration) -> Result<String, ProbeError> {
     let bytes = read_limited(path, timeout)?;
     String::from_utf8(bytes).map_err(|_| ProbeError::Malformed)
 }
 
-fn availability_of(error: &ProbeError) -> Availability {
+pub fn availability_of(error: &ProbeError) -> Availability {
     match error {
         ProbeError::Denied => Availability::PermissionDenied,
         ProbeError::Missing
@@ -981,7 +1028,7 @@ fn availability_of(error: &ProbeError) -> Availability {
     }
 }
 
-fn detail_of(error: &ProbeError) -> String {
+pub fn detail_of(error: &ProbeError) -> String {
     match error {
         ProbeError::Missing => "missing".into(),
         ProbeError::Denied => "permission denied".into(),
@@ -1067,8 +1114,6 @@ struct Slow {
     drives: Vec<Drive>,
     drives_availability: Availability,
     smart: Availability,
-    cooling: Cooling,
-    cpu_temp: Metric,
     maintenance: NodeMaintenance,
 }
 
@@ -1809,9 +1854,6 @@ fn load_slow(root: &Path, at: i64, timeout: Duration) -> Slow {
     } else {
         apply_smart(&mut drives, root, at, timeout)
     };
-    let (temperatures, fans, temperatures_availability, fans_availability) =
-        sensor_group(root, at, timeout);
-    let cpu_temp = pick_cpu_temp(&temperatures, at);
     Slow {
         at_ms: at,
         filesystems,
@@ -1819,13 +1861,6 @@ fn load_slow(root: &Path, at: i64, timeout: Duration) -> Slow {
         drives,
         drives_availability,
         smart,
-        cooling: Cooling {
-            temperatures,
-            fans,
-            temperatures_availability,
-            fans_availability,
-        },
-        cpu_temp,
         maintenance: load_maintenance(root, at, timeout),
     }
 }
@@ -2292,6 +2327,9 @@ pub fn sample_timeout(
         warnings.push("reboot: status is not readable".into());
     }
     let backup = load_backup(&inputs.backup_path, at, timeout);
+    let (temperatures, fans, temperatures_availability, fans_availability) =
+        sensor_group(root, at, timeout);
+    let temperature = pick_cpu_temp(&temperatures, at);
     let mut host = HostSnapshot {
         device_id: DEVICE_ID.into(),
         observed_at_ms: at,
@@ -2306,7 +2344,7 @@ pub fn sample_timeout(
             load1,
             load5,
             load15,
-            temperature: slow.cpu_temp.clone(),
+            temperature,
         },
         memory,
         gpus: gpu_slots(inputs.gpu.as_ref(), at),
@@ -2320,7 +2358,13 @@ pub fn sample_timeout(
             rx: net_rx,
             tx: net_tx,
         },
-        cooling: slow.cooling.clone(),
+        cooling: Cooling {
+            temperatures,
+            fans,
+            temperatures_availability,
+            fans_availability,
+        },
+        power: None,
         maintenance: Maintenance {
             services: inputs.services.clone(),
             backup,

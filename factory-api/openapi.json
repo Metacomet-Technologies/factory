@@ -702,6 +702,16 @@
             "format": "int64",
             "type": "integer"
           },
+          "power": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Power"
+              }
+            ]
+          },
           "schema_version": {
             "description": "Only `1` is accepted.",
             "example": 1,
@@ -1334,6 +1344,16 @@
           "observed_at_ms": {
             "format": "int64",
             "type": "integer"
+          },
+          "power": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Power"
+              }
+            ]
           }
         },
         "required": [
@@ -2754,6 +2774,48 @@
             "type": "object"
           }
         ]
+      },
+      "Power": {
+        "properties": {
+          "adapter_online": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "availability": {
+            "$ref": "#/components/schemas/Availability"
+          },
+          "battery_percent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "battery_power_w": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "battery_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "observed_at_ms": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "availability",
+          "observed_at_ms"
+        ],
+        "type": "object"
       },
       "Pricing": {
         "properties": {

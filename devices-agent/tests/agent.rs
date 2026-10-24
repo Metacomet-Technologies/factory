@@ -105,6 +105,318 @@ fn availability(value: &Value) -> &str {
     value["availability"].as_str().unwrap()
 }
 
+fn accepted(sample: &DeviceSampleV1) -> devices_ingest::Sample {
+    assert_eq!(locally_valid(sample), Ok(()));
+    devices_ingest::parse(
+        &serde_json::to_vec(sample).unwrap(),
+        DEVICE_ID,
+        sample.observed_at_ms,
+    )
+    .expect("server accepts")
+}
+
+fn applesmc(root: &Path) {
+    let node = root.join("sys/devices/platform/applesmc.768");
+    let acpi = root.join("sys/bus/acpi/devices/APP0001:00");
+    fs::create_dir_all(&node).unwrap();
+    fs::create_dir_all(&acpi).unwrap();
+    std::os::unix::fs::symlink(&node, acpi.join("physical_node")).unwrap();
+}
+
+#[test]
+fn applesmc_symlink_fans_preserve_hwmon_and_refresh_each_sample() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    console(root);
+    applesmc(root);
+    let node = "sys/bus/acpi/devices/APP0001:00/physical_node";
+    write(root, &format!("{node}/fan1_input"), "2200\n");
+    write(root, &format!("{node}/fan2_input"), "2300\n");
+    write(root, &format!("{node}/fan1_label"), "Left\n");
+    write(root, &format!("{node}/fan1_min"), "1200\n");
+    write(root, &format!("{node}/fan1_max"), "6000\n");
+    write(root, "sys/class/hwmon/hwmon0/fan1_input", "1500\n");
+    let mut agent = collector(root, &new_session_id().unwrap());
+    let first = agent.sample(1_000_000);
+    let fans = &first.cooling.fans;
+    assert_eq!(first.cooling.fans_availability, Availability::Available);
+    assert_eq!(fans.len(), 3);
+    for (name, rpm) in [
+        ("coretemp fan1", 1500.0),
+        ("applesmc fan1", 2200.0),
+        ("applesmc fan2", 2300.0),
+    ] {
+        let metric = &fans.iter().find(|fan| fan.name == name).unwrap().metric;
+        assert_eq!(metric.value, Some(rpm));
+        assert_eq!(metric.unit, "rpm");
+        assert_eq!(metric.availability, Availability::Available);
+    }
+    let detail = fans
+        .iter()
+        .find(|fan| fan.name == "applesmc fan1")
+        .unwrap()
+        .metric
+        .detail
+        .as_ref()
+        .unwrap();
+    for value in ["Left", "1200", "6000"] {
+        assert!(detail.contains(value));
+    }
+    assert_eq!(accepted(&first).host.cooling.fans, *fans);
+    write(root, &format!("{node}/fan1_input"), "2400\n");
+    write(root, "sys/class/hwmon/hwmon0/fan1_input", "1600\n");
+    write(root, "sys/class/hwmon/hwmon0/temp1_input", "61000\n");
+    let next = agent.sample(1_015_000);
+    assert_eq!(next.cooling.fans.len(), 3);
+    for (name, rpm) in [("applesmc fan1", 2400.0), ("coretemp fan1", 1600.0)] {
+        let metric = &next
+            .cooling
+            .fans
+            .iter()
+            .find(|fan| fan.name == name)
+            .unwrap()
+            .metric;
+        assert_eq!(metric.value, Some(rpm));
+        assert_eq!(metric.observed_at_ms, 1_015_000);
+    }
+    assert_eq!(next.cpu.temperature.value, Some(61.0));
+    assert_eq!(next.cpu.temperature.observed_at_ms, 1_015_000);
+    accepted(&next);
+}
+
+#[test]
+fn absent_applesmc_leaves_hwmon_fans_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    console(dir.path());
+    let empty = collector(dir.path(), &new_session_id().unwrap()).sample(1_000_000);
+    assert!(empty.cooling.fans.is_empty());
+    assert_eq!(empty.cooling.fans_availability, Availability::Unsupported);
+    write(dir.path(), "sys/class/hwmon/hwmon0/fan1_input", "1500\n");
+    let sample = collector(dir.path(), &new_session_id().unwrap()).sample(1_000_000);
+    assert_eq!(sample.cooling.fans.len(), 1);
+    assert_eq!(sample.cooling.fans[0].name, "coretemp fan1");
+    assert_eq!(sample.cooling.fans[0].metric.value, Some(1500.0));
+    assert_eq!(sample.cooling.fans_availability, Availability::Available);
+    accepted(&sample);
+}
+
+#[test]
+fn applesmc_invalid_rpm_and_long_labels_stay_inside_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    console(dir.path());
+    applesmc(dir.path());
+    let node = "sys/bus/acpi/devices/APP0001:00/physical_node";
+    for (index, value) in ["NaN", "-1", "30001", "bad", "1200"].iter().enumerate() {
+        write(dir.path(), &format!("{node}/fan{}_input", index + 1), value);
+    }
+    write(dir.path(), &format!("{node}/fan5_label"), &"é".repeat(300));
+    let sample = collector(dir.path(), &new_session_id().unwrap()).sample(1_000_000);
+    assert_eq!(sample.cooling.fans.len(), 5);
+    for fan in &sample.cooling.fans[..4] {
+        assert_eq!(fan.metric.availability, Availability::Error);
+        assert_eq!(fan.metric.value, None);
+    }
+    assert_eq!(sample.cooling.fans[4].metric.value, Some(1200.0));
+    assert!(sample.cooling.fans[4].metric.detail.as_ref().unwrap().len() <= 256);
+    accepted(&sample);
+}
+
+fn battery(root: &Path) {
+    write(root, "sys/class/power_supply/ADP/type", "Mains\n");
+    write(root, "sys/class/power_supply/ADP/online", "1\n");
+    write(root, "sys/class/power_supply/BAT0/type", "Battery\n");
+    write(root, "sys/class/power_supply/BAT0/status", "Charging\n");
+    write(root, "sys/class/power_supply/BAT0/capacity", "73\n");
+}
+
+#[test]
+fn power_direct_and_fallback_watts_survive_ingest_and_refresh() {
+    for direct in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        console(root);
+        battery(root);
+        write(root, "sys/class/power_supply/BAT0/current_now", "2000000\n");
+        write(
+            root,
+            "sys/class/power_supply/BAT0/voltage_now",
+            "12000000\n",
+        );
+        if direct {
+            write(root, "sys/class/power_supply/BAT0/power_now", "18500000\n");
+        }
+        let mut agent = collector(root, &new_session_id().unwrap());
+        let sample = agent.sample(1_000_000);
+        let power = sample.power.as_ref().unwrap();
+        assert_eq!(power.availability, Availability::Available);
+        assert_eq!(power.observed_at_ms, 1_000_000);
+        assert_eq!(power.adapter_online, Some(true));
+        assert_eq!(power.battery_status.as_deref(), Some("Charging"));
+        assert_eq!(power.battery_percent, Some(73.0));
+        assert_eq!(
+            power.battery_power_w,
+            Some(if direct { 18.5 } else { 24.0 })
+        );
+        assert_eq!(accepted(&sample).host.power, sample.power);
+        write(root, "sys/class/power_supply/ADP/online", "0\n");
+        write(root, "sys/class/power_supply/BAT0/status", "Discharging\n");
+        write(root, "sys/class/power_supply/BAT0/capacity", "72\n");
+        let next = agent.sample(1_015_000);
+        let power = next.power.as_ref().unwrap();
+        assert_eq!(power.observed_at_ms, 1_015_000);
+        assert_eq!(power.adapter_online, Some(false));
+        assert_eq!(power.battery_status.as_deref(), Some("Discharging"));
+        assert_eq!(power.battery_percent, Some(72.0));
+        assert_eq!(accepted(&next).host.power, next.power);
+    }
+}
+
+#[test]
+fn power_selects_first_sorted_battery_and_any_online_mains() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    console(root);
+    // Created first, but sorted after BAT0; its readings must not win.
+    write(root, "sys/class/power_supply/BAT1/type", "Battery\n");
+    write(root, "sys/class/power_supply/BAT1/status", "Discharging\n");
+    write(root, "sys/class/power_supply/BAT1/capacity", "5\n");
+    battery(root);
+    write(root, "sys/class/power_supply/ADP/online", "0\n");
+    write(root, "sys/class/power_supply/AC/type", "Mains\n");
+    write(root, "sys/class/power_supply/AC/online", "bad\n");
+    write(root, "sys/class/power_supply/OTHER/type", "Mains\n");
+    write(root, "sys/class/power_supply/OTHER/online", "1\n");
+    let sample = collector(root, &new_session_id().unwrap()).sample(1_000_000);
+    let power = sample.power.as_ref().unwrap();
+    assert_eq!(power.adapter_online, Some(true));
+    assert_eq!(power.battery_percent, Some(73.0));
+    assert_eq!(power.battery_status.as_deref(), Some("Charging"));
+    assert_eq!(power.battery_power_w, None);
+    assert_eq!(power.availability, Availability::Available);
+    accepted(&sample);
+    for name in ["ADP", "AC", "OTHER"] {
+        fs::remove_dir_all(root.join(format!("sys/class/power_supply/{name}"))).unwrap();
+    }
+    write(root, "sys/class/power_supply/BAT0/status", "Unknown\n");
+    let sample = collector(root, &new_session_id().unwrap()).sample(1_000_000);
+    let power = sample.power.as_ref().unwrap();
+    assert_eq!(power.adapter_online, Some(false));
+    assert_eq!(power.battery_status.as_deref(), Some("Unknown"));
+    accepted(&sample);
+}
+
+#[test]
+fn power_without_battery_is_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    console(dir.path());
+    for mains in [false, true] {
+        if mains {
+            write(dir.path(), "sys/class/power_supply/ADP/type", "Mains\n");
+            write(dir.path(), "sys/class/power_supply/ADP/online", "1\n");
+        }
+        let sample = collector(dir.path(), &new_session_id().unwrap()).sample(1_000_000);
+        let power = sample.power.as_ref().unwrap();
+        assert_eq!(power.availability, Availability::Unsupported);
+        assert_eq!(power.adapter_online, None);
+        assert_eq!(power.battery_status, None);
+        assert_eq!(power.battery_percent, None);
+        assert_eq!(power.battery_power_w, None);
+        assert_eq!(accepted(&sample).host.power, sample.power);
+    }
+}
+
+#[test]
+fn power_missing_or_malformed_required_fields_cannot_recover() {
+    for (field, value) in [
+        ("status", None),
+        ("status", Some("")),
+        ("status", Some("garbage")),
+        ("capacity", None),
+        ("capacity", Some("NaN")),
+        ("capacity", Some("inf")),
+        ("capacity", Some("101")),
+        ("capacity", Some("-1")),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        console(root);
+        battery(root);
+        let mut agent = collector(root, &new_session_id().unwrap());
+        let before = agent.sample(1_000_000);
+        assert_eq!(before.power.unwrap().availability, Availability::Available);
+        let path = format!("sys/class/power_supply/BAT0/{field}");
+        if let Some(value) = value {
+            write(root, &path, value);
+        } else {
+            fs::remove_file(root.join(path)).unwrap();
+        }
+        let sample = agent.sample(1_015_000);
+        let power = sample.power.as_ref().unwrap();
+        assert_eq!(power.availability, Availability::Error, "{field}={value:?}");
+        assert_eq!(power.battery_status, None);
+        assert_eq!(power.battery_percent, None);
+        assert_eq!(power.observed_at_ms, 1_015_000);
+        accepted(&sample);
+    }
+}
+
+#[test]
+fn power_bad_optional_wattage_and_adapter_do_not_hide_battery() {
+    for value in ["-1", "NaN", "inf", "1e300", "garbage"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        console(root);
+        battery(root);
+        write(root, "sys/class/power_supply/ADP/online", "bad\n");
+        write(root, "sys/class/power_supply/BAT0/power_now", value);
+        write(root, "sys/class/power_supply/BAT0/current_now", value);
+        write(
+            root,
+            "sys/class/power_supply/BAT0/voltage_now",
+            "12000000\n",
+        );
+        let sample = collector(root, &new_session_id().unwrap()).sample(1_000_000);
+        let power = sample.power.as_ref().unwrap();
+        assert_eq!(power.availability, Availability::Available);
+        assert_eq!(power.battery_percent, Some(73.0));
+        assert_eq!(power.battery_status.as_deref(), Some("Charging"));
+        assert_eq!(power.battery_power_w, None, "{value}");
+        assert_eq!(power.adapter_online, None);
+        accepted(&sample);
+    }
+}
+
+#[test]
+fn applesmc_and_power_reads_timeout_without_rejecting_sample() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    console(root);
+    applesmc(root);
+    battery(root);
+    fs::remove_file(root.join("sys/class/power_supply/BAT0/status")).unwrap();
+    for rel in [
+        "sys/bus/acpi/devices/APP0001:00/physical_node/fan1_input",
+        "sys/class/power_supply/BAT0/status",
+    ] {
+        let path = std::ffi::CString::new(root.join(rel).to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    let sample = sample_within(root, Duration::from_secs(5));
+    assert_eq!(
+        sample.cooling.fans[0].metric.availability,
+        Availability::Error
+    );
+    assert_eq!(
+        sample.cooling.fans[0].metric.detail.as_deref(),
+        Some("timed out")
+    );
+    assert_eq!(
+        sample.power.as_ref().unwrap().availability,
+        Availability::Error
+    );
+    accepted(&sample);
+}
+
 #[test]
 fn identity_rates_and_unpublished_status() {
     let dir = tempfile::tempdir().unwrap();

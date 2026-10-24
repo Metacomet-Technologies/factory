@@ -652,6 +652,7 @@ export interface components {
        * @description Device wall clock (Unix ms) when the fast sample was taken.
        */
       observed_at_ms: number;
+      power?: null | components["schemas"]["Power"];
       /**
        * Format: int64
        * @description Only `1` is accepted.
@@ -828,6 +829,7 @@ export interface components {
       network: components["schemas"]["Network"];
       /** Format: int64 */
       observed_at_ms: number;
+      power?: null | components["schemas"]["Power"];
     };
     IngestResult: {
       current_updated: boolean;
@@ -1229,6 +1231,17 @@ export interface components {
           availability: "error";
           error: string;
         };
+    Power: {
+      adapter_online?: boolean | null;
+      availability: components["schemas"]["Availability"];
+      /** Format: double */
+      battery_percent?: number | null;
+      /** Format: double */
+      battery_power_w?: number | null;
+      battery_status?: string | null;
+      /** Format: int64 */
+      observed_at_ms: number;
+    };
     Pricing: {
       families: components["schemas"]["Family"][];
       warnings: string[];
