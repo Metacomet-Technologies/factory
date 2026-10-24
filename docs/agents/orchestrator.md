@@ -27,6 +27,15 @@ The dispatcher keeps ownership of `dispatch`-labeled work. Do not add dispatch
 labels to work the orchestrator drives. `factory-dispatch` and `factory-qa`
 markers stay off limits unless Devon authorizes a specific write.
 
+## Choosing engine, effort and advisor
+
+Before proposing `dispatch` labels or an orb worker's mode, follow
+`scripts/dispatch/README.md` §"Choosing engine, effort and advisor". Decide
+effort and subscription family separately, and post a one-line rationale. Use
+the smallest effort that is enough. Ultra needs Devon's explicit approval, and
+`advisor` needs a material unresolved question. Confirm plugin modes with
+`amp plugins list`, and never switch a family Devon chose.
+
 ## Merge gate
 
 For every merge:

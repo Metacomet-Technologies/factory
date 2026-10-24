@@ -305,6 +305,64 @@ unlabeled issues still use Amp medium. Under Devon's ChatGPT Only preset,
 a thread's self-reported model; check usage metadata.
 Submission success is not execution success. Inspect the thread for results.
 
+**Subscription plugin engines.** `engine/grok`, `engine/go` and `engine/docs` run
+Devon's User Plugin modes (`grok-low|medium|high`, `go-low|medium|high`, `docs`;
+`docs` ignores `agent-effort`). `agent-effort/ultra` selects `grok-ultra` or
+`go-ultra` and is refused with any other engine. The `advisor` label is valid only
+for grok or go at medium, high or ultra and lets the builder call that mode's
+report-only advisor tool; without it the prompt says not to. Before claiming a
+plugin-engine issue the poll runs `amp plugins list` once (`plugin-modes` log
+line) and refuses the issue with `Mode <key> unavailable … not substituted`,
+`Mode <key> unverified …` (the listing failed, logged `plugin-modes-unverified`)
+or `Advisor <tool> unavailable`. The listing is read on the dispatcher host
+(factory-gpu); console threads assume the same User Plugins load there, and a
+launch failure there takes the usual non-retrying path. Every Amp claim and
+builder prompt carries one `Mode: … Advisor: …` line. QA reviewers for these
+engines are Claude, as for any non-Claude builder.
+
+### Choosing engine, effort and advisor
+
+The orchestrator and Devon choose labels. The dispatcher only enforces them.
+Decide two things separately and write a one-line rationale on the issue for
+each.
+
+1. **Capability and effort.** Weigh the task type, ambiguity, scope, risk, the
+   context the builder needs and the verification burden. Use the smallest
+   effort that is enough:
+   - low: small, well-defined, single-area changes with obvious checks;
+   - medium: everyday engineering;
+   - high: difficult debugging, cross-module work, heavy verification;
+   - ultra: only with Devon's explicit authorization for that issue
+     (`engine/ultra`, or `agent-effort/ultra` with grok or go).
+2. **Subscription family.** Choose the family that fits the task and has
+   verified availability:
+   - existing families: Amp (the default), ChatGPT, Claude Code and Cursor;
+   - Grok (Grok 4.7) or OpenCode Go (GLM-5.3 Flash at low and medium, GLM-5.3
+     at high);
+   - `engine/docs` is the first candidate for documentation-only work. Use a
+     code-capable engine when the docs depend on running or changing code.
+
+   Devon's explicit family choice wins, and a family he chose is never
+   switched. Spread ordinary and harder work across Grok and Go where they
+   fit, but keep the existing families eligible. Never invent quota or balance
+   figures; use only usage data you actually have.
+
+**Advisor.** Add `advisor` only when Context names a material unresolved
+question, such as a design choice or root cause the builder cannot settle from
+the code. Having an advisor available is not a reason to use one. The Grok
+advisor is Grok 4.7 at high effort (xhigh for ultra). The Go advisor is Kimi K3
+at high effort (max for ultra). Either is optional, bounded and report-only,
+never a review or a second builder. Low and docs modes have none.
+
+**Availability.** If `amp plugins list` doesn't show a mode, say so and propose
+an existing engine for Devon to approve. Never substitute one silently.
+
+**Benchmark caveat.** The 2026-10 benchmark of GLM-5.3 Flash, GLM-5.3, Kimi K3
+and Grok 4.7 was small and synthetic: every model handled the sampled tasks,
+but that proves no specialization or speed ranking. Treat these choices as
+starting heuristics, and revise them from observed QA rounds, fixes and
+wrap-ups at each weekly board pass.
+
 CLI evidence, 2026-10-13: `amp --help` confirms `--features <value>` accepts
 comma-separated features. A tiny runner probe with the exact Claude features
 returned `OK`; its exported metadata records `model:claude-opus-5-5` and

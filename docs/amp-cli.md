@@ -66,6 +66,15 @@ grok45, grok46, grok46-high, grok46-medium, grok47,
 kimi-k3, minimax-m3, muse-spark, qwen3.8-max
 ```
 
+Devon's User Plugins add subscription modes outside this catalog. On 2026-10-24
+`amp plugins list` on factory-gpu (after an `amp-runner` restart onto the current
+build; the stale pre-update process failed to spawn them) reported agent modes
+`grok-low`, `grok-medium`, `grok-high`, `grok-ultra` (grok-modes; tools
+`grok_advisor_high`, `grok_advisor_xhigh`), `go-low`, `go-medium`, `go-high`,
+`go-ultra` (go-modes; tools `go_advisor_high`, `go_advisor_max`) and `docs`
+(docs-mode). That listing is the dispatcher's availability check; the keys can
+differ by user and runtime, so they are not hard-wired as available.
+
 `amp config external-agents list` separately reports the active mode
 `external-agent:claude-code`. Amp's own Claude model modes are **not** Claude
 subscription mode.
