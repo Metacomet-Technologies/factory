@@ -63,6 +63,21 @@ fn fingerprints_are_stable_relocatable_and_component_scoped() {
         assert_eq!(expected, configured_target.trim());
     }
 
+    let contract = relocated.path().join("meter/openapi.json");
+    let original = fs::read(&contract).unwrap();
+    let mut changed = original.clone();
+    changed.push(b'\n');
+    fs::write(&contract, changed).unwrap();
+    let after = fingerprints(relocated.path());
+    fs::write(contract, original).unwrap();
+    assert_ne!(baseline[0], after[0]);
+    assert_ne!(
+        baseline[1], after[1],
+        "factory-api embeds the meter contract"
+    );
+    assert_eq!(baseline[2], after[2]);
+    assert_eq!(baseline, fingerprints(relocated.path()));
+
     let meter = root.join("meter/src/lib.rs");
     let original = fs::read(&meter).unwrap();
     let mut changed = original.clone();

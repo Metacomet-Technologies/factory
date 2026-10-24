@@ -289,6 +289,8 @@ mod api {
     struct MeterHealth {
         #[serde(flatten)]
         build: Health,
+        /// SHA-256 (first 12 hex) of the whole served `/meter/openapi.json` snapshot.
+        openapi_sha256: String,
         #[serde(flatten)]
         queue: db::QueueStatus,
         /// Rollup job health; status stays "ok" so inference health is unchanged.
@@ -380,6 +382,7 @@ mod api {
         state.db.health().await.map_err(|e| e.to_string())?;
         serde_json::to_value(MeterHealth {
             build: shared::build_info(env!("FACTORY_INPUTS_FINGERPRINT")),
+            openapi_sha256: openapi_sha256().into(),
             queue: state.db.queue_status(),
             maintenance: state.db.maintenance(),
         })
@@ -473,6 +476,17 @@ mod api {
     #[utoipa::path(get, path = "/meter/openapi.json", responses((status = 200, description = "OpenAPI 3.1 document")))]
     fn openapi_doc() -> Response<Body> {
         Json(ApiDoc::openapi()).into_response()
+    }
+
+    fn openapi_sha256() -> &'static str {
+        use sha2::Digest;
+        static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        HASH.get_or_init(|| {
+            let spec = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
+            let snapshot = format!("{}\n", serde_json::to_string_pretty(&spec).unwrap());
+            let digest = sha2::Sha256::digest(snapshot);
+            digest[..6].iter().map(|b| format!("{b:02x}")).collect()
+        })
     }
 
     #[derive(OpenApi)]

@@ -29,6 +29,84 @@ async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test]
+async fn health_reports_meter_contract_or_unknown_without_losing_api_health() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    pricing::migrate(directory.path().join("pricing.db"))?;
+    let state = AppState::new(
+        "http://127.0.0.1:1".into(),
+        directory.path().join("requests.db"),
+        directory.path().join("pricing.db"),
+        fleet::Config { nodes: vec![] },
+    )
+    .await?;
+    state.db.clock_synchronized.store(true, Ordering::Release);
+    let expected = env!("FACTORY_METER_OPENAPI_SHA256");
+    for (status, body, served) in [
+        (
+            StatusCode::OK,
+            json!({"openapi_sha256": expected}),
+            json!(expected),
+        ),
+        (
+            StatusCode::OK,
+            json!({"openapi_sha256": "000000000000"}),
+            json!("000000000000"),
+        ),
+        (StatusCode::OK, json!({"status": "ok"}), Value::Null),
+        (StatusCode::OK, json!({"openapi_sha256": 7}), Value::Null),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"openapi_sha256": expected}),
+            Value::Null,
+        ),
+    ] {
+        let (meter_url, meter) = serve(Router::new().route(
+            "/meter/health",
+            get(move || {
+                let body = body.clone();
+                async move { (status, Json(body)) }
+            }),
+        ))
+        .await;
+        let mut state = state.clone();
+        state.meter_url = meter_url;
+        let (url, api) = serve(router(state)).await;
+        let health: Value = reqwest::get(format!("{url}/v1/health"))
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(health["meter_openapi_expected"], expected);
+        assert_eq!(health["meter_openapi_sha256"], served);
+        assert_eq!(health["status"], "ok");
+        api.abort();
+        meter.abort();
+    }
+    let (meter_url, meter) = serve(Router::new().route(
+        "/meter/health",
+        get(|| async { std::future::pending::<Json<Value>>().await }),
+    ))
+    .await;
+    let mut state = state;
+    state.meter_url = meter_url;
+    let (url, api) = serve(router(state)).await;
+    let health: Value = tokio::time::timeout(Duration::from_secs(2), async {
+        reqwest::get(format!("{url}/v1/health"))
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+    })
+    .await??;
+    assert!(health["meter_openapi_sha256"].is_null());
+    assert_eq!(health["meter_openapi_expected"], expected);
+    assert_eq!(health["status"], "ok");
+    api.abort();
+    meter.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn ups_unavailable_and_silent_peer_do_not_block_collectors() -> Result<()> {
     let directory = tempfile::tempdir()?;
     pricing::migrate(directory.path().join("pricing.db"))?;
@@ -287,6 +365,8 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             "built_at_ms",
             "inputs_fingerprint",
             "openapi_sha256",
+            "meter_openapi_expected",
+            "meter_openapi_sha256",
             "uptime_ms",
             "retention",
         ],

@@ -1178,6 +1178,17 @@
           "inputs_fingerprint": {
             "type": "string"
           },
+          "meter_openapi_expected": {
+            "description": "SHA-256 (first 12 hex) of the whole `meter/openapi.json` used at build time.",
+            "type": "string"
+          },
+          "meter_openapi_sha256": {
+            "description": "Meter's served contract hash; null when unreachable or not reported.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "openapi_sha256": {
             "description": "SHA-256 (first 12 hex) of the served `/openapi.json`, byte-identical to\nthe committed `factory-api/openapi.json` snapshot: the kiosk's API contract.",
             "type": "string"
@@ -1205,6 +1216,7 @@
           "built_at_ms",
           "inputs_fingerprint",
           "openapi_sha256",
+          "meter_openapi_expected",
           "uptime_ms",
           "retention"
         ],

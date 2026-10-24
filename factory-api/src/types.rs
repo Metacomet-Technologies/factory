@@ -13,6 +13,10 @@ pub struct Health {
     /// SHA-256 (first 12 hex) of the served `/openapi.json`, byte-identical to
     /// the committed `factory-api/openapi.json` snapshot: the kiosk's API contract.
     pub openapi_sha256: String,
+    /// SHA-256 (first 12 hex) of the whole `meter/openapi.json` used at build time.
+    pub meter_openapi_expected: String,
+    /// Meter's served contract hash; null when unreachable or not reported.
+    pub meter_openapi_sha256: Option<String>,
     pub uptime_ms: u64,
     pub retention: RequestRetention,
 }

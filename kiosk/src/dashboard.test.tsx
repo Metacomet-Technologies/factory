@@ -579,6 +579,8 @@ describe("dashboard contract", () => {
       ...build,
       inputs_fingerprint: "111111111111",
       openapi_sha256: "9ece56431fd2",
+      meter_openapi_expected: "123456abcdef",
+      meter_openapi_sha256: "123456abcdef",
       status: "ok",
       uptime_ms: 123,
       retention: { status: "pending", pruned_rows: 0, pruned_rows_since_start: 0 },
@@ -592,6 +594,35 @@ describe("dashboard contract", () => {
     const footer = screen.getByRole("contentinfo", { name: "Running versions" });
     expect(footer).toHaveTextContent("factory v0.2.0api a1b2c3dkiosk a1b2c3dmeter a1b2c3d");
     expect(within(footer).queryByRole("status")).not.toBeInTheDocument();
+    rerender(
+      <VersionFooter
+        api={{ ...health, meter_openapi_sha256: "fedcba654321" }}
+        meter={meter}
+        kiosk={build}
+      />,
+    );
+    expect(within(footer).getByRole("status")).toHaveTextContent("Build mismatch");
+    expect(within(footer).getByRole("status")).toHaveAttribute(
+      "title",
+      "API↔meter contract mismatch: api built against OpenAPI 123456abcdef, meter serves fedcba654321",
+    );
+    rerender(
+      <VersionFooter
+        api={{ ...health, openapi_sha256: "000000000000", meter_openapi_sha256: "fedcba654321" }}
+        meter={meter}
+        kiosk={build}
+      />,
+    );
+    expect(within(footer).getByRole("status").title).toContain("kiosk built against");
+    expect(within(footer).getByRole("status").title).toContain("API↔meter contract mismatch");
+    for (const values of [
+      { meter_openapi_sha256: null },
+      { meter_openapi_sha256: "" },
+      { meter_openapi_expected: "" },
+    ]) {
+      rerender(<VersionFooter api={{ ...health, ...values }} meter={meter} kiosk={build} />);
+      expect(within(footer).queryByRole("status")).not.toBeInTheDocument();
+    }
     // Same contract, every component on a different commit, version and inputs: no warning.
     rerender(
       <VersionFooter

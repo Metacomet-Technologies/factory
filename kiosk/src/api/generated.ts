@@ -783,6 +783,10 @@ export interface components {
       git_dirty: boolean;
       git_sha: string;
       inputs_fingerprint: string;
+      /** @description SHA-256 (first 12 hex) of the whole `meter/openapi.json` used at build time. */
+      meter_openapi_expected: string;
+      /** @description Meter's served contract hash; null when unreachable or not reported. */
+      meter_openapi_sha256?: string | null;
       /**
        * @description SHA-256 (first 12 hex) of the served `/openapi.json`, byte-identical to
        *     the committed `factory-api/openapi.json` snapshot: the kiosk's API contract.

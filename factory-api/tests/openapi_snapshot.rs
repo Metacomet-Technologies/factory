@@ -66,6 +66,13 @@ async fn openapi_snapshot() -> Result<()> {
     use sha2::Digest;
     let committed = sha2::Sha256::digest(std::fs::read(&path)?);
     let committed: String = committed[..6].iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(health?["openapi_sha256"], committed.as_str());
+    let health = health?;
+    assert_eq!(health["openapi_sha256"], committed.as_str());
+    let meter = sha2::Sha256::digest(std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../meter/openapi.json"),
+    )?);
+    let meter: String = meter[..6].iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(health["meter_openapi_expected"], meter);
+    assert!(health["meter_openapi_sha256"].is_null());
     Ok(())
 }

@@ -169,9 +169,14 @@
               "maintenance": {
                 "$ref": "#/components/schemas/Maintenance",
                 "description": "Rollup job health; status stays \"ok\" so inference health is unchanged."
+              },
+              "openapi_sha256": {
+                "description": "SHA-256 (first 12 hex) of the whole served `/meter/openapi.json` snapshot.",
+                "type": "string"
               }
             },
             "required": [
+              "openapi_sha256",
               "maintenance"
             ],
             "type": "object"

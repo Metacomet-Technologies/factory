@@ -17,6 +17,10 @@ const openapi_sha256 = createHash("sha256")
   .update(readFileSync(join(import.meta.dirname, "../../factory-api/openapi.json")))
   .digest("hex")
   .slice(0, 12);
+const meter_openapi_sha256 = createHash("sha256")
+  .update(readFileSync(join(import.meta.dirname, "../../meter/openapi.json")))
+  .digest("hex")
+  .slice(0, 12);
 
 const build = {
   version: "0.2.0",
@@ -184,6 +188,8 @@ export function fixtures(
     status: "ok",
     ...build,
     openapi_sha256,
+    meter_openapi_expected: meter_openapi_sha256,
+    meter_openapi_sha256,
     uptime_ms: 9_840_000,
     retention: { status: "ok", oldest_retained_id: 1, pruned_rows: 0, pruned_rows_since_start: 0 },
   };
