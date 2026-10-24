@@ -2,7 +2,7 @@
 import { describe } from 'node:test';
 import { availableParallelism } from 'node:os';
 
-describe('dispatcher', { concurrency: Math.min(4, availableParallelism()) }, async () => {
+describe('dispatcher', { concurrency: Math.min(2, availableParallelism()) }, async () => {
   await import('./dispatch.test.ts');
   await import('./policy.test.ts');
 });
