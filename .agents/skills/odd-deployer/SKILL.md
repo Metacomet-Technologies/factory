@@ -39,13 +39,18 @@ an installer, a rollback script or `sudo`; the job owns those.
 4. Install: `sudo -n /usr/bin/bash /home/agent/work/factory/deploy/install-<c>.sh <artifact>`,
    three health probes 20 s apart, all three must report the release SHA.
    Red: the listed rollback script runs once with the snapshot path the
-   installer printed, then the health probe decides `rollback=<sha>` or
-   `rollback=none`. The release stops at the first failed component.
+   installer printed, then three more probes must find a healthy previous
+   release: `rollback=<snapshot>`, otherwise `rollback=none`. Usage has no
+   restoring rollback, so red usage is `rollback=none` without running
+   anything. The release stops at the first failed component. A failed
+   component record is never a baseline; the next release retries it.
 5. Receipt, one line per issue the release closes
    (`(#N)` merge subjects → PR body `closes`/`contributes` lines), posted only
    on issues currently in `Deploying`:
    `odd-deploy host=factory-gpu component=<a+b|none|failed> sha=<sha>
-   health=<pass|fail> rollback=<none|sha>`. `parseDeployReceipt` in
+   health=<pass|fail> rollback=<none|snapshot>`. The receipt is saved in the
+   ledger before delivery, so a crashed run posts the rest without
+   redeploying. `parseDeployReceipt` in
    `scripts/odd/lifecycle.ts` must parse it. The ledger `lastTag` advances
    even on failure so one broken release cannot block the next.
 
@@ -54,10 +59,16 @@ follow-up (fail with rollback), or a page (fail without rollback).
 
 ## Inputs for the agent
 
-`journalctl -u factory-deploy --since -2h` (JSON lines, `event` field:
+The control plane starts you (Amp low, runner factory-gpu, thread label
+`odd-deploy-<sha12>`) once per red release. Your first message carries the
+receipt line, the issue, and the Bug follow-up to attach to (none when the
+rollback failed: comment on the issue instead).
+
+`journalctl -u factory-deploy --since -2h` (JSON lines, `decision` field:
 `pending`, `checkout`, `baseline`, `plan`, `resume`, `install`,
-`installer-output`, `probe`, `rollback`, `rollback-missing-snapshot`,
-`receipt`, `receipt-skipped`, `main-left-detached`; a failure ends the run
+`installer-output`, `probe`, `rollback`, `rollback-probe`,
+`rollback-missing-snapshot`, `rollback-unavailable`, `receipt`,
+`receipt-resume`, `receipt-skipped`, `main-left-detached`; a failure ends the run
 with a non-zero exit and the receipt line in the error), the ledger, the
 receipt comment on the issue, and the component health endpoint.
 
@@ -66,9 +77,8 @@ receipt comment on the issue, and the component health endpoint.
 1. Find the failing `install`, `probe` or `rollback` event and quote it.
 2. Compare the probe `git_sha` with the receipt `sha`; name which component
    is live on which SHA.
-3. Comment the diagnosis on the issue the receipt names, then stop. The Bug
-   follow-up already exists when `rollback` is a SHA; add the diagnosis to it
-   instead of filing another.
+3. Comment the excerpts and diagnosis on the Bug named in your first message
+   (on the issue when there is none), then stop. Never file another Bug.
 
 ## Authority
 

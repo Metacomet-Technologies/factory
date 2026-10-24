@@ -302,8 +302,11 @@ newer than the ledger's `lastTag` with `release.py verify --anonymous`, detaches
 component whose sources or installer changed since the SHA the host already
 runs: `meter`, `factory-api`, `kiosk`, `usage`, in that order, through the
 sudoers allowlist (`deploy/sudoers/README.md`). Three health probes 20 s apart
-must report the release SHA; red runs the component's rollback script once. The
-result is one `odd-deploy` receipt per issue the release closes
+must report the release SHA; red runs the component's rollback script once and
+re-probes, and the receipt names the snapshot only when the previous release is
+back and healthy. Usage has no restoring rollback (`rollback-usage.sh` removes
+the units), so a red usage install is never rolled back automatically and pages
+Devon. The result is one `odd-deploy` receipt per issue the release closes
 (`docs/odd/README.md` §7). The enabled set lives in `deploy.ts`, not in
 `deploy/components.json`, because `release.py inventory_check` keeps
 `enabled_auto_deploy` empty and eligibility human-only.
@@ -332,6 +335,9 @@ gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-deploy.sh'   # remov
 ```
 
 A failed component stops the release and exits non-zero; `lastTag` still
-advances so the next release is the retry. Deleting the ledger makes the next
+advances and the failed record is not a baseline, so the next release is the
+retry even when it touches only docs. A run killed mid-component resumes that
+component first; a run killed while posting receipts posts the rest without
+redeploying. Deleting the ledger makes the next
 run bootstrap again without deploying. A dirty host checkout blocks every
 deploy until it is clean, and the job logs it each tick.

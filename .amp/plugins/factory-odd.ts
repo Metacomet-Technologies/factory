@@ -3,12 +3,14 @@
 // @amp-agent-mode {"key":"odd-builder","label":"ODD Builder"}
 // @amp-agent-mode {"key":"odd-reviewer","label":"ODD Reviewer"}
 // @amp-agent-mode {"key":"odd-verifier","label":"ODD Verifier"}
+// @amp-agent-mode {"key":"odd-deployer","label":"ODD Deployer"}
 // @amp-agent-mode {"key":"odd-control","label":"ODD Control"}
 
-import type { Agent, PluginAPI, PluginEventContext, ThreadID, WebhookEvent, WebhookHandlerContext } from '@ampcode/plugin'
+import type { Agent, AgentThreadExecutor, PluginAPI, PluginEventContext, ThreadID, WebhookEvent, WebhookHandlerContext } from '@ampcode/plugin'
 import {
 	capacity,
 	contracts,
+	deployReceiptLine,
 	escalatedLabel,
 	issueTriaged,
 	nextAction,
@@ -18,6 +20,7 @@ import {
 	specComplete,
 	threadLabels,
 	type Action,
+	type DeployReceipt,
 	type IssueSnapshot,
 	type Load,
 	type Role,
@@ -38,6 +41,8 @@ const performLabel = 'odd-perform'
 const marker = '[odd]'
 const liveRoles: ReadonlySet<Role> = new Set<Role>(['intake', 'spec', 'builder', 'reviewer'])
 const slackPollMs = 5 * 60_000
+/** Runner ID of the host the deploy job runs on; the red-deploy log reader runs there. */
+const deployRunner = 'factory-gpu'
 
 export default async function (amp: PluginAPI) {
 	const roleAgent = (role: Role, extendsMode: 'low' | 'medium' | 'high', label: string, extra: string, tools?: { exclude?: string[] }): Agent =>
@@ -61,6 +66,7 @@ export default async function (amp: PluginAPI) {
 		{ key: 'builder', label: 'ODD Builder', agent: roleAgent('builder', 'medium', 'ODD Builder', 'Implement the smallest correct change on your own branch, open the PR with the Evidence output in its body, and keep the same thread and branch across review rounds.') },
 		{ key: 'reviewer', label: 'ODD Reviewer', agent: roleAgent('reviewer', 'high', 'ODD Reviewer', 'Rerun the Evidence commands yourself at the exact head SHA. Verdict is bound to that SHA: a PR comment plus the odd-verdict thread label.', { exclude: ['edit_file', 'create_file'] }) },
 		{ key: 'verifier', label: 'ODD Verifier', agent: roleAgent('verifier', 'low', 'ODD Verifier', 'Check each Done-means item against the deployed system using the Evidence lines and the deploy receipt.', { exclude: ['edit_file', 'create_file'] }) },
+		{ key: 'deployer', label: 'ODD Deployer', agent: roleAgent('deployer', 'low', 'ODD Deployer', 'Read the factory-deploy journal and ledger for the red receipt you were given and attach the installer and journal excerpts to the named issue. Never run installers, rollbacks, sudo or systemctl.', { exclude: ['edit_file', 'create_file'] }) },
 	]
 	const agents: Partial<Record<Role, Agent>> = Object.fromEntries(modes.map((m) => [m.key, m.agent]))
 	const control = amp.createAgent({
@@ -305,10 +311,10 @@ export default async function (amp: PluginAPI) {
 		}
 	}
 
-	async function spawnThread(parentThreadID: ThreadID, role: Role, labels: string[], content: string): Promise<string> {
+	async function spawnThread(parentThreadID: ThreadID, role: Role, labels: string[], content: string, executor: AgentThreadExecutor = 'orb'): Promise<string> {
 		const agent = agents[role]
 		if (!agent) throw new Error(`no plugin agent for role ${role}`)
-		const thread = await agent.createThread({ executor: 'orb', parentThreadID, visibility: 'workspace' })
+		const thread = await agent.createThread({ executor, parentThreadID, visibility: 'workspace' })
 		await thread.setLabels(labels)
 		await thread.appendUserMessage({ type: 'user-message', content })
 		return thread.id
@@ -358,10 +364,12 @@ export default async function (amp: PluginAPI) {
 				if (action.role === 'builder' && issue.status === 'Todo') await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: 'In Progress' })
 				return
 			}
-			case 'set-status':
+			case 'set-status': {
 				await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: action.status })
-				if (action.followUp) await followUp(ctx, issue, action.followUp)
+				const bug = action.followUp ? await followUp(ctx, issue, action.followUp) : undefined
+				if (action.diagnose) await diagnose(ctx, issue, action.diagnose, bug, spawnDeployer(ctx))
 				return
+			}
 			case 'steer': {
 				const key = `${action.threadID}:${action.message}`
 				if (steered.has(key)) return
@@ -374,6 +382,7 @@ export default async function (amp: PluginAPI) {
 				return
 			case 'page':
 				await page(ctx, issue, action)
+				if (action.diagnose) await diagnose(ctx, issue, action.diagnose, undefined, spawnDeployer(ctx))
 				return
 			default:
 				ctx.logger.log(marker, 'deferred to a later phase', action.kind)
@@ -404,33 +413,66 @@ export default async function (amp: PluginAPI) {
 		ctx.logger.log(marker, 'merged', issue.identifier, pr, sha, mergeSha)
 	}
 
-	// Escalation (§8): the issue stays In Progress with the `escalated` label (the lifecycle waits
-	// on it), the PR goes back to draft so nothing merges it, and Devon gets one Slack DM.
-	// `slack_write` without a recipient DMs the thread owner.
-	async function page(ctx: EvalContext, issue: IssueSnapshot, action: Extract<Action, { kind: 'page' }>) {
-		await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, addLabels: [escalatedLabel] })
-		if (action.pr !== undefined) {
-			const draft = await ctx.$`gh pr ready ${String(action.pr)} --undo`
-			if (draft.exitCode !== 0) ctx.logger.log(marker, 'draft failed', action.pr, draft.stderr.trim())
-		}
-		await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-escalated reason=${action.reason}\n\n${action.detail}` })
-		await ctx.tools.call('slack_write', { text: `${marker} ${issue.identifier} escalated (${action.reason}): ${action.detail}. Remove the \`${escalatedLabel}\` label to resume.` })
-		ctx.logger.log(marker, 'paged', issue.identifier, action.reason)
-	}
+	// The red-deploy log reader (§4 Deployer, Build 6): an Amp low thread on the deploy host.
+	const spawnDeployer = (ctx: EvalContext) => (labels: string[], content: string) =>
+		spawnThread(ctx.thread.id, 'deployer', labels, content, { type: 'runner', id: deployRunner })
+}
 
-	// A rolled-back release returns its issues to Todo and files one Bug in Backlog per failed
-	// release (the title carries the SHA; a second issue of the same release reuses it).
-	async function followUp(ctx: EvalContext, issue: IssueSnapshot, followUp: { title: string; body: string }) {
-		const existing = await callJson<{ issues?: { id?: string; title?: string }[] }>(ctx.tools, 'linear.list_issues', { team: 'Metacomet', query: followUp.title, limit: 10 })
-		const match = existing.issues?.find(candidate => candidate.title === followUp.title)
-		if (match?.id) {
-			await callJson(ctx.tools, 'linear.save_issue', { id: match.id, relatedTo: [issue.identifier] })
-			ctx.logger.log(marker, 'follow-up exists', issue.identifier, match.id)
-			return
-		}
-		const created = await callJson<{ id?: string; identifier?: string }>(ctx.tools, 'linear.save_issue', { team: 'Metacomet', title: followUp.title, description: followUp.body, labels: ['Bug', 'area:agents'], state: 'Backlog', relatedTo: [issue.identifier] })
-		ctx.logger.log(marker, 'follow-up filed', issue.identifier, created.identifier ?? created.id ?? '')
+// Escalation (§8): the issue stays In Progress with the `escalated` label (the lifecycle waits
+// on it), the PR goes back to draft so nothing merges it, and Devon gets one Slack DM.
+// `slack_write` without a recipient DMs the thread owner.
+export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, issue: IssueSnapshot, action: Extract<Action, { kind: 'page' }>) {
+	await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, addLabels: [escalatedLabel] })
+	if (action.pr !== undefined) {
+		const draft = await ctx.$`gh pr ready ${String(action.pr)} --undo`
+		if (draft.exitCode !== 0) ctx.logger.log(marker, 'draft failed', action.pr, draft.stderr.trim())
 	}
+	await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-escalated reason=${action.reason}\n\n${action.detail}` })
+	await ctx.tools.call('slack_write', { text: `${marker} ${issue.identifier} escalated (${action.reason}): ${action.detail}. Remove the \`${escalatedLabel}\` label to resume.` })
+	ctx.logger.log(marker, 'paged', issue.identifier, action.reason)
+}
+
+// A rolled-back release returns its issues to Todo and files one Bug in Backlog per failed
+// release (the title carries the SHA; a second issue of the same release reuses it). Returns the Bug.
+export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, followUp: { title: string; body: string }): Promise<string | undefined> {
+	const existing = await callJson<{ issues?: { id?: string; title?: string }[] }>(ctx.tools, 'linear.list_issues', { team: 'Metacomet', query: followUp.title, limit: 10 })
+	const match = existing.issues?.find(candidate => candidate.title === followUp.title)
+	if (match?.id) {
+		await callJson(ctx.tools, 'linear.save_issue', { id: match.id, relatedTo: [issue.identifier] })
+		ctx.logger.log(marker, 'follow-up exists', issue.identifier, match.id)
+		return match.id
+	}
+	const created = await callJson<{ id?: string; identifier?: string }>(ctx.tools, 'linear.save_issue', { team: 'Metacomet', title: followUp.title, description: followUp.body, labels: ['Bug', 'area:agents'], state: 'Backlog', relatedTo: [issue.identifier] })
+	ctx.logger.log(marker, 'follow-up filed', issue.identifier, created.identifier ?? created.id ?? '')
+	return created.identifier ?? created.id
+}
+
+// One log-reading Deployer per red release (label odd-deploy-<sha12>, searched without an
+// archived:false filter, plus this process's memory while the search index lags). It attaches the installer and
+// journal excerpts to the Bug, or to the issue when the rollback failed and no Bug exists.
+const diagnosed = new Set<string>()
+export async function diagnose(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, receipt: DeployReceipt, bug: string | undefined, spawn: (labels: string[], content: string) => Promise<string>) {
+	const label = `odd-deploy-${receipt.sha.slice(0, 12)}`
+	const found = await callJson<{ threads: { id: string }[] }>(ctx.tools, 'find_thread', { query: `label:${label}`, limit: 1 })
+	if (diagnosed.has(label) || found.threads.length) {
+		ctx.logger.log(marker, 'deploy log reader exists', issue.identifier, label)
+		return
+	}
+	diagnosed.add(label)
+	const target = bug ?? issue.identifier
+	let thread: string
+	try {
+		thread = await spawn([...threadLabels(issue.identifier, 'deployer', 1), label], [
+			`${marker} Outcome ${issue.identifier}. Role: deployer. Reason: red deploy.`,
+			`Receipt: \`${deployReceiptLine(receipt)}\`.`,
+			`Attach the installer and journal excerpts (\`journalctl -u factory-deploy\`, the ledger) for this release to ${target}${bug ? ` (Bug follow-up of ${issue.identifier})` : ' (the rollback failed; Devon is paged)'}.`,
+			`Load the \`${contracts.deployer.skill}\` skill and start.`,
+		].join(' '))
+	} catch (error: unknown) {
+		diagnosed.delete(label)
+		throw error
+	}
+	ctx.logger.log(marker, 'deploy log reader', issue.identifier, label, '->', thread)
 }
 
 // --- Derivation: Linear through the thread's MCP tools, GitHub through gh, Amp through thread search.

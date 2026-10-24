@@ -64,10 +64,11 @@ export type Action =
   | { kind: 'spawn'; role: Role; executor: Executor; reason: string; round: number }
   | { kind: 'steer'; role: Role; threadID: string; message: string }
   | { kind: 'merge'; pr: number; sha: string }
-  | { kind: 'set-status'; status: Status; reason: string; followUp?: { title: string; body: string } }
-  | { kind: 'page'; reason: PageReason; detail: string; pr?: number }
+  | { kind: 'set-status'; status: Status; reason: string; followUp?: { title: string; body: string }; diagnose?: DeployReceipt }
+  | { kind: 'page'; reason: PageReason; detail: string; pr?: number; diagnose?: DeployReceipt }
   | { kind: 'wait'; reason: string };
 
+/** `diagnose` on a red deploy: after acting, the control plane starts one log-reading Deployer on the receipt's host (odd-deployer skill). */
 export type PageReason = 'third-failed-qa-round' | 'failed-rollback' | 'irreversible-action' | 'security-finding' | 'budget-ceiling' | 'control-plane-blind';
 
 const sections = ['## Goal', '## Isolation', '## Build', '## Done means', '## Evidence'] as const;
@@ -100,6 +101,9 @@ export function issueTriaged(issue: { status: string; labels: readonly string[] 
   if (!issue.labels.some(label => label.startsWith('area:') || label.startsWith('area/'))) missing.push('an area:* label');
   return missing;
 }
+
+export const deployReceiptLine = (receipt: DeployReceipt) =>
+  `odd-deploy host=${receipt.host} component=${receipt.component} sha=${receipt.sha} health=${receipt.health} rollback=${receipt.rollback}`;
 
 export function parseDeployReceipt(text: string): DeployReceipt | undefined {
   const match = /^odd-deploy host=(\S+) component=(\S+) sha=([a-f0-9]{7,40}) health=(pass|fail) rollback=(\S+)$/m.exec(text);
@@ -173,11 +177,12 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
   if (status === 'Deploying') {
     const receipt = issue.deployReceipt;
     if (!receipt) return { kind: 'wait', reason: 'release not published' };
-    if (receipt.health === 'fail' && receipt.rollback === 'none') return { kind: 'page', reason: 'failed-rollback', detail: `${receipt.component} on ${receipt.host} unhealthy at ${receipt.sha}` };
+    const line = deployReceiptLine(receipt);
+    if (receipt.health === 'fail' && receipt.rollback === 'none') return { kind: 'page', reason: 'failed-rollback', detail: `${receipt.component} on ${receipt.host} unhealthy at ${receipt.sha}: ${line}`, diagnose: receipt };
     if (receipt.health === 'fail') {
-      return { kind: 'set-status', status: 'Todo', reason: `rolled back to ${receipt.rollback}`, followUp: {
+      return { kind: 'set-status', status: 'Todo', reason: `rolled back to ${receipt.rollback}`, diagnose: receipt, followUp: {
         title: `Deploy failed: ${receipt.component} at ${receipt.sha.slice(0, 12)}`,
-        body: `${issue.identifier} was rolled back on ${receipt.host}.\n\n\`\`\`\nodd-deploy host=${receipt.host} component=${receipt.component} sha=${receipt.sha} health=fail rollback=${receipt.rollback}\n\`\`\`\n\nRead \`journalctl -u factory-deploy\` on ${receipt.host} for the installer and probe output.`,
+        body: `${issue.identifier} was rolled back on ${receipt.host}.\n\n\`\`\`\n${line}\n\`\`\`\n\nRead \`journalctl -u factory-deploy\` on ${receipt.host} for the installer and probe output.`,
       } };
     }
     // Phase 6 adds the Verifier's judgement; until then a 60 s exact-SHA health window is Done.

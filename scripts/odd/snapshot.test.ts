@@ -55,12 +55,14 @@ test('snapshot combines Linear, GitHub and thread state, and feeds nextAction', 
   assert.deepEqual(snapshot.owner, { role: 'builder', threadID: 'T-b', round: 2, state: 'idle' });
   assert.deepEqual(snapshot.pr, { number: 157, headSha: sha, ci: 'success', verdict: undefined, merged: false, mergeSha: undefined, changesRounds: 0 });
   assert.equal(snapshot.deployReceipt?.health, 'pass');
-  // A receipt from before the latest merge belongs to the previous deploy of a re-opened issue.
-  const reopened = toSnapshot({ issue: { id: 'met-277', status: 'Deploying', labels: [], comments: [
-    { body: 'odd-deploy host=gpu component=api sha=abc1234 health=fail rollback=/var/backups/x' },
-    { body: 'odd-merge pr=1 head=a merge=b release=none' },
-  ] } });
-  assert.equal(reopened.deployReceipt, undefined);
+  // linear.list_comments returns newest first. A receipt from before the latest merge belongs to
+  // the previous deploy of a re-opened issue; the receipt after it counts.
+  const merge = (n: number, at: string) => ({ body: `odd-merge pr=${n} head=a merge=b release=none`, createdAt: at });
+  const receipt = (health: string, at: string) => ({ body: `odd-deploy host=gpu component=api sha=abc1234 health=${health} rollback=none`, createdAt: at });
+  const deploying = (comments: { body: string; createdAt: string }[]) => toSnapshot({ issue: { id: 'met-277', status: 'Deploying', labels: [], comments } }).deployReceipt;
+  assert.equal(deploying([merge(2, '2026-10-24T13:30:00Z'), receipt('fail', '2026-10-24T13:20:00Z'), merge(1, '2026-10-24T13:10:00Z')]), undefined);
+  assert.equal(deploying([receipt('pass', '2026-10-24T13:40:00Z'), merge(1, '2026-10-24T13:30:00Z')])?.health, 'pass');
+  assert.equal(deploying([receipt('pass', '2026-10-24T13:40:00Z'), merge(2, '2026-10-24T13:30:00Z'), receipt('fail', '2026-10-24T13:20:00Z'), merge(1, '2026-10-24T13:10:00Z')])?.health, 'pass');
   assert.equal(snapshot.risk, 'ordinary');
   assert.deepEqual(nextAction(snapshot, { orbs: 0, runnerSlots: 0, buildIssues: 1 }), { kind: 'spawn', role: 'reviewer', executor: 'orb', reason: `no verdict at ${sha.slice(0, 12)}`, round: 1 });
   const unknown = toSnapshot({ issue: { id: 'MET-1', status: 'Nonsense', labels: [] } });

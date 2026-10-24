@@ -3,16 +3,17 @@
 // this as `agent` on factory-gpu every 2 minutes, one run at a time (flock in the unit). No model:
 // every published release newer than the ledger is verified, the main checkout is detached at
 // its SHA, each enabled component whose inputs changed is installed through the sudoers
-// allowlist, probed three times for the exact release SHA, rolled back once when red, and every
+// allowlist, probed three times for the exact release SHA, rolled back once when red (and
+// re-probed: the rollback counts only when the previous release is back and healthy), and every
 // Deploying issue the release ships gets one `odd-deploy` receipt. The control plane turns the
 // receipt into Done, Todo + Bug, or a page (scripts/odd/lifecycle.ts).
 //
-// Pure planning (`plan`, `pendingTags`, `issuesFromSubjects`, `parseSnapshot`, `probeResult`,
-// `receiptLine`, `resume`) is exported for tests; effects go through `Effects` so the sandbox
-// fixture fakes sudo, curl, git and Linear.
+// Pure planning (`plan`, `pendingTags`, `issuesFromSubjects`, `parseSnapshot`, `healthySha`,
+// `probeResult`, `restoredResult`, `receiptLine`, `resume`) is exported for tests; effects go
+// through `Effects` so the sandbox fixture fakes sudo, curl, git, the release download and Linear.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,32 +34,35 @@ export type Recipe = {
   /** Installer argument from the verified release directory; undefined installs from the checkout. */
   artifact?: (releaseDir: string) => string;
   installer: string;
-  rollback: string;
-  rollbackTakesSnapshot: boolean;
+  /** Restores the installer's snapshot; undefined when no script restores the previous release. */
+  rollback?: string;
   health: Health;
 };
 
 /** Auto-deploy set settled by Devon 2026-10-24, in install order. The dispatcher's installer needs
  * a console runner list on stdin and retires in phase 7; pricing, ups, alerts, backup, reboot and
- * nut stay human-only (deploy/components.json). */
+ * nut stay human-only (deploy/components.json). Usage has no rollback: deploy/rollback-usage.sh
+ * removes the units rather than restoring the previous ones, so a red usage install pages. */
 export const recipes: readonly Recipe[] = [
   { name: 'meter', deployFiles: ['deploy/install-meter.sh', 'deploy/meter.service'], artifact: dir => join(dir, 'meter-linux-x86_64'),
-    installer: 'deploy/install-meter.sh', rollback: 'deploy/rollback-meter-v1.sh', rollbackTakesSnapshot: true,
+    installer: 'deploy/install-meter.sh', rollback: 'deploy/rollback-meter-v1.sh',
     health: { kind: 'http', url: 'http://127.0.0.1:11434/meter/health' } },
   { name: 'factory-api', deployFiles: ['deploy/install-factory-api.sh', 'deploy/factory-api.service'], artifact: dir => join(dir, 'factory-api-linux-x86_64'),
-    installer: 'deploy/install-factory-api.sh', rollback: 'deploy/rollback-factory-api.sh', rollbackTakesSnapshot: true,
+    installer: 'deploy/install-factory-api.sh', rollback: 'deploy/rollback-factory-api.sh',
     health: { kind: 'http', url: 'http://127.0.0.1:8080/v1/health' } },
   { name: 'kiosk', deployFiles: ['deploy/install-kiosk.sh'], artifact: dir => join(dir, 'kiosk'),
-    installer: 'deploy/install-kiosk.sh', rollback: 'deploy/rollback-kiosk.sh', rollbackTakesSnapshot: true,
+    installer: 'deploy/install-kiosk.sh', rollback: 'deploy/rollback-kiosk.sh',
     health: { kind: 'http', url: 'http://127.0.0.1:8080/version.json' } },
   { name: 'usage', deployFiles: ['deploy/factory-usage.service', 'deploy/factory-usage.timer', 'deploy/factory-usage-refresh.path'],
-    installer: 'deploy/install-usage.sh', rollback: 'deploy/rollback-usage.sh', rollbackTakesSnapshot: false,
+    installer: 'deploy/install-usage.sh',
     health: { kind: 'unit', unit: 'factory-usage.timer' } },
 ];
 
 export type ComponentRecord = { sha: string; tag: string; health: 'pass' | 'fail'; snapshot?: string };
 export type InFlight = { tag: string; sha: string; component: string; phase: 'installing' | 'probing'; snapshot?: string };
-export type Ledger = { lastTag?: string; components: Record<string, ComponentRecord>; inFlight?: InFlight };
+/** A release's receipt, saved before delivery so a crashed delivery resumes without redeploying. `delivered` lists issues already handled. */
+export type PendingReceipt = { tag: string; receipt: Receipt; delivered: string[] };
+export type Ledger = { lastTag?: string; components: Record<string, ComponentRecord>; inFlight?: InFlight; receipt?: PendingReceipt };
 
 export const semver = (tag: string): [number, number, number] | undefined => {
   const match = /^v(\d+)\.(\d+)\.(\d+)$/.exec(tag);
@@ -91,14 +95,27 @@ export function parseSnapshot(output: string): string | undefined {
   return paths.at(-1);
 }
 
-/** A probe passes when the body reports the release SHA (7-char local or full release builds) and status ok. */
+/** The SHA a healthy body reports (7-char local or full release builds): status ok when present, not dirty. */
+export function healthySha(body: string): string | undefined {
+  let json: Record<string, unknown>;
+  try { json = JSON.parse(body) as Record<string, unknown>; } catch { return undefined; }
+  const reported = typeof json.git_sha === 'string' ? json.git_sha : '';
+  if (!/^[0-9a-f]{7,40}$/.test(reported) || json.git_dirty === true) return undefined;
+  return 'status' in json && json.status !== 'ok' ? undefined : reported;
+}
+
+/** A probe passes when a healthy body reports the release SHA; a unit probe when the unit is active. */
 export function probeResult(health: Health, sha: string, body: string): 'pass' | 'fail' {
   if (health.kind === 'unit') return body.trim() === 'active' ? 'pass' : 'fail';
-  let json: Record<string, unknown>;
-  try { json = JSON.parse(body) as Record<string, unknown>; } catch { return 'fail'; }
-  const reported = typeof json.git_sha === 'string' ? json.git_sha : '';
-  if (reported.length < 7 || !sha.startsWith(reported) || json.git_dirty === true) return 'fail';
-  return 'status' in json && json.status !== 'ok' ? 'fail' : 'pass';
+  const reported = healthySha(body);
+  return reported && sha.startsWith(reported) ? 'pass' : 'fail';
+}
+
+/** After a rollback the component must be healthy on a release other than the one rolled back. */
+export function restoredResult(health: Health, sha: string, body: string): 'pass' | 'fail' {
+  if (health.kind === 'unit') return 'fail';
+  const reported = healthySha(body);
+  return reported && !sha.startsWith(reported) ? 'pass' : 'fail';
 }
 
 export type Receipt = { component: string; sha: string; health: 'pass' | 'fail'; rollback: string };
@@ -106,10 +123,11 @@ export const receiptLine = (receipt: Receipt) =>
   `odd-deploy host=${HOST} component=${receipt.component} sha=${receipt.sha} health=${receipt.health} rollback=${receipt.rollback}`;
 
 /**
- * Components to install for a release, in recipe order: enabled recipes whose sources or deploy
- * files changed since their baseline, skipping ones the ledger already records at this SHA.
- * `changedSince(baseline)` lists the paths that changed in (baseline, release]; a component with
- * no baseline (never deployed, no health SHA) installs.
+ * Components to install for a release, in recipe order: the in-flight component of a killed run
+ * at this SHA (it resumes whatever the health endpoint says), then enabled recipes whose sources
+ * or deploy files changed since their baseline, skipping ones the ledger already records healthy
+ * at this SHA. `changedSince(baseline)` lists the paths that changed in (baseline, release]; a
+ * component with no baseline (never deployed, no health SHA) installs.
  */
 export function plan(input: {
   sha: string;
@@ -118,7 +136,9 @@ export function plan(input: {
   ledger: Ledger;
   changedSince: (baseline: string) => readonly string[];
 }): Recipe[] {
+  const inFlight = input.ledger.inFlight;
   return recipes.filter(recipe => {
+    if (inFlight?.sha === input.sha && inFlight.component === recipe.name) return true;
     const record = input.ledger.components[recipe.name];
     if (record?.sha === input.sha && record.health === 'pass') return false;
     const baseline = input.baselines[recipe.name];
@@ -135,6 +155,8 @@ export function resume(inFlight: InFlight, probe: 'pass' | 'fail'): 'installed' 
 }
 
 export type Effects = {
+  /** Holds the ledger's release directories (`releases/<tag>`) and inventories. */
+  stateDir: string;
   log: (decision: string, details?: object) => void;
   sleep: (ms: number) => Promise<void>;
   /** Run a command; non-zero exit throws with stdout+stderr in the message. */
@@ -162,33 +184,35 @@ function newest(effects: Effects, candidates: readonly (string | undefined)[]): 
   return best;
 }
 
+/** The commit a healthy endpoint reports; a degraded, dirty or unreachable one is no baseline. */
 function healthSha(effects: Effects, recipe: Recipe): string | undefined {
   if (recipe.health.kind !== 'http') return undefined;
   try {
-    const json = JSON.parse(effects.probe(recipe.health)) as { git_sha?: unknown };
-    if (typeof json.git_sha !== 'string' || json.git_sha.length < 7) return undefined;
-    return effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `${json.git_sha}^{commit}`]).stdout.trim();
+    const reported = healthySha(effects.probe(recipe.health));
+    return reported && effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `${reported}^{commit}`]).stdout.trim();
   } catch { return undefined; }
 }
 
-async function probeWindow(effects: Effects, recipe: Recipe, sha: string): Promise<'pass' | 'fail'> {
+async function probeWindow(effects: Effects, recipe: Recipe, sha: string, check = probeResult, event = 'probe'): Promise<'pass' | 'fail'> {
   for (let attempt = 1; attempt <= PROBES; attempt++) {
     let body = '';
     try { body = effects.probe(recipe.health); } catch (error) { body = String(error); }
-    const result = probeResult(recipe.health, sha, body);
-    effects.log('probe', { component: recipe.name, attempt, result });
+    const result = check(recipe.health, sha, body);
+    effects.log(event, { component: recipe.name, attempt, result });
     if (result === 'fail') return 'fail';
     if (attempt < PROBES) await effects.sleep(PROBE_GAP_MS);
   }
   return 'pass';
 }
 
-/** Run the rollback once; `none` when it fails or no snapshot exists for a snapshot-taking rollback. */
-function rollback(effects: Effects, recipe: Recipe, snapshot: string | undefined): string {
-  if (recipe.rollbackTakesSnapshot && !snapshot) { effects.log('rollback-missing-snapshot', { component: recipe.name }); return 'none'; }
-  const result = effects.sudo(recipe.rollback, recipe.rollbackTakesSnapshot ? [snapshot!] : []);
+/** Run the rollback once, then re-probe: the snapshot when the previous release is back and healthy, else `none`. */
+async function rollback(effects: Effects, recipe: Recipe, sha: string, snapshot: string | undefined): Promise<string> {
+  if (!recipe.rollback) { effects.log('rollback-unavailable', { component: recipe.name }); return 'none'; }
+  if (!snapshot) { effects.log('rollback-missing-snapshot', { component: recipe.name }); return 'none'; }
+  const result = effects.sudo(recipe.rollback, [snapshot]);
   effects.log('rollback', { component: recipe.name, ok: result.ok, snapshot });
-  return result.ok ? (snapshot ?? 'done') : 'none';
+  if (!result.ok) return 'none';
+  return (await probeWindow(effects, recipe, sha, restoredResult, 'rollback-probe')) === 'pass' ? snapshot : 'none';
 }
 
 /** Install, probe, roll back once on red. Returns the receipt for this component. */
@@ -202,7 +226,7 @@ export async function deployComponent(effects: Effects, recipe: Recipe, tag: str
     effects.log('resume', { component: recipe.name, phase: inFlight.phase, action });
     snapshot = inFlight.snapshot;
     if (action === 'installed') needInstall = false;
-    if (action === 'rollback') return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: rollback(effects, recipe, snapshot) }, snapshot);
+    if (action === 'rollback') return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: await rollback(effects, recipe, sha, snapshot) }, snapshot);
   }
   if (needInstall) {
     effects.writeLedger({ ...ledger, inFlight: { tag, sha, component: recipe.name, phase: 'installing' } });
@@ -212,19 +236,24 @@ export async function deployComponent(effects: Effects, recipe: Recipe, tag: str
     if (!install.ok) {
       effects.log('installer-output', { component: recipe.name, tail: install.output.split('\n').slice(-20) });
       // The installer's own ERR path already restored or never changed anything; a snapshot means it changed something.
-      return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: snapshot ? rollback(effects, recipe, snapshot) : 'none' }, snapshot);
+      return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: snapshot ? await rollback(effects, recipe, sha, snapshot) : 'none' }, snapshot);
     }
     effects.writeLedger({ ...effects.readLedger(), inFlight: { tag, sha, component: recipe.name, phase: 'probing', snapshot } });
     if ((await probeWindow(effects, recipe, sha)) === 'fail') {
-      return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: rollback(effects, recipe, snapshot) }, snapshot);
+      return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: await rollback(effects, recipe, sha, snapshot) }, snapshot);
     }
   }
   return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'pass', rollback: 'none' }, snapshot);
 }
 
+/** Record the component; a failure also saves the release's receipt in the same write, so a rerun delivers it instead of redeploying. */
 function finish(effects: Effects, recipe: Recipe, tag: string, sha: string, receipt: Receipt, snapshot: string | undefined): Receipt {
   const ledger = effects.readLedger();
-  effects.writeLedger({ ...ledger, inFlight: undefined, components: { ...ledger.components, [recipe.name]: { sha, tag, health: receipt.health, snapshot } } });
+  effects.writeLedger({
+    ...ledger, inFlight: undefined,
+    components: { ...ledger.components, [recipe.name]: { sha, tag, health: receipt.health, snapshot } },
+    ...(receipt.health === 'fail' ? { receipt: { tag, receipt, delivered: [] } } : {}),
+  });
   return receipt;
 }
 
@@ -232,16 +261,21 @@ function prepareRelease(effects: Effects, tag: string): { sha: string; dir: stri
   effects.run('git', ['-C', ROOT, 'fetch', '--quiet', '--tags', 'origin']);
   const sha = effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `refs/tags/${tag}^{commit}`]).stdout.trim();
   effects.run('git', ['-C', ROOT, 'merge-base', '--is-ancestor', sha, 'origin/main']);
-  const dir = join(STATE_DIR, 'releases', tag);
+  const dir = join(effects.stateDir, 'releases', tag);
   if (!existsSync(join(dir, '.verified'))) {
     rmSync(dir, { recursive: true, force: true });
     mkdirSync(dirname(dir), { recursive: true });
-    const inventory = join(STATE_DIR, `components-${sha}.json`);
+    const inventory = join(effects.stateDir, `components-${sha}.json`);
     writeFileSync(inventory, effects.run('git', ['-C', ROOT, 'show', `${sha}:deploy/components.json`]).stdout);
     effects.run('python3', [join(ROOT, 'scripts/release/release.py'), 'verify', '--anonymous', '--tag', tag, '--sha', sha, '--inventory', inventory, '--directory', dir]);
     mkdirSync(join(dir, 'kiosk'));
     effects.run('tar', ['--no-same-owner', '-xzf', join(dir, 'kiosk.tar.gz'), '-C', join(dir, 'kiosk')]);
     writeFileSync(join(dir, '.verified'), `${sha}\n`);
+  }
+  // release.py writes assets without the execute bit; the meter and factory-api installers require -x.
+  for (const recipe of recipes) {
+    const artifact = recipe.artifact?.(dir);
+    if (artifact && statSync(artifact).isFile()) chmodSync(artifact, statSync(artifact).mode | 0o100);
   }
   if (effects.run('git', ['-C', ROOT, 'status', '--porcelain']).stdout.trim()) throw new Error(`${ROOT} is dirty; not deploying ${tag}`);
   effects.run('git', ['-C', ROOT, 'checkout', '--quiet', '--detach', sha]);
@@ -258,30 +292,47 @@ function restoreMain(effects: Effects): void {
   effects.run('git', ['-C', ROOT, 'checkout', '--quiet', 'main']);
 }
 
-async function deployRelease(effects: Effects, tag: string, previousTag: string): Promise<void> {
-  const { sha, dir } = prepareRelease(effects, tag);
+/** Install the release's changed components; the receipt is saved in the ledger before any delivery. */
+async function installRelease(effects: Effects, tag: string, sha: string, dir: string): Promise<Receipt> {
   const inventory = JSON.parse(effects.run('git', ['-C', ROOT, 'show', `${sha}:deploy/components.json`]).stdout) as { components: { id: string; sources: string[] }[] };
   const sources = Object.fromEntries(inventory.components.map(component => [component.id, component.sources]));
   const ledger = effects.readLedger();
-  const baselines = Object.fromEntries(recipes.map(recipe => [recipe.name, newest(effects, [ledger.components[recipe.name]?.sha, healthSha(effects, recipe)])]));
+  // Only a healthy record is a baseline: a failed target was rolled back, so its inputs are still undeployed.
+  const recorded = (name: string) => ledger.components[name]?.health === 'pass' ? ledger.components[name].sha : undefined;
+  const baselines = Object.fromEntries(recipes.map(recipe => [recipe.name, newest(effects, [recorded(recipe.name), healthSha(effects, recipe)])]));
   const changed = plan({ sha, sources, baselines, ledger, changedSince: baseline => effects.run('git', ['-C', ROOT, 'diff', '--name-only', `${baseline}..${sha}`]).stdout.split('\n').filter(Boolean) });
   effects.log('plan', { tag, sha, components: changed.map(recipe => recipe.name) });
-  let receipt: Receipt = { component: changed.length ? changed.map(recipe => recipe.name).join('+') : 'none', sha, health: 'pass', rollback: 'none' };
   for (const recipe of changed) {
     const result = await deployComponent(effects, recipe, tag, sha, dir);
-    if (result.health === 'fail') { receipt = result; break; }
+    if (result.health === 'fail') return result;
   }
+  // A run killed after a component finished counts it from the ledger.
+  const installed = recipes.filter(recipe => changed.includes(recipe) || (ledger.components[recipe.name]?.sha === sha && ledger.components[recipe.name].health === 'pass'));
+  const receipt: Receipt = { component: installed.length ? installed.map(recipe => recipe.name).join('+') : 'none', sha, health: 'pass', rollback: 'none' };
+  effects.writeLedger({ ...effects.readLedger(), receipt: { tag, receipt, delivered: [] } });
+  return receipt;
+}
+
+async function deployRelease(effects: Effects, tag: string, previousTag: string): Promise<void> {
+  const { sha, dir } = prepareRelease(effects, tag);
+  const saved = effects.readLedger().receipt;
+  const receipt = saved?.tag === tag ? saved.receipt : await installRelease(effects, tag, sha, dir);
+  if (saved?.tag === tag) effects.log('receipt-resume', { tag, delivered: saved.delivered });
   const subjects = effects.run('git', ['-C', ROOT, 'log', '--first-parent', '--format=%s', `${previousTag}..${sha}`]).stdout.split('\n').filter(Boolean);
   const issues = issuesFromSubjects(subjects, pr => {
     try { return (JSON.parse(effects.run('gh', ['pr', 'view', String(pr), '--json', 'body'], { cwd: ROOT }).stdout) as { body?: string }).body ?? ''; } catch { return ''; }
   });
   const line = receiptLine(receipt);
   for (const identifier of issues) {
-    if (!(await effects.linear.deploying(identifier))) { effects.log('receipt-skipped', { issue: identifier, reason: 'not Deploying' }); continue; }
-    await effects.linear.comment(identifier, line);
-    effects.log('receipt', { issue: identifier, line });
+    const pending = effects.readLedger().receipt!;
+    if (pending.delivered.includes(identifier)) continue;
+    if (await effects.linear.deploying(identifier)) {
+      await effects.linear.comment(identifier, line);
+      effects.log('receipt', { issue: identifier, line });
+    } else effects.log('receipt-skipped', { issue: identifier, reason: 'not Deploying' });
+    effects.writeLedger({ ...effects.readLedger(), receipt: { ...pending, delivered: [...pending.delivered, identifier] } });
   }
-  effects.writeLedger({ ...effects.readLedger(), lastTag: tag });
+  effects.writeLedger({ ...effects.readLedger(), lastTag: tag, receipt: undefined });
   if (receipt.health === 'fail') throw new Error(`${tag}: ${line}`);
 }
 
@@ -331,6 +382,7 @@ export function liveEffects(): Effects {
   const issueQuery = 'query Issue($id: String!) { issue(id: $id) { id state { name } } }';
   type IssueData = { issue: { id: string; state: { name: string } } };
   return {
+    stateDir: STATE_DIR,
     log,
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     run,
