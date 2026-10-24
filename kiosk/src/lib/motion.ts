@@ -11,7 +11,7 @@ const snapshot = () => matchMedia(query).matches;
 /**
  * Infinite scene motion (sweep, aurora, stars) pauses while the page is hidden and
  * while a visible page has had no pointer, key or focus activity for this long.
- * A live pulse is a steady glow, not another infinite animation: one running
+ * A live pulse is a steady ring, not another infinite animation: one running
  * animation is enough to keep Chrome's GPU process compositing the frosted panels.
  */
 export const IDLE_HOLD_MS = 2_000;

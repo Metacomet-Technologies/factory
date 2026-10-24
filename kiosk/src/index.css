@@ -97,7 +97,6 @@
   --dur-tween: 600ms;
   --dur-draw: 900ms;
   --dur-event: 1200ms;
-  --dur-ping: 1800ms;
   --dur-sweep: 60s;
   --dur-aurora: 48s;
   --dur-twinkle: 6s;
@@ -677,8 +676,14 @@
   background: currentColor;
   box-shadow: 0 0 8px currentColor;
 }
-.chip-dot-pulse {
-  box-shadow: 0 0 8px currentColor;
+/* A steady ring, not an infinite animation: one running animation keeps the GPU
+   process compositing the frosted panels. */
+.chip-dot-pulse::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
 }
 /* Event pulse: pulse() in lib/motion.ts appends the ripple to the Live chip and flashes
    every .fk-hero value once per data refresh. */
@@ -1470,17 +1475,6 @@
     transform: none;
   }
 }
-@keyframes ping {
-  0% {
-    transform: scale(0.6);
-    opacity: 0.9;
-  }
-  80%,
-  100% {
-    transform: scale(2);
-    opacity: 0;
-  }
-}
 @keyframes fade-in {
   from {
     opacity: 0;
@@ -1661,9 +1655,11 @@
   animation: sweep var(--dur-sweep) linear infinite;
   will-change: transform;
 }
+/* Pause, don't cancel: animation: none drops the sweep back to its start and the
+   GPU process keeps compositing a cancelled-then-restarted layer. */
 .fk-still,
 .fk-still * {
-  animation: none !important;
+  animation-play-state: paused !important;
 }
 /* ?ambient=static (diagnostic): no live blur anywhere. Panels show the pre-blurred sky image
    (--fk-static-sky, viewport-sized) as a fixed background under the same glass tint. */

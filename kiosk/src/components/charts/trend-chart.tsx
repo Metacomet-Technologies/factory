@@ -16,7 +16,7 @@ import { ChartContainer, ChartTooltip, ChartTooltipContent } from "../ui/chart";
 /**
  * TrendChart: one accent series over time with an animated first draw and a hover tooltip.
  * The `comet` variant (default) fades the stroke in from the left and ends in a lit "now"
- * head with a halo and a ping ring; `area` keeps the soft gradient fill for multi-hour
+ * head with a halo and a steady ring; `area` keeps the soft gradient fill for multi-hour
  * views. Import it only from lazily loaded chart modules so Recharts stays out of the main
  * bundle.
  */

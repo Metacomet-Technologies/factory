@@ -8,8 +8,8 @@ export type Tone = "ok" | "warn" | "fail" | "neutral" | "accent";
  * StatusChip: tinted pill for state words (Online, Failing, Stale, 2 / 3 online).
  * Tone colors are the semantic tokens; the tint keeps AA text contrast in both themes.
  * `fail` is the one solid chip (the brand never fills) and carries an alert icon unless
- * `icon={false}`. `dot` adds a leading status dot; `pulse` gives that dot the live glow.
- * The glow is steady: an infinite ring keeps the GPU process compositing the glass.
+ * `icon={false}`. `dot` adds a leading status dot; `pulse` draws a steady ring
+ * around it for live and alarm states. The ring does not animate.
  */
 export function StatusChip({
   tone = "neutral",
