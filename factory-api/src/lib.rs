@@ -63,6 +63,8 @@ pub struct AppState {
     usage_refresh_lock: Arc<std::sync::Mutex<()>>,
     meter_sync_lock: Arc<tokio::sync::Mutex<()>>,
     pub config: Arc<fleet::Config>,
+    /// MET-260 per-service interval cache and in-flight probe sharing.
+    pub fleet_cache: fleet::CheckCache,
     pub client: reqwest::Client,
     pub pricing_sources: [String; 2],
     pub disable_pricing_collector: bool,
@@ -135,6 +137,7 @@ impl AppState {
             usage_refresh_lock: Default::default(),
             meter_sync_lock: Default::default(),
             config: Arc::new(config),
+            fleet_cache: fleet::CheckCache::default(),
             client,
             pricing_sources: [pricing::OPENROUTER_URL.into(), pricing::LITELLM_URL.into()],
             disable_pricing_collector: false,

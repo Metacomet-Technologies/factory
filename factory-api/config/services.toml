@@ -9,12 +9,12 @@ services = [
   { name = "factory-api", kind = "http", target = "http://127.0.0.1:8080/v1/health" },
   { name = "kiosk-static", kind = "http", target = "http://127.0.0.1:8080/version.json" },
   { name = "backup-timer", kind = "systemd", target = "factory-backup.timer" },
-  { name = "rdp-tcp", kind = "tcp", target = "factory-gpu:3389" },
+  { name = "rdp", kind = "rdp", target = "factory-gpu:3389", interval_s = 300 },
 ]
 [[nodes]]
 name = "factory-console"
 services = [
-  { name = "rdp-tcp", kind = "tcp", target = "factory-console:3389" },
+  { name = "rdp", kind = "rdp", target = "factory-console:3389", interval_s = 300 },
   # Reachability only: no remote systemd/Chrome/replica freshness claim.
   { name = "backup-replica-ssh", kind = "tcp", target = "factory-console:22" },
 ]

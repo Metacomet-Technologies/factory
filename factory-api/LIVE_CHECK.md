@@ -40,9 +40,10 @@ Health returned HTTP 200:
 Fleet returned HTTP 200 with both configured nodes online:
 
 - factory-gpu, `100.64.236.114`, Linux: meter-http, ollama-http, ssh-tcp and
-  rdp-tcp all healthy.
-- factory-console, `100.97.7.82`, Linux: rdp-tcp, amp-runner and factory-api
-  healthy. ssh-tcp failed with `Connection refused (os error 111)`.
+  rdp (X.224 negotiation canary) all healthy.
+- factory-console, `100.97.7.82`, Linux: rdp (X.224 negotiation canary),
+  amp-runner and factory-api healthy. ssh-tcp failed with
+  `Connection refused (os error 111)`.
 - Both `last_seen_ms` values were null. Every service included kind, target,
   latency, detail and checked-at timestamp. The self-check used port 18080.
 

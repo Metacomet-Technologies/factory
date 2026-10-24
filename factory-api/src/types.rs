@@ -68,6 +68,8 @@ pub struct ApiError {
 pub enum ServiceKind {
     Http,
     Tcp,
+    /// X.224 negotiation canary for an `host:port` RDP server (MET-260).
+    Rdp,
     Systemd,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
