@@ -4,7 +4,7 @@
 // @amp-agent-mode {"key":"odd-verifier","label":"ODD Verifier"}
 // @amp-agent-mode {"key":"odd-control","label":"ODD Control"}
 
-import type { Agent, PluginAPI, ThreadID, WebhookEvent, WebhookHandlerContext } from '@ampcode/plugin'
+import type { Agent, PluginAPI, PluginEventContext, ThreadID, WebhookEvent, WebhookHandlerContext } from '@ampcode/plugin'
 import {
 	capacity,
 	contracts,
@@ -69,7 +69,9 @@ export default async function (amp: PluginAPI) {
 	// --- Ralph guard: one rule for every role thread (docs/odd/README.md §5.3) -----------------
 	const chained = new Map<ThreadID, number>()
 	amp.on('agent.end', async (event, ctx) => {
-		const { role, issue } = parseThreadLabels(await ctx.thread.labels())
+		const labels = await ctx.thread.labels()
+		await arm(ctx, labels)
+		const { role, issue } = parseThreadLabels(labels)
 		if (!role || !issue || event.status !== 'done') return
 		const count = event.message.includes(marker) ? (chained.get(event.thread.id) ?? 0) : 0
 		const { stopMet, missing } = await externalStop(ctx, role, issue)
@@ -84,9 +86,18 @@ export default async function (amp: PluginAPI) {
 	})
 
 	// --- Control plane: armed only in the labelled control thread inside an orb ---------------
-	amp.on('session.start', async (_event, ctx) => {
-		const labels = await ctx.thread.labels()
-		if (!labels.includes(controlLabel)) return
+	// The label is usually set after the thread's first session.start, so every turn boundary
+	// re-checks it; `armed` keeps the webhooks and the one-time URL dialog from repeating.
+	const armed = new Set<ThreadID>()
+	amp.on('session.start', async (_event, ctx) => arm(ctx, await ctx.thread.labels()))
+	amp.on('agent.start', async (_event, ctx) => {
+		await arm(ctx, await ctx.thread.labels())
+		return {}
+	})
+
+	async function arm(ctx: PluginEventContext<'agent.end'>, labels: readonly string[]) {
+		if (!labels.includes(controlLabel) || armed.has(ctx.thread.id)) return
+		armed.add(ctx.thread.id)
 		if (ctx.system.executor.kind !== 'remote') {
 			await ctx.ui.notify(`${marker} control plane needs an Amp-managed orb; webhooks are unavailable here.`)
 			return
@@ -112,9 +123,12 @@ export default async function (amp: PluginAPI) {
 			return `${key}: ${url}`
 		}))
 		// The URLs are credentials. They are shown once, in the control thread, for Devon to paste
-		// into Linear, GitHub and Slack. Never log or post them anywhere else.
-		await ctx.ui.confirm({ title: 'ODD webhook endpoints', message: urls.join('\n'), confirmButtonText: 'Configured', requireHuman: true })
-	})
+		// into Linear, GitHub and Slack. Never log or post them anywhere else. Not awaited: the
+		// dialog waits for a human and must not hold the turn boundary that armed it.
+		void ctx.ui
+			.confirm({ title: 'ODD webhook endpoints', message: urls.join('\n'), confirmButtonText: 'Configured', requireHuman: true })
+			.catch((error: unknown) => ctx.logger.log(marker, 'webhook dialog failed', String(error)))
+	}
 
 	// Phases 3-6 fill in `perform` stage by stage; today only spawn, steer and page are wired.
 	async function perform(ctx: WebhookHandlerContext, issue: IssueSnapshot, action: Action) {
