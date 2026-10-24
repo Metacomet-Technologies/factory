@@ -89,7 +89,15 @@ export default async function (amp: PluginAPI) {
 	// The label is usually set after the thread's first session.start, so every turn boundary
 	// re-checks it; `armed` keeps the webhooks and the one-time URL dialog from repeating.
 	// `urls` are credentials: kept in memory, shown only through the confirm dialog, never returned.
-	type HandledEvent = { at: string; source: string; issue: string; status: string; action: Action; performed: boolean }
+	type HandledEvent = {
+		at: string
+		source: string
+		issue: string | null
+		stage: 'received' | 'ignored' | 'dry-run' | 'performed' | 'failed'
+		status?: string
+		action?: Action
+		error?: string
+	}
 	type ArmState = { armed: boolean; error?: string; webhooks: string[]; urls: string[]; events: HandledEvent[] }
 	const armState = new Map<ThreadID, ArmState>()
 	amp.on('session.start', async (_event, ctx) => arm(ctx, await ctx.thread.labels()))
@@ -143,19 +151,34 @@ export default async function (amp: PluginAPI) {
 		const handle = (source: 'linear' | 'github' | 'slack') => async (event: WebhookEvent, hctx: WebhookHandlerContext) => {
 			if (seen.has(event.id)) return
 			seen.add(event.id)
-			const identifier = issueFromEvent(source, new TextDecoder().decode(event.body))
-			if (!identifier) return
-			const issue = await snapshotFor(hctx, identifier)
-			const action = nextAction(issue, await currentLoad(hctx))
-			hctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
-			const performed = (await hctx.thread.labels()).includes(performLabel)
-			state.events.push({ at: event.receivedAt, source, issue: issue.identifier, status: issue.status, action, performed })
+			const record: HandledEvent = { at: event.receivedAt, source, issue: null, stage: 'received' }
+			state.events.push(record)
 			state.events.splice(0, Math.max(0, state.events.length - 20))
-			if (!performed) {
-				hctx.logger.log(marker, 'dry run; add label', performLabel, 'to act')
-				return
+			try {
+				const identifier = issueFromEvent(source, new TextDecoder().decode(event.body))
+				if (!identifier) {
+					record.stage = 'ignored'
+					return
+				}
+				record.issue = identifier
+				const issue = await snapshotFor(hctx, identifier)
+				const action = nextAction(issue, await currentLoad(hctx))
+				hctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
+				record.status = issue.status
+				record.action = action
+				if (!(await hctx.thread.labels()).includes(performLabel)) {
+					hctx.logger.log(marker, 'dry run; add label', performLabel, 'to act')
+					record.stage = 'dry-run'
+					return
+				}
+				await perform(hctx, issue, action)
+				record.stage = 'performed'
+			} catch (error: unknown) {
+				record.stage = 'failed'
+				record.error = String(error)
+				hctx.logger.log(marker, source, 'handler failed', record.error)
+				throw error
 			}
-			await perform(hctx, issue, action)
 		}
 		for (const key of ['linear', 'github', 'slack'] as const) {
 			const { url } = await amp.createWebhook({ key, headers: ['x-hub-signature-256', 'linear-signature', 'x-slack-signature'], handler: handle(key) })
