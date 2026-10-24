@@ -212,7 +212,7 @@ async fn dispatch(State(mut state): State<AppState>, request: Request<Body>) -> 
         return response;
     }
     match path {
-        "/v1/health" => health(&state).into_response(),
+        "/v1/health" => health(&state).await.into_response(),
         "/v1/fleet" => fleet(&state).await.into_response(),
         "/v1/agents" => agents(&state).await.into_response(),
         "/v1/agents/refresh" => refresh_agents(&state, request).await,
@@ -305,7 +305,17 @@ fn openapi_sha256() -> &'static str {
     })
 }
 #[utoipa::path(get, path="/v1/health", responses((status=200, body=Health)))]
-fn health(state: &AppState) -> Json<Health> {
+async fn health(state: &AppState) -> Json<Health> {
+    #[derive(serde::Deserialize)]
+    struct MeterHealth {
+        openapi_sha256: Option<String>,
+    }
+    // Stay inside the four-second route deadline, including a stalled response body.
+    let meter = tokio::time::timeout(
+        Duration::from_secs(1),
+        state.get::<MeterHealth>("/meter/health"),
+    )
+    .await;
     let build = shared::build_info(env!("FACTORY_INPUTS_FINGERPRINT"));
     Json(Health {
         status: if state.require_clock().is_ok() {
@@ -320,6 +330,11 @@ fn health(state: &AppState) -> Json<Health> {
         built_at_ms: build.built_at_ms,
         inputs_fingerprint: build.inputs_fingerprint,
         openapi_sha256: openapi_sha256().into(),
+        meter_openapi_expected: env!("FACTORY_METER_OPENAPI_SHA256").into(),
+        meter_openapi_sha256: meter
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|m| m.openapi_sha256),
         uptime_ms: state.started.elapsed().as_millis() as u64,
         retention: state.retention(),
     })

@@ -922,6 +922,18 @@ async fn endpoint_budgets_plans_settings_and_openapi() {
                         std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap() + "\n")
                             .unwrap();
                     }
+                    use sha2::Digest;
+                    let digest = sha2::Sha256::digest(std::fs::read(&path).unwrap());
+                    let hash: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+                    let health: Value = reqwest::get(format!("{url}/meter/health"))
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    assert_eq!(health["openapi_sha256"], hash);
                     let golden: Value =
                         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
                     assert_eq!(value, golden);

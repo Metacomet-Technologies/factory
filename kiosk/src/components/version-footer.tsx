@@ -16,9 +16,20 @@ export function VersionFooter({
     { name: "meter", build: meter },
   ];
   // Only a contract difference is a mismatch; SHAs, versions and input fingerprints are provenance.
-  // factory-api has no meter contract check yet, so only the kiosk↔API pair is compared.
   const served = api?.openapi_sha256;
-  const mismatch = Boolean(served && served !== kiosk.expected_openapi_sha256);
+  const apiMismatch = Boolean(served && served !== kiosk.expected_openapi_sha256);
+  const meterExpected = api?.meter_openapi_expected;
+  const meterServed = api?.meter_openapi_sha256;
+  const meterMismatch = Boolean(meterExpected && meterServed && meterExpected !== meterServed);
+  const mismatch = apiMismatch || meterMismatch;
+  const mismatchTitle = [
+    apiMismatch &&
+      `API contract mismatch: kiosk built against OpenAPI ${kiosk.expected_openapi_sha256}, api serves ${served}`,
+    meterMismatch &&
+      `API↔meter contract mismatch: api built against OpenAPI ${meterExpected}, meter serves ${meterServed}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const dirty = components.some(({ build }) => build?.git_dirty);
   const unknown = components.some(
     ({ build }) =>
@@ -52,15 +63,7 @@ export function VersionFooter({
         ))}
       </div>
       {warning && (
-        <p
-          role="status"
-          className="status-warn"
-          title={
-            mismatch
-              ? `API contract mismatch: kiosk built against OpenAPI ${kiosk.expected_openapi_sha256}, api serves ${served}`
-              : undefined
-          }
-        >
+        <p role="status" className="status-warn" title={mismatchTitle || undefined}>
           {warning}
         </p>
       )}
