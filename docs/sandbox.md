@@ -204,9 +204,54 @@ the received mutation/tracking lines and all audit rows. Evidence is also saved
 at `.sandbox/ups-check.json`. No screenshots, real credentials, physical outlet
 changes, production Serve or live NUT calls occur.
 
-The API's usage snapshot and refresh trigger also point inside `.sandbox`.
-Without a synthetic `.sandbox/usage.json`, Frontier CLIs show unknown usage;
-the sandbox never displays the host's account quota snapshot.
+The API's usage snapshot and refresh trigger also point inside `.sandbox`
+(`.sandbox/usage.json` and `.sandbox/usage-trigger`), so no `FACTORY_API_USAGE_*`
+environment overrides are needed. Without a synthetic `.sandbox/usage.json`,
+Frontier CLIs show unknown usage; the sandbox never displays the host's account
+quota snapshot.
+
+Two commands put a synthetic snapshot in place and simulate collector runs:
+
+```sh
+scripts/sandbox usage seed <file>       # copy a synthetic snapshot into .sandbox/usage.json
+scripts/sandbox usage refresh           # rewrite observed_at_ms/generated_at_ms to now
+scripts/sandbox usage refresh --delay 5 # same rewrite, after a delay, in the background
+```
+
+`seed` validates the basic snapshot shape (schema_version 1, generated_at_ms and
+six tools) and replaces `.sandbox/usage.json` in place; the file must follow the
+snapshot contract in `factory-api/src/usage.rs`, and unreadable snapshots show
+`usage snapshot invalid` in the API. `refresh` rewrites `generated_at_ms` and
+every tool's `observed_at_ms` to the current time and requires a previously
+seeded snapshot. With `--delay <s>`, the rewrite is scheduled in the background:
+a `POST /v1/agents/refresh` issued meanwhile answers 202 `accepted`, and the
+collector watcher emits `agents.usage` on `/v1/stream` when the rewritten file
+appears. Without a delay, `refresh` lands immediately, so an API refresh inside
+its 3-minute cooldown answers 429 `cooldown` until the cooldown passes.
+
+Example kiosk refresh sequence (build with `--kiosk` and watch the agents panel):
+
+```sh
+scripts/sandbox up --rows 1k --kiosk
+cat > /tmp/usage-seed.json <<'EOF'
+{"schema_version":1,"generated_at_ms":1791676800000,"tools":[
+ {"tool":"amp","status":"ok","note":null,"reason":null,"observed_at_ms":1791676800000,"source":"amp-cli","cli_version":"0.0.1791763306-ged595a","plan":"Gigawatt","windows":[{"name":"agent","used_percent":14.0,"resets_at_ms":1794268800000,"window_minutes":null}],"balance":{"amount":"171.27","remaining":"171.27","total":"200","unit":"usd"},"balances":[{"amount":"171.27","remaining":"171.27","total":"200","unit":"usd"}],"breakdown":[],"reset_credits_available":null},
+ {"tool":"cursor","status":"unknown","note":null,"reason":"CLI failed","observed_at_ms":null,"source":"cursor-about","cli_version":null,"plan":null,"windows":[],"balance":null,"balances":[],"breakdown":[],"reset_credits_available":null},
+ {"tool":"claude-code","status":"unknown","note":null,"reason":"CLI failed","observed_at_ms":null,"source":"claude-usage","cli_version":null,"plan":null,"windows":[],"balance":null,"balances":[],"breakdown":[],"reset_credits_available":null},
+ {"tool":"codex","status":"unknown","note":null,"reason":"CLI failed","observed_at_ms":null,"source":"codex-app-server","cli_version":null,"plan":null,"windows":[],"balance":null,"balances":[],"breakdown":[],"reset_credits_available":null},
+ {"tool":"kimi","status":"unknown","note":null,"reason":"CLI failed","observed_at_ms":null,"source":"kimi-oauth-usage","cli_version":null,"plan":null,"windows":[],"balance":null,"balances":[],"breakdown":[],"reset_credits_available":null},
+ {"tool":"opencode","status":"unknown","note":null,"reason":"CLI failed","observed_at_ms":null,"source":"opencode-stats","cli_version":null,"plan":null,"windows":[],"balance":null,"balances":[],"breakdown":[],"reset_credits_available":null}]}
+EOF
+scripts/sandbox usage seed /tmp/usage-seed.json
+scripts/sandbox usage refresh --delay 5
+# The rewrite lands five seconds later; POST /v1/agents/refresh answers
+# 202 accepted, then the collector watcher emits agents.usage on /v1/stream.
+scripts/sandbox usage refresh
+scripts/sandbox down
+```
+
+`GET /v1/agents` then shows the refreshed `observed_at_ms`; the kiosk agents
+panel follows the same data on its next sync tick.
 
 ## Network fakes (MET-197)
 

@@ -61,8 +61,27 @@ case "$command" in
     status|down)
         (($# == 0)) || { echo 'Unexpected arguments' >&2; exit 1; }
         python3 "$helper" "$command" "$root" ;;
+    usage)
+        case "$1" in
+            seed)
+                [[ $# == 2 ]] || { echo 'Usage: scripts/sandbox usage seed <file>' >&2; exit 1; }
+                python3 "$helper" usage "$root" seed "$2" ;;
+            refresh)
+                shift
+                delay_args=()
+                while (($#)); do
+                    case "$1" in
+                        --delay) (($# >= 2)) || { echo 'Missing value for --delay' >&2; exit 1; }
+                            [[ "$2" =~ ^[0-9]{1,5}$ ]] || { echo 'Invalid delay seconds' >&2; exit 1; }
+                            delay_args=(--delay "$2"); shift 2 ;;
+                        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+                    esac
+                done
+                python3 "$helper" usage "$root" refresh "${delay_args[@]}" ;;
+            *) echo 'Usage: scripts/sandbox usage seed <file>|refresh [--delay <s>]' >&2; exit 1 ;;
+        esac ;;
     logs)
         [[ $# == 1 && "$1" =~ ^(fake-ollama|fake-upsd|fake-net|fake-serve|ups-control|meter|factory-api|seed|traffic|runtime)$ ]] || { echo 'Usage: scripts/sandbox logs <fake-ollama|fake-upsd|fake-net|fake-serve|ups-control|meter|factory-api|seed|traffic|runtime>' >&2; exit 1; }
         tail -n 100 "$state/$1.log" ;;
-    *) echo 'Usage: scripts/sandbox {up [--rows 100k] [--seed 42] [--kiosk]|status|reset [up options]|down|logs <svc>}' >&2; exit 1 ;;
+    *) echo 'Usage: scripts/sandbox {up [--rows 100k] [--seed 42] [--kiosk]|status|reset [up options]|down|logs <svc>|usage seed <file>|usage refresh [--delay <s>]}' >&2; exit 1 ;;
 esac
