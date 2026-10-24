@@ -159,6 +159,73 @@ async fn sigterm_drains_writes_and_closes_wal() {
 }
 
 #[tokio::test]
+async fn sigterm_with_busy_checkpoint_warns_and_exits_successfully() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("meter.db");
+        meter::migrate::migrate(None, Some(&path), false).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_meter"))
+            .env("PATH", directory.path())
+            .args(["--listen", &address.to_string(), "--db-path"])
+            .arg(&path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        loop {
+            assert!(child.try_wait().unwrap().is_none());
+            if client
+                .get(format!("http://{address}/meter/requests"))
+                .send()
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        // Create WAL frames and pin a read snapshot until after meter exits.
+        reader
+            .execute_batch(
+                "CREATE TABLE checkpoint_probe (id INTEGER);
+                 BEGIN; SELECT COUNT(*) FROM checkpoint_probe;",
+            )
+            .unwrap();
+        assert!(
+            tokio::process::Command::new("kill")
+                .args(["-TERM", &child.id().unwrap().to_string()])
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        let output = child.wait_with_output().await.unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains("WARN"), "{stderr}");
+        assert!(stderr.contains("shutdown checkpoint"), "{stderr}");
+        assert!(stderr.contains("busy=1"), "{stderr}");
+        assert!(stderr.contains("frames="), "{stderr}");
+        assert!(stderr.contains("checkpointed="), "{stderr}");
+        assert!(
+            std::fs::metadata(path.with_extension("db-wal"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        reader.execute_batch("ROLLBACK").unwrap();
+    })
+    .await
+    .expect("busy checkpoint SIGTERM test timed out");
+}
+
+#[tokio::test]
 async fn slow_ndjson_is_incremental_and_written_once() {
     tokio::time::timeout(Duration::from_secs(30), async {
     let upstream = Router::new().route("/api/generate", post(|| async {

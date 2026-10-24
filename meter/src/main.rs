@@ -116,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
     db.close().await?;
     // Pool closes can finish with a read-only connection, which cannot perform
     // SQLite's last-connection checkpoint. All admitted writes are drained now.
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    if let Err(error) = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let db = rusqlite::Connection::open_with_flags(
             shutdown_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -128,10 +128,20 @@ async fn main() -> anyhow::Result<()> {
             })?;
         anyhow::ensure!(
             busy == 0 && frames == checkpointed,
-            "shutdown checkpoint incomplete: {busy}|{frames}|{checkpointed}"
+            "shutdown checkpoint incomplete: busy={busy} frames={frames} checkpointed={checkpointed}"
         );
         Ok(())
     })
-    .await??;
+    .await
+    .unwrap_or_else(|error| Err(error.into()))
+    {
+        // Route this shutdown warning to stderr without changing normal logging.
+        tracing::subscriber::with_default(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .finish(),
+            || tracing::warn!(%error, "shutdown checkpoint failed; continuing shutdown"),
+        );
+    }
     Ok(())
 }
