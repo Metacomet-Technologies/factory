@@ -1,4 +1,14 @@
-import { lazy, Suspense, useEffect, useState, type ReactNode } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import { AlertTriangle, ArrowUpRight, Radio, RefreshCw } from "lucide-react";
 import type { Resource } from "../api/client";
 import { useAgentsRefresh } from "../api/agents-refresh";
@@ -83,6 +93,79 @@ export function Warnings({ warnings, reserve = false }: { warnings: string[]; re
   ) : null;
   return reserve ? <div className="warning-slot">{list}</div> : list;
 }
+/**
+ * A service's failure detail in a box of fixed height (two lines on its own row, one line
+ * inline on desktop), so an error appearing, clearing or wrapping never resizes the tile.
+ * A longer error scrolls inside the box: it is a focusable, labelled group, so keyboard
+ * (Tab, then arrow keys), wheel and touch reach the whole text, and it fades while more text
+ * is below. Keys and the wheel move one line at a time: the browser's 40 px key step and
+ * ~100 px wheel notch would skip lines in a one-line box.
+ */
+function ServiceDetail({ service, detail }: { service: string; detail: string | null }) {
+  const ref = useRef<HTMLParagraphElement>(null);
+  const [more, setMore] = useState(false);
+  const measure = useCallback(() => {
+    const box = ref.current;
+    setMore(!!box && box.scrollTop + box.clientHeight < box.scrollHeight - 1);
+  }, []);
+  useLayoutEffect(measure, [detail, measure]);
+  useEffect(() => {
+    const box = ref.current;
+    if (!box || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(box);
+    return () => observer.disconnect();
+  }, [measure]);
+  const hasDetail = detail !== null;
+  useEffect(() => {
+    const box = ref.current;
+    if (!box || !hasDetail) return;
+    let pending = 0;
+    // Non-passive, so a wheel over the box scrolls it line by line instead of the page.
+    const wheel = (event: WheelEvent) => {
+      if (box.scrollHeight <= box.clientHeight) return;
+      const line = parseFloat(getComputedStyle(box).lineHeight);
+      pending += event.deltaMode === 0 ? event.deltaY : event.deltaY * line;
+      const lines = Math.trunc(pending / line);
+      const end = box.scrollHeight - box.clientHeight;
+      if ((pending < 0 && box.scrollTop <= 0) || (pending > 0 && box.scrollTop >= end - 1)) {
+        pending = 0;
+        return; // at the edge: let the page scroll
+      }
+      event.preventDefault();
+      if (lines === 0) return;
+      pending -= lines * line;
+      box.scrollTop = Math.min(end, Math.max(0, box.scrollTop + lines * line));
+    };
+    box.addEventListener("wheel", wheel, { passive: false });
+    return () => box.removeEventListener("wheel", wheel);
+  }, [hasDetail]);
+  const onKeyDown = (event: KeyboardEvent<HTMLParagraphElement>) => {
+    const box = event.currentTarget;
+    const line = parseFloat(getComputedStyle(box).lineHeight);
+    const lines = { ArrowDown: 1, ArrowUp: -1, PageDown: 1, PageUp: -1 }[event.key];
+    if (lines === undefined) return;
+    event.preventDefault();
+    const page = Math.max(1, Math.floor(box.clientHeight / line));
+    box.scrollTop += lines * line * (event.key.startsWith("Page") ? page : 1);
+  };
+  return detail === null ? (
+    <p className="muted service-detail" aria-hidden="true" />
+  ) : (
+    <p
+      ref={ref}
+      className="muted service-detail"
+      role="group"
+      aria-label={`${service} failure detail`}
+      tabIndex={0}
+      data-more={more || undefined}
+      onScroll={measure}
+      onKeyDown={onKeyDown}
+    >
+      {detail}
+    </p>
+  );
+}
 const healthTone = (health: DeviceList["devices"][number]["health"]) =>
   health === "critical"
     ? "fail"
@@ -133,9 +216,15 @@ export function FleetSection({
             <>
               <div className="row">
                 <h3>
-                  {node.name}
-                  {device && (
-                    <ArrowUpRight aria-hidden="true" size={14} className="tile-link-hint" />
+                  {/* The name is the link; its stretched hit area keeps the whole tile
+                      clickable without nesting the focusable service details inside it. */}
+                  {device ? (
+                    <a href={device.href} className="tile-link">
+                      {node.name}
+                      <ArrowUpRight aria-hidden="true" size={14} className="tile-link-hint" />
+                    </a>
+                  ) : (
+                    node.name
                   )}
                 </h3>
                 <span className="row chips">
@@ -169,22 +258,17 @@ export function FleetSection({
                           {service.ok ? "OK" : "Failing"} · {ms(service.latency_ms)}
                         </StatusText>
                       </div>
-                      {/* Every service keeps its detail line, so a failure or recovery never
-                          resizes the tile and moves the cards below it. */}
-                      <p className="muted service-detail" aria-hidden={service.ok || undefined}>
-                        {service.ok ? null : (service.detail ?? "—")}
-                      </p>
+                      <ServiceDetail
+                        service={service.name}
+                        detail={service.ok ? null : (service.detail ?? "—")}
+                      />
                     </li>
                   ))}
                 </ul>
               )}
             </>
           );
-          return device ? (
-            <a key={node.name} href={device.href} className="tile-link">
-              <Tile tone={tone}>{body}</Tile>
-            </a>
-          ) : (
+          return (
             <Tile key={node.name} tone={tone}>
               {body}
             </Tile>
@@ -195,20 +279,20 @@ export function FleetSection({
           devices
             .filter((device) => !data.nodes.some((node) => node.name === device.device_id))
             .map((device) => (
-              <a key={device.device_id} href={device.href} className="tile-link">
-                <Tile>
-                  <div className="row">
-                    <h3>
+              <Tile key={device.device_id}>
+                <div className="row">
+                  <h3>
+                    <a href={device.href} className="tile-link">
                       {device.device_id}
                       <ArrowUpRight aria-hidden="true" size={14} className="tile-link-hint" />
-                    </h3>
-                    <StatusChip tone={healthTone(device.health)}>
-                      Host health{device.health === "unknown" ? "" : ` · ${device.health}`}
-                    </StatusChip>
-                  </div>
-                  <p className="muted node-meta">Device collector only · not a fleet node</p>
-                </Tile>
-              </a>
+                    </a>
+                  </h3>
+                  <StatusChip tone={healthTone(device.health)}>
+                    Host health{device.health === "unknown" ? "" : ` · ${device.health}`}
+                  </StatusChip>
+                </div>
+                <p className="muted node-meta">Device collector only · not a fleet node</p>
+              </Tile>
             ))}
       </div>
     </Panel>

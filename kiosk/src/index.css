@@ -565,30 +565,41 @@
   border-color: var(--accent-text);
   transform: translateY(-1px);
 }
-/* Fleet node tile that opens a device page. */
-.tile-link {
-  display: block;
-  color: inherit;
-  border-radius: var(--radius-md);
-}
-.tile-link:hover {
-  text-decoration: none;
-}
-.tile-link > .tile {
-  height: 100%;
+/* Fleet node tile that opens a device page: the name is the link, and its ::after covers the
+   tile so the whole tile stays clickable. Service details sit above it (see .service-detail),
+   so they scroll and take focus without being nested in the link. */
+.tile:has(.tile-link) {
+  position: relative;
   transition:
     border-color var(--dur-fast),
     transform var(--dur) var(--ease-out);
 }
-.tile-link:hover > .tile {
+.tile:has(.tile-link:hover) {
   border-color: var(--accent-text);
   transform: translateY(-1px);
 }
-.tile-link h3 {
+.tile-link {
   display: inline-flex;
   align-items: center;
   gap: 4px;
   white-space: nowrap;
+  color: inherit;
+}
+.tile-link:hover {
+  text-decoration: none;
+}
+.tile-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+.tile-link:focus-visible {
+  outline: none;
+}
+.tile:has(.tile-link:focus-visible) {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 2px;
 }
 .tile-link-hint {
   color: var(--accent-text);
@@ -970,9 +981,25 @@
   white-space: nowrap;
   min-width: 8em;
 }
-/* Reserved on every service, empty while it is OK (see FleetSection). */
+/* Every service keeps a detail box of fixed height, empty while it is OK (ServiceDetail): two
+   lines here, one inline line at >= 1280 px. Longer errors scroll inside it; it is focusable
+   and fades at the bottom while more text is below. */
 .service-detail {
-  min-height: 1lh;
+  position: relative;
+  z-index: 1;
+  height: 2lh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+  scrollbar-width: thin;
+}
+.service-detail[data-more] {
+  mask-image: linear-gradient(to bottom, black 55%, transparent);
+}
+.service-detail:focus-visible {
+  outline: 2px solid var(--accent-text);
+  outline-offset: 1px;
+  border-radius: var(--radius-sm);
 }
 
 /* ---- GPU / Usage --------------------------------------------------------- */
@@ -1908,12 +1935,13 @@
   .services {
     gap: 3px;
   }
-  /* The detail shares its service's row (name · detail · state), so reserving it costs no
-     height at 1728×1117; narrower layouts keep it on its own reserved line. */
+  /* The detail shares its service's row (name · detail · state) as a one-line box, so it
+     costs no height at 1728×1117; narrower layouts give it two lines of its own. Start, not
+     baseline, alignment: a scroll box's baseline moves with its content, and the row with it. */
   .services li {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr) auto;
-    align-items: baseline;
+    align-items: start;
     gap: 0 8px;
   }
   .services li .row {
@@ -1926,8 +1954,10 @@
   .service-detail {
     grid-column: 2;
     grid-row: 1;
-    min-height: 0;
-    text-align: right;
+    height: 1lh;
+  }
+  .service-detail[data-more] {
+    mask-image: linear-gradient(to right, black 75%, transparent);
   }
   .stat[data-size="lg"] .stat-value {
     font-size: 26px;

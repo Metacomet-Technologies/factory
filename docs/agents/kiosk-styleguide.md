@@ -140,7 +140,9 @@ nothing on the page moves or resizes.
   every width and scrolls. Status and warning content that comes and goes is
   always rendered in its reserved slot, never conditionally: the Verdict chip
   list (one row, two on phones; extra chips scroll inside it), each Fleet
-  service's detail line (inline on desktop), and `Warnings reserve` on overview
+  service's detail box (`ServiceDetail`: a fixed one line inline at ≥ 1280 px,
+  two lines below; a longer error scrolls line by line by key, wheel or touch
+  and fades while more is below), and `Warnings reserve` on overview
   cards (three lines that scroll, full text on the details page). Panel headers
   put the subtitle on its own full-width row, so a status chip changing width
   never rewraps it. Never hide or clip that text to make it fit. Keep changing

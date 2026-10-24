@@ -628,6 +628,44 @@ describe("dashboard contract", () => {
     expect(footer).toHaveTextContent("meter unknown");
     expect(footer).not.toHaveTextContent("Build mismatch");
   });
+  it("keeps whole service errors reachable by keyboard, outside the tile link, as they come and go", () => {
+    const long =
+      "Unit failed to start because the configured upstream endpoint was unavailable after repeated connection attempts; inspect the service journal for the original connection error.";
+    const fleet = (detail: string | null, gpuFailing: boolean) => {
+      const data = fixtures().fleet;
+      const backup = data.nodes[1]!.services[0]!;
+      Object.assign(backup, detail === null ? { ok: true, detail } : { ok: false, detail });
+      if (gpuFailing) Object.assign(data.nodes[0]!.services[0]!, { ok: false, detail: long });
+      return { data, error: null, loading: false };
+    };
+    const devices = [
+      { device_id: "factory-gpu", health: "healthy" as const, href: "/devices/factory-gpu" },
+    ];
+    const { rerender } = render(
+      <FleetSection resource={fleet(long, true)} devices={devices} icon={null} />,
+    );
+    const region = within(screen.getByRole("region", { name: "Fleet" }));
+    const backup = region.getByRole("group", { name: "backup failure detail" });
+    expect(backup).toHaveTextContent(long);
+    expect(backup).toHaveAttribute("tabindex", "0");
+    const meter = region.getByRole("group", { name: "meter-http failure detail" });
+    expect(meter).toHaveTextContent(long);
+    // The tile link is the node name: the focusable detail is not nested inside it.
+    const link = region.getByRole("link", { name: /factory-gpu/ });
+    expect(link).toHaveAttribute("href", "/devices/factory-gpu");
+    expect(link).not.toContainElement(meter);
+    const rows = region.getAllByRole("listitem").length;
+    rerender(<FleetSection resource={fleet(null, false)} devices={devices} icon={null} />);
+    expect(region.queryByRole("group", { name: /failure detail/ })).not.toBeInTheDocument();
+    expect(region.getAllByRole("listitem")).toHaveLength(rows);
+    rerender(
+      <FleetSection resource={fleet("Unit is inactive", false)} devices={devices} icon={null} />,
+    );
+    expect(region.getByRole("group", { name: "backup failure detail" })).toHaveTextContent(
+      "Unit is inactive",
+    );
+    expect(region.getAllByRole("listitem")).toHaveLength(rows);
+  });
   it("shows now only for online nodes without a last-seen timestamp", () => {
     const data = fixtures().fleet;
     data.nodes = [
