@@ -1,5 +1,6 @@
-import { render } from "@testing-library/react";
-import { describe, expect, it, vi } from "vite-plus/test";
+import { act, render } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { IDLE_HOLD_MS } from "@/lib/motion";
 import { parseAmbient } from "./mode";
 import { startAmbientPerf } from "./perf";
 import { AmbientScene } from "./scene";
@@ -55,6 +56,10 @@ describe("startAmbientPerf", () => {
 });
 
 describe("AmbientScene", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
   const motion = (reduce: boolean) =>
     vi.stubGlobal("matchMedia", (query: string) => ({
       matches: reduce && query.includes("reduced-motion"),
@@ -71,6 +76,38 @@ describe("AmbientScene", () => {
     motion(true);
     const still = render(<AmbientScene mode="both" dark />);
     expect(still.container.querySelector(".fk-backdrop")).toHaveClass("fk-still");
+  });
+
+  it("pauses the scene when the page is hidden and while it is idle", () => {
+    vi.useFakeTimers();
+    motion(false);
+    const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+    const scene = render(<AmbientScene mode="both" dark />);
+    const backdrop = scene.container.querySelector(".fk-backdrop");
+    expect(backdrop).not.toHaveClass("fk-still");
+
+    hidden.mockReturnValue(true);
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(backdrop).toHaveClass("fk-still");
+
+    hidden.mockReturnValue(false);
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(backdrop).not.toHaveClass("fk-still");
+
+    act(() => {
+      vi.advanceTimersByTime(IDLE_HOLD_MS);
+    });
+    expect(backdrop).toHaveClass("fk-still");
+
+    act(() => {
+      window.dispatchEvent(new Event("pointerdown"));
+    });
+    expect(backdrop).not.toHaveClass("fk-still");
+    scene.unmount();
   });
 
   it("draws no night layer or sweep where the mode omits them", () => {
