@@ -21,7 +21,7 @@ receipts, `capacity` and `nextAction` from `scripts/odd/lifecycle.ts`.
 ## Sweep (deterministic, every `sweepMs` = 10 min)
 
 The control plane evaluates every issue with a live role thread, every
-`Backlog`/`Triage` issue, and every `odd` issue in `Todo`, `In Progress` or
+`Triage` issue (never Backlog: Devon moves ideas to Triage on demand), and every `odd` issue in `Todo`, `In Progress` or
 `Deploying`, running `nextAction` for each; a webhook batch does not trigger
 a sweep.
 

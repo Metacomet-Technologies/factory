@@ -192,8 +192,11 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
   if (status === 'Done' || status === 'Canceled' || status === 'Duplicate') return { kind: 'wait', reason: status };
   if (issue.labels.includes(escalatedLabel)) return { kind: 'wait', reason: 'escalated to Devon' };
 
-  if (status === 'Backlog') return spawn('intake', load, 'no triage yet', issue);
+  // Backlog is triaged on demand: Devon moves an idea to Triage when it should enter the factory.
+  if (status === 'Backlog') return { kind: 'wait', reason: 'backlog: triage on demand' };
   if (status === 'Triage') {
+    const untriaged = issueTriaged(issue);
+    if (untriaged.length) return spawn('intake', load, untriaged.join('; '), issue);
     if (specComplete(issue.description)) return { kind: 'set-status', status: 'Todo', reason: 'spec complete' };
     if (issue.risk && issue.risk !== 'ordinary') return { kind: 'wait', reason: `risk ${issue.risk} needs a human decision` };
     return spawn('spec', load, 'spec incomplete', issue);

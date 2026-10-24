@@ -68,6 +68,26 @@ export const digestHeading = (day: string) => `ODD digest ${day}`;
 const short = (sha: string) => sha.slice(0, 12);
 const list = <T>(items: readonly T[], line: (item: T) => string) => (items.length ? items.map(item => `- ${line(item)}`).join('\n') : '- none');
 
+/** Slack rejects a message whose block text exceeds 3000 characters (`invalid_blocks`); a day with 46 merged PRs is longer. */
+export const slackMessageMax = 2800;
+
+/** Splits `text` on line breaks into messages of at most `max` characters; every part after the first starts with `(n/total)`. */
+export function slackMessages(text: string, max = slackMessageMax): string[] {
+  const parts: string[] = [];
+  let current = '';
+  for (const line of text.split('\n')) {
+    const next = current ? `${current}\n${line}` : line;
+    if (next.length <= max || !current) {
+      current = next;
+    } else {
+      parts.push(current);
+      current = line;
+    }
+  }
+  parts.push(current);
+  return parts.length === 1 ? parts : parts.map((part, i) => (i === 0 ? part : `(${i + 1}/${parts.length})\n${part}`));
+}
+
 /** The daily digest for `#factory-alerts`: counts, identifiers and SHAs only; never diffs or secrets. */
 export function digest(input: DigestInput): string {
   return [

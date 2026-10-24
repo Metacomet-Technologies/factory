@@ -108,7 +108,7 @@ defines Amp-native agents for the roles that need Amp coordination tools.
 
 | Role | Trigger | Produces | Authority | Engine | Loop budget | Escalates when |
 | --- | --- | --- | --- | --- | --- | --- |
-| Intake | Slack message in `#factory-intake`; Linear issue created without a spec. | A Linear issue in the template, or a comment on the existing issue, with `area:*`, type and a duplicate check. | Create and edit *its own* issue; link duplicates. | Amp low (plugin agent). | 1 turn + 2 continuations. | Never. Ambiguity becomes a question inside the spec. |
+| Intake | Slack message in `#factory-intake`; Linear issue in `Triage` without a type or area label (Backlog is never triaged). | A Linear issue in the template, or a comment on the existing issue, with `area:*`, type and a duplicate check. | Create and edit *its own* issue; link duplicates. | Amp low (plugin agent). | 1 turn + 2 continuations. | Never. Ambiguity becomes a question inside the spec. |
 | Spec | Issue reaches `Triage` with a type and area. | `## Isolation`, `## Build`, `## Done means`, `## Evidence`, size estimate, risk class. Status moves to `Todo`. | Edit its own issue; split into children; mark blocked-by. | Amp medium or Claude high for `security`/`data` areas. | 1 turn + 3 continuations. | Risk class is `irreversible` or `security` and no existing pattern covers it. |
 | Builder | Issue in `Todo` labelled `odd` with a free build slot. | A PR whose body carries the Evidence section filled with real output; the same thread and branch across review rounds. | Push to its own branch; open and update its PR; comment on its issue. | Amp medium (plugin agent); the engine table returns in a later phase (see §6). | 3 review rounds per PR. | Third `changes` verdict, or Isolation cannot be respected. |
 | Reviewer | PR head SHA with CI green and no verdict for that SHA. | Verdict `ready` or `changes` as a PR comment and the thread label `odd-verdict-<ready\|changes>-<sha12>`, findings bound to the SHA; reruns Evidence commands itself in its own orb. | Request changes; approve. Never pushes to the builder's branch. GitHub refuses a review on a PR the same account opened, so the verdict is a comment, not a review. | Amp high (plugin agent); opposite family returns with the engine table. | 1 per SHA; 2 rounds after a Watchdog cancellation. | Third `changes` verdict on one issue (page: third failed QA round); second spent round (page: budget ceiling). |
@@ -177,8 +177,8 @@ machine; it reads status, labels and GitHub and computes the next action.
 
 | Linear status | Meaning | Owner | Leaves when |
 | --- | --- | --- | --- |
-| Backlog | Idea exists, not yet specified. | Intake | Intake has type + area → `Triage`. |
-| Triage | Needs a spec. | Spec | Spec posts Isolation/Build/Done means/Evidence → `Todo`; or splits → children in `Triage`, parent stays. |
+| Backlog | Idea parked; never worked. | Devon | Devon moves it to `Triage` on demand. The control plane and the sweep ignore Backlog. |
+| Triage | Needs type + area, then a spec. | Intake, then Spec | Intake adds type + area (it lacks them → Intake, one round). Spec posts Isolation/Build/Done means/Evidence → `Todo`; or splits → children in `Triage`, parent stays. |
 | Todo | Ready to build. | Control plane | A slot is free and no blocker is open → `In Progress`. |
 | In Progress | A builder thread owns it. | Builder / Reviewer | PR merged → `In Review` is not used; merge receipt → `Deploying` (label `odd:deploying`). |
 | Deploying | Release exists, deploy or verify pending. | Deployer / Verifier | Verifier passes → `Done`; rollback → `Todo` with a `Bug` child and `odd:rolled-back`. |
@@ -205,9 +205,9 @@ keyed by `issue + stage + SHA`).
 | Reviewer thread ends (`agent.end` with `odd-role-reviewer`) | Plugin | Read verdict label. `ready` → Shipper; `changes` → steer builder, round+1 or page at 3. | Shipper |
 | Merge receipt (`odd-merge`) | Control plane | Status `Deploying`; wait `release not published` until a receipt newer than the merge receipt appears. | — |
 | Release published | `factory-deploy.timer` poll on factory-gpu (no webhook: the runner reads `gh release list`) | Verify, install changed components, probe, roll back on red, post one receipt per issue in `Deploying`. | Deployer (runner job) |
-| Deploy receipt comment | Linear webhook | `health=fail` with a rollback snapshot → `Todo` plus a Bug follow-up in Backlog (`Deploy failed: <component> at <sha12>`); `rollback=none` → page. Either red path also starts one log-reading Deployer on factory-gpu (thread label `odd-deploy-<sha12>`). The Bug and the log reader come before `Todo`, so a failure leaves the issue in `Deploying`; a failed evaluation re-checks the issue itself (90 s, doubling, up to 5 times) and a redelivered failed webhook is evaluated again; a page goes out even when its log reader cannot start, and `escalated` is set last. `health=pass` with no `odd-verify` comment for the receipt SHA → spawn Verifier. | Verifier |
+| Deploy receipt comment | Linear webhook | `health=fail` with a rollback snapshot → `Todo` plus a Bug follow-up in Triage (`Deploy failed: <component> at <sha12>`); `rollback=none` → page. Either red path also starts one log-reading Deployer on factory-gpu (thread label `odd-deploy-<sha12>`). The Bug and the log reader come before `Todo`, so a failure leaves the issue in `Deploying`; a failed evaluation re-checks the issue itself (90 s, doubling, up to 5 times) and a redelivered failed webhook is evaluated again; a page goes out even when its log reader cannot start, and `escalated` is set last. `health=pass` with no `odd-verify` comment for the receipt SHA → spawn Verifier. | Verifier |
 | `odd-verify` comment | Linear webhook | `result=pass` for the current receipt SHA → `Done`; `result=fail` → wait on the Bug it filed (the next release's receipt carries a new SHA and is verified again). A merged PR or a verify line for the receipt SHA satisfies the role's stop. | Intake (for the bug) |
-| Sweep tick (10 min) | `setInterval` in the plugin, started by `arm` | Watchdog: evaluate every issue with a live role thread, every `Backlog`/`Triage` issue and every `odd` issue in `Todo`/`In Progress`/`Deploying`; cancel threads stale for 15 min (`odd-watchdog cancelled` comment, status restored, immediate re-evaluation); caps alert after 60 min over; `control-plane-blind` page after 15 min of failed sweeps; daily digest. Spawns deferred to the dispatcher (no `odd` label) are recorded `ignored`. | Whatever `nextAction` returns |
+| Sweep tick (10 min) | `setInterval` in the plugin, started by `arm` | Watchdog: evaluate every issue with a live role thread, every `Triage` issue (never Backlog) and every `odd` issue in `Todo`/`In Progress`/`Deploying`; cancel threads stale for 15 min (`odd-watchdog cancelled` comment, status restored, immediate re-evaluation); caps alert after 60 min over; `control-plane-blind` page after 15 min of failed sweeps; daily digest. Spawns deferred to the dispatcher (no `odd` label) are recorded `ignored`. | Whatever `nextAction` returns |
 | `agent.end` on any `odd-role-*` thread | Plugin | Ralph guard: continue with the role's stop condition unless budget spent or an external check passed. | — |
 
 ### 5.3 Ralph loops, bounded
@@ -237,8 +237,8 @@ SHA x with this output; Done means item 3 has no evidence".
 
 - Ownership from `Todo` on is per issue: the Linear label `odd` hands an
   issue to the control plane; without it the dispatcher (`dispatch` label and
-  `factory-dispatch` markers) keeps it. ODD owns `Backlog` and `Triage` for
-  every issue. The two never act on the same issue.
+  `factory-dispatch` markers) keeps it. ODD owns `Triage` for every issue;
+  `Backlog` belongs to Devon. The two never act on the same issue.
 - Phase 4 builders are Amp medium plugin agents. The engine table in
   `scripts/dispatch/dispatch.ts` (`engine/{amp,claude,chatgpt,ultra,cursor,
   grok,go,docs}` × `agent-effort/*`) and the usage-weighted round-robin come
@@ -391,9 +391,14 @@ by the previous one).
    with a verdict, verifier labelled `odd-receipt-<sha12>` for an older
    receipt) holds no round; verifier rounds count per receipt. The sweep
    reads every page of issues and threads, and the digest is not reposted
-   after a plugin reload (it checks `#factory-alerts`). The sweep also evaluates
-   `Backlog`, so every untriaged issue gets an Intake thread as orb capacity
-   allows. Intake over-spawn (MET-304) is not fixed here.
+   after a plugin reload (it checks `#factory-alerts`). Backlog is on demand
+   (MET-304): the sweep and `nextAction` never work a Backlog issue; a Triage
+   issue without type + area gets one Intake round, then Spec. The sweep posts
+   a cancellation before archiving the thread (a failed comment keeps the
+   thread, so the round is not lost) and a blind episode ends only when a
+   whole sweep, digest included, succeeds; the digest is split into Slack
+   messages of at most 2800 characters. Removing the `odd-perform` label is
+   the off-switch: the plane keeps evaluating but records `dry-run`.
 7. Retire the poller as primary; it stays as the backstop with the 20 minute
    silence rule.
 

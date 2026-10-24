@@ -92,9 +92,9 @@ test('finished threads: idle role threads whose stage the issue has left; runnin
     { id: 'verifier-idle', labels: ['odd-role-verifier', 'odd-issue-met-1'], state: 'idle' },
     { id: 'plain', labels: ['odd-issue-met-1'], state: 'idle' },
   ];
-  // A builder or reviewer thread beside an issue that went back to Backlog or Triage is stale too.
-  assert.deepEqual(finishedThreads('Backlog', threads).map(t => t.id), ['builder-idle', 'reviewer-idle', 'verifier-idle']);
-  assert.deepEqual(finishedThreads('Triage', threads).map(t => t.id), ['intake-idle', 'builder-idle', 'reviewer-idle', 'verifier-idle']);
+  // Intake and Spec both work in Triage (Backlog is never worked), so an idle intake thread there is mid-handoff, not finished.
+  assert.deepEqual(finishedThreads('Backlog', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'builder-idle', 'reviewer-idle', 'verifier-idle']);
+  assert.deepEqual(finishedThreads('Triage', threads).map(t => t.id), ['builder-idle', 'reviewer-idle', 'verifier-idle']);
   assert.deepEqual(finishedThreads('Todo', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'reviewer-idle', 'verifier-idle']);
   assert.deepEqual(finishedThreads('In Progress', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'verifier-idle']);
   assert.deepEqual(finishedThreads('Deploying', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'builder-idle', 'reviewer-idle']);
