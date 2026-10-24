@@ -1714,6 +1714,13 @@ fn sensor_group(
     let mut fans = Vec::new();
     let mut temp_availability = Availability::Unsupported;
     let mut fan_availability = Availability::Unsupported;
+    let applesmc = child_path(root, "sys/bus/acpi/devices/APP0001:00");
+    let apple_nodes = [applesmc.clone(), applesmc.join("physical_node")];
+    let apple_paths: Vec<_> = apple_nodes
+        .iter()
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .collect();
+    let mut fan_sources = Vec::new();
     match read_dir_names(&hwmon) {
         Err(ProbeError::Missing) => {}
         Err(error) => {
@@ -1732,24 +1739,80 @@ fn sensor_group(
                             .unwrap_or_else(|| format!("{name} temp{index}"));
                         temps.push(named_milli(&format!("{name} {label}"), &raw, at));
                     }
-                    if let Some(raw) = sys_string(&dir.join(format!("fan{index}_input")), timeout) {
-                        fan_availability = Availability::Available;
-                        fans.push(named_count(&format!("{name} fan{index}"), &raw, "rpm", at));
-                    }
                 }
+                let fan_name = if fs::canonicalize(&dir)
+                    .is_ok_and(|path| apple_paths.iter().any(|apple| path.starts_with(apple)))
+                {
+                    "applesmc".into()
+                } else {
+                    name
+                };
+                fan_sources.push((dir, fan_name));
             }
         }
     }
-    let applesmc = child_path(root, "sys/bus/acpi/devices/APP0001:00/physical_node");
-    if applesmc.exists() {
+    for node in &apple_nodes {
+        fan_sources.push((node.clone(), "applesmc".into()));
+        let hwmon = node.join("hwmon");
+        if let Ok(chips) = read_dir_names(&hwmon) {
+            fan_sources.extend(
+                chips
+                    .into_iter()
+                    .map(|chip| (hwmon.join(chip), "applesmc".into())),
+            );
+        }
+    }
+    let apple_expected = applesmc.exists()
+        || fan_sources
+            .iter()
+            .any(|(dir, name)| name == "applesmc" && dir.exists());
+    let mut seen = Vec::new();
+    let mut apple_fan_availability = Availability::Unsupported;
+    for (dir, chip) in fan_sources {
         for index in 1..=8 {
-            let name = format!("applesmc fan{index}");
-            if !fans.iter().any(|fan| fan.name == name)
-                && let Some(raw) = sys_string(&applesmc.join(format!("fan{index}_input")), timeout)
+            let key = format!("{chip} fan{index}");
+            if (chip != "applesmc" || !seen.contains(&key))
+                && let Some(raw) = sys_string(&dir.join(format!("fan{index}_input")), timeout)
             {
-                fans.push(named_count(&name, &raw, "rpm", at));
+                let mut fan = named_count(&key, &raw, "rpm", at);
+                if chip == "applesmc" {
+                    if let Some(label) = sys_string(&dir.join(format!("fan{index}_label")), timeout)
+                        .filter(|label| !label.is_empty())
+                    {
+                        fan.name = format!("{key} ({label})");
+                    }
+                    if fan
+                        .metric
+                        .value
+                        .is_some_and(|rpm| !(0.0..=30000.0).contains(&rpm))
+                    {
+                        fan.metric =
+                            blank_metric("rpm", at, Availability::Error, "rpm outside 0 to 30000");
+                    }
+                    if apple_fan_availability != Availability::Available {
+                        apple_fan_availability = fan.metric.availability;
+                    }
+                }
+                seen.push(key);
+                fans.push(fan);
                 fan_availability = Availability::Available;
             }
+        }
+    }
+    if apple_expected {
+        fan_availability = apple_fan_availability;
+        if apple_fan_availability == Availability::Unsupported {
+            let bound = apple_nodes.iter().any(|node| node.join("driver").exists());
+            let detail = if bound {
+                fan_availability = Availability::Error;
+                "APP0001:00 applesmc is bound but exposes no readable fan inputs"
+            } else {
+                "APP0001:00 has no applesmc driver binding or readable fan inputs"
+            };
+            fans.push(NamedMetric {
+                name: "applesmc fans".into(),
+                metric: blank_metric("rpm", at, fan_availability, detail),
+            });
         }
     }
     if let Ok(zones) = read_dir_names(&thermal) {
