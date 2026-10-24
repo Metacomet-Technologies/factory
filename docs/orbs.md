@@ -18,6 +18,23 @@ flock, Bubblewrap, shellcheck, SQLite CLI, zstd, rsync and xz. SQLite used by
 Rust is bundled; it does not depend on the host SQLite CLI version. Rust crates
 are fetched by the first build, not by setup.
 
+Orb setup also installs missing coding-agent tools: rg, fd, jq, yq, ast-grep,
+gh, shellcheck, uv/uvx, just, watchexec, entr, hyperfine, scc and direnv. Debian
+packages supply rg, fd (`fdfind`, with an `fd` symlink), jq, gh, shellcheck,
+entr, hyperfine and direnv. The others use pinned Linux x86_64 upstream
+release binaries with SHA-256 verification in `scripts/env/setup.sh`; yq is
+Mike Farah's YAML/JSON/XML processor, not Debian's Python jq wrapper. Updating
+a release requires updating its asset and checksum together. Existing commands
+on PATH are kept, and user-local binaries go in `~/.local/bin`, appended to
+login-shell PATH. Only `ast-grep` is installed, not its `sg` companion (a
+standard Unix command). No standard commands are aliased or replaced, no
+direnv hook or automatic `.envrc` approval is added, and bat/eza/fzf/delta/
+zoxide/difftastic are not installed. These conveniences are orb-only; they do
+not extend the shared build contract or provision CI, Cursor or production.
+`--check-only` includes them in its read-only plan. System-package installs
+use the shared installer's root requirement; without privileges it prints the
+administrator command and stops rather than silently skipping tools.
+
 Linux x86_64 and these development tools provide practical parity with the
 Ubuntu factory runners. Their kernels, GPU, real Ollama, Tailscale, systemd
 deployment units, UPS, physical kiosk, backups, dispatcher, account collectors,

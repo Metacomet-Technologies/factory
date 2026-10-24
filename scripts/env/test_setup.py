@@ -31,6 +31,7 @@ def real_checker():
 
 CHECK = real_checker()
 PACKAGES = ["ca-certificates"] + [name for name, _ in CHECK.SYSTEM]
+ORB_TOOLS = "rg fd jq yq ast-grep gh shellcheck uv uvx just watchexec entr hyperfine scc direnv".split()
 
 FAKE_CHECK = f"""#!{sys.executable}
 import os, sys
@@ -140,6 +141,9 @@ class SetupTest(unittest.TestCase):
         stubs, late = os.path.join(self.base, "bin"), os.path.join(self.base, "late")
         for name, body in STUBS.items():
             write(os.path.join(stubs, name), f'#!/bin/sh\necho "{name} $*" >> "$FAKE_LOG"\n{body}', 0o755)
+        # Most tests start with the orb's convenience tools already available.
+        for name in ORB_TOOLS:
+            write(os.path.join(stubs, name), "#!/bin/sh\nexit 0\n", 0o755)
         for name, body in LATE.items():
             write(os.path.join(late, name), f'#!/bin/sh\necho "{name} $*" >> "$FAKE_LOG"\n{body}', 0o755)
         self.env = {
@@ -243,9 +247,61 @@ class SetupTest(unittest.TestCase):
                 line, _, path = action[len("add "):].rpartition(" to ")
                 self.assertEqual(path, profile)
                 self.assertIn(line, lines)
-        added = {line for line in lines if line.startswith(". ")}
+        added = {line for line in lines if line.startswith((". ", "export PATH="))}
         self.assertEqual({f"add {line} to {profile}" for line in added}, {a for a in plan if a.startswith("add ")})
         self.assertEqual(self.run_setup("--env", "orb", "--check-only")[1].count("would "), 0)
+
+    def test_orb_tools_are_planned_only_for_orbs_without_mutation(self):
+        for name in ORB_TOOLS:
+            os.remove(os.path.join(self.base, "bin", name))
+        before = self.tree()
+        code, err, calls = self.run_setup("--env", "orb", "--check-only")
+        self.assertEqual((code, calls), (0, []), err)
+        self.assertEqual(self.tree(), before)
+        for name in ("yq", "ast-grep", "just", "watchexec", "scc", "uv", "uvx"):
+            self.assertIn(f"would install {name} from ", err)
+        self.assertIn("would link fd to Debian fdfind", err)
+        for package in ("ripgrep", "fd-find", "entr", "hyperfine", "direnv"):
+            self.assertIn(package, err)
+
+        code, err, calls = self.run_setup("--env", "cursor", "--check-only")
+        self.assertEqual((code, calls), (0, []), err)
+        self.assertEqual(self.tree(), before)
+        self.assertNotIn("from ast-grep/ast-grep", err)
+        self.assertNotIn("fd-find", err)
+        self.assertNotIn(".local/bin", err)
+
+    def test_orb_preserves_existing_tools_and_reruns_without_changes(self):
+        stubs = os.path.join(self.base, "bin")
+        before = {}
+        for name in ORB_TOOLS:
+            with open(os.path.join(stubs, name), "rb") as handle:
+                before[name] = handle.read()
+        code, err, _ = self.run_setup("--env", "orb")
+        self.assertEqual(code, 0, err)
+        for name in ORB_TOOLS:
+            with open(os.path.join(stubs, name), "rb") as handle:
+                self.assertEqual(handle.read(), before[name])
+            self.assertFalse(os.path.lexists(os.path.join(self.home, ".local", "bin", name)))
+        tree = self.tree()
+        code, err, calls = self.run_setup("--env", "orb")
+        self.assertEqual((code, calls), (0, []), err)
+        self.assertIn("0 change(s)", err)
+        self.assertEqual(self.tree(), tree)
+
+    def test_orb_rejects_corrupted_release_before_installing(self):
+        self.mark(*(f"apt-{p}" for p in PACKAGES), "rust", "js", "vite-plus")
+        os.makedirs(os.path.join(self.repo, "kiosk", "node_modules"))
+        stubs = os.path.join(self.base, "bin")
+        write(os.path.join(stubs, "bun"), "#!/bin/sh\necho 1.4.2\n", 0o755)
+        os.remove(os.path.join(stubs, "yq"))
+        # Curl's final argument is the output path; deliver bytes that do not
+        # match the pinned digest. Keep the real checksum and install commands.
+        write(os.path.join(stubs, "curl"),
+              '#!/bin/sh\nfor arg; do output=$arg; done\nprintf corrupted > "$output"\n', 0o755)
+        code, err, _ = self.run_setup("--env", "orb")
+        self.assertEqual(code, 1, err)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "yq")))
 
     def test_existing_vite_plus_with_older_system_bun_converges(self):
         # The orb image: its own bun 1.3.10 on PATH, then a Vite+ install that saw it
