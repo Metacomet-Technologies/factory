@@ -1728,7 +1728,7 @@ mod tests {
                     node(
                         "factory-console",
                         console_online,
-                        vec![service("rdp-tcp", console_online)],
+                        vec![service("rdp", console_online)],
                     ),
                 ],
             }),
