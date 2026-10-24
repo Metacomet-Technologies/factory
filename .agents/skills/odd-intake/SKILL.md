@@ -16,31 +16,40 @@ message), a `#factory-alerts` post, or a CI failure on `main`.
 
 ## Steps
 
-1. Search Linear (team MET) for an open issue with the same symptom or goal.
+1. If a Slack message names no system, symptom, goal or request (a greeting,
+   a test, a bare link), reply in its Slack thread asking what is broken or
+   wanted, and stop. Do not create an issue for it.
+2. Search Linear (team MET) for an open issue with the same symptom or goal.
    If one exists, comment on it with the new report and link the duplicate;
    do not create a second issue. When your input is a bare Linear issue that
    duplicates an existing one, mark it `Duplicate` of the existing issue.
-2. Otherwise create one issue with the team template "Agent task issue"
-   (`Goal`, `Context`, `Isolation`, `Build`, `Sandbox check`, `Done means`,
+3. Otherwise create one issue with the team template "Agent task" (`Goal`,
+   `Context`, `Isolation`, `Build`, `Sandbox check`, `Done means`,
    `Evidence`; see `scripts/dispatch/README.md`), or fill the bare issue you
    were given. Fill `Goal` and `Context` from the report. Leave the other
    sections with their default bodies; Spec owns them.
-3. Set exactly one of `Bug`, `Feature`, `Improvement` and at least one
+4. Set exactly one of `Bug`, `Feature`, `Improvement` and at least one
    `area:*` label. Set status `Triage`. Never set priority, assignee or
    `dispatch`.
-4. Record the source (Slack channel and message `ts`, alert id, CI run URL) in
+5. Record the source (Slack channel and message `ts`, alert id, CI run URL) in
    `Context`.
 
 ## Linear calls
 
-Use `code_exec` with `import { get_issue, list_issues, save_issue, save_comment } from "linear"`.
+Use `code_exec` with `import { get_issue, list_issues, list_templates, save_issue, save_comment } from "linear"`.
 `get_issue({ id: "MET-n" })` returns an object; stringify it. There is no
 `search_issues`: use `list_issues({ query, team: "Metacomet" })` for the
 duplicate check. Do not pass `fields`; the default shape has `status`,
-`labels`, `description`. Fill the issue with `save_issue({ id, description,
-state: "Triage", labels: [...] })`. The template's section bodies are the
-hints shown in the "Agent task issue" template in Linear; copy them from
-`get_issue` on any recent Triage/Todo issue if the bare issue lacks them.
+`labels`, `description`.
+
+Create a new issue in one call so it never sits in `Backlog`, where the
+control plane would start a second Intake for it:
+`save_issue({ team: "Metacomet", template: "Agent task", title, description,
+labels: ["Bug", "area:kiosk"], state: "Triage" })`. Fill a bare issue with
+`save_issue({ id, description, state: "Triage", labels: [...] })`. The
+template's section bodies are the hints in the "Agent task" template
+(`list_templates`); copy them from `get_issue` on any recent Triage/Todo
+issue if the bare issue lacks them.
 
 ## Authority
 
