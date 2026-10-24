@@ -116,7 +116,7 @@ def fails(message, dropin=VALID, **kwargs):
 def main():
     installs = [(None, "absent"), (VALID, "gpu=4,console=2")] + [
         (f"[Service]\nEnvironment=DISPATCH_RUNNER_CAPS={caps}\n", caps)
-        for caps in ("console=1", "gpu=007,cursor=3,console=2", "gpu=9007199254740991")]
+        for caps in ("console=1", "gpu=007,console=2", "gpu=9007199254740991")]
     for dropin, expected in installs:
         passes(dropin, expected)
     print(f"PASS: {len(installs)} installs (no drop-in, valid cap.conf with comments, grammar edges) print caps and snapshot without changing cap.conf")
@@ -139,7 +139,7 @@ def main():
         ("factory-dispatch.timer drop-ins", dict(dropin=None, timer_dropins="@etc/systemd/system/factory-dispatch.timer.d/x.conf")),
         ("factory-dispatch.timer drop-ins", dict(timer_dropins="@etc/systemd/system/factory-dispatch.timer.d/cap.conf")),
     ]
-    for value in ("gpu=0", "gpu=4,", ",gpu=4", "gpu=4 ", "gpu=-1", "gpu=x", "", "GPU=4", "orb=1",
+    for value in ("gpu=0", "gpu=4,", ",gpu=4", "gpu=4 ", "gpu=-1", "gpu=x", "", "GPU=4", "orb=1", "cursor=1",
                   "gpu=9007199254740992", "gpu=4;console=2", "gpu=4,console=2,gpu=1", "console=1,console=1"):
         cases.append(("Invalid DISPATCH_RUNNER_CAPS at ", dict(dropin=VALID.replace("gpu=4,console=2", value))))
     for message, kwargs in cases:

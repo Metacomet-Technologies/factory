@@ -22,4 +22,4 @@ if [[ $(systemctl show factory-dispatch.service --property=LoadState --value) !=
 fi
 rm -f /etc/systemd/system/factory-dispatch.service /etc/systemd/system/factory-dispatch.timer
 systemctl daemon-reload
-printf 'Dispatcher removed; Linear and Cursor keys, Linear claims, threads, agents and runners retained. Snapshot: %s\n' "$snapshot"
+printf 'Dispatcher removed; Linear key, Linear claims, threads, agents and runners retained. Snapshot: %s\n' "$snapshot"

@@ -1,12 +1,12 @@
 # Environments
 
 One toolchain contract for every place factory code is built or checked: orbs,
-Cursor Cloud, the sandbox, CI and the two prod runners (MET-222). The contract
+the sandbox, CI and the two prod runners (MET-222). The contract
 states requirements, not install paths. `scripts/env/setup.sh` brings an
 environment up to it (MET-225); `scripts/env/check` proves whether it meets it.
 
 ```sh
-scripts/env/check --env <orb|cursor|sandbox|ci|factory-gpu|factory-console>
+scripts/env/check --env <orb|sandbox|ci|factory-gpu|factory-console>
 ```
 
 Run it from the repository root. It is read-only, needs only `python3`, prints
@@ -49,7 +49,7 @@ The checker never installs or caches anything:
 scripts/env/setup.sh [--env <name>] [--ci] [--prebuild] [--check-only]
 ```
 
-Without `--env` it uses `ci` with `--ci`, otherwise `cursor`: the full
+Without `--env` it uses `ci` with `--ci`, otherwise `factory-gpu`: the full
 contract, nothing exempt. That default never under-provisions; a bare
 `--check-only` or `--prebuild` works anywhere. Pass `--env` to apply an
 environment's exemptions and record its name in the checker JSON.
@@ -119,7 +119,6 @@ Where kiosk UI checks run (the `verify-kiosk` skill):
 | Environment | Provisioned by | Exempt from |
 | -- | -- | -- |
 | `orb` (Amp) | `.agents/setup` on orb creation: `scripts/env/setup.sh --env orb` | Playwright, layout |
-| `cursor` (Cursor Cloud) | The repo's `.cursor/environment.json` (`scripts/env/cursor-install.sh`, `scripts/env/cursor-start.sh`, below) for every Cursor environment of this repo, personal or team. The repo file takes precedence over saved environments, and builds read it from main | nothing |
 | `sandbox` (`scripts/sandbox` host) | `scripts/env/setup.sh --env sandbox` on the host it runs on; CI's `sandbox` job runs it with `--ci` | Playwright, layout |
 | `ci` (GitHub Actions `kiosk` job, ubuntu-24.04) | `scripts/env/setup.sh --ci` in `.github/workflows/ci.yml` | Playwright, layout, bubblewrap (the `sandbox` job installs it) |
 | `factory-gpu` | `scripts/env/setup.sh --env factory-gpu`, run as `agent` by an administrator (below) | nothing |
@@ -188,21 +187,6 @@ baseline below, as `agent`:
 The repository side (this script, the orb wrapper, CI, the sandbox preflight)
 rolls back by reverting its merge commit.
 
-## Cursor Cloud environment
-
-`.cursor/environment.json` runs two scripts from `/workspace`:
-
-* `scripts/env/cursor-install.sh` (snapshot build): removes the pre-MET-225
-  hand-rolled toolchain, symlinks the checkout to `/home/agent/work/factory`,
-  then runs `scripts/env/setup.sh --prebuild` (default `cursor`).
-* `scripts/env/cursor-start.sh` (each boot): fast-forwards a stale checkout to
-  `origin/main` (only when it has no local commits or edits), then runs
-  `scripts/sandbox up --rows 1k --kiosk` unless the sandbox is already running.
-
-Changes land through a PR and take effect on each environment's next build.
-To roll back, revert the merge and trigger a build, or select the previous
-build in the dashboard.
-
 ## Prod baseline (MET-222, 2026-10-17)
 
 Recorded evidence before convergence. Both nodes identical unless noted.
@@ -237,7 +221,7 @@ Claude Code and Codex cloud are next. Each needs one setup line and the check.
 
    Add `--prebuild` when the vendor snapshots the result. If it runs kiosk UI
    checks, first symlink the checkout to `/home/agent/work/factory` as in the
-   Cursor script above; setup installs Playwright Chromium and the Vite+ env
+   `factory-gpu` layout; setup installs Playwright Chromium and the Vite+ env
    file unless the environment is exempt.
 3. Make `scripts/env/check --env <name>` a fresh agent's first command there
    and record the JSON on the issue.

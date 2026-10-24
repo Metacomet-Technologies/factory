@@ -1,12 +1,7 @@
 # Cloud agent
 
-## Cursor Cloud specific instructions
-
-On boot, the start script (`scripts/env/cursor-start.sh`) fast-forwards a
-stale checkout to `origin/main`, then runs
-`scripts/sandbox up --rows 1k --kiosk` when that synthetic stack is stopped.
-You can start before that
-finishes. If `scripts/sandbox status` prints "Another sandbox command is
+Start the synthetic stack with `scripts/sandbox up --rows 1k --kiosk` if `scripts/sandbox status`
+shows it stopped. If `scripts/sandbox status` prints "Another sandbox command is
 running", wait and retry every 15 s for up to 5 minutes before using the
 stack. Never start a second `sandbox up`. `scripts/sandbox status` prints the
 loopback URLs.
@@ -14,7 +9,7 @@ loopback URLs.
 call production.
 
 The environment is provisioned by `scripts/env/setup.sh --prebuild`
-(`docs/environments.md`); `scripts/env/check --env cursor` proves it. Login
+(`docs/environments.md`); `scripts/env/check --env orb` proves it. Login
 shells source `~/.cargo/env` and the Vite+ env, so `node` and `bun` resolve to
 the kiosk's pinned versions. Inside `kiosk/`, `vp` is the project CLI. From
 `kiosk/`: `OPENAPI_URL=file://$PWD/../factory-api/openapi.json vp check`,

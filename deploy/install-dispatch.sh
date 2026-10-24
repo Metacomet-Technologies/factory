@@ -3,7 +3,6 @@ set -Eeuo pipefail
 umask 0077
 root=$(dirname "$(dirname "$(realpath "$0")")")
 key=/etc/factory-dispatch/linear-api-key
-cursor_key=/etc/factory-dispatch/cursor-api-key
 # The one accepted service drop-in (MET-215): runner caps, tuned without reinstalling.
 caps_dropin=/etc/systemd/system/factory-dispatch.service.d/cap.conf
 snapshot=
@@ -43,18 +42,6 @@ fi
 [[ $(stat -c '%U:%G %a' "$key") == 'root:agent 640' ]] || fail 'Require root:agent 0640: sudo chown root:agent /etc/factory-dispatch/linear-api-key; sudo chmod 0640 /etc/factory-dispatch/linear-api-key.'
 sudo -u agent test -r "$key"
 [[ -s "$key" ]] || fail 'The existing Linear key file is empty.'
-# Optional: only engine/cursor issues need it. Absence never fails; a present key must be safe.
-if [[ -L "$cursor_key" ]]; then
-    fail "Resolve the $cursor_key symlink manually; engine/cursor needs a regular root:agent 0640 file."
-elif [[ -f "$cursor_key" ]]; then
-    cursor_mode=$(stat -c '%U:%G %a' "$cursor_key")
-    printf 'Cursor key: present (%s)\n' "$cursor_mode"
-    [[ $cursor_mode == 'root:agent 640' ]] || fail "Require root:agent 0640: sudo chown root:agent $cursor_key; sudo chmod 0640 $cursor_key."
-    sudo -u agent test -r "$cursor_key"
-    [[ -s "$cursor_key" ]] || fail 'The existing Cursor key file is empty.'
-else
-    printf 'Cursor key: absent (optional; engine/cursor issues are refused until it is provisioned)\n'
-fi
 for file in scripts/dispatch/dispatch.ts scripts/dispatch/dispatch.lock scripts/dispatch/.node-version deploy/factory-dispatch.service deploy/factory-dispatch.timer; do
     [[ -f "$root/$file" && ! -L "$root/$file" ]] || fail "Missing/unsafe artifact: $file"
 done
@@ -63,10 +50,10 @@ for unit in factory-dispatch.service factory-dispatch.timer; do
 done
 [[ -z $(systemctl show factory-dispatch.timer --property=DropInPaths --value) ]] || fail 'Review/remove factory-dispatch.timer drop-ins before installing.'
 # Same grammar as DISPATCH_RUNNER_CAPS in scripts/dispatch/dispatch.ts: unique
-# gpu|console|cursor=<positive safe integer> entries separated by commas.
+# gpu|console=<positive safe integer> entries separated by commas.
 valid_caps() {
     local item seen=,
-    [[ $1 =~ ^(gpu|console|cursor)=[0-9]+(,(gpu|console|cursor)=[0-9]+)*$ ]] || return 1
+    [[ $1 =~ ^(gpu|console)=[0-9]+(,(gpu|console)=[0-9]+)*$ ]] || return 1
     for item in ${1//,/ }; do
         [[ $seen != *",${item%%=*},"* && ${item#*=} =~ ^0*([1-9][0-9]{0,15})$ ]] || return 1
         (( BASH_REMATCH[1] <= 9007199254740991 )) || return 1
@@ -93,7 +80,7 @@ if [[ -e $caps_dropin || -L $caps_dropin ]]; then
             header=1
         elif [[ $line == Environment=DISPATCH_RUNNER_CAPS=* && $header == 1 && -z $caps ]]; then
             caps=${line#Environment=DISPATCH_RUNNER_CAPS=}
-            valid_caps "$caps" || fail "Invalid DISPATCH_RUNNER_CAPS at $caps_dropin line $number: $caps (want unique gpu|console|cursor=<positive integer> entries separated by commas)"
+            valid_caps "$caps" || fail "Invalid DISPATCH_RUNNER_CAPS at $caps_dropin line $number: $caps (want unique gpu|console=<positive integer> entries separated by commas)"
         else
             # Print only the key: an unexpected Environment= line could hold a secret.
             fail "Unexpected $caps_dropin line $number: ${line%%=*}; allowed are blank lines, # comments, one [Service] and one Environment=DISPATCH_RUNNER_CAPS=<caps> line"
