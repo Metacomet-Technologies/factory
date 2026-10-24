@@ -63,13 +63,16 @@ export function useChartMotion() {
   } as const;
 }
 
+/** Phone-sized viewports, both iPhone orientations: the scene holds and event pulses are off. */
+export const PHONE = "(max-width: 932px) and (max-height: 932px)";
+
 /**
  * Event pulse: fresh data landed. The Live chip throws one ripple and every `.fk-hero`
- * number flashes once over `--dur-event`. Pure CSS; under reduced motion the keyframes are
- * disabled, so the ripple is removed at once and the flash class is a no-op.
+ * number flashes once over `--dur-event`. Pure CSS; under reduced motion and on phones it does
+ * nothing.
  */
 export function pulse(root: ParentNode = document) {
-  if (snapshot()) return;
+  if (snapshot() || matchMedia(PHONE).matches) return;
   for (const live of root.querySelectorAll(".live-indicator")) {
     const ripple = document.createElement("span");
     ripple.className = "fk-ripple";

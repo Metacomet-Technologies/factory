@@ -50,6 +50,8 @@ That command is the theme journey in [features/theme.md](features/theme.md). It 
 
 Other journeys are specified in `features/` and are not wrapped by the helper. Follow those files literally. Do not substitute a unit test or a direct `dataset.theme` write for a click.
 
+Any layout or CSS change must also pass the device matrix in [features/device-matrix.md](features/device-matrix.md): every page at Devon's iPhone, iPad, MacBook, 27-inch and kiosk viewports, both themes, through `vp run devices:check`.
+
 ## Evidence
 
 Write proof under `$VERIFY_ROOT/evidence/<feature>/`. A theme proof is `theme/after.png` and `theme/after.aria.txt`. The text file records the button label and theme before and after the click, plus the stored preference. A screenshot alone is not proof.

@@ -201,6 +201,13 @@ describe("UPS telemetry", () => {
     expect(await screen.findByText(/UPS: No data · Charge/)).toHaveTextContent(warning);
     expect(screen.queryByText("ups: initial failure")).not.toBeInTheDocument();
   });
+  it("opens the API health details on a tap, so touch screens see them too", async () => {
+    api();
+    render(<App />);
+    await screen.findByText("Your local compute. In focus.");
+    fireEvent.click(screen.getByRole("button", { name: "API health details" }));
+    expect(await screen.findByText(/^API .+ · uptime \d+ min$/)).toBeInTheDocument();
+  });
   it.each([null, "stale"])("shows warning in the %s badge tooltip", async (mode) => {
     render(
       <TooltipProvider>

@@ -1,5 +1,15 @@
 import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
-import { Activity, Cpu, Moon, Mountain, Server, Sun, Terminal, Info } from "lucide-react";
+import {
+  Activity,
+  Cpu,
+  Moon,
+  Mountain,
+  Server,
+  Sun,
+  Terminal,
+  Info,
+  Waypoints,
+} from "lucide-react";
 import { useApi } from "./api/client";
 import { useStream } from "./api/stream";
 import { useBuildUpdate } from "./api/build-update";
@@ -99,6 +109,7 @@ export default function App() {
     };
   }, []);
   useEffect(() => (ambient.perf ? startAmbientPerf(ambient.mode) : undefined), []);
+  const [healthOpen, setHealthOpen] = useState(false);
   const [dark, setDark] = useState(() => document.documentElement.dataset.theme === "dark");
   const [followsSystem, setFollowsSystem] = useState(
     () => !document.documentElement.dataset.themePreference,
@@ -224,13 +235,19 @@ export default function App() {
           </ol>
         </nav>
         <div className="header-actions">
-          <a href="/topology">Topology</a>
+          <a href="/topology" className="topology-link">
+            <Waypoints aria-hidden="true" size={18} />
+            <span>Topology</span>
+          </a>
           <LiveIndicator status={live.status} />
           <Clock>
             {(now) => <UpsBadge current={upsCurrent} now={now} warnings={upsWarnings} />}
           </Clock>
-          <Tooltip>
+          {/* Opens on hover and focus, and toggles on a tap: touch screens have no hover. */}
+          <Tooltip open={healthOpen} onOpenChange={setHealthOpen}>
             <TooltipTrigger
+              closeOnClick={false}
+              onClick={() => setHealthOpen((open) => !open)}
               render={
                 <Button variant="ghost" size="icon" aria-label="API health details">
                   <Info />

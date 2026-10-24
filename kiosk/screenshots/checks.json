@@ -9,7 +9,7 @@
       "reload": "manual",
       "cacheDisabled": true,
       "cpuThrottle": 6,
-      "fcpMs": 488,
+      "fcpMs": 636,
       "firstFrameBackground": "rgb(13, 18, 24)",
       "animationFrameBackgrounds": ["rgb(13, 18, 24)"],
       "screencastBackgrounds": ["rgb(13, 18, 24)", "rgb(12, 17, 23)"],
@@ -24,7 +24,7 @@
       "reload": "manual",
       "cacheDisabled": true,
       "cpuThrottle": 6,
-      "fcpMs": 588,
+      "fcpMs": 404,
       "firstFrameBackground": "rgb(242, 246, 247)",
       "animationFrameBackgrounds": ["rgb(242, 246, 247)"],
       "screencastBackgrounds": ["rgb(242, 246, 247)", "rgb(243, 246, 248)"],
@@ -39,11 +39,11 @@
       "reload": "manual",
       "cacheDisabled": true,
       "cpuThrottle": 6,
-      "fcpMs": 488,
+      "fcpMs": 436,
       "firstFrameBackground": "rgb(13, 18, 24)",
       "animationFrameBackgrounds": ["rgb(13, 18, 24)"],
       "screencastBackgrounds": ["rgb(13, 18, 24)", "rgb(12, 17, 23)"],
-      "frames": 12
+      "frames": 11
     },
     {
       "name": "kiosk-dark-saved-light",
@@ -54,11 +54,11 @@
       "reload": "manual",
       "cacheDisabled": true,
       "cpuThrottle": 6,
-      "fcpMs": 392,
+      "fcpMs": 400,
       "firstFrameBackground": "rgb(242, 246, 247)",
       "animationFrameBackgrounds": ["rgb(242, 246, 247)"],
-      "screencastBackgrounds": ["rgb(242, 246, 247)", "rgb(243, 246, 248)"],
-      "frames": 11
+      "screencastBackgrounds": ["rgb(243, 246, 248)"],
+      "frames": 9
     },
     {
       "name": "kiosk-dark-saved-invalid",
@@ -69,11 +69,11 @@
       "reload": "manual",
       "cacheDisabled": true,
       "cpuThrottle": 6,
-      "fcpMs": 436,
+      "fcpMs": 440,
       "firstFrameBackground": "rgb(13, 18, 24)",
       "animationFrameBackgrounds": ["rgb(13, 18, 24)"],
       "screencastBackgrounds": ["rgb(13, 18, 24)", "rgb(12, 17, 23)"],
-      "frames": 12
+      "frames": 11
     },
     {
       "name": "kiosk-light-saved-invalid",
@@ -84,11 +84,11 @@
       "reload": "manual",
       "cacheDisabled": true,
       "cpuThrottle": 6,
-      "fcpMs": 456,
+      "fcpMs": 464,
       "firstFrameBackground": "rgb(242, 246, 247)",
       "animationFrameBackgrounds": ["rgb(242, 246, 247)"],
       "screencastBackgrounds": ["rgb(242, 246, 247)", "rgb(243, 246, 248)"],
-      "frames": 11
+      "frames": 12
     },
     {
       "name": "kiosk-dark-saved-blocked",
@@ -99,7 +99,7 @@
       "reload": "manual",
       "cacheDisabled": true,
       "cpuThrottle": 6,
-      "fcpMs": 492,
+      "fcpMs": 436,
       "firstFrameBackground": "rgb(13, 18, 24)",
       "animationFrameBackgrounds": ["rgb(13, 18, 24)"],
       "screencastBackgrounds": ["rgb(13, 18, 24)", "rgb(12, 17, 23)"],
@@ -114,11 +114,11 @@
       "reload": "manual",
       "cacheDisabled": true,
       "cpuThrottle": 6,
-      "fcpMs": 412,
+      "fcpMs": 444,
       "firstFrameBackground": "rgb(242, 246, 247)",
       "animationFrameBackgrounds": ["rgb(242, 246, 247)"],
       "screencastBackgrounds": ["rgb(242, 246, 247)", "rgb(243, 246, 248)"],
-      "frames": 12
+      "frames": 13
     },
     {
       "name": "1728-dark",
@@ -132,13 +132,13 @@
       "contrast": {
         "textMin": {
           "text": "Failing · —",
-          "ratio": 5.092415960938867,
+          "ratio": 4.938131581239852,
           "foreground": "rgba(255, 106, 79, 1.00)",
-          "background": "rgba(26, 45, 42, 1.00)"
+          "background": "rgba(26, 48, 43, 1.00)"
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.6552275302373123,
+          "ratio": 4.671954601130476,
           "cue": "border"
         },
         "failures": {
@@ -159,13 +159,13 @@
       "contrast": {
         "textMin": {
           "text": "Failing · —",
-          "ratio": 5.092415960938867,
+          "ratio": 4.938131581239852,
           "foreground": "rgba(255, 106, 79, 1.00)",
-          "background": "rgba(26, 45, 42, 1.00)"
+          "background": "rgba(26, 48, 43, 1.00)"
         },
         "controlMin": {
           "control": "24h",
-          "ratio": 3.6552275302373123,
+          "ratio": 4.671954601130476,
           "cue": "border"
         },
         "failures": {
@@ -192,7 +192,7 @@
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.518089118776229,
+          "ratio": 3.9408401986960673,
           "cue": "border"
         },
         "failures": {
@@ -219,7 +219,7 @@
         },
         "controlMin": {
           "control": "24h",
-          "ratio": 3.518089118776229,
+          "ratio": 3.9408401986960673,
           "cue": "border"
         },
         "failures": {
@@ -233,13 +233,13 @@
       "contrast": {
         "textMin": {
           "text": "Failing · —",
-          "ratio": 4.543913227033642,
+          "ratio": 5.029455159912673,
           "foreground": "rgba(255, 106, 79, 1.00)",
-          "background": "rgba(45, 51, 56, 1.00)"
+          "background": "rgba(26, 46, 44, 1.00)"
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.663212786949082,
+          "ratio": 4.638422755417384,
           "cue": "border"
         },
         "failures": {
@@ -253,13 +253,13 @@
       "contrast": {
         "textMin": {
           "text": "Failing · —",
-          "ratio": 4.543913227033642,
+          "ratio": 4.71151154188422,
           "foreground": "rgba(255, 106, 79, 1.00)",
-          "background": "rgba(45, 51, 56, 1.00)"
+          "background": "rgba(42, 48, 54, 1.00)"
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.268155472224116,
+          "ratio": 4.638422755417384,
           "cue": "border"
         },
         "failures": {
@@ -279,7 +279,7 @@
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.0201551535558315,
+          "ratio": 3.848744370064145,
           "cue": "border"
         },
         "failures": {
@@ -300,13 +300,13 @@
       "contrast": {
         "textMin": {
           "text": "Failing · —",
-          "ratio": 5.085575314968547,
+          "ratio": 4.933623651487904,
           "foreground": "rgba(255, 106, 79, 1.00)",
-          "background": "rgba(26, 45, 42, 1.00)"
+          "background": "rgba(26, 48, 43, 1.00)"
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.6436889522635414,
+          "ratio": 4.671954601130476,
           "cue": "border"
         },
         "failures": {
@@ -326,14 +326,14 @@
       },
       "contrast": {
         "textMin": {
-          "text": "24h",
-          "ratio": 6.0456641374896165,
+          "text": "Warning 20 % · Low/shutdown  30 %",
+          "ratio": 6.193414309563016,
           "foreground": "rgba(159, 176, 186, 1.00)",
-          "background": "rgba(30, 50, 47, 1.00)"
+          "background": "rgba(40, 45, 51, 1.00)"
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.645906741683671,
+          "ratio": 4.670312417098685,
           "cue": "border"
         },
         "failures": {
@@ -353,14 +353,14 @@
       },
       "contrast": {
         "textMin": {
-          "text": "24h",
-          "ratio": 6.0456641374896165,
+          "text": "Warning 20 % · Low/shutdown  30 %",
+          "ratio": 6.193414309563016,
           "foreground": "rgba(159, 176, 186, 1.00)",
-          "background": "rgba(30, 50, 47, 1.00)"
+          "background": "rgba(40, 45, 51, 1.00)"
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.645906741683671,
+          "ratio": 4.670312417098685,
           "cue": "border"
         },
         "failures": {
@@ -380,14 +380,14 @@
       },
       "contrast": {
         "textMin": {
-          "text": "HTTP 503 . Retrying on the next refresh.",
-          "ratio": 5.097528340542048,
+          "text": ". Retrying on the next refresh.",
+          "ratio": 4.945361395319368,
           "foreground": "rgba(255, 106, 79, 1.00)",
-          "background": "rgba(26, 45, 42, 1.00)"
+          "background": "rgba(26, 48, 43, 1.00)"
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.66338884702579,
+          "ratio": 4.674816303828191,
           "cue": "border"
         },
         "failures": {
@@ -407,14 +407,14 @@
       },
       "contrast": {
         "textMin": {
-          "text": "HTTP 503 . Retrying on the next refresh.",
-          "ratio": 5.097528340542048,
+          "text": ". Retrying on the next refresh.",
+          "ratio": 4.945361395319368,
           "foreground": "rgba(255, 106, 79, 1.00)",
-          "background": "rgba(26, 45, 42, 1.00)"
+          "background": "rgba(26, 48, 43, 1.00)"
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.66338884702579,
+          "ratio": 4.674816303828191,
           "cue": "border"
         },
         "failures": {
@@ -441,7 +441,7 @@
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.5139710712125587,
+          "ratio": 3.9408401986960673,
           "cue": "border"
         },
         "failures": {
@@ -468,7 +468,7 @@
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.5147337964318344,
+          "ratio": 3.940393329543993,
           "cue": "border"
         },
         "failures": {
@@ -495,7 +495,7 @@
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.5147337964318344,
+          "ratio": 3.940393329543993,
           "cue": "border"
         },
         "failures": {
@@ -522,7 +522,7 @@
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.5240974273719554,
+          "ratio": 3.942302356812926,
           "cue": "border"
         },
         "failures": {
@@ -549,7 +549,7 @@
         },
         "controlMin": {
           "control": "1h",
-          "ratio": 3.5240974273719554,
+          "ratio": 3.942302356812926,
           "cue": "border"
         },
         "failures": {

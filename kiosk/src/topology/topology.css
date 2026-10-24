@@ -1,7 +1,14 @@
 /* Topology page (design system v2). Tokens only: teal is the active accent, never a status. */
 
-/* The page is a header row plus one panel that takes the remaining viewport height. */
+/* The page is a header row plus one panel that takes the remaining viewport height. The map
+   is an app canvas, so on this route the frame is exactly the viewport, but at least 560 px
+   tall: a landscape phone scrolls a little instead of getting a sliver of map. */
+:root:has(.topology-page) #root {
+  height: max(100dvh, 560px);
+}
 .topology-page {
+  flex: 1 1 0;
+  min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
@@ -33,8 +40,8 @@
 .topology-steps {
   position: fixed;
   inset: auto;
-  top: 112px;
-  right: 28px;
+  top: calc(112px + env(safe-area-inset-top));
+  right: var(--gutter-right);
   width: min(380px, calc(100vw - 32px));
   max-height: calc(100dvh - 160px);
   overflow: auto;
@@ -92,6 +99,10 @@
   --xy-controls-button-border-color: var(--border-control);
   --xy-controls-box-shadow: none;
   --xy-attribution-background-color: transparent;
+}
+/* A full control outline (React Flow draws only a bottom rule), so the buttons read at 3:1. */
+.topology-canvas .react-flow__controls-button {
+  border: 1px solid var(--border-control);
 }
 .topology-canvas .react-flow__attribution a {
   color: var(--muted-foreground);

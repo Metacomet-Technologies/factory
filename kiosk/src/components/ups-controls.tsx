@@ -461,11 +461,7 @@ export default function UpsControls() {
               retry="The refresh does not reload older rows; select Older audit to try again."
             />
             {!rows.length && <p className="muted">No audit rows.</p>}
-            <ol
-              className="ups-events ups-control-audit"
-              tabIndex={0}
-              aria-label="UPS control audit rows"
-            >
+            <ol className="ups-events ups-control-audit" aria-label="UPS control audit rows">
               {rows.map((row) => (
                 <li key={row.id}>
                   <time dateTime={new Date(row.ts_ms).toISOString()}>
