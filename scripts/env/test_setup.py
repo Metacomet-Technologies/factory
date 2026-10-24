@@ -269,7 +269,7 @@ class SetupTest(unittest.TestCase):
         for package in ("ripgrep", "fd-find", "entr", "hyperfine", "direnv"):
             self.assertIn(package, err)
 
-        code, err, calls = self.run_setup("--env", "cursor", "--check-only")
+        code, err, calls = self.run_setup("--env", "factory-gpu", "--check-only")
         self.assertEqual((code, calls), (0, []), err)
         self.assertEqual(self.tree(), before)
         self.assertNotIn("from ast-grep/ast-grep", err)
