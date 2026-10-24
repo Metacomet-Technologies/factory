@@ -21,12 +21,13 @@ export function issueFromEvent(source: WebhookSource, body: string): string | un
   }
   if (source === 'github') {
     const pr = event.pull_request as Record<string, unknown> | undefined;
-    if (!pr) return undefined;
-    const head = pr.head as Record<string, unknown> | undefined;
-    const ref = typeof head?.ref === 'string' ? head.ref : '';
+    const head = pr?.head as Record<string, unknown> | undefined;
+    // check_suite and workflow_run carry the branch at the top level, not under pull_request.
+    const run = (event.check_suite ?? event.workflow_run) as Record<string, unknown> | undefined;
+    const ref = typeof head?.ref === 'string' ? head.ref : typeof run?.head_branch === 'string' ? run.head_branch : '';
     const branch = /^met-(\d+)/i.exec(ref);
     if (branch) return `MET-${branch[1]}`;
-    const text = typeof pr.body === 'string' ? pr.body : '';
+    const text = typeof pr?.body === 'string' ? pr.body : '';
     const link = /\b(?:closes|contributes)\s+(MET-\d+)/i.exec(text);
     return link ? link[1].toUpperCase() : undefined;
   }

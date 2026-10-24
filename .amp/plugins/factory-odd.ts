@@ -88,46 +88,113 @@ export default async function (amp: PluginAPI) {
 	// --- Control plane: armed only in the labelled control thread inside an orb ---------------
 	// The label is usually set after the thread's first session.start, so every turn boundary
 	// re-checks it; `armed` keeps the webhooks and the one-time URL dialog from repeating.
-	const armed = new Set<ThreadID>()
+	// `urls` are credentials: kept in memory, shown only through the confirm dialog, never returned.
+	type HandledEvent = {
+		at: string
+		source: string
+		issue: string | null
+		stage: 'received' | 'ignored' | 'dry-run' | 'performed' | 'failed'
+		status?: string
+		action?: Action
+		error?: string
+	}
+	type ArmState = { armed: boolean; error?: string; webhooks: string[]; urls: string[]; events: HandledEvent[] }
+	const armState = new Map<ThreadID, ArmState>()
 	amp.on('session.start', async (_event, ctx) => arm(ctx, await ctx.thread.labels()))
 	amp.on('agent.start', async (_event, ctx) => {
 		await arm(ctx, await ctx.thread.labels())
 		return {}
 	})
 
-	async function arm(ctx: PluginEventContext<'agent.end'>, labels: readonly string[]) {
-		if (!labels.includes(controlLabel) || armed.has(ctx.thread.id)) return
-		armed.add(ctx.thread.id)
-		if (ctx.system.executor.kind !== 'remote') {
-			await ctx.ui.notify(`${marker} control plane needs an Amp-managed orb; webhooks are unavailable here.`)
-			return
+	// Lets the control agent see why arming did or did not happen, and arm explicitly. Never
+	// returns webhook URLs.
+	amp.registerTool({
+		name: 'odd_control_status',
+		description:
+			'ODD control plane state for this thread: labels, executor kind, whether webhooks are armed, last arming error, the last 20 handled webhook events. Pass arm: true to arm now (control thread in an orb only). Pass show_urls: true to show the webhook URLs to the human in a confirm dialog; the call blocks until they answer. URLs are never returned to the agent.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				arm: { type: 'boolean', description: 'Arm the control plane now if not armed' },
+				show_urls: { type: 'boolean', description: 'Show the webhook URLs to the human in a dialog and wait for them to confirm' },
+			},
+		},
+		async execute(input, ctx) {
+			const labels = await ctx.thread.labels()
+			if (input.arm === true) await arm(ctx, labels)
+			const { urls, ...state } = armState.get(ctx.thread.id) ?? { armed: false, webhooks: [], urls: [], events: [] }
+			const dialog = input.show_urls === true && urls.length > 0 ? await showUrls(ctx, urls) : undefined
+			return JSON.stringify({ thread: ctx.thread.id, labels, executor: amp.system.executor.kind, ...state, dialog })
+		},
+	})
+
+	async function arm(ctx: Pick<PluginEventContext<'agent.end'>, 'thread' | 'ui' | 'logger'>, labels: readonly string[]) {
+		if (!labels.includes(controlLabel) || armState.has(ctx.thread.id)) return
+		const state: ArmState = { armed: false, webhooks: [], urls: [], events: [] }
+		armState.set(ctx.thread.id, state)
+		try {
+			await armWebhooks(ctx, state)
+			state.armed = true
+		} catch (error: unknown) {
+			state.error = String(error)
+			ctx.logger.log(marker, 'arming failed', state.error)
+			await ctx.ui.notify(`${marker} control plane arming failed: ${state.error}`)
 		}
-		await ctx.system.executor.keepAlive().catch((error: unknown) => ctx.logger.log(marker, 'keepAlive failed', String(error)))
+	}
+
+	async function armWebhooks(ctx: Pick<PluginEventContext<'agent.end'>, 'thread' | 'ui' | 'logger'>, state: ArmState) {
+		if (amp.system.executor.kind !== 'remote') {
+			throw new Error(`control plane needs an Amp-managed orb; executor is ${amp.system.executor.kind}`)
+		}
+		await amp.system.executor.keepAlive().catch((error: unknown) => ctx.logger.log(marker, 'keepAlive failed', String(error)))
 		const seen = new Set<string>()
 		const handle = (source: 'linear' | 'github' | 'slack') => async (event: WebhookEvent, hctx: WebhookHandlerContext) => {
 			if (seen.has(event.id)) return
 			seen.add(event.id)
-			const identifier = issueFromEvent(source, new TextDecoder().decode(event.body))
-			if (!identifier) return
-			const issue = await snapshotFor(hctx, identifier)
-			const action = nextAction(issue, await currentLoad(hctx))
-			hctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
-			if (!(await hctx.thread.labels()).includes(performLabel)) {
-				hctx.logger.log(marker, 'dry run; add label', performLabel, 'to act')
-				return
+			const record: HandledEvent = { at: event.receivedAt, source, issue: null, stage: 'received' }
+			state.events.push(record)
+			state.events.splice(0, Math.max(0, state.events.length - 20))
+			try {
+				const identifier = issueFromEvent(source, new TextDecoder().decode(event.body))
+				if (!identifier) {
+					record.stage = 'ignored'
+					return
+				}
+				record.issue = identifier
+				const issue = await snapshotFor(hctx, identifier)
+				const action = nextAction(issue, await currentLoad(hctx))
+				hctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
+				record.status = issue.status
+				record.action = action
+				if (!(await hctx.thread.labels()).includes(performLabel)) {
+					hctx.logger.log(marker, 'dry run; add label', performLabel, 'to act')
+					record.stage = 'dry-run'
+					return
+				}
+				await perform(hctx, issue, action)
+				record.stage = 'performed'
+			} catch (error: unknown) {
+				record.stage = 'failed'
+				record.error = String(error)
+				hctx.logger.log(marker, source, 'handler failed', record.error)
+				throw error
 			}
-			await perform(hctx, issue, action)
 		}
-		const urls = await Promise.all((['linear', 'github', 'slack'] as const).map(async key => {
+		for (const key of ['linear', 'github', 'slack'] as const) {
 			const { url } = await amp.createWebhook({ key, headers: ['x-hub-signature-256', 'linear-signature', 'x-slack-signature'], handler: handle(key) })
-			return `${key}: ${url}`
-		}))
-		// The URLs are credentials. They are shown once, in the control thread, for Devon to paste
-		// into Linear, GitHub and Slack. Never log or post them anywhere else. Not awaited: the
-		// dialog waits for a human and must not hold the turn boundary that armed it.
-		void ctx.ui
-			.confirm({ title: 'ODD webhook endpoints', message: urls.join('\n'), confirmButtonText: 'Configured', requireHuman: true })
-			.catch((error: unknown) => ctx.logger.log(marker, 'webhook dialog failed', String(error)))
+			state.webhooks.push(key)
+			state.urls.push(`${key}: ${url}`)
+		}
+		// Not awaited: the dialog waits for a human and must not hold the turn boundary that
+		// armed it. odd_control_status({ show_urls: true }) shows it again on demand and waits.
+		void showUrls(ctx, state.urls).catch((error: unknown) => ctx.logger.log(marker, 'webhook dialog failed', String(error)))
+	}
+
+	// The URLs are credentials, shown only in the control thread for Devon to paste into Linear,
+	// GitHub and Slack. Never log or post them anywhere else.
+	async function showUrls(ctx: Pick<PluginEventContext<'agent.end'>, 'ui'>, urls: readonly string[]) {
+		const confirmed = await ctx.ui.confirm({ title: 'ODD webhook endpoints', message: urls.join('\n'), confirmButtonText: 'Configured', requireHuman: true })
+		return confirmed ? 'configured' : 'dismissed'
 	}
 
 	// Phases 3-6 fill in `perform` stage by stage; today only spawn, steer and page are wired.
@@ -166,10 +233,23 @@ export default async function (amp: PluginAPI) {
 
 type Tools = WebhookHandlerContext['tools']
 
+// `ctx.tools.call` returns the full CallToolResult for MCP tools: the payload is JSON in the
+// first text block (or `structuredContent` when the server provides it). Built-in tools return
+// their result directly; pass those through unchanged.
+async function callJson<T>(tools: Tools, name: string, input: Record<string, unknown>): Promise<T> {
+	const result = (await tools.call(name, input)) as { structuredContent?: unknown; content?: { type: string; text?: string }[] } | T
+	if (typeof result !== 'object' || result === null) return result as T
+	const envelope = result as { structuredContent?: unknown; content?: { type: string; text?: string }[] }
+	if (envelope.structuredContent !== undefined) return envelope.structuredContent as T
+	const textBlock = envelope.content?.find(block => block.type === 'text' && typeof block.text === 'string')
+	if (!textBlock) return result as T
+	return JSON.parse(textBlock.text as string) as T
+}
+
 async function snapshotFor(ctx: WebhookHandlerContext, identifier: string): Promise<IssueSnapshot> {
 	const [issue, comments, pr, threads] = await Promise.all([
-		ctx.tools.call('linear.get_issue', { id: identifier }) as Promise<LinearIssue>,
-		ctx.tools.call('linear.list_comments', { issueId: identifier, limit: 50 }).then(result => (result as { comments?: { body: string }[] }).comments ?? []),
+		callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: identifier }),
+		callJson<{ comments?: { body: string }[] }>(ctx.tools, 'linear.list_comments', { issueId: identifier, limit: 50 }).then(result => result.comments ?? []),
 		pullRequestFor(ctx, identifier),
 		threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`),
 	])
@@ -189,9 +269,9 @@ async function pullRequestFor(ctx: WebhookHandlerContext, identifier: string): P
 }
 
 async function threadsFor(tools: Tools, query: string): Promise<LiveThread[]> {
-	const found = (await tools.call('find_thread', { query, limit: 100 })) as { threads: { id: string }[] }
+	const found = await callJson<{ threads: { id: string }[] }>(tools, 'find_thread', { query, limit: 100 })
 	return Promise.all(found.threads.map(async ({ id }) => {
-		const status = (await tools.call('get_thread_status', { thread: id })) as { metadata: { labels: string[] }; agentState?: { state?: string } }
+		const status = await callJson<{ metadata: { labels: string[] }; agentState?: { state?: string } }>(tools, 'get_thread_status', { thread: id })
 		return { id, labels: status.metadata.labels, state: status.agentState?.state ?? 'idle' }
 	}))
 }

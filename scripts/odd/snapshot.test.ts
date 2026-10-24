@@ -12,6 +12,9 @@ test('webhook deliveries resolve to one issue or none', () => {
   assert.equal(issueFromEvent('linear', JSON.stringify({ type: 'Project', data: { name: 'p' } })), undefined);
   assert.equal(issueFromEvent('github', JSON.stringify({ pull_request: { head: { ref: 'met-277-odd-control' }, body: '' } })), 'MET-277');
   assert.equal(issueFromEvent('github', JSON.stringify({ pull_request: { head: { ref: 'feature' }, body: 'Closes MET-12.' } })), 'MET-12');
+  assert.equal(issueFromEvent('github', JSON.stringify({ check_suite: { head_branch: 'met-277-odd-arm', conclusion: 'success' } })), 'MET-277');
+  assert.equal(issueFromEvent('github', JSON.stringify({ workflow_run: { head_branch: 'MET-9-x' } })), 'MET-9');
+  assert.equal(issueFromEvent('github', JSON.stringify({ check_suite: { head_branch: 'main' } })), undefined);
   assert.equal(issueFromEvent('github', JSON.stringify({ release: { tag_name: 'v1' } })), undefined);
   assert.equal(issueFromEvent('slack', JSON.stringify({ event: { text: 'MET-1 is broken' } })), undefined);
   assert.equal(issueFromEvent('linear', '{not json'), undefined);
