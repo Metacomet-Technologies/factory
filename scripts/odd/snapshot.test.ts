@@ -47,7 +47,7 @@ test('snapshot combines Linear, GitHub and thread state, and feeds nextAction', 
   assert.deepEqual(snapshot.pr, { number: 157, headSha: sha, ci: 'success', verdict: undefined, merged: false, mergeSha: undefined });
   assert.equal(snapshot.deployReceipt?.health, 'pass');
   assert.equal(snapshot.risk, 'ordinary');
-  assert.deepEqual(nextAction(snapshot, { orbs: 0, runnerSlots: 0 }), { kind: 'spawn', role: 'reviewer', executor: 'orb', reason: `no verdict at ${sha.slice(0, 12)}` });
+  assert.deepEqual(nextAction(snapshot, { orbs: 0, runnerSlots: 0 }), { kind: 'spawn', role: 'reviewer', executor: 'orb', reason: `no verdict at ${sha.slice(0, 12)}`, round: 1 });
   const unknown = toSnapshot({ issue: { id: 'MET-1', status: 'Nonsense', labels: [] } });
   assert.equal(unknown.status, 'Backlog');
   assert.equal(unknown.pr, undefined);

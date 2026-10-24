@@ -199,7 +199,10 @@ No production issue/poll is used for development verification.
 Both also check QA, pending wrap-ups and archives. Blockers must be completed or canceled;
 one waiting comment survives subsequent polls. Invalid tasks lose the label and
 get reasons. `>` hint lines do not count as section content. Required sections:
-Goal, Context, Isolation, Build, Sandbox check, Done means. Empty Link type means
+Goal, Context, Isolation, Build, Sandbox check, Done means. The team template
+also carries Evidence (one line per Done-means item); the ODD control plane
+(`docs/odd/README.md`) requires it before an issue leaves Triage, the dispatcher
+ignores it. Empty Link type means
 contributes. Link type section must contain only `closes` or `contributes`; put notes in Context. Tests get the playbook
 defaults when empty. Exactly one Bug/Feature/Improvement and at least one
 `area:*` label are required. Group labels use `parent.name` plus the child name;

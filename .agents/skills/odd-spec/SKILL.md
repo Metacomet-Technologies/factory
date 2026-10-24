@@ -38,7 +38,9 @@ A Linear issue in `Triage` with a type and an `area:*` label.
    effort and advisor" only when the default round-robin is wrong.
 8. If the work needs more than three build rounds, split into child issues,
    each with its own full spec, and mark blocked-by order.
-9. Move the issue to `Todo`.
+9. Move the issue to `Todo`. The control plane does the same on its next
+   Linear event once `specComplete` holds, and moves a `Todo` issue whose
+   spec regressed back to `Triage`.
 
 ## Authority
 
