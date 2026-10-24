@@ -11,6 +11,11 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::sync::RwLock;
+
+// A spawned child retains copies of locked fds until exec. Exclude shim spawns
+// while calls can hold file locks; calls in separate harnesses still run together.
+static SHIM_FORK_GATE: RwLock<()> = RwLock::const_new(());
 
 fn uid() -> u32 {
     fs::read_to_string("/proc/self/status")
@@ -165,14 +170,17 @@ impl Harness {
         let shims = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/sandbox-shims");
         let (mut nut_shim, nut) = shim(shims.join("fake-upsd.py"));
         let (mut slack_shim, slack) = shim(shims.join("fake-serve.py"));
-        let children = vec![
-            nut_shim.arg(root.join("ups-status")).spawn().unwrap(),
-            slack_shim
-                .arg(listen.port().to_string())
-                .arg(root)
-                .spawn()
-                .unwrap(),
-        ];
+        let children = {
+            let _spawn = SHIM_FORK_GATE.write().await;
+            vec![
+                nut_shim.arg(root.join("ups-status")).spawn().unwrap(),
+                slack_shim
+                    .arg(listen.port().to_string())
+                    .arg(root)
+                    .spawn()
+                    .unwrap(),
+            ]
+        };
         let db_path = root.join("audit.db");
         Store::open(db_path.clone(), true)
             .await
@@ -212,7 +220,16 @@ impl Harness {
             url: format!("http://{listen}"),
         }
     }
+    async fn selftest(&self, uptime_seconds: f64) -> anyhow::Result<Value> {
+        let _action = SHIM_FORK_GATE.read().await;
+        self.control.selftest(uptime_seconds).await
+    }
+    async fn flush_notifications(&self) -> anyhow::Result<()> {
+        let _notifications = SHIM_FORK_GATE.read().await;
+        self.control.flush_notifications().await
+    }
     async fn request(&self, path: &str, login: Option<&str>, body: Option<Value>) -> (u16, Value) {
+        let _action = SHIM_FORK_GATE.read().await;
         let mut request = if let Some(body) = body {
             self.client.post(format!("{}{path}", self.url)).json(&body)
         } else {
@@ -275,7 +292,7 @@ async fn guard_notifications_have_complete_escaped_block_kit_payloads() {
         let h = Harness::with_hostname(uid(), "host<&>").await;
         assert_eq!(h.request("/v1/state", login, None).await.0, 403);
         h.sql("UPDATE audit SET ts_ms=1709164800123");
-        h.control.flush_notifications().await.unwrap();
+        h.flush_notifications().await.unwrap();
         assert_eq!(
             h.posts(),
             vec![json!({
@@ -294,7 +311,7 @@ async fn guard_notifications_have_complete_escaped_block_kit_payloads() {
                 ]}]
             })]
         );
-        h.control.flush_notifications().await.unwrap();
+        h.flush_notifications().await.unwrap();
         assert_eq!(h.posts().len(), 1, "delivered audit must not be reposted");
     }
 }
@@ -319,7 +336,7 @@ async fn outbox_notifications_escape_all_values_and_classify_outcomes() {
         tracking_id: None,
     };
     h.control.store.append(row.clone(), true).await.unwrap();
-    h.control.flush_notifications().await.unwrap();
+    h.flush_notifications().await.unwrap();
     assert_eq!(
         h.posts(),
         vec![json!({
@@ -382,7 +399,7 @@ async fn outbox_notifications_escape_all_values_and_classify_outcomes() {
             )
             .await
             .unwrap();
-        h.control.flush_notifications().await.unwrap();
+        h.flush_notifications().await.unwrap();
         assert_eq!(
             h.posts().last().unwrap()["attachments"][0]["color"],
             color,
@@ -410,7 +427,7 @@ async fn real_socket_guard_and_notification_throttle() {
         .0,
         403
     );
-    h.control.flush_notifications().await.unwrap();
+    h.flush_notifications().await.unwrap();
     assert_eq!(
         fs::read_to_string(h.dir.path().join("slack-posts.jsonl"))
             .unwrap()
@@ -514,8 +531,8 @@ async fn denial_flood_preserves_allowed_actions_and_aggregates_audit() {
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(61)).await;
     tokio::time::resume();
-    h.control.flush_notifications().await.unwrap();
-    h.control.flush_notifications().await.unwrap();
+    h.flush_notifications().await.unwrap();
+    h.flush_notifications().await.unwrap();
     let rows = h.control.store.rows(100, i64::MAX).await.unwrap();
     assert_eq!(rows.iter().filter(|r| r.event == "guard-deny").count(), 9);
     assert_eq!(
@@ -539,7 +556,7 @@ async fn denial_flood_preserves_allowed_actions_and_aggregates_audit() {
             .count(),
         10
     );
-    h.control.flush_notifications().await.unwrap();
+    h.flush_notifications().await.unwrap();
     // Wall time has not advanced: samples and summary still share one Slack allowance.
     let posts = fs::read_to_string(h.dir.path().join("slack-posts.jsonl")).unwrap();
     assert_eq!(
@@ -802,7 +819,7 @@ async fn quick_and_scheduled_tests_accept_only_known_idle_results() {
             let h = Harness::new(uid()).await;
             h.fixture(json!({"ups.test.result":result}));
             if scheduled {
-                assert!(h.control.selftest(3600.0).await.unwrap()["executed"] == true);
+                assert!(h.selftest(3600.0).await.unwrap()["executed"] == true);
             } else {
                 let (status, pending) = h.prepare("test.quick", None).await;
                 assert_eq!(status, 200, "{result}: {pending}");
@@ -821,7 +838,7 @@ async fn quick_and_scheduled_tests_accept_only_known_idle_results() {
     ] {
         h.fixture(json!({"ups.test.result":result}));
         assert_eq!(h.prepare("test.quick", None).await.0, 409, "{result:?}");
-        assert!(h.control.selftest(3600.0).await.is_err(), "{result:?}");
+        assert!(h.selftest(3600.0).await.is_err(), "{result:?}");
     }
     assert!(!h.received().contains("INSTCMD"));
 }
@@ -829,8 +846,10 @@ async fn quick_and_scheduled_tests_accept_only_known_idle_results() {
 #[tokio::test]
 async fn quick_and_scheduled_preflight_migrations_and_strict_schema() {
     let h = Harness::new(uid()).await;
+    let no_spawn = SHIM_FORK_GATE.read().await;
     let action_lock = fs::File::create(h.dir.path().join("audit.action.lock")).unwrap();
     action_lock.try_lock().unwrap();
+    // Already holding the fork gate for this deliberately contending lock.
     assert!(h.control.selftest(3600.0).await.is_err());
     let rows = h.control.store.rows(20, i64::MAX).await.unwrap();
     assert!(rows.iter().any(|r| r.event == "refuse"
@@ -842,7 +861,8 @@ async fn quick_and_scheduled_preflight_migrations_and_strict_schema() {
             .contains("another action is in progress")
     );
     drop(action_lock);
-    assert!(h.control.selftest(3599.99).await.is_err());
+    drop(no_spawn);
+    assert!(h.selftest(3599.99).await.is_err());
     for values in [
         json!({"battery.charge":"99"}),
         json!({"ups.test.result":"Test in progress"}),
@@ -851,11 +871,12 @@ async fn quick_and_scheduled_preflight_migrations_and_strict_schema() {
     ] {
         h.fixture(values);
         assert_eq!(h.prepare("test.quick", None).await.0, 409);
-        assert!(h.control.selftest(3600.0).await.is_err());
+        assert!(h.selftest(3600.0).await.is_err());
     }
     h.fixture(json!({}));
-    assert!(h.control.selftest(3600.0).await.is_ok());
-    assert!(h.control.selftest(3600.0).await.is_err());
+    let r = h.selftest(3600.0).await;
+    assert!(r.is_ok(), "{r:?}");
+    assert!(h.selftest(3600.0).await.is_err());
     assert_eq!(
         h.received()
             .matches("INSTCMD cyberpower test.battery.start.quick")
