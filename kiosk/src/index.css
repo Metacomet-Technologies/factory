@@ -677,14 +677,8 @@
   background: currentColor;
   box-shadow: 0 0 8px currentColor;
 }
-.chip-dot-pulse::after {
-  content: "";
-  position: absolute;
-  inset: -3px;
-  border-radius: 50%;
-  border: 1.5px solid currentColor;
-  opacity: 0;
-  animation: ping var(--dur-ping) var(--ease-out) infinite;
+.chip-dot-pulse {
+  box-shadow: 0 0 8px currentColor;
 }
 /* Event pulse: pulse() in lib/motion.ts appends the ripple to the Live chip and flashes
    every .fk-hero value once per data refresh. */
@@ -886,9 +880,7 @@
   fill: none;
   stroke: var(--accent-text);
   stroke-width: 2px;
-  transform-box: fill-box;
-  transform-origin: center;
-  animation: ping var(--dur-ping) var(--ease-out) infinite;
+  opacity: 0.45;
 }
 [data-slot="chart"] .recharts-cartesian-grid line {
   stroke: var(--border);

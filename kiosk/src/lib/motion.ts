@@ -8,6 +8,41 @@ const subscribe = (callback: () => void) => {
 };
 const snapshot = () => matchMedia(query).matches;
 
+/**
+ * Infinite scene motion (sweep, aurora, stars) pauses while the page is hidden and
+ * while a visible page has had no pointer, key or focus activity for this long.
+ * A live pulse is a steady glow, not another infinite animation: one running
+ * animation is enough to keep Chrome's GPU process compositing the frosted panels.
+ */
+export const IDLE_HOLD_MS = 2_000;
+
+/** True while the page is hidden, or visible and quiet past `IDLE_HOLD_MS`. */
+export function useSceneHeld(enabled: boolean) {
+  const [held, setHeld] = useState(false);
+  useEffect(() => {
+    if (!enabled) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const hold = () => {
+      clearTimeout(timer);
+      setHeld(document.hidden || document.visibilityState === "hidden");
+      if (!document.hidden) timer = setTimeout(() => setHeld(true), IDLE_HOLD_MS);
+    };
+    hold();
+    document.addEventListener("visibilitychange", hold);
+    window.addEventListener("pointerdown", hold);
+    window.addEventListener("keydown", hold);
+    window.addEventListener("focusin", hold);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", hold);
+      window.removeEventListener("pointerdown", hold);
+      window.removeEventListener("keydown", hold);
+      window.removeEventListener("focusin", hold);
+    };
+  }, [enabled]);
+  return enabled && held;
+}
+
 /** True when the user asked for reduced motion; charts and tweens must then render final state. */
 export function useReducedMotion() {
   return useSyncExternalStore(subscribe, snapshot, () => false);

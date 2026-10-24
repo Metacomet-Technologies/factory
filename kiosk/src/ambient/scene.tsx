@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useState, type CSSProperties } from "react";
 import { cn } from "@/lib/utils";
-import { useReducedMotion } from "@/lib/motion";
+import { useReducedMotion, useSceneHeld } from "@/lib/motion";
 import type { AmbientMode } from "./mode";
 
 // [dawn, night] from docs/design/kiosk-v2/tokens.json, mirrored here for the `static` sky
@@ -114,6 +114,7 @@ const viewport = () => ({ width: window.innerWidth, height: window.innerHeight }
 /** The kiosk backdrop: sky, Teton ridgeline band and the ambient layers for `mode`. */
 export function AmbientScene({ mode, dark }: { mode: AmbientMode; dark: boolean }) {
   const reduced = useReducedMotion();
+  const held = useSceneHeld(!reduced && mode !== "none");
   const [size, setSize] = useState(viewport);
   useEffect(() => {
     if (mode !== "static") return;
@@ -138,7 +139,7 @@ export function AmbientScene({ mode, dark }: { mode: AmbientMode; dark: boolean 
   }, [mode, dark, size]);
   return (
     <div
-      className={cn("fk-backdrop", (reduced || mode === "none") && "fk-still")}
+      className={cn("fk-backdrop", (reduced || held || mode === "none") && "fk-still")}
       data-ambient-scene={mode}
       aria-hidden="true"
     >
