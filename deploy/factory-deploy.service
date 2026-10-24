@@ -1,0 +1,22 @@
+[Unit]
+Description=ODD Deployer: install published releases on factory-gpu
+Documentation=file:///home/agent/work/factory/docs/odd/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=agent
+Group=agent
+WorkingDirectory=/home/agent/work
+Environment=HOME=/home/agent
+Environment="PATH=@PATH@"
+ExecStartPre=/usr/bin/mkdir -p /home/agent/.local/state/factory-odd
+ExecStart=/usr/bin/flock -n /home/agent/.local/state/factory-odd/deploy.lock @NODE@ /home/agent/work/factory/scripts/odd/deploy.ts
+# sudo through the allowlist needs new privileges.
+NoNewPrivileges=false
+Nice=10
+TimeoutStartSec=30min
+UMask=0077
+StandardOutput=journal
+StandardError=journal

@@ -360,6 +360,7 @@ export default async function (amp: PluginAPI) {
 			}
 			case 'set-status':
 				await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: action.status })
+				if (action.followUp) await followUp(ctx, issue, action.followUp)
 				return
 			case 'steer': {
 				const key = `${action.threadID}:${action.message}`
@@ -415,6 +416,20 @@ export default async function (amp: PluginAPI) {
 		await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-escalated reason=${action.reason}\n\n${action.detail}` })
 		await ctx.tools.call('slack_write', { text: `${marker} ${issue.identifier} escalated (${action.reason}): ${action.detail}. Remove the \`${escalatedLabel}\` label to resume.` })
 		ctx.logger.log(marker, 'paged', issue.identifier, action.reason)
+	}
+
+	// A rolled-back release returns its issues to Todo and files one Bug in Backlog per failed
+	// release (the title carries the SHA; a second issue of the same release reuses it).
+	async function followUp(ctx: EvalContext, issue: IssueSnapshot, followUp: { title: string; body: string }) {
+		const existing = await callJson<{ issues?: { id?: string; title?: string }[] }>(ctx.tools, 'linear.list_issues', { team: 'Metacomet', query: followUp.title, limit: 10 })
+		const match = existing.issues?.find(candidate => candidate.title === followUp.title)
+		if (match?.id) {
+			await callJson(ctx.tools, 'linear.save_issue', { id: match.id, relatedTo: [issue.identifier] })
+			ctx.logger.log(marker, 'follow-up exists', issue.identifier, match.id)
+			return
+		}
+		const created = await callJson<{ id?: string; identifier?: string }>(ctx.tools, 'linear.save_issue', { team: 'Metacomet', title: followUp.title, description: followUp.body, labels: ['Bug', 'area:agents'], state: 'Backlog', relatedTo: [issue.identifier] })
+		ctx.logger.log(marker, 'follow-up filed', issue.identifier, created.identifier ?? created.id ?? '')
 	}
 }
 

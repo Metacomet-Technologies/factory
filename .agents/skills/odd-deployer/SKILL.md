@@ -10,45 +10,80 @@ Contract source: `docs/odd/README.md` §4, §7; sudo rules in
 condition: `deploy-receipt`. Runs on the runner that owns the host, never in
 an orb.
 
-The Deployer is a deterministic job. An agent loads this skill only to read
-logs after a red health probe and write the receipt and bug report.
+The Deployer is a deterministic job: `scripts/odd/deploy.ts`, run every two
+minutes by `factory-deploy.timer` on factory-gpu as `agent`. An agent loads
+this skill only to read its logs after a red health probe, a failed rollback
+or a stuck release, and to turn them into a bug report. The agent never runs
+an installer, a rollback script or `sudo`; the job owns those.
 
-## Inputs
+## What the job does
 
-A published GitHub release for a component with a deploy script, the merge
-receipt on the issue, `/etc/sudoers.d/factory-agent-deploy` installed on the
-host.
+1. `gh release list` → every `v*` tag newer than `lastTag` in the ledger
+   `~/.local/state/factory-odd/deploy.json`, oldest first. The first run only
+   records the newest tag as `lastTag`; the next published release is the
+   first automatic deploy.
+2. Per release: fetch tags, require the tag commit to be an ancestor of
+   `origin/main`, `release.py verify --anonymous` into
+   `~/.local/state/factory-odd/releases/<tag>` (marker `.verified`), unpack
+   `kiosk.tar.gz`, refuse a dirty `/home/agent/work/factory`, then
+   `git checkout --detach <sha>` there so the installers read the released
+   sources. Afterwards `main` is fast-forwarded to the deployed SHA when it
+   was behind, otherwise the checkout stays detached and the log says so.
+3. Plan: a component installs when the inventory `sources` for it in
+   `deploy/components.json`, or its installer and rollback scripts, changed
+   between its baseline and the release SHA. The baseline is the newer of the
+   ledger SHA and the SHA the live health endpoint reports. Enabled
+   components, in install order: `meter`, `factory-api`, `kiosk`, `usage`.
+   Everything else (dispatcher, pricing, ups-control, alerts, backup, reboot,
+   nut, devices) stays with Devon.
+4. Install: `sudo -n /usr/bin/bash /home/agent/work/factory/deploy/install-<c>.sh <artifact>`,
+   three health probes 20 s apart, all three must report the release SHA.
+   Red: the listed rollback script runs once with the snapshot path the
+   installer printed, then the health probe decides `rollback=<sha>` or
+   `rollback=none`. The release stops at the first failed component.
+5. Receipt, one line per issue the release closes
+   (`(#N)` merge subjects → PR body `closes`/`contributes` lines), posted only
+   on issues currently in `Deploying`:
+   `odd-deploy host=factory-gpu component=<a+b|none|failed> sha=<sha>
+   health=<pass|fail> rollback=<none|sha>`. `parseDeployReceipt` in
+   `scripts/odd/lifecycle.ts` must parse it. The ledger `lastTag` advances
+   even on failure so one broken release cannot block the next.
 
-## Steps
+The control plane turns the receipt into `Done` (pass), `Todo` plus a Bug
+follow-up (fail with rollback), or a page (fail without rollback).
 
-1. Confirm the release artifact is the one the merge receipt names
-   (`docs/release.md` §"Source version and release identity are different").
-2. From `/home/agent/work/factory` at merged `origin/main`, run only the
-   listed script for this host: `sudo -n /usr/bin/bash <exact path>`. No other
-   sudo. If the sudoers file is missing, post Devon's exact Mac commands on the
-   issue (mention Devon) and stop with `health=skipped`.
-3. Run the component's health probe. Green: write the receipt. Red: run the
-   listed rollback script once, probe again.
-4. Comment the receipt on the issue, one line:
-   `odd-deploy host=<h> component=<c> sha=<s> health=<pass|fail>
-   rollback=<none|sha>`. `parseDeployReceipt` in `scripts/odd/lifecycle.ts`
-   must parse it.
-5. Hand to the Verifier when `health=pass`. When `health=fail` after rollback,
-   leave the component on the previous release and pause all deploys of that
-   component.
+## Inputs for the agent
+
+`journalctl -u factory-deploy --since -2h` (JSON lines, `event` field:
+`pending`, `checkout`, `baseline`, `plan`, `resume`, `install`,
+`installer-output`, `probe`, `rollback`, `rollback-missing-snapshot`,
+`receipt`, `receipt-skipped`, `main-left-detached`; a failure ends the run
+with a non-zero exit and the receipt line in the error), the ledger, the
+receipt comment on the issue, and the component health endpoint.
+
+## Steps for the agent
+
+1. Find the failing `install`, `probe` or `rollback` event and quote it.
+2. Compare the probe `git_sha` with the receipt `sha`; name which component
+   is live on which SHA.
+3. Comment the diagnosis on the issue the receipt names, then stop. The Bug
+   follow-up already exists when `rollback` is a SHA; add the diagnosis to it
+   instead of filing another.
 
 ## Authority
 
-Run allowlisted scripts on the runner. Never merge, never edit the spec, never
-touch a host not named in the release, never deploy during a paused window
-for that component.
+Read logs, the ledger and health endpoints. Never run the installers, the
+rollback scripts, `sudo`, `systemctl` or `git checkout` in
+`/home/agent/work/factory`; never merge; never edit the spec; never touch a
+host not named in the release.
 
 ## Escalation
 
-Health red after rollback, or rollback script fails: Slack DM Devon with
-host, component, both SHAs and the probe output. This is one of the five
-paging conditions; include the receipt line verbatim.
+`rollback=none` with `health=fail`, or the same release failing twice: the
+control plane pages Devon with the receipt line verbatim. The agent adds the
+probe output and the failing event to the issue; it does not page.
 
 ## Budget
 
-One deploy plus one rollback per release. No retries beyond that.
+One deploy plus one rollback per component per release. No retries beyond
+that; the next release is the retry.

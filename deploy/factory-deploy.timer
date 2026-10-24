@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll GitHub releases every 2 minutes and deploy new ones
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+Unit=factory-deploy.service
+
+[Install]
+WantedBy=timers.target

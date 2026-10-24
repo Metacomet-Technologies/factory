@@ -291,3 +291,47 @@ python3 scripts/release/release.py verify --anonymous --tag "$RELEASE_TAG" --sha
 A nonexistent requested tag prints `tag not found`. Do not mark MET-157 finished
 until this live canary and anonymous verification succeed. Local fixtures do not
 prove GitHub token access, native immutability enforcement, or public downloads.
+
+## Automatic host deploy (MET-280)
+
+`factory-deploy.timer` on factory-gpu runs `scripts/odd/deploy.ts` as `agent`
+every two minutes (`deploy/factory-deploy.service`, `flock` so runs never
+overlap, 30 minute cap). The job reads `gh release list`, verifies each release
+newer than the ledger's `lastTag` with `release.py verify --anonymous`, detaches
+`/home/agent/work/factory` at the release SHA, and installs each enabled
+component whose sources or installer changed since the SHA the host already
+runs: `meter`, `factory-api`, `kiosk`, `usage`, in that order, through the
+sudoers allowlist (`deploy/sudoers/README.md`). Three health probes 20 s apart
+must report the release SHA; red runs the component's rollback script once. The
+result is one `odd-deploy` receipt per issue the release closes
+(`docs/odd/README.md` §7). The enabled set lives in `deploy.ts`, not in
+`deploy/components.json`, because `release.py inventory_check` keeps
+`enabled_auto_deploy` empty and eligibility human-only.
+
+Not deployed by the job: dispatcher, pricing, ups-control, alerts, backup,
+reboot, nut, devices-agent. Those stay with Devon.
+
+One-time install from the Mac, after the merge is on main and the host
+checkout is at or past it (the script refuses any other root path or host):
+
+```sh
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-deploy.sh'
+```
+
+The first run only records the newest published tag as `lastTag`; the next
+release is the first automatic deploy. Expect that release to reinstall
+meter, factory-api, kiosk and usage once, because the host baselines predate
+it.
+
+Watch and recover:
+
+```sh
+gpu-ssh 'journalctl -u factory-deploy --since -1h -o cat'
+gpu-ssh 'cat /home/agent/.local/state/factory-odd/deploy.json'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-deploy.sh'   # removes the timer; ledger kept
+```
+
+A failed component stops the release and exits non-zero; `lastTag` still
+advances so the next release is the retry. Deleting the ledger makes the next
+run bootstrap again without deploying. A dirty host checkout blocks every
+deploy until it is clean, and the job logs it each tick.

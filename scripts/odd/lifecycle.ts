@@ -51,10 +51,11 @@ export type IssueSnapshot = {
   owner?: { role: Role; threadID: string; round: number; state: 'idle' | 'running' | 'awaiting-approval' | 'error' };
   /** `changesRounds` counts the distinct `changes` verdicts on this issue: the builder thread persists across rounds, so rounds live on the reviewer side. */
   pr?: { number: number; headSha: string; ci: 'pending' | 'success' | 'failure'; verdict?: Verdict; merged: boolean; mergeSha?: string; changesRounds?: number };
-  release?: { tag: string; components: readonly string[] };
+  /** Latest `odd-deploy` receipt posted after the latest `odd-merge` receipt (scripts/odd/deploy.ts posts one per release per issue). */
   deployReceipt?: DeployReceipt;
 };
 
+/** `component` is the `+`-joined set the release installed (`none` when it touched no enabled component), or the component that failed. */
 export type DeployReceipt = { host: string; component: string; sha: string; health: 'pass' | 'fail'; rollback: 'none' | string };
 
 export type Load = { orbs: number; runnerSlots: number; buildIssues: number };
@@ -63,8 +64,7 @@ export type Action =
   | { kind: 'spawn'; role: Role; executor: Executor; reason: string; round: number }
   | { kind: 'steer'; role: Role; threadID: string; message: string }
   | { kind: 'merge'; pr: number; sha: string }
-  | { kind: 'deploy'; tag: string; components: readonly string[] }
-  | { kind: 'set-status'; status: Status; reason: string }
+  | { kind: 'set-status'; status: Status; reason: string; followUp?: { title: string; body: string } }
   | { kind: 'page'; reason: PageReason; detail: string; pr?: number }
   | { kind: 'wait'; reason: string };
 
@@ -169,12 +169,19 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
       ? { kind: 'steer', role: 'builder', threadID: owner.threadID, message: `QA requested changes at ${pr.headSha}; see the odd-verdict comment on PR #${pr.number}. Address every finding, rerun the Evidence commands, push to the same branch.` }
       : spawn('builder', load, `qa changes, round ${round + 1}`);
   }
+  // Deploying: the host Deployer (scripts/odd/deploy.ts) posts the receipt; the control plane never deploys.
   if (status === 'Deploying') {
     const receipt = issue.deployReceipt;
-    if (!receipt) return issue.release ? { kind: 'deploy', tag: issue.release.tag, components: issue.release.components } : { kind: 'wait', reason: 'release not published' };
+    if (!receipt) return { kind: 'wait', reason: 'release not published' };
     if (receipt.health === 'fail' && receipt.rollback === 'none') return { kind: 'page', reason: 'failed-rollback', detail: `${receipt.component} on ${receipt.host} unhealthy at ${receipt.sha}` };
-    if (receipt.health === 'fail') return { kind: 'set-status', status: 'Todo', reason: `rolled back to ${receipt.rollback}` };
-    return spawn('verifier', load, 'deploy receipt healthy');
+    if (receipt.health === 'fail') {
+      return { kind: 'set-status', status: 'Todo', reason: `rolled back to ${receipt.rollback}`, followUp: {
+        title: `Deploy failed: ${receipt.component} at ${receipt.sha.slice(0, 12)}`,
+        body: `${issue.identifier} was rolled back on ${receipt.host}.\n\n\`\`\`\nodd-deploy host=${receipt.host} component=${receipt.component} sha=${receipt.sha} health=fail rollback=${receipt.rollback}\n\`\`\`\n\nRead \`journalctl -u factory-deploy\` on ${receipt.host} for the installer and probe output.`,
+      } };
+    }
+    // Phase 6 adds the Verifier's judgement; until then a 60 s exact-SHA health window is Done.
+    return { kind: 'set-status', status: 'Done', reason: `deployed ${receipt.component} at ${receipt.sha.slice(0, 12)}` };
   }
   return { kind: 'wait', reason: `unknown status ${status}` };
 }

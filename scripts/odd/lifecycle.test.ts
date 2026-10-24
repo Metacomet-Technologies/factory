@@ -81,14 +81,20 @@ test('changes steer the live builder; the third rejected head pages instead of l
   assert.deepEqual(nextAction(issue({ status: 'In Progress', pr }), idle), { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'qa changes, round 3', round: 1 });
 });
 
-test('deploy receipts: healthy verifies, rolled back returns to Todo, unhealthy without rollback pages', () => {
-  const release = { tag: 'v0.3.0', components: ['kiosk'] };
-  assert.deepEqual(nextAction(issue({ status: 'Deploying', release }), idle), { kind: 'deploy', tag: 'v0.3.0', components: ['kiosk'] });
-  const receipt = parseDeployReceipt('note\nodd-deploy host=factory-gpu component=kiosk sha=abcdef1234 health=pass rollback=none\n');
-  assert.deepEqual(receipt, { host: 'factory-gpu', component: 'kiosk', sha: 'abcdef1234', health: 'pass', rollback: 'none' });
-  assert.equal(nextAction(issue({ status: 'Deploying', release, deployReceipt: receipt }), idle).kind, 'spawn');
-  assert.equal(nextAction(issue({ status: 'Deploying', release, deployReceipt: { ...receipt!, health: 'fail', rollback: 'abc1234' } }), idle).kind, 'set-status');
-  assert.deepEqual(nextAction(issue({ status: 'Deploying', release, deployReceipt: { ...receipt!, health: 'fail' } }), idle),
+test('deploy receipts: no receipt waits, healthy is Done, rolled back returns to Todo with a Bug, unhealthy without rollback pages', () => {
+  assert.deepEqual(nextAction(issue({ status: 'Deploying' }), idle), { kind: 'wait', reason: 'release not published' });
+  const receipt = parseDeployReceipt('note\nodd-deploy host=factory-gpu component=meter+kiosk sha=abcdef1234 health=pass rollback=none\n');
+  assert.deepEqual(receipt, { host: 'factory-gpu', component: 'meter+kiosk', sha: 'abcdef1234', health: 'pass', rollback: 'none' });
+  assert.deepEqual(nextAction(issue({ status: 'Deploying', deployReceipt: receipt }), idle), { kind: 'set-status', status: 'Done', reason: 'deployed meter+kiosk at abcdef1234' });
+  const none = parseDeployReceipt('odd-deploy host=factory-gpu component=none sha=abcdef1234 health=pass rollback=none');
+  assert.equal(nextAction(issue({ status: 'Deploying', deployReceipt: none }), idle).kind, 'set-status');
+  const rolledBack = nextAction(issue({ status: 'Deploying', deployReceipt: { ...receipt!, component: 'kiosk', health: 'fail', rollback: '/var/backups/factory-kiosk/20261024T120000.abc' } }), idle);
+  assert.equal(rolledBack.kind, 'set-status');
+  assert.equal((rolledBack as { status: string }).status, 'Todo');
+  const followUp = (rolledBack as { followUp?: { title: string; body: string } }).followUp;
+  assert.equal(followUp?.title, 'Deploy failed: kiosk at abcdef1234');
+  assert.match(followUp?.body ?? '', /^odd-deploy host=factory-gpu component=kiosk sha=abcdef1234 health=fail rollback=\/var\/backups\/factory-kiosk\/20261024T120000\.abc$/m);
+  assert.deepEqual(nextAction(issue({ status: 'Deploying', deployReceipt: { ...receipt!, component: 'kiosk', health: 'fail' } }), idle),
     { kind: 'page', reason: 'failed-rollback', detail: 'kiosk on factory-gpu unhealthy at abcdef1234' });
   assert.equal(parseDeployReceipt('odd-deploy host=x component=y sha=zz health=pass rollback=none'), undefined);
 });
