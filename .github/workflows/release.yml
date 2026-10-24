@@ -61,7 +61,7 @@ jobs:
           node-version: ${{ steps.versions.outputs.node }}
       - name: Prepare build tools on the ephemeral runner
         run: |
-          rustup toolchain install 1.99.0 --profile minimal
+          rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy
           # Historical scripts/sandbox clears PATH to /usr/bin:/bin at runtime.
           # Match sandbox CI provisioning; GITHUB_PATH alone cannot reach it.
           sudo apt-get update
