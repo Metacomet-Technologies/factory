@@ -2,7 +2,7 @@ import { readFileSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node
 import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { commentMarkers, cursorId, engineArgs, openWrapup, prepareWorktree, runnerCommand, runWorktreeCommand, sharesCheckout, wrapupRunner, type Issue } from './dispatch.ts';
+import { commentMarkers, engineArgs, openWrapup, prepareWorktree, runnerCommand, runWorktreeCommand, sharesCheckout, wrapupRunner, type Issue } from './dispatch.ts';
 import { repos } from './repos.ts';
 
 const config = JSON.parse(readFileSync(new URL('qa-config.json', import.meta.url), 'utf8'));
@@ -37,8 +37,7 @@ function verdict(issue: Issue, key: string) {
 function evidence(body: string, pr: string, sha: string) {
   return new RegExp(`https://github.com/${config.repository}/pull/${pr}(?:\\s|[)/]|$)`).test(body)
     && new RegExp(`\\b${sha}\\b`).test(body) && /(?:`{3,}|~{3,})(?:diff|text|rust|typescript|ts|sh)\b|^\s*[-*]\s+\S+/m.test(body)
-    // The dispatcher's own Cursor evidence comment carries only its marker for this head.
-    && commentMarkers(body).every(line => line === `<!-- factory-dispatch:cursor-evidence pr:${pr} sha:${sha} -->`);
+    && commentMarkers(body).length === 0;
 }
 const followupText = (body: string) => body.split(/^## Builder follow-up\s*$/m)[1]?.trim();
 // A changes verdict whose only finding is missing evidence for its own PR and head is moot
@@ -186,10 +185,6 @@ type Context = {
   showAmp: (issue: Issue, args: string[]) => void;
   log: (decision: string, details?: object) => void;
   labelThread: (issue: Issue, id: string) => Promise<void>;
-  cursorRun: (id: string, text: string) => Promise<'sent' | 'busy'>;
-  cursorStatus: (id: string) => Promise<string | undefined>;
-  cursorTerminal: string[];
-  showCursor: (issue: Issue, method: string, path: string) => void;
 };
 
 export function cleanupQAWorktrees(ctx: Context) {
@@ -234,17 +229,11 @@ export async function reviewPRs(ctx: Context) {
     if (!finished(issue, start.key, start.pr) && result?.value !== 'changes') active[start.runner]++;
   }
   for (const issue of issues) {
-    const builder = lines(issue).map(line => line.match(new RegExp(`^<!-- factory-dispatch:thread (T-[a-f0-9-]{36}(?: runner:(?:gpu|console))?|${cursorId} runner:cursor) -->$`))).find(Boolean)?.[1].split(' ')[0];
-    const claim = issue.comments.find(c => commentMarkers(c.body).some(line => /^<!-- factory-dispatch:claim runner:(gpu|console|cursor) -->$/.test(line)));
+    const builder = lines(issue).map(line => line.match(/^<!-- factory-dispatch:thread (T-[a-f0-9-]{36})(?: runner:(?:gpu|console))? -->$/)).find(Boolean)?.[1];
+    const claim = issue.comments.find(c => commentMarkers(c.body).some(line => /^<!-- factory-dispatch:claim runner:(gpu|console) -->$/.test(line)));
     if (!builder || !claim?.createdAt || ['completed', 'canceled'].includes(issue.state.type)) continue;
-    // A failed Cursor agent gets no new review or follow-up until Devon recovers it by hand.
-    if (lines(issue).includes(`<!-- factory-dispatch:cursor-failed ${builder} -->`)) { log('qa-skipped', { issue: issue.identifier, reason: 'Cursor agent failed' }); continue; }
-    // A Cursor builder's recorded original PR is the only one QA acts on; replacements get
-    // the dispatcher's one Devon mention and nothing else.
-    const original = builder.startsWith('bc-') ? lines(issue).map(line => line.match(/^<!-- factory-dispatch:cursor-pr pr:(\d+) -->$/)?.[1]).find(Boolean) : undefined;
     const attachments = issue.attachments.filter(a => Date.parse(a.createdAt) > Date.parse(claim.createdAt!)
-      && new RegExp(`^https://github.com/${config.repository}/pull/\\d+/?$`).test(a.url)
-      && (!original || a.url.match(/\/pull\/(\d+)/)![1] === original));
+      && new RegExp(`^https://github.com/${config.repository}/pull/\\d+/?$`).test(a.url));
     for (const attachment of attachments) {
       const pr = attachment.url.match(/\/pull\/(\d+)/)![1];
       if (attachment.metadata.status !== 'open') {
@@ -275,31 +264,14 @@ export async function reviewPRs(ctx: Context) {
           active[start.runner]--;
         }
         if (result?.value !== 'changes' || has(issue, `round ${start.key}`)) continue;
-        // Each claim is one send; only a recorded 409 agent_busy (no run started) allows another.
-        const count = (name: string) => lines(issue).filter(line => line === qa(`${name} ${start.key}`)).length;
-        if (count('followup-claim') > count('followup-busy')) continue;
+        // Each claim is one send.
+        if (has(issue, `followup-claim ${start.key}`)) continue;
         const followup = followupText(result.body);
         if (!followup) { log('qa-pending', { issue: issue.identifier, pr, reason: 'Missing builder follow-up' }); continue; }
         if (moot(issue, start.key)) { log('followup-moot', { issue: issue.identifier, pr, sha: start.sha }); continue; }
-        const cloud = builder.startsWith('bc-');
-        if (cloud && dryRun) ctx.showCursor(issue, 'GET', `/v1/agents/${builder}`);
-        else if (cloud) {
-          let status;
-          try { status = await ctx.cursorStatus(builder); }
-          catch { log('qa-pending', { issue: issue.identifier, pr, reason: 'Cursor status unavailable' }); continue; }
-          if (!ctx.cursorTerminal.includes(status!)) { log('qa-pending', { issue: issue.identifier, pr, reason: 'Cursor run active' }); continue; }
-        }
         await comment(issue, `QA follow-up claimed; inspect interrupted delivery before recovery.\n\n${qa(`followup-claim ${start.key}`)}`);
-        // Cursor builders receive the findings as a follow-up run on their agent; Cursor updates the PR.
-        const text = `Dispatcher QA findings for PR ${pr} at ${start.sha}. Check these findings against your current head, fix what remains, verify, ${cloud ? 'and push your branch. Cursor updates the existing PR; the dispatcher posts the Linear evidence comment' : 'push, and post the updated Linear diff comment'}. Never deploy or merge.\n\n${followup}`;
-        if (cloud) {
-          if (dryRun) ctx.showCursor(issue, 'POST', `/v1/agents/${builder}/runs`);
-          else if (await ctx.cursorRun(builder, text) === 'busy') {
-            await comment(issue, `Cursor agent busy (409 agent_busy); no run started. The follow-up is retried after the current run ends.\n\n${qa(`followup-busy ${start.key}`)}`);
-            log('qa-followup-busy', { issue: issue.identifier, pr });
-            continue;
-          }
-        } else if (dryRun) showAmp(issue, ['amp', 'threads', 'continue', builder, '-ox', '$QA_FOLLOWUP']);
+        const text = `Dispatcher QA findings for PR ${pr} at ${start.sha}. Check these findings against your current head, fix what remains, verify, push, and post the updated Linear diff comment. Never deploy or merge.\n\n${followup}`;
+        if (dryRun) showAmp(issue, ['amp', 'threads', 'continue', builder, '-ox', '$QA_FOLLOWUP']);
         else await amp(['threads', 'continue', builder, '-ox', text]);
         const rounds = starts(issue).filter(start => start.pr === pr && has(issue, `round ${start.key}`)).length + 1;
         await comment(issue, `QA changes delivered (round ${rounds}).${rounds >= 2 ? `\n\n${devonMention} two rounds without ready; automatic QA stopped. Inspect the builder's second fix before restarting.` : ''}\n\n${qa(`round ${start.key}`)}${rounds >= 2 ? `\n${qa(`stopped pr:${pr}`)}` : ''}`);
@@ -394,7 +366,7 @@ export async function reviewPRs(ctx: Context) {
 const wrapupDone = '<!-- factory-dispatch:wrapup-done -->';
 // Merged factory PRs linked after this dispatch's claim; older ones belong to earlier work.
 function mergedPRs(issue: Issue) {
-  const claim = issue.comments.find(c => commentMarkers(c.body).some(line => /^<!-- factory-dispatch:claim runner:(gpu|console|cursor) -->$/.test(line)));
+  const claim = issue.comments.find(c => commentMarkers(c.body).some(line => /^<!-- factory-dispatch:claim runner:(gpu|console) -->$/.test(line)));
   return issue.attachments.flatMap(attachment => {
     const pr = attachment.url.match(new RegExp(`^https://github.com/${config.repository}/pull/(\\d+)/?$`))?.[1];
     return pr && attachment.metadata.status === 'merged' && Date.parse(attachment.createdAt) > Date.parse(claim?.createdAt ?? '') ? [pr] : [];

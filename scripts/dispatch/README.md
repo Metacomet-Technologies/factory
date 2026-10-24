@@ -1,8 +1,8 @@
 # Linear factory dispatcher (MET-80)
 
 Single-user, outbound-only automation of [PLAYBOOK §4](../../docs/PLAYBOOK.md#4-agent-prompt-template).
-No dependencies, webhook, OAuth app, new credential, or runner changes
-(MET-207 adds one optional Cursor key for `engine/cursor`). The one database is
+No dependencies, webhook, OAuth app, new credential, or runner changes.
+The one database is
 Node's built-in `node:sqlite` ledger (MET-261).
 Node **24.22.1** in `.node-version` remains the preferred and CI version; runtime
 accepts Node 24.x at **24.12.0** or newer. Requires Linux `flock` and the agent's
@@ -250,15 +250,12 @@ and updates main, then the next eligible factory-access issue completes.
 Configuration:
 
 - `LINEAR_API_KEY_FILE`: `/etc/factory-dispatch/linear-api-key`; read, never logged.
-- `CURSOR_API_KEY_FILE`: `/etc/factory-dispatch/cursor-api-key`; optional, read
-  only for `engine/cursor` issues, never logged (MET-207 below).
 - `DISPATCH_TEAM`: `MET`.
 - `DISPATCH_MAX_ACTIVE_PER_RUNNER`: fallback for runners without an override;
   positive integer, default `2`. Existing deployments using only this variable
   keep the same cap on both runners.
 - `DISPATCH_RUNNER_CAPS`: optional comma-separated overrides, e.g.
-  `gpu=4,console=2`. Keys are `gpu`, `console` and `cursor` (default 2, never
-  from the global fallback), not Amp runner IDs. Each value
+  `gpu=4,console=2`. Keys are `gpu` and `console`, not Amp runner IDs. Each value
   must be a positive safe integer written with decimal digits only. Unknown or
   duplicate keys, whitespace, empty entries and malformed values fail startup
   before API calls. Omit this variable rather than setting it to an empty string.
@@ -336,7 +333,7 @@ each.
      (`engine/ultra`, or `agent-effort/ultra` with grok or go).
 2. **Subscription family.** Choose the family that fits the task and has
    verified availability:
-   - existing families: Amp (the default), ChatGPT, Claude Code and Cursor;
+   - existing families: Amp (the default), ChatGPT and Claude Code;
    - Grok (Grok 4.7) or OpenCode Go (GLM-5.3 Flash at low and medium, GLM-5.3
      at high);
    - `engine/docs` is the first candidate for documentation-only work. Use a
@@ -382,200 +379,6 @@ the check.
 
 - [Ultra probe](https://ampcode.com/threads/T-01a133dc-100b-72c8-bce7-b77d3d2d4998)
 - [Claude low probe](https://ampcode.com/threads/T-01a133dc-1b2d-744f-9db0-1d2e62b9119c)
-
-## Cursor Cloud Agent builders (MET-207)
-
-`engine/cursor` (grouped or flat) launches the builder as a Cursor Cloud Agent
-through the [Cloud Agents API v1](https://cursor.com/docs/cloud-agent/api/endpoints)
-(public beta, no webhooks) instead of an Amp thread on a factory runner. Claims,
-blockers, QA, the merge gate, wrap-up and Devon's deploy/verify are unchanged.
-**Key:** a personal (user) API key with only "Run agents" (see Key below). Team
-keys are not supported: their agents run as a service token, are invisible to
-Devon and got no PR (verified 2026-10-18).
-**Environment:** `repos` launches resolve to Devon's personal environment,
-configured by the repo's `.cursor/environment.json` (MET-248).
-**Billing and usage:** the team plan (Devon's Ultra seat); the claim says the
-agent bills Cursor usage. Per-agent usage has returned 0 so far, so the
-`Cursor usage` comment is best-effort.
-Use it only when the task's checks run in CI or the cloud sandbox
-(`docs/agents/cloud.md`): cloud builders cannot reach factory-gpu.
-
-Validation: full-flow (factory) issues only. `agent-effort` and the runner
-defaults are ignored; `repo/<simple repo>`, any `runner/*` label, or a missing,
-unreadable or empty key take the invalid path before any claim (label removed,
-reasons commented). Reasons: `engine/cursor is only for the full factory flow`,
-`engine/cursor cannot be combined with runner/*`, `Cursor key unavailable`.
-
-Capacity: key `cursor`, default **2**, set only by `DISPATCH_RUNNER_CAPS`
-(for example `gpu=4,console=2,cursor=1`). It counts `claim runner:cursor` and
-`thread bc-… runner:cursor` markers until the wrap-up marker, like gpu/console.
-Cursor builders never use or count gpu/console slots, and nothing overflows into
-or out of `cursor`. A full cursor slot logs `capacity` with `runner: cursor` and
-leaves `dispatch` on. The `caps` log line keeps its gpu/console shape.
-
-Lifecycle and markers:
-
-1. Remove `dispatch`, then post `Dispatch claimed on cursor.` with
-   `<!-- factory-dispatch:claim runner:cursor -->`, no `worktree` marker, and
-   `Engine cursor: bills Cursor usage (Ultra plan).`
-2. `POST /v1/agents` with `name` (`MET-n — title`, at most 100 characters),
-   `prompt.text` (the shared builder prompt with the cloud Startup block),
-   `repos: [{ url: https://github.com/Metacomet-Technologies/factory, startingRef: main }]`
-   `autoCreatePR: true` and `skipReviewerRequest: true`. No `model` (Cursor's
-   default applies), no `envVars`, no `mcpServers`: Linear comes from the
-   dashboard MCP (OAuth). `openAsCursorGithubApp` keeps its user-key default, so
-   PRs open as Devon.
-3. Post `https://cursor.com/agents/<id>` with
-   `<!-- factory-dispatch:thread <bc-id> runner:cursor -->`, then move to In Progress.
-
-**PR (verified 2026-10-18):** Cursor opens a draft PR as Devon after the agent
-pushes (`autoCreatePR`; PRs 133 and 134). A prompt that forbids PRs suppresses
-it, so Cursor prompts must never forbid PRs. The prompt tells the agent to commit
-and push its branch when the work is complete, post no evidence comment, title
-its work `MET-n — <issue title>` and end its reply with tests, deviations and
-unverified items; QA follow-ups say Cursor updates the existing PR. The
-dispatcher then normalizes that PR (below). Cursor's own title and body, and
-whether follow-up runs push to the same branch, remain **unverified**.
-
-Every thread-marker consumer accepts `bc-<uuid>` (Cursor's documented format)
-only with `runner:cursor`: capacity, QA builder lookup, wrap-up, labeling (skipped:
-agents have no Amp labels), archive and the stage-policy observer (runner `cursor`).
-Amp `T-` markers parse exactly as before.
-
-Unknown outcome: a timeout (30 seconds), transport error, non-2xx response or
-missing/invalid agent ID keeps the claim and posts one comment with the reason and
-`<Devon>: inspect cursor.com/agents before manual recovery`. There is never a
-retry, including after relabeling. 401/403 say `Cursor key rejected (HTTP n)`.
-Other errors publish only `Cursor HTTP <status>` plus Cursor's `error.code` when
-it is one of the codes documented in the v1 OpenAPI Error schema; free-text
-messages are never published because they may reflect request data. Output is
-also redacted for the raw key and its Basic encoding and capped at 200 characters.
-The key travels only as the Basic username (`key:`); it is never logged,
-commented or echoed, and dry-run prints `Basic [redacted]`.
-
-Status: v1 agents are only `ACTIVE`/`ARCHIVED`; execution status lives on runs.
-Each pass, an active cursor builder (not Done/Canceled, no wrap-up, no merged PR
-newer than the claim) gets `GET /v1/agents/<id>` and, when it has one,
-`GET /v1/agents/<id>/runs/<latestRunId>`. Before a PR links, run `ERROR`,
-`CANCELLED` or `EXPIRED`, or an `ARCHIVED` agent (archived or expired), posts one
-Devon mention with the status and agent URL plus
-`<!-- factory-dispatch:cursor-failed <bc-id> -->`; the dispatcher then stops
-acting on that agent: no further status polls, normalization, QA reviews or
-`/runs` follow-ups (logged `qa-skipped`), even after a late PR or verdict. The
-claim keeps its slot until wrap-up; recovery is manual. Read failures log
-`cursor-status-pending`. Dry-run previews these reads without calling.
-
-PR normalization: when the latest run is `FINISHED`, the dispatcher normalizes
-the issue's original PR (below). Each step reads the PR with `gh pr view` and acts only when
-needed, logging one `cursor-pr` decision per action:
-
-1. Title not starting `MET-n — ` → `gh pr edit --title "MET-n — <issue title>"`.
-2. Body without a `Closes MET-n` / `Contributes MET-n` line (per Link type) →
-   prepend it, keeping the rest (`gh pr edit --body-file -`).
-3. Draft → `gh pr ready`.
-4. No `<!-- factory-dispatch:cursor-evidence pr:<n> sha:<head> -->` yet → post the
-   AGENTS.md evidence comment: PR URL, head SHA and the full file list from
-   `gh api …/pulls/<n>/files` (deletions and rename sources called out). A head
-   that moves during the read waits for the next poll. A new head after a
-   follow-up run gets a new comment; QA accepts it as round-two evidence.
-
-A closed PR or one not based on `main` is skipped (`cursor-pr-skipped`). A
-failed step logs `cursor-pr-failed` and posts one Devon mention naming the step
-(`<!-- factory-dispatch:cursor-pr-failed pr:<n> step:<step> -->`); later steps
-wait and every poll retries. A run that reports another PR in the repo posts one
-Devon mention (`cursor-pr-other pr:<n>`) and is never acted on; PR URLs in other
-repos only log `cursor-pr-foreign`.
-
-QA: unchanged reviewer selection treats cursor like amp (Claude reviews at high
-effort on gpu/console). Delivered changes go to `POST /v1/agents/<id>/runs`
-instead of `amp threads continue`; the text tells the agent to push its branch
-(Cursor updates the existing PR) and leave the Linear evidence comment to the
-dispatcher. Round counting, the two-round stop and its Devon mention are
-unchanged; the merge continuation still goes to the local reviewer.
-
-- While the latest run is not terminal (`CREATING`, `RUNNING`, …) or its status
-  is unreadable, the follow-up stays pending (`qa-pending`) with no claim.
-- A documented `409 agent_busy` proves no run started: it posts
-  `<!-- factory-qa:followup-busy <key> -->` and a later poll, once the run is
-  terminal, claims and sends again. Each `followup-claim` is one send; a send is
-  allowed only while busy markers equal claims, so delivery happens once.
-- Any other failure or unknown outcome keeps the claim and is never retried, as
-  for Amp.
-- A changes verdict whose follow-up only asks for evidence for its own PR and
-  head is moot. Recognition is conservative: every line must open with a
-  post/update/provide evidence (or diff) comment request and name no other work
-  (no fix, run, test, change, code, …), and no other PR or SHA may appear. It is moot once matching evidence exists: nothing is sent, `followup-moot` is
-  logged, no round is consumed and a fresh review starts at the same head. Mixed
-  findings and stale or wrong-PR evidence are delivered as usual.
-
-Original PR: the first PR the dispatcher sees for the issue (an evidence marker,
-the earliest post-claim linked PR by attachment time, or the first run-reported
-URL) is recorded before any write as `<!-- factory-dispatch:cursor-pr pr:<n> -->`
-and stays the issue's PR, even if its first normalization failed. Later runs
-reporting another URL get the one Devon mention and no writes. QA for a Cursor
-builder with that marker reviews, follows up and merges only the recorded PR;
-other linked PRs are ignored.
-
-Wrap-up: a cloud agent cannot update factory-gpu's main checkout. After merge,
-the same `wrapup-claim` precedes a **new local Amp thread** on gpu:
-`amp -x <wrap-up prompt> --mode low --executor runner:factory-gpu --runner-dir
-/home/agent/work/factory --title "MET-n — wrap-up"`. Its prompt starts on main and
-skips the worktree-removal steps because no worktree marker exists. The submitted
-comment carries `wrapup` plus `<!-- factory-dispatch:wrapup-thread <T-id> -->`;
-the thread is labeled `factory`. Failures post the usual non-retrying comment.
-Then `GET /v1/agents/<id>/usage` posts `Cursor usage: <totalTokens> tokens,
-$<chargedCents/100> charged (0 = plan-included)` with
-`<!-- factory-dispatch:cursor-usage <bc-id> -->`. Tokens can lag a finished run:
-a 0-token or failed read instead posts `cursor-usage-pending <bc-id>`, and one
-later poll re-reads and posts whatever it gets (or `Cursor usage unavailable`).
-Usage never blocks or retries the wrap-up.
-
-Archive: after Done and the wrap-up marker, both archive through the shared
-five-attempt path and thread-ID markers. The wrap-up thread uses Amp's listing
-quiet time. The agent archives only with proof: `GET /v1/agents/<id>` returns
-`ACTIVE` (or the prose-documented `IDLE`) with a `latestRunId`, that run reads back
-with a terminal status (`FINISHED`, `ERROR`, `CANCELLED`, `EXPIRED`), and both
-records have valid `updatedAt` values at least five minutes old. Anything else
-(active, missing or unknown run status, absent run ID, unknown agent status,
-unreadable or future timestamps) stays `archive-pending`. Then the documented,
-idempotent `POST /v1/agents/<id>/archive` runs; an already `ARCHIVED` agent only
-records the marker. Canceled issues never
-archive the agent. `DELETE` is never used.
-
-Limits: no webhooks, so status lags one poll. One run per agent; follow-ups to a busy
-agent fail closed. Cursor's v1 is beta and may change. Agent Linear comments use
-whatever identity Cursor's Linear MCP connection has (recorded by the live check).
-Test-only `DISPATCH_CURSOR_URL` accepts only a loopback HTTP origin.
-
-Key: Devon's personal (user) API key with only "Run agents"
-(`op://Factory/Cursor API Key/credential`); team keys are not supported.
-`CURSOR_API_KEY_FILE`, default `/etc/factory-dispatch/cursor-api-key`,
-`root:agent 0640`, read only when a cursor issue needs it. The installer reports
-it present (with owner/mode) or absent and never fails when it is absent; a present
-key must be a regular, non-empty root:agent 0640 file. Rollback never deletes it.
-Provision it from Mac with the same no-echo pattern as the Linear key. First open
-an interactive GPU shell (so `opin` can prompt):
-
-```sh
-gpu-ssh
-```
-
-In that shell (no key creation, shell tracing or printing):
-
-```sh
-set -euo pipefail
-set +x
-umask 077
-temporary=$(mktemp)
-trap 'rm -f "$temporary"' EXIT
-opin read 'op://Factory/Cursor API Key/credential' > "$temporary"
-test -s "$temporary"
-sudo install -d -o root -g agent -m 0750 /etc/factory-dispatch
-sudo install -o root -g agent -m 0640 "$temporary" /etc/factory-dispatch/cursor-api-key
-rm -f "$temporary"
-trap - EXIT
-exit
-```
 
 ## Project-attached worktrees (MET-134)
 
@@ -872,7 +675,7 @@ The completion marker means submitted, not that the build or deployment passed.
 Wrap-ups run after dispatch decisions; a freed slot is available next pass.
 
 **One wrap-up per runner (MET-214).** Each runner's wrap-ups share its main
-checkout; a cursor builder's wrap-up runs on gpu. A legacy thread marker without
+checkout. A legacy thread marker without
 `runner:` takes the runner from the dispatch claim. With neither, the runner is
 unknown and conflicts with every runner. A wrap-up is open while its issue is
 open (not Done or Canceled) and has `wrapup` without `wrapup-done`. Done and

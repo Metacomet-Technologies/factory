@@ -12,7 +12,7 @@ set -euo pipefail
 
 usage() {
     echo 'Usage: scripts/env/setup.sh [--env <name>] [--ci] [--prebuild] [--check-only]' >&2
-    echo 'Without --env: ci with --ci, otherwise cursor (the full contract, nothing exempt).' >&2
+    echo 'Without --env: ci with --ci, otherwise factory-gpu (the full contract, nothing exempt).' >&2
     exit 2
 }
 
@@ -30,10 +30,10 @@ while (($#)); do
         *) usage ;;
     esac
 done
-# The default never under-provisions: cursor exempts nothing, so a bare run
+# The default never under-provisions: factory-gpu exempts nothing, so a bare run
 # meets every environment's requirements.
 if [[ -z "$env_name" ]]; then
-    if ((ci)); then env_name=ci; else env_name=cursor; fi
+    if ((ci)); then env_name=ci; else env_name=factory-gpu; fi
 fi
 export DEBIAN_FRONTEND=noninteractive
 initial_path=$PATH

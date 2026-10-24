@@ -183,7 +183,7 @@ class SetupTest(unittest.TestCase):
         return found
 
     def test_converges_then_reruns_without_changes(self):
-        code, err, calls = self.run_setup("--env", "cursor")
+        code, err, calls = self.run_setup("--env", "factory-gpu")
         self.assertEqual(code, 0, err)
         joined = "\n".join(calls)
         self.assertIn("apt-get install --no-install-recommends -y ca-certificates build-essential pkg-config", joined)
@@ -202,7 +202,7 @@ class SetupTest(unittest.TestCase):
         self.assertIn(f'. "{self.home}/.config/vite-plus/env"', profile)
 
         before = self.tree()
-        code, err, calls = self.run_setup("--env", "cursor")
+        code, err, calls = self.run_setup("--env", "factory-gpu")
         self.assertEqual((code, calls), (0, []), err)
         self.assertIn("0 change(s)", err)
         self.assertEqual(self.tree(), before)
@@ -318,8 +318,8 @@ class SetupTest(unittest.TestCase):
             # Reversed, because each GITHUB_PATH line is prepended.
             self.assertEqual(handle.read().splitlines(), [f"{self.home}/.cargo/bin", f"{self.home}/vp/bin"])
 
-        # Cursor still requires Playwright and the layout; --ci installs neither, so its check fails.
-        code, err, calls = self.run_setup("--ci", "--env", "cursor", GITHUB_PATH=github_path)
+        # factory-gpu still requires Playwright and the layout; --ci installs neither, so its check fails.
+        code, err, calls = self.run_setup("--ci", "--env", "factory-gpu", GITHUB_PATH=github_path)
         self.assertEqual(code, 1, err)
         self.assertNotIn("vp exec playwright install chromium", calls)
         self.assertFalse(os.path.exists(self.layout))
