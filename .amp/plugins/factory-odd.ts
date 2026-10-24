@@ -17,13 +17,16 @@ import {
 	type Load,
 	type Role,
 } from '../../scripts/odd/lifecycle.ts'
+import { issueFromEvent, loadFrom, roleLabelQueries, toSnapshot, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
 
 export const description =
 	'Factory ODD control plane: Linear, GitHub and Slack webhooks drive a deterministic outcome lifecycle; role agents run in orbs; Ralph loops are bounded by external checks. See docs/odd/README.md.'
 
-// Phase 2 (MET-276): the plugin is armed only in the control thread. Everywhere else it
-// registers the role modes and the Ralph guard and does nothing on its own.
+// The plugin is armed only in the control thread (label odd-control-plane). Everywhere else it
+// registers the role modes and the Ralph guard and does nothing on its own. Phase 2 (MET-277)
+// derives and logs; `perform` acts only when the control thread also carries odd-perform.
 const controlLabel = 'odd-control-plane'
+const performLabel = 'odd-perform'
 const marker = '[odd]'
 
 export default async function (amp: PluginAPI) {
@@ -93,10 +96,15 @@ export default async function (amp: PluginAPI) {
 		const handle = (source: 'linear' | 'github' | 'slack') => async (event: WebhookEvent, hctx: WebhookHandlerContext) => {
 			if (seen.has(event.id)) return
 			seen.add(event.id)
-			const issue = await snapshotFor(hctx, source, event.payload)
-			if (!issue) return
+			const identifier = issueFromEvent(source, new TextDecoder().decode(event.body))
+			if (!identifier) return
+			const issue = await snapshotFor(hctx, identifier)
 			const action = nextAction(issue, await currentLoad(hctx))
 			hctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
+			if (!(await hctx.thread.labels()).includes(performLabel)) {
+				hctx.logger.log(marker, 'dry run; add label', performLabel, 'to act')
+				return
+			}
 			await perform(hctx, issue, action)
 		}
 		const urls = await Promise.all((['linear', 'github', 'slack'] as const).map(async key => {
@@ -108,7 +116,7 @@ export default async function (amp: PluginAPI) {
 		await ctx.ui.confirm({ title: 'ODD webhook endpoints', message: urls.join('\n'), confirmButtonText: 'Configured', requireHuman: true })
 	})
 
-	// Phase 2 stops here: derive and log. Phases 3-6 fill in `perform` stage by stage.
+	// Phases 3-6 fill in `perform` stage by stage; today only spawn, steer and page are wired.
 	async function perform(ctx: WebhookHandlerContext, issue: IssueSnapshot, action: Action) {
 		switch (action.kind) {
 			case 'spawn': {
@@ -139,17 +147,46 @@ export default async function (amp: PluginAPI) {
 	}
 }
 
-// --- Derivation helpers. Real implementations land with phase 2; shapes are fixed here. --------
+// --- Derivation: Linear through the thread's MCP tools, GitHub through gh, Amp through thread search.
+// Tool calls run without a model (PluginTools.call); the pure combination lives in scripts/odd/snapshot.ts.
 
-async function snapshotFor(ctx: WebhookHandlerContext, source: string, payload: unknown): Promise<IssueSnapshot | undefined> {
-	ctx.logger.log(marker, 'snapshot', source, typeof payload)
-	return undefined
+type Tools = WebhookHandlerContext['tools']
+
+async function snapshotFor(ctx: WebhookHandlerContext, identifier: string): Promise<IssueSnapshot> {
+	const [issue, comments, pr, threads] = await Promise.all([
+		ctx.tools.call('linear.get_issue', { id: identifier }) as Promise<LinearIssue>,
+		ctx.tools.call('linear.list_comments', { issueId: identifier, limit: 50 }).then(result => (result as { comments?: { body: string }[] }).comments ?? []),
+		pullRequestFor(ctx, identifier),
+		threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`),
+	])
+	// Open blockers are not exposed by the Linear MCP; phase 4 (MET-279) adds them before builders spawn.
+	return toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers: [] })
+}
+
+async function pullRequestFor(ctx: WebhookHandlerContext, identifier: string): Promise<GitHubPullRequest | undefined> {
+	const result = await ctx.$`gh pr list --search ${identifier} --state all --json number,headRefOid,state,mergeCommit,statusCheckRollup --limit 5`
+	if (result.exitCode !== 0) {
+		ctx.logger.log(marker, 'gh pr list failed', result.stderr.trim())
+		return undefined
+	}
+	const prs = JSON.parse(result.stdout) as GitHubPullRequest[]
+	// Prefer the open PR; otherwise the merged one, so a merged issue derives `Deploying`.
+	return prs.find(pr => pr.state === 'OPEN') ?? prs.find(pr => pr.state === 'MERGED')
+}
+
+async function threadsFor(tools: Tools, query: string): Promise<LiveThread[]> {
+	const found = (await tools.call('find_thread', { query, limit: 100 })) as { threads: { id: string }[] }
+	return Promise.all(found.threads.map(async ({ id }) => {
+		const status = (await tools.call('get_thread_status', { thread: id })) as { metadata: { labels: string[] }; agentState?: { state?: string } }
+		return { id, labels: status.metadata.labels, state: status.agentState?.state ?? 'idle' }
+	}))
 }
 
 async function currentLoad(ctx: WebhookHandlerContext): Promise<Load> {
-	// Derived from live thread labels odd-role-* in later phases; conservative until then.
-	ctx.logger.log(marker, 'load assumed full', JSON.stringify(capacity))
-	return { orbs: capacity.orbs, runnerSlots: capacity.runnerSlots }
+	const threads = (await Promise.all(roleLabelQueries.map(query => threadsFor(ctx.tools, query)))).flat()
+	const load = loadFrom(threads)
+	ctx.logger.log(marker, 'load', JSON.stringify(load), 'of', JSON.stringify(capacity))
+	return load
 }
 
 async function externalStop(ctx: { $: WebhookHandlerContext['$'] }, role: Role, issue: string): Promise<{ stopMet: boolean; missing: string[] }> {
