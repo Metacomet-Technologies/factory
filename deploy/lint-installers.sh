@@ -10,14 +10,18 @@
 # Checks, in script order (function calls and `source` are followed; heredocs,
 # comments and quoted text are not commands):
 #   strict     the first command is `set` with -e, -u and -o pipefail (-E too when an ERR trap exists)
-#   root       an EUID/`id -u` test against 0 that exits, before the first deploy mutation
+#   root       an EUID/`id -u` test against 0 whose failing branch exits for non-root (`-eq 0 ]] || exit`,
+#              `-ne 0 ]] && exit`, or `if ... -ne 0; then ... exit`), directly or in a called function, before
+#              the first deploy mutation; an inverted guard or one after a mutation on its line does not count
 #   preflight  at least one read-only check (test, command -v, getent, stat, curl, systemctl show/is-*, ...)
 #              before the first deploy mutation
 #   trap       an ERR or EXIT trap that writes a diagnostic to stderr, before the first deploy mutation
-#   snapshot   installers copy existing state into a /var/backups or $snapshot path first; rollbacks either do
-#              that or validate the snapshot they consume
-#   health     after the first deploy mutation: curl with --max-time/-m, `timeout N`, systemctl is-active, a
-#              deadline/seq/attempt-bounded loop, or starting a repo oneshot unit that sets TimeoutStartSec
+#   snapshot   installers back up existing state first: cp of a non-scratch, non-repo path, or sqlite3 .backup,
+#              into a /var/backups or $snapshot path (touch markers and recorded states are not backups);
+#              rollbacks either do that or validate the snapshot they consume
+#   health     after the first deploy mutation, a bounded probe of the component: curl with --max-time/-m,
+#              `timeout N` around curl/wget/upsc/nc, systemctl is-active, a deadline/seq/attempt-bounded loop
+#              that runs one of those probes (directly or through an array), or starting a repo oneshot unit that sets TimeoutStartSec
 #   rollback   installers name an existing rollback-*.sh in their directory; rollbacks are named by another
 #              deploy script or a Markdown doc
 # A deploy mutation is a write (install, cp, mv, rm, mkdir, chown, chmod, touch, tee, sed -i, redirection,
@@ -72,7 +76,8 @@ SYSTEMCTL_WRITES = {"start", "stop", "restart", "reload", "enable", "disable", "
 SYSTEMCTL_READS = {"show", "is-active", "is-enabled", "is-failed", "cat", "status", "list-timers", "list-units"}
 CHECK_COMMANDS = {"[[", "[", "test", "command", "getent", "id", "stat", "cmp", "curl", "hostname", "df",
                   "dpkg-query", "timedatectl", "systemd-analyze", "sqlite3", "find", "ss", "fuser"}
-SNAPSHOT_COPIES = {"cp", "touch", "stat", "systemctl", "sqlite3"}
+PROBES = {"curl", "wget", "upsc", "nc"}
+REPO_SOURCE = re.compile(r"^\"?\$\{?(here|repo)\b|^\"?\$\{?root\}?/deploy\b")
 ROOT_TEST = re.compile(r"(\bEUID\b|\$\(id -u\))[^]\n]*?(-eq|-ne|==|!=)\s*0\b")
 BOUNDED_LOOP = re.compile(r"SECONDS\s*<\s*deadline|\$\(seq \d+\)|attempt\s*<\s*\d+")
 
@@ -253,6 +258,8 @@ class Script:
                         break
             elif token == "timeout" and i + 1 < len(tokens):
                 bounded, i = True, i + 2
+                while i < len(tokens) and tokens[i].startswith("-"):
+                    i += 1
             elif token == "exec" and i + 1 < len(tokens) and not re.match(r"^\d*[<>]", tokens[i + 1]):
                 i += 1
             elif token in self.functions and self.wrapper(token):
@@ -291,15 +298,17 @@ class Script:
         if re.match(r"^trap\s", text):
             return found
         if BOUNDED_LOOP.search(text):
-            found.add("health")
+            found.add("loop")
         if re.search(r"-[fde]\s+\"?\$\{?(1|" + "|".join(map(re.escape, self.backup)) + r")\b", text):
             found.add("consume")
         for segment in segments(text):
             tokens, bounded = self.command(segment)
-            if bounded:
-                found.add("health")
             if not tokens:
                 continue
+            if tokens[0] in PROBES:
+                found.add("probe")
+                if bounded:
+                    found.add("health")
             name, args = tokens[0], []
             skip = False
             for token in tokens[1:]:
@@ -310,7 +319,10 @@ class Script:
                 else:
                     args.append(token)
             if name in self.functions and name not in stack:
-                found |= self.function_effects(name, stack + (name,))
+                called = self.function_effects(name, stack + (name,))
+                if {"loop", "probe"} <= called:
+                    called.add("health")
+                found |= called
                 continue
             redirect = [m.group(1) for m in re.finditer(r"(?<![<&])\d*>>?\s*([^&\s][^\s]*)", segment)
                         if m.group(1) != "/dev/null"]
@@ -331,9 +343,8 @@ class Script:
                 scratch = all(t is not None and self.in_area(t, self.scratch) for t in writes)
                 found.add("scratch" if scratch else "mutation")
                 into_backup = [t for t in writes if t is not None and self.in_area(t, self.backup) and t.strip('"') != "/dev/null"]
-                if name in SNAPSHOT_COPIES and into_backup and not (name == "systemctl" and not redirect):
-                    found.add("snapshot")
-                if name == "cp" and into_backup:
+                sources = [a for a in args if not a.startswith("-")][:-1] if name == "cp" else []
+                if into_backup and any(not self.in_area(a, self.scratch) and not REPO_SOURCE.match(a) for a in sources):
                     found.add("snapshot")
             if name == "bash" and any(re.search(r"rollback-[\w.-]+\.sh", a) for a in args) and "--snapshot" in args:
                 found.add("snapshot")
@@ -342,7 +353,7 @@ class Script:
             if name in CHECK_COMMANDS or (name == "systemctl" and args[:1] and args[0] in SYSTEMCTL_READS):
                 if "$#" not in segment:
                     found.add("check")
-            if name == "curl" and re.search(r"(^|\s)(--max-time|-m)(\s|=)", segment):
+            if name == "curl" and re.search(r"(^|\s)(--max-time|-m)(\s|=|\d)", segment):
                 found.add("health")
             if name == "systemctl" and "is-active" in args:
                 found.add("health")
@@ -372,6 +383,89 @@ class Script:
         return False
 
 
+WORD = r"(?<![\w$-]){}(?![\w-])"
+
+
+def exits(script, text, stack=()):
+    """True when text runs `exit` with a non-zero or default status, directly or in a called function."""
+    if re.search(WORD.format("exit") + r"(?!\s+0\b)", flatten(text)):
+        return True
+    for segment in segments(text):
+        tokens, _ = script.command(segment)
+        name = tokens[0] if tokens else None
+        if name in script.functions and name not in stack:
+            if any(exits(script, body, stack + (name,)) for _, _, body in script.functions[name]):
+                return True
+    return False
+
+
+def branch(texts, i, after):
+    """The then-branch of the `if` whose condition ends in texts[i] just before `after`."""
+    joined = " ; ".join([flatten(after)] + [flatten(t) for t in texts[i + 1:i + 200]])
+    start = re.search(WORD.format("then"), joined)
+    if not start:
+        return ""
+    depth = 0
+    for word in re.finditer(WORD.format("(if|fi|else|elif)"), joined[start.end():]):
+        if word.group(1) == "if":
+            depth += 1
+        elif depth and word.group(1) == "fi":
+            depth -= 1
+        elif not depth:
+            return joined[start.end():start.end() + word.start()]
+    return ""
+
+
+def root_guard(script, texts, i, stack=()):
+    """True when texts[i] refuses non-root before any mutation on the same line."""
+    text = texts[i]
+    test = ROOT_TEST.search(text)
+    if test and "mutation" not in script.effects(text[:test.start()]):
+        prefix, rest = text[:test.start()], text[test.end():]
+        close = re.search(r"\]\]|\)\)|\]", rest)
+        inner, after = (rest[:close.start()], rest[close.end():].lstrip()) if close else (rest, "")
+        nonroot = test.group(2) in ("-ne", "!=")
+        if re.search(r"!\s*(\[\[|\(\(|\[)\s*\$?$", prefix):
+            nonroot = not nonroot
+        if after.startswith("||") and not nonroot and "||" not in inner:
+            return exits(script, after[2:].split("&&")[0])
+        if after.startswith("&&") and nonroot and "&&" not in inner:
+            return exits(script, after[2:].split("||")[0])
+        if re.search(r"(^|[;&|]\s*)(el)?if\s+(!\s*)?(\[\[|\(\(|\[)\s*\$?$", prefix) and nonroot and "||" not in inner:
+            return exits(script, branch(texts, i, after))
+    for segment in segments(text):
+        tokens, _ = script.command(segment)
+        name = tokens[0] if tokens else None
+        if name in script.functions and name not in stack:
+            body = [t for _, _, t in script.functions[name]]
+            before = text[:text.find(name)]
+            if "mutation" not in script.effects(before) and any(
+                    root_guard(script, body, j, stack + (name,)) for j in range(len(body))):
+                return True
+    return False
+
+
+def loop_probes(texts, i):
+    """True when the bounded loop starting at texts[i] runs a probe before its matching `done`.
+
+    A probe is one of PROBES, directly or through an array such as upsc=(runuser -u nut -- upsc)."""
+    arrays = {m.group(1) for t in texts for m in re.finditer(r"(?:^|[\s;])(\w+)=\(([^)]*)\)", t)
+              if set(m.group(2).split()) & PROBES}
+    depth, opened = 0, False
+    for text in texts[i:i + 200]:
+        flat = flatten(text)
+        if any(re.search(r"\$\{" + re.escape(name) + r"\[@\]\}", flat) for name in arrays):
+            return True
+        if any(re.match(r"(sudo\s.*\s|timeout\s+\S+\s+)?(" + "|".join(PROBES) + r")\b", seg) for seg in segments(text)) \
+                or re.search(r"(^|[;\s])(" + "|".join(PROBES) + r")\s", flat):
+            return True
+        depth += len(re.findall(WORD.format("do"), flat)) - len(re.findall(WORD.format("done"), flat))
+        opened = opened or depth > 0
+        if opened and depth <= 0:
+            return False
+    return False
+
+
 def lint(script, references):
     lines = [(source, number, text, script.effects(text)) for source, number, text in script.lines]
     first = next((i for i, (*_, e) in enumerate(lines) if "mutation" in e), len(lines))
@@ -399,8 +493,8 @@ def lint(script, references):
     if missing:
         failures["strict"] = f"first command is not set -Eeuo pipefail (missing {', '.join(missing)})"
 
-    guard = next((i for i, (_, _, text, _) in enumerate(lines) if ROOT_TEST.search(text)
-                  and any(re.search(r"\b(exit|fail)\b", t) for _, _, t, _ in lines[i:i + 3])), None)
+    texts = [text for _, _, text, _ in lines]
+    guard = next((i for i in range(len(texts)) if root_guard(script, texts, i)), None)
     if guard is None or guard > first:
         failures["root"] = f"no root guard before the first deploy mutation ({where(first)})"
 
@@ -423,7 +517,8 @@ def lint(script, references):
         wanted = "snapshot copy" if script.kind == "install" else "snapshot copy or validated snapshot argument"
         failures["snapshot"] = f"no {wanted} before the first deploy mutation ({where(first)})"
 
-    if first < len(lines) and not any("health" in e for *_, e in after):
+    if first < len(lines) and not any("health" in e or ("loop" in e and loop_probes(texts, first + i))
+                                      for i, (*_, e) in enumerate(after)):
         failures["health"] = f"no bounded health check after the first deploy mutation ({where(first)})"
 
     text = script.path.read_text()

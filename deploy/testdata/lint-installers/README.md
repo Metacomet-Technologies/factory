@@ -9,10 +9,13 @@ copy. They are not tracked because `scripts/release/test-release.py` treats ever
 tracked unit under `deploy/` as deployable.
 
 - Compliant: `install-good.sh`, `install-good-oneshot.sh` (bounded oneshot health
-  check) and `rollback-good.sh`.
+  check), `install-called-root.sh` (root guard in a called function) and
+  `rollback-good.sh`.
 - One failure each: `install-no-strict.sh`, `install-no-root.sh`,
-  `install-late-root.sh`, `install-no-preflight.sh`, `install-no-trap.sh`,
-  `install-no-snapshot.sh`, `install-no-health.sh`, `install-no-health-oneshot.sh`,
-  `install-no-rollback.sh` and `rollback-no-snapshot.sh`.
+  `install-late-root.sh`, `install-inverted-root.sh`,
+  `install-root-after-mutation.sh`, `install-no-preflight.sh`, `install-no-trap.sh`,
+  `install-no-snapshot.sh`, `install-touch-snapshot.sh`, `install-no-health.sh`,
+  `install-no-health-oneshot.sh`, `install-timeout-true.sh`, `install-no-rollback.sh`
+  and `rollback-no-snapshot.sh`.
 - The unnamed rollback fails `rollback` because nothing here names it. Do not
   name it in this file.
