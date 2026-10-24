@@ -89,7 +89,8 @@ export default async function (amp: PluginAPI) {
 	// The label is usually set after the thread's first session.start, so every turn boundary
 	// re-checks it; `armed` keeps the webhooks and the one-time URL dialog from repeating.
 	// `urls` are credentials: kept in memory, shown only through the confirm dialog, never returned.
-	type ArmState = { armed: boolean; error?: string; webhooks: string[]; urls: string[] }
+	type HandledEvent = { at: string; source: string; issue: string; status: string; action: Action; performed: boolean }
+	type ArmState = { armed: boolean; error?: string; webhooks: string[]; urls: string[]; events: HandledEvent[] }
 	const armState = new Map<ThreadID, ArmState>()
 	amp.on('session.start', async (_event, ctx) => arm(ctx, await ctx.thread.labels()))
 	amp.on('agent.start', async (_event, ctx) => {
@@ -102,7 +103,7 @@ export default async function (amp: PluginAPI) {
 	amp.registerTool({
 		name: 'odd_control_status',
 		description:
-			'ODD control plane state for this thread: labels, executor kind, whether webhooks are armed, last arming error. Pass arm: true to arm now (control thread in an orb only). Pass show_urls: true to show the webhook URLs to the human in a confirm dialog; the call blocks until they answer. URLs are never returned to the agent.',
+			'ODD control plane state for this thread: labels, executor kind, whether webhooks are armed, last arming error, the last 20 handled webhook events. Pass arm: true to arm now (control thread in an orb only). Pass show_urls: true to show the webhook URLs to the human in a confirm dialog; the call blocks until they answer. URLs are never returned to the agent.',
 		inputSchema: {
 			type: 'object',
 			properties: {
@@ -113,7 +114,7 @@ export default async function (amp: PluginAPI) {
 		async execute(input, ctx) {
 			const labels = await ctx.thread.labels()
 			if (input.arm === true) await arm(ctx, labels)
-			const { urls, ...state } = armState.get(ctx.thread.id) ?? { armed: false, webhooks: [], urls: [] }
+			const { urls, ...state } = armState.get(ctx.thread.id) ?? { armed: false, webhooks: [], urls: [], events: [] }
 			const dialog = input.show_urls === true && urls.length > 0 ? await showUrls(ctx, urls) : undefined
 			return JSON.stringify({ thread: ctx.thread.id, labels, executor: amp.system.executor.kind, ...state, dialog })
 		},
@@ -121,7 +122,7 @@ export default async function (amp: PluginAPI) {
 
 	async function arm(ctx: Pick<PluginEventContext<'agent.end'>, 'thread' | 'ui' | 'logger'>, labels: readonly string[]) {
 		if (!labels.includes(controlLabel) || armState.has(ctx.thread.id)) return
-		const state: ArmState = { armed: false, webhooks: [], urls: [] }
+		const state: ArmState = { armed: false, webhooks: [], urls: [], events: [] }
 		armState.set(ctx.thread.id, state)
 		try {
 			await armWebhooks(ctx, state)
@@ -147,7 +148,10 @@ export default async function (amp: PluginAPI) {
 			const issue = await snapshotFor(hctx, identifier)
 			const action = nextAction(issue, await currentLoad(hctx))
 			hctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
-			if (!(await hctx.thread.labels()).includes(performLabel)) {
+			const performed = (await hctx.thread.labels()).includes(performLabel)
+			state.events.push({ at: event.receivedAt, source, issue: issue.identifier, status: issue.status, action, performed })
+			state.events.splice(0, Math.max(0, state.events.length - 20))
+			if (!performed) {
 				hctx.logger.log(marker, 'dry run; add label', performLabel, 'to act')
 				return
 			}
