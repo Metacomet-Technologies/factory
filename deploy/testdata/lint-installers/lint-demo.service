@@ -1,3 +1,0 @@
-[Service]
-Type=simple
-ExecStart=/bin/true

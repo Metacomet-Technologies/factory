@@ -1,4 +1,0 @@
-[Service]
-Type=oneshot
-TimeoutStartSec=30
-ExecStart=/bin/true

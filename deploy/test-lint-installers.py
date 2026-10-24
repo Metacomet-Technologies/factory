@@ -28,6 +28,20 @@ EXPECTED_FAILURE = {
     "rollback-no-snapshot.sh": "snapshot",
     "rollback-unnamed.sh": "rollback",
 }
+# Written at test time, not tracked: scripts/release/test-release.py treats tracked units under deploy/ as deployable.
+UNITS = {
+    "lint-demo.service": "[Service]\nType=simple\nExecStart=/bin/true\n",
+    "lint-oneshot.service": "[Service]\nType=oneshot\nTimeoutStartSec=30\nExecStart=/bin/true\n",
+    "lint-unbounded.service": "[Service]\nType=oneshot\nExecStart=/bin/true\n",
+}
+
+
+def fixture_copy(directory):
+    """Copy the fixtures and their unit files into directory; return it."""
+    shutil.copytree(FIXTURES, directory, dirs_exist_ok=True)
+    for name, text in UNITS.items():
+        (directory / name).write_text(text)
+    return directory
 
 
 def run(lint, *paths):
@@ -46,13 +60,18 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual({c for c in EXPECTED_FAILURE.values() if c}, set(CHECKS))
 
     def test_each_fixture_fails_only_its_check(self):
-        for name, check in EXPECTED_FAILURE.items():
-            with self.subTest(name):
-                result, rows = run(LINT, FIXTURES / name)
-                self.assertEqual(len(rows), 1, result.stdout + result.stderr)
-                expected = {c: "FAIL" if c == check else "pass" for c in CHECKS}
-                self.assertEqual(next(iter(rows.values())), expected, result.stderr)
-                self.assertEqual(result.returncode, 1 if check else 0, result.stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            fixtures = fixture_copy(Path(directory))
+            for name, check in EXPECTED_FAILURE.items():
+                with self.subTest(name):
+                    self.check_fixture(fixtures / name, check)
+
+    def check_fixture(self, path, check):
+        result, rows = run(LINT, path)
+        self.assertEqual(len(rows), 1, result.stdout + result.stderr)
+        expected = {c: "FAIL" if c == check else "pass" for c in CHECKS}
+        self.assertEqual(next(iter(rows.values())), expected, result.stderr)
+        self.assertEqual(result.returncode, 1 if check else 0, result.stderr)
 
 
 class InventoryTest(unittest.TestCase):
@@ -75,7 +94,7 @@ class InventoryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             deploy = Path(directory) / "deploy"
             deploy.mkdir()
-            for name in ("install-good.sh", "rollback-good.sh", "lint-demo.service"):
+            for name in ("install-good.sh", "rollback-good.sh"):
                 shutil.copy(FIXTURES / name, deploy / name)
             text = re.sub(
                 r"^exemptions=\(\n.*?^\)$",
