@@ -208,10 +208,20 @@ export default async function (amp: PluginAPI) {
 	// until the owner is idle. One pending re-check per issue.
 	const recheckMs = 90_000
 	const rechecks = new Map<string, ReturnType<typeof setTimeout>>()
-	async function evaluate(ctx: EvalContext, state: ArmState, source: string, identifier: string, at: string): Promise<HandledEvent> {
+	// Linear sends several webhooks for one change and `find_thread` indexes a new thread with a
+	// lag, so evaluations of one issue run one at a time and remember the threads they spawned
+	// until the index returns them; otherwise two events seconds apart spawn two role threads.
+	const queues = new Map<string, Promise<unknown>>()
+	const spawned = new Map<string, string[]>()
+	function evaluate(ctx: EvalContext, state: ArmState, source: string, identifier: string, at: string): Promise<HandledEvent> {
+		const run = (queues.get(identifier) ?? Promise.resolve()).then(() => evaluateNow(ctx, state, source, identifier, at))
+		queues.set(identifier, run.catch(() => undefined))
+		return run
+	}
+	async function evaluateNow(ctx: EvalContext, state: ArmState, source: string, identifier: string, at: string): Promise<HandledEvent> {
 		const entry = record(state, { at, source, issue: identifier, stage: 'received' })
 		try {
-			const issue = await snapshotFor(ctx, identifier)
+			const issue = await snapshotFor(ctx, identifier, spawned.get(identifier) ?? [])
 			const action = nextAction(issue, await currentLoad(ctx))
 			ctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
 			entry.status = issue.status
@@ -298,7 +308,14 @@ export default async function (amp: PluginAPI) {
 
 	// Phases 3-6 fill in `perform` stage by stage: phase 3 spawns intake and spec and moves
 	// issues between Triage and Todo; steer and page are wired; merge and deploy are deferred.
+	// While the dispatcher still owns Todo and later, ODD performs only on issues in the
+	// statuses it owns (Backlog, Triage); an issue the orchestrator created in Todo without an
+	// Evidence section must not be pulled back into Triage.
 	async function perform(ctx: ArmContext, issue: IssueSnapshot, action: Action) {
+		if (issue.status !== 'Backlog' && issue.status !== 'Triage') {
+			ctx.logger.log(marker, 'deferred to a later phase', issue.identifier, issue.status, action.kind)
+			return
+		}
 		switch (action.kind) {
 			case 'spawn': {
 				if (!liveRoles.has(action.role)) {
@@ -310,20 +327,16 @@ export default async function (amp: PluginAPI) {
 					ctx.logger.log(marker, 'launch request for runner', issue.identifier, action.role)
 					return
 				}
-				await spawnThread(
+				const threadID = await spawnThread(
 					ctx.thread.id,
 					action.role,
 					threadLabels(issue.identifier, action.role, action.round),
 					`${marker} Outcome ${issue.identifier}. Role: ${action.role}. Reason: ${action.reason}. Load the \`${contracts[action.role].skill}\` skill and start.`,
 				)
+				spawned.set(issue.identifier, [...(spawned.get(issue.identifier) ?? []), threadID])
 				return
 			}
 			case 'set-status':
-				// Phase 3 owns only the Triage/Todo transitions; Deploying belongs to the shipper (phase 5).
-				if (action.status !== 'Triage' && action.status !== 'Todo') {
-					ctx.logger.log(marker, 'deferred to a later phase', issue.identifier, 'set-status', action.status)
-					return
-				}
 				await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: action.status })
 				return
 			case 'steer':
@@ -357,12 +370,12 @@ async function callJson<T>(tools: Tools, name: string, input: Record<string, unk
 	return JSON.parse(textBlock.text as string) as T
 }
 
-async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string): Promise<IssueSnapshot> {
+async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, knownThreads: readonly string[]): Promise<IssueSnapshot> {
 	const [issue, comments, pr, threads] = await Promise.all([
 		callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: identifier }),
 		callJson<{ comments?: { body: string }[] }>(ctx.tools, 'linear.list_comments', { issueId: identifier, limit: 50 }).then(result => result.comments ?? []),
 		pullRequestFor(ctx, identifier),
-		threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`),
+		threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, knownThreads),
 	])
 	// Open blockers are not exposed by the Linear MCP; phase 4 (MET-279) adds them before builders spawn.
 	return toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers: [] })
@@ -379,12 +392,15 @@ async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, 
 	return prs.find(pr => pr.state === 'OPEN') ?? prs.find(pr => pr.state === 'MERGED')
 }
 
-async function threadsFor(tools: Tools, query: string): Promise<LiveThread[]> {
+// `known` are thread IDs this control plane spawned that the search index may not return yet.
+async function threadsFor(tools: Tools, query: string, known: readonly string[] = []): Promise<LiveThread[]> {
 	const found = await callJson<{ threads: { id: string }[] }>(tools, 'find_thread', { query, limit: 100 })
-	return Promise.all(found.threads.map(async ({ id }) => {
-		const status = await callJson<{ metadata: { labels: string[] }; agentState?: { state?: string } }>(tools, 'get_thread_status', { thread: id })
-		return { id, labels: status.metadata.labels, state: status.agentState?.state ?? 'idle' }
+	const ids = new Set([...found.threads.map(({ id }) => id), ...known])
+	const threads = await Promise.all([...ids].map(async id => {
+		const status = await callJson<{ metadata: { labels: string[]; archived?: boolean }; agentState?: { state?: string } }>(tools, 'get_thread_status', { thread: id })
+		return { id, labels: status.metadata.labels, state: status.agentState?.state ?? 'idle', archived: status.metadata.archived === true }
 	}))
+	return threads.filter(thread => !thread.archived).map(({ archived: _, ...thread }) => thread)
 }
 
 async function currentLoad(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>): Promise<Load> {
