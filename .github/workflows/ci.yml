@@ -26,6 +26,10 @@ jobs:
     name: rust
     timeout-minutes: 20
     runs-on: ubuntu-24.04
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,10 +51,17 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*') }}
+          key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain*') }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain*') }}-
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --workspace --locked
+      - name: Install installer test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y sqlite3
+      - run: bash meter/tests/installer-db.sh target/debug/meter
 
   kiosk:
     name: kiosk
@@ -102,8 +113,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y shellcheck sqlite3 zstd rsync
-      - run: cargo build --locked -p meter
-      - run: bash meter/tests/installer-db.sh target/debug/meter
       - name: Check every deployment and version script
         run: |
           mapfile -d '' scripts < <(find deploy scripts -type f -name '*.sh' -print0)
@@ -136,7 +145,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: sandbox-${{ runner.os }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'rust-toolchain*') }}
+          key: sandbox-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain*') }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            sandbox-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain*') }}-
       - name: Check sandbox scripts
         run: |
           scripts=(scripts/sandbox scripts/sandbox-shims/nvidia-smi scripts/sandbox-shims/tailscale scripts/sandbox-shims/timedatectl scripts/sandbox-shims/ping)
