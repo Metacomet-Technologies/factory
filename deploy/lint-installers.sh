@@ -35,8 +35,6 @@ set -Eeuo pipefail
 # script or a delegated helper. It must be a TODO, shows TODO whether or not the check passes, and is
 # never stale.
 exemptions=(
-    'deploy/rollback-meter.sh|root|TODO MET-<new>: as_root falls back to sudo instead of refusing non-root.'
-    'deploy/rollback-meter.sh|trap|TODO MET-<new>: no ERR/EXIT trap; set -euo pipefail only.'
     'deploy/rollback-meter.sh|snapshot|By design it rewrites only OLLAMA_HOST; install-meter.sh snapshots the full drop-in (README, proxy-removal rollback).'
     'deploy/devices/install-devices.sh|trap|TODO MET-<new>: the ERR trap is set after mkdir -p of the lib, state and unit directories.'
     'deploy/devices/install-devices.sh|snapshot|TODO MET-<new>: mkdir -p of the lib, state and unit directories runs before the snapshot.'

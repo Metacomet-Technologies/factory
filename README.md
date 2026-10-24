@@ -324,7 +324,7 @@ seven daily snapshots of the new schema; cleanup is explicit, never automatic.
 The older proxy-removal rollback is separate and does restart Ollama:
 
 ```sh
-./deploy/rollback-meter.sh
+sudo bash /home/agent/work/factory/deploy/rollback-meter.sh
 ```
 
 Stops/disables meter, restores only `OLLAMA_HOST=0.0.0.0:11434`, restarts Ollama,
