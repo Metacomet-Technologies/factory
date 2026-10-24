@@ -8,6 +8,7 @@
 
 import type { Agent, AgentThreadExecutor, PluginAPI, PluginEventContext, ThreadID, WebhookEvent, WebhookHandlerContext } from '@ampcode/plugin'
 import {
+	cancelledLine,
 	capacity,
 	contracts,
 	deployReceiptLine,
@@ -15,10 +16,12 @@ import {
 	issueTriaged,
 	nextAction,
 	oddLabel,
+	pageText,
 	parseThreadLabels,
 	ralphGuard,
 	specComplete,
 	threadLabels,
+	verifyLine,
 	type Action,
 	type DeployReceipt,
 	type IssueSnapshot,
@@ -26,7 +29,8 @@ import {
 	type Role,
 } from '../../scripts/odd/lifecycle.ts'
 import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, roleLabelQueries, toSnapshot, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
+import { finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, roleLabelQueries, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
+import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, overCaps, restoreStatus, staleThreads, sweepMs, type DigestInput } from '../../scripts/odd/watchdog.ts'
 
 export const description =
 	'Factory ODD control plane: Linear, GitHub and Slack webhooks drive a deterministic outcome lifecycle; role agents run in orbs; Ralph loops are bounded by external checks. See docs/odd/README.md.'
@@ -35,11 +39,12 @@ export const description =
 // registers the role modes and the Ralph guard and does nothing on its own. `perform` acts only
 // when the control thread also carries odd-perform, and only for the roles already live:
 // phase 3 (MET-278) spawns intake and spec and sets Triage/Todo; phase 4 (MET-279) adds the
-// builder, the reviewer and the deterministic merge for issues labelled `odd`.
+// builder, the reviewer and the deterministic merge for issues labelled `odd`; phase 6
+// (MET-281) adds the verifier and the Watchdog sweep.
 const controlLabel = 'odd-control-plane'
 const performLabel = 'odd-perform'
 const marker = '[odd]'
-const liveRoles: ReadonlySet<Role> = new Set<Role>(['intake', 'spec', 'builder', 'reviewer'])
+const liveRoles: ReadonlySet<Role> = new Set<Role>(['intake', 'spec', 'builder', 'reviewer', 'verifier'])
 const slackPollMs = 5 * 60_000
 /** Runner ID of the host the deploy job runs on; the red-deploy log reader runs there. */
 const deployRunner = 'factory-gpu'
@@ -124,10 +129,12 @@ export default async function (amp: PluginAPI) {
 		events: HandledEvent[]
 		/** Slack intake poll: last run, last error, and the message timestamps handed to Intake. */
 		slack: { polledAt?: string; error?: string; spawned: string[] }
-		timer?: ReturnType<typeof setInterval>
+		/** Watchdog sweep (scripts/odd/watchdog.ts): last run, issues swept, episodes in progress, digest day, cancellations today. */
+		watchdog: { sweptAt?: string; error?: string; issues?: number; overSince?: string; alerted?: boolean; blindSince?: string; paged?: boolean; digestDay?: string; cancelled: string[] }
+		timers: ReturnType<typeof setInterval>[]
 	}
 	const armState = new Map<ThreadID, ArmState>()
-	const emptyState = (): ArmState => ({ armed: false, webhooks: [], urls: [], events: [], slack: { spawned: [] } })
+	const emptyState = (): ArmState => ({ armed: false, webhooks: [], urls: [], events: [], slack: { spawned: [] }, watchdog: { cancelled: [] }, timers: [] })
 	const record = (state: ArmState, event: HandledEvent) => {
 		state.events.push(event)
 		state.events.splice(0, Math.max(0, state.events.length - 20))
@@ -144,12 +151,13 @@ export default async function (amp: PluginAPI) {
 	amp.registerTool({
 		name: 'odd_control_status',
 		description:
-			'ODD control plane state for this thread: labels, executor kind, whether webhooks are armed, last arming error, the last 20 handled events (webhooks and Slack intake polls), Slack poll state. Pass arm: true to arm now (control thread in an orb only). Pass poll_slack: true to poll #factory-intake now. Pass show_urls: true to show the webhook URLs to the human in a confirm dialog; the call blocks until they answer. URLs are never returned to the agent.',
+			'ODD control plane state for this thread: labels, executor kind, whether webhooks are armed, last arming error, the last 20 handled events (webhooks, Slack intake polls, Watchdog sweeps), Slack poll and Watchdog state. Pass arm: true to arm now (control thread in an orb only). Pass poll_slack: true to poll #factory-intake now. Pass sweep: true to run the Watchdog sweep now. Pass show_urls: true to show the webhook URLs to the human in a confirm dialog; the call blocks until they answer. URLs are never returned to the agent.',
 		inputSchema: {
 			type: 'object',
 			properties: {
 				arm: { type: 'boolean', description: 'Arm the control plane now if not armed' },
 				poll_slack: { type: 'boolean', description: 'Poll #factory-intake now and hand new messages to Intake (dry run without the odd-perform label)' },
+				sweep: { type: 'boolean', description: 'Run the Watchdog sweep now: re-evaluate every live or ODD-owned issue' },
 				show_urls: { type: 'boolean', description: 'Show the webhook URLs to the human in a dialog and wait for them to confirm' },
 			},
 		},
@@ -158,18 +166,20 @@ export default async function (amp: PluginAPI) {
 			if (input.arm === true) await arm(ctx, labels)
 			const current = armState.get(ctx.thread.id)
 			if (input.poll_slack === true && current?.armed) await pollSlackIntake(ctx, current)
-			const { urls, timer: _timer, ...state } = current ?? emptyState()
+			if (input.sweep === true && current?.armed) await sweep({ ...ctx, $: amp.$ }, current)
+			const { urls, timers: _timers, ...state } = current ?? emptyState()
 			const dialog = input.show_urls === true && urls.length > 0 ? await showUrls(ctx, urls) : undefined
 			return JSON.stringify({ thread: ctx.thread.id, labels, executor: amp.system.executor.kind, ...state, dialog })
 		},
 	})
 
 	// What arming and the Slack poll need from a context; event, tool and webhook contexts all
-	// provide it. Evaluating an issue also shells out to gh, which tool contexts cannot do.
+	// provide it. Evaluating an issue also shells out to gh; tool contexts have no `$`, so the
+	// sweep they start uses the plugin-level runner.
 	type ArmContext = Pick<WebhookHandlerContext, 'thread' | 'ui' | 'logger' | 'tools'>
 	type EvalContext = ArmContext & Pick<WebhookHandlerContext, '$'>
 
-	async function arm(ctx: ArmContext, labels: readonly string[]) {
+	async function arm(ctx: ArmContext & Partial<Pick<WebhookHandlerContext, '$'>>, labels: readonly string[]) {
 		if (!labels.includes(controlLabel) || armState.has(ctx.thread.id)) return
 		const state = emptyState()
 		armState.set(ctx.thread.id, state)
@@ -178,8 +188,11 @@ export default async function (amp: PluginAPI) {
 			state.armed = true
 			// Slack has no push path (its Events API needs a challenge reply a handler cannot send),
 			// so #factory-intake is polled with the arming context's tools while the orb lives.
-			state.timer = setInterval(() => void pollSlackIntake(ctx, state), slackPollMs)
+			// The Watchdog sweep runs on the same clock: the plugin API has no schedule primitive.
+			const evalCtx: EvalContext = { ...ctx, $: ctx.$ ?? amp.$ }
+			state.timers.push(setInterval(() => void pollSlackIntake(ctx, state), slackPollMs), setInterval(() => void sweep(evalCtx, state), sweepMs))
 			void pollSlackIntake(ctx, state)
+			void sweep(evalCtx, state)
 		} catch (error: unknown) {
 			state.error = String(error)
 			ctx.logger.log(marker, 'arming failed', state.error)
@@ -249,21 +262,28 @@ export default async function (amp: PluginAPI) {
 		const entry = record(state, { at, source, issue: identifier, stage: 'received' })
 		try {
 			const { snapshot: issue, threads } = await snapshotFor(ctx, identifier, spawned.get(identifier) ?? [])
+			const performing = (await ctx.thread.labels()).includes(performLabel)
 			const finished = finishedThreads(issue.status, threads)
-			if (finished.length && (await ctx.thread.labels()).includes(performLabel)) await archiveThreads(ctx, finished)
+			if (finished.length && performing) await archiveThreads(ctx, finished)
 			const action = nextAction(issue, await currentLoad(ctx))
 			ctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
 			entry.status = issue.status
 			entry.action = action
 			const ownerBusy = action.kind === 'spawn' || (action.kind === 'wait' && action.reason.endsWith('running'))
 			if (ownerBusy) recheck(ctx, state, identifier, recheckMs)
-			if (!(await ctx.thread.labels()).includes(performLabel)) {
+			if (!performing) {
 				ctx.logger.log(marker, 'dry run; add label', performLabel, 'to act')
 				entry.stage = 'dry-run'
 				return entry
 			}
-			await perform(ctx, issue, action)
-			entry.stage = 'performed'
+			const stale = action.kind === 'wait' && action.stuck ? staleThreads(action, threads, new Date()) : []
+			if (action.kind === 'wait' && action.stuck && stale.length) {
+				await cancelStale(ctx, state, issue, action.stuck, stale)
+				entry.stage = 'performed'
+				recheck(ctx, state, identifier, 0)
+			} else {
+				entry.stage = (await perform(ctx, state, issue, action, threads)) ? 'performed' : 'ignored'
+			}
 			failures.delete(identifier)
 		} catch (error: unknown) {
 			entry.stage = 'failed'
@@ -275,6 +295,118 @@ export default async function (amp: PluginAPI) {
 			else ctx.logger.log(marker, 'giving up rechecks after failures', identifier, count)
 		}
 		return entry
+	}
+
+	// The Watchdog's cancel (§8): an idle thread the lifecycle waits on past `staleMs` is archived
+	// and the cancellation is recorded on the issue, so `spawn()` counts the next round from it. A
+	// builder that never opened a PR hands the issue back to Todo for a fresh builder.
+	async function cancelStale(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, role: Role, stale: readonly LiveThread[]) {
+		await archiveThreads(ctx, stale)
+		for (const thread of stale) {
+			const line = cancelledLine(role, thread.id, parseThreadLabels(thread.labels).round)
+			await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: line })
+			state.watchdog.cancelled.push(`${issue.identifier} ${line}`)
+			ctx.logger.log(marker, 'watchdog cancelled', issue.identifier, thread.id)
+		}
+		const status = restoreStatus(role, issue.status, issue.pr !== undefined)
+		if (status) await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: status })
+	}
+
+	// The Watchdog (§4, §8) as deterministic code. Every `sweepMs` each issue with a live role
+	// thread or in an ODD-owned status is re-evaluated, so a chain left dormant by a cleared
+	// escalation, a refused merge or a missed webhook resumes without an event. Then the
+	// episodes: caps exceeded for `capsAlertMs` alert once, every evaluation failing for `blindMs`
+	// pages once, and the digest posts once per day after `digestHour` on the host clock.
+	const sweeping = new WeakSet<ArmState>()
+	async function sweep(ctx: EvalContext, state: ArmState) {
+		if (sweeping.has(state)) return
+		sweeping.add(state)
+		const now = new Date()
+		const at = now.toISOString()
+		const { watchdog } = state
+		const performing = (await ctx.thread.labels()).includes(performLabel)
+		const entry = record(state, { at, source: 'watchdog', issue: null, stage: performing ? 'performed' : 'dry-run' })
+		watchdog.sweptAt = at
+		try {
+			const threads = (await Promise.all(roleLabelQueries.map(query => threadsFor(ctx.tools, query)))).flat()
+			const identifiers = new Set<string>()
+			for (const thread of threads) {
+				const { issue } = parseThreadLabels(thread.labels)
+				if (issue) identifiers.add(issue.toUpperCase())
+			}
+			for (const status of ['Backlog', 'Triage']) for (const id of await issueIds(ctx.tools, { state: status })) identifiers.add(id)
+			for (const status of ['Todo', 'In Progress', 'Deploying']) for (const id of await issueIds(ctx.tools, { state: status, label: oddLabel })) identifiers.add(id)
+			watchdog.issues = identifiers.size
+			let failed = 0
+			for (const identifier of identifiers) {
+				if ((await evaluate(ctx, state, 'watchdog', identifier, at)).stage === 'failed') failed += 1
+			}
+			if (identifiers.size && failed === identifiers.size) throw new Error(`all ${failed} evaluations failed`)
+			delete watchdog.error
+			delete watchdog.blindSince
+			watchdog.paged = false
+			const load = loadFrom(threads)
+			if (!overCaps(load)) {
+				delete watchdog.overSince
+				watchdog.alerted = false
+			} else {
+				watchdog.overSince ??= at
+				if (performing && !watchdog.alerted && now.getTime() - Date.parse(watchdog.overSince) >= capsAlertMs) {
+					await ctx.tools.call('slack_write', { channelName: alertsChannel, text: `${marker} soft caps exceeded since ${watchdog.overSince}: orbs ${load.orbs}/${capacity.orbs}, runner slots ${load.runnerSlots}/${capacity.runnerSlots}, build issues ${load.buildIssues}/${capacity.buildIssues}.` })
+					watchdog.alerted = true
+				}
+			}
+			const day = digestDue(watchdog.digestDay, now)
+			if (day && performing) {
+				await ctx.tools.call('slack_write', { channelName: alertsChannel, text: digest(await digestInput(ctx, day, now, load, watchdog.cancelled)) })
+				watchdog.digestDay = day
+				watchdog.cancelled = []
+			}
+		} catch (error: unknown) {
+			watchdog.error = String(error)
+			entry.stage = 'failed'
+			entry.error = watchdog.error
+			ctx.logger.log(marker, 'sweep failed', watchdog.error)
+			watchdog.blindSince ??= at
+			if (performing && !watchdog.paged && now.getTime() - Date.parse(watchdog.blindSince) >= blindMs) {
+				const text = pageText('-', { kind: 'page', reason: 'control-plane-blind', detail: `every sweep since ${watchdog.blindSince} failed: ${watchdog.error}` })
+				await ctx.tools.call('slack_write', { text: `${marker} ${text}` }).then(() => { watchdog.paged = true }, (slackError: unknown) => ctx.logger.log(marker, 'blind page failed', String(slackError)))
+			}
+		} finally {
+			sweeping.delete(state)
+		}
+	}
+
+	async function issueIds(tools: Tools, filter: { state: string; label?: string }): Promise<string[]> {
+		const result = await callJson<{ issues?: { id?: string }[] }>(tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields: ['id'] })
+		return (result.issues ?? []).flatMap(issue => (issue.id ? [issue.id] : []))
+	}
+
+	// Yesterday's facts for the digest: identifiers, titles and SHAs only (digest() formats them).
+	async function digestInput(ctx: EvalContext, day: string, now: Date, load: Load, cancelled: readonly string[]): Promise<DigestInput> {
+		const since = new Date(now.getTime() - 24 * 60 * 60_000).toISOString()
+		const merged = await ctx.$`gh pr list --state merged --search ${`merged:>=${since.slice(0, 10)}`} --json number,title,headRefOid,mergeCommit,mergedAt --limit 50`
+		if (merged.exitCode !== 0) throw new Error(`gh pr list for the digest failed: ${merged.stderr.trim()}`)
+		type Issue = { id?: string; title?: string; completedAt?: string; createdAt?: string }
+		const issues = async (filter: Record<string, unknown>, fields: string[]) =>
+			(await callJson<{ issues?: Issue[] }>(ctx.tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields })).issues ?? []
+		const named = (list: Issue[]) => list.flatMap(issue => (issue.id ? [{ identifier: issue.id, title: issue.title ?? '' }] : []))
+		const [done, bugs, escalated] = await Promise.all([
+			issues({ state: 'Done' }, ['id', 'title', 'completedAt']).then(list => list.filter(issue => (issue.completedAt ?? '') >= since)),
+			issues({ label: 'Bug', createdAt: '-P1D' }, ['id', 'title', 'createdAt']).then(list => list.filter(issue => (issue.createdAt ?? '') >= since)),
+			issues({ label: escalatedLabel }, ['id', 'title']),
+		])
+		return {
+			day,
+			merged: (JSON.parse(merged.stdout) as { number: number; title: string; headRefOid: string; mergeCommit?: { oid?: string }; mergedAt?: string }[])
+				.filter(pr => (pr.mergedAt ?? '') >= since)
+				.map(pr => ({ number: pr.number, title: pr.title, headSha: pr.headRefOid, mergeSha: pr.mergeCommit?.oid ?? 'unknown' })),
+			done: named(done),
+			bugs: named(bugs),
+			escalated: named(escalated),
+			load,
+			cancelled,
+		}
 	}
 
 	// Every fresh top-level message in #factory-intake gets its own Intake orb thread, then the
@@ -350,61 +482,81 @@ export default async function (amp: PluginAPI) {
 	// A steer is delivered once per (thread, message): the message names the head SHA, and the
 	// same evaluation repeats on every webhook until the builder pushes.
 	const steered = new Set<string>()
-	async function perform(ctx: EvalContext, issue: IssueSnapshot, action: Action) {
+	/** Returns false when nothing was done because the action is not this control plane's to take. */
+	async function perform(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, action: Action, threads: readonly LiveThread[]): Promise<boolean> {
 		const owned = issue.status === 'Backlog' || issue.status === 'Triage' || issue.labels.includes(oddLabel)
 		if (!owned) {
 			ctx.logger.log(marker, 'deferred: dispatcher owns', issue.identifier, issue.status, action.kind)
-			return
+			return false
 		}
 		switch (action.kind) {
 			case 'spawn': {
 				if (!liveRoles.has(action.role)) {
 					ctx.logger.log(marker, 'deferred to a later phase', issue.identifier, action.role)
-					return
+					return false
 				}
 				if (action.executor !== 'orb') {
 					// Subscription engines and runner jobs are launched by the runner backstop (§6).
 					ctx.logger.log(marker, 'launch request for runner', issue.identifier, action.role)
-					return
+					return false
 				}
-				const target = action.role === 'reviewer' && issue.pr ? ` Review PR #${issue.pr.number} at head ${issue.pr.headSha}.` : ''
 				const threadID = await spawnThread(
 					ctx.thread.id,
 					action.role,
 					threadLabels(issue.identifier, action.role, action.round),
-					`${marker} Outcome ${issue.identifier}. Role: ${action.role}. Reason: ${action.reason}.${target} Load the \`${contracts[action.role].skill}\` skill and start.`,
+					`${marker} Outcome ${issue.identifier}. Role: ${action.role}. Reason: ${action.reason}.${spawnTarget(issue, action.role)} Load the \`${contracts[action.role].skill}\` skill and start.`,
 				)
 				spawned.set(issue.identifier, [...(spawned.get(issue.identifier) ?? []), threadID])
 				// Todo -> In Progress is the builder's claim; the status change is the handoff artifact (§7).
 				if (action.role === 'builder' && issue.status === 'Todo') await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: 'In Progress' })
-				return
+				return true
 			}
 			case 'set-status':
 				await setStatus(ctx, issue, action, spawnDeployer(ctx))
-				return
+				return true
 			case 'steer': {
 				const key = `${action.threadID}:${action.message}`
-				if (steered.has(key)) return
+				if (steered.has(key)) return true
 				steered.add(key)
 				await amp.threads.get(action.threadID as ThreadID).appendUserMessage({ type: 'user-message', content: `${marker} ${action.message}` }, { steer: true })
-				return
+				return true
 			}
 			case 'merge':
-				await merge(ctx, issue, action.pr, action.sha)
-				return
+				await merge(ctx, state, issue, action.pr, action.sha)
+				return true
 			case 'page':
-				await page(ctx, issue, action, spawnDeployer(ctx))
-				return
+				await page(ctx, issue, action, spawnDeployer(ctx), threads)
+				return true
 			default:
 				ctx.logger.log(marker, 'deferred to a later phase', action.kind)
+				return false
 		}
+	}
+
+	// What a spawned role must act on beyond the issue: the reviewer's head, the verifier's receipt.
+	function spawnTarget(issue: IssueSnapshot, role: Role): string {
+		if (role === 'reviewer' && issue.pr) return ` Review PR #${issue.pr.number} at head ${issue.pr.headSha}.`
+		if (role === 'verifier' && issue.deployReceipt) {
+			const { sha } = issue.deployReceipt
+			return ` Receipt: \`${deployReceiptLine(issue.deployReceipt)}\`. Check every Done-means item against the deployed system and comment \`${verifyLine({ sha, result: 'pass' })}\` (or \`result=fail bug=<MET-n>\` after filing the Bug in Triage) on ${issue.identifier}.`
+		}
+		return ''
 	}
 
 	// The Shipper (§4) is this function: the dispatcher's merge gate at the exact head, then a
 	// head-pinned squash merge. Self-deploying paths pass because ODD merges them too (§1). A
-	// refusal is posted once per head so the builder sees it; the next push re-enters the loop.
+	// page puts the PR back to draft, and the gate refuses drafts, so a ready verdict un-drafts it
+	// first. A refusal is posted once per head so the builder sees it; GitHub's merge state lags
+	// CI by a minute or so (MET-280's PR #182), so the issue is re-checked instead of waiting for
+	// a webhook that nothing will send.
 	const refused = new Set<string>()
-	async function merge(ctx: EvalContext, issue: IssueSnapshot, pr: number, sha: string) {
+	async function merge(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, pr: number, sha: string) {
+		const draft = await ctx.$`gh pr view ${String(pr)} --json isDraft --jq .isDraft`
+		if (draft.exitCode === 0 && draft.stdout.trim() === 'true') {
+			const ready = await ctx.$`gh pr ready ${String(pr)}`
+			if (ready.exitCode !== 0) throw new Error(`gh pr ready ${pr} failed: ${ready.stderr.trim()}`)
+			ctx.logger.log(marker, 'un-drafted', issue.identifier, pr)
+		}
 		const root = (await ctx.$`git rev-parse --show-toplevel`).stdout.trim()
 		const check = await ctx.$`node ${`${root}/scripts/dispatch/qa.ts`} check ${String(pr)} ${sha} --self-deploying-ok`
 		if (check.exitCode !== 0) {
@@ -414,6 +566,7 @@ export default async function (amp: PluginAPI) {
 				refused.add(sha)
 				await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-merge-refused pr=${pr} head=${sha}\n\n${cause}` })
 			}
+			recheck(ctx, state, issue.identifier, recheckMs)
 			return
 		}
 		const merged = await ctx.$`gh pr merge ${String(pr)} --squash --match-head-commit ${sha}`
@@ -441,11 +594,18 @@ export async function setStatus(ctx: Pick<WebhookHandlerContext, 'tools' | 'logg
 }
 
 // Escalation (§8): the issue stays In Progress with the `escalated` label (the lifecycle waits
-// on it), the PR goes back to draft so nothing merges it, and Devon gets one Slack DM.
-// `slack_write` without a recipient DMs the thread owner. The label is written last, so a failed
-// step is retried by the next evaluation. A failed rollback starts its log reader first; a page
-// is never held back by that spawn, so its failure goes into the page instead.
-export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, issue: IssueSnapshot, action: Extract<Action, { kind: 'page' }>, spawn?: Spawn) {
+// on it), the PR goes back to draft so nothing merges it, and Devon gets one Slack DM in the one
+// page format (pageText). `slack_write` without a recipient DMs the thread owner. The label is
+// written last, so a failed step is retried by the next evaluation, and a page while the label
+// is present is a no-op (MET-304 paged twice). A failed rollback starts its log reader first; a
+// page is never held back by that spawn, so its failure goes into the page instead. Reviewer
+// threads holding `changes` verdicts for older heads are archived, so the round count restarts
+// when Devon clears the label.
+export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, issue: IssueSnapshot, action: Extract<Action, { kind: 'page' }>, spawn?: Spawn, threads: readonly LiveThread[] = []) {
+	if (issue.labels.includes(escalatedLabel)) {
+		ctx.logger.log(marker, 'already paged', issue.identifier, action.reason)
+		return
+	}
 	let detail = action.detail
 	if (action.diagnose && spawn) {
 		try {
@@ -459,7 +619,13 @@ export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 		if (draft.exitCode !== 0) ctx.logger.log(marker, 'draft failed', action.pr, draft.stderr.trim())
 	}
 	await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-escalated reason=${action.reason}\n\n${detail}` })
-	await ctx.tools.call('slack_write', { text: `${marker} ${issue.identifier} escalated (${action.reason}): ${detail}. Remove the \`${escalatedLabel}\` label to resume.` })
+	await ctx.tools.call('slack_write', { text: `${marker} ${pageText(issue.identifier, { ...action, detail })} Remove the \`${escalatedLabel}\` label to resume.` })
+	const head = issue.pr?.headSha.slice(0, 12)
+	const spent = threads.filter(thread => thread.labels.some(label => {
+		const match = verdictPattern.exec(label)
+		return match?.[1] === 'changes' && match[2] !== head
+	}))
+	await archiveThreads(ctx, spent)
 	await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, addLabels: [escalatedLabel] })
 	ctx.logger.log(marker, 'paged', issue.identifier, action.reason)
 }
@@ -528,7 +694,7 @@ async function callJson<T>(tools: Tools, name: string, input: Record<string, unk
 async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, knownThreads: readonly string[]): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[] }> {
 	const [issue, comments, pr, threads] = await Promise.all([
 		callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: identifier, includeRelations: true }),
-		callJson<{ comments?: { body: string }[] }>(ctx.tools, 'linear.list_comments', { issueId: identifier, limit: 50 }).then(result => result.comments ?? []),
+		callJson<{ comments?: { body: string; createdAt?: string }[] }>(ctx.tools, 'linear.list_comments', { issueId: identifier, limit: 50 }).then(result => result.comments ?? []),
 		pullRequestFor(ctx, identifier),
 		threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, knownThreads),
 	])
@@ -575,11 +741,12 @@ async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, 
 
 // `known` are thread IDs this control plane spawned that the search index may not return yet.
 async function threadsFor(tools: Tools, query: string, known: readonly string[] = []): Promise<LiveThread[]> {
-	const found = await callJson<{ threads: { id: string }[] }>(tools, 'find_thread', { query, limit: 100 })
+	const found = await callJson<{ threads: { id: string; updatedAt?: string }[] }>(tools, 'find_thread', { query, limit: 100 })
+	const updated = new Map(found.threads.map(({ id, updatedAt }) => [id, updatedAt]))
 	const ids = new Set([...found.threads.map(({ id }) => id), ...known])
 	const threads = await Promise.all([...ids].map(async id => {
 		const status = await callJson<{ metadata: { labels: string[]; archived?: boolean }; agentState?: { state?: string } }>(tools, 'get_thread_status', { thread: id })
-		return { id, labels: status.metadata.labels, state: status.agentState?.state ?? 'idle', archived: status.metadata.archived === true }
+		return { id, labels: status.metadata.labels, state: status.agentState?.state ?? 'idle', archived: status.metadata.archived === true, updatedAt: updated.get(id) }
 	}))
 	return threads.filter(thread => !thread.archived).map(({ archived: _, ...thread }) => thread)
 }
@@ -600,9 +767,25 @@ async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools' | 'lo
 			: specComplete(snapshot.description ?? '') ? [] : ['Goal, Isolation, Build, Done means and Evidence sections, with one Evidence line per Done-means item']
 		return { stopMet: missing.length === 0, missing }
 	}
+	if (role === 'verifier') {
+		// The verdict is the `odd-verify` comment for the latest receipt's SHA (snapshot.toSnapshot).
+		const [snapshot, comments] = await Promise.all([
+			callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: issue }),
+			callJson<{ comments?: { body: string; createdAt?: string }[] }>(ctx.tools, 'linear.list_comments', { issueId: issue, limit: 50 }).then(result => result.comments ?? []),
+		])
+		const { deployReceipt, verify } = toSnapshot({ issue: { ...snapshot, comments } })
+		if (!deployReceipt) return { stopMet: false, missing: [`no odd-deploy receipt on ${issue}`] }
+		return verify?.sha === deployReceipt.sha
+			? { stopMet: true, missing: [] }
+			: { stopMet: false, missing: [`comment \`${verifyLine({ sha: deployReceipt.sha, result: 'pass' })}\` (or result=fail bug=<MET-n>) on ${issue}`] }
+	}
 	if (role !== 'builder' && role !== 'reviewer') return { stopMet: true, missing: [] }
 	const [open] = await pullRequestsFor(ctx, issue, 'open')
-	if (!open) return { stopMet: false, missing: [`no open PR for ${issue}`] }
+	if (!open) {
+		// A PR merged before the guard ran (MET-279's #179) is delivered work, not a missing PR.
+		const [merged] = await pullRequestsFor(ctx, issue, 'merged')
+		return merged ? { stopMet: true, missing: [] } : { stopMet: false, missing: [`no open PR for ${issue}`] }
+	}
 	const { headRefOid, statusCheckRollup = [] } = open
 	if (role === 'reviewer') {
 		// The verdict is the reviewer thread's own label for the current head (snapshot.verdictFor).

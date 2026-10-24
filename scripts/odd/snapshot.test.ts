@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { changesRounds, ciState, finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, riskFrom, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { changesRounds, ciState, finishedThreads, issueFromEvent, loadFrom, openRounds, prOwnsIssue, riskFrom, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
 import { nextAction } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
@@ -93,12 +93,12 @@ test('finished threads: idle role threads whose stage the issue has left; runnin
     { id: 'plain', labels: ['odd-issue-met-1'], state: 'idle' },
   ];
   // A builder or reviewer thread beside an issue that went back to Backlog or Triage is stale too.
-  assert.deepEqual(finishedThreads('Backlog', threads).map(t => t.id), ['builder-idle', 'reviewer-idle']);
-  assert.deepEqual(finishedThreads('Triage', threads).map(t => t.id), ['intake-idle', 'builder-idle', 'reviewer-idle']);
-  assert.deepEqual(finishedThreads('Todo', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'reviewer-idle']);
-  assert.deepEqual(finishedThreads('In Progress', threads).map(t => t.id), ['intake-idle', 'spec-idle']);
+  assert.deepEqual(finishedThreads('Backlog', threads).map(t => t.id), ['builder-idle', 'reviewer-idle', 'verifier-idle']);
+  assert.deepEqual(finishedThreads('Triage', threads).map(t => t.id), ['intake-idle', 'builder-idle', 'reviewer-idle', 'verifier-idle']);
+  assert.deepEqual(finishedThreads('Todo', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'reviewer-idle', 'verifier-idle']);
+  assert.deepEqual(finishedThreads('In Progress', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'verifier-idle']);
   assert.deepEqual(finishedThreads('Deploying', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'builder-idle', 'reviewer-idle']);
-  assert.deepEqual(finishedThreads('Duplicate', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'builder-idle', 'reviewer-idle']);
+  assert.deepEqual(finishedThreads('Duplicate', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'builder-idle', 'reviewer-idle', 'verifier-idle']);
 });
 
 test('the owner is the running thread, else the builder, so a steer targets the builder beside an idle reviewer', () => {
@@ -108,4 +108,45 @@ test('the owner is the running thread, else the builder, so a steer targets the 
   assert.equal(toSnapshot({ issue, threads: [reviewer, builder] }).owner?.threadID, 'T-b');
   assert.equal(toSnapshot({ issue, threads: [builder, { ...reviewer, state: 'running' }] }).owner?.threadID, 'T-r');
   assert.equal(changesRounds([reviewer, { ...reviewer, id: 'T-r2' }, { ...builder, labels: [...builder.labels, 'odd-verdict-changes-' + 'e'.repeat(12)] }]), 2);
+});
+
+test('open rounds skip reviewer threads that delivered a verdict; the owner carries its idle time', () => {
+  const threads: LiveThread[] = [
+    { id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-2'], state: 'idle', updatedAt: '2026-10-24T15:00:00Z' },
+    { id: 'T-r1', labels: ['odd-issue-met-1', 'odd-role-reviewer', 'odd-round-1', `odd-verdict-changes-${sha.slice(0, 12)}`], state: 'idle' },
+    { id: 'T-r2', labels: ['odd-issue-met-1', 'odd-role-reviewer', 'odd-round-2'], state: 'idle' },
+  ];
+  assert.deepEqual(openRounds(threads), { builder: 2, reviewer: 2 });
+  const snapshot = toSnapshot({ issue: { id: 'MET-1', status: 'In Progress', labels: [] }, threads });
+  assert.deepEqual(snapshot.owner, { role: 'builder', threadID: 'T-b', round: 2, state: 'idle', idleSince: '2026-10-24T15:00:00Z' });
+});
+
+test('cancelled rounds and verify comments come from the issue; an escalation comment resets the cancelled count', () => {
+  const at = (minute: number) => `2026-10-24T15:${String(minute).padStart(2, '0')}:00Z`;
+  const comments = [
+    { body: 'odd-watchdog cancelled role=builder thread=T-1 round=1', createdAt: at(1) },
+    { body: 'odd-watchdog cancelled role=builder thread=T-2 round=2', createdAt: at(2) },
+    { body: 'odd-escalated reason=budget-ceiling\n\nMET-1: builder spent 2/2 rounds', createdAt: at(3) },
+    { body: 'odd-verify sha=abcdef1234 result=fail bug=MET-9', createdAt: at(4) },
+    { body: 'odd-watchdog cancelled role=reviewer thread=T-3 round=1', createdAt: at(5) },
+  ];
+  const snapshot = toSnapshot({ issue: { id: 'MET-1', status: 'Todo', labels: [], comments: [...comments].reverse() } });
+  assert.deepEqual(snapshot.cancelledRounds, { reviewer: 1 });
+  assert.deepEqual(snapshot.verify, { sha: 'abcdef1234', result: 'fail', bug: 'MET-9' });
+  assert.deepEqual(toSnapshot({ issue: { id: 'MET-1', status: 'Todo', labels: [], comments: comments.slice(0, 2) } }).cancelledRounds, { builder: 2 });
+});
+
+test('after a third changes verdict and a cleared escalation, the spent reviewers are archived and the builder gets a fresh round', () => {
+  const changes = (n: number, head: string): LiveThread => ({ id: `T-r${n}`, labels: ['odd-issue-met-1', 'odd-role-reviewer', `odd-round-${n}`, `odd-verdict-changes-${head}`], state: 'idle' });
+  const builder: LiveThread = { id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1'], state: 'idle' };
+  const pr: GitHubPullRequest = { number: 9, headRefOid: sha, state: 'OPEN', statusCheckRollup: [check('SUCCESS')] };
+  const issue = { id: 'MET-1', status: 'In Progress', labels: [], comments: [{ body: 'odd-escalated reason=third-failed-qa-round\n\nMET-1: PR #9 rejected 3 times', createdAt: '2026-10-24T15:00:00Z' }] };
+  const all = [builder, changes(1, 'a'.repeat(12)), changes(2, 'b'.repeat(12)), changes(3, sha.slice(0, 12))];
+  assert.equal(nextAction(toSnapshot({ issue, pr, threads: all }), { orbs: 0, runnerSlots: 0, buildIssues: 1 }).kind, 'page');
+  // page() archives the reviewer threads whose changes verdict is for another head.
+  const resumed = toSnapshot({ issue, pr, threads: [builder, changes(3, sha.slice(0, 12))] });
+  assert.equal(resumed.pr?.changesRounds, 1);
+  assert.equal(nextAction(resumed, { orbs: 0, runnerSlots: 0, buildIssues: 1 }).kind, 'steer');
+  assert.deepEqual(nextAction(toSnapshot({ issue, pr, threads: [changes(3, sha.slice(0, 12))] }), { orbs: 0, runnerSlots: 0, buildIssues: 0 }),
+    { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'qa changes, round 2', round: 1 });
 });

@@ -1,7 +1,7 @@
 // Outcome driven development: derive an IssueSnapshot from what Linear, GitHub and Amp
 // report (docs/odd/README.md §9). Pure functions; the control-plane plugin does the IO.
 
-import { capacity, contracts, parseDeployReceipt, parseThreadLabels, roles, type DeployReceipt, type IssueSnapshot, type Load, type RiskClass, type Status, type Verdict } from './lifecycle.ts';
+import { capacity, contracts, parseCancelled, parseDeployReceipt, parseThreadLabels, parseVerify, roles, type DeployReceipt, type IssueSnapshot, type Load, type RiskClass, type Role, type Status, type Verdict, type Verify } from './lifecycle.ts';
 
 export type WebhookSource = 'linear' | 'github' | 'slack';
 
@@ -70,7 +70,8 @@ export function prOwnsIssue(pr: Pick<GitHubPullRequest, 'headRefName' | 'body'>,
   return new RegExp(`^\\s*(closes|contributes)\\s+${escaped}\\b`, 'im').test(pr.body ?? '');
 }
 
-export type LiveThread = { id: string; labels: readonly string[]; state: string };
+/** `updatedAt` is the thread's last activity as reported by thread search; absent for a thread the index has not returned yet. */
+export type LiveThread = { id: string; labels: readonly string[]; state: string; updatedAt?: string };
 
 const statuses: readonly Status[] = ['Backlog', 'Triage', 'Todo', 'In Progress', 'Deploying', 'Done', 'Canceled', 'Duplicate'];
 
@@ -81,7 +82,8 @@ export function ciState(checks: GitHubPullRequest['statusCheckRollup'] = []): 'p
   return 'success';
 }
 
-const verdictPattern = /^odd-verdict-(ready|changes)-([a-f0-9]{12})$/;
+/** A reviewer thread's verdict label: state and the 12-character head prefix it judged. */
+export const verdictPattern = /^odd-verdict-(ready|changes)-([a-f0-9]{12})$/;
 
 /** The newest reviewer verdict label, matched to the PR head by its 12-character SHA prefix. */
 export function verdictFor(threads: readonly LiveThread[], headSha: string): Verdict | undefined {
@@ -132,14 +134,21 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     ?? roleThreads[0];
   const owner = owned ? (() => {
     const { role, round } = parseThreadLabels(owned.labels);
-    return role ? { role, threadID: owned.id, round, state: ownerState(owned.state) } : undefined;
+    return role ? { role, threadID: owned.id, round, state: ownerState(owned.state), ...(owned.updatedAt ? { idleSince: owned.updatedAt } : {}) } : undefined;
   })() : undefined;
   // Only receipts after the latest merge count: an issue re-opened after a rollback and merged again starts clean.
+  // Cancelled rounds restart at the latest escalation: Devon clearing `escalated` grants a fresh budget.
   let receipt: DeployReceipt | undefined;
+  let verify: Verify | undefined;
+  let cancelledRounds: Partial<Record<Role, number>> = {};
   const oldestFirst = [...issue.comments ?? []].sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''));
   for (const comment of oldestFirst) {
     if (/^odd-merge pr=/m.test(comment.body)) receipt = undefined;
+    if (/^odd-escalated reason=/m.test(comment.body)) cancelledRounds = {};
     receipt = parseDeployReceipt(comment.body) ?? receipt;
+    verify = parseVerify(comment.body) ?? verify;
+    const cancelled = parseCancelled(comment.body);
+    if (cancelled) cancelledRounds[cancelled.role] = Math.max(cancelledRounds[cancelled.role] ?? 0, cancelled.round);
   }
   return {
     identifier: issue.id.toUpperCase(),
@@ -159,7 +168,21 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
       changesRounds: changesRounds(threads),
     } : undefined,
     deployReceipt: receipt,
+    verify,
+    openRounds: openRounds(roleThreads),
+    cancelledRounds,
   };
+}
+
+/** Highest round per role among live threads still owed their artifact; a reviewer thread carrying a verdict label has delivered. */
+export function openRounds(threads: readonly LiveThread[]): Partial<Record<Role, number>> {
+  const rounds: Partial<Record<Role, number>> = {};
+  for (const thread of threads) {
+    const { role, round } = parseThreadLabels(thread.labels);
+    if (!role || (role === 'reviewer' && thread.labels.some(label => verdictPattern.test(label)))) continue;
+    rounds[role] = Math.max(rounds[role] ?? 0, round);
+  }
+  return rounds;
 }
 
 /**
@@ -189,6 +212,7 @@ const roleStages: Partial<Record<keyof typeof contracts, readonly Status[]>> = {
   spec: ['Backlog', 'Triage'],
   builder: ['Todo', 'In Progress'],
   reviewer: ['In Progress'],
+  verifier: ['Deploying'],
 };
 
 /** Idle role threads whose stage the issue has left: finished work to archive (§7 handoff). */
