@@ -1,6 +1,6 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import { Activity, Cpu, Moon, Mountain, Server, Sun, Terminal, Info } from "lucide-react";
-import { useApi, useHeld } from "./api/client";
+import { useApi } from "./api/client";
 import { useStream } from "./api/stream";
 import { useBuildUpdate } from "./api/build-update";
 import type { UsageRange, GpuRange, DeviceRange } from "./api/types";
@@ -61,6 +61,29 @@ export function crumbs(path: string): { label: string; href: string }[] {
   }));
 }
 
+// One shared one-second tick. Only the subtrees that show a relative time or a countdown
+// subscribe through <Clock>, so the tick never re-renders the dashboard tree, and every
+// subscriber receives the same timestamp in the same batch.
+const ticks = new Set<(now: number) => void>();
+let tick: ReturnType<typeof setInterval> | undefined;
+function subscribeTick(listener: (now: number) => void) {
+  if (ticks.size === 0)
+    tick = setInterval(() => {
+      const now = Date.now();
+      for (const notify of ticks) notify(now);
+    }, 1000);
+  ticks.add(listener);
+  return () => {
+    ticks.delete(listener);
+    if (ticks.size === 0) clearInterval(tick);
+  };
+}
+function Clock({ children }: { children: (now: number) => ReactNode }) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => subscribeTick(setNow), []);
+  return children(now);
+}
+
 export default function App() {
   const [path, setPath] = useState(() => window.location.pathname);
   const [usageRange, setUsageRange] = useState<UsageRange>("24h");
@@ -101,14 +124,9 @@ export default function App() {
   );
   const gpu = useApi("/v1/gpu", `?range=${gpuRange}`, live.snapshotRevision);
   const ups = useApi("/v1/ups", "", live.snapshotRevision + live.upsWarningRevision);
-  const [now, setNow] = useState(Date.now);
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
   const upsCurrent = live.upsAt > (ups.data?.generated_at_ms ?? 0) ? live.ups : ups.data?.current;
   const upsWarnings = ups.data?.warnings ?? (ups.error ? [ups.error] : []);
-  const network = useHeld(useApi("/v1/network", "", live.networkRevision + live.snapshotRevision));
+  const network = useApi("/v1/network", "", live.networkRevision + live.snapshotRevision);
   const networkTrend = useApi("/v1/network/history", "?range=24h", live.snapshotRevision);
   const pricing = useApi("/v1/pricing", "", live.pricingRevision + live.snapshotRevision);
   const agents = useApi("/v1/agents", "", live.agentsRevision + live.snapshotRevision);
@@ -162,19 +180,20 @@ export default function App() {
     }
     pulse();
   }, [refresh]);
-  const overview = verdict({
-    fleet,
-    gpu,
-    usage,
-    pricing,
-    agents,
-    devices,
-    network,
-    networkBadge: networkBadge(freshStatus(network.data, now)),
-    ups: upsState({ current: upsCurrent, now }),
-    upsCurrent,
-    stream: live.status,
-  });
+  const overview = (now: number) =>
+    verdict({
+      fleet,
+      gpu,
+      usage,
+      pricing,
+      agents,
+      devices,
+      network,
+      networkBadge: networkBadge(freshStatus(network.data, now)),
+      ups: upsState({ current: upsCurrent, now }),
+      upsCurrent,
+      stream: live.status,
+    });
   return (
     <TooltipProvider>
       <AmbientScene mode={ambient.mode} dark={dark} />
@@ -207,7 +226,9 @@ export default function App() {
         <div className="header-actions">
           <a href="/topology">Topology</a>
           <LiveIndicator status={live.status} />
-          <UpsBadge current={upsCurrent} now={now} warnings={upsWarnings} />
+          <Clock>
+            {(now) => <UpsBadge current={upsCurrent} now={now} warnings={upsWarnings} />}
+          </Clock>
           <Tooltip>
             <TooltipTrigger
               render={
@@ -246,50 +267,64 @@ export default function App() {
         </div>
       </header>
       {remote ? (
-        <DevicesPage
-          deviceId={remote}
-          view={remoteView}
-          history={deviceHistory.data}
-          historyLoading={deviceHistory.loading}
-          historyError={deviceHistory.error}
-          range={deviceRange}
-          setRange={setDeviceRange}
-          error={deviceCurrent.error}
-          loading={deviceCurrent.loading}
-          connected={live.connected}
-          // A pushed frame triggers a refetch, so the newer GET is just as current; the
-          // page shows Live only while the agent link itself is live.
-          live={live.connected && remoteView != null}
-          now={now}
-        />
+        <Clock>
+          {(now) => (
+            <DevicesPage
+              deviceId={remote}
+              view={remoteView}
+              history={deviceHistory.data}
+              historyLoading={deviceHistory.loading}
+              historyError={deviceHistory.error}
+              range={deviceRange}
+              setRange={setDeviceRange}
+              error={deviceCurrent.error}
+              loading={deviceCurrent.loading}
+              connected={live.connected}
+              // A pushed frame triggers a refetch, so the newer GET is just as current; the
+              // page shows Live only while the agent link itself is live.
+              live={live.connected && remoteView != null}
+              now={now}
+            />
+          )}
+        </Clock>
       ) : path === "/devices/factory-gpu" ? (
-        <DevicesPage
-          deviceId="factory-gpu"
-          view={deviceView}
-          history={deviceHistory.data}
-          historyLoading={deviceHistory.loading}
-          historyError={deviceHistory.error}
-          range={deviceRange}
-          setRange={setDeviceRange}
-          error={deviceError}
-          loading={deviceCurrent.loading}
-          connected={live.connected}
-          live={live.connected && live.devices != null}
-          now={now}
-        />
+        <Clock>
+          {(now) => (
+            <DevicesPage
+              deviceId="factory-gpu"
+              view={deviceView}
+              history={deviceHistory.data}
+              historyLoading={deviceHistory.loading}
+              historyError={deviceHistory.error}
+              range={deviceRange}
+              setRange={setDeviceRange}
+              error={deviceError}
+              loading={deviceCurrent.loading}
+              connected={live.connected}
+              live={live.connected && live.devices != null}
+              now={now}
+            />
+          )}
+        </Clock>
       ) : path === "/llm" ? (
         <LlmPage usage={usage} pricing={pricing} range={usageRange} setRange={setUsageRange} />
       ) : path === "/network" ? (
-        <NetworkPage status={network} now={now} revision={live.snapshotRevision} />
+        <Clock>
+          {(now) => <NetworkPage status={network} now={now} revision={live.snapshotRevision} />}
+        </Clock>
       ) : path === "/ups" ? (
-        <UpsPage
-          current={upsCurrent}
-          status={{ loading: ups.loading && upsCurrent == null, error: ups.error }}
-          now={now}
-          warnings={ups.data?.warnings ?? []}
-          live={live}
-          revision={live.snapshotRevision + live.upsEventRevision}
-        />
+        <Clock>
+          {(now) => (
+            <UpsPage
+              current={upsCurrent}
+              status={{ loading: ups.loading && upsCurrent == null, error: ups.error }}
+              now={now}
+              warnings={ups.data?.warnings ?? []}
+              live={live}
+              revision={live.snapshotRevision + live.upsEventRevision}
+            />
+          )}
+        </Clock>
       ) : path === "/topology" ? (
         <Suspense fallback={<p className="loading">Loading topology…</p>}>
           <TopologyPage dark={dark} />
@@ -301,7 +336,12 @@ export default function App() {
             title="Your local compute. In focus."
             aside="Auto-refreshes every 60s"
           />
-          <Verdict issues={overview.issues} okCount={overview.okCount} />
+          <Clock>
+            {(now) => {
+              const { issues, okCount } = overview(now);
+              return <Verdict issues={issues} okCount={okCount} />;
+            }}
+          </Clock>
           <div className="dashboard-grid">
             <FleetSection
               resource={fleet}
@@ -317,8 +357,14 @@ export default function App() {
               icon={<Cpu />}
               index={1}
             />
-            <UpsSection current={upsCurrent} now={now} warnings={upsWarnings} index={2} />
-            <NetworkSection status={network} trend={networkTrend} now={now} index={3} />
+            <Clock>
+              {(now) => (
+                <>
+                  <UpsSection current={upsCurrent} now={now} warnings={upsWarnings} index={2} />
+                  <NetworkSection status={network} trend={networkTrend} now={now} index={3} />
+                </>
+              )}
+            </Clock>
             <UsageSection
               resource={usage}
               pricing={pricing}
@@ -328,8 +374,9 @@ export default function App() {
             />
             <aside className="sidebar" aria-label="Frontier tools and live requests">
               <AgentsSection
+                // The named event carries the full snapshot, so it wins until its refetch lands.
                 resource={
-                  live.agents && !agents.data
+                  live.agents && (!agents.data || agents.refreshing)
                     ? { data: live.agents, loading: false, error: null }
                     : agents
                 }

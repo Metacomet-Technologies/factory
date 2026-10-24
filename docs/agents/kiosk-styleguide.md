@@ -124,6 +124,33 @@ slide in (`.ticker li.fk-new`, `row-in`). All of it is CSS keyframes;
 `document.getAnimations()` is empty. The screenshot and ambient scripts assert
 that.
 
+Data updates (MET-296) are calm: values and charts ease into place and
+nothing on the page moves or resizes.
+
+- Charts draw in once on mount; later data changes tween from the previous
+  points (`useChartMotion()` in `lib/motion.ts`: 900 ms ease-in-out, off under
+  reduced motion). Never remount a chart to refresh it: no `key` tied to data,
+  no skeleton during a refetch, and memoize derived chart arrays so an
+  unrelated render (the clock) does not restart the tween. The comet head
+  follows with a CSS `cx`/`cy` transition of the same length.
+- Numbers tween through `Stat` (`useAnimatedNumber`, 600 ms) and use
+  `tabular-nums`, so a changing digit never changes width.
+- Anything whose content changes size gets a fixed or reserved box: chart
+  heights are fixed in `index.css`, and the request log has one height at
+  every width and scrolls. Status and warning content that comes and goes is
+  always rendered in its reserved slot, never conditionally: the Verdict chip
+  list (one row, two on phones; extra chips scroll inside it), each Fleet
+  service's detail box (`ServiceDetail`: a fixed one line inline at ≥ 1280 px,
+  two lines below; a longer error scrolls line by line by key, wheel or touch
+  and fades while more is below), and `Warnings reserve` on overview
+  cards (three lines that scroll, full text on the details page). Panel headers
+  put the subtitle on its own full-width row, so a status chip changing width
+  never rewraps it. Never hide or clip that text to make it fit. Keep changing
+  labels at a stable width (`min-width`, left-anchored) where a width change
+  would slide neighbours. When you change a live card, measure Cumulative
+  Layout Shift across three stream updates on the mock at 1512×982 and
+  430×932, and keep it at 0 (below 0.01 only with the cause named).
+
 ## Primitives
 
 All optional props accept `undefined` explicitly (`exactOptionalPropertyTypes`
@@ -234,8 +261,13 @@ stacks; numbers get `tabular-nums` from `body`.
   changes; `useStream()` owns the SSE connection and returns `status`
   (`connecting | live | reconnecting`), revision counters and the latest
   samples. Each refresh calls `pulse()` once.
-- Wrap frequently bumped resources in `useHeld` so the last response stays on
-  screen during a refetch.
+- A revision bump refetches in place: `useApi` keeps the last response (or
+  error) on screen, with `refreshing: true`, until the new one lands. Only a new
+  path or query (a range change) starts from the skeleton. Pushed SSE data
+  that is newer than a held GET (the `agents.usage` snapshot) wins while
+  `refreshing` is true.
+- Relative times and countdowns read `now` from App's shared one-second
+  `<Clock>`; wrap only the subtree that shows them, never the whole page tree.
 - The stream reconnects on `error`, after 45 s of silence, and on
   `online` / `visibilitychange` / `pageshow`, with jittered backoff. Do not
   add a second EventSource.

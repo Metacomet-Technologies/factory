@@ -1,4 +1,4 @@
-import { lazy, Suspense, type ReactNode } from "react";
+import { lazy, Suspense, useMemo, type ReactNode } from "react";
 import { Globe } from "lucide-react";
 import type { Resource } from "../api/client";
 import type { Endpoints, NetworkSpeedTest } from "../api/types";
@@ -37,7 +37,11 @@ export function NetworkSection({
   const fresh = freshStatus(status.data, now);
   const badge = networkBadge(fresh);
   const wan = layerNow(fresh?.targets ?? [], "wan");
-  const points = trend.data ? layerTrend(trend.data.series, "wan") : [];
+  // Same history, same array: the per-second clock must not restart the sparkline tween.
+  const points = useMemo(
+    () => (trend.data ? layerTrend(trend.data.series, "wan") : []),
+    [trend.data],
+  );
   const test = status.data?.latest_speed_test;
   const sparkline = (metric: "latency" | "loss") =>
     trend.loading ? (
@@ -104,7 +108,7 @@ export function NetworkSection({
             </div>
           </div>
         )}
-        <Warnings warnings={status.data?.warnings ?? []} />
+        <Warnings warnings={status.data?.warnings ?? []} reserve />
       </Panel>
     </a>
   );

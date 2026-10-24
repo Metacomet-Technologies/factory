@@ -9,7 +9,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { useReducedMotion } from "@/lib/motion";
+import { useChartMotion } from "@/lib/motion";
 import { time } from "@/lib/format";
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from "../ui/chart";
 
@@ -39,7 +39,7 @@ export function TrendChart<T extends { ts_ms: number }>({
   caption?: string | undefined;
   variant?: "comet" | "area" | undefined;
 }) {
-  const reduced = useReducedMotion();
+  const motion = useChartMotion();
   const gradient = `trend-${useId().replace(/:/g, "")}`;
   const last = data.findLast((point) => typeof point[dataKey] === "number");
   const margin = { left: 0, right: 8, top: 8, bottom: 0 };
@@ -82,9 +82,7 @@ export function TrendChart<T extends { ts_ms: number }>({
                 fill={`url(#${gradient})`}
                 strokeWidth={2}
                 connectNulls={false}
-                isAnimationActive={!reduced}
-                animationDuration={900}
-                animationEasing="ease-out"
+                {...motion}
                 activeDot={{ r: 4, strokeWidth: 0 }}
               />
             </AreaChart>
@@ -117,9 +115,7 @@ export function TrendChart<T extends { ts_ms: number }>({
                 strokeWidth={2.5}
                 dot={false}
                 connectNulls={false}
-                isAnimationActive={!reduced}
-                animationDuration={900}
-                animationEasing="ease-out"
+                {...motion}
                 activeDot={{ r: 4, strokeWidth: 0, fill: "var(--accent-text)" }}
               />
               {last && (

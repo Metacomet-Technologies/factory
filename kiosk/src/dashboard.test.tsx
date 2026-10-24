@@ -628,6 +628,44 @@ describe("dashboard contract", () => {
     expect(footer).toHaveTextContent("meter unknown");
     expect(footer).not.toHaveTextContent("Build mismatch");
   });
+  it("keeps whole service errors reachable by keyboard, outside the tile link, as they come and go", () => {
+    const long =
+      "Unit failed to start because the configured upstream endpoint was unavailable after repeated connection attempts; inspect the service journal for the original connection error.";
+    const fleet = (detail: string | null, gpuFailing: boolean) => {
+      const data = fixtures().fleet;
+      const backup = data.nodes[1]!.services[0]!;
+      Object.assign(backup, detail === null ? { ok: true, detail } : { ok: false, detail });
+      if (gpuFailing) Object.assign(data.nodes[0]!.services[0]!, { ok: false, detail: long });
+      return { data, error: null, loading: false };
+    };
+    const devices = [
+      { device_id: "factory-gpu", health: "healthy" as const, href: "/devices/factory-gpu" },
+    ];
+    const { rerender } = render(
+      <FleetSection resource={fleet(long, true)} devices={devices} icon={null} />,
+    );
+    const region = within(screen.getByRole("region", { name: "Fleet" }));
+    const backup = region.getByRole("group", { name: "backup failure detail" });
+    expect(backup).toHaveTextContent(long);
+    expect(backup).toHaveAttribute("tabindex", "0");
+    const meter = region.getByRole("group", { name: "meter-http failure detail" });
+    expect(meter).toHaveTextContent(long);
+    // The tile link is the node name: the focusable detail is not nested inside it.
+    const link = region.getByRole("link", { name: /factory-gpu/ });
+    expect(link).toHaveAttribute("href", "/devices/factory-gpu");
+    expect(link).not.toContainElement(meter);
+    const rows = region.getAllByRole("listitem").length;
+    rerender(<FleetSection resource={fleet(null, false)} devices={devices} icon={null} />);
+    expect(region.queryByRole("group", { name: /failure detail/ })).not.toBeInTheDocument();
+    expect(region.getAllByRole("listitem")).toHaveLength(rows);
+    rerender(
+      <FleetSection resource={fleet("Unit is inactive", false)} devices={devices} icon={null} />,
+    );
+    expect(region.getByRole("group", { name: "backup failure detail" })).toHaveTextContent(
+      "Unit is inactive",
+    );
+    expect(region.getAllByRole("listitem")).toHaveLength(rows);
+  });
   it("shows now only for online nodes without a last-seen timestamp", () => {
     const data = fixtures().fleet;
     data.nodes = [
@@ -782,6 +820,82 @@ describe("dashboard contract", () => {
     );
     await screen.findByText("Pricing provider unavailable. Reference rates are unknown.");
     expect(screen.getByText("Meter unavailable. Usage cannot be retrieved.")).toBeInTheDocument();
+  });
+  it("keeps cards and the mounted GPU chart while stream-triggered refetches are pending", async () => {
+    const fetch = api();
+    render(<App />);
+    const chart = await screen.findByLabelText("GPU utilization history");
+    const fleet = within(screen.getByRole("region", { name: "Fleet" }));
+    await waitFor(() => expect(fleet.getByRole("link", { name: /factory-gpu/ })).toBeVisible());
+    const calls = (path: string) => fetch.mock.calls.filter(([url]) => url === path).length;
+    const before = [calls("/v1/gpu?range=1h"), calls("/v1/devices")];
+    fetch.mockImplementation(() => new Promise<Response>(() => {}));
+    act(() => {
+      MockSource.latest.onopen?.();
+      MockSource.latest.onopen?.(); // a reopen refetches every snapshot, GPU history included
+      MockSource.latest.dispatchEvent(
+        new MessageEvent("devices.sample", {
+          data: JSON.stringify({ type: "devices.sample", ts_ms: Date.now(), data: null }),
+        }),
+      );
+    });
+    expect([calls("/v1/gpu?range=1h"), calls("/v1/devices")]).toEqual(before.map((n) => n + 1));
+    expect(screen.queryByLabelText("Loading section")).not.toBeInTheDocument();
+    // Same node: the chart was not remounted, so Recharts tweens from its previous series.
+    expect(screen.getByLabelText("GPU utilization history")).toBe(chart);
+    expect(fleet.getByRole("link", { name: /factory-gpu/ })).toBeVisible();
+  });
+  it("keeps the verdict chip list in place when every issue clears and comes back", async () => {
+    const fetch = api();
+    const serve = fetch.getMockImplementation()!;
+    let recovered = false;
+    fetch.mockImplementation(async (path: string) => {
+      const response = await serve(path);
+      if (!recovered) return response;
+      if (path === "/v1/fleet") {
+        const fleet = (await response.json()) as ReturnType<typeof fixtures>["fleet"];
+        for (const node of fleet.nodes) {
+          node.online = true;
+          for (const service of node.services) Object.assign(service, { ok: true, detail: null });
+        }
+        return new Response(JSON.stringify(fleet));
+      }
+      if (path === "/v1/pricing") {
+        const pricing = (await response.json()) as ReturnType<typeof fixtures>["pricing"];
+        for (const family of pricing.families) family.pending = null;
+        return new Response(JSON.stringify(pricing));
+      }
+      return response;
+    });
+    render(<App />);
+    const fleet = within(screen.getByRole("region", { name: "Fleet" }));
+    await fleet.findByText("Unit is inactive");
+    const items = screen.getByRole("list", { name: "Attention items" });
+    const issues = within(items).getAllByRole("listitem").length;
+    const services = fleet.getAllByRole("listitem").length;
+    const change = (ok: boolean) =>
+      act(async () => {
+        const event = (type: string, data: unknown) =>
+          MockSource.latest.dispatchEvent(
+            new MessageEvent(type, { data: JSON.stringify({ type, ts_ms: Date.now(), data }) }),
+          );
+        event("fleet.change", { node: "factory-console", service: "backup", ok });
+        event("pricing.changed", { family: "Claude Sonnet", pending_model_id: null });
+      });
+    recovered = true;
+    await change(true);
+    expect(await screen.findByText("All systems nominal")).toBeVisible();
+    // The (now empty) chip list and the service rows stay; only their contents change.
+    expect(screen.getByRole("list", { name: "Attention items" })).toBe(items);
+    expect(within(items).queryAllByRole("listitem")).toHaveLength(0);
+    expect(fleet.queryByText("Unit is inactive")).not.toBeInTheDocument();
+    expect(fleet.getAllByRole("listitem")).toHaveLength(services);
+    recovered = false;
+    await change(false);
+    expect(await fleet.findByText("Unit is inactive")).toBeVisible();
+    expect(screen.getByRole("list", { name: "Attention items" })).toBe(items);
+    expect(within(items).getAllByRole("listitem")).toHaveLength(issues);
+    expect(fleet.getAllByRole("listitem")).toHaveLength(services);
   });
   it("renders outage nulls and warnings without dropping other sections", async () => {
     api(true);

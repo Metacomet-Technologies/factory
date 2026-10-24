@@ -49,6 +49,21 @@ export function useReducedMotion() {
 }
 
 /**
+ * Recharts series motion. A mounted series draws in once (`--dur-draw`); every later data
+ * change tweens from the previous points over the same eased duration, because Recharts keeps
+ * those points for as long as the chart stays mounted. So never remount a chart to refresh it
+ * (no `key` on data, no skeleton during a refetch). Reduced motion renders the final state.
+ */
+export function useChartMotion() {
+  const reduced = useReducedMotion();
+  return {
+    isAnimationActive: !reduced,
+    animationDuration: 900,
+    animationEasing: "ease-in-out",
+  } as const;
+}
+
+/**
  * Event pulse: fresh data landed. The Live chip throws one ripple and every `.fk-hero`
  * number flashes once over `--dur-event`. Pure CSS; under reduced motion the keyframes are
  * disabled, so the ripple is removed at once and the flash class is a no-op.
