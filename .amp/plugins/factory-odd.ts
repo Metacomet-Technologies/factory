@@ -233,10 +233,23 @@ export default async function (amp: PluginAPI) {
 
 type Tools = WebhookHandlerContext['tools']
 
+// `ctx.tools.call` returns the full CallToolResult for MCP tools: the payload is JSON in the
+// first text block (or `structuredContent` when the server provides it). Built-in tools return
+// their result directly; pass those through unchanged.
+async function callJson<T>(tools: Tools, name: string, input: Record<string, unknown>): Promise<T> {
+	const result = (await tools.call(name, input)) as { structuredContent?: unknown; content?: { type: string; text?: string }[] } | T
+	if (typeof result !== 'object' || result === null) return result as T
+	const envelope = result as { structuredContent?: unknown; content?: { type: string; text?: string }[] }
+	if (envelope.structuredContent !== undefined) return envelope.structuredContent as T
+	const textBlock = envelope.content?.find(block => block.type === 'text' && typeof block.text === 'string')
+	if (!textBlock) return result as T
+	return JSON.parse(textBlock.text as string) as T
+}
+
 async function snapshotFor(ctx: WebhookHandlerContext, identifier: string): Promise<IssueSnapshot> {
 	const [issue, comments, pr, threads] = await Promise.all([
-		ctx.tools.call('linear.get_issue', { id: identifier }) as Promise<LinearIssue>,
-		ctx.tools.call('linear.list_comments', { issueId: identifier, limit: 50 }).then(result => (result as { comments?: { body: string }[] }).comments ?? []),
+		callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: identifier }),
+		callJson<{ comments?: { body: string }[] }>(ctx.tools, 'linear.list_comments', { issueId: identifier, limit: 50 }).then(result => result.comments ?? []),
 		pullRequestFor(ctx, identifier),
 		threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`),
 	])
@@ -256,9 +269,9 @@ async function pullRequestFor(ctx: WebhookHandlerContext, identifier: string): P
 }
 
 async function threadsFor(tools: Tools, query: string): Promise<LiveThread[]> {
-	const found = (await tools.call('find_thread', { query, limit: 100 })) as { threads: { id: string }[] }
+	const found = await callJson<{ threads: { id: string }[] }>(tools, 'find_thread', { query, limit: 100 })
 	return Promise.all(found.threads.map(async ({ id }) => {
-		const status = (await tools.call('get_thread_status', { thread: id })) as { metadata: { labels: string[] }; agentState?: { state?: string } }
+		const status = await callJson<{ metadata: { labels: string[] }; agentState?: { state?: string } }>(tools, 'get_thread_status', { thread: id })
 		return { id, labels: status.metadata.labels, state: status.agentState?.state ?? 'idle' }
 	}))
 }
