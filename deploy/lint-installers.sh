@@ -19,9 +19,9 @@
 #   snapshot   installers back up existing state first: cp of a non-scratch, non-repo path, or sqlite3 .backup,
 #              into a /var/backups or $snapshot path (touch markers and recorded states are not backups);
 #              rollbacks either do that or validate the snapshot they consume
-#   health     after the first deploy mutation, a bounded probe of the component: curl with --max-time/-m,
-#              `timeout N` around curl/wget/upsc/nc, systemctl is-active, a deadline/seq/attempt-bounded loop
-#              that runs one of those probes (directly or through an array), or starting a repo oneshot unit that sets TimeoutStartSec
+#   health     after the first deploy mutation, a bounded probe of the component: curl with a positive
+#              --max-time/-m, a positive `timeout N` around curl/wget/upsc/nc, systemctl is-active, or starting a
+#              repo oneshot unit that sets a positive TimeoutStartSec. A retry loop does not bound the probes in it.
 #   rollback   installers name an existing rollback-*.sh in their directory; rollbacks are named by another
 #              deploy script or a Markdown doc
 # A deploy mutation is a write (install, cp, mv, rm, mkdir, chown, chmod, touch, tee, sed -i, redirection,
@@ -31,6 +31,9 @@ set -Eeuo pipefail
 
 # One line per exemption: path|check|reason. A reason starting with `TODO MET-<new>` is a genuine
 # gap to fix in a follow-up issue; otherwise the check does not fit that component's contract.
+# `path|check!|TODO ...` records an audited gap the static checks cannot see, such as one branch of a
+# script or a delegated helper. It must be a TODO, shows TODO whether or not the check passes, and is
+# never stale.
 exemptions=(
     'deploy/rollback-meter.sh|root|TODO MET-<new>: as_root falls back to sudo instead of refusing non-root.'
     'deploy/rollback-meter.sh|trap|TODO MET-<new>: no ERR/EXIT trap; set -euo pipefail only.'
@@ -39,16 +42,21 @@ exemptions=(
     'deploy/devices/install-devices.sh|snapshot|TODO MET-<new>: mkdir -p of the lib, state and unit directories runs before the snapshot.'
     'deploy/devices/install-devices.sh|health|TODO MET-<new>: the first oneshot runs have no TimeoutStartSec, and oneshot units default to no start timeout.'
     'deploy/devices/rollback-devices.sh|trap|TODO MET-<new>: no ERR/EXIT trap.'
-    'deploy/devices/rollback-devices.sh|health|Restores helper files and units only; it starts nothing, so there is nothing to probe.'
+    'deploy/devices/rollback-devices.sh|health|TODO MET-<new>: restored SMART and maintenance units stay enabled and running, and nothing checks them after the restore.'
     'deploy/devices-agent/install-devices-agent.sh|health|TODO MET-<new>: restarts factory-devices-agent.service without a bounded probe.'
     'deploy/devices-agent/rollback-devices-agent.sh|trap|TODO MET-<new>: no ERR/EXIT trap.'
-    'deploy/devices-agent/rollback-devices-agent.sh|health|Removes the agent and restores SMART helper files; no service remains to probe.'
+    'deploy/devices-agent/rollback-devices-agent.sh|health|TODO MET-<new>: the SMART timer and service stay enabled when the snapshot had them, and nothing checks them after the restore.'
     'deploy/backup/rollback-backup-config.sh|trap|TODO MET-<new>: no ERR/EXIT trap.'
-    'deploy/backup/rollback-backup-config.sh|health|Restores configuration and recorded unit states only; the backup job has no endpoint.'
+    'deploy/backup/rollback-backup-config.sh|health|TODO MET-<new>: restarts factory-backup units to their recorded state with no bounded check.'
     'deploy/ups/rollback-nut.sh|health|TODO MET-<new>: restarts nut-server and nut-monitor without the bounded upsc probe the installer uses.'
     'deploy/ups/rollback-ups-control.sh|trap|TODO MET-<new>: no ERR/EXIT trap.'
     'deploy/ups/rollback-ups-control.sh|health|TODO MET-<new>: restarts the control service without a bounded probe.'
-    'deploy/reboot/install-reboot-policy.sh|health|The probe is reboot-check.sh --mode observe; reboot-policy.py bounds each subprocess with timeout=15.'
+    'deploy/reboot/install-reboot-policy.sh|health|TODO MET-<new>: the probe, reboot-check.sh --mode observe, has no outer deadline, and reboot-policy.py waits on fcntl LOCK_EX of policy.lock with no timeout.'
+    'deploy/ups/install-nut.sh|health|TODO MET-<new>: every upsc status probe runs with no timeout, so the 45 s deadline loop cannot bound a hung call.'
+    'deploy/alerts/rollback-alerts.sh|health!|TODO MET-<new>: the factory-console path restarts factory-watchdog.timer with no bounded probe; only the factory-gpu path waits for health.'
+    'deploy/alerts/rollback-alerts.sh|snapshot!|TODO MET-<new>: with no snapshot argument it removes the token, drop-in and watchdog files without saving them first.'
+    'deploy/install-factory-api.sh|snapshot!|TODO MET-<new>: --enroll-device execs device-tokens.sh, which creates and chowns /etc/factory-api before its snapshot; the snapshot holds only the added line, not the previous file.'
+    'deploy/rollback-factory-api.sh|snapshot!|TODO MET-<new>: --unenroll-device execs device-tokens.sh, which rewrites /etc/factory-api/device-tokens without saving the current file.'
     'deploy/reboot/rollback-reboot-policy.sh|snapshot|TODO MET-<new>: deletes /etc/factory-reboot/node.conf without saving it, so local edits since the last install are lost.'
     'deploy/reboot/rollback-reboot-policy.sh|health|Removal only; no service remains to probe.'
     'deploy/rollback-dispatch.sh|health|Removal only; no service remains to probe.'
@@ -79,7 +87,13 @@ CHECK_COMMANDS = {"[[", "[", "test", "command", "getent", "id", "stat", "cmp", "
 PROBES = {"curl", "wget", "upsc", "nc"}
 REPO_SOURCE = re.compile(r"^\"?\$\{?(here|repo)\b|^\"?\$\{?root\}?/deploy\b")
 ROOT_TEST = re.compile(r"(\bEUID\b|\$\(id -u\))[^]\n]*?(-eq|-ne|==|!=)\s*0\b")
-BOUNDED_LOOP = re.compile(r"SECONDS\s*<\s*deadline|\$\(seq \d+\)|attempt\s*<\s*\d+")
+MAX_TIME = re.compile(r"(?:^|\s)(?:--max-time(?:\s+|=)|-m\s*)(\S+)")
+
+
+def positive(value):
+    """False for an empty or zero duration such as 0, 0s or 0.0; curl and timeout treat 0 as no limit."""
+    value = value.strip("\"'")
+    return bool(value) and not re.fullmatch(r"0*\.?0*[smhd]?", value)
 
 
 def flatten(line):
@@ -257,9 +271,11 @@ class Script:
                     if tokens[i - 1] == "--":
                         break
             elif token == "timeout" and i + 1 < len(tokens):
-                bounded, i = True, i + 2
+                i += 1
                 while i < len(tokens) and tokens[i].startswith("-"):
-                    i += 1
+                    i += 2 if tokens[i] in ("-s", "-k", "--signal", "--kill-after") else 1
+                if i < len(tokens):
+                    bounded, i = positive(tokens[i]), i + 1
             elif token == "exec" and i + 1 < len(tokens) and not re.match(r"^\d*[<>]", tokens[i + 1]):
                 i += 1
             elif token in self.functions and self.wrapper(token):
@@ -297,18 +313,14 @@ class Script:
         found = set()
         if re.match(r"^trap\s", text):
             return found
-        if BOUNDED_LOOP.search(text):
-            found.add("loop")
         if re.search(r"-[fde]\s+\"?\$\{?(1|" + "|".join(map(re.escape, self.backup)) + r")\b", text):
             found.add("consume")
         for segment in segments(text):
             tokens, bounded = self.command(segment)
             if not tokens:
                 continue
-            if tokens[0] in PROBES:
-                found.add("probe")
-                if bounded:
-                    found.add("health")
+            if tokens[0] in PROBES and bounded:
+                found.add("health")
             name, args = tokens[0], []
             skip = False
             for token in tokens[1:]:
@@ -319,10 +331,7 @@ class Script:
                 else:
                     args.append(token)
             if name in self.functions and name not in stack:
-                called = self.function_effects(name, stack + (name,))
-                if {"loop", "probe"} <= called:
-                    called.add("health")
-                found |= called
+                found |= self.function_effects(name, stack + (name,))
                 continue
             redirect = [m.group(1) for m in re.finditer(r"(?<![<&])\d*>>?\s*([^&\s][^\s]*)", segment)
                         if m.group(1) != "/dev/null"]
@@ -353,7 +362,8 @@ class Script:
             if name in CHECK_COMMANDS or (name == "systemctl" and args[:1] and args[0] in SYSTEMCTL_READS):
                 if "$#" not in segment:
                     found.add("check")
-            if name == "curl" and re.search(r"(^|\s)(--max-time|-m)(\s|=|\d)", segment):
+            limit = MAX_TIME.search(segment) if name == "curl" else None
+            if limit and positive(limit.group(1)):
                 found.add("health")
             if name == "systemctl" and "is-active" in args:
                 found.add("health")
@@ -445,27 +455,6 @@ def root_guard(script, texts, i, stack=()):
     return False
 
 
-def loop_probes(texts, i):
-    """True when the bounded loop starting at texts[i] runs a probe before its matching `done`.
-
-    A probe is one of PROBES, directly or through an array such as upsc=(runuser -u nut -- upsc)."""
-    arrays = {m.group(1) for t in texts for m in re.finditer(r"(?:^|[\s;])(\w+)=\(([^)]*)\)", t)
-              if set(m.group(2).split()) & PROBES}
-    depth, opened = 0, False
-    for text in texts[i:i + 200]:
-        flat = flatten(text)
-        if any(re.search(r"\$\{" + re.escape(name) + r"\[@\]\}", flat) for name in arrays):
-            return True
-        if any(re.match(r"(sudo\s.*\s|timeout\s+\S+\s+)?(" + "|".join(PROBES) + r")\b", seg) for seg in segments(text)) \
-                or re.search(r"(^|[;\s])(" + "|".join(PROBES) + r")\s", flat):
-            return True
-        depth += len(re.findall(WORD.format("do"), flat)) - len(re.findall(WORD.format("done"), flat))
-        opened = opened or depth > 0
-        if opened and depth <= 0:
-            return False
-    return False
-
-
 def lint(script, references):
     lines = [(source, number, text, script.effects(text)) for source, number, text in script.lines]
     first = next((i for i, (*_, e) in enumerate(lines) if "mutation" in e), len(lines))
@@ -517,8 +506,7 @@ def lint(script, references):
         wanted = "snapshot copy" if script.kind == "install" else "snapshot copy or validated snapshot argument"
         failures["snapshot"] = f"no {wanted} before the first deploy mutation ({where(first)})"
 
-    if first < len(lines) and not any("health" in e or ("loop" in e and loop_probes(texts, first + i))
-                                      for i, (*_, e) in enumerate(after)):
+    if first < len(lines) and not any("health" in e for *_, e in after):
         failures["health"] = f"no bounded health check after the first deploy mutation ({where(first)})"
 
     text = script.path.read_text()
@@ -571,7 +559,9 @@ for path in scripts:
     cells = []
     for check in CHECKS:
         reason = exemptions.get((name, check))
-        if check in failures and reason:
+        if exemptions.get((name, check + "!")):
+            cells.append("TODO")
+        elif check in failures and reason:
             cells.append("TODO" if reason.startswith("TODO") else "exempt")
         elif check in failures:
             cells.append("FAIL")
@@ -583,12 +573,15 @@ for path in scripts:
             cells.append("pass")
     print(f"| {name} | " + " | ".join(cells) + " |")
 for (path, check), reason in exemptions.items():
-    if path not in known or check not in CHECKS or not reason.strip():
+    audited = check.endswith("!")
+    if (path not in known or check.rstrip("!") not in CHECKS or not reason.strip()
+            or (audited and (not reason.startswith("TODO") or (path, check[:-1]) in exemptions))):
         errors.append(f"INVALID exemption {path}|{check}: unknown script or check, or empty reason")
 if exemptions:
     print("\nExemptions:")
     for (path, check), reason in exemptions.items():
-        print(f"- {path} {check}: {reason}")
+        label = f"{check[:-1]} (audited; the lint cannot see it)" if check.endswith("!") else check
+        print(f"- {path} {label}: {reason}")
 for line in details + errors:
     print(line, file=sys.stderr)
 sys.exit(1 if details or errors else 0)

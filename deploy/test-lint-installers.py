@@ -24,6 +24,10 @@ EXPECTED_FAILURE = {
     "install-called-root.sh": None,
     "install-touch-snapshot.sh": "snapshot",
     "install-timeout-true.sh": "health",
+    "install-max-time-zero.sh": "health",
+    "install-m-zero.sh": "health",
+    "install-timeout-zero.sh": "health",
+    "install-loop-unbounded.sh": "health",
     "install-no-preflight.sh": "preflight",
     "install-no-trap.sh": "trap",
     "install-no-snapshot.sh": "snapshot",
@@ -95,20 +99,32 @@ class InventoryTest(unittest.TestCase):
             reason = line.split(": ", 1)[1]
             self.assertTrue(reason.startswith("TODO MET-<new>: ") or not reason.startswith("TODO"), line)
 
-    def test_stale_and_unknown_exemptions_fail(self):
+    def lint_with(self, *exemptions):
+        """Run a copy of the lint over install-good.sh and rollback-good.sh with only these exemptions."""
         with tempfile.TemporaryDirectory() as directory:
             deploy = Path(directory) / "deploy"
-            deploy.mkdir()
-            for name in ("install-good.sh", "rollback-good.sh"):
-                shutil.copy(FIXTURES / name, deploy / name)
-            text = re.sub(
-                r"^exemptions=\(\n.*?^\)$",
-                "exemptions=(\n    'deploy/install-good.sh|health|Passes, so this is stale.'\n"
-                "    'deploy/install-gone.sh|root|No such script.'\n)",
-                LINT.read_text(), count=1, flags=re.M | re.S,
-            )
+            fixture_copy(deploy)
+            for path in deploy.glob("*.sh"):
+                if path.name not in ("install-good.sh", "rollback-good.sh"):
+                    path.unlink()
+            lines = "".join(f"    '{line}'\n" for line in exemptions)
+            text = re.sub(r"^exemptions=\(\n.*?^\)$", lambda _: f"exemptions=(\n{lines})",
+                          LINT.read_text(), count=1, flags=re.M | re.S)
             (deploy / LINT.name).write_text(text)
-            result, rows = run(deploy / LINT.name)
+            return run(deploy / LINT.name)
+
+    def test_audited_exemption_marks_a_passing_check_todo(self):
+        result, rows = self.lint_with("deploy/install-good.sh|health!|TODO MET-<new>: one branch skips the probe.")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(rows["deploy/install-good.sh"]["health"], "TODO")
+        self.assertEqual(rows["deploy/rollback-good.sh"]["health"], "pass")
+        result, _ = self.lint_with("deploy/install-good.sh|health!|Not a TODO, so it hides a pass.")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("INVALID exemption deploy/install-good.sh|health!", result.stderr)
+
+    def test_stale_and_unknown_exemptions_fail(self):
+        result, rows = self.lint_with("deploy/install-good.sh|health|Passes, so this is stale.",
+                                      "deploy/install-gone.sh|root|No such script.")
         self.assertEqual(result.returncode, 1)
         self.assertEqual(rows["deploy/install-good.sh"]["health"], "STALE")
         self.assertIn("STALE deploy/install-good.sh health", result.stderr)
