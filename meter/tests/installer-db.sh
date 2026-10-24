@@ -123,7 +123,10 @@ sudo -u meter "$meter_binary" migrate --db "$v1" >/dev/null
 [[ $(stat -c %i "$v1") == "$inode" && $(telemetry_counts "$v1") == "$before" ]]
 [[ $(meter_sqlite "$v1" 'PRAGMA user_version;') == 2 ]]
 [[ $(rollup_state "$v1" | cut -d'|' -f1,2) == $'gpu|1\nrequests|2' ]]
-! rollup_state "$v1" | grep -q unverified
+if rollup_state "$v1" | grep -q unverified; then
+    echo 'Unverified rollup job after upgrade.' >&2
+    exit 1
+fi
 [[ $(meter_sqlite "$v1" 'SELECT SUM(requests) FROM request_daily;') == 2 ]]
 sudo -u meter "$meter_binary" migrate --check-only --db "$v1" >/dev/null
 sudo -u meter "$meter_binary" migrate --db "$v1" >/dev/null
