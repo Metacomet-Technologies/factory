@@ -124,7 +124,7 @@ fn applesmc(root: &Path) {
 }
 
 #[test]
-fn applesmc_symlink_fans_preserve_hwmon_and_refresh_each_sample() {
+fn applesmc_symlink_fans_preserve_hwmon_and_refresh_on_slow_cadence() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     console(root);
@@ -151,22 +151,16 @@ fn applesmc_symlink_fans_preserve_hwmon_and_refresh_each_sample() {
         assert_eq!(metric.unit, "rpm");
         assert_eq!(metric.availability, Availability::Available);
     }
-    let detail = fans
-        .iter()
-        .find(|fan| fan.name == "applesmc fan1")
-        .unwrap()
-        .metric
-        .detail
-        .as_ref()
-        .unwrap();
-    for value in ["Left", "1200", "6000"] {
-        assert!(detail.contains(value));
-    }
+    assert!(fans.iter().all(|fan| fan.metric.detail.is_none()));
     assert_eq!(accepted(&first).host.cooling.fans, *fans);
     write(root, &format!("{node}/fan1_input"), "2400\n");
     write(root, "sys/class/hwmon/hwmon0/fan1_input", "1600\n");
     write(root, "sys/class/hwmon/hwmon0/temp1_input", "61000\n");
     let next = agent.sample(1_015_000);
+    assert_eq!(next.cooling, first.cooling);
+    assert_eq!(next.cpu.temperature, first.cpu.temperature);
+    accepted(&next);
+    let next = agent.sample(1_300_000);
     assert_eq!(next.cooling.fans.len(), 3);
     for (name, rpm) in [("applesmc fan1", 2400.0), ("coretemp fan1", 1600.0)] {
         let metric = &next
@@ -177,10 +171,10 @@ fn applesmc_symlink_fans_preserve_hwmon_and_refresh_each_sample() {
             .unwrap()
             .metric;
         assert_eq!(metric.value, Some(rpm));
-        assert_eq!(metric.observed_at_ms, 1_015_000);
+        assert_eq!(metric.observed_at_ms, 1_300_000);
     }
     assert_eq!(next.cpu.temperature.value, Some(61.0));
-    assert_eq!(next.cpu.temperature.observed_at_ms, 1_015_000);
+    assert_eq!(next.cpu.temperature.observed_at_ms, 1_300_000);
     accepted(&next);
 }
 
@@ -217,7 +211,7 @@ fn applesmc_invalid_rpm_and_long_labels_stay_inside_contract() {
         assert_eq!(fan.metric.value, None);
     }
     assert_eq!(sample.cooling.fans[4].metric.value, Some(1200.0));
-    assert!(sample.cooling.fans[4].metric.detail.as_ref().unwrap().len() <= 256);
+    assert_eq!(sample.cooling.fans[4].metric.detail, None);
     accepted(&sample);
 }
 
@@ -243,7 +237,7 @@ fn power_direct_and_fallback_watts_survive_ingest_and_refresh() {
             "12000000\n",
         );
         if direct {
-            write(root, "sys/class/power_supply/BAT0/power_now", "18500000\n");
+            write(root, "sys/class/power_supply/BAT0/power_now", "-18500000\n");
         }
         let mut agent = collector(root, &new_session_id().unwrap());
         let sample = agent.sample(1_000_000);
@@ -300,7 +294,7 @@ fn power_selects_first_sorted_battery_and_any_online_mains() {
     write(root, "sys/class/power_supply/BAT0/status", "Unknown\n");
     let sample = collector(root, &new_session_id().unwrap()).sample(1_000_000);
     let power = sample.power.as_ref().unwrap();
-    assert_eq!(power.adapter_online, Some(false));
+    assert_eq!(power.adapter_online, None);
     assert_eq!(power.battery_status.as_deref(), Some("Unknown"));
     accepted(&sample);
 }
@@ -355,6 +349,9 @@ fn power_missing_or_malformed_required_fields_cannot_recover() {
         assert_eq!(power.availability, Availability::Error, "{field}={value:?}");
         assert_eq!(power.battery_status, None);
         assert_eq!(power.battery_percent, None);
+        assert_eq!(power.adapter_online, None);
+        assert_eq!(power.battery_power_w, None);
+        assert!(power.detail.is_some());
         assert_eq!(power.observed_at_ms, 1_015_000);
         accepted(&sample);
     }
@@ -362,7 +359,7 @@ fn power_missing_or_malformed_required_fields_cannot_recover() {
 
 #[test]
 fn power_bad_optional_wattage_and_adapter_do_not_hide_battery() {
-    for value in ["-1", "NaN", "inf", "1e300", "garbage"] {
+    for value in ["NaN", "inf", "1e300", "garbage"] {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         console(root);
@@ -387,6 +384,71 @@ fn power_bad_optional_wattage_and_adapter_do_not_hide_battery() {
 }
 
 #[test]
+fn power_conform_limits_fields_and_blanks_unavailable_readings() {
+    let dir = tempfile::tempdir().unwrap();
+    console(dir.path());
+    let mut sample = collector(dir.path(), &new_session_id().unwrap()).sample(1_000_000);
+    for (percent, watts, expected_percent, expected_watts) in [
+        (0.0, 0.0, Some(0.0), Some(0.0)),
+        (100.0, 1000.0, Some(100.0), Some(1000.0)),
+        (-1.0, -1.0, None, None),
+        (100.1, 1000.1, None, None),
+        (f64::NAN, f64::NAN, None, None),
+        (f64::INFINITY, f64::NEG_INFINITY, None, None),
+    ] {
+        sample.power = Some(factory_api::devices::Power {
+            availability: Availability::Available,
+            observed_at_ms: sample.observed_at_ms + 1,
+            adapter_online: Some(true),
+            battery_status: Some(format!("a{}", "é".repeat(40))),
+            battery_percent: Some(percent),
+            battery_power_w: Some(watts),
+            detail: Some(format!("a{}", "é".repeat(140))),
+        });
+        conform(&mut sample);
+        let power = sample.power.as_ref().unwrap();
+        assert_eq!(power.battery_percent, expected_percent);
+        assert_eq!(power.battery_power_w, expected_watts);
+        assert_eq!(power.adapter_online, Some(true));
+        assert_eq!(power.observed_at_ms, sample.observed_at_ms);
+        assert_eq!(
+            power.battery_status.as_deref(),
+            Some(format!("a{}", "é".repeat(31)).as_str())
+        );
+        assert_eq!(
+            power.detail.as_deref(),
+            Some(format!("a{}", "é".repeat(127)).as_str())
+        );
+        assert_eq!(accepted(&sample).host.power, sample.power);
+    }
+    for availability in [
+        Availability::Unsupported,
+        Availability::PermissionDenied,
+        Availability::Stale,
+        Availability::Error,
+    ] {
+        sample.power = Some(factory_api::devices::Power {
+            availability,
+            observed_at_ms: sample.observed_at_ms,
+            adapter_online: Some(true),
+            battery_status: Some("Charging".into()),
+            battery_percent: Some(73.0),
+            battery_power_w: Some(24.0),
+            detail: Some("unavailable source".into()),
+        });
+        conform(&mut sample);
+        let power = sample.power.as_ref().unwrap();
+        assert_eq!(power.availability, availability);
+        assert_eq!(power.adapter_online, None);
+        assert_eq!(power.battery_status, None);
+        assert_eq!(power.battery_percent, None);
+        assert_eq!(power.battery_power_w, None);
+        assert_eq!(power.detail.as_deref(), Some("unavailable source"));
+        assert_eq!(accepted(&sample).host.power, sample.power);
+    }
+}
+
+#[test]
 fn applesmc_and_power_reads_timeout_without_rejecting_sample() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -402,17 +464,15 @@ fn applesmc_and_power_reads_timeout_without_rejecting_sample() {
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     }
     let sample = sample_within(root, Duration::from_secs(5));
-    assert_eq!(
-        sample.cooling.fans[0].metric.availability,
-        Availability::Error
-    );
-    assert_eq!(
-        sample.cooling.fans[0].metric.detail.as_deref(),
-        Some("timed out")
-    );
+    assert!(sample.cooling.fans.is_empty());
+    assert_eq!(sample.cooling.fans_availability, Availability::Unsupported);
     assert_eq!(
         sample.power.as_ref().unwrap().availability,
         Availability::Error
+    );
+    assert_eq!(
+        sample.power.as_ref().unwrap().detail.as_deref(),
+        Some("timed out")
     );
     accepted(&sample);
 }

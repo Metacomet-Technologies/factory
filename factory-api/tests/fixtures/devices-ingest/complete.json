@@ -240,6 +240,15 @@
     "temperatures_availability": "available",
     "fans_availability": "available"
   },
+  "power": {
+    "availability": "available",
+    "observed_at_ms": 1792238415000,
+    "adapter_online": true,
+    "battery_status": "Charging",
+    "battery_percent": 80,
+    "battery_power_w": 26.6,
+    "detail": null
+  },
   "maintenance": {
     "backup": {
       "availability": "available",

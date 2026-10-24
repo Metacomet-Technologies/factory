@@ -142,6 +142,152 @@ fn setup() -> (tempfile::TempDir, PathBuf) {
 }
 
 #[tokio::test]
+async fn power_absent_is_accepted() {
+    let (dir, tokens) = setup();
+    enroll(&tokens, &[("factory-console", CONSOLE)]);
+    let api = serve(state(dir.path(), &tokens).await).await;
+    let mut body = sample(COMPLETE, SESSION_A, 1, now_ms());
+    body.as_object_mut().unwrap().remove("power");
+    let (status, response) = api.post("factory-console", Some(CONSOLE), &body).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (status, view) = api.get("/v1/devices/factory-console").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(view["device"]["power"].is_null());
+    api.server.abort();
+}
+
+#[tokio::test]
+async fn power_roundtrips_available_and_unsupported() {
+    let (dir, tokens) = setup();
+    enroll(&tokens, &[("factory-console", CONSOLE)]);
+    let api = serve(state(dir.path(), &tokens).await).await;
+    for (index, fixture) in [COMPLETE, UNSUPPORTED].into_iter().enumerate() {
+        let body = sample(fixture, SESSION_A, index as i64 + 1, now_ms());
+        let (status, response) = api.post("factory-console", Some(CONSOLE), &body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let (status, view) = api.get("/v1/devices/factory-console").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut expected = body["power"].clone();
+        if fixture == COMPLETE {
+            expected["battery_percent"] = json!(80.0);
+        }
+        assert_eq!(view["device"]["power"], expected);
+    }
+    api.server.abort();
+}
+
+#[tokio::test]
+async fn power_rejects_invalid_values_with_field_paths() {
+    for (key, value) in [
+        ("battery_percent", json!(150)),
+        ("battery_percent", json!(-1)),
+        ("battery_power_w", json!(-0.1)),
+        ("battery_power_w", json!(1000.1)),
+        ("battery_power_w", json!("NaN")),
+        ("battery_status", json!("é".repeat(33))),
+        ("detail", json!("é".repeat(129))),
+        ("detail", json!(false)),
+    ] {
+        let (dir, tokens) = setup();
+        enroll(&tokens, &[("factory-console", CONSOLE)]);
+        let api = serve(state(dir.path(), &tokens).await).await;
+        let mut body = sample(COMPLETE, SESSION_A, 1, now_ms());
+        body["power"][key] = value;
+        let (status, response) = api.post("factory-console", Some(CONSOLE), &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key}: {response}");
+        assert_eq!(response["error"]["code"], "invalid_field");
+        assert_eq!(response["error"]["field"], format!("power.{key}"));
+        api.server.abort();
+    }
+}
+
+#[tokio::test]
+async fn power_unsupported_rejects_nonnull_readings() {
+    let (dir, tokens) = setup();
+    enroll(&tokens, &[("factory-console", CONSOLE)]);
+    let api = serve(state(dir.path(), &tokens).await).await;
+    for (key, value) in [
+        ("adapter_online", json!(false)),
+        ("battery_status", json!("Unknown")),
+        ("battery_percent", json!(0)),
+        ("battery_power_w", json!(0)),
+    ] {
+        let mut body = sample(UNSUPPORTED, SESSION_A, 1, now_ms());
+        body["power"][key] = value;
+        let (status, response) = api.post("factory-console", Some(CONSOLE), &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key}: {response}");
+        assert_eq!(response["error"]["code"], "invalid_metric");
+        assert_eq!(response["error"]["field"], format!("power.{key}"));
+    }
+    api.server.abort();
+}
+
+#[tokio::test]
+async fn power_requires_all_fields_including_nullable_detail() {
+    let (dir, tokens) = setup();
+    enroll(&tokens, &[("factory-console", CONSOLE)]);
+    let api = serve(state(dir.path(), &tokens).await).await;
+    for key in [
+        "availability",
+        "observed_at_ms",
+        "adapter_online",
+        "battery_status",
+        "battery_percent",
+        "battery_power_w",
+        "detail",
+    ] {
+        let mut body = sample(COMPLETE, SESSION_A, 1, now_ms());
+        body["power"].as_object_mut().unwrap().remove(key);
+        let (status, response) = api.post("factory-console", Some(CONSOLE), &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key}: {response}");
+        assert_eq!(response["error"]["code"], "missing_field");
+        assert_eq!(response["error"]["field"], format!("power.{key}"));
+    }
+    api.server.abort();
+}
+
+#[tokio::test]
+async fn power_accepts_inclusive_limits_and_nullable_readings() {
+    let (dir, tokens) = setup();
+    enroll(&tokens, &[("factory-console", CONSOLE)]);
+    let api = serve(state(dir.path(), &tokens).await).await;
+    for (index, (percent, watts)) in [
+        (json!(0.0), json!(0.0)),
+        (json!(100.0), json!(1000.0)),
+        (Value::Null, Value::Null),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut body = sample(COMPLETE, SESSION_A, index as i64 + 1, now_ms());
+        body["power"]["battery_percent"] = percent;
+        body["power"]["battery_power_w"] = watts;
+        body["power"]["battery_status"] = json!("é".repeat(32));
+        body["power"]["detail"] = json!("é".repeat(128));
+        let (status, response) = api.post("factory-console", Some(CONSOLE), &body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let (_, view) = api.get("/v1/devices/factory-console").await;
+        assert_eq!(view["device"]["power"], body["power"]);
+    }
+    api.server.abort();
+}
+
+#[tokio::test]
+async fn power_device_id_is_refused_in_token_config() {
+    let (dir, tokens) = setup();
+    enroll(&tokens, &[("power", OTHER), ("factory-console", CONSOLE)]);
+    let credentials = device_auth::Tokens::new(&tokens);
+    assert_eq!(credentials.devices(), vec!["factory-console"]);
+    let api = serve(state(dir.path(), &tokens).await).await;
+    let mut body = sample(COMPLETE, SESSION_A, 1, now_ms());
+    body["device_id"] = json!("power");
+    let (status, response) = api.post("power", Some(OTHER), &body).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(response["error"]["code"], "unauthorized");
+    api.server.abort();
+}
+
+#[tokio::test]
 async fn credentials_and_check_order() {
     let log = Log::default();
     let writer = log.clone();
@@ -149,7 +295,7 @@ async fn credentials_and_check_order() {
         .with_writer(move || writer.clone())
         .with_ansi(false)
         .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::subscriber::set_global_default(subscriber).unwrap();
     let (dir, tokens) = setup();
     let api = serve(state(dir.path(), &tokens).await).await;
     let now = now_ms();

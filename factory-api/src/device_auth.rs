@@ -15,8 +15,8 @@ pub const TOKEN_PREFIX: &str = "fdv1_";
 const TOKEN_CHARS: usize = 43;
 const PER_DEVICE: usize = 2;
 /// `factory-gpu` is the local collector. The rest would collide with phase-1
-/// alert keys (`devices:fs:…`, `devices:smart:…`, `devices:cpu:…`, `devices:telemetry`).
-pub const RESERVED: [&str; 5] = ["factory-gpu", "fs", "smart", "cpu", "telemetry"];
+/// alert keys (`devices:fs:…`, `devices:smart:…`, `devices:cpu:…`, `devices:power:…`, `devices:telemetry`).
+pub const RESERVED: [&str; 6] = ["factory-gpu", "fs", "smart", "cpu", "power", "telemetry"];
 
 pub fn valid_device_id(id: &str) -> bool {
     let bytes = id.as_bytes();

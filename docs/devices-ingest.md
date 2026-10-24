@@ -40,6 +40,8 @@ other method on this path returns 405 with `Allow: POST`. The existing
 
 `device_id` matches `^[a-z0-9][a-z0-9-]{0,62}$`. `factory-gpu` is reserved for
 the local phase-1 collector and can never be written through this endpoint.
+Token enrollment also reserves `fs`, `smart`, `cpu`, `power`, and `telemetry`
+to prevent collisions with local alert keys.
 
 ### Schema version
 
@@ -82,6 +84,7 @@ All timestamps are integer Unix milliseconds UTC. All integers fit in
 | `disk_io` | `DiskIo` | yes | Summed over whole disks, skipping the phase-1 virtual names (`loop`, `ram`, `fd`, `dm-`, `md`, `zram`, `nbd`, `sr`, `zd`) |
 | `network` | `Network` | yes | Summed over every interface except `lo`, as phase 1 |
 | `cooling` | `Cooling` | yes | Temperatures and fans |
+| `power` | `Power` or null | no | Adapter and battery readings from `power_supply`, added in MET-258 |
 | `maintenance.backup` | `BackupView` | yes | From the node's published backup status |
 | `maintenance.clock` | `ClockView` | yes | From `timedatectl`-equivalent sync state |
 | `maintenance.reboot` | `RebootView` | yes | Read-only copy of the published reboot status (MET-178), mapped field for field; reboot policy is not changed |
@@ -111,6 +114,32 @@ Every `Metric` object has all five fields: `value`, `unit`, `observed_at_ms`,
 `SmartStatus`, `BackupView`, `ClockView` and `RebootView` follow the same rule:
 fields other than `availability`, `observed_at_ms` and `detail` are null unless
 `availability` is `available`.
+
+### Power
+
+`power` is optional in schema version 1. Omission or null preserves compatibility
+with older agents. A non-null object contains all seven fields below, including
+fields whose value is null.
+
+| Field | Value |
+| --- | --- |
+| `availability` | `available`, `unsupported`, `permission_denied`, `stale`, or `error` |
+| `observed_at_ms` | Integer UTC milliseconds, no newer than the sample's `observed_at_ms` |
+| `adapter_online` | Boolean or null |
+| `battery_status` | String of at most 64 bytes or null, such as `Charging` or `Discharging` |
+| `battery_percent` | Finite number from 0 to 100 inclusive or null |
+| `battery_power_w` | Finite watts from 0 to 1000 inclusive or null |
+| `detail` | String of at most 256 bytes or null |
+
+Unless `availability` is `available`, all four readings must be null.
+`detail` may explain an unavailable source. With `available`, individual readings
+may still be null when the host exposes only part of the power data.
+Invalid types, ranges, or text lengths return `400 invalid_field` with the
+`power.<field>` path. Non-null unavailable readings return `400 invalid_metric`.
+A missing field returns `400 missing_field`.
+
+Power uses its own observation timestamp for freshness. A fresh sample envelope
+does not make an old power reading current.
 
 ### Units and ranges
 
@@ -453,6 +482,15 @@ All sources available.
     ],
     "temperatures_availability": "available",
     "fans_availability": "available"
+  },
+  "power": {
+    "availability": "available",
+    "observed_at_ms": 1792238415000,
+    "adapter_online": true,
+    "battery_status": "Charging",
+    "battery_percent": 80,
+    "battery_power_w": 26.6,
+    "detail": null
   },
   "maintenance": {
     "backup": {
@@ -1008,6 +1046,15 @@ evidence the drive is healthy.
     "temperatures_availability": "unsupported",
     "fans_availability": "unsupported"
   },
+  "power": {
+    "availability": "unsupported",
+    "observed_at_ms": 1792238430000,
+    "adapter_online": null,
+    "battery_status": null,
+    "battery_percent": null,
+    "battery_power_w": null,
+    "detail": "no power_supply battery or adapter"
+  },
   "maintenance": {
     "backup": {
       "availability": "available",
@@ -1313,8 +1360,9 @@ Design of A:
   unchanged.
 - Recommended authentication: per-device bearer token, hash-only on the
   server.
-- Battery, T2-specific sensors and anything not in phase-1 types are out of
-  v1.0. They can be added later as optional fields.
+- MET-258 adds optional adapter and battery telemetry as `power` in schema
+  version 1, and reads `applesmc` fans through `APP0001:00` when exposed.
+  Other T2-specific sensors remain outside the contract.
 
 ### Decided by Devon (2026-10-17)
 
@@ -1418,9 +1466,8 @@ logs a `discovered sources` line on each start).
 | Disk I/O | `/proc/diskstats` | available | pending install | — |
 | Network | `/proc/net/dev`, all but `lo` | available | pending install | — |
 | Temperatures | `/sys/class/hwmon`, `/sys/class/thermal` | available (1 sensor) | pending install | whatever hwmon exposes |
-| Fans | hwmon `fan*_input` | unsupported | pending install | `applesmc` does not bind behind the T2 without t2linux patches; expect unsupported |
-| Battery | not in schema v1 | not reported | not reported | out of v1.0 (section 4) |
+| Fans | hwmon `fan*_input`, plus `applesmc` via `/sys/bus/acpi/devices/APP0001:00/physical_node` | unsupported in the baseline sandbox | pending verification | MET-258 adds each ACPI fan unless hwmon already reported the same name |
+| Battery | `/sys/class/power_supply`, including adapter online state | unsupported without a battery fixture | pending verification | MET-258 adds optional `power` readings in schema v1 |
 | Clock | `adjtimex` | available | pending install | — |
 | Backup | published status file | unsupported (no file) | pending install | factory-console publishes none (`deploy/backup/nodes.conf`) |
 | Reboot | published status file | unsupported (no file) | pending install | published only where a `factory-api` group exists, so none today |
-

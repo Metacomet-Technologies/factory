@@ -1239,6 +1239,7 @@ export interface components {
       /** Format: double */
       battery_power_w?: number | null;
       battery_status?: string | null;
+      detail?: string | null;
       /** Format: int64 */
       observed_at_ms: number;
     };

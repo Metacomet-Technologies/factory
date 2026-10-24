@@ -945,22 +945,23 @@ impl Engine {
         key: &str,
         now: i64,
         reading: Option<(i64, bool, bool)>,
-        fire_ms: i64,
-        clear_ms: i64,
+        timing: (i64, i64, i64),
+        severity: AlertSeverity,
         summary: String,
     ) -> Option<Verdict> {
+        let (fire_ms, clear_ms, stale_ms) = timing;
         let open = self.alert_open(key);
         let clear_key = format!("{key}:clear");
-        let Some((at, fire, clear)) = reading.filter(|(at, _, _)| {
-            (0..=crate::devices_ingest::REMOTE_STALE_MS).contains(&now.saturating_sub(*at))
-        }) else {
+        let Some((at, fire, clear)) =
+            reading.filter(|(at, _, _)| (0..=stale_ms).contains(&now.saturating_sub(*at)))
+        else {
             self.pending_since.remove(key);
             self.pending_since.remove(&clear_key);
             self.device_sample_ms.remove(key);
             return open.then_some(Verdict::Hold);
         };
         if let Some(previous) = self.device_sample_ms.insert(key.into(), at) {
-            if at < previous || at - previous > crate::devices_ingest::REMOTE_STALE_MS {
+            if at < previous || at - previous > stale_ms {
                 self.pending_since.remove(key);
                 self.pending_since.remove(&clear_key);
             } else if at == previous {
@@ -970,7 +971,7 @@ impl Engine {
         if fire {
             self.pending_since.remove(&clear_key);
             if self.held(key, at, fire_ms) {
-                return Some(Verdict::Fire(AlertSeverity::Warning, summary));
+                return Some(Verdict::Fire(severity, summary));
             }
         } else {
             self.pending_since.remove(key);
@@ -1045,7 +1046,7 @@ impl Engine {
             &format!("{label}CPU temperature"),
         );
         let heat = input
-            .cpu_temp_observed_ms
+            .fast_success_ms
             .zip(input.cpu_temp_c.flatten())
             .map(|(at, value)| (at, value >= 85.0, value < 80.0));
         let power = input
@@ -1078,31 +1079,35 @@ impl Engine {
                 None
             }
         });
-        for (suffix, reading, fire_ms, clear_ms, summary) in [
+        for (suffix, reading, timing, severity, summary) in [
             (
                 "cpu:temperature:sustained",
                 heat,
-                15 * 60_000,
-                5 * 60_000,
+                (15 * 60_000, 5 * 60_000, DEVICE_STALE_MS),
+                AlertSeverity::Critical,
                 format!("{label}CPU temperature at or above 85 C for 15 min"),
             ),
             (
                 "power:discharging-on-mains",
                 mains,
-                10 * 60_000,
-                5 * 60_000,
+                (
+                    10 * 60_000,
+                    5 * 60_000,
+                    crate::devices_ingest::REMOTE_STALE_MS,
+                ),
+                AlertSeverity::Warning,
                 format!("{label}battery discharging on mains for 10 min"),
             ),
             (
                 "power:battery-low",
                 low,
-                0,
-                0,
+                (0, 0, crate::devices_ingest::REMOTE_STALE_MS),
+                AlertSeverity::Critical,
                 format!("{label}battery below 30% while discharging"),
             ),
         ] {
             let key = format!("{prefix}{suffix}");
-            if let Some(verdict) = self.device_timed(&key, now, reading, fire_ms, clear_ms, summary)
+            if let Some(verdict) = self.device_timed(&key, now, reading, timing, severity, summary)
             {
                 out.insert(key, verdict);
             }
@@ -3642,7 +3647,6 @@ mod tests {
                 DeviceAlertInput {
                     fast_success_ms: Some(at),
                     cpu_temp_c: Some(Some(temperature)),
-                    cpu_temp_observed_ms: Some(at),
                     power: Some(Power {
                         availability: Availability::Available,
                         observed_at_ms: at,
@@ -3650,6 +3654,7 @@ mod tests {
                         battery_status: Some(status.into()),
                         battery_percent: Some(percent),
                         battery_power_w: Some(26.6),
+                        detail: None,
                     }),
                     ..Default::default()
                 },
@@ -3659,11 +3664,155 @@ mod tests {
     }
 
     fn console_alert(engine: &Engine, suffix: &str) -> bool {
-        engine
-            .view()
+        let view = engine.view();
+        let alert = view
             .active
             .iter()
-            .any(|alert| alert.key == format!("devices:factory-console:{suffix}"))
+            .find(|alert| alert.key == format!("devices:factory-console:{suffix}"));
+        if let Some(alert) = alert {
+            assert_eq!(
+                alert.severity,
+                if suffix == "power:discharging-on-mains" {
+                    AlertSeverity::Warning
+                } else {
+                    AlertSeverity::Critical
+                }
+            );
+        }
+        alert.is_some()
+    }
+
+    fn console_samples(
+        engine: &mut Engine,
+        steps: std::ops::RangeInclusive<i64>,
+        temperature: f64,
+        status: &str,
+        percent: f64,
+    ) {
+        for step in steps {
+            let at = T0 + step * 30_000;
+            engine.evaluate(at, &console_power_signals(at, temperature, status, percent));
+        }
+    }
+
+    #[test]
+    fn sustained_heat_fires_at_fifteen_not_fourteen_minutes() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=28, 85.0, "Charging", 80.0);
+        assert!(!console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 29..=30, 85.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "cpu:temperature:sustained"));
+    }
+
+    #[test]
+    fn sustained_heat_eighty_four_restarts_count_at_minute_ten() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=19, 90.0, "Charging", 80.0);
+        console_samples(&mut engine, 20..=20, 84.0, "Charging", 80.0);
+        console_samples(&mut engine, 21..=50, 90.0, "Charging", 80.0);
+        assert!(!console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 51..=51, 90.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "cpu:temperature:sustained"));
+    }
+
+    #[test]
+    fn sustained_heat_clears_after_five_minutes_below_eighty() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=30, 85.0, "Charging", 80.0);
+        console_samples(&mut engine, 31..=42, 82.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 43..=51, 79.9, "Charging", 80.0);
+        assert!(console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 52..=53, 79.9, "Charging", 80.0);
+        assert!(!console_alert(&engine, "cpu:temperature:sustained"));
+    }
+
+    #[test]
+    fn sustained_heat_stale_gap_restarts_fire_and_clear() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=20, 90.0, "Charging", 80.0);
+        console_samples(&mut engine, 25..=54, 90.0, "Charging", 80.0);
+        assert!(!console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 55..=55, 90.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 56..=64, 70.0, "Charging", 80.0);
+        console_samples(&mut engine, 69..=78, 70.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "cpu:temperature:sustained"));
+        console_samples(&mut engine, 79..=79, 70.0, "Charging", 80.0);
+        assert!(!console_alert(&engine, "cpu:temperature:sustained"));
+    }
+
+    #[test]
+    fn discharging_on_mains_fires_at_ten_not_nine_minutes() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=18, 70.0, "Discharging", 80.0);
+        assert!(!console_alert(&engine, "power:discharging-on-mains"));
+        console_samples(&mut engine, 19..=20, 70.0, "Discharging", 80.0);
+        assert!(console_alert(&engine, "power:discharging-on-mains"));
+    }
+
+    #[test]
+    fn discharging_on_mains_clears_after_five_minutes_not_discharging() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=20, 70.0, "Discharging", 80.0);
+        console_samples(&mut engine, 21..=29, 70.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "power:discharging-on-mains"));
+        console_samples(&mut engine, 30..=31, 70.0, "Charging", 80.0);
+        assert!(!console_alert(&engine, "power:discharging-on-mains"));
+    }
+
+    #[test]
+    fn discharging_on_mains_stale_gap_restarts_fire_and_clear() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=18, 70.0, "Discharging", 80.0);
+        console_samples(&mut engine, 21..=40, 70.0, "Discharging", 80.0);
+        assert!(!console_alert(&engine, "power:discharging-on-mains"));
+        console_samples(&mut engine, 41..=41, 70.0, "Discharging", 80.0);
+        assert!(console_alert(&engine, "power:discharging-on-mains"));
+        console_samples(&mut engine, 42..=50, 70.0, "Charging", 80.0);
+        console_samples(&mut engine, 53..=62, 70.0, "Charging", 80.0);
+        assert!(console_alert(&engine, "power:discharging-on-mains"));
+        console_samples(&mut engine, 63..=63, 70.0, "Charging", 80.0);
+        assert!(!console_alert(&engine, "power:discharging-on-mains"));
+    }
+
+    #[test]
+    fn battery_low_fires_below_thirty_and_clears_at_thirty_five() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=0, 70.0, "Discharging", 30.0);
+        assert!(!console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 1..=1, 70.0, "Discharging", 29.9);
+        assert!(console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 2..=2, 70.0, "Discharging", 34.9);
+        assert!(console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 3..=3, 70.0, "Discharging", 35.0);
+        assert!(!console_alert(&engine, "power:battery-low"));
+    }
+
+    #[test]
+    fn battery_low_requires_discharging_and_clears_when_charging() {
+        let mut engine = Engine::load(Config::default());
+        console_samples(&mut engine, 0..=0, 70.0, "Charging", 25.0);
+        assert!(!console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 1..=1, 70.0, "Discharging", 25.0);
+        assert!(console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 2..=2, 70.0, "Charging", 25.0);
+        assert!(!console_alert(&engine, "power:battery-low"));
+    }
+
+    #[test]
+    fn battery_low_stale_gap_neither_fires_nor_clears() {
+        let mut engine = Engine::load(Config::default());
+        let stale = console_power_signals(T0, 70.0, "Discharging", 25.0);
+        engine.evaluate(T0 + 60_000, &stale);
+        assert!(!console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 3..=3, 70.0, "Discharging", 25.0);
+        assert!(console_alert(&engine, "power:battery-low"));
+        let stale = console_power_signals(T0 + 3 * 30_000, 70.0, "Charging", 40.0);
+        engine.evaluate(T0 + 5 * 30_000, &stale);
+        assert!(console_alert(&engine, "power:battery-low"));
+        console_samples(&mut engine, 6..=6, 70.0, "Charging", 40.0);
+        assert!(!console_alert(&engine, "power:battery-low"));
     }
 
     #[test]
@@ -3759,16 +3908,16 @@ mod tests {
                 engine.evaluate(at, &console_power_signals(at, 79.0, "Charging", 25.0));
             }
             // No evaluation during a long sample gap must also restart recovery.
-            for step in 62..=72 {
+            for step in 64..=74 {
                 let at = T0 + step * 30_000;
                 engine.evaluate(at, &console_power_signals(at, 79.0, "Charging", 25.0));
                 assert_eq!(
                     console_alert(&engine, "cpu:temperature:sustained"),
-                    step < 72
+                    step < 74
                 );
                 assert_eq!(
                     console_alert(&engine, "power:discharging-on-mains"),
-                    step < 72
+                    step < 74
                 );
             }
         }

@@ -255,9 +255,10 @@ impl Reader {
             availability,
             observed_at_ms,
             adapter_online: opt_boolean(get("adapter_online")?, "power.adapter_online")?,
-            battery_status: opt_text(get("battery_status")?, "power.battery_status", MAX_TEXT)?,
+            battery_status: opt_text(get("battery_status")?, "power.battery_status", 64)?,
             battery_percent: number("battery_percent", 100.0)?,
-            battery_power_w: number("battery_power_w", f64::MAX)?,
+            battery_power_w: number("battery_power_w", 1000.0)?,
+            detail: opt_text(get("detail")?, "power.detail", MAX_TEXT)?,
         }))
     }
 
@@ -1333,11 +1334,17 @@ mod tests {
     #[test]
     fn optional_power_is_validated_and_preserved() {
         assert!(
-            parse(COMPLETE.as_bytes(), "factory-console", AT)
-                .unwrap()
-                .host
-                .power
-                .is_none()
+            parse(
+                &edit(COMPLETE, |v| {
+                    v.as_object_mut().unwrap().remove("power");
+                }),
+                "factory-console",
+                AT
+            )
+            .unwrap()
+            .host
+            .power
+            .is_none()
         );
         assert!(
             parse(
@@ -1354,7 +1361,7 @@ mod tests {
             v["power"] = serde_json::json!({
                 "availability": "available", "observed_at_ms": v["observed_at_ms"],
                 "adapter_online": true, "battery_status": "Discharging",
-                "battery_percent": 25, "battery_power_w": 26.6
+                "battery_percent": 25, "battery_power_w": 26.6, "detail": null
             });
         });
         let sample = parse(&body, "factory-console", AT).unwrap();
@@ -1369,8 +1376,10 @@ mod tests {
             ("battery_percent", serde_json::json!(101)),
             ("battery_percent", serde_json::json!("25")),
             ("battery_power_w", serde_json::json!(-2)),
+            ("battery_power_w", serde_json::json!(1001)),
             ("adapter_online", serde_json::json!(1)),
-            ("battery_status", serde_json::json!("x".repeat(257))),
+            ("battery_status", serde_json::json!("x".repeat(65))),
+            ("detail", serde_json::json!("x".repeat(257))),
             ("observed_at_ms", serde_json::json!(AT + 1)),
             ("availability", serde_json::json!("unsupported")),
         ] {
@@ -1400,17 +1409,8 @@ mod tests {
                 .ingest_view(),
             ),
         };
-        view.device.cpu.temperature.observed_at_ms = at;
-        view.device.cpu.temperature.value = Some(90.0);
-        view.device.cpu.temperature.availability = Availability::Available;
         assert!(view.alert_input(at).power.is_some());
-        assert_eq!(view.alert_input(at).cpu_temp_observed_ms, Some(at));
         assert!(view.alert_input(at + REMOTE_STALE_MS + 1).power.is_none());
-        assert!(
-            view.alert_input(at + REMOTE_STALE_MS + 1)
-                .cpu_temp_observed_ms
-                .is_none()
-        );
         let stale =
             devices::freshen_within(&view, at + REMOTE_STALE_MS + 1, REMOTE_STALE_MS, Some(at));
         let power = stale.device.power.unwrap();
@@ -1421,7 +1421,6 @@ mod tests {
         view.device.collector.last_fast_ms = Some(at + 60_000);
         view.ingest.as_mut().unwrap().last_received_at_ms = Some(at + 60_000);
         assert!(view.alert_input(at + 60_000).power.is_none());
-        assert!(view.alert_input(at + 60_000).cpu_temp_observed_ms.is_none());
     }
 
     #[test]

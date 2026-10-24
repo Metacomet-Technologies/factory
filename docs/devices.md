@@ -141,6 +141,9 @@ These keys are new. Fleet already covers the other host alerts.
 | --- | --- | --- |
 | `devices:cpu:temperature:warning` | 80 °C for 5 minutes | below 75 °C |
 | `devices:cpu:temperature:critical` | 95 °C for 2 minutes | below 90 °C |
+| `devices:<device>:cpu:temperature:sustained` | Critical at ≥ 85 °C for 15 minutes | below 80 °C for 5 minutes |
+| `devices:<device>:power:discharging-on-mains` | Warning when `adapter_online` is true and `battery_status` is `Discharging` for 10 minutes | `Charging`, `Full`, or `Not charging` for 5 minutes |
+| `devices:<device>:power:battery-low` | Critical immediately below 30% while `Discharging` | immediately at ≥ 35%, or `Charging`, `Full`, or `Not charging` |
 | `devices:fs:{id}:space:warning` and `:inodes:warning` | 85% for 10 minutes | below 80% |
 | `devices:fs:{id}:space:critical` and `:inodes:critical` | 95% for 10 minutes | below 90% |
 | `devices:smart:{id}` | unhealthy for 60 seconds | healthy for 2 minutes |
@@ -150,6 +153,12 @@ These keys are new. Fleet already covers the other host alerts.
 An unreadable source holds open alerts. It does not clear them. A fast sample
 older than 2 minutes does not open a new temperature or filesystem alert from
 those stale numbers.
+
+The MET-258 sustained-temperature and power alerts use the device id in remote
+keys. Local keys omit `<device>:`. Stale or unsupported readings hold existing
+alerts open and reset pending fire and clear timers. Missing readings are not
+evidence of recovery. Power freshness uses its own `observed_at_ms`, not just
+the sample envelope.
 
 ## Permissions
 

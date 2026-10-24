@@ -194,6 +194,7 @@ pub struct Power {
     pub battery_status: Option<String>,
     pub battery_percent: Option<f64>,
     pub battery_power_w: Option<f64>,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -421,7 +422,6 @@ pub struct DeviceAlertInput {
     pub fast_success_ms: Option<i64>,
     /// None: unreadable, hold. Some(None): sensor unsupported. Some(Some): celsius.
     pub cpu_temp_c: Option<Option<f64>>,
-    pub cpu_temp_observed_ms: Option<i64>,
     pub power: Option<Power>,
     pub filesystems: Option<Vec<FsPressure>>,
     pub smart: Option<Vec<SmartPressure>>,
@@ -927,10 +927,6 @@ impl DeviceView {
                 .then_some(self.device.collector.last_fast_ms)
                 .flatten(),
             cpu_temp_c,
-            cpu_temp_observed_ms: (sample_fresh
-                && self.device.cpu.temperature.availability == Availability::Available
-                && current(self.device.cpu.temperature.observed_at_ms))
-            .then_some(self.device.cpu.temperature.observed_at_ms),
             power: self
                 .device
                 .power
@@ -980,7 +976,7 @@ fn smart_unhealthy(drive: &Drive) -> Option<bool> {
 }
 
 #[derive(Debug)]
-pub enum ProbeError {
+enum ProbeError {
     Missing,
     Denied,
     Timeout,
@@ -1012,12 +1008,12 @@ fn read_limited(path: &Path, timeout: Duration) -> Result<Vec<u8>, ProbeError> {
     }
 }
 
-pub fn read_text(path: &Path, timeout: Duration) -> Result<String, ProbeError> {
+fn read_text(path: &Path, timeout: Duration) -> Result<String, ProbeError> {
     let bytes = read_limited(path, timeout)?;
     String::from_utf8(bytes).map_err(|_| ProbeError::Malformed)
 }
 
-pub fn availability_of(error: &ProbeError) -> Availability {
+fn availability_of(error: &ProbeError) -> Availability {
     match error {
         ProbeError::Denied => Availability::PermissionDenied,
         ProbeError::Missing
@@ -1028,7 +1024,7 @@ pub fn availability_of(error: &ProbeError) -> Availability {
     }
 }
 
-pub fn detail_of(error: &ProbeError) -> String {
+fn detail_of(error: &ProbeError) -> String {
     match error {
         ProbeError::Missing => "missing".into(),
         ProbeError::Denied => "permission denied".into(),
@@ -1114,6 +1110,8 @@ struct Slow {
     drives: Vec<Drive>,
     drives_availability: Availability,
     smart: Availability,
+    cooling: Cooling,
+    cpu_temp: Metric,
     maintenance: NodeMaintenance,
 }
 
@@ -1742,6 +1740,18 @@ fn sensor_group(
             }
         }
     }
+    let applesmc = child_path(root, "sys/bus/acpi/devices/APP0001:00/physical_node");
+    if applesmc.exists() {
+        for index in 1..=8 {
+            let name = format!("applesmc fan{index}");
+            if !fans.iter().any(|fan| fan.name == name)
+                && let Some(raw) = sys_string(&applesmc.join(format!("fan{index}_input")), timeout)
+            {
+                fans.push(named_count(&name, &raw, "rpm", at));
+                fan_availability = Availability::Available;
+            }
+        }
+    }
     if let Ok(zones) = read_dir_names(&thermal) {
         for zone in zones
             .into_iter()
@@ -1854,6 +1864,9 @@ fn load_slow(root: &Path, at: i64, timeout: Duration) -> Slow {
     } else {
         apply_smart(&mut drives, root, at, timeout)
     };
+    let (temperatures, fans, temperatures_availability, fans_availability) =
+        sensor_group(root, at, timeout);
+    let cpu_temp = pick_cpu_temp(&temperatures, at);
     Slow {
         at_ms: at,
         filesystems,
@@ -1861,8 +1874,109 @@ fn load_slow(root: &Path, at: i64, timeout: Duration) -> Slow {
         drives,
         drives_availability,
         smart,
+        cooling: Cooling {
+            temperatures,
+            fans,
+            temperatures_availability,
+            fans_availability,
+        },
+        cpu_temp,
         maintenance: load_maintenance(root, at, timeout),
     }
+}
+
+fn load_power(root: &Path, at: i64, timeout: Duration) -> Power {
+    let mut power = Power {
+        availability: Availability::Unsupported,
+        observed_at_ms: at,
+        adapter_online: None,
+        battery_status: None,
+        battery_percent: None,
+        battery_power_w: None,
+        detail: Some("no battery".into()),
+    };
+    let directory = child_path(root, "sys/class/power_supply");
+    let supplies = match read_dir_names(&directory) {
+        Ok(supplies) => supplies,
+        Err(ProbeError::Missing) => return power,
+        Err(error) => {
+            power.availability = availability_of(&error);
+            power.detail = Some(detail_of(&error));
+            return power;
+        }
+    };
+    let mut battery = None;
+    let mut mains = Vec::new();
+    for supply in supplies {
+        let path = directory.join(supply);
+        match read_text(&path.join("type"), timeout) {
+            Ok(kind) => match kind.trim() {
+                "Battery" if battery.is_none() => battery = Some(path),
+                "Mains" => mains.push(path),
+                _ => {}
+            },
+            Err(error) => {
+                power.availability = availability_of(&error);
+                power.detail = Some(detail_of(&error));
+            }
+        }
+    }
+    let Some(battery) = battery else {
+        return power;
+    };
+    let mut online = (!mains.is_empty()).then_some(false);
+    for path in mains {
+        match sys_string(&path.join("online"), timeout).as_deref() {
+            Some("1") => {
+                online = Some(true);
+                break;
+            }
+            Some("0") => {}
+            _ => online = None,
+        }
+    }
+    let number = |name: &str| -> Result<f64, ProbeError> {
+        read_text(&battery.join(name), timeout)?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .ok_or(ProbeError::Malformed)
+    };
+    let status = read_text(&battery.join("status"), timeout).and_then(|text| match text.trim() {
+        status @ ("Charging" | "Discharging" | "Not charging" | "Full" | "Unknown") => {
+            Ok(status.to_string())
+        }
+        _ => Err(ProbeError::Malformed),
+    });
+    let percent = number("capacity").and_then(|n| {
+        if (0.0..=100.0).contains(&n) {
+            Ok(n)
+        } else {
+            Err(ProbeError::Malformed)
+        }
+    });
+    let (status, percent) = match (status, percent) {
+        (Ok(status), Ok(percent)) => (status, percent),
+        (Err(error), _) | (_, Err(error)) => {
+            power.availability = availability_of(&error);
+            power.detail = Some(detail_of(&error));
+            return power;
+        }
+    };
+    power.battery_power_w = number("power_now")
+        .map(|n| n.abs() / 1e6)
+        .or_else(|_| {
+            Ok::<_, ProbeError>((number("current_now")? * number("voltage_now")?).abs() / 1e12)
+        })
+        .ok()
+        .filter(|n: &f64| n.is_finite() && (0.0..=1000.0).contains(n));
+    power.availability = Availability::Available;
+    power.adapter_online = online;
+    power.battery_status = Some(status);
+    power.battery_percent = Some(percent);
+    power.detail = None;
+    power
 }
 
 fn load_maintenance(root: &Path, at: i64, timeout: Duration) -> NodeMaintenance {
@@ -2327,9 +2441,6 @@ pub fn sample_timeout(
         warnings.push("reboot: status is not readable".into());
     }
     let backup = load_backup(&inputs.backup_path, at, timeout);
-    let (temperatures, fans, temperatures_availability, fans_availability) =
-        sensor_group(root, at, timeout);
-    let temperature = pick_cpu_temp(&temperatures, at);
     let mut host = HostSnapshot {
         device_id: DEVICE_ID.into(),
         observed_at_ms: at,
@@ -2344,7 +2455,7 @@ pub fn sample_timeout(
             load1,
             load5,
             load15,
-            temperature,
+            temperature: slow.cpu_temp.clone(),
         },
         memory,
         gpus: gpu_slots(inputs.gpu.as_ref(), at),
@@ -2358,13 +2469,8 @@ pub fn sample_timeout(
             rx: net_rx,
             tx: net_tx,
         },
-        cooling: Cooling {
-            temperatures,
-            fans,
-            temperatures_availability,
-            fans_availability,
-        },
-        power: None,
+        cooling: slow.cooling.clone(),
+        power: Some(load_power(root, at, timeout)),
         maintenance: Maintenance {
             services: inputs.services.clone(),
             backup,

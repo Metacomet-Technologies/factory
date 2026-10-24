@@ -218,6 +218,15 @@
     "temperatures_availability": "unsupported",
     "fans_availability": "unsupported"
   },
+  "power": {
+    "availability": "unsupported",
+    "observed_at_ms": 1792238430000,
+    "adapter_online": null,
+    "battery_status": null,
+    "battery_percent": null,
+    "battery_power_w": null,
+    "detail": "no power_supply battery or adapter"
+  },
   "maintenance": {
     "backup": {
       "availability": "available",
