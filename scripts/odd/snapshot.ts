@@ -134,6 +134,21 @@ export function loadFrom(threads: readonly LiveThread[]): Load {
   return load;
 }
 
+/** The statuses in which each role's thread still matters; past them its idle threads are archived. */
+const roleStages: Partial<Record<keyof typeof contracts, readonly Status[]>> = {
+  intake: ['Backlog'],
+  spec: ['Backlog', 'Triage'],
+};
+
+/** Idle role threads whose stage the issue has left: finished work to archive (§7 handoff). */
+export function finishedThreads(status: Status, threads: readonly LiveThread[]): LiveThread[] {
+  return threads.filter(thread => {
+    const { role } = parseThreadLabels(thread.labels);
+    const stages = role ? roleStages[role] : undefined;
+    return stages !== undefined && !stages.includes(status) && ownerState(thread.state) === 'idle';
+  });
+}
+
 /** Thread-search queries that enumerate every live role thread (labels are exact-match). */
 export const roleLabelQueries = roles.map(role => `label:odd-role-${role} archived:false`);
 

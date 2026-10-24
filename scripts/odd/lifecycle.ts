@@ -53,7 +53,7 @@ export type DeployReceipt = { host: string; component: string; sha: string; heal
 export type Load = { orbs: number; runnerSlots: number };
 
 export type Action =
-  | { kind: 'spawn'; role: Role; executor: Executor; reason: string }
+  | { kind: 'spawn'; role: Role; executor: Executor; reason: string; round: number }
   | { kind: 'steer'; role: Role; threadID: string; message: string }
   | { kind: 'merge'; pr: number; sha: string }
   | { kind: 'deploy'; tag: string; components: readonly string[] }
@@ -83,6 +83,17 @@ export function specComplete(description: string): boolean {
   return done > 0 && evidence >= done;
 }
 
+export const typeLabels = ['Bug', 'Feature', 'Improvement'] as const;
+
+/** Intake's stop condition: the issue is in Triage with exactly one type label and an area label. */
+export function issueTriaged(issue: { status: string; labels: readonly string[] }): string[] {
+  const missing: string[] = [];
+  if (issue.status !== 'Triage') missing.push(`status is ${issue.status}, not Triage`);
+  if (issue.labels.filter(label => (typeLabels as readonly string[]).includes(label)).length !== 1) missing.push('exactly one of Bug, Feature, Improvement');
+  if (!issue.labels.some(label => label.startsWith('area:') || label.startsWith('area/'))) missing.push('an area:* label');
+  return missing;
+}
+
 export function parseDeployReceipt(text: string): DeployReceipt | undefined {
   const match = /^odd-deploy host=(\S+) component=(\S+) sha=([a-f0-9]{7,40}) health=(pass|fail) rollback=(\S+)$/m.exec(text);
   if (!match) return undefined;
@@ -92,9 +103,16 @@ export function parseDeployReceipt(text: string): DeployReceipt | undefined {
 const free = (executor: Executor, load: Load) =>
   executor === 'none' || (executor === 'orb' ? load.orbs < capacity.orbs : load.runnerSlots < capacity.runnerSlots);
 
-function spawn(role: Role, load: Load, reason: string): Action {
-  const executor = contracts[role].executor;
-  return free(executor, load) ? { kind: 'spawn', role, executor, reason } : { kind: 'wait', reason: `${executor} capacity (${role})` };
+/**
+ * Spawn a fresh round of `role`, or wait: on capacity, or when the idle owner thread already
+ * spent the role's rounds (a role that ends without reaching its stop condition must not be
+ * respawned forever; Watchdog sweeps those issues).
+ */
+function spawn(role: Role, load: Load, reason: string, owner?: IssueSnapshot['owner']): Action {
+  const { executor, rounds } = contracts[role];
+  const previous = owner?.role === role ? owner.round : 0;
+  if (previous >= rounds) return { kind: 'wait', reason: `${role} round budget spent (${previous}/${rounds})` };
+  return free(executor, load) ? { kind: 'spawn', role, executor, reason, round: previous + 1 } : { kind: 'wait', reason: `${executor} capacity (${role})` };
 }
 
 /** Derive the single next action for one issue. Idempotent: the same snapshot always yields the same action. */
@@ -104,23 +122,23 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
   if (status === 'Done' || status === 'Canceled' || status === 'Duplicate') return { kind: 'wait', reason: status };
   if (issue.labels.includes('odd:needs-devon')) return { kind: 'wait', reason: 'needs Devon' };
 
-  if (status === 'Backlog') return spawn('intake', load, 'no triage yet');
+  if (status === 'Backlog') return spawn('intake', load, 'no triage yet', owner);
   if (status === 'Triage') {
     if (specComplete(issue.description)) return { kind: 'set-status', status: 'Todo', reason: 'spec complete' };
     if (issue.risk && issue.risk !== 'ordinary') return { kind: 'wait', reason: `risk ${issue.risk} needs a human decision` };
-    return spawn('spec', load, 'spec incomplete');
+    return spawn('spec', load, 'spec incomplete', owner);
   }
   if (status === 'Todo') {
     if (issue.openBlockers.length) return { kind: 'wait', reason: `blocked by ${issue.openBlockers.join(', ')}` };
     if (!specComplete(issue.description)) return { kind: 'set-status', status: 'Triage', reason: 'spec regressed' };
-    return spawn('builder', load, 'ready to build');
+    return spawn('builder', load, 'ready to build', owner);
   }
   if (status === 'In Progress') {
     if (!pr) {
       if (owner?.role === 'builder' && owner.state === 'error') {
         return owner.round >= contracts.builder.rounds
           ? { kind: 'page', reason: 'third-failed-qa-round', detail: `${issue.identifier}: builder failed ${owner.round} rounds without a PR` }
-          : spawn('builder', load, `builder round ${owner.round + 1}`);
+          : spawn('builder', load, `builder round ${owner.round + 1}`, owner);
       }
       return owner ? { kind: 'wait', reason: 'builder has not opened a PR' } : spawn('builder', load, 'no owner');
     }

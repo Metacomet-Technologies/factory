@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ciState, issueFromEvent, loadFrom, riskFrom, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { ciState, finishedThreads, issueFromEvent, loadFrom, riskFrom, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
 import { nextAction } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
@@ -47,7 +47,7 @@ test('snapshot combines Linear, GitHub and thread state, and feeds nextAction', 
   assert.deepEqual(snapshot.pr, { number: 157, headSha: sha, ci: 'success', verdict: undefined, merged: false, mergeSha: undefined });
   assert.equal(snapshot.deployReceipt?.health, 'pass');
   assert.equal(snapshot.risk, 'ordinary');
-  assert.deepEqual(nextAction(snapshot, { orbs: 0, runnerSlots: 0 }), { kind: 'spawn', role: 'reviewer', executor: 'orb', reason: `no verdict at ${sha.slice(0, 12)}` });
+  assert.deepEqual(nextAction(snapshot, { orbs: 0, runnerSlots: 0 }), { kind: 'spawn', role: 'reviewer', executor: 'orb', reason: `no verdict at ${sha.slice(0, 12)}`, round: 1 });
   const unknown = toSnapshot({ issue: { id: 'MET-1', status: 'Nonsense', labels: [] } });
   assert.equal(unknown.status, 'Backlog');
   assert.equal(unknown.pr, undefined);
@@ -62,4 +62,18 @@ test('load counts only running role threads, by the role executor', () => {
     { id: '5', labels: ['unrelated'], state: 'running' },
   ];
   assert.deepEqual(loadFrom(threads), { orbs: 1, runnerSlots: 1 });
+});
+
+test('finished threads: idle intake past Backlog and idle spec past Triage; running, later roles and unlabelled threads stay', () => {
+  const threads: LiveThread[] = [
+    { id: 'intake-idle', labels: ['odd-role-intake', 'odd-issue-met-1'], state: 'idle' },
+    { id: 'intake-running', labels: ['odd-role-intake', 'odd-issue-met-1'], state: 'streaming' },
+    { id: 'spec-idle', labels: ['odd-role-spec', 'odd-issue-met-1'], state: 'idle' },
+    { id: 'builder-idle', labels: ['odd-role-builder', 'odd-issue-met-1'], state: 'idle' },
+    { id: 'plain', labels: ['odd-issue-met-1'], state: 'idle' },
+  ];
+  assert.deepEqual(finishedThreads('Backlog', threads).map(t => t.id), []);
+  assert.deepEqual(finishedThreads('Triage', threads).map(t => t.id), ['intake-idle']);
+  assert.deepEqual(finishedThreads('Todo', threads).map(t => t.id), ['intake-idle', 'spec-idle']);
+  assert.deepEqual(finishedThreads('Duplicate', threads).map(t => t.id), ['intake-idle', 'spec-idle']);
 });
