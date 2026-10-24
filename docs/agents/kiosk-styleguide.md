@@ -33,6 +33,10 @@ the primitives do the heavy lifting, so prefer composing them over writing CSS.
    every state (steady, loading, error, outage, reconnecting). The screenshot
    script fails if the document or `.dashboard` overflows. Check the ≥1280 px
    grid in `index.css` after adding anything to the overview.
+8. Every page fits Devon's devices (see Layout): `node .cursor/skills/verify-kiosk/devices.mjs` fails
+   on page-level horizontal scroll, content past the viewport or the safe
+   area, an unlisted inner scroller, a touch target under 44 px or a contrast
+   pair under AA at any matrix viewport.
 
 ## Tokens (`kiosk/src/index.css`)
 
@@ -44,14 +48,14 @@ system; the top-bar toggle writes the sticky `factory-theme` override and
 | Token | Light | Dark | Use |
 | --- | --- | --- | --- |
 | `--background` | `#f2f6f7` | `#0d1218` | page ground under the scene |
-| `--card` | `#ffffff` | `#101820` | panel glass tint (at `--glass-alpha`) |
+| `--card` | `#ffffff` | `#101820` | panel glass tint (at `--card-alpha`: `--glass-alpha` below 1280 px, 82% / 74% at ≥ 1280 px) |
 | `--muted` | `#e7eef0` | `#17222c` | sub-surfaces, meter tracks, disabled fills |
 | `--foreground` | `#102026` | `#eef4f6` | primary text |
 | `--muted-foreground` | `#4f6169` | `#9fb0ba` | secondary text, stale readings |
 | `--border` / `--border-strong` | 10% / 18% ink | 9% / 18% white | resting and hover edges on tiles and rows |
 | `--border-control` | `#718389` | `#728894` | the only border that must read alone (≥ 3:1): buttons, toggles, inputs, disabled controls |
 | `--primary` / `--primary-foreground` | `#00756c` / `#ffffff` | `#3fd1c2` / `#06201d` | brand teal, filled buttons, the mark |
-| `--accent-text`, `--accent-soft` | `= --primary`, 12% teal | `= --primary`, 14% teal | links, focus rings, chart line, soft accent fills |
+| `--accent-text`, `--accent-soft` | `#006f67`, 12% teal | `= --primary`, 14% teal | links, focus rings, chart line, soft accent fills |
 | `--glow` | `#e0895a` | `#f2a477` | alpenglow; scene only |
 | `--ok` | `#25661a` | `#7ee081` | status only |
 | `--warn` | `#7a5800` | `#ffd447` | status only |
@@ -74,12 +78,23 @@ Deviations from `tokens.json`, each one step away to clear AA over the scene
   outlines at 3:1 on glass.
 - Top bar and footer tint at `--glass-alpha`, not 60%, so the footer SHAs
   stay above 4.5:1 over the sky.
+- Panels at ≥ 1280 px (laptop, kiosk, 27-inch) tint at `--card-alpha` 82%
+  dawn / 74% night so the scene shows through dense layouts (MET-297). 80% dawn
+  put warn text and muted tile text at 4.44:1 on the details pages.
+- light `--accent-text` `#006f67`, one step darker than `--primary`: teal text
+  on glass over the dawn ridge (Energy periods, spend estimates) reached only
+  4.43:1 on phones. The alpenglow sweep uses `--primary`, so the scene did not
+  change.
+- dark `--snow-opacity` 0.65 (was 0.75): headings and the power buttons that
+  scroll over the lit peaks on phones and iPads keep 4.5:1.
 
-Measured minimums with the current tokens (`kiosk/screenshots/checks.json`):
-text 4.54:1 ("Failing · —" at 1024 and 390 dark), 5.09:1 at 1728 dark,
-5.15:1 at 1728 light; controls 3.09:1 (pressed "1h" border at 390 light),
-3.66:1 / 3.53:1 at 1728 dark / light. If you change a token, run the
-screenshot script and keep every pair above its floor.
+Measured minimums with the current tokens (`vp run screenshots` on the MET-297
+branch; the committed `kiosk/screenshots/` predate it):
+text 4.64:1 ("Pricing update pending" at 390 light), 4.71:1 ("Failing · —" at
+390 dark), 4.94:1 at 1728 dark, 5.04:1 at 1728 light; controls 3.85:1
+(pressed "1h" border at 390 light), 4.67:1 / 3.94:1 at 1728 dark / light.
+If you change a token, run the screenshot script and the device matrix
+(`node .cursor/skills/verify-kiosk/devices.mjs`) and keep every pair above its floor.
 
 ## Surfaces: liquid glass
 
@@ -114,6 +129,12 @@ Unknown values fall back to `both`. `?perf=1` starts the frame sampler
 (`perf.ts`, `window.__ambientPerf`) for `kiosk/scripts/ambient-trial.sh`.
 "Night" means the dark theme, so dawn mode never shows stars or aurora. The
 v1 look no longer exists.
+
+Phones (`PHONE` in `lib/motion.ts`, ≤ 932 × 932 px: both iPhone
+orientations, not the iPad) run less: the scene and the topology flow dots
+hold still, the aurora is hidden, panels skip the entrance stagger and
+`pulse()` does nothing. Charts, number tweens and new request rows still ease
+in (MET-296).
 
 Event pulses (`lib/motion.ts` `pulse()`, called once per data refresh in
 `App.tsx`): the Live chip throws one `.fk-ripple`, every `.fk-hero
@@ -180,7 +201,12 @@ is on).
   flex row with other content, or it collapses to zero width (the filesystem
   rows on the device page are a grid for this reason).
 - `RangeToggle` (`ui/range-toggle.tsx`): segmented control; the pressed
-  segment gets a `--border-control` outline so the state reads at 3:1.
+  segment gets a `--border-control` outline so the state reads at 3:1. The
+  group is a glass field (card tint at `--glass-alpha`), because details-page
+  sections and the topology flows put it straight on the scene.
+- `Button variant="destructive"` (the UPS power actions only) is filled
+  `--fail` with `--on-status` text, like a fail chip: the tinted version read
+  at 3.7:1 and had no 3:1 boundary over the lit peaks.
 - `Input` (`ui/input.tsx`) and `Select` (`ui/select.tsx`), both Base UI:
   glass fields (`.field`): the card tint at `--glass-alpha`, a
   `--border-control` outline (≥ 3:1), `radius-md`, the teal focus ring,
@@ -230,9 +256,41 @@ stacks; numbers get `tabular-nums` from `body`.
 
 ## Layout
 
+- Frame: the document is the only page scroller. `#root` is at least
+  `100dvh`, the top bar is `position: sticky`, the footer ends the page. No
+  page area scrolls by itself (iOS Safari then collapses its toolbars and
+  keeps native momentum); the reserved MET-296 boxes (request log, Verdict
+  chips, service details, warning slots) and tables wider than a phone
+  (`overflow-x` on that element only) are the exceptions. `/topology` is an
+  app canvas: its frame is `max(100dvh, 560px)` tall. Because the document
+  scrolls, `App.tsx` keeps an offset per history entry: an in-app link opens
+  its page at the top, with the heading below the top bar, and Back/Forward
+  return each page to where it was left, holding that offset while the page
+  finishes loading.
+- Safe areas: `index.html` sets `viewport-fit=cover`. Side gutters are
+  `--gutter-left/right` (`max(--gutter, env(safe-area-inset-*))`, `--gutter`
+  14 / 28 / 40 px on phone / default / ≥ 1920 px); the top bar adds the top
+  inset and the footer the bottom inset.
+- Device matrix (`node .cursor/skills/verify-kiosk/devices.mjs`, verify-kiosk skill):
+  iPhone 15 Pro Max 430×739 portrait and 932×380 landscape (DPR 3, Dynamic
+  Island and home-indicator insets), iPad Air 11" 820×1180 and 1180×820, MacBook
+  Pro 14" 1512×982, 27" 2560×1440, kiosk 1728×1117.
+- Breakpoints: below 640 px one column. 640–1023 px (landscape phone, iPad
+  portrait) two columns: Fleet, GPU (stats beside the chart) and Local LLM
+  full width, UPS and Network side by side, Frontier CLIs and Live requests
+  side by side at their own heights. 1024–1279 px (iPad landscape) puts UPS,
+  Local LLM and Network in one row. ≥ 1280 px is the kiosk grid; ≥ 1920 px
+  keeps it at full width with taller charts. Overview cards narrower than
+  560 px (container query on `.panel-link`) pair their readings two across.
+- Touch (`pointer: coarse`): buttons, toggles, fields and top-bar links are
+  at least 44 × 44 px. No information is hover-only: the API health tooltip
+  also toggles on a tap.
 - Top bar: brand mark (teal, one hue) + `factory` link home, then breadcrumbs
   derived from the path (`crumbs()` in `App.tsx`). Crumb separators use
-  `--muted-foreground`, not opacity.
+  `--muted-foreground`, not opacity. Below 640 px the mark stands in for the
+  `factory` title and an icon for `Topology` (both names stay for screen
+  readers), only the current crumb shows and a long one ends in an
+  ellipsis.
 - Overview (`/`): `.dashboard-grid`. At ≥1280 px it is three columns plus a
   1.38fr sidebar, rows `auto auto auto 1fr`: Fleet, GPU, then UPS / Local LLM
   / Network on one row (the spec draws two columns there; three keeps the
@@ -240,7 +298,7 @@ stacks; numbers get `tabular-nums` from `body`.
   requests in the sidebar. Sections with a details page render as `<a
   className="panel-link">` wrapping a compact `Panel`.
 - Details pages (`/ups`, `/llm`, `/network`, `/devices/<id>`): `PageHeader`
-  then stacked Panels; the dashboard area scrolls there.
+  then stacked Panels; the document scrolls there.
 - Navigation: plain `<a href="/…">`; `App.tsx` intercepts same-origin clicks.
   An icon that navigates (the UPS badge in the top bar) is an `<a>` styled
   with `buttonVariants({ variant: "ghost", size: "icon" })`, never a button
@@ -253,7 +311,10 @@ stacks; numbers get `tabular-nums` from `body`.
   `@xyflow/react` loads only on this route (`lazy()` in `App.tsx`), so the
   overview chunk stays free of it; `topology.test.ts` walks the static imports
   to keep it that way. Colors come from tokens via `topology.css`; the
-  "How … works" steps open a native `popover`.
+  "How … works" steps open a native `popover`. On phones (`usePhone()`, the
+  `PHONE` query) the button is a disclosure (`aria-expanded`) and the steps
+  render inline above the map, so the document scrolls them; the map keeps a
+  `clamp(300px, 70dvh, 560px)` canvas with its own drag-to-pan and pinch-zoom.
 
 ## Live data
 
@@ -307,10 +368,22 @@ From `kiosk/` after `source /home/agent/.config/vite-plus/env`:
   motion stops everything. Results in `.amp/in/artifacts/ambient/`.
 - `kiosk/scripts/ambient-trial.sh both` on the console for the 15%-of-all-cores
   rule (MET-237).
+- `node .cursor/skills/verify-kiosk/devices.mjs` from the repo root against a running mock (`BASE_URL`,
+  default `http://127.0.0.1:4180`; about four minutes): every page at every
+  matrix viewport in both themes in Chromium device emulation with the
+  safe-area insets, as rule 8 describes, then the topology "How linear
+  dispatch works" explanation at 932×380 and 430×739 (no nested vertical
+  scroller, no horizontal overflow, every line reachable), then the
+  overview → Network card → Back → Forward journey on both iPhone and iPad
+  orientations (`JOURNEY_ONLY=1` runs only that). Full-page
+  screenshots and `devices-check.json` go to `DEVICES_OUT` (default
+  `$VERIFY_ROOT/evidence/devices`, else `.amp/in/artifacts/devices/`).
+  `DEVICES=` and `THEMES=` narrow a run. WebKit is not covered: its system
+  libraries are not part of the environment contract.
 
 ## Checklist before opening a PR
 
-- The three `vp` commands plus both scripts above pass.
+- The three `vp` commands plus the scripts above pass.
 - Screenshots of every changed page in light and dark at 1728×1117 and at a
   narrow width, inspected.
 - Tests assert through roles and visible text, not class names.

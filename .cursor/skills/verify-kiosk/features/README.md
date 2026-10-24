@@ -43,3 +43,4 @@ Each feature file starts with an H1 title and one paragraph describing the user-
 - [Usage range](./usage-range.md) covers the Local LLM 24h, 7d, and 30d control.
 - [GPU range](./gpu-range.md) covers the GPU 1h, 24h, and 7d history control.
 - [Frontier refresh](./frontier-refresh.md) covers the Frontier CLIs refresh button and its mock limitation.
+- [Device matrix](./device-matrix.md) covers every page on Devon's iPhone, iPad, MacBook, 27-inch monitor and the kiosk screen.

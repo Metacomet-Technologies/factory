@@ -3,10 +3,11 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createElement } from "react";
 import { fireEvent, render, screen, within } from "@testing-library/react";
-import { beforeAll, describe, expect, it, vi } from "vite-plus/test";
+import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EDGES, FLOWS, NODE_H, NODE_W, NODES, ZONES } from "./topology";
 import { routesFor } from "./routes";
 import TopologyPage from "./topology-map";
+import { PHONE } from "../lib/motion";
 
 const ids = (items: { id: string }[]) => items.map((item) => item.id);
 const nodeIds = new Set(ids(NODES));
@@ -85,7 +86,7 @@ describe("routing", () => {
 });
 
 describe("topology page", () => {
-  beforeAll(() => {
+  beforeEach(() => {
     // React Flow measures nodes with layout APIs jsdom lacks (reactflow.dev/learn/advanced-use/testing).
     vi.stubGlobal(
       "ResizeObserver",
@@ -161,6 +162,29 @@ describe("topology page", () => {
     const items = within(steps).getAllByRole("listitem", { hidden: true });
     expect(items.map((item) => item.textContent)).toStrictEqual(next.steps);
     expect(within(steps).getByText("Solid: request or data")).toBeInTheDocument();
+  });
+
+  it("shows the steps inline on a phone, in the document flow instead of a popover", () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query === PHONE,
+      addEventListener() {},
+      removeEventListener() {},
+    }));
+    render(createElement(TopologyPage, { dark: true }));
+    const first = FLOWS[0]!;
+    const explain = screen.getByRole("button", { name: `How ${first.name.toLowerCase()} works` });
+    expect(explain).not.toHaveAttribute("popovertarget");
+    expect(explain).toHaveAttribute("aria-expanded", "false");
+    expect(document.getElementById("topology-steps")).toBeNull();
+    fireEvent.click(explain);
+    expect(explain).toHaveAttribute("aria-expanded", "true");
+    const steps = screen.getByRole("region", { name: `How ${first.name.toLowerCase()} works` });
+    expect(steps).not.toHaveAttribute("popover");
+    expect(
+      within(steps)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toStrictEqual(first.steps);
   });
 });
 

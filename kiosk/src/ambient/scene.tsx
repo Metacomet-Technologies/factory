@@ -74,6 +74,8 @@ const SWEEP_MASK = svgUrl(
  */
 function staticSky(dark: boolean, width: number, height: number) {
   const c = (name: keyof typeof COLORS) => COLORS[name][dark ? 1 : 0];
+  // The band shrinks to 40% of short viewports, as `.fk-band` does in index.css.
+  const band = height <= 600 ? height * 0.4 : H;
   const sky = [0, 0.4, 0.66, 0.84, 1]
     .map((offset, i) => `<stop offset="${offset}" stop-color="${c(`sky-${i}` as "sky-0")}"/>`)
     .join("");
@@ -83,13 +85,13 @@ function staticSky(dark: boolean, width: number, height: number) {
       `<linearGradient id="n" x2="0" y2="1"><stop stop-color="${c("ridge-mid")}"/>` +
       `<stop offset="1" stop-color="${c("ridge-near")}"/></linearGradient>` +
       `<linearGradient id="w" gradientUnits="userSpaceOnUse" x2="0" y2="${H * 0.22}">` +
-      `<stop stop-color="${c("snow")}" stop-opacity="${dark ? 0.75 : 0.95}"/>` +
+      `<stop stop-color="${c("snow")}" stop-opacity="${dark ? 0.65 : 0.95}"/>` +
       `<stop offset="1" stop-color="${c("snow")}" stop-opacity="0"/></linearGradient>` +
       `<filter id="b" x="0" y="0" width="1" height="1" color-interpolation-filters="sRGB">` +
       `<feGaussianBlur stdDeviation="18" edgeMode="duplicate"/>` +
       `<feColorMatrix type="saturate" values="1.7"/></filter></defs>` +
       `<g filter="url(#b)"><rect width="100%" height="100%" fill="url(#s)"/>` +
-      `<svg y="${height - H}" width="${width}" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">` +
+      `<svg y="${height - band}" width="${width}" height="${band}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">` +
       `<path d="${FAR_PATH}" fill="${c("ridge-far")}" opacity="0.75"/>` +
       `<path d="${NEAR_PATH}" fill="url(#n)"/><path d="${NEAR_PATH}" fill="url(#w)"/>` +
       `<path d="${RIM}" fill="none" stroke="${c("rim")}" stroke-opacity="0.55" stroke-width="1.5" vector-effect="non-scaling-stroke"/>` +

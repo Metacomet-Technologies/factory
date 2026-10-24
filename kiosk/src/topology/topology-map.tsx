@@ -13,6 +13,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { Workflow } from "lucide-react";
 import { Button } from "../components/ui/button";
+import { usePhone } from "../lib/motion";
 import { PageHeader } from "../components/ui/page-header";
 import { Panel } from "../components/ui/panel";
 import { ToggleGroup, ToggleGroupItem } from "../components/ui/toggle-group";
@@ -129,6 +130,24 @@ export default function TopologyPage({ dark }: { dark: boolean }) {
   const [flowId, setFlowId] = useState(FLOWS[0]!.id);
   const flow = FLOWS.find((candidate) => candidate.id === flowId) ?? FLOWS[0]!;
   const { nodes, edges } = useMemo(() => buildGraph(flow), [flow]);
+  // Phones read the steps inline, so the document scrolls them; elsewhere they float in a popover.
+  const phone = usePhone();
+  const [explained, setExplained] = useState(false);
+  const steps = (
+    <>
+      <h3>{flow.name}</h3>
+      <p className="muted">{flow.intro}</p>
+      <ol>
+        {flow.steps.map((step) => (
+          <li key={step}>{step}</li>
+        ))}
+      </ol>
+      <div className="topology-legend">
+        <span>Solid: request or data</span>
+        <span className="is-dashed">Dashed: a person acting, or a scheduled job</span>
+      </div>
+    </>
+  );
   return (
     <main id="main" className="dashboard topology-page">
       <PageHeader
@@ -161,24 +180,38 @@ export default function TopologyPage({ dark }: { dark: boolean }) {
         className="topology-panel"
         bodyClassName="topology-body"
         action={
-          <Button variant="outline" size="sm" popoverTarget="topology-steps">
-            How {flow.name.toLowerCase()} works
-          </Button>
+          phone ? (
+            <Button
+              variant="outline"
+              size="sm"
+              aria-expanded={explained}
+              aria-controls="topology-steps"
+              onClick={() => setExplained((open) => !open)}
+            >
+              How {flow.name.toLowerCase()} works
+            </Button>
+          ) : (
+            <Button variant="outline" size="sm" popoverTarget="topology-steps">
+              How {flow.name.toLowerCase()} works
+            </Button>
+          )
         }
       >
-        <div id="topology-steps" popover="auto" className="panel topology-steps">
-          <h3>{flow.name}</h3>
-          <p className="muted">{flow.intro}</p>
-          <ol>
-            {flow.steps.map((step) => (
-              <li key={step}>{step}</li>
-            ))}
-          </ol>
-          <div className="topology-legend">
-            <span>Solid: request or data</span>
-            <span className="is-dashed">Dashed: a person acting, or a scheduled job</span>
+        {phone ? (
+          explained && (
+            <section
+              id="topology-steps"
+              className="topology-steps topology-steps-inline"
+              aria-label={`How ${flow.name.toLowerCase()} works`}
+            >
+              {steps}
+            </section>
+          )
+        ) : (
+          <div id="topology-steps" popover="auto" className="panel topology-steps">
+            {steps}
           </div>
-        </div>
+        )}
         <div className="topology-canvas">
           <ReactFlow
             nodes={nodes}

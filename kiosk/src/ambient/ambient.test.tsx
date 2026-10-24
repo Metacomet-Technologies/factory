@@ -1,6 +1,6 @@
 import { act, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-import { IDLE_HOLD_MS } from "@/lib/motion";
+import { IDLE_HOLD_MS, PHONE, pulse } from "@/lib/motion";
 import { parseAmbient } from "./mode";
 import { startAmbientPerf } from "./perf";
 import { AmbientScene } from "./scene";
@@ -133,5 +133,20 @@ describe("AmbientScene", () => {
     scene.unmount();
     expect(root.dataset.ambient).toBeUndefined();
     expect(root.getAttribute("style") ?? "").toBe("");
+  });
+});
+
+describe("pulse", () => {
+  it("ripples the Live chip on a refresh, except on phones", () => {
+    const root = document.createElement("div");
+    root.innerHTML = '<span class="live-indicator"></span>';
+    const media = (phone: boolean) =>
+      vi.stubGlobal("matchMedia", (query: string) => ({ matches: phone && query === PHONE }));
+    media(true);
+    pulse(root);
+    expect(root.querySelectorAll(".fk-ripple")).toHaveLength(0);
+    media(false);
+    pulse(root);
+    expect(root.querySelectorAll(".fk-ripple")).toHaveLength(1);
   });
 });
