@@ -341,6 +341,8 @@ by the previous one).
    deterministically on `ready` (self-deploying paths included) and escalates
    after the third rejected head; caps enforced from thread labels; Ralph
    guard on. Subscription engines and the launcher come later.
+
+   First autonomous run: this issue, built, reviewed and merged by the control plane.
 5. Shipper and Deployer: install the sudoers allowlist; the runner deploy job
    consumes `release.published`; canary + rollback; self-deploying paths
    merge through the same gate.
