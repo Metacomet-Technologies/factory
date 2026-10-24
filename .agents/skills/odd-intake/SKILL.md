@@ -31,10 +31,23 @@ message), a `#factory-alerts` post, or a CI failure on `main`.
 4. Record the source (Slack channel and message `ts`, alert id, CI run URL) in
    `Context`.
 
+## Linear calls
+
+Use `code_exec` with `import { get_issue, list_issues, save_issue, save_comment } from "linear"`.
+`get_issue({ id: "MET-n" })` returns an object; stringify it. There is no
+`search_issues`: use `list_issues({ query, team: "Metacomet" })` for the
+duplicate check. Do not pass `fields`; the default shape has `status`,
+`labels`, `description`. Fill the issue with `save_issue({ id, description,
+state: "Triage", labels: [...] })`. The template's section bodies are the
+hints shown in the "Agent task issue" template in Linear; copy them from
+`get_issue` on any recent Triage/Todo issue if the bare issue lacks them.
+
 ## Authority
 
-Create and edit only the issue you created; comment and link on duplicates.
-Never edit another issue's status, labels, assignee or priority.
+Create and edit only the issue you created, or the bare issue the control
+plane handed you (Intake owns Backlog issues, `docs/odd/README.md` §5.1);
+comment and link on duplicates. Never edit another issue's status, labels,
+assignee or priority.
 
 ## Stop and handoff
 
