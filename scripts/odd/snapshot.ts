@@ -45,14 +45,29 @@ export type LinearIssue = {
   relations?: { blockedBy?: readonly { id: string }[] } | null;
 };
 
-/** `gh pr list --json number,headRefOid,state,mergeCommit,statusCheckRollup`. */
+/** `gh pr list --json number,headRefName,headRefOid,state,mergeCommit,statusCheckRollup,body`. */
 export type GitHubPullRequest = {
   number: number;
+  headRefName?: string;
   headRefOid: string;
   state: 'OPEN' | 'MERGED' | 'CLOSED';
   mergeCommit?: { oid: string } | null;
   statusCheckRollup?: readonly { name?: string; conclusion?: string | null; state?: string | null; status?: string | null }[];
+  body?: string;
 };
+
+/**
+ * A PR belongs to an issue by the builder contract: branch `met-<n>-<slug>` or a
+ * `closes MET-<n>` / `contributes MET-<n>` line in its body. A PR that merely
+ * mentions the issue in prose (another issue's fix explaining it) does not.
+ */
+export function prOwnsIssue(pr: Pick<GitHubPullRequest, 'headRefName' | 'body'>, identifier: string): boolean {
+  const id = identifier.toLowerCase();
+  const branch = (pr.headRefName ?? '').toLowerCase();
+  if (branch === id || branch.startsWith(`${id}-`)) return true;
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^\\s*(closes|contributes)\\s+${escaped}\\b`, 'im').test(pr.body ?? '');
+}
 
 export type LiveThread = { id: string; labels: readonly string[]; state: string };
 

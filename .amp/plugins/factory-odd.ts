@@ -23,7 +23,7 @@ import {
 	type Role,
 } from '../../scripts/odd/lifecycle.ts'
 import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { finishedThreads, issueFromEvent, loadFrom, roleLabelQueries, toSnapshot, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
+import { finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, roleLabelQueries, toSnapshot, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
 
 export const description =
 	'Factory ODD control plane: Linear, GitHub and Slack webhooks drive a deterministic outcome lifecycle; role agents run in orbs; Ralph loops are bounded by external checks. See docs/odd/README.md.'
@@ -458,14 +458,19 @@ async function archiveThreads(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger
 	}
 }
 
-// The identifier is quoted: an unquoted `MET-301` is tokenised and also matches `MET-30` and `301`.
-async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, identifier: string): Promise<GitHubPullRequest | undefined> {
-	const result = await ctx.$`gh pr list --search ${`"${identifier}"`} --state all --json number,headRefOid,state,mergeCommit,statusCheckRollup --limit 5`
+// The search is only a prefilter (quoted, since an unquoted `MET-301` also matches `301`); a PR
+// counts only if it owns the issue by branch name or `closes`/`contributes` line (prOwnsIssue).
+async function pullRequestsFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, identifier: string, state: 'all' | 'open'): Promise<GitHubPullRequest[]> {
+	const result = await ctx.$`gh pr list --search ${`"${identifier}"`} --state ${state} --json number,headRefName,headRefOid,state,mergeCommit,statusCheckRollup,body --limit 20`
 	if (result.exitCode !== 0) {
 		ctx.logger.log(marker, 'gh pr list failed', result.stderr.trim())
-		return undefined
+		return []
 	}
-	const prs = JSON.parse(result.stdout) as GitHubPullRequest[]
+	return (JSON.parse(result.stdout) as GitHubPullRequest[]).filter(pr => prOwnsIssue(pr, identifier))
+}
+
+async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, identifier: string): Promise<GitHubPullRequest | undefined> {
+	const prs = await pullRequestsFor(ctx, identifier, 'all')
 	// Prefer the open PR; otherwise the merged one, so a merged issue derives `Deploying`.
 	return prs.find(pr => pr.state === 'OPEN') ?? prs.find(pr => pr.state === 'MERGED')
 }
@@ -489,7 +494,7 @@ async function currentLoad(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>)
 }
 
 // The Ralph guard's external checks: each is read from Linear or GitHub, never from the agent.
-async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools'>, role: Role, issue: string, labels: readonly string[]): Promise<{ stopMet: boolean; missing: string[] }> {
+async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools' | 'logger'>, role: Role, issue: string, labels: readonly string[]): Promise<{ stopMet: boolean; missing: string[] }> {
 	if (role === 'intake' || role === 'spec') {
 		const snapshot = await callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: issue })
 		const missing = role === 'intake'
@@ -498,9 +503,9 @@ async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools'>, rol
 		return { stopMet: missing.length === 0, missing }
 	}
 	if (role !== 'builder' && role !== 'reviewer') return { stopMet: true, missing: [] }
-	const pr = await ctx.$`gh pr list --search ${`"${issue}"`} --state open --json number,headRefOid,statusCheckRollup --limit 1`
-	if (pr.exitCode !== 0 || pr.stdout.trim() === '[]') return { stopMet: false, missing: [`no open PR for ${issue}`] }
-	const [{ headRefOid, statusCheckRollup = [] }] = JSON.parse(pr.stdout) as Array<{ headRefOid: string; statusCheckRollup?: Array<{ name?: string; conclusion?: string; state?: string }> }>
+	const [open] = await pullRequestsFor(ctx, issue, 'open')
+	if (!open) return { stopMet: false, missing: [`no open PR for ${issue}`] }
+	const { headRefOid, statusCheckRollup = [] } = open
 	if (role === 'reviewer') {
 		// The verdict is the reviewer thread's own label for the current head (snapshot.verdictFor).
 		const head = headRefOid.slice(0, 12)
