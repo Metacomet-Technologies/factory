@@ -255,6 +255,13 @@ const args = process.argv.slice(2);
 fs.appendFileSync(process.env.FAKE_CALLS, JSON.stringify(args) + '\\n');
 fs.appendFileSync(process.env.FAKE_EVENTS, JSON.stringify(['amp', ...args]) + '\\n');
 if (args.includes('--project') && args[0] !== '-ox') process.exit(99);
+if (args[0] === 'plugins' && args[1] === 'list') {
+  if (process.env.FAKE_PLUGINS_FAIL) process.exit(7);
+  console.log(process.env.FAKE_PLUGINS ?? ['✓ docs-mode (User Plugins) active', '  agent mode: docs', '✓ go-modes (User Plugins) active', '  tool: go_advisor_high', '  tool: go_advisor_max',
+    ...['low', 'medium', 'high', 'ultra'].map(e => '  agent mode: go-' + e), '✓ grok-modes (User Plugins) active', '  tool: grok_advisor_high', '  tool: grok_advisor_xhigh',
+    ...['low', 'medium', 'high', 'ultra'].map(e => '  agent mode: grok-' + e)].join('\\n'));
+  process.exit(0);
+}
 if (args[0] === '-x') {
   const runner = args[args.indexOf('--executor') + 1].includes('console') ? 'console' : 'gpu';
   const trees = JSON.parse(fs.readFileSync(process.env.FAKE_WORKTREES, 'utf8'))[runner];
@@ -531,7 +538,7 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
     events: () => readFileSync(eventsFile, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)),
     threads: () => JSON.parse(readFileSync(threadsFile, 'utf8')),
     setThreads: (threads: any[]) => writeFileSync(threadsFile, JSON.stringify(threads)),
-    calls: () => allCalls().filter(args => !['label', 'search'].includes(args[1]))
+    calls: () => allCalls().filter(args => !['label', 'search'].includes(args[1]) && args[0] !== 'plugins')
       .filter(args => !options.submissionsOnly || args[0] === '-x' || args[1] === 'continue') };
 }
 
@@ -1031,6 +1038,70 @@ test('all engine/effort mappings and runner configuration reach exact Amp argv',
       assert.ok(claim.body.includes('agent-effort is ignored for ultra.'));
     } else assert.ok(!claim.body.includes('Engine ultra:'));
   }
+});
+
+test('subscription plugin engines launch verified mode keys and show mode and advisor rationale', { timeout: 15_000 }, async t => {
+  const cases: [string, string | null, boolean, string, string][] = [
+    ['grok', 'low', false, 'grok-low', 'Advisor: none for this mode.'],
+    ['grok', 'medium', false, 'grok-medium', 'Advisor: not warranted; do not call grok_advisor_high.'],
+    ['grok', 'high', true, 'grok-high', 'Advisor: warranted for the unresolved question named in Context; grok_advisor_high is optional, report-only'],
+    ['grok', 'ultra', true, 'grok-ultra', 'Advisor: warranted for the unresolved question named in Context; grok_advisor_xhigh'],
+    ['go', 'low', false, 'go-low', 'Advisor: none for this mode.'],
+    ['go', 'medium', true, 'go-medium', 'grok_advisor_high'.replace('grok', 'go')],
+    ['go', 'high', false, 'go-high', 'Advisor: not warranted; do not call go_advisor_high.'],
+    ['go', 'ultra', false, 'go-ultra', 'Advisor: not warranted; do not call go_advisor_max.'],
+    ['docs', null, false, 'docs', 'Mode: docs (OpenCode Go subscription, agent-effort ignored). Advisor: none for this mode.'],
+  ];
+  const issues = cases.map(([engine, effort, advisor], n) => {
+    const i = issue(200 + n);
+    i.labels.push(n % 2 ? { id: engine, name: `engine/${engine}` } : group('engine', engine), group('runner', 'console'));
+    if (effort) i.labels.push(n % 2 ? { id: effort, name: `agent-effort/${effort}` } : group('agent-effort', effort));
+    if (advisor) i.labels.push({ id: 'advisor', name: 'advisor' });
+    return i;
+  });
+  const f = await fixture(t, issues);
+  assert.equal((await f.run(['poll'], { DISPATCH_MAX_ACTIVE_PER_RUNNER: '12' })).code, 0);
+  assert.equal(f.allCalls().filter(args => args[0] === 'plugins').length, 1, 'one inventory read per poll');
+  assert.deepEqual(f.calls().map(args => args[args.indexOf('--mode') + 1]), cases.map(c => c[3]));
+  for (const [n, args] of f.calls().entries()) {
+    assert.ok(!args.includes('--features'), 'plugin modes never get Claude features');
+    const claim = issues[n].comments.find((c: any) => c.body.includes('factory-dispatch:claim')).body;
+    for (const text of [cases[n][4], `Mode: ${cases[n][3]} (`]) { assert.ok(claim.includes(text), `${cases[n][3]} claim: ${text}`); assert.ok(args[1].includes(text), `${cases[n][3]} prompt: ${text}`); }
+    assert.ok(!claim.includes('Engine ultra:'));
+  }
+  assert.ok(issues[1].comments.some((c: any) => c.body.includes('Mode: grok-medium (Grok subscription, effort medium).')));
+});
+
+test('plugin engines refuse unauthorized ultra, misplaced advisors and unverified modes without substitution', { timeout: 15_000 }, async t => {
+  const make = (n: number, labels: any[]) => { const i = issue(300 + n); i.labels.push(...labels); return i; };
+  const bad = [
+    [make(0, [group('engine', 'amp'), group('agent-effort', 'ultra')]), 'agent-effort/ultra is only for engine/grok or engine/go'],
+    [make(1, [group('engine', 'docs'), group('agent-effort', 'ultra')]), 'agent-effort/ultra is only for engine/grok or engine/go'],
+    [make(2, [group('engine', 'claude'), { id: 'advisor', name: 'advisor' }]), 'advisor needs engine/grok or engine/go'],
+    [make(3, [group('engine', 'grok'), group('agent-effort', 'low'), { id: 'advisor', name: 'advisor' }]), 'advisor needs engine/grok or engine/go'],
+    [make(4, [group('engine', 'docs'), { id: 'advisor', name: 'advisor' }]), 'advisor needs engine/grok or engine/go'],
+  ] as const;
+  const f = await fixture(t, bad.map(b => b[0]));
+  assert.equal((await f.run()).code, 0);
+  assert.equal(f.calls().length, 0);
+  assert.equal(f.allCalls().filter(args => args[0] === 'plugins').length, 0, 'invalid labels fail before discovery');
+  for (const [i, reason] of bad) { assert.ok(i.comments[0].body.includes(reason), reason); assert.ok(!labeled(i)); }
+
+  const missing = make(10, [group('engine', 'grok'), group('agent-effort', 'high')]);
+  const tool = make(11, [group('engine', 'go'), group('agent-effort', 'high'), { id: 'advisor', name: 'advisor' }]);
+  const g = await fixture(t, [missing, tool]);
+  assert.equal((await g.run(['poll'], { FAKE_PLUGINS: '  agent mode: grok-low\n  agent mode: go-high' })).code, 0);
+  assert.equal(g.calls().length, 0, 'no launch and no fallback mode');
+  assert.match(missing.comments[0].body, /Mode grok-high unavailable: `amp plugins list` does not report it; not substituted/);
+  assert.match(tool.comments[0].body, /Advisor go_advisor_high unavailable/);
+
+  const unverified = make(12, [group('engine', 'go')]);
+  const h = await fixture(t, [unverified]);
+  const result = await h.run(['poll'], { FAKE_PLUGINS_FAIL: '1' });
+  assert.equal(result.code, 0);
+  assert.match(result.stdout, /"decision":"plugin-modes-unverified"/);
+  assert.equal(h.calls().length, 0);
+  assert.match(unverified.comments[0].body, /Mode go-medium unverified: `amp plugins list` failed; not substituted/);
 });
 
 test('Claude defaults to medium effort and invalid engine labels never launch', { timeout: 10_000 }, async t => {
@@ -1711,7 +1782,7 @@ test('unreachable console leaves QA unclaimed and retries on a later reachable p
 });
 
 test('QA engine mapping uses grouped/flat builder engine labels, with Claude fallback', () => {
-  for (const [engine, expected] of [['amp', 'claude'], ['chatgpt', 'claude'], ['ultra', 'claude'], ['claude', 'amp'], ['unknown', 'claude']]) {
+  for (const [engine, expected] of [['amp', 'claude'], ['chatgpt', 'claude'], ['ultra', 'claude'], ['claude', 'amp'], ['grok', 'claude'], ['go', 'claude'], ['docs', 'claude'], ['unknown', 'claude']]) {
     for (const label of [group('engine', engine), { id: engine, name: `engine/${engine}` }]) assert.equal(reviewerEngine(issue(1, { labels: [label] })), expected);
   }
   assert.equal(reviewerEngine(issue(1, { labels: [] })), 'claude');
@@ -3423,6 +3494,7 @@ test('cursor initial and follow-up prompts let Cursor open a draft PR and assign
     assert.equal(local, `**Thread title:** Use the Linear ticket identifier and title: \`MET-123 — Build the useful widget today\`.
 
 Runner: factory-${runner}. Directory: /home/agent/work/factory-met-123-build-the-useful-widget. Effort: medium.
+Mode: medium (Amp, effort medium). Advisor: none for this mode.
 
 ## 1. Start fresh
 The dispatcher already created branch met-123-build-the-useful-widget from origin/main in the directory above. Do not recreate it.

@@ -42,7 +42,26 @@ export const modes = {
   claude: { low: 'external-agent:claude-code', medium: 'external-agent:claude-code', high: 'external-agent:claude-code' },
   chatgpt: { low: 'gpt56l', medium: 'gpt61s', high: 'gpt61s' },
   ultra: { low: 'ultra', medium: 'ultra', high: 'ultra' },
+  // Devon's User Plugins (subscription-backed, no Claude models). Checked with
+  // `amp plugins list` before launch; never substituted when missing.
+  grok: { low: 'grok-low', medium: 'grok-medium', high: 'grok-high', ultra: 'grok-ultra' },
+  go: { low: 'go-low', medium: 'go-medium', high: 'go-high', ultra: 'go-ultra' },
+  docs: { low: 'docs', medium: 'docs', high: 'docs' },
 };
+export const families = { amp: 'Amp', claude: 'Claude Code subscription', chatgpt: 'ChatGPT through Amp', ultra: 'Amp credits',
+  grok: 'Grok subscription', go: 'OpenCode Go subscription', docs: 'OpenCode Go subscription' };
+export const pluginEngines = ['grok', 'go', 'docs'];
+// Report-only advisor tools each plugin mode registers; low and docs have none.
+export const advisors = { grok: { medium: 'grok_advisor_high', high: 'grok_advisor_high', ultra: 'grok_advisor_xhigh' },
+  go: { medium: 'go_advisor_high', high: 'go_advisor_high', ultra: 'go_advisor_max' } };
+const effortIgnored = (engine: string) => engine === 'ultra' || engine === 'docs';
+export function assignment(engine: string, effort: string, advisor: boolean) {
+  const tool = advisors[engine]?.[effort];
+  const advice = !tool ? 'none for this mode' : advisor
+    ? `warranted for the unresolved question named in Context; ${tool} is optional, report-only and bounded to two consultations, never a review or a second builder`
+    : `not warranted; do not call ${tool}`;
+  return `Mode: ${modes[engine][effort]} (${families[engine]}, ${effortIgnored(engine) ? 'agent-effort ignored' : `effort ${effort}`}). Advisor: ${advice}.`;
+}
 export function engineArgs(engine: string, effort: string) {
   return ['--mode', modes[engine][effort],
     ...(engine === 'claude' ? ['--features', `model:${CLAUDE_MODEL},effort:${effort}`] : [])];
@@ -141,7 +160,11 @@ export function validate(issue: Issue) {
   if (!repo) errors.push('Needs at most one allowlisted repo/<name> label');
   const requested = choice('runner', repo?.defaultRunner ?? 'gpu', ['gpu', 'console', 'orb']);
   const engine = choice('engine', 'amp', [...Object.keys(modes), 'cursor']);
-  const effort = choice('agent-effort', 'medium', ['low', 'medium', 'high']);
+  const effort = choice('agent-effort', 'medium', ['low', 'medium', 'high', 'ultra']);
+  const advisor = names.includes('advisor');
+  // agent-effort/ultra is the explicit authorization for grok-ultra and go-ultra.
+  if (effort === 'ultra' && !['grok', 'go'].includes(engine)) errors.push('agent-effort/ultra is only for engine/grok or engine/go');
+  else if (advisor && !advisors[engine]?.[effort]) errors.push(`advisor needs engine/grok or engine/go at medium, high or ultra effort`);
   // Cursor builders run in Cursor's cloud: runner labels and agent-effort do not apply.
   const runner = engine === 'cursor' ? 'cursor' : requested;
   if (engine === 'cursor' && repo?.flow === 'simple') errors.push('engine/cursor is only for the full factory flow');
@@ -151,11 +174,11 @@ export function validate(issue: Issue) {
   }
   const link = content['Link type']?.toLowerCase() || 'contributes';
   if (!['contributes', 'closes'].includes(link)) errors.push('Link type section must contain only `closes` or `contributes`; put notes in Context.');
-  return { content, errors, runner, engine, effort, link, repo };
+  return { content, errors, runner, engine, effort, advisor, link, repo };
 }
 
 export function prompt(issue: Issue, runner = validate(issue).runner) {
-  const { content, effort, link } = validate(issue);
+  const { content, engine, effort, advisor, link } = validate(issue);
   const branch = slug(issue.identifier, issue.title);
   const tests = 'Run the AGENTS.md defaults and task-specific checks.';
   const startup = runner === 'cursor' ? `Engine: Cursor Cloud Agent.
@@ -167,6 +190,7 @@ export function prompt(issue: Issue, runner = validate(issue).runner) {
 4. Confirm \`get_issue\` works through the Linear MCP; otherwise stop and report.
 5. Never deploy, never touch production, never write dispatch or QA markers.
 Commit and push your branch when the work is complete; Cursor opens a draft PR from it. Do not post the Linear evidence comment; the dispatcher posts it. Title your work \`${issue.identifier} — ${issue.title}\`. End your reply with tests run and counts, deviations and unverified items.` : `Runner: factory-${runner}. Directory: /home/agent/work/factory-${branch}. Effort: ${effort}.
+${assignment(engine, effort, advisor)}
 
 ## 1. Start fresh
 The dispatcher already created branch ${branch} from origin/main in the directory above. Do not recreate it.
@@ -393,6 +417,17 @@ async function runPass(command: string, identifier: string | undefined, dryRun: 
   const log = (decision: string, details: object = {}) => console.log(redact(JSON.stringify({ decision, ...details })));
   // The caps line keeps its existing local-runner shape.
   log('caps', { caps: { gpu: caps.gpu, console: caps.console } });
+  // Read once, only when a plugin-engine issue needs it; failure means unverified, never a fallback mode.
+  let inventory: Promise<{ modes: Set<string>, tools: Set<string> } | undefined> | undefined;
+  function pluginInventory() {
+    inventory ??= amp(['plugins', 'list']).then(output => {
+      const found = (kind: string) => new Set([...output.matchAll(new RegExp(`^\\s*${kind}: (\\S+)\\s*$`, 'gm'))].map(match => match[1]));
+      const result = { modes: found('agent mode'), tools: found('tool') };
+      log('plugin-modes', { modes: [...result.modes].filter(mode => pluginEngines.some(engine => Object.values(modes[engine]).includes(mode))).sort() });
+      return result;
+    }, () => { log('plugin-modes-unverified'); return undefined; });
+    return inventory;
+  }
   // Read only when a cursor issue needs it; an unreadable or empty file means unavailable.
   function readCursorKey() {
     if (cursorKey === undefined) {
@@ -759,8 +794,16 @@ async function runPass(command: string, identifier: string | undefined, dryRun: 
       if (!has(issue, 'waiting') && !defer('waiting comments')) await comment(issue, `Waiting on ${blockers.join(', ')}\n\n${marker('waiting')}`);
       continue;
     }
-    const { errors, runner: requestedRunner, engine, effort, repo } = validate(issue);
+    const { errors, runner: requestedRunner, engine, effort, advisor, repo } = validate(issue);
     if (engine === 'cursor' && !readCursorKey()) errors.push('Cursor key unavailable');
+    if (pluginEngines.includes(engine) && !errors.length) {
+      const found = await pluginInventory();
+      const mode = modes[engine][effort];
+      const tool = advisor ? advisors[engine][effort] : undefined;
+      if (!found) errors.push(`Mode ${mode} unverified: \`amp plugins list\` failed; not substituted`);
+      else if (!found.modes.has(mode)) errors.push(`Mode ${mode} unavailable: \`amp plugins list\` does not report it; not substituted`);
+      else if (tool && !found.tools.has(tool)) errors.push(`Advisor ${tool} unavailable: \`amp plugins list\` does not report it`);
+    }
     if (errors.length) {
       log('invalid', { issue: issue.identifier, reasons: errors });
       if (!has(issue, 'invalid')) await comment(issue, `Cannot dispatch:\n${errors.map(error => `- ${error}`).join('\n')}\n\n${marker('invalid')}`);
@@ -803,7 +846,7 @@ async function runPass(command: string, identifier: string | undefined, dryRun: 
       log('dispatched', { issue: issue.identifier, thread: dryRun ? '<new-agent-id>' : id, runner });
       continue;
     }
-    await comment(issue, `Dispatch claimed on ${runner}${overflow ? ' (overflow)' : ''}. If submission is interrupted, inspect Amp before manual recovery; do not delete this claim to retry blindly.${engine === 'ultra' ? '\nEngine ultra: bills Amp credits (or OpenCode Go)\nagent-effort is ignored for ultra.' : ''}\n\n${marker(`claim runner:${runner}`)}\n${marker(`worktree ${slug(issue.identifier, issue.title)}`)}${repo!.flow === 'simple' ? `\n${marker(`repo ${repo!.name}`)}` : ''}`);
+    await comment(issue, `Dispatch claimed on ${runner}${overflow ? ' (overflow)' : ''}. If submission is interrupted, inspect Amp before manual recovery; do not delete this claim to retry blindly.\n${assignment(engine, effort, advisor)}${engine === 'ultra' ? '\nEngine ultra: bills Amp credits (or OpenCode Go)\nagent-effort is ignored for ultra.' : ''}\n\n${marker(`claim runner:${runner}`)}\n${marker(`worktree ${slug(issue.identifier, issue.title)}`)}${repo!.flow === 'simple' ? `\n${marker(`repo ${repo!.name}`)}` : ''}`);
     active[capacityKey]++;
     const branch = slug(issue.identifier, issue.title);
     const checkout = repo!.fallbackRunners[runner]?.checkout;
