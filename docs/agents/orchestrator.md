@@ -7,6 +7,11 @@ QA keep every limit in `AGENTS.md`; no grant here passes to a worker, builder
 or QA thread unless the orchestrator states it in that thread's prompt and the
 grant is listed here.
 
+## Outcome driven development
+
+`docs/odd/README.md` splits this thread into roles, phase by phase. Until a
+phase ships, this file stays authoritative.
+
 ## Authority
 
 On top of `AGENTS.md`, the orchestrator may:
