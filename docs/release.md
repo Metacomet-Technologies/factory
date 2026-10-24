@@ -37,7 +37,7 @@ The release timestamp is therefore source commit time, not upload time.
 
 ## Eligibility, ordering and recovery
 
-The immutable activation baseline is recorded in `deploy/components.json`.
+The activation baseline is recorded in `deploy/components.json`.
 Walk first-parent `origin/main` after that baseline. Merges before the inventory
 first exists are preactivation and ineligible; removing it afterward fails.
 Every later first-parent commit needs one verified merged PR whose exact merge
@@ -152,6 +152,28 @@ time from the UI's drafted timestamp, delete the draft, or retry creation becaus
 a collection lookup did not show it. Recovery still reconciles all eligible
 history and may publish subsequent reserved versions; it is not a single-tag
 publication mode. Existing tags and drafts must be preserved while investigating.
+
+### Baseline moves (MET-266)
+
+The baseline only moves forward, by a PR that changes nothing else in
+`deploy/components.json` and sets it to the exact first-parent main tip the PR
+merges onto. The merge commit is then the first eligible SHA. Any later commit
+still carrying the old value stops planning with `activation baseline changed`,
+so a stale move fails closed instead of skipping. Existing tags and releases are
+never rewritten: SHAs before the baseline are not planned, and the next tag is
+still allocated above the highest existing tag.
+
+2026-10-24: the baseline moved from `95a1d3beac77e9503cc0d11bff019eb76aa33b67`
+to `cfbfacf3b1e5327bc34b67b0a05fc9f3250baed0` (MET-206's merge, the main tip MET-266
+merges onto), by Devon's decision. v0.2.0–v0.2.3 are
+unchanged. The first-parent SHAs after v0.2.3 (`cccac737d6cd032e690f769ae64fe9400efc96ae`)
+through the new baseline are never released. Concurrent main CI cancelled 11 of
+them and 2 failed on flakes (MET-265), and exact-SHA builds from `4475aa8`
+onward cannot package because their own inventory omits the devices units
+(MET-240). MET-240's merge `d24539c` and the merges after it (`89480f4`,
+`cfbfacf`) can package, but they carry the old baseline, so they are skipped
+too. Merging MET-266 publishes its merge commit as the next patch release once
+that commit's CI succeeds.
 
 ## Build and consumer contracts
 

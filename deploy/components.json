@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "repository": "Metacomet-Technologies/factory",
-  "activation_baseline": "95a1d3beac77e9503cc0d11bff019eb76aa33b67",
+  "activation_baseline": "cfbfacf3b1e5327bc34b67b0a05fc9f3250baed0",
   "required_ci": ["rust", "kiosk", "scripts", "sandbox"],
   "enabled_auto_deploy": [],
   "target": "x86_64-unknown-linux-gnu",
