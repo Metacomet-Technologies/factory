@@ -7,8 +7,13 @@ if [[ ${1:-} == --enroll-device ]]; then
     shift
     exec bash "$root/deploy/device-tokens.sh" enroll "$@"
 fi
+checkout=$root
+if [[ ${1:-} == --source-checkout ]]; then
+    checkout=${2:?Supply a clean source checkout after --source-checkout.}
+    shift 2
+fi
 binary=${1:-}
-unit=$root/deploy/factory-api.service
+unit=$checkout/deploy/factory-api.service
 destination=/usr/local/bin/factory-api
 installed_unit=/etc/systemd/system/factory-api.service
 pricing_db=/var/lib/factory-api/pricing.db
@@ -53,7 +58,7 @@ wait_ready() {
 [[ $# -eq 1 || ( $# -eq 2 && ( $2 == --prepare-only || $2 == --check-only ) ) ]] || fail 'Supply a prebuilt binary path and optional --prepare-only or --check-only.'
 [[ -f "$binary" && -x "$binary" ]] || fail "Prebuilt binary missing or not executable: $binary"
 info=$(sudo -u agent "$binary" --build-info) || fail "factory-api --build-info failed; rebuild from $root."
-verify_artifact factory-api "$info" "$root"
+verify_artifact factory-api "$info" "$checkout"
 [[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-factory-api.sh <prebuilt-binary>.'
 trap 'printf "ERROR: factory-api install failed at line %s.\n" "$LINENO" >&2; rollback_hint' ERR
 

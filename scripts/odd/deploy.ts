@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Outcome driven development, Deployer (docs/odd/README.md §4, §5.2). factory-deploy.timer runs
 // this as `agent` on factory-gpu every 2 minutes, one run at a time (flock in the unit). No model:
-// every published release newer than the ledger is verified, the main checkout is detached at
-// its SHA, each enabled component whose inputs changed is installed through the sudoers
+// every published release newer than the ledger is verified, a separate source worktree is
+// detached at its SHA, each enabled component whose inputs changed is installed through the sudoers
 // allowlist, probed three times for the exact release SHA, rolled back once when red (and
 // re-probed: the rollback counts only when the previous release is back and healthy), and every
 // Deploying issue the release ships gets one `odd-deploy` receipt. The control plane turns the
@@ -227,7 +227,7 @@ export async function deployComponent(effects: Effects, recipe: Recipe, tag: str
   }
   if (needInstall) {
     effects.writeLedger({ ...ledger, inFlight: { tag, sha, component: recipe.name, phase: 'installing' } });
-    const install = effects.sudo(recipe.installer, [recipe.artifact(releaseDir)]);
+    const install = effects.sudo(recipe.installer, ['--source-checkout', join(effects.stateDir, 'source'), recipe.artifact(releaseDir)]);
     snapshot = parseSnapshot(install.output);
     effects.log('install', { component: recipe.name, ok: install.ok, snapshot });
     if (!install.ok) {
@@ -255,6 +255,7 @@ function finish(effects: Effects, recipe: Recipe, tag: string, sha: string, rece
 }
 
 function prepareRelease(effects: Effects, tag: string): { sha: string; dir: string } {
+  if (effects.run('git', ['-C', ROOT, 'status', '--porcelain']).stdout.trim()) throw new Error(`${ROOT} is dirty; not deploying ${tag}`);
   effects.run('git', ['-C', ROOT, 'fetch', '--quiet', '--tags', 'origin']);
   const sha = effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `refs/tags/${tag}^{commit}`]).stdout.trim();
   effects.run('git', ['-C', ROOT, 'merge-base', '--is-ancestor', sha, 'origin/main']);
@@ -274,19 +275,16 @@ function prepareRelease(effects: Effects, tag: string): { sha: string; dir: stri
     const artifact = recipe.artifact(dir);
     if (statSync(artifact).isFile()) chmodSync(artifact, statSync(artifact).mode | 0o100);
   }
-  if (effects.run('git', ['-C', ROOT, 'status', '--porcelain']).stdout.trim()) throw new Error(`${ROOT} is dirty; not deploying ${tag}`);
-  effects.run('git', ['-C', ROOT, 'checkout', '--quiet', '--detach', sha]);
-  effects.log('checkout', { tag, sha });
+  // Never check out a release over the running job, verifier or allowlisted installers.
+  // Reuse one worktree, but never discard interrupted/operator changes in it.
+  const source = join(effects.stateDir, 'source');
+  if (!existsSync(source)) effects.run('git', ['-C', ROOT, 'worktree', 'add', '--quiet', '--detach', source, sha]);
+  const gitDir = (path: string) => effects.run('git', ['-C', path, 'rev-parse', '--absolute-git-dir']).stdout.trim();
+  if (gitDir(source) === gitDir(ROOT)) throw new Error(`Refusing ${tag}: source checkout aliases the deployer runtime; checkout would replace deployment tools`);
+  if (effects.run('git', ['-C', source, 'status', '--porcelain']).stdout.trim()) throw new Error(`${source} is dirty; not deploying ${tag}`);
+  effects.run('git', ['-C', source, 'checkout', '--quiet', '--detach', sha]);
+  effects.log('checkout', { tag, sha, source });
   return { sha, dir };
-}
-
-/** Put the main checkout back on `main` at the deployed SHA when main is behind or equal; leave it detached otherwise. */
-function restoreMain(effects: Effects): void {
-  if (effects.ok('git', ['-C', ROOT, 'symbolic-ref', '--quiet', 'HEAD'])) return;
-  const head = effects.run('git', ['-C', ROOT, 'rev-parse', 'HEAD']).stdout.trim();
-  if (!effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', 'main', head])) { effects.log('main-left-detached', { head }); return; }
-  effects.run('git', ['-C', ROOT, 'branch', '--force', 'main', head]);
-  effects.run('git', ['-C', ROOT, 'checkout', '--quiet', 'main']);
 }
 
 /** Install the release's changed components; the receipt is saved in the ledger before any delivery. */
@@ -348,7 +346,8 @@ async function deployRelease(effects: Effects, tag: string, previousTag: string)
 }
 
 export async function main(effects: Effects): Promise<void> {
-  const tags = (JSON.parse(effects.run('gh', ['release', 'list', '--exclude-drafts', '--exclude-pre-releases', '--limit', '50', '--json', 'tagName'], { cwd: ROOT }).stdout) as { tagName: string }[]).map(release => release.tagName);
+  const pages = JSON.parse(effects.run('gh', ['api', '--paginate', '--slurp', 'repos/Metacomet-Technologies/factory/releases?per_page=100'], { cwd: ROOT }).stdout) as { tag_name: string; draft: boolean; prerelease: boolean }[][];
+  const tags = pages.flat().filter(release => !release.draft && !release.prerelease).map(release => release.tag_name);
   const ledger = effects.readLedger();
   if (!ledger.lastTag) {
     // First run records where the host already is; the next published release is the first auto-deploy.
@@ -361,13 +360,9 @@ export async function main(effects: Effects): Promise<void> {
   const pending = pendingTags(tags, ledger.lastTag);
   effects.log('pending', { lastTag: ledger.lastTag, tags: pending });
   let previous = ledger.lastTag;
-  try {
-    for (const tag of pending) {
-      await deployRelease(effects, tag, previous);
-      previous = tag;
-    }
-  } finally {
-    if (pending.length) restoreMain(effects);
+  for (const tag of pending) {
+    await deployRelease(effects, tag, previous);
+    previous = tag;
   }
 }
 

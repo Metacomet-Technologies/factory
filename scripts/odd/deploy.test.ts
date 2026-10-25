@@ -1,9 +1,11 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { deployComponent, emptyLedger, issuesFromSubjects, main, parseSnapshot, pendingTags, plan, probeResult, receiptLine, recipes, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
+import { pathToFileURL } from 'node:url';
+import { ROOT, deployComponent, emptyLedger, issuesFromSubjects, main, parseSnapshot, pendingTags, plan, probeResult, receiptLine, recipes, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
 import { nextAction, parseDeployReceipt, type Action } from './lifecycle.ts';
 import plugin, { diagnose, page, setStatus } from '../../.amp/plugins/factory-odd.ts';
 
@@ -44,7 +46,7 @@ test('install, three green probes 20 s apart, pass receipt, ledger records the c
   const { effects, calls, ledger } = fixture({ bodies: [green, green, green] });
   const receipt = await deployComponent(effects, kiosk, 'v0.3.0', sha, '/tmp/rel');
   assert.deepEqual(receipt, { component: 'kiosk', sha, health: 'pass', rollback: 'none' });
-  assert.deepEqual(calls, ['sudo deploy/install-kiosk.sh /tmp/rel/kiosk', 'probe', 'sleep', 'probe', 'sleep', 'probe']);
+  assert.deepEqual(calls, ['sudo deploy/install-kiosk.sh --source-checkout /nonexistent/source /tmp/rel/kiosk', 'probe', 'sleep', 'probe', 'sleep', 'probe']);
   assert.deepEqual(ledger(), { components: { kiosk: { sha, tag: 'v0.3.0', health: 'pass', snapshot } }, inFlight: undefined });
   assert.equal(receiptLine(receipt), `odd-deploy host=factory-gpu component=kiosk sha=${sha} health=pass rollback=none`);
 });
@@ -160,7 +162,7 @@ function world(options: {
     sleep: async () => {},
     run: (command, args) => {
       const out = (stdout: string) => ({ stdout, stderr: '' });
-      if (command === 'gh' && args[0] === 'release') return out(JSON.stringify(options.tags.map(tagName => ({ tagName }))));
+      if (command === 'gh' && args[0] === 'api') return out(JSON.stringify([options.tags.map(tag_name => ({ tag_name, draft: false, prerelease: false }))]));
       if (command === 'gh' && args[0] === 'pr') {
         if (failPrView) { failPrView = false; throw new Error(`gh pr view ${args[2]} exited 1\nHTTP 503: Service Unavailable`); }
         if (args[2] === '404') throw new Error('gh pr view 404 exited 1\nGraphQL: Could not resolve to a PullRequest with the number of 404. (repository.pullRequest)');
@@ -175,6 +177,7 @@ function world(options: {
       }
       if (command === 'tar') return out('');
       const git = args.slice(2);
+      if (git[0] === 'rev-parse' && git[1] === '--absolute-git-dir') return out(`${args[1]}/.git`);
       if (git[0] === 'rev-parse' && git[1] === '--verify') {
         const ref = git[2].replace(/^refs\/tags\//, '').replace('^{commit}', '');
         const full = ref in shas ? shas[ref as Tag] : order.find(candidate => candidate.startsWith(ref));
@@ -197,14 +200,16 @@ function world(options: {
       return false;
     },
     sudo: (script, args) => {
-      calls.push(`sudo ${script} ${args.join(' ')}`.trim());
       const component = /deploy\/(?:install|rollback)-(.+?)(?:-v1)?\.sh$/.exec(script)![1];
       if (script.includes('/install-')) {
-        const target = order.find(full => args[0].includes(`/releases/${tagOf(full)}/`))!;
+        assert.deepEqual(args.slice(0, 2), ['--source-checkout', join(stateDir, 'source')]);
+        calls.push(`sudo ${script} ${args.slice(2).join(' ')}`);
+        const target = order.find(full => args[2].includes(`/releases/${tagOf(full)}/`))!;
         before[component] = live[component];
         live[component] = target;
         return { ok: true, output: `Rollback snapshot: /var/backups/${component}/snap\n` };
       }
+      calls.push(`sudo ${script} ${args.join(' ')}`.trim());
       if (options.rollbackOk === false) return { ok: false, output: 'ERROR: rollback failed\n' };
       if (options.rollbackRestores !== false) live[component] = before[component];
       return { ok: true, output: '' };
@@ -235,6 +240,123 @@ function world(options: {
 const baseline = (extra: Partial<Ledger> = {}): Ledger => ({ lastTag: 'v0.2.9', components: {}, ...extra });
 const sudoCalls = (calls: string[]) => calls.filter(call => call.startsWith('sudo'));
 const line = (fields: string) => `odd-deploy host=factory-gpu ${fields}`;
+
+test('real Git: releases predating the deployer cannot remove its runtime or tools, including the tick after a failed install', async t => {
+  const temp = mkdtempSync(join(tmpdir(), 'odd-history-'));
+  t.after(() => rmSync(temp, { recursive: true, force: true }));
+  const runtime = join(temp, 'factory');
+  const stateDir = join(temp, 'state');
+  mkdirSync(join(runtime, 'deploy'), { recursive: true });
+  mkdirSync(stateDir);
+  const run: Effects['run'] = (command, args, options) => {
+    const result = spawnSync(command, args, { cwd: options?.cwd, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`${command}: ${result.stderr}`);
+    return { stdout: result.stdout, stderr: result.stderr };
+  };
+  const git = (...args: string[]) => run('git', ['-C', runtime, ...args]).stdout.trim();
+  git('init', '-q');
+  git('config', 'user.name', 'Fixture');
+  git('config', 'user.email', 'fixture@example.invalid');
+  const commit = (message: string) => { git('add', '.'); git('commit', '-qm', message); return git('rev-parse', 'HEAD'); };
+  writeFileSync(join(runtime, 'deploy/components.json'), JSON.stringify({ components: Object.entries(sources).map(([id, paths]) => ({ id, sources: paths })) }));
+  writeFileSync(join(runtime, 'deploy/install-meter.sh'), '# obsolete installer\nexit 99\n');
+  commit('baseline');
+  git('tag', 'v0.2.9');
+  writeFileSync(join(runtime, 'release.txt'), 'first historical release');
+  const first = commit('first (#310)');
+  git('tag', 'v0.2.10');
+  writeFileSync(join(runtime, 'release.txt'), 'next historical release');
+  const second = commit('second (#311)');
+  git('tag', 'v0.2.11');
+  mkdirSync(join(runtime, 'scripts/odd'), { recursive: true });
+  mkdirSync(join(runtime, 'scripts/release'), { recursive: true });
+  const tools = ['scripts/odd/deploy.ts', 'scripts/release/release.py', ...recipes.flatMap(recipe => [recipe.installer, recipe.rollback])];
+  for (const path of tools) writeFileSync(join(runtime, path), readFileSync(new URL(`../../${path}`, import.meta.url)));
+  const toolsSha = commit('deployment machinery');
+  git('update-ref', 'refs/remotes/origin/main', toolsSha);
+  let ledger = baseline();
+  let failInstall = true;
+  const live = new Map<string, string>();
+  const verified: string[] = [];
+  const comments: [string, string][] = [];
+  const effects: Effects = {
+    stateDir, log: () => {}, sleep: async () => {},
+    run: (command, args, options) => {
+      if (command === 'git') {
+        if (args[2] === 'fetch') return { stdout: '', stderr: '' }; // No network in this fixture.
+        return run(command, args.map(arg => arg === ROOT ? runtime : arg), options);
+      }
+      if (command === 'gh') return { stdout: JSON.stringify(args[0] === 'api' ? [
+        [{ tag_name: 'v0.2.11', draft: false, prerelease: false },
+          ...Array.from({ length: 99 }, (_, i) => ({ tag_name: `v9.0.${i}`, draft: i % 2 === 0, prerelease: i % 2 !== 0 }))],
+        ...(args.includes('--paginate') ? [['v0.2.10', 'v0.2.9'].map(tag_name => ({ tag_name, draft: false, prerelease: false }))] : []),
+      ] : { body: `closes MET-${args[2]}` }), stderr: '' };
+      if (command === 'python3') {
+        assert.equal(readFileSync(args[0].replace(ROOT, runtime), 'utf8'), readFileSync(new URL('../release/release.py', import.meta.url), 'utf8'));
+        verified.push(args[args.indexOf('--tag') + 1]);
+        const dir = args.at(-1)!;
+        mkdirSync(dir);
+        for (const asset of ['meter-linux-x86_64', 'factory-api-linux-x86_64']) writeFileSync(join(dir, asset), 'fixture');
+        return { stdout: '', stderr: '' };
+      }
+      assert.equal(command, 'tar');
+      return { stdout: '', stderr: '' };
+    },
+    ok: (command, args) => spawnSync(command, args.map(arg => arg === ROOT ? runtime : arg)).status === 0,
+    sudo: (script, args) => {
+      assert.equal(readFileSync(join(runtime, script), 'utf8'), readFileSync(new URL(`../../${script}`, import.meta.url), 'utf8'));
+      assert.equal(args[0], '--source-checkout');
+      assert.equal(args[1], join(stateDir, 'source'));
+      assert.equal(existsSync(join(args[1], 'scripts/odd/deploy.ts')), false);
+      const target = run('git', ['-C', args[1], 'rev-parse', 'HEAD']).stdout.trim();
+      if (failInstall) { failInstall = false; return { ok: false, output: 'No deployment changes made; no rollback snapshot exists.' }; }
+      live.set(recipes.find(recipe => recipe.installer === script)!.health, target);
+      return { ok: true, output: 'Rollback snapshot: /var/backups/fixture/snap\n' };
+    },
+    probe: url => JSON.stringify({ git_sha: live.get(url), git_dirty: false, status: 'ok' }),
+    readLedger: () => structuredClone(ledger), writeLedger: next => { ledger = structuredClone(next); },
+    linear: { deploying: async () => true, posted: async (id, body) => comments.some(([i, b]) => i === id && b === body), comment: async (id, body) => { comments.push([id, body]); } },
+  };
+  const entry = pathToFileURL(join(runtime, 'scripts/odd/deploy.ts')).href;
+  // A symlink or Git-file alias must fail before it can change HEAD, install, or handle the tag.
+  const source = join(stateDir, 'source');
+  for (const alias of ['symlink', 'gitfile']) {
+    if (alias === 'symlink') symlinkSync(runtime, source);
+    else { mkdirSync(source); writeFileSync(join(source, '.git'), `gitdir: ${runtime}/.git\n`); }
+    await assert.rejects((await import(entry)).main(effects), /source checkout aliases the deployer runtime/);
+    assert.deepEqual(ledger, baseline());
+    assert.equal(git('rev-parse', 'HEAD'), toolsSha);
+    assert.deepEqual(comments, []);
+    assert.equal(live.size, 0);
+    rmSync(source, { recursive: true });
+  }
+  await assert.rejects((await import(entry)).main(effects), /health=fail/);
+  assert.equal(ledger.lastTag, 'v0.2.10');
+  assert.equal(ledger.components.meter.health, 'fail');
+  assert.equal(live.size, 0, 'failed preflight did not replace any running component');
+  assert.equal(git('rev-parse', 'HEAD'), toolsSha);
+  assert.equal(git('status', '--porcelain'), '');
+  // A fresh Node process must still load the timer entry point after the failed tick.
+  run(process.execPath, ['--input-type=module', '-e', `await import(${JSON.stringify(entry)})`]);
+  await (await import(`${entry}?next-tick`)).main(effects);
+  assert.equal(ledger.lastTag, 'v0.2.11');
+  assert.deepEqual([...live.values()], [second, second, second]);
+  assert.deepEqual(verified, ['v0.2.10', 'v0.2.11']);
+  assert.deepEqual(comments, [
+    ['MET-310', line(`component=meter sha=${first} health=fail rollback=none`)],
+    ['MET-311', line(`component=meter+factory-api+kiosk sha=${second} health=pass rollback=none`)],
+  ]);
+  assert.equal(git('rev-parse', 'HEAD'), toolsSha);
+  assert.equal(git('status', '--porcelain'), '');
+  // Neither checkout may silently discard operator edits, even before a docs-only retry.
+  for (const checkout of [runtime, join(stateDir, 'source')]) {
+    writeFileSync(join(checkout, 'operator-note'), 'preserve me');
+    ledger.lastTag = 'v0.2.10';
+    await assert.rejects(main(effects), /is dirty/);
+    assert.equal(readFileSync(join(checkout, 'operator-note'), 'utf8'), 'preserve me');
+    rmSync(join(checkout, 'operator-note'));
+  }
+});
 
 test('sandbox: a kiosk release installs, three green probes report its SHA, Deploying issues get a pass receipt and move to Done', async t => {
   const host = world({ tags: ['v0.2.9', 'v0.3.0'], changes: { 'v0.3.0': ['kiosk/src/App.tsx', 'docs/x.md'] }, issues: { 'v0.3.0': ['MET-301', 'MET-302'] }, notDeploying: ['MET-302'], ledger: baseline() });
