@@ -4,7 +4,7 @@ umask 0027
 here=$(dirname "$(realpath "$0")")
 # shellcheck source=deploy/backup/nodes.conf
 source "${BACKUP_CONFIG:-$here/nodes.conf}"
-export PUBLISHED_STATUS
+export PUBLISHED_STATUS R2_ENABLED
 state=$here/backup-state.py
 
 if [[ ${1:-} == --check-access ]]; then
@@ -148,3 +148,15 @@ for name in "${names[@]}"; do
     size=$(stat -c %s "$LOCAL_ROOT/$BACKUP_HOST/$name/$STAMP.db.zst")
     python3 "$state" result "$STATUS_FILE" "$name" "$size" ok true ''
 done
+if [[ ${R2_ENABLED:-0} == 1 ]]; then
+    python3 "$state" offsite "$STATUS_FILE" pending
+    if timeout --kill-after=10s 15m "${R2_PYTHON:-python3}" "$here/offsite.py" \
+        --endpoint "${R2_ENDPOINT:-}" --bucket "${R2_BUCKET:-}" push \
+        --root "$LOCAL_ROOT" --host "$BACKUP_HOST" --stamp "$STAMP" \
+        --recipient "${R2_RECIPIENT_FILE:-}" "${names[@]}"; then
+        python3 "$state" offsite "$STATUS_FILE" ok
+    else
+        python3 "$state" offsite "$STATUS_FILE" failed
+        echo 'Off-site push failed; local backup, peer push and retention succeeded.' >&2
+    fi
+fi

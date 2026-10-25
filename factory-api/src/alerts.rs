@@ -1545,7 +1545,7 @@ impl Engine {
                 for entry in entries {
                     let running = matches!(
                         entry.error.as_deref(),
-                        Some("Peer push pending" | "Retention pending")
+                        Some("Peer push pending" | "Retention pending" | "Off-site push pending")
                     ) && entry
                         .last_attempt_ms
                         .is_some_and(|at| now - at < BACKUP_RUN_MS);
@@ -3496,6 +3496,26 @@ mod tests {
             keys(&engine),
             [("backup:status".into(), "backup: meter last succeeded 37 h ago; requests failed: Peer push pending; pricing failed: rsync: connection refused".into())]
         );
+
+        for (error, age, fires) in [
+            (Some("Off-site push pending"), h, false),
+            (Some("Off-site push pending"), 2 * h, true),
+            (Some("Off-site push failed"), 0, true),
+            (None, 37 * h, true),
+            (None, 0, false),
+        ] {
+            engine.evaluate(
+                T0,
+                &backup(vec![
+                    ("meter", Some(T0), Some(T0), None),
+                    ("r2", Some(T0 - age), Some(T0 - age), error),
+                ]),
+            );
+            assert_eq!(
+                keys(&engine).iter().any(|(key, _)| key == "backup:status"),
+                fires
+            );
+        }
 
         // Dispatch timer and usage snapshot staleness.
         engine.evaluate(

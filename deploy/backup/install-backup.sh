@@ -22,7 +22,7 @@ done
 python3 -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ required"'
 [[ -d /run/systemd/system ]] || fail 'systemd is not running.'
 systemctl is-active --quiet tailscaled.service
-for file in account.sh nodes.conf backup-state.py factory-backup.sh restore-check.sh factory-backup.service factory-backup.timer rollback-backup-config.sh; do
+for file in account.sh nodes.conf backup-state.py offsite.py factory-backup.sh restore-check.sh factory-backup.service factory-backup.timer rollback-backup-config.sh; do
     [[ -f "$here/$file" && -r "$here/$file" ]] || fail "Missing artifact: $file"
 done
 for entry in "${DBS[@]}"; do
@@ -43,6 +43,7 @@ for path in /usr/local/lib/factory-backup /etc/factory-backup "$BACKUP_HOME" \
     "$LOCAL_ROOT" "$LOCAL_ROOT/$BACKUP_HOST" "$REPLICA_ROOT" "$REPLICA_ROOT/.ssh" \
     /etc/systemd/system/factory-backup.service /etc/systemd/system/factory-backup.timer \
     /etc/factory-backup/nodes.conf /usr/local/lib/factory-backup/backup-state.py \
+    /usr/local/lib/factory-backup/offsite.py \
     /usr/local/lib/factory-backup/factory-backup.sh /usr/local/lib/factory-backup/restore-check.sh; do
     parent=$path
     while [[ "$parent" != / ]]; do
@@ -84,7 +85,9 @@ install -d -o root -g root -m 0755 /usr/local/lib/factory-backup /etc/factory-ba
 for file in factory-backup.sh restore-check.sh; do
     install -o root -g root -m 0755 "$here/$file" "/usr/local/lib/factory-backup/$file"
 done
-install -o root -g root -m 0644 "$here/backup-state.py" /usr/local/lib/factory-backup/backup-state.py
+for file in backup-state.py offsite.py; do
+    install -o root -g root -m 0644 "$here/$file" "/usr/local/lib/factory-backup/$file"
+done
 # Keep a single root-owned configuration; the installed scripts source its link.
 install -o root -g root -m 0644 "$here/nodes.conf" /etc/factory-backup/nodes.conf
 ln -sfn /etc/factory-backup/nodes.conf /usr/local/lib/factory-backup/nodes.conf

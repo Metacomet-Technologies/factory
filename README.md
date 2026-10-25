@@ -573,6 +573,8 @@ See [the live check](factory-api/LIVE_CHECK.md) for observed outputs and limits.
 
 ## Cross-host SQLite backups (MET-74)
 
+See [off-site backup recommendations and the opt-in R2 prototype](docs/offsite-backups.md) for MET-308.
+
 `deploy/backup/` backs up running services without copying live SQLite files.
 Root uses SQLite's `.backup` API (including committed WAL data), requires exactly
 `ok` from `PRAGMA integrity_check`, compresses with zstd, and publishes a SHA-256

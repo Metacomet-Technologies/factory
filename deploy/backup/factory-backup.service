@@ -7,6 +7,8 @@ After=network-online.target tailscaled.service
 Type=oneshot
 User=root
 Environment=BACKUP_CONFIG=/etc/factory-backup/nodes.conf
+# Name-only lookup in credstore: an absent optional credential is not fatal.
+LoadCredential=factory-r2
 ExecStart=/usr/local/lib/factory-backup/factory-backup.sh
 UMask=0027
 TimeoutStartSec=2h

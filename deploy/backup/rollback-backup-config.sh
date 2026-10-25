@@ -9,7 +9,7 @@ if (( EUID != 0 )); then
 fi
 files=(etc/factory-backup/nodes.conf usr/local/lib/factory-backup/nodes.conf
     usr/local/lib/factory-backup/backup-state.py usr/local/lib/factory-backup/factory-backup.sh
-    usr/local/lib/factory-backup/restore-check.sh
+    usr/local/lib/factory-backup/restore-check.sh usr/local/lib/factory-backup/offsite.py
     etc/systemd/system/factory-backup.service etc/systemd/system/factory-backup.timer)
 [[ $# == 1 ]] || { echo 'Usage: rollback-backup-config.sh --snapshot|SNAPSHOT' >&2; exit 1; }
 for path in "${files[@]}"; do
