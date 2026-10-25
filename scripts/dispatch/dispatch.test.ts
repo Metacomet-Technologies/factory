@@ -9,6 +9,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { sections, slug, prompt, simplePrompt, wrapupPrompt, validate, isMergedGitHubPR, commentMarkers, supportedNode } from './dispatch.ts';
+import { heartbeatLine, silenceMs } from '../odd/lifecycle.ts';
 import { reviewerEngine } from './qa.ts';
 import { repos, validateRepos } from './repos.ts';
 import { parsePolicy } from './policy.ts';
@@ -437,6 +438,11 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
           assert.ok(v.filter.id.in.length <= 20);
           data = { issues: { nodes: issues.filter(i => v.filter.id.in.includes(i.id)).map(i => wire(i, query)), pageInfo: { hasNextPage: false, endCursor: null } },
             workflowStates: page([{ id: 'started-id', name: 'In Progress', type: 'started' }]) };
+        } else if (operation === 'Heartbeat') {
+          // No update is silence, so existing polls keep running the lifecycle. A fixture sets
+          // `heartbeats` to the project status updates the control plane would have written.
+          const bodies = typeof options.heartbeats === 'function' ? options.heartbeats() : options.heartbeats ?? [];
+          data = { project: { projectUpdates: { nodes: bodies.map((body: string) => ({ body, updatedAt: body })) } } };
         } else if (operation === 'OneIssue') data = { issue: wire(i, query) };
         else if (operation === 'IssuePage') {
           const name = query.match(/\{ issue\(id: \$id\) \{ (\w+)/)[1];
@@ -1152,7 +1158,7 @@ test('MET-256: queue scopes both finish dates, keeps live work and honors team, 
   const f = await fixture(t, issues);
   const result = await f.run(['poll', '--dry-run']);
   assert.equal(result.code, 0, result.stdout);
-  assert.equal(f.queries[0].filter.and[0].or[1].completedAt.gte, '2026-10-06T12:00:00.000Z');
+  assert.equal(f.queries.find(query => query.operation === 'Import').filter.and[0].or[1].completedAt.gte, '2026-10-06T12:00:00.000Z');
   const observed = result.stdout.split('\n').filter(Boolean).map(line => JSON.parse(line))
     .filter(line => line.decision === 'stage-policy' && line.stage === 'spec').map(line => line.issue);
   assert.deepEqual(observed, [1, 2, 7, 8, 9, 10, 11, 15].map(n => `MET-${n}`));
@@ -1224,8 +1230,10 @@ test('MET-256: Linear failures log only allowed fields and stop before further r
     const f = await fixture(t, [], { linearResponse: () => ({ status: 400, headers, body: `not JSON: ${key}` }) });
     const result = await f.run();
     assert.equal(result.code, 1);
-    assert.equal(f.linearRequests.length, 1);
-    assert.match(result.stdout, /"requests":1,"remaining":null,"reset_ms":null/);
+    // The heartbeat read fails and counts as silence; the import is the request that stops the poll.
+    assert.equal(f.linearRequests.at(-1).operation, 'Import');
+    assert.match(result.stdout, /"decision":"odd-backstop-unread"/);
+    assert.match(result.stdout, /"requests":2,"remaining":null,"reset_ms":null/);
     assert.ok(!(result.stdout + result.stderr).includes(key));
   }
 });
@@ -1265,9 +1273,10 @@ test('runner cap parsing, precedence and idle logging', { timeout: 10_000 }, asy
     const result = await f.run(['poll'], environment);
     assert.equal(result.code, 0, result.stdout);
     assert.deepEqual(result.stdout.trim().split('\n').map(line => JSON.parse(line)), [{ decision: 'caps', caps },
+      { decision: 'odd-backstop-resume', age: 'missing', page: 'ODD page: control-plane-silent | issue - | - | - | default if silent: the runner backstop poller runs the lifecycle until a fresh heartbeat. heartbeat missing; the poller runs the lifecycle' },
       { decision: 'import', dryRun: false, issues: 0, comments: 0, markers: 0 },
       { decision: 'archive-sweep', reason: 'sweep state missing', openCount: 0, unknownCount: 0, issueCount: 0 },
-      { decision: 'linear-budget', requests: 2, remaining: null, reset_ms: null }]);
+      { decision: 'linear-budget', requests: 3, remaining: null, reset_ms: null }]);
     assert.equal(f.calls().length, 0);
     assert.equal(f.mutations.length, 0);
   }
@@ -2990,11 +2999,11 @@ test('MET-261: 150 marker-bearing issues, 5 live: import once, then delta polls 
 
   const counts: number[] = [];
   const first = await requests(['poll']);
-  assert.deepEqual(first.operations, ['Delta', 'Sweep']);
+  assert.deepEqual(first.operations, ['Heartbeat', 'Delta', 'Sweep']);
   counts.push(first.operations.length);
   for (let n = 1; n <= 3; n++) {
     const idle = await requests(['poll'], now + n * 60_000);
-    assert.deepEqual(idle.operations, ['Delta']);
+    assert.deepEqual(idle.operations, ['Heartbeat', 'Delta']);
     counts.push(idle.operations.length);
   }
   // A busy poll: every live issue changed; their full snapshots arrive in one delta page.
@@ -3074,6 +3083,53 @@ test('MET-261: RATELIMITED persists blocked_until inside the jitter bounds; poll
   const h = await fixture(t, [issue()]);
   assert.equal((await h.run()).code, 0);
   assert.deepEqual(ledgerRows(h, "SELECT value FROM meta WHERE key = 'backoff_s'"), [{ value: '0' }]);
+});
+
+test('MET-282: a fresh heartbeat skips the lifecycle; silence runs it and pages once per episode', { timeout: 20_000 }, async t => {
+  const beat = (age: number) => heartbeatLine(new Date(now - age).toISOString());
+  const cursor = (f: any) => ledgerRows(f, "SELECT value FROM meta WHERE key = 'cursor'");
+  const fresh = await fixture(t, [issue()], { heartbeats: () => [beat(silenceMs - 1)] });
+  const skipped = await fresh.run(['poll'], { FAKE_NOW: String(now) });
+  assert.equal(skipped.code, 0, skipped.stdout);
+  assert.deepEqual(fresh.linearRequests.map((request: any) => request.operation), ['Heartbeat']);
+  assert.equal(records(skipped.stdout).some((line: any) => line.decision === 'odd-backstop'), true);
+  assert.equal(records(skipped.stdout).some((line: any) => line.decision === 'dispatched'), false);
+  assert.equal(fresh.allMutations.length, 0);
+  assert.deepEqual(cursor(fresh), [], 'a skipped poll writes no ledger cursor');
+
+  // The poll runs at now + 20 min. A heartbeat written 1 ms after `now` is 19 min 59.999 s old.
+  for (const [label, bodies] of [
+    ['19 min 59 s', () => [beat(-1)]],
+    ['exactly 20 min', () => [beat(0)]],
+    ['missing', () => []],
+    ['unparseable', () => ['handoff notes, not a heartbeat']],
+  ] as const) {
+    const f = await fixture(t, [issue()], { heartbeats: bodies });
+    const result = await f.run(['poll'], { FAKE_NOW: String(now + silenceMs) });
+    assert.equal(result.code, 0, `${label}: ${result.stdout}`);
+    // A first silent poll imports; the point is that it does not stop at the heartbeat read.
+    const ran = records(result.stdout).some((line: any) => line.decision === 'import' || line.decision === 'dispatched');
+    assert.equal(ran, label !== '19 min 59 s', label);
+    assert.equal(records(result.stdout).some((line: any) => line.decision === 'odd-backstop'), label === '19 min 59 s', label);
+  }
+
+  // Two silent polls page once. A fresh heartbeat ends the episode; the next silence pages again.
+  let age = silenceMs;
+  const episode = await fixture(t, [issue()], { heartbeats: () => [beat(age)] });
+  const resumes = async (at: number) => {
+    const result = await episode.run(['poll'], { FAKE_NOW: String(at) });
+    assert.equal(result.code, 0, result.stdout);
+    return records(result.stdout).filter((line: any) => line.decision === 'odd-backstop-resume');
+  };
+  const first = await resumes(now);
+  assert.equal(first.length, 1);
+  assert.match(first[0].page, /control-plane-silent/);
+  assert.equal((await resumes(now + 60_000)).length, 0, 'the same silence does not page again');
+  age = 0;
+  const alive = await episode.run(['poll'], { FAKE_NOW: String(now + 120_000) });
+  assert.equal(records(alive.stdout).some((line: any) => line.decision === 'odd-backstop'), true);
+  age = silenceMs;
+  assert.equal((await resumes(now + 180_000)).length, 1, 'a new silence pages once more');
 });
 
 test('MET-261: the cursor advances only after a successful poll, and overlapping updates are deduped', { timeout: 20_000 }, async t => {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { nextAction, specComplete, ralphGuard, parseDeployReceipt, parseVerify, parseCancelled, pageText, verifyLine, cancelledLine, threadLabels, parseThreadLabels, capacity, issueTriaged, type Action, type IssueSnapshot, type PageReason } from './lifecycle.ts';
+import { nextAction, specComplete, ralphGuard, parseDeployReceipt, parseVerify, parseCancelled, pageText, verifyLine, cancelledLine, threadLabels, parseThreadLabels, capacity, issueTriaged, controlPlaneSilent, heartbeatLine, parseHeartbeat, silenceMs, type Action, type IssueSnapshot, type PageReason } from './lifecycle.ts';
 
 const spec = `## Goal
 Ship it.
@@ -160,11 +160,26 @@ test('every page uses the one format with the condition, issue, place, SHA and t
     { kind: 'page', reason: 'security-finding', detail: 'token in the diff' },
     { kind: 'page', reason: 'budget-ceiling', detail: 'MET-1: builder spent 2/2 rounds' },
     { kind: 'page', reason: 'control-plane-blind', detail: 'every sweep failed' },
+    { kind: 'page', reason: 'control-plane-silent', detail: 'heartbeat missing; the poller runs the lifecycle' },
   ];
   const reasons = new Set<PageReason>(pages.map(page => page.reason));
-  assert.equal(reasons.size, 6);
-  for (const page of pages) assert.match(pageText('MET-1', page), /^ODD page: [a-z-]+ \| issue MET-\d+ \| .+ \| .+ \| default if silent: .+$/);
+  assert.equal(reasons.size, 7);
+  for (const page of pages) assert.match(pageText(page.reason === 'control-plane-silent' ? '-' : 'MET-1', page), /^ODD page: [a-z-]+ \| issue (?:MET-\d+|-) \| .+ \| .+ \| default if silent: .+$/);
   assert.equal(pageText('MET-1', pages[0]), `ODD page: third-failed-qa-round | issue MET-1 | PR #9 | ${sha} | default if silent: issue stays In Progress and the PR stays a draft until the \`escalated\` label is removed. MET-1: PR #9 rejected 3 times`);
   assert.match(pageText('MET-1', pages[1]), /\| host factory-gpu \| abcdef1234 \|/);
   assert.match(pageText('MET-1', pages[2]), /\| - \| - \| default if silent: not executed\./);
+});
+
+test('a heartbeat is silent at 20 minutes and not one millisecond before', () => {
+  const at = '2026-10-24T15:00:00.000Z';
+  const now = Date.parse(at);
+  assert.equal(parseHeartbeat(heartbeatLine(at)), at);
+  assert.equal(parseHeartbeat('odd-heartbeat at=2026-10-24'), undefined);
+  assert.equal(parseHeartbeat('notes\nodd-heartbeat at=not-a-time'), undefined);
+  assert.equal(controlPlaneSilent([], now), true);
+  assert.equal(controlPlaneSilent(['handoff notes'], now), true);
+  assert.equal(controlPlaneSilent([heartbeatLine(at)], now + silenceMs - 1), false);
+  assert.equal(controlPlaneSilent([heartbeatLine(at)], now + silenceMs), true);
+  // The newest line wins, so an older stale row does not silence a fresh one.
+  assert.equal(controlPlaneSilent([heartbeatLine(new Date(now - silenceMs).toISOString()), heartbeatLine(at)], now), false);
 });

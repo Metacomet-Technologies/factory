@@ -306,6 +306,7 @@ Each artifact is machine-checkable before the next role starts.
 | Role round budget spent (builder 3, reviewer 2, verifier 2, intake and spec 1) after a Watchdog cancellation | Control plane | Slack DM (`budget-ceiling`), `escalated` label, `odd-escalated` comment, PR back to draft when one exists | Issue waits with no owner thread until Devon removes `escalated`; the next evaluation starts a fresh round. |
 | Soft caps exceeded for 60 min | Watchdog sweep | `#factory-alerts`, once per episode | Launches already stop at the caps; the alert only reports it. |
 | Control plane blind (every sweep failing for 15 min) | Watchdog sweep | Slack DM (`control-plane-blind`), once per episode | Backstop poller runs the lifecycle at 60 s cadence (phase 7). |
+| Control plane silent (no heartbeat for 20 min) | Runner poller | Journal line `odd-backstop-resume`, once per episode | The poller runs the lifecycle until a fresh heartbeat. |
 | Everything else | role | Linear comment | Proceed. |
 
 Every Slack DM uses one format, `pageText` in `scripts/odd/lifecycle.ts`:
@@ -338,7 +339,14 @@ exist only in Amp-managed orbs; a runner cannot receive webhooks (no inbound
 Tailscale from Linear or GitHub). Why the runner keeps a poller: the orb can
 pause, the webhook can be rate-limited (10 events/min) and subscription
 engines can only be launched from a shell. The two agree because both derive
-state from Linear and GitHub, never from each other.
+state from Linear and GitHub, never from each other. The control plane writes
+one Software Factory project status update, `odd-heartbeat at=<ISO-8601>`,
+after each successful sweep and updates that same row on the next. The poller
+reads it. Younger than 20 minutes, the poll logs `odd-backstop` and does not
+run the lifecycle. Missing or older, it runs the lifecycle and logs
+`odd-backstop-resume` once per silence episode. The poller has no Slack
+credential, so that journal line is the page; `control-plane-blind` stays the
+Slack page for a sweep that keeps failing.
 
 What stays in `scripts/dispatch/`: the launcher (`amp -x` construction,
 worktrees, caps), `qa.ts check` and merge, the ledger as the backstop's cache,
@@ -399,8 +407,11 @@ by the previous one).
    whole sweep, digest included, succeeds; the digest is split into Slack
    messages of at most 2800 characters. Removing the `odd-perform` label is
    the off-switch: the plane keeps evaluating but records `dry-run`.
-7. Retire the poller as primary; it stays as the backstop with the 20 minute
-   silence rule.
+7. Retire the poller as primary (MET-282). It stays as the backstop: one
+   `odd-heartbeat` project status update per successful sweep, and the poller
+   runs the lifecycle only when that heartbeat is missing or 20 minutes old.
+   The `dispatch` label is the legacy path for issues the control plane does
+   not own. The timer stays at 60 seconds; the skip is inside the poll.
 
 ## 11. Risks and open items
 
