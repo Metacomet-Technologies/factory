@@ -11,6 +11,10 @@ temp=$(mktemp -d)
 trap 'rm -rf -- "$temp"' EXIT
 check() {
     local directory=$1 name=$2 latest
+    if [[ ${name##*/} == atuin && ! -e "$directory" && ! -L "$directory" ]]; then
+        printf 'Skipping atuin: no archive tree yet: %s\n' "$directory"
+        return 0
+    fi
     latest=$(find "$directory" -maxdepth 1 -type f -name '*.db.zst' -printf '%f\n' | LC_ALL=C sort | tail -n 1)
     [[ -n "$latest" ]] || { printf 'No copy for %s\n' "$directory" >&2; return 1; }
     (cd "$directory" && sha256sum --strict -c "$latest.sha256")

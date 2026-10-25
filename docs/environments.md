@@ -61,7 +61,7 @@ version literals:
 
 | Item | How setup installs it | Version from |
 | -- | -- | -- |
-| System packages | `apt-get install --no-install-recommends` (`DEBIAN_FRONTEND=noninteractive`), as root or through `sudo -n`; without either it stops and prints the administrator's command. Curl and shellcheck are external prerequisites, never installed here | the checker's `SYSTEM` list |
+| System packages | `apt-get install --no-install-recommends` (`DEBIAN_FRONTEND=noninteractive`), as root or through `sudo -n`; without either it stops and prints the administrator's command | the checker's `SYSTEM` list |
 | Rust | rustup (installed from `sh.rustup.rs` if missing), then `rustup toolchain install` in the repo root | `rust-toolchain.toml` (channel and components) |
 | Vite+ | the `vite.plus` installer, which verifies the npm package integrity; `VP_NODE_MANAGER=yes` | `kiosk/package.json` `catalog.vite-plus` |
 | Node, Bun | `vp env on <node|bun>` for each failing one (the Vite+ installer leaves a tool system-first when the image already has one, as orbs do with `/usr/local/bin/bun`), then `vp env install` in `kiosk/` and the repo root | `devEngines`, `.node-version` |
@@ -80,25 +80,8 @@ dependencies when `kiosk/node_modules` is missing (Playwright needs them).
   kiosk build (the same as `scripts/sandbox up --kiosk`), for snapshots.
 * `--check-only`: prints each change it would make (`would …`), including the
   login-file lines for env files an install would create, and changes
-  nothing. Exits 1 when an item cannot be installed (`os`, `layout:checkout`)
-  or a host-base prerequisite is missing.
-
-Dotfiles `bootstrap/linux-host.sh` owns shared Linux CLI tools and user config.
-Supply those tools through host-base or the CI runner image before setup.
-Missing curl or shellcheck fails setup before any provisioning. Orbs also
-require the [coding-agent tools](orbs.md) on PATH. Factory checks them but no
-longer installs them or writes their PATH configuration.
-
-Removed installs: ripgrep, fd-find, jq, gh, shellcheck, entr, hyperfine, direnv,
-yq, ast-grep, just, watchexec, scc, and uv/uvx. The release-only unzip dependency,
-Factory's fd symlink, and its `~/.local/bin` profile edits are removed too.
-Starship and the other dotfiles host-base tools had no Factory installs.
-
-Factory still provisions ca-certificates, build-essential, pkg-config, Python,
-util-linux, Bubblewrap, sqlite3, zstd, rsync, xz-utils, Rust/rustup, Vite+,
-pinned Node/Bun, kiosk dependencies, and applicable Playwright Chromium.
-Service installers still own Factory binaries, NUT, and the standalone Atuin
-server. The server is separate from dotfiles' `atuin` client.
+  nothing. Exits 1 only when an item cannot be installed (`os`,
+  `layout:checkout`).
 
 Exempt items are never installed. Tests:
 `python3 -B scripts/env/test_setup.py` (fake checker, stubbed installers).

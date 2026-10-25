@@ -111,10 +111,8 @@ jobs:
         run: python3 scripts/release/test-release.py
       - name: Install script check dependencies
         run: |
-          # Shared host tools belong to the runner image, not Factory provisioning.
-          command -v shellcheck
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y sqlite3 zstd rsync
+          sudo apt-get install --no-install-recommends -y shellcheck sqlite3 zstd rsync
       - name: Check every deployment and version script
         run: |
           mapfile -d '' scripts < <(find deploy scripts -type f -name '*.sh' -print0)
