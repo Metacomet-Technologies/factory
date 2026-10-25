@@ -20,6 +20,32 @@ fails verification after publication; it cannot undo that publication. Preserve
 remote state and investigate rather than deleting, replacing or retagging it.
 This policy decision does not itself prove the live canary succeeded.
 
+## Publishing credential
+
+The publish step requires the repository Actions secret `FACTORY_RELEASE_TOKEN`.
+Devon provisions an expiring fine-grained personal access token restricted to
+`Metacomet-Technologies/factory`, with Contents and Workflows read/write,
+Actions and Pull requests read, and the mandatory Metadata read permission.
+No Administration permission is needed. Store the token directly in GitHub's
+Actions secret form, never in an issue, thread, checkout or command argument.
+Approve this credential separately before merging the workflow change; merging
+activates publication and the existing host deploy timer consumes new releases.
+
+The built-in `GITHUB_TOKEN` cannot request Workflows write in workflow YAML.
+GitHub can require that permission when creating a tag for an older commit whose
+workflow files differ from current main, even with Contents write. This matches
+the historical `POST git/refs` 403: the first unreleased commit's `ci.yml` differs
+from main. See [GitHub's explanation](https://github.com/cli/cli/issues/9514).
+Do not work around the denial by tagging current main or skipping old SHAs.
+The publish step fails explicitly if its secret is missing; there is no fallback
+to the built-in token or automatic write retry. Rotate the secret before expiry.
+
+Only the trusted publish step receives this credential. Builds, dependency
+installation, sandbox runs, checkout and artifact download continue using the
+read-only built-in token. Existing tag, draft, asset and immutable-receipt
+validation remains unchanged. Provisioning the secret does not prove the repair:
+confirm exact-SHA tag creation and immutable publication on the next approved run.
+
 ## Source version and release identity are different
 
 `VERSION`, workspace package versions and `kiosk/package.json` remain coherent
@@ -78,22 +104,35 @@ SHAs. Completed history is checked against its immutable manifest receipt and
 GitHub asset sizes/digests without rebuilding or downloading all old binaries.
 CI retention does not invalidate an already completed immutable release.
 
-The read-only job computes plans, builds exact-SHA bundles and verifies them before
-uploading `plans.json` and the bundles through a SHA-pinned artifact action. No
-plans means no publish job. The dependent publish job downloads only this run's
-artifact and recomputes the current plans from GitHub/main. The downloaded plans
-must be non-empty and equal the first plans of the current list, in order (an
+The read-only job takes at most the first five pending plans, builds exact-SHA
+bundles and verifies them before uploading `plans.json` and the bundles through
+a SHA-pinned artifact action. This bounds each build instead of rebuilding the
+entire backlog before any release can publish. A failed CI beyond the batch
+does not prevent earlier eligible releases from publishing, but the next batch
+still stops at that failed predecessor. No plans means no publish job.
+The dependent publish job downloads only this run's artifact and recomputes
+the first five pending plans from GitHub/main. The downloaded plans must fit
+the batch limit and equal the first plans of the current batch, in order (an
 empty handoff must match exactly). `planned()` walks first-parent history and
 each plan depends only on earlier history and existing tags, so an eligible
 merge during the build only appends plans. The publisher publishes just the
-downloaded plans, prints `N newer plans remain for the next run` to stderr and
-leaves later SHAs unreserved; the run that merge queued in the same concurrency
-group reconciles them. Any other difference, including a changed plan inside the
+downloaded plans, reports any newer plans seen within the current batch to
+stderr and leaves later SHAs unreserved. Any other difference, including a changed plan inside the
 prefix, an extra downloaded plan or a current list starting later because a
 downloaded release already completed, requires a fresh build; pending CI instead
 waits without writes. It verifies every bundle and its plan before the first
 remote write.
 Its builder callback only copies those verified files, never executes them.
+
+After successful non-empty publication, a separate continuation job dispatches
+`release.yml` on main in the same concurrency group, carrying forward any
+explicit recovery inputs. It uses the built-in token with only Actions write,
+has no checkout and never receives the publishing credential. The build and
+publish jobs retain Actions read. The next run skips completed releases and
+builds the next batch, even without another push or CI event. Once drained,
+one no-op run finds no plans and stops. A pending-CI wait or failed publication
+does not dispatch another run. A failed continuation dispatch needs inspection
+and an approved reconcile; it never undoes already published releases.
 
 Crash recovery is monotonic: build and verify, reserve tag, create draft, upload manifest and
 six assets, download and validate all assets, then publish with a manifest digest
@@ -203,8 +242,9 @@ and working Bubblewrap namespaces.
 The credential boundary is job-level separation, not environment filtering.
 All dependency installation, builds and sandbox execution run in a job with
 contents:read, actions:read and pull-requests:read. The dependent publication job
-has contents:write, actions:read and pull-requests:read, installs no tools, and
-executes no repository code except trusted main `release.py`. Checkout and
+also has a read-only built-in token; only its publish step receives
+`FACTORY_RELEASE_TOKEN` with the permissions listed above. It installs no tools
+and executes no repository code except trusted main `release.py`. Checkout and
 artifact actions are SHA-pinned. Downloaded bundles remain data, outside the
 trusted checkout. Publication relies on organization/repository immutability
 enforcement and verifies `immutable: true` afterward.
