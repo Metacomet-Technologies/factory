@@ -13,12 +13,23 @@ Keep each installer's printed snapshot path for rollback.
    environment. Dotfiles owns shell config, the Atuin client, and shared tools.
 2. On each node, run `sudo bash deploy/install-agent-env.sh`.
    The installer saves the previous drop-in, runs `daemon-reload`, and prints
-   the restart command. It does not restart anything.
+   (but does not run) the ordered follow-up commands. It does not restart
+   anything.
 3. At an approved maintenance point, restart each runner explicitly:
    `sudo systemctl restart amp-runner.service`. This can interrupt agent work.
-   The unit loads `/etc/factory/agent.env` first as a transitional hotfix, then
-   `/home/agent/.config/agent/env`. The user file wins for duplicate keys.
-4. On each node, run `sudo bash deploy/install-environment-cleanup.sh`.
+4. Verify the restarted service's MainPID environment contains exactly
+   `NO_COLOR=1`, then remove the retired hotfix:
+
+   ```sh
+   pid=$(sudo systemctl show amp-runner.service -p MainPID --value)
+   sudo tr '\0' '\n' < "/proc/$pid/environ" | grep -Fx 'NO_COLOR=1'
+   sudo rm /etc/factory/agent.env
+   ```
+
+   The unit now loads only `/home/agent/.config/agent/env`. To roll back, use
+   the snapshot path printed by the installer with `rollback-agent-env.sh`; it
+   restores the previous drop-in.
+5. On each node, run `sudo bash deploy/install-environment-cleanup.sh`.
    It refuses unless the live `amp-runner` MainPID contains exactly
    `NO_COLOR=1`. It removes only `PAGER`, `GIT_PAGER`, `SYSTEMD_PAGER`, and
    `NO_COLOR` assignments from `/etc/environment`. Comments, other variables,
@@ -96,6 +107,7 @@ exist yet. Once Atuin is activated, the next backup includes it automatically.
 Confirm integrity, checksum, and restore-check success for the Atuin archive
 without displaying history. Backup runs as root and reads the private DB
 without widening its permissions. Off-site backup remains MET-308.
+Any hand-made archive under `/var/backups/factory-db` must be `root:factory-backup` mode `0640`.
 
 For Mac setup, use [the shared client instructions](../client/README.md).
 Remove old manually sourced helper copies to avoid duplicate definitions.

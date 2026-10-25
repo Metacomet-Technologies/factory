@@ -51,14 +51,12 @@ if [[ ${1:-} == --snapshot ]]; then
     [[ "$integrity" == ok ]] || { printf 'Integrity failed: %s\n' "$integrity" >&2; exit 1; }
     zstd -q -T1 "$temp/copy.db" -o "$temp/$STAMP.db.zst"
     (cd "$temp" && sha256sum "$STAMP.db.zst" > "$STAMP.db.zst.sha256")
-    chmod 0640 "$temp/$STAMP.db.zst" "$temp/$STAMP.db.zst.sha256"
+    install -g "$BACKUP_USER" -m 0640 "$temp/$STAMP.db.zst" "$directory/$STAMP.db.zst"
+    install -g "$BACKUP_USER" -m 0640 "$temp/$STAMP.db.zst.sha256" "$directory/$STAMP.db.zst.sha256"
     if [[ ${BACKUP_TRANSPORT:-ssh} == ssh ]]; then
-        chgrp "$BACKUP_USER" "$directory" "$temp/$STAMP.db.zst" "$temp/$STAMP.db.zst.sha256"
         chmod 0750 "$LOCAL_ROOT" "$LOCAL_ROOT/$BACKUP_HOST" "$directory"
-        chgrp "$BACKUP_USER" "$LOCAL_ROOT" "$LOCAL_ROOT/$BACKUP_HOST"
+        chgrp "$BACKUP_USER" "$LOCAL_ROOT" "$LOCAL_ROOT/$BACKUP_HOST" "$directory"
     fi
-    mv -- "$temp/$STAMP.db.zst" "$directory/"
-    mv -- "$temp/$STAMP.db.zst.sha256" "$directory/"
     exit 0
 fi
 
