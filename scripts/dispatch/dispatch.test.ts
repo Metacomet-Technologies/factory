@@ -456,6 +456,8 @@ console.log(process.env.FAKE_NO_ID ? 'submitted without id' : 'https://ampcode.c
         } else throw new Error(`Unexpected query ${operation}`);
       }
       response.setHeader('content-type', 'application/json');
+      // Real Linear sends the budget limit on every reply; the poller reads it on the heartbeat query too.
+      response.setHeader('x-ratelimit-requests-limit', '2500');
       response.end(JSON.stringify({ data }));
     } catch (error) { response.statusCode = 500; response.end(String(error)); }
   });

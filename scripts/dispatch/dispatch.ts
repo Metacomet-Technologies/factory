@@ -386,6 +386,9 @@ async function runPass(command: string, identifier: string | undefined, dryRun: 
   const redact = (text: string) => text.replaceAll(key, '[redacted]');
   const log = (decision: string, details: object = {}) => console.log(redact(JSON.stringify({ decision, ...details })));
   log('caps', { caps: { gpu: caps.gpu, console: caps.console } });
+  // Headroom: below 10% of the request budget, non-lifecycle work waits for a later poll.
+  // Declared before the heartbeat read: `query` assigns it from the rate-limit header.
+  let requestLimit = 2500;
   // The control plane's heartbeat is one project status update (docs/odd/README.md §9). A fresh
   // one means the poller is the backstop and does not drive the lifecycle. A missing or failed
   // read is silence: the lifecycle runs, and the next poll reads again.
@@ -511,8 +514,6 @@ async function runPass(command: string, identifier: string | undefined, dryRun: 
     issue.labels = issue.labels.filter(value => value.id !== label.id);
     ledger.saveIssue(issue);
   }
-  // Headroom: below 10% of the request budget, non-lifecycle work waits for a later poll.
-  let requestLimit = 2500;
   const deferred = new Set<string>();
   function defer(work: string) {
     if (budget.remaining === null || budget.remaining > requestLimit / 10) return false;
