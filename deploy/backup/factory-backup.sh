@@ -68,7 +68,16 @@ mkdir -p "$(dirname "$STATUS_FILE")" "$LOCAL_ROOT/$BACKUP_HOST"
 exec 9>"$LOCAL_ROOT/.backup.lock"
 flock -n 9 || { echo 'Backup already running' >&2; exit 1; }
 names=()
-for entry in "${DBS[@]}"; do names+=("${entry%%:*}"); done
+for index in "${!DBS[@]}"; do
+    entry=${DBS[index]}
+    name=${entry%%:*} db=${entry#*:}
+    if [[ $name == atuin && ! -e "$db" && ! -L "$db" ]]; then
+        printf 'Skipping atuin: database not created yet: %s\n' "$db"
+        unset 'DBS[index]'
+        continue
+    fi
+    names+=("$name")
+done
 python3 "$state" attempt "$STATUS_FILE" "${names[@]}"
 trap 'python3 "$state" fatal "$STATUS_FILE" "Backup failed at line $LINENO"; exit 1' ERR
 # Receiver-only nodes retain their old originals for rollback. Do not push or

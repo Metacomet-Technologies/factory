@@ -71,6 +71,9 @@ def prune(root, names):
         directory = root / name
         if root.is_symlink() or directory.is_symlink():
             raise ValueError(f"Refusing symlink tree: {directory}")
+        if name == "atuin" and not directory.exists():
+            print("Skipping atuin: no archive tree yet")
+            continue
         copies = []
         for path in directory.glob("*.db.zst"):
             if path.is_symlink() or not path.is_file():

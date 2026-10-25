@@ -64,8 +64,9 @@ Registration is closed by default. Restrict tailnet access to intended admins
 before this temporary window. In `/etc/atuin/server.toml`, change
 `open_registration = false` to `true` with `sudoedit`, then explicitly restart
 `atuin-server.service`. Set each client's sync address to
-`https://factory-gpu.bearded-pompano.ts.net:8888` using dotfiles. Each admin
-runs `atuin register` interactively with their own credentials.
+`https://factory-gpu.bearded-pompano.ts.net:8888` using dotfiles. Devon registers
+with `atuin register` interactively. Other admins register only if they want
+their own account.
 
 Immediately set `open_registration = false` again and restart the service.
 Confirm that new registration is rejected while existing accounts can log in
@@ -73,17 +74,25 @@ and sync. Never include passwords or history in command lines, logs, or PRs.
 
 ## Add verified backups before relying on sync
 
-After Atuin has created its DB, update the backup installation on both nodes.
+Update the backup installation on both nodes, even before Atuin is activated.
 Run the receiver (factory-console) first, then the sender (factory-gpu):
 
 ```sh
 sudo bash deploy/backup/install-backup.sh
+```
+
+After both installers finish and GPU has pushed its first backup, run on both nodes:
+
+```sh
 sudo /usr/local/lib/factory-backup/restore-check.sh all
 ```
 
 The existing installer restarts backup units and performs an immediate backup.
 Approve that activation separately from preparing Atuin. The GPU config adds
 the `atuin` database. The console config accepts and retains its replica.
+Until the Atuin DB exists, backup logs and skips it without blocking the other
+databases or retention. Restore checks skip an Atuin archive tree that does not
+exist yet. Once Atuin is activated, the next backup includes it automatically.
 Confirm integrity, checksum, and restore-check success for the Atuin archive
 without displaying history. Backup runs as root and reads the private DB
 without widening its permissions. Off-site backup remains MET-308.

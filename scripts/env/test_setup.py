@@ -162,8 +162,6 @@ class SetupTest(unittest.TestCase):
             "FAKE_KIOSK": os.path.join(self.repo, "kiosk"),
         }
         self.mark("checkout")
-        # Shared host-base prerequisites are supplied externally, not by setup.
-        self.mark("apt-curl", "apt-shellcheck")
 
     def mark(self, *names):
         for name in names:
@@ -258,22 +256,18 @@ class SetupTest(unittest.TestCase):
         self.assertEqual({f"add {line} to {profile}" for line in added}, {a for a in plan if a.startswith("add ")})
         self.assertEqual(self.run_setup("--env", "orb", "--check-only")[1].count("would "), 0)
 
-    def test_missing_orb_tools_are_external_prerequisites_without_mutation(self):
+    def test_orb_tools_are_planned_only_for_orbs_without_mutation(self):
         for name in ORB_TOOLS:
             os.remove(os.path.join(self.base, "bin", name))
         before = self.tree()
         code, err, calls = self.run_setup("--env", "orb", "--check-only")
-        self.assertEqual((code, calls), (1, []), err)
+        self.assertEqual((code, calls), (0, []), err)
         self.assertEqual(self.tree(), before)
-        for name in ORB_TOOLS:
-            self.assertIn(f"{name}: missing host-base prerequisite", err)
-        self.assertNotIn("would link fd", err)
-        self.assertNotIn("releases/download", err)
-
-        code, err, calls = self.run_setup("--env", "orb")
-        self.assertEqual((code, calls), (1, []), err)
-        self.assertEqual(self.tree(), before)
-        self.assertIn("bootstrap/linux-host.sh in the orb image/pre-setup", err)
+        for name in ("yq", "ast-grep", "just", "watchexec", "scc", "uv", "uvx"):
+            self.assertIn(f"would install {name} from ", err)
+        self.assertIn("would link fd to Debian fdfind", err)
+        for package in ("ripgrep", "fd-find", "entr", "hyperfine", "direnv"):
+            self.assertIn(package, err)
 
         code, err, calls = self.run_setup("--env", "factory-gpu", "--check-only")
         self.assertEqual((code, calls), (0, []), err)
@@ -300,20 +294,19 @@ class SetupTest(unittest.TestCase):
         self.assertIn("0 change(s)", err)
         self.assertEqual(self.tree(), tree)
 
-    def test_shared_contract_tools_are_required_but_never_installed(self):
-        for tool in ("curl", "shellcheck"):
-            with self.subTest(tool=tool):
-                marker = os.path.join(self.state, f"apt-{tool}")
-                os.remove(marker)
-                before = self.tree()
-                for args in (("--ci",), ("--env", "factory-gpu"),
-                             ("--env", "sandbox"), ("--check-only",)):
-                    code, err, calls = self.run_setup(*args)
-                    self.assertEqual((code, calls), (1, []), err)
-                    self.assertIn(f"{tool}: missing host-base prerequisite", err)
-                    self.assertNotIn(f"-y {tool}", err)
-                    self.assertEqual(self.tree(), before)
-                self.mark(f"apt-{tool}")
+    def test_orb_rejects_corrupted_release_before_installing(self):
+        self.mark(*(f"apt-{p}" for p in PACKAGES), "rust", "js", "vite-plus")
+        os.makedirs(os.path.join(self.repo, "kiosk", "node_modules"))
+        stubs = os.path.join(self.base, "bin")
+        write(os.path.join(stubs, "bun"), "#!/bin/sh\necho 1.4.2\n", 0o755)
+        os.remove(os.path.join(stubs, "yq"))
+        # Curl's final argument is the output path; deliver bytes that do not
+        # match the pinned digest. Keep the real checksum and install commands.
+        write(os.path.join(stubs, "curl"),
+              '#!/bin/sh\nfor arg; do output=$arg; done\nprintf corrupted > "$output"\n', 0o755)
+        code, err, _ = self.run_setup("--env", "orb")
+        self.assertEqual(code, 1, err)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "yq")))
 
     def test_existing_vite_plus_with_older_system_bun_converges(self):
         # The orb image: its own bun 1.3.10 on PATH, then a Vite+ install that saw it
@@ -411,10 +404,10 @@ class SetupTest(unittest.TestCase):
     def test_apt_without_root_names_the_command(self):
         if os.geteuid() == 0:
             self.skipTest("root needs no sudo")
-        self.mark("no-sudo", "apt-ca-certificates", *(f"apt-{p}" for p in PACKAGES if p != "sqlite3"))
+        self.mark("no-sudo", "apt-ca-certificates", *(f"apt-{p}" for p in PACKAGES if p != "shellcheck"))
         code, err, calls = self.run_setup("--env", "factory-gpu")
         self.assertEqual(code, 1)
-        self.assertIn("sudo apt-get install --no-install-recommends -y sqlite3", err)
+        self.assertIn("sudo apt-get install --no-install-recommends -y shellcheck", err)
         self.assertFalse(any(c.startswith(("apt-get", "rustup", "vp")) for c in calls), calls)
 
     def test_usage_errors(self):

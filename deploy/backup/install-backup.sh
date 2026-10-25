@@ -26,6 +26,10 @@ for file in account.sh nodes.conf backup-state.py factory-backup.sh restore-chec
     [[ -f "$here/$file" && -r "$here/$file" ]] || fail "Missing artifact: $file"
 done
 for entry in "${DBS[@]}"; do
+    if [[ ${entry%%:*} == atuin && ! -e ${entry#*:} && ! -L ${entry#*:} ]]; then
+        printf 'Skipping atuin: database not created yet: %s\n' "${entry#*:}"
+        continue
+    fi
     [[ -f ${entry#*:} ]] || fail "Database missing: ${entry#*:}; deploy its service first."
 done
 for unit in factory-backup.service factory-backup.timer; do

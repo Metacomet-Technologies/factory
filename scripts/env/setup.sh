@@ -7,8 +7,7 @@
 # Node and Bun from kiosk/package.json devEngines and .node-version (installed
 # by Vite+), Vite+ from kiosk/package.json catalog (the checker's expected
 # value), Playwright Chromium from the kiosk's locked @playwright/test, and the
-# system packages from the checker's contract list. Shared host tools, including
-# curl, shellcheck and orb conveniences, are prerequisites owned by dotfiles host-base.
+# system packages from the checker's contract list.
 set -euo pipefail
 
 usage() {
@@ -112,7 +111,6 @@ for line in "${failing[@]}"; do
     IFS=$'\t' read -r name expected actual <<<"$line"
     case "$name" in
         os|layout:checkout) unmet+=("$name: expected $expected, found $actual") ;;
-        curl|shellcheck) unmet+=("$name: missing host-base prerequisite (dotfiles bootstrap/linux-host.sh or the CI runner image)") ;;
         rust|rust:*) rust=1 ;;
         vite-plus) vite_plus=$expected ;;
         node|node:*|bun)
@@ -125,19 +123,19 @@ for line in "${failing[@]}"; do
         *) [[ " ${packages[*]} " == *" ${name%%:*} "* ]] || packages+=("${name%%:*}") ;;
     esac
 done
+for item in "${unmet[@]}"; do log "cannot install $item (see docs/environments.md)"; done
 
-# The orb image/pre-setup must supply dotfiles host-base; Factory only checks
-# its existing coding-agent requirements, without installing tools or user config.
+# Convenience tools are orb-only, not part of the build/production contract.
 if [[ "$env_name" == orb ]]; then
-    for tool in rg fd jq yq ast-grep gh shellcheck uv uvx just watchexec entr hyperfine scc direnv; do
-        if ! command -v "$tool" >/dev/null; then
-            unmet+=("$tool: missing host-base prerequisite (dotfiles bootstrap/linux-host.sh in the orb image/pre-setup)")
+    for pair in ripgrep:rg fd-find:fdfind jq:jq gh:gh shellcheck:shellcheck entr:entr hyperfine:hyperfine direnv:direnv unzip:unzip; do
+        package=${pair%:*} command=${pair#*:}
+        # An existing upstream fd also satisfies fd-find.
+        if [[ "$package" == fd-find ]] && command -v fd >/dev/null; then continue; fi
+        if ! command -v "$command" >/dev/null && [[ " ${packages[*]} " != *" $package "* ]]; then
+            packages+=("$package")
         fi
     done
 fi
-for item in "${unmet[@]}"; do log "cannot install $item (see docs/orbs.md and docs/environments.md)"; done
-# Never partially provision a host that is missing an external prerequisite.
-if ((${#unmet[@]})) && ((!check_only)); then exit 1; fi
 
 if ((${#packages[@]})) && would "install apt packages: ${packages[*]}"; then
     as_root=()
@@ -148,6 +146,54 @@ if ((${#packages[@]})) && would "install apt packages: ${packages[*]}"; then
     "${as_root[@]}" apt-get update
     "${as_root[@]}" apt-get install --no-install-recommends -y "${packages[@]}"
     if [[ " ${packages[*]} " == *" python3 "* ]]; then exec "$0" "${args[@]}"; fi
+fi
+
+# Install only the requested binary, never companion commands such as ast-grep's
+# `sg` (which would shadow the standard Unix command). Verify pinned release bytes.
+release_tool() {
+    local name=$1 repo=$2 tag=$3 asset=$4 digest=$5 member=${6:-} tmp
+    command -v "$name" >/dev/null && return 0
+    would "install $name from $repo $tag" || return 0
+    (
+        tmp=$(mktemp -d)
+        trap 'rm -rf "$tmp"' EXIT
+        curl -fsSL --proto '=https' --tlsv1.2 "https://github.com/$repo/releases/download/$tag/$asset" -o "$tmp/asset"
+        printf '%s  %s\n' "$digest" "$tmp/asset" | sha256sum --check --status
+        case "$asset" in
+            *.zip) unzip -p "$tmp/asset" "$member" >"$tmp/binary" ;;
+            *.tar.*) tar -xOf "$tmp/asset" "$member" >"$tmp/binary" ;;
+            *) mv "$tmp/asset" "$tmp/binary" ;;
+        esac
+        install -m 755 "$tmp/binary" "$HOME/.local/bin/$name"
+    )
+}
+
+if [[ "$env_name" == orb ]]; then
+    export PATH="$PATH:$HOME/.local/bin"
+    if [[ ! -d "$HOME/.local/bin" ]] && would 'create ~/.local/bin'; then mkdir -p "$HOME/.local/bin"; fi
+    file=$(login_file)
+    line="export PATH=\"\$PATH:\$HOME/.local/bin\""
+    if ! grep -Fqx "$line" "$file" 2>/dev/null && would "add $line to $file"; then
+        printf '\n%s\n' "$line" >>"$file"
+    fi
+    if ! command -v fd >/dev/null && would 'link fd to Debian fdfind'; then
+        ln -s "$(command -v fdfind)" "$HOME/.local/bin/fd"
+    fi
+    release_tool yq mikefarah/yq v4.54.1 yq_linux_amd64 \
+        8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f
+    release_tool ast-grep ast-grep/ast-grep 0.51.0 app-x86_64-unknown-linux-gnu.zip \
+        a7eead5552d3a8daad70f5d50d935da44bd0c138e946b5b0a96b1d38169fa639 ast-grep
+    release_tool just casey/just 1.59.0 just-1.59.0-x86_64-unknown-linux-musl.tar.gz \
+        409044617b6f06517c1035e55ca38c8c856ff8b650e41bc2aa1ef82d5903a23e just
+    release_tool watchexec watchexec/watchexec v2.8.0 watchexec-2.8.0-x86_64-unknown-linux-musl.tar.xz \
+        35ea667cbe4bc96c23ba2a1f46c94c46bc385b67165e3bf621c0e7e4959aa99b \
+        watchexec-2.8.0-x86_64-unknown-linux-musl/watchexec
+    release_tool scc boyter/scc v4.1.0 scc_Linux_x86_64.tar.gz \
+        c7328436d3027f4357d3d7853f7dc3ac2bbcb4ca08f1adad91a27c593884079b scc
+    for tool in uv uvx; do
+        release_tool "$tool" astral-sh/uv 0.13.5 uv-x86_64-unknown-linux-gnu.tar.gz \
+            f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f "uv-x86_64-unknown-linux-gnu/$tool"
+    done
 fi
 
 cargo_env=0

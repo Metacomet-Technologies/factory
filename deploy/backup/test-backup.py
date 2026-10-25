@@ -221,6 +221,44 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
     assert all(hashlib.sha256(path.read_bytes()).digest() == digest for path, digest in live_files.items())
     print("PASS: restore-check reports every table and never changes live databases")
 
+    # Before activation, Atuin has neither a live DB nor an archive tree.
+    with tempfile.TemporaryDirectory(prefix="backup-before-atuin-") as missing_temp:
+        missing = Path(missing_temp)
+        pending = dict(gpu, ATUIN_DB=str(missing / "not-created.db"),
+                       LOCAL_ROOT=str(missing / "local"),
+                       PEER_REPLICA_ROOT=str(missing / "replica"),
+                       STATUS_FILE=str(missing / "status.json"))
+        names = ("meter", "requests", "pricing", "ups-control")
+        for tree in (missing / "local" / "factory-gpu", missing / "replica" / "factory-gpu"):
+            for name in names:
+                seed(tree / name)
+        output = run("factory-backup.sh", pending)
+        assert "Skipping atuin" in output, output
+        assert not Path(pending["ATUIN_DB"]).exists()
+        status = json.loads(Path(pending["STATUS_FILE"]).read_text())
+        assert set(status) == set(names)
+        assert all(value["pushed_to_peer"] and value["error"] is None for value in status.values())
+        receiver = dict(console, REPLICA_ROOT=pending["PEER_REPLICA_ROOT"])
+        # Re-seed expired replicas: receiver retention must not stall on Atuin.
+        for name in names:
+            seed(missing / "replica" / "factory-gpu" / name)
+        run("factory-backup.sh", receiver, "--prune-replica")
+        for tree in (missing / "local" / "factory-gpu", missing / "replica" / "factory-gpu"):
+            assert not (tree / "atuin").exists()
+            for name in names:
+                assert len(list((tree / name).glob("*.db.zst"))) == len(expected_days)
+        assert run("restore-check.sh", pending, "local").count("integrity_check=ok") == 4
+        assert run("restore-check.sh", receiver, "replica").count("integrity_check=ok") == 4
+        corrupt = missing / "corrupt-atuin.db"
+        corrupt.write_text("not sqlite")
+        run("factory-backup.sh", dict(pending, ATUIN_DB=str(corrupt)), success=False)
+        # Activation is picked up on the next backup without changing config.
+        pending["ATUIN_DB"] = gpu["ATUIN_DB"]
+        run("factory-backup.sh", pending)
+        assert run("restore-check.sh", pending, "local").count("integrity_check=ok") == 5
+        assert run("restore-check.sh", receiver, "replica").count("integrity_check=ok") == 5
+    print("PASS: absent Atuin is logged and skipped; other backups and both retention paths continue; activation resumes automatically")
+
     env = environments["factory-gpu"]
     trees = [root / "local" / "factory-gpu", root / "factory-console" / "replica" / "factory-gpu"]
     for tree in trees:
@@ -487,7 +525,7 @@ prepare_backup_account
     # Run the real installer against rewritten absolute paths. Reuse the account
     # stubs above; systemctl is an executable stub so child rollback is safe too.
     with tempfile.TemporaryDirectory(prefix="backup-installer-") as install_temp:
-        for scenario in ("new", "existing", "missing-group", "console", "symlink"):
+        for scenario in ("new", "existing", "missing-group", "console", "symlink", "missing-atuin"):
             fixture = Path(install_temp) / scenario
             artifact = fixture / "artifact"
             artifact.mkdir(parents=True)
@@ -505,6 +543,8 @@ prepare_backup_account
             for path in ("srv/factory/meter/meter.db", "var/lib/factory-api/requests.db",
                          "var/lib/factory-api/pricing.db", "var/lib/factory-ups-control/audit.db",
                          "var/lib/atuin/atuin.db"):
+                if scenario == "missing-atuin" and path == "var/lib/atuin/atuin.db":
+                    continue
                 db = fixture / path
                 db.parent.mkdir(parents=True, exist_ok=True)
                 db.touch()
@@ -572,7 +612,7 @@ bash "$INSTALL_SCRIPT" --prepare-only
                 snapshots.append(snapshot)
                 enabled = scenario not in ("missing-group", "console")
                 assert published.exists() == enabled
-                assert (snapshot / "published-status.created").exists() == (scenario == "new" and attempt == 0)
+                assert (snapshot / "published-status.created").exists() == (scenario in ("new", "missing-atuin") and attempt == 0)
                 if enabled:
                     assert published.read_bytes() == status.read_bytes()
                     assert published.stat().st_mode & 0o777 == 0o640
@@ -580,6 +620,8 @@ bash "$INSTALL_SCRIPT" --prepare-only
                     assert f"root\tfactory-api\t{published.parent}\n" in (fixture / "owners").read_text()
                 if scenario == "missing-group":
                     assert "factory-api group is missing" in output
+                if scenario == "missing-atuin":
+                    assert "Skipping atuin: database not created yet" in output
                 assert home.stat().st_mode & 0o777 == 0o700
                 assert status.stat().st_mode & 0o777 == 0o600
             if scenario == "symlink":
@@ -591,4 +633,4 @@ bash "$INSTALL_SCRIPT" --prepare-only
                 assert (published.parent / "keep").read_text() == "administrator file"
             assert status.read_text() == '{"meter":{"error":"current status"}}\n'
             assert home.stat().st_mode & 0o777 == 0o700
-    print("PASS: installer publishes immediately, reruns safely, skips missing groups/console, refuses symlinks; rollback removes only newly created directory")
+    print("PASS: installer publishes immediately, permits absent Atuin, reruns safely, skips missing groups/console, refuses symlinks; rollback removes only newly created directory")
