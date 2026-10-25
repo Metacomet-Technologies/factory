@@ -579,12 +579,15 @@ Root uses SQLite's `.backup` API (including committed WAL data), requires exactl
 sidecar. Failed snapshots never become successful status entries. The databases are:
 
 - factory-gpu: `meter`, `/srv/factory/meter/meter.db`; `requests`,
-  `/var/lib/factory-api/requests.db`; and `pricing`,
-  `/var/lib/factory-api/pricing.db` (factory-api's systemd `StateDirectory`).
-- factory-console: no originating DBs; receives all three GPU replicas.
+  `/var/lib/factory-api/requests.db`; `pricing`,
+  `/var/lib/factory-api/pricing.db`; `ups-control`,
+  `/var/lib/factory-ups-control/audit.db`; and `atuin`,
+  `/var/lib/atuin/atuin.db`. Follow the [Atuin handoff](docs/agent-host-handoff.md)
+  before updating backup configuration. The Atuin DB must exist first.
+- factory-console: no originating DBs; receives all five GPU replicas.
   Its retained API DBs and old snapshots are rollback data, never pushed/pruned
   by the receiver-only timer. Its local status becomes `{}`. GPU requests
-  replica pruning after successful pushes; all three verified current copies
+  replica pruning after successful pushes; all five verified current copies
   are required before retention can delete anything.
 
 Snapshots are `/var/backups/factory-db/<host>/<db>/<UTC-timestamp>.db.zst` with

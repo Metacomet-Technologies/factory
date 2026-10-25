@@ -1,0 +1,4 @@
+host = "127.0.0.1"
+port = 8888
+db_uri = "sqlite:///var/lib/atuin/atuin.db"
+open_registration = false
