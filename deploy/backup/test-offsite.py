@@ -6,18 +6,23 @@ uvx --from 'moto[server]==5.2.4' --with 'pyrage==1.4.0' --with 'boto3==1.43.118'
 
 import contextlib
 import datetime as dt
+import grp
 import hashlib
+import http.client
+import http.server
 import importlib.metadata
 import io
 import json
 import os
 from pathlib import Path
+import shlex
 import socket
 import sqlite3
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -66,8 +71,7 @@ with tempfile.TemporaryDirectory(prefix="factory-offsite-test ' ") as temp:
             credentials.mkdir(mode=0o700)
             credential = credentials / "factory-r2"
             credential.write_text(json.dumps(dict(access_key_id="testing",
-                                                  secret_access_key="test-secret-must-not-leak",
-                                                  session_token="moto-test-session")))
+                                                  secret_access_key="test-secret-must-not-leak")))
             identity = pyrage.x25519.Identity.generate()
             keyfile, recipient = root / "identity.txt", root / "recipient.txt"
             keyfile.write_text(str(identity) + "\n")
@@ -79,6 +83,7 @@ with tempfile.TemporaryDirectory(prefix="factory-offsite-test ' ") as temp:
             original = database.read_bytes()
             config = root / "nodes.conf"
             config.write_text(f'''source '{HERE / "nodes.conf"}'
+BACKUP_USER='{grp.getgrgid(os.getgid()).gr_name}'
 DBS=("meter:$METER_DB")
 ''')
             env = dict(base_env, BACKUP_CONFIG=str(config), BACKUP_HOST="factory-gpu",
@@ -151,11 +156,16 @@ DBS=("meter:$METER_DB")
             archive.mkdir()
             (archive / snapshot.name).write_bytes(snapshot.read_bytes())
             (archive / sidecar.name).write_bytes(valid_checksum)
+            # The daily push/restore used static credentials; temporary sessions
+            # remain supported for both directions, without changing key format.
+            static_credential = credential.read_text()
+            credential.write_text(json.dumps(dict(json.loads(static_credential), session_token="moto-test-session")))
             print(run([*upload, "--archive", "meter-v0"], env), end="")
             archive_key = key.replace("/daily/", "/archive/").replace("/meter/", "/meter-v0/")
             print(run([*offsite, "restore", "--key", archive_key, "--identity", str(keyfile)], env), end="")
+            credential.write_text(static_credential)
             assert (archive / snapshot.name).read_bytes() == snapshot.read_bytes()
-            print("PASS: bad checksum/recipient never upload; immutable archive round-trip leaves its source intact")
+            print("PASS: static and session credentials push/restore; bad checksum/recipient never upload; archive source intact")
 
             wrong_key = root / "wrong.txt"
             wrong_key.write_text(str(pyrage.x25519.Identity.generate()))
@@ -223,6 +233,74 @@ DBS=("meter:$METER_DB")
             run([*offsite, "restore", "--key", partial.pop(), "--identity", str(keyfile)], env, success=False)
             s3.delete_bucket_policy(Bucket=bucket)
             print("PASS: sidecar failure leaves an unusable partial pair and cannot mark off-site success")
+
+            # Run the operator shell end to end, redirecting ONLY the fixture's
+            # endpoint/runtime/scratch. Moto stores real encrypted objects; this
+            # HTTP proxy supplies R2-style lock responses (not proof of R2 locks).
+            class LockProxy(http.server.BaseHTTPRequestHandler):
+                denials = {}
+
+                def log_message(self, *_args):
+                    pass
+
+                def request(self):
+                    body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                    lock_probe = self.command == "DELETE" or (
+                        self.command == "PUT" and "If-None-Match" not in self.headers)
+                    denial = self.denials.get(self.command) if lock_probe else None
+                    if denial:
+                        status_code, code = denial
+                        payload = f"<Error><Code>{code}</Code><Message>synthetic denial</Message></Error>".encode()
+                        self.send_response(status_code)
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
+                    with contextlib.closing(http.client.HTTPConnection("127.0.0.1", port, timeout=10)) as upstream:
+                        upstream.request(self.command, self.path, body, dict(self.headers))
+                        response = upstream.getresponse()
+                        payload = response.read()
+                        self.send_response(response.status)
+                        for header, value in response.getheaders():
+                            if header.lower() not in ("transfer-encoding", "connection", "content-length"):
+                                self.send_header(header, value)
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+
+                do_PUT = do_GET = do_DELETE = request
+
+            with http.server.ThreadingHTTPServer(("127.0.0.1", 0), LockProxy) as proxy:
+                worker = threading.Thread(target=proxy.serve_forever, daemon=True)
+                worker.start()
+                try:
+                    fixture = root / "drill-artifacts"
+                    fixture.mkdir()
+                    (fixture / "offsite.py").write_bytes((HERE / "offsite.py").read_bytes())
+                    script = (HERE / "r2-drill.sh").read_text().replace(
+                        "/opt/factory-backup-r2/bin/python", shlex.quote(sys.executable)).replace(
+                        "/dev/shm/factory-r2-drill.XXXXXX", shlex.quote(str(root / "drill-scratch.XXXXXX")))
+                    script = script.replace(
+                        "https://25c7d5cf9a2dbcd9238a95f54cfeedff.r2.cloudflarestorage.com",
+                        f"http://127.0.0.1:{proxy.server_port}").replace("factory-sqlite-backups", bucket)
+                    (fixture / "r2-drill.sh").write_text(script)
+                    operator_drill = ["bash", str(fixture / "r2-drill.sh"), str(credential), str(recipient), str(keyfile)]
+                    denied = (403, "AccessDenied")
+                    for responses, success in (({"PUT": denied, "DELETE": denied}, True),
+                                               ({}, False), ({"PUT": denied}, False),
+                                               ({"PUT": (412, "PreconditionFailed")}, False),
+                                               ({"PUT": (403, "InvalidAccessKeyId")}, False)):
+                        LockProxy.denials = responses
+                        output = run(operator_drill, env, success=success)
+                        assert ("PASS: R2 synthetic restore and overwrite/delete lock checks" in output) == success
+                        assert "integrity_check=ok" in output
+                        assert not list(root.glob("drill-scratch.*"))
+                    output = run([*operator_drill[:-1], str(wrong_key)], env, success=False)
+                    assert "PASS: locked object" not in output and not list(root.glob("drill-scratch.*"))
+                    print("PASS: operator drill restores encrypted synthetic DB; requires both lock denials, rejects 412/auth failures, cleans scratch on success/failure")
+                finally:
+                    proxy.shutdown()
+                    worker.join(timeout=5)
 
             credential.unlink()
             run(backup, enabled)

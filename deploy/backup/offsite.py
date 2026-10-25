@@ -42,7 +42,7 @@ def verify(path):
     print(f"{path.name}: OK", flush=True)
 
 
-def client(endpoint, uploading):
+def client(endpoint):
     import boto3
     from botocore.config import Config
 
@@ -56,8 +56,9 @@ def client(endpoint, uploading):
     credentials = json.loads((Path(os.environ["CREDENTIALS_DIRECTORY"]) / "factory-r2").read_text())
     access, secret = credentials["access_key_id"], credentials["secret_access_key"]
     session = credentials.get("session_token")
-    if not access or not secret or (uploading and not session):
-        raise ValueError("upload requires action-scoped session credentials")
+    if (not isinstance(access, str) or not access or not isinstance(secret, str) or not secret
+            or (session is not None and (not isinstance(session, str) or not session))):
+        raise ValueError("invalid S3 credentials")
     return boto3.session.Session().client(
         "s3", endpoint_url=endpoint, region_name="auto",
         aws_access_key_id=access, aws_secret_access_key=secret, aws_session_token=session,
@@ -107,7 +108,7 @@ def push(args):
             key = f"v1/{prefix}/{args.host}/{name}/{encrypted.name}"
             uploads.append((encrypted, sidecar, key))
         # Every pair is verified and encrypted before the first network request.
-        s3 = client(args.endpoint, uploading=True)
+        s3 = client(args.endpoint)
         for encrypted, sidecar, key in uploads:
             for path, object_key in ((encrypted, key), (sidecar, key + ".sha256")):
                 with path.open("rb") as body:
@@ -139,7 +140,7 @@ def restore(args):
     _, host, name, stamp = match.groups()
     identities = [pyrage.x25519.Identity.from_str(line) for line in
                   args.identity.read_text().splitlines() if line and not line.startswith("#")]
-    s3 = client(args.endpoint, uploading=False)
+    s3 = client(args.endpoint)
     with tempfile.TemporaryDirectory(prefix="factory-r2-restore-") as temp:
         root = Path(temp)
         encrypted = root / (stamp + ".tar.age")

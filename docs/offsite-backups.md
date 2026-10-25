@@ -1,20 +1,20 @@
-# Off-site SQLite backups (MET-308)
+# Off-site SQLite backups (MET-334)
 
-Investigated 2026-10-25. This is a disabled-by-default prototype, not a
-production rollout. All experiments used synthetic SQLite data, disposable
-credentials, and moto on loopback on factory-gpu. No production database,
-`/var/backups` tree, live unit, or real R2 endpoint was accessed. Devon's
-expanded request supersedes MET-308's older docs-only isolation.
+R2 backups remain disabled by default until Devon runs the activation runbook.
+The MET-308 prototype tests used synthetic SQLite data, disposable credentials,
+and moto on loopback on factory-gpu. Those results do not establish a live R2
+backup or production restore. This document records the approved rollout model,
+not a claim that activation has happened.
 
 ## Recommendation per database
 
 Use the existing verified snapshots first. The two hosts share a house and
 power supply; cross-host replication does not protect against whole-house loss.
-The following RPOs are **proposed acceptable data-loss budgets**, not measured
+The following RPOs are **approved data-loss budgets**, not measured
 SLAs. A daily backup gives roughly 24 hours of loss between successful runs.
 The 03:15 host-local schedule adds up to ten minutes of jitter, snapshot/upload
 time, and a possible 25-hour interval at the DST transition. Failures extend
-the recovery-point age until another upload succeeds. The proposed maximum
+the recovery-point age until another upload succeeds. The approved maximum
 recovery-point age is **26 hours** for each active daily database, including
 that schedule margin. Both local freshness and off-site recovery-point alerts
 use this threshold. A stricter accepted RPO requires a shorter backup interval
@@ -22,13 +22,13 @@ or a separately evaluated Litestream deployment.
 
 | Name | Host | Path | Covered today | System of record | RPO | Mechanism | Reason |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| meter | factory-gpu | `/srv/factory/meter/meter.db` | yes | yes: original request facts, GPU history and rollups | 26 h; daily snapshots | snapshot-to-R2 | Historical observations cannot be recollected, but about a day of operational telemetry loss is the proposed disaster budget. |
+| meter | factory-gpu | `/srv/factory/meter/meter.db` | yes | yes: original request facts, GPU history and rollups | 26 h; daily snapshots | snapshot-to-R2 | Historical observations cannot be recollected, but the approved disaster budget allows up to 26 hours of loss. |
 | requests | factory-gpu | `/var/lib/factory-api/requests.db` | yes | yes: frozen costs, aggregates, UPS/device/network histories and settings; not just a meter cache | 26 h; daily snapshots | snapshot-to-R2 | Explicitly accept losing up to 26 hours of cost/operational history after whole-house loss. No current requirement establishes a minutes-level billing ledger. |
 | pricing | factory-gpu | `/var/lib/factory-api/pricing.db` | yes | yes: historical prices and operator selections | 26 h; daily snapshots | snapshot-to-R2 | Refetching current prices cannot restore old rates or confirmations. Preserve the DB even though writes are infrequent. |
 | ups-control | factory-gpu | `/var/lib/factory-ups-control/audit.db` | yes | yes: action audit, confirmations, cooldowns and notification state | 26 h for history; daily snapshots | snapshot-to-R2 | Restore with control disabled and reconcile physical actions first. A fresher asynchronous copy alone cannot make physical-action replay safe. |
-| dispatch | factory-gpu | `/home/agent/.local/state/factory-dispatch/dispatch.db` | no | yes: local claims, decisions, thread and QA/recovery state | 26 h; manual reconciliation before restart | snapshot-to-R2 | Linear/GitHub are reconciliation inputs, not a complete copy of the decision ledger. Add to inventory in rollout. |
+| dispatch | factory-gpu | `/home/agent/.local/state/factory-dispatch/dispatch.db` | no; separate later ticket | yes: local claims, decisions, thread and QA/recovery state | 26 h target; manual reconciliation before restart | snapshot-to-R2 | Linear/GitHub are reconciliation inputs, not a complete copy of the decision ledger. Not part of this activation. |
 | atuin | factory-gpu, conditional on activation | `/var/lib/atuin/atuin.db` | yes in config; skipped if not created | no for history, assuming clients retain full encrypted history; yes for account/sync metadata | 26 h for server state; daily snapshots | snapshot-to-R2 | Cheap server recovery; no continuous replication needed for a client-encrypted sync hub. Client retention is an assumption to confirm in the drill. |
-| meter-v0 | factory-gpu | `/var/backups/factory-db/factory-gpu/meter-v0/` | no: outside `DBS`, pruning and restore checks | yes: immutable historical archive | zero further loss after a verified one-time copy | snapshot-to-R2 | Upload every approved archive generation once, keep indefinitely, and include in restore drills. Do not silently discard history. |
+| meter-v0 | factory-gpu | `/var/backups/factory-db/factory-gpu/meter-v0/` | no; separate later ticket, outside `DBS`, pruning and restore checks | yes: immutable historical archive | zero further loss after a verified one-time copy | snapshot-to-R2 | Upload every approved archive generation once, keep indefinitely, and include in restore drills after that import. |
 
 The live inventory comes from [nodes.conf](../deploy/backup/nodes.conf), not
 the older issue's four-database list. Source evidence for the loss budget:
@@ -41,8 +41,8 @@ the older issue's four-database list. Source evidence for the loss budget:
 [UPS control safety state](ups.md), and the
 [dispatch ledger](../scripts/dispatch/README.md).
 
-**Requests RPO decision:** daily loss is acceptable for this recommendation,
-not an assertion that the data is reconstructible. Meter replay cannot restore
+**Requests RPO decision:** Devon approved the 26-hour budget. This does not mean
+that the data is reconstructible. Meter replay cannot restore
 co-resident telemetry or every historical cost decision, and both source and
 API copies disappear in a house loss. If requests becomes authoritative for
 customer invoicing or its loss budget becomes 15 minutes, choose Litestream
@@ -50,15 +50,15 @@ for requests and separately reassess meter/pricing consistency. None of the
 current evidence justifies operating continuous replication for every DB.
 No database is recommended as `none`; no Litestream daemon is part of this PR.
 
-Rollout adds `dispatch` to GPU `DBS` and console `PEER_DBS`. Root's SQLite
-`.backup` can read the `agent`-owned WAL database outside `/var/lib`; preserve
+The later dispatch ticket adds `dispatch` to GPU `DBS` and console `PEER_DBS`.
+Root's SQLite `.backup` can read the `agent`-owned WAL database outside `/var/lib`; preserve
 its ownership and modes, do not copy the live DB/WAL files or widen permissions.
-Test a live WAL writer and an absent required dispatch DB before activation.
+Test a live WAL writer and an absent required dispatch DB before dispatch activation.
 Keep the dispatcher disabled after restore until claims and in-flight work
 are reconciled with Linear/GitHub. This prototype does not change `DBS`.
 
-For `meter-v0`, inventory and validate the existing pairs under separate
-approval. Verify checksums, decompress in scratch, and require SQLite integrity
+In the later `meter-v0` ticket, inventory and validate the existing pairs under
+separate approval. Verify checksums, decompress in scratch, and require SQLite integrity
 before the first upload. Use `offsite.py push --archive` with each exact stamp.
 If an archive lacks a sidecar, record a newly verified baseline explicitly;
 do not pretend a new checksum proves historical authenticity. Do not add the
@@ -66,11 +66,11 @@ immutable archive to daily pruning or take recurring snapshots of it.
 
 ## Bucket layout, retention and cost
 
-Proposed private bucket: **`factory-sqlite-backups`**, Standard storage, default
-jurisdiction, `enam` location hint. The location hint is not a residency
+Devon has created the private bucket **`factory-sqlite-backups`**. Use Standard
+storage. The planned `enam` location hint is not a residency
 guarantee ([data location](https://developers.cloudflare.com/r2/reference/data-location/)).
 The S3 region is **`auto`**, endpoint
-`https://<ACCOUNT_ID>.r2.cloudflarestorage.com`
+`https://25c7d5cf9a2dbcd9238a95f54cfeedff.r2.cloudflarestorage.com`
 ([S3 compatibility](https://developers.cloudflare.com/r2/api/s3/api/)).
 Do not enable an r2.dev URL or public custom domain.
 
@@ -86,7 +86,7 @@ original `.sha256`. The identity inside the authenticated payload prevents
 swapping different DBs from the same run. The outside sidecar checks ciphertext.
 It is uploaded last; an object without its sidecar is not a restore point.
 No mutable `latest` object, remote delete, bucket creation, or LIST/GET request
-is needed by the uploader. A separate read-only operator lists complete pairs.
+is needed by the uploader. The operator lists complete pairs during recovery.
 PUTs use `If-None-Match: *` to refuse accidental replacement even in the local
 test bucket. R2 evaluates that condition atomically
 ([conditional PUT](https://developers.cloudflare.com/r2/api/s3/api/)); it is
@@ -102,10 +102,12 @@ the independent failure. Each run uploads only its current generation, so a
 later success does not backfill missed days. Manual re-upload must use a fresh
 generation because locks reject overwriting previously uploaded objects.
 
-Create these enabled rules, using an administrator credential kept off-host:
+Devon has already created these rules. Do not recreate them during activation:
 
 - Lifecycle `expire-daily-35d`: prefix `v1/daily/`, `Expiration.Days = 35`.
-- Lifecycle `abort-incomplete-1d`: empty prefix, `AbortIncompleteMultipartUpload.DaysAfterInitiation = 1`.
+- Cloudflare's built-in **Default Multipart Abort Rule** aborts incomplete
+  multipart uploads after 7 days across the whole bucket. It replaces the
+  proposed `abort-incomplete-1d` rule.
 - No expiry or storage-class transition for `v1/archive/`.
 - Bucket lock `lock-daily-35d`: prefix `v1/daily/`, condition
   `{"type":"Age","maxAgeSeconds":3024000}`.
@@ -128,6 +130,8 @@ for daily peak/expiry overlap and 5 GB total for the immutable archive:
 1.25 × 36 + 5 = **50 GB-month**. Individual prototype uploads must be ≤4 GiB;
 an archive above that limit needs a separately reviewed multipart design, not
 silent truncation. Measure aggregate archive size before accepting this estimate.
+This estimate includes dispatch and meter-v0 from the later tickets. This
+activation covers at most five daily DBs, not the six in the estimate.
 
 [R2 pricing](https://developers.cloudflare.com/r2/pricing/), retrieved
 **2026-10-25**: Standard storage USD 0.015/GB-month, Class A USD 4.50/million,
@@ -144,44 +148,28 @@ size, retry frequency, expiry lag, and retained archive volume.
 
 ## Credentials
 
-**A normal R2 token is not write-only.** The narrowest long-lived upload
-permission is **Object Read & Write**, API group
-`Workers R2 Storage Bucket Item Write`, scoped only to `factory-sqlite-backups`.
-It can read/list, overwrite and delete objects, and is therefore not the
-credential to put on factory-gpu. `Admin Read & Write` can also change bucket
-configuration and must stay off-host
+Use the existing static, bucket-scoped **Object Read & Write** account token
+for `factory-sqlite-backups`. Devon approved this model instead of temporary
+child credentials. There is no off-house issuer or credential renewal service.
+The permission group is `Workers R2 Storage Bucket Item Write`. The token can
+read and list objects and upload new objects. Bucket locks deny deletion and
+overwrite of locked objects even with this permission. A stolen token can
+download ciphertext or upload junk, but cannot decrypt the databases or replace
+locked backups. Junk uploads can still incur storage costs.
+
+Keep bucket-administrator credentials off both hosts. `Admin Read & Write`
+can change bucket configuration, including locks
 ([token permissions](https://developers.cloudflare.com/r2/api/tokens/),
 [S3 operations](https://developers.cloudflare.com/r2/api/s3/api/)).
 
-R2 now supports locally signed **temporary credentials with explicit actions**.
-Mint a child credential off-host with bucket `factory-sqlite-backups`,
-`actions: ["PutObject"]`, and `paths.prefixPaths: ["v1/daily/factory-gpu/"]`.
-Do not include `scope` alongside `actions`. This denies GET, LIST, DELETE and
-other buckets, but PUT alone still permits overwrite unless a bucket lock
-prevents it. For the one-time archive import mint a separate child restricted
-to `v1/archive/factory-gpu/meter-v0/`. The API's broad permission presets are
-not a substitute for locally signed action restrictions
-([temporary credential actions](https://developers.cloudflare.com/r2/api/s3/temporary-credentials/)).
-
-The [Cloudflare signing example](https://developers.cloudflare.com/r2/examples/authenticate-r2-temp-credentials/)
-specifies HS256 JWT claims (`sub`, `iss`, `aud`, `iat`, `exp`, bucket, actions,
-paths), temporary secret SHA-256(JWT), and session token base64(`jwt/` + JWT).
-Keep the parent secret in **1Password → Factory → Factory R2 backup signer**.
-Never copy that parent secret to either factory node. A compromised child
-cannot mint new credentials. Revoking the parent revokes its children.
-
-For rollout, use an off-house issuer to deliver a **48-hour child every 24 hours**.
-This renewal/delivery mechanism is deliberately not implemented here and is a
-production activation prerequisite. A manual child suffices for an approved
-one-shot real-R2 drill. Do not replace renewal with a permanent read/write
-token on the host. Rotate the parent every 90 days and immediately on suspicion
-of compromise: create replacement, mint/deliver child, verify a new upload and
-independent restore, revoke old parent, verify old child rejection, then update
-the vault record. Alert on renewal failure before child expiry.
-
-Store only the child on factory-gpu at `/etc/credstore/factory-r2`,
-`root:root 0600`, inside a `0700` directory. Its JSON fields are
-`access_key_id`, `secret_access_key`, `session_token`. The checked-in unit uses
+The existing 1Password item is **Metacomet account → Factory vault → Factory
+R2 backup**. Its fields are `access_key_id`, `secret_access_key`, `url`,
+`account_id`, and `credential`. The `credential` field holds the Cloudflare API
+token and is unused by backups. Deliver only `access_key_id` and
+`secret_access_key` as JSON to `/etc/credstore/factory-r2` on GPU,
+`root:root 0600`, with parent directory `root:root 0700`. `session_token` is
+optional for compatibility with temporary credentials, not required for this
+static token. The checked-in unit uses
 **`LoadCredential=factory-r2`**, a name-only lookup; a missing credential does
 not prevent the local backup from starting. An absolute missing source in
 `LoadCredential=` would fail unit startup, so do not change it to that form
@@ -189,9 +177,10 @@ not prevent the local backup from starting. An absolute missing source in
 The helper reads `$CREDENTIALS_DIRECTORY/factory-r2` directly. No credential
 value is passed through environment variables, command arguments, shell config
 or the repository. Missing/malformed credentials fail only the off-site step.
-Restore operators use a separate **Object Read only** bucket-scoped credential,
-stored as **Factory R2 backup restore** in the same vault, never on a scheduled
-backup node. Factory-console needs neither credential.
+Restore operators retrieve the same token from the shared Factory vault.
+Factory-console needs no R2 credential. On suspected compromise, create and
+deliver a replacement bucket-scoped token, verify upload and restore, revoke
+the old token, and update the vault item. No scheduled renewal is required.
 
 ## Encryption
 
@@ -201,8 +190,9 @@ and sync metadata. Uniform encryption avoids classifying individual tables.
 The prototype uses **pyrage 1.4.0**, bindings to the Rust implementation of
 the standard age format, with streaming file APIs
 ([pyrage](https://github.com/woodruffw/pyrage)). The S3 client is boto3 1.43.118.
-These two dependencies are provisioned into a private Python environment by
-the later rollout, not downloaded by the backup timer.
+The runtime installer provisions these dependencies with hash checking into
+the root-owned `/opt/factory-backup-r2` environment. The backup timer never
+downloads dependencies.
 
 R2's [server-side encryption](https://developers.cloudflare.com/r2/reference/data-security/)
 does not protect against a leaked object-read credential. Age encryption keeps
@@ -211,14 +201,16 @@ authenticated encryption, but is not a signature: anyone holding the public
 recipient can fabricate a new valid archive. Bucket locks and independently
 recorded recovery-point receipts remain necessary for origin-compromise recovery.
 
-Create one age X25519 identity on a trusted administrator workstation. Save
-the complete `AGE-SECRET-KEY-...` identity, public recipient, creation date and
-recovery instructions in **1Password → Factory → Factory SQLite backup age
-identity**. Store an offline recovery copy and 1Password recovery material
-outside the house. Verify retrieval from a second authorized workstation.
+Devon has created the age X25519 identity in **1Password → Factory → Factory
+SQLite backup age identity**. Its fields are `credential` for the complete
+`AGE-SECRET-KEY-...`, `recipient` for the public `age1...` recipient, and `date`.
+The Factory vault is shared with Dave. Devon approved recovery from that shared
+vault without a separate offline key copy. Verify vault retrieval before the drill.
 Put **only** the `age1...` public recipient in
 `/etc/factory-backup/age-recipient.txt`, root-owned, `0644`; the nodes never
-need the private identity. Keep previous private identities until all their
+need the private identity for scheduled backups. The authorized activation drills
+temporarily use a `0600` identity file on GPU's tmpfs and delete it afterward.
+Keep previous private identities until all their
 objects, including indefinite meter-v0 archives, are migrated and restore-tested.
 
 The external `.sha256` checks encrypted bytes before decryption. The original
@@ -278,7 +270,7 @@ Other tools in that run: Python 3.14.4, SQLite CLI 3.46.1, zstd 1.5.7,
 and uvx 0.13.0. The `meter-v0` case is also synthetic, not the real archive.
 
 Moto proves the client workflow and real HTTP failure handling. It does **not**
-prove R2 action-scoped JWT enforcement, bucket locks, lifecycle timing, actual
+prove R2 token permissions, bucket locks, lifecycle timing, actual
 production recovery, or service-manager credential delivery. Those require
 the approved real-R2 drill in MET-334. The uploader's success means both PUTs
 were acknowledged; only an independent restore proves a usable remote copy.
@@ -287,7 +279,7 @@ were acknowledged; only an independent restore proves a usable remote copy.
 
 Use a clean recovery workstation, not a production database host. Install the
 pinned helper dependencies and SQLite/zstd tools in an isolated environment.
-Retrieve the read-only R2 credential and age identity from the Factory vault
+Retrieve the R2 credential and age identity from the shared Factory vault
 into a private, temporary directory. Never paste them into a shell command or
 export their values. Place the credential JSON at `$CREDENTIALS_DIRECTORY/factory-r2`.
 Set `TMPDIR` to a private directory on an encrypted recovery volume with enough
@@ -298,7 +290,7 @@ object after a suspected host compromise.
 ```sh
 CREDENTIALS_DIRECTORY=/path/to/private/credentials TMPDIR=/path/to/private/scratch \
   timeout --kill-after=10s 15m /path/to/venv/bin/python deploy/backup/offsite.py \
-  --endpoint https://ACCOUNT_ID.r2.cloudflarestorage.com \
+  --endpoint https://25c7d5cf9a2dbcd9238a95f54cfeedff.r2.cloudflarestorage.com \
   --bucket factory-sqlite-backups restore \
   --key v1/daily/factory-gpu/meter/UTC_STAMP.tar.age \
   --identity /path/to/private/identity.txt
@@ -310,7 +302,7 @@ downloaded and decrypted scratch files on normal exit and has no live-destinatio
 option. It accepts at most 4 GiB ciphertext and 16 GiB decompressed SQLite.
 
 For an actual recovery, separately download the selected pair into private
-scratch with the read-only client, then use the standard age tool and the
+scratch with the operator's S3 client, then use the standard age tool and the
 exact authenticated member names. Substitute the selected values below:
 
 ```sh
@@ -347,7 +339,7 @@ detect accidental disablement.
 
 `backup-state.py` publishes the whole status to
 `/var/lib/factory-backup-status/status.json` as `root:factory-api 0640`.
-All three conditions are implemented **in this PR**, using the existing
+All three conditions are implemented in the merged prototype, using the existing
 factory-api `backup:status` warning and Slack engine:
 
 1. **Status unavailable or unreadable:** `AppState::alert_signals` detects a
@@ -385,82 +377,325 @@ Readable publication is already in source, but deployment and real notification
 delivery still need verification in MET-334. Publication errors remain warning-only:
 an old readable copy eventually becomes stale; a missing or unreadable copy now
 alerts immediately on evaluation. A stopped API, Slack outage, or whole-house
-loss cannot be reported reliably by this in-house engine. An independent
-off-house check must detect no complete daily R2 recovery point within 26 hours,
-using the timestamp in the object key rather than the upload time. The immutable
-meter-v0 archive has no daily freshness deadline; its complete approved inventory
-must remain present and pass the recurring restore drill.
+loss cannot be reported reliably by this in-house engine. Devon accepted that
+risk and dropped off-house freshness monitoring. The in-house `backup:status`
+alerts cover a silent upload stop while the API and notification path work.
+The later meter-v0 import has no daily freshness deadline.
 
-Run a **monthly independent restore drill for every active DB**, plus meter-v0,
+Run a **monthly independent restore drill for every active DB**,
 and before/after encryption-key rotation. Record object keys, checksums,
 integrity results, tool versions and drill time outside the house without
-recording database contents. Keep the recovery identity off both backup hosts;
-use a trusted operator workstation or separately authorized recovery executor.
+recording database contents. Include meter-v0 after its separately approved import.
+Keep the recovery identity off both backup hosts except during an authorized
+drill with a transient tmpfs file. Use a trusted operator workstation for recovery.
 Page on failed or overdue drills. A PUT receipt is not a restore-check receipt.
 
-## Follow-up
+## Activation runbook
 
-[MET-334](https://linear.app/metacomet/issue/MET-334/roll-out-verified-encrypted-r2-backups-and-off-host-credential-renewal)
-is the Backlog rollout issue related to MET-308. It owns production approval,
-off-host credential renewal, R2 lock/lifecycle/permission checks, measured cost
-inputs, dispatch inventory, meter-v0 import, independent freshness monitoring,
-and real-R2 plus per-database restore/alert drills. Spec sections remain empty.
-MET-115 is the older overlapping issue; its disposition remains Devon's decision.
+[MET-334](https://linear.app/metacomet/issue/MET-334) covers activation of the
+current daily inventory. Dispatch and meter-v0 remain separate later tickets,
+not prerequisites for this rollout. The 26-hour budget, static token, shared
+Factory vault recovery with Dave, and lack of off-house monitoring are approved.
 
-### Administrator setup checklist and apply order
+Run these commands in Devon's existing Mac zsh session with the client helpers
+loaded from `~/factory/client/factory.zsh`, as described in the
+[Mac client setup](../client/README.md). Do not start Bash or source that file
+in Bash. It uses zsh-only syntax. Use an approved maintenance window.
+The backup-permissions hotfix and API monitoring
+release must already be deployed. Confirm existing local and peer backups work.
+Sign in to the Metacomet 1Password account. The Mac needs `op` and `jq` and its
+existing `gpu-ssh` and `console-ssh` functions. The helpers load `FACTORY_GPU`
+and `FACTORY_CONSOLE` from `client/factory.env` and use
+`${FACTORY_SSH_USER:-$USER}` as the node login. Set `FACTORY_SSH_USER` if your
+Mac username differs. The hosts need noninteractive sudo for these commands.
+Never enable shell tracing or paste credential values into commands.
 
-These are **future operator steps**, not actions taken by this investigation.
+Use `gpu-ssh` for GPU commands. Its `_factory_ready` check runs before SSH and
+can consume stdin, including a script heredoc. Every helper call below carries
+its script or configuration in the quoted remote command, with stdin redirected
+from `/dev/null`. Heredocs inside those quoted commands run on the remote host,
+not through helper stdin. Secret streams instead use plain `ssh -T` with the
+same username and host variables. Only non-secret scripts, paths, and
+configuration values appear in arguments or environment variables.
 
-1. Review the daily RPO assumption, especially requests, and approve MET-334.
-   Confirm the backup-permissions hotfix is deployed and verify current local
-   and replica restores without broadening permissions.
-2. Create private Standard bucket `factory-sqlite-backups`, default jurisdiction,
-   `enam` location hint, S3 region `auto`. Add both lifecycle rules and both
-   bucket locks above **before uploading anything**. Keep bucket-admin access
-   off the hosts.
-3. Create the bucket-scoped Object Read & Write parent in 1Password Factory
-   item **Factory R2 backup signer** and the separate read-only recovery item.
-   Build and verify off-host issuance/delivery of PutObject-only 48-hour children
-   every 24 hours. Confirm that GET, LIST, DELETE, other buckets and overwrite
-   under lock are denied. Do not give the parent to factory-gpu.
-4. Generate the age X25519 identity on the administrator workstation. Store it
-   in **Factory SQLite backup age identity**, with an off-house recovery copy.
-   Verify the private key can be recovered before installing the public recipient.
-5. Provision a root-owned Python environment with `boto3==1.43.118` and
-   `pyrage==1.4.0`. Run the synthetic drill against real R2 with a temporary
-   test prefix and the intended lock policy. Check credential expiry and denied
-   upload behavior. No production data is required for this first test.
-6. In an approved maintenance window, install the reviewed backup artifacts,
-   console first, GPU second, **with R2 disabled**. The existing installer
-   stops/restarts backup units; do not run it as a read-only check. Deploy the
-   API monitoring changes through its normal release process. Repeat local
-   and peer checks and verify the API-readable status file and notifications.
-7. On GPU only, atomically deliver the child JSON to `/etc/credstore/factory-r2`
-   (`root:root 0600`, parent `0700`). Install the public recipient file. Configure
-   the following non-secret values in `/etc/factory-backup/nodes.conf`:
+### 1. Install the GPU runtime
 
-   ```sh
-   R2_ENABLED=1
-   R2_PYTHON=/opt/factory-backup-r2/bin/python
-   R2_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
-   R2_BUCKET=factory-sqlite-backups
-   R2_RECIPIENT_FILE=/etc/factory-backup/age-recipient.txt
-   ```
+The deployed checkout is at a release tag. Fetch `origin/main` as `agent` and
+create a detached temporary worktree without changing the deployed checkout.
+Stop if `/tmp/factory-main` already exists. Review the printed commit and
+confirm it contains the approved MET-334 changes before running the installer.
 
-8. Approve one immediate backup, then independently download and drill each
-   active DB. Check local/replica retention and both local and `r2` status.
-   Exercise unavailable status, stale local success, denied off-site upload,
-   and stale off-site recovery points using a separate temporary status fixture
-   read by a test API instance. Never change live DB or status permissions to
-   test alerts. Confirm delivery and recovery, then verify the production
-   collector reads the published status successfully.
-9. Add dispatch under its own verified rollout; inventory and upload meter-v0
-   once with archive-scoped credentials. Record the complete object inventory
-   off-house. Activate independent freshness/renewal monitoring and monthly
-   restore drills before declaring the system protected.
+```sh
+setopt ERR_EXIT NO_UNSET PIPE_FAIL
+gpu-ssh 'sudo -iu agent bash -s <<\REMOTE
+set -Eeuo pipefail
+cd /home/agent/work/factory
+test ! -e /tmp/factory-main
+git fetch origin main
+git worktree add --detach /tmp/factory-main origin/main
+git -C /tmp/factory-main log -1 --format="%H %s"
+test -f /tmp/factory-main/deploy/backup/install-offsite-runtime.sh
+test -f /tmp/factory-main/deploy/backup/r2-drill.sh
+REMOTE' </dev/null
+```
 
-To disable the prototype, set `R2_ENABLED=0`; the next run removes the off-site
-status entry and uses only the existing local/peer path. Preserve remote objects,
-old identities and receipts. Revoke upload credentials separately. Configuration
-rollback includes `offsite.py`, but intentionally never deletes vault items,
-credstore files, encryption keys or remote backups.
+After checking that commit, install the pinned runtime. This does not enable R2.
+The installer requires Python 3.11 or newer with `venv` and `ensurepip`.
+If those modules are missing, install Ubuntu's `python3-venv` package as an
+operator prerequisite, then rerun the installer. It does not install OS packages.
+
+```sh
+gpu-ssh 'sudo bash /tmp/factory-main/deploy/backup/install-offsite-runtime.sh' </dev/null
+gpu-ssh '/opt/factory-backup-r2/bin/python -c "import boto3, importlib.metadata; print(boto3.__version__, importlib.metadata.version(\"pyrage\"))"' </dev/null
+```
+
+Expect `1.43.118 1.4.0`. Record the printed runtime rollback snapshot path.
+The runtime installer is idempotent and runs only on GPU.
+
+### 2. Deliver the credential and public recipient over stdin
+
+Create root-owned directories first. Build JSON from two input reads on the
+Mac, not `--arg` with shell substitutions. Neither key enters argv or the
+environment. The API-token `credential` field is not read.
+
+```sh
+gpu-ssh 'sudo install -d -o root -g root -m 0700 /etc/credstore && sudo install -d -o root -g root -m 0755 /etc/factory-backup' </dev/null
+{
+	op read 'op://Factory/Factory R2 backup/access_key_id' &&
+	op read 'op://Factory/Factory R2 backup/secret_access_key'
+} | jq -nRe '{access_key_id: input, secret_access_key: input}
+	| if (.access_key_id | length) > 0 and (.secret_access_key | length) > 0
+	  then . else error("Missing R2 key") end' |
+	ssh -T "${FACTORY_SSH_USER:-$USER}@$FACTORY_GPU" 'sudo install -o root -g root -m 0600 /dev/stdin /etc/credstore/factory-r2'
+op read 'op://Factory/Factory SQLite backup age identity/recipient' |
+	ssh -T "${FACTORY_SSH_USER:-$USER}@$FACTORY_GPU" 'sudo install -o root -g root -m 0644 /dev/stdin /etc/factory-backup/age-recipient.txt'
+gpu-ssh 'sudo stat -c "%U:%G %a %n" /etc/credstore /etc/credstore/factory-r2 /etc/factory-backup/age-recipient.txt' </dev/null
+```
+
+Expect `root:root` and modes `700`, `600`, and `644`. Do not print the JSON.
+`jq` emits JSON only after both nonempty input reads succeed. However, SSH's
+`install` can still open and truncate the destination before an upstream read
+fails. The pipeline's failure is fatal with `PIPE_FAIL`. If any delivery fails,
+leave R2 disabled, repeat delivery successfully, and rerun the synthetic drill
+before activation. File ownership and mode alone do not prove valid contents.
+
+### 3. Run the synthetic real-R2 drill
+
+This is the first real-R2 operation. It uses only a synthetic SQLite DB under
+`v1/daily/drill-synthetic/`. The resulting object stays locked for 35 days.
+Do not try to remove the locked object after the drill.
+
+Verify `/run` is tmpfs. Deliver the private identity to a root-only temporary
+file, then run the drill with file-path arguments. The exit trap deletes the
+identity even if the drill fails. If delivery or the SSH session fails before
+the trap is installed, delete `/run/factory-r2-drill` before doing anything else.
+
+```sh
+gpu-ssh 'test "$(findmnt -n -o FSTYPE -T /run)" = tmpfs && sudo install -d -o root -g root -m 0700 /run/factory-r2-drill' </dev/null
+op read 'op://Factory/Factory SQLite backup age identity/credential' |
+	ssh -T "${FACTORY_SSH_USER:-$USER}@$FACTORY_GPU" 'sudo install -o root -g root -m 0600 /dev/stdin /run/factory-r2-drill/identity.txt'
+gpu-ssh 'sudo bash -s <<\REMOTE
+set -Eeuo pipefail
+cleanup() {
+	rm -f /run/factory-r2-drill/identity.txt
+	rmdir /run/factory-r2-drill
+}
+trap cleanup EXIT
+trap "exit 1" HUP INT TERM
+bash /tmp/factory-main/deploy/backup/r2-drill.sh \
+	/etc/credstore/factory-r2 \
+	/etc/factory-backup/age-recipient.txt \
+	/run/factory-r2-drill/identity.txt
+REMOTE' </dev/null
+gpu-ssh 'sudo test ! -e /run/factory-r2-drill/identity.txt' </dev/null
+```
+
+Require a PASS summary for upload, restore with `integrity_check=ok`, denied
+overwrite, and denied delete. The drill uses the fixed endpoint and bucket
+above and `/opt/factory-backup-r2/bin/python`. It shreds its scratch files.
+On any failure, leave R2 disabled and investigate before uploading real DBs.
+
+### 4. Reinstall backup artifacts with R2 disabled, console first
+
+Use the same reviewed commit on both nodes. This is the only shared-node loop.
+It stages the detached worktree on console and checks that the source config
+is still disabled on both nodes. It does not install artifacts yet.
+
+```sh
+REV=$(gpu-ssh 'sudo -iu agent git -C /tmp/factory-main rev-parse HEAD' </dev/null | tail -n 1)
+[[ $REV =~ ^[0-9a-f]{40}$ ]]
+# Both nodes: stage and verify the reviewed backup artifacts.
+for n in gpu console; do
+	printf '\n== %s: stage backup artifacts ==\n' "$n"
+	"$n-ssh" 'sudo -iu agent bash -s -- '"$REV"' <<\REMOTE
+set -Eeuo pipefail
+cd /home/agent/work/factory
+if [[ ! -e /tmp/factory-main ]]; then
+	git fetch origin main
+	git worktree add --detach /tmp/factory-main origin/main
+fi
+test "$(git -C /tmp/factory-main rev-parse HEAD)" = "$1"
+test -z "$(git -C /tmp/factory-main status --porcelain)"
+unset R2_ENABLED
+source /tmp/factory-main/deploy/backup/nodes.conf
+test "$R2_ENABLED" = 0
+REMOTE' </dev/null
+done
+console-ssh 'sudo bash /tmp/factory-main/deploy/backup/install-backup.sh' </dev/null
+gpu-ssh 'sudo bash /tmp/factory-main/deploy/backup/install-backup.sh' </dev/null
+console-ssh 'sudo /usr/local/lib/factory-backup/restore-check.sh all' </dev/null
+gpu-ssh 'sudo /usr/local/lib/factory-backup/restore-check.sh all' </dev/null
+```
+
+Each installer stops and restarts backup units, replaces installed `nodes.conf`,
+runs a local backup with peer replication, and enables the timer. Record each
+printed configuration rollback path. Require checksum and integrity success
+on both nodes. Atuin may be skipped if its database has not been created.
+Do not change ownership or modes to bypass a failed check.
+
+### 5. Enable R2 on GPU and run one backup
+
+Append these non-secret overrides to GPU's root-owned configuration. Leave
+console disabled. Re-running this block repeats the same effective settings.
+
+```sh
+gpu-ssh 'sudo tee -a /etc/factory-backup/nodes.conf >/dev/null <<\CONFIG
+
+# MET-334 approved off-site backup settings.
+R2_ENABLED=1
+R2_ENDPOINT=https://25c7d5cf9a2dbcd9238a95f54cfeedff.r2.cloudflarestorage.com
+R2_BUCKET=factory-sqlite-backups
+R2_PYTHON=/opt/factory-backup-r2/bin/python
+R2_RECIPIENT_FILE=/etc/factory-backup/age-recipient.txt
+CONFIG' </dev/null
+gpu-ssh 'sudo systemctl start factory-backup.service' </dev/null
+gpu-ssh 'sudo journalctl -u factory-backup.service -n 80 --no-pager' </dev/null
+```
+
+A successful unit alone does not prove R2 success. Require no `r2.error`, a new
+`r2.last_success_ms`, and a fresh `r2.recovery_point_ms` in step 7. Keep the
+recorded object keys from the upload log for the next step.
+
+### 6. Restore every active DB from R2
+
+Repeat the tmpfs identity delivery below. The restore helper downloads and
+verifies remote data into private scratch and never writes a live database.
+Use an encrypted scratch volume with enough room for all intermediate copies.
+The example uses `/var/tmp`; confirm that its backing volume is encrypted and
+has enough free space before proceeding.
+
+```sh
+gpu-ssh 'test "$(findmnt -n -o FSTYPE -T /run)" = tmpfs && sudo install -d -o root -g root -m 0700 /run/factory-r2-drill' </dev/null
+op read 'op://Factory/Factory SQLite backup age identity/credential' |
+	ssh -T "${FACTORY_SSH_USER:-$USER}@$FACTORY_GPU" 'sudo install -o root -g root -m 0600 /dev/stdin /run/factory-r2-drill/identity.txt'
+gpu-ssh 'sudo bash -s <<\REMOTE
+set -Eeuo pipefail
+umask 0077
+scratch=
+cleanup() {
+	if [[ -n $scratch ]]; then rm -rf -- "$scratch"; fi
+	rm -f /run/factory-r2-drill/identity.txt
+	rmdir /run/factory-r2-drill
+}
+trap cleanup EXIT
+trap "exit 1" HUP INT TERM
+scratch=$(mktemp -d /var/tmp/factory-r2-restore.XXXXXX)
+source /etc/factory-backup/nodes.conf
+export CREDENTIALS_DIRECTORY=/etc/credstore
+export TMPDIR="$scratch"
+for entry in "${DBS[@]}"; do
+	name=${entry%%:*}
+	if [[ $name == atuin && ! -e ${entry#*:} ]]; then
+		printf "Skipping atuin: database not created\n"
+		continue
+	fi
+	directory="$LOCAL_ROOT/$BACKUP_HOST/$name"
+	stamp=$(find "$directory" -maxdepth 1 -type f -name "*.db.zst" -printf "%f\n" | LC_ALL=C sort | tail -n 1)
+	test -n "$stamp"
+	stamp=${stamp%.db.zst}
+	key="v1/daily/$BACKUP_HOST/$name/$stamp.tar.age"
+	printf "Restore-check %s\n" "$key"
+	timeout --kill-after=10s 15m "$R2_PYTHON" /usr/local/lib/factory-backup/offsite.py \
+		--endpoint "$R2_ENDPOINT" --bucket "$R2_BUCKET" restore \
+		--key "$key" --identity /run/factory-r2-drill/identity.txt
+done
+REMOTE' </dev/null
+gpu-ssh 'sudo test ! -e /run/factory-r2-drill/identity.txt' </dev/null
+```
+
+Check that each selected stamp matches a successful upload from step 5. Avoid a
+scheduled backup during this drill. Require both checksum checks and
+`factory-gpu/<db>: integrity_check=ok` for meter, requests, pricing, ups-control,
+and atuin if present. Record keys, checksums, versions, and results without DB
+contents. If delivery fails before the trap is installed, delete the tmpfs
+identity immediately. This GPU drill is authorized for activation. Use a clean
+recovery workstation for a compromise investigation.
+
+### 7. Verify backup:status and remove temporary worktrees
+
+Check the published status through the API's account without printing database
+contents or credentials:
+
+```sh
+gpu-ssh 'sudo -u factory-api python3 - <<\PY
+import json
+import time
+from pathlib import Path
+
+status = json.loads(Path("/var/lib/factory-backup-status/status.json").read_text())
+now = time.time() * 1000
+assert status and "r2" in status, "Missing backup status or r2 entry"
+for name, entry in status.items():
+	assert not entry.get("error"), f"{name}: backup error"
+	field = "recovery_point_ms" if name == "r2" else "last_success_ms"
+	stamp = entry.get(field)
+	assert stamp is not None and 0 <= now - stamp <= 26 * 3600 * 1000, f"{name}: stale or missing {field}"
+	if name == "r2":
+		assert entry.get("last_success_ms") is not None, "No R2 upload success"
+	print(f"{name}: fresh {field}, no error")
+PY' </dev/null
+gpu-ssh 'systemctl list-timers factory-backup.timer --no-pager' </dev/null
+```
+
+Wait for the API's next background evaluation. Check `GET /v1/alerts` through
+the normal authenticated API route and confirm no active `backup:status`
+warning. If a warning was active, confirm its recovery notification in Slack.
+Do not alter live DB or status permissions to manufacture an alert. The
+temporary-fixture alert tests described above cover failure and recovery paths.
+Record separately if real Slack delivery has not been verified.
+
+After all checks pass, remove both temporary worktrees as `agent`. Keep the
+deployed release-tag checkout unchanged.
+
+```sh
+console-ssh 'sudo -iu agent git -C /home/agent/work/factory worktree remove /tmp/factory-main' </dev/null
+gpu-ssh 'sudo -iu agent git -C /home/agent/work/factory worktree remove /tmp/factory-main' </dev/null
+```
+
+### Disable or roll back R2
+
+To disable R2, append `R2_ENABLED=0` to GPU's installed `nodes.conf`. Run the
+backup service once to remove the off-site status entry and verify that the
+local and peer path still succeeds. Preserve remote objects, old identities,
+and receipts. Revoke upload credentials separately.
+
+```sh
+gpu-ssh 'sudo tee -a /etc/factory-backup/nodes.conf >/dev/null <<\CONFIG
+
+R2_ENABLED=0
+CONFIG' </dev/null
+gpu-ssh 'sudo systemctl start factory-backup.service' </dev/null
+```
+
+If an artifact install needs rollback, use its recorded snapshot with
+`rollback-backup-config.sh SNAPSHOT` on that node. Configuration rollback
+includes `offsite.py`, but never deletes vault items, credstore files,
+encryption keys, or remote backups. To roll back the runtime, first disable R2
+and wait for any running backup to finish. Then run
+`sudo bash /tmp/factory-main/deploy/backup/rollback-offsite-runtime.sh SNAPSHOT`
+through `gpu-ssh`, using the root-owned runtime snapshot
+`/opt/factory-backup-r2-snapshots/install.*` recorded in step 1. Pass the exact
+snapshot directory, not the wildcard. These rollback
+scripts live in the temporary worktree. If it has been removed, recreate the
+same reviewed commit before using them. Runtime rollback changes only the
+runtime and leaves credentials and backups intact.
