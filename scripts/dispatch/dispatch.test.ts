@@ -3096,6 +3096,14 @@ test('MET-282: a fresh heartbeat skips the lifecycle; silence runs it and pages 
   assert.equal(records(skipped.stdout).some((line: any) => line.decision === 'dispatched'), false);
   assert.equal(fresh.allMutations.length, 0);
   assert.deepEqual(cursor(fresh), [], 'a skipped poll writes no ledger cursor');
+  // Linear sends x-ratelimit-requests-limit on every response, including the heartbeat read.
+  const limited = await fixture(t, [issue()], { heartbeats: () => [beat(silenceMs - 1)],
+    linearResponse: () => ({ headers: { 'x-ratelimit-requests-remaining': '2499', 'x-ratelimit-requests-limit': '2500' } }) });
+  const limitedRun = await limited.run(['poll'], { FAKE_NOW: String(now) });
+  assert.equal(limitedRun.code, 0, limitedRun.stdout);
+  assert.equal(records(limitedRun.stdout).some((line: any) => line.decision === 'odd-backstop-unread'), false, limitedRun.stdout);
+  assert.equal(records(limitedRun.stdout).some((line: any) => line.decision === 'odd-backstop'), true);
+  assert.deepEqual(limited.linearRequests.map((request: any) => request.operation), ['Heartbeat']);
 
   // The poll runs at now + 20 min. A heartbeat written 1 ms after `now` is 19 min 59.999 s old.
   for (const [label, bodies] of [
