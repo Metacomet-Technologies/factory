@@ -154,7 +154,7 @@ if [[ ${R2_ENABLED:-0} == 1 ]]; then
         --endpoint "${R2_ENDPOINT:-}" --bucket "${R2_BUCKET:-}" push \
         --root "$LOCAL_ROOT" --host "$BACKUP_HOST" --stamp "$STAMP" \
         --recipient "${R2_RECIPIENT_FILE:-}" "${names[@]}"; then
-        python3 "$state" offsite "$STATUS_FILE" ok
+        python3 "$state" offsite "$STATUS_FILE" ok "$STAMP"
     else
         python3 "$state" offsite "$STATUS_FILE" failed
         echo 'Off-site push failed; local backup, peer push and retention succeeded.' >&2

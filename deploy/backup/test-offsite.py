@@ -107,6 +107,11 @@ DBS=("meter:$METER_DB")
             keys = objects()
             assert len(keys) == 2 and all(key.startswith("v1/daily/factory-gpu/meter/") for key in keys)
             key = next(key for key in keys if key.endswith(".age"))
+            snapshot_second = int(dt.datetime.strptime(Path(key).name[:15], "%Y%m%dT%H%M%S")
+                                  .replace(tzinfo=dt.timezone.utc).timestamp()) * 1000
+            before_recovery_point = status()["r2"]["recovery_point_ms"]
+            assert snapshot_second <= before_recovery_point < snapshot_second + 1000
+            assert before_recovery_point < status()["r2"]["last_success_ms"]
             encrypted = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
             assert encrypted.startswith(b"age-encryption.org/v1\n")
             assert b"synthetic private data" not in encrypted and b"SQLite format" not in encrypted
@@ -194,15 +199,18 @@ DBS=("meter:$METER_DB")
             assert status()["meter"]["last_success_ms"] >= status()["meter"]["last_attempt_ms"]
             assert status()["r2"]["error"].startswith("Off-site push failed")
             assert status()["r2"]["last_success_ms"] == before_success
+            assert status()["r2"]["recovery_point_ms"] == before_recovery_point
             assert all(not path.exists() for path in expired)
             assert objects() == before_keys
             run(backup, dict(enabled, METER_DB=str(root / "missing.db")), success=False)
             assert status()["r2"]["error"].startswith("Off-site push failed")
+            assert status()["r2"]["recovery_point_ms"] == before_recovery_point
             assert objects() == before_keys
             s3.delete_bucket_policy(Bucket=bucket)
             run(backup, enabled)
             assert status()["r2"]["error"] is None
             assert status()["r2"]["last_success_ms"] > before_success
+            assert status()["r2"]["recovery_point_ms"] > before_recovery_point
             print("PASS: denied PUT preserves local/peer success and pruning; prior failure survives local failure; retry recovers")
 
             s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{

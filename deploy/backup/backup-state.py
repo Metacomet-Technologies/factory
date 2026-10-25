@@ -62,7 +62,9 @@ def status(path, operation, args):
             entry["last_attempt_ms"] = now
             entry["error"] = entry.get("error") or "Off-site push pending"
         elif args[0] == "ok":
-            entry.update(last_success_ms=now, error=None)
+            recovery_point = dt.datetime.fromisoformat(args[1])
+            entry.update(last_success_ms=now, error=None,
+                         recovery_point_ms=int(recovery_point.timestamp() * 1000))
         else:
             entry["error"] = "Off-site push failed; local backup and peer retention completed"
     elif operation == "fatal":

@@ -14,16 +14,20 @@ The following RPOs are **proposed acceptable data-loss budgets**, not measured
 SLAs. A daily backup gives roughly 24 hours of loss between successful runs.
 The 03:15 host-local schedule adds up to ten minutes of jitter, snapshot/upload
 time, and a possible 25-hour interval at the DST transition. Failures extend
-the recovery-point age until another upload succeeds.
+the recovery-point age until another upload succeeds. The proposed maximum
+recovery-point age is **26 hours** for each active daily database, including
+that schedule margin. Both local freshness and off-site recovery-point alerts
+use this threshold. A stricter accepted RPO requires a shorter backup interval
+or a separately evaluated Litestream deployment.
 
 | Name | Host | Path | Covered today | System of record | RPO | Mechanism | Reason |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| meter | factory-gpu | `/srv/factory/meter/meter.db` | yes | yes: original request facts, GPU history and rollups | daily, nominal 24 h | snapshot-to-R2 | Historical observations cannot be recollected, but a day of operational telemetry loss is the proposed disaster budget. |
-| requests | factory-gpu | `/var/lib/factory-api/requests.db` | yes | yes: frozen costs, aggregates, UPS/device/network histories and settings; not just a meter cache | daily, nominal 24 h | snapshot-to-R2 | Explicitly accept losing up to a day's cost/operational history after whole-house loss. No current requirement establishes a minutes-level billing ledger. |
-| pricing | factory-gpu | `/var/lib/factory-api/pricing.db` | yes | yes: historical prices and operator selections | daily, nominal 24 h | snapshot-to-R2 | Refetching current prices cannot restore old rates or confirmations. Preserve the DB even though writes are infrequent. |
-| ups-control | factory-gpu | `/var/lib/factory-ups-control/audit.db` | yes | yes: action audit, confirmations, cooldowns and notification state | daily, nominal 24 h for history | snapshot-to-R2 | Restore with control disabled and reconcile physical actions first. A fresher asynchronous copy alone cannot make physical-action replay safe. |
-| dispatch | factory-gpu | `/home/agent/.local/state/factory-dispatch/dispatch.db` | no | yes: local claims, decisions, thread and QA/recovery state | daily, nominal 24 h; manual reconciliation before restart | snapshot-to-R2 | Linear/GitHub are reconciliation inputs, not a complete copy of the decision ledger. Add to inventory in rollout. |
-| atuin | factory-gpu, conditional on activation | `/var/lib/atuin/atuin.db` | yes in config; skipped if not created | no for history, assuming clients retain full encrypted history; yes for account/sync metadata | daily, nominal 24 h for server state | snapshot-to-R2 | Cheap server recovery; no continuous replication needed for a client-encrypted sync hub. Client retention is an assumption to confirm in the drill. |
+| meter | factory-gpu | `/srv/factory/meter/meter.db` | yes | yes: original request facts, GPU history and rollups | 26 h; daily snapshots | snapshot-to-R2 | Historical observations cannot be recollected, but about a day of operational telemetry loss is the proposed disaster budget. |
+| requests | factory-gpu | `/var/lib/factory-api/requests.db` | yes | yes: frozen costs, aggregates, UPS/device/network histories and settings; not just a meter cache | 26 h; daily snapshots | snapshot-to-R2 | Explicitly accept losing up to 26 hours of cost/operational history after whole-house loss. No current requirement establishes a minutes-level billing ledger. |
+| pricing | factory-gpu | `/var/lib/factory-api/pricing.db` | yes | yes: historical prices and operator selections | 26 h; daily snapshots | snapshot-to-R2 | Refetching current prices cannot restore old rates or confirmations. Preserve the DB even though writes are infrequent. |
+| ups-control | factory-gpu | `/var/lib/factory-ups-control/audit.db` | yes | yes: action audit, confirmations, cooldowns and notification state | 26 h for history; daily snapshots | snapshot-to-R2 | Restore with control disabled and reconcile physical actions first. A fresher asynchronous copy alone cannot make physical-action replay safe. |
+| dispatch | factory-gpu | `/home/agent/.local/state/factory-dispatch/dispatch.db` | no | yes: local claims, decisions, thread and QA/recovery state | 26 h; manual reconciliation before restart | snapshot-to-R2 | Linear/GitHub are reconciliation inputs, not a complete copy of the decision ledger. Add to inventory in rollout. |
+| atuin | factory-gpu, conditional on activation | `/var/lib/atuin/atuin.db` | yes in config; skipped if not created | no for history, assuming clients retain full encrypted history; yes for account/sync metadata | 26 h for server state; daily snapshots | snapshot-to-R2 | Cheap server recovery; no continuous replication needed for a client-encrypted sync hub. Client retention is an assumption to confirm in the drill. |
 | meter-v0 | factory-gpu | `/var/backups/factory-db/factory-gpu/meter-v0/` | no: outside `DBS`, pruning and restore checks | yes: immutable historical archive | zero further loss after a verified one-time copy | snapshot-to-R2 | Upload every approved archive generation once, keep indefinitely, and include in restore drills. Do not silently discard history. |
 
 The live inventory comes from [nodes.conf](../deploy/backup/nodes.conf), not
@@ -331,32 +335,61 @@ or dispatcher jobs merely because a restored DB says they are pending.
 ## Monitoring
 
 The prototype adds an independent **`r2` entry** to the existing status object:
-`last_attempt_ms`, `last_success_ms`, and `error`. Local DB entries retain
-their existing meaning. `r2.last_success_ms` advances only after **all** current
-uploads and sidecars succeed; partial generation uploads do not count. A failed
-retry keeps the prior success timestamp, and a new local attempt preserves a
-prior off-site error. Turning the opt-in off removes the `r2` entry on the next
-run, so separately audit configuration to detect accidental disablement.
+`last_attempt_ms`, `last_success_ms`, `recovery_point_ms`, and `error`. Local DB
+entries retain their existing meaning. Only after **all** current uploads and
+sidecars succeed does `r2.last_success_ms` advance to the upload completion time
+and `r2.recovery_point_ms` to the snapshot generation's UTC timestamp. That
+timestamp precedes the sequential snapshots, so it is conservative for every DB
+in the generation. Partial uploads do not count. A failed retry preserves both
+timestamps, and a new local attempt preserves a prior off-site error. Turning
+the opt-in off removes `r2` on the next run; audit configuration separately to
+detect accidental disablement.
 
 `backup-state.py` publishes the whole status to
 `/var/lib/factory-backup-status/status.json` as `root:factory-api 0640`.
-Factory-api already reads arbitrary backup-entry names; no new collector or
-alert channel is required. Its **`backup:status`** rule alerts on `r2.error`,
-last success older than 36 hours, and `Off-site push pending` lasting two hours.
-The helper has a 15-minute total timeout plus a ten-second kill grace, and
-bounded S3 retries. Off-site failures do **not** block local or replica
-retention, and the backup unit remains successful when only R2 fails.
-Monitor this JSON/alert path, not just `systemctl is-failed`.
+All three conditions are implemented **in this PR**, using the existing
+factory-api `backup:status` warning and Slack engine:
 
-MET-152's readable-status publication fix is already in source. The recent
-two-day missed peer failure means deployment and alert delivery still need
-verification: test service-user readability, timestamp freshness, collector
-ingestion and actual notification delivery. Publication errors currently warn
-without failing backups; unreadable status provides no backup signal. Do not
-claim this PR repairs that monitoring blind spot. MET-334 must prove a denied
-upload produces the visible alert and recovery clears it. An independent
-off-house freshness check must also detect no new complete R2 pair for 36 hours,
-even when the house, API or local status publisher is unavailable.
+1. **Status unavailable or unreadable:** `AppState::alert_signals` detects a
+   missing file, denied read, invalid JSON, empty status, or a file above the
+   1 MB read limit. It supplies an explicit failed status entry instead of
+   silently dropping the backup signal. The next engine evaluation raises
+   `backup:status`, including when no previous alert exists.
+2. **Local backup stale:** the backup rule in `factory-api/src/alerts.rs`
+   raises the warning when any local DB's `last_success_ms` is more than
+   **26 hours** old. A new pending attempt does not hide an old success.
+   Existing local errors and never-successful entries also alert.
+3. **Off-site failed or stale:** the optional helper's failure is recorded as
+   `r2.error` by `factory-backup.sh` through `backup-state.py`. The same API
+   rule alerts on that error or an `r2.recovery_point_ms` more than **26 hours**
+   old. A recent upload receipt cannot hide an old recovery point. A missing
+   recovery point also alerts unless the initial push is still in progress.
+   `Off-site push pending` lasting two hours is a failure, not success.
+
+The engine checks these signals on its existing background cadence, deduplicates
+notifications, and sends recovery when healthy status returns. The helper has
+a 15-minute timeout plus a ten-second kill grace and bounded S3 retries. Off-site
+failure does **not** block local or replica retention; the backup unit remains
+successful when only R2 fails. Monitor the JSON/alert path, not just unit failure.
+
+`backup_status_failures_and_freshness_reach_slack` exercises the real collector,
+engine, and loopback Slack HTTP stub. Cases include an actual `PermissionDenied`
+read of a mode-000 temporary status file, missing/malformed/empty/oversized status,
+stale local success, failed upload, and a recent upload with an old recovery
+point. It checks alert delivery, deduplication, and recovery. `signal_rules`
+checks both sides of the 26-hour boundary and stuck-push handling. Moto tests
+prove failed pushes preserve the prior recovery point and local/peer retention.
+These checks use temporary data, not production paths or Slack credentials.
+
+Readable publication is already in source, but deployment and real notification
+delivery still need verification in MET-334. Publication errors remain warning-only:
+an old readable copy eventually becomes stale; a missing or unreadable copy now
+alerts immediately on evaluation. A stopped API, Slack outage, or whole-house
+loss cannot be reported reliably by this in-house engine. An independent
+off-house check must detect no complete daily R2 recovery point within 26 hours,
+using the timestamp in the object key rather than the upload time. The immutable
+meter-v0 archive has no daily freshness deadline; its complete approved inventory
+must remain present and pass the recurring restore drill.
 
 Run a **monthly independent restore drill for every active DB**, plus meter-v0,
 and before/after encryption-key rotation. Record object keys, checksums,
@@ -400,7 +433,7 @@ These are **future operator steps**, not actions taken by this investigation.
 6. In an approved maintenance window, install the reviewed backup artifacts,
    console first, GPU second, **with R2 disabled**. The existing installer
    stops/restarts backup units; do not run it as a read-only check. Deploy the
-   API pending-marker change through its normal release process. Repeat local
+   API monitoring changes through its normal release process. Repeat local
    and peer checks and verify the API-readable status file and notifications.
 7. On GPU only, atomically deliver the child JSON to `/etc/credstore/factory-r2`
    (`root:root 0600`, parent `0700`). Install the public recipient file. Configure
@@ -416,8 +449,11 @@ These are **future operator steps**, not actions taken by this investigation.
 
 8. Approve one immediate backup, then independently download and drill each
    active DB. Check local/replica retention and both local and `r2` status.
-   Test an intentionally denied off-site upload and its notification without
-   changing source DB permissions. Confirm the next successful run clears it.
+   Exercise unavailable status, stale local success, denied off-site upload,
+   and stale off-site recovery points using a separate temporary status fixture
+   read by a test API instance. Never change live DB or status permissions to
+   test alerts. Confirm delivery and recovery, then verify the production
+   collector reads the published status successfully.
 9. Add dispatch under its own verified rollout; inventory and upload meter-v0
    once with archive-scoped credentials. Record the complete object inventory
    off-house. Activate independent freshness/renewal monitoring and monthly
