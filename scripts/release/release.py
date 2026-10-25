@@ -4,6 +4,7 @@ import argparse
 import gzip
 import hashlib
 import io
+from itertools import islice
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -18,6 +19,7 @@ import urllib.request
 
 REPO = "Metacomet-Technologies/factory"
 SCHEMA = 1
+BATCH_SIZE = 5
 API_VERSION = "2026-03-10"
 # PR merge_commit_sha was removed in 2026-03-10; keep exact-merge evidence.
 PR_API_VERSION = "2022-11-28"
@@ -654,7 +656,7 @@ def build_pending(api, root, inventory, directory):
     """Read-only job: transfer plans and verified bundles, never reserve a tag."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=False)
-    plans = list(planned(api, root, inventory))
+    plans = list(islice(planned(api, root, inventory), BATCH_SIZE))
     (directory / "plans.json").write_bytes(canonical(plans))
     for plan in plans:
         output = directory / "bundles" / plan["release_tag"]
@@ -669,13 +671,15 @@ def publish_downloaded(api, root, inventory, directory):
     """Write-enabled job: validate the entire handoff before any remote write."""
     directory = Path(directory)
     plans = json.loads((directory / "plans.json").read_bytes())
-    current = list(planned(api, root, inventory))
+    require(isinstance(plans, list) and len(plans) <= BATCH_SIZE,
+            "downloaded plans exceed the release batch limit; rebuild before publishing")
+    current = list(islice(planned(api, root, inventory), BATCH_SIZE))
     # planned() is first-parent ordered and each plan depends only on earlier
     # history and tags, so merges during the build only append plans. Publish
-    # the downloaded prefix; the queued run reconciles the newer SHAs.
+    # the downloaded prefix; a successful publication queues the next batch.
     prefix = plans == current or (plans and plans == current[:len(plans)])
     if api.waiting_for_ci and not prefix:
-        return  # CI restarted during the build; wait without reserving anything.
+        return False  # CI restarted; wait without writes or a continuation loop.
     require(prefix, "downloaded plans differ from current reconciliation; rebuild before publishing")
     if len(current) > len(plans):
         print(f"{len(current) - len(plans)} newer plans remain for the next run", file=sys.stderr)
@@ -694,6 +698,7 @@ def publish_downloaded(api, root, inventory, directory):
         with tempfile.TemporaryDirectory() as output:
             result = publish_one(api, plan, source_inventory, output, copy_verified)
         print(plan["release_tag"], plan["source_sha"], result, flush=True)
+    return bool(plans)
 
 
 def main():
@@ -754,7 +759,9 @@ def main():
         require(os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("GITHUB_REF") == "refs/heads/main",
                 "live publish is restricted to the approved main workflow; use the fake API for fixtures")
         require(args.directory, "publish requires a downloaded build directory")
-        publish_downloaded(api, args.root, inventory, args.directory)
+        if publish_downloaded(api, args.root, inventory, args.directory) and os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                output.write("published=true\n")
 
 
 if __name__ == "__main__":

@@ -495,11 +495,13 @@ class Releases(unittest.TestCase):
 
     def test_workflow_passes_same_recovery_hint_to_both_jobs(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertEqual(workflow.count("RESUME_RELEASE: ${{ inputs.resume_release }}"), 2)
+        self.assertEqual(workflow.count("RESUME_RELEASE: ${{ inputs.resume_release }}"), 3)
         self.assertEqual(workflow.count('resume_args+=(--resume-release "$RESUME_RELEASE")'), 2)
         for command in ("build", "publish"):
             self.assertIn('release.py ' + command + ' --directory "$RUNNER_TEMP/release-build" "${resume_args[@]}"', workflow)
         self.assertIn('[[ -z "$REQUESTED_TAG" ]]', workflow)
+        self.assertIn('--raw-field resume_release="$RESUME_RELEASE"', workflow)
+        self.assertIn('--raw-field create_reserved_releases="$CREATE_RESERVED_RELEASES"', workflow)
 
     def test_recovery_rejects_bad_identity_reservation_and_conflicting_list(self):
         for identity in ("v0.2.1=0", "v0.2.1=-1", "v0.2.1=True", "v0.2.1=01",
@@ -827,6 +829,7 @@ class Releases(unittest.TestCase):
         plans = json.loads(plans_path.read_bytes())
         self.assertEqual([(p["source_sha"], p["release_tag"]) for p in plans], [(first, "v0.2.1"), (second, "v0.3.0")])
         argv = ["release.py", "publish", "--root", str(root), "--directory", str(handoff)]
+        output = self.directory / "github-output"
         original_run = subprocess.run
 
         def only_git_reads(args, *positional, **kwargs):
@@ -834,7 +837,8 @@ class Releases(unittest.TestCase):
             return original_run(args, *positional, **kwargs)
 
         with patch.object(r, "GitHub", return_value=api), patch.object(sys, "argv", argv), \
-                patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REF": "refs/heads/main"}), \
+                patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REF": "refs/heads/main",
+                                        "GITHUB_OUTPUT": str(output)}), \
                 patch.object(r, "build_exact", side_effect=AssertionError("publisher invoked build_exact")), \
                 patch.object(subprocess, "run", side_effect=only_git_reads), redirect_stdout(io.StringIO()):
             changed = copy.deepcopy(plans)
@@ -869,17 +873,75 @@ class Releases(unittest.TestCase):
                 self.assertIsNone(r.main())
             self.assertIn(f"waiting for CI on {first} run 1", message.getvalue())
             self.assertEqual(api.writes, 0)
+            self.assertFalse(output.exists(), "pending CI must not queue a continuation")
             api.runs[1]["status"] = "completed"
             api.crash_at, api.crash_after = 4, True
             with self.assertRaises(OSError):
                 r.main()
+            self.assertFalse(output.exists(), "failed publication must not queue a continuation")
             api.crash_at = None
             self.assertIsNone(r.main())
+            self.assertEqual(output.read_text(), "published=true\n")
             self.assertEqual([release["tag_name"] for release in api.releases], ["v0.2.1", "v0.3.0"])
             self.assertEqual(len(api.uploaded), len(set(api.uploaded)))
             for p in plans:
                 r.verify_bundle(handoff / "bundles" / p["release_tag"], inventory, p["source_sha"],
                                 r.release_for(api, p["release_tag"]))
+
+    def test_backlog_publishes_in_batches_without_skipping_a_failed_boundary(self):
+        root, inventory, first, second = self.history()
+        shas = [first, second]
+        for number in range(3, 9):
+            (root / "another").write_text(f"merge {number}")
+            commit(root, f"merge {number}")
+            shas.append(r.git(root, "rev-parse", "HEAD"))
+        run(root, "git", "update-ref", "refs/remotes/origin/main", shas[-1])
+        api = FakeGitHub()
+        for number, sha in enumerate(shas, 1):
+            api.eligible(sha, number)
+        api.runs[6]["conclusion"] = "failure"
+        first_batch = self.directory / "batch-1"
+        with patch.object(r, "build_exact", side_effect=lambda root, p, d: fixture_build(p, d, inventory)):
+            r.build_pending(api, root, inventory, first_batch)
+        plans_path = first_batch / "plans.json"
+        plans = json.loads(plans_path.read_bytes())
+        self.assertEqual([(p["source_sha"], p["release_tag"]) for p in plans],
+                         list(zip(shas[:5], ["v0.2.1", "v0.2.2", "v0.2.3", "v0.2.4", "v0.2.5"])))
+        self.assertEqual(api.writes, 0)
+        plans_path.write_bytes(r.canonical(plans + [plan(shas[5], "v0.2.6")]))
+        with self.assertRaisesRegex(ValueError, "batch limit"):
+            r.publish_downloaded(api, root, inventory, first_batch)
+        self.assertEqual(api.writes, 0)
+        plans_path.write_bytes(r.canonical(plans))
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(r.publish_downloaded(api, root, inventory, first_batch))
+        self.assertEqual([release["tag_name"] for release in api.releases],
+                         ["v0.2.1", "v0.2.2", "v0.2.3", "v0.2.4", "v0.2.5"])
+        writes = api.writes
+        with self.assertRaisesRegex(ValueError, "inspect/rerun CI run 6"):
+            r.build_pending(api, root, inventory, self.directory / "blocked")
+        self.assertEqual(api.writes, writes)
+        api.runs[6]["conclusion"] = "success"
+        second_batch = self.directory / "batch-2"
+        with patch.object(r, "build_exact", side_effect=lambda root, p, d: fixture_build(p, d, inventory)):
+            r.build_pending(api, root, inventory, second_batch)
+        self.assertEqual([p["source_sha"] for p in json.loads((second_batch / "plans.json").read_bytes())], shas[5:])
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(r.publish_downloaded(api, root, inventory, second_batch))
+        self.assertEqual([release["tag_name"] for release in api.releases],
+                         ["v0.2.1", "v0.2.2", "v0.2.3", "v0.2.4", "v0.2.5", "v0.2.6", "v0.2.7", "v0.2.8"])
+        self.assertTrue(all(not release["draft"] and release["immutable"] for release in api.releases))
+        empty = self.directory / "drained"
+        r.build_pending(api, root, inventory, empty)
+        self.assertEqual(json.loads((empty / "plans.json").read_bytes()), [])
+        self.assertFalse((empty / "bundles").exists())
+        output = self.directory / "empty-output"
+        argv = ["release.py", "publish", "--root", str(root), "--directory", str(empty)]
+        with patch.object(r, "GitHub", return_value=api), patch.object(sys, "argv", argv), \
+                patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REF": "refs/heads/main",
+                                        "GITHUB_OUTPUT": str(output)}):
+            r.main()
+        self.assertFalse(output.exists(), "drained history must stop automatic continuation")
 
     def test_advancing_history_publishes_downloaded_prefix_then_next_run_reconciles(self):
         root, inventory, first, second = self.history()
@@ -1052,6 +1114,7 @@ class RunnerProvisioning(unittest.TestCase):
     def test_historical_sandbox_gets_system_bubblewrap_before_build(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         build, publish = workflow.split("\n  publish:\n", 1)
+        publish, continuation = publish.split("\n  continue:\n", 1)
         install = "sudo apt-get install --no-install-recommends -y bubblewrap"
         probe = "env -i PATH=/usr/bin:/bin bwrap --unshare-net --ro-bind / / true"
         self.assertIn("runs-on: ubuntu-22.04", build)
@@ -1065,10 +1128,22 @@ class RunnerProvisioning(unittest.TestCase):
         self.assertNotIn("dpkg-deb", build)
         self.assertIn("contents: read", build)
         self.assertNotIn("contents: write", build)
-        self.assertIn("contents: write", publish)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", build)
+        self.assertNotIn("FACTORY_RELEASE_TOKEN", build)
+        self.assertIn("GH_TOKEN: ${{ secrets.FACTORY_RELEASE_TOKEN }}", publish)
+        self.assertNotIn("GH_TOKEN: ${{ github.token }}", publish)
+        self.assertIn("contents: read", publish)
+        self.assertNotIn("contents: write", publish)
         self.assertNotIn("sudo", publish)
         self.assertNotIn("apt-get", publish)
         self.assertNotIn("bwrap", publish)
+        self.assertNotIn("actions: write", build + publish)
+        self.assertIn("actions: write", continuation)
+        self.assertNotIn("FACTORY_RELEASE_TOKEN", continuation)
+        self.assertNotIn("checkout@", continuation)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", continuation)
+        self.assertIn("if: needs.publish.outputs.published == 'true'", continuation)
+        self.assertIn("gh workflow run release.yml --repo Metacomet-Technologies/factory --ref main", continuation)
 
     def test_sanitized_runtime_ignores_user_space_bubblewrap(self):
         # Reproduce why an outer PATH/GITHUB_PATH entry cannot fix old checkouts.
@@ -1175,4 +1250,3 @@ if __name__ == "__main__":
         build_fixture(Path(sys.argv[2]))
     else:
         unittest.main(verbosity=2)
-

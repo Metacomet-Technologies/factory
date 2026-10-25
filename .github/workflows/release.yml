@@ -112,9 +112,11 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     permissions:
-      contents: write
+      contents: read
       actions: read
       pull-requests: read
+    outputs:
+      published: ${{ steps.publication.outputs.published }}
     steps:
       # Only trusted main release.py runs here. Never execute downloaded content,
       # install dependencies, or build in the job that holds the write credential.
@@ -128,11 +130,13 @@ jobs:
           name: release-build
           path: ${{ runner.temp }}/release-build
       - name: Revalidate plans and publish verified bundles (never build or deploy)
+        id: publication
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.FACTORY_RELEASE_TOKEN }}
           RESUME_RELEASE: ${{ inputs.resume_release }}
           CREATE_RESERVED_RELEASES: ${{ inputs.create_reserved_releases }}
         run: |
+          [[ -n "$GH_TOKEN" ]] || { echo 'Missing FACTORY_RELEASE_TOKEN; see docs/release.md publishing credential'; exit 1; }
           resume_args=()
           if [[ -n "$CREATE_RESERVED_RELEASES" ]]; then
             [[ "$CREATE_RESERVED_RELEASES" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(,v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))*$ ]] || { echo 'Invalid reserved tags'; exit 1; }
@@ -144,3 +148,20 @@ jobs:
           fi
           python3 scripts/release/release.py publish --directory "$RUNNER_TEMP/release-build" "${resume_args[@]}"
 
+  continue:
+    needs: publish
+    if: needs.publish.outputs.published == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Queue the next batch after successful publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESUME_RELEASE: ${{ inputs.resume_release }}
+          CREATE_RESERVED_RELEASES: ${{ inputs.create_reserved_releases }}
+        run: |
+          gh workflow run release.yml --repo Metacomet-Technologies/factory --ref main \
+            --raw-field resume_release="$RESUME_RELEASE" \
+            --raw-field create_reserved_releases="$CREATE_RESERVED_RELEASES"
