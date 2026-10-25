@@ -3,6 +3,7 @@
 
 import datetime as dt
 import contextlib
+import grp
 import hashlib
 import importlib.util
 import io
@@ -114,6 +115,7 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
                        LOCAL_ROOT=str(root / "local"),
                        REPLICA_ROOT=str(root / host / "replica"),
                        PEER_REPLICA_ROOT=str(root / peer / "replica"),
+                       BACKUP_USER="users",
                        PUBLISHED_STATUS="",
                        STATUS_FILE=str(root / host / "status" / "status.json"))
             env.pop("BACKUP_CONFIG", None)
@@ -160,6 +162,11 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
                     if name == names[0]:
                         assert duplicate.name in {p.name for p in copies}
                     latest = copies[-1]
+                    latest_checksum = Path(str(latest) + ".sha256")
+                    assert latest.stat().st_mode & 0o777 == 0o640
+                    assert latest_checksum.stat().st_mode & 0o777 == 0o640
+                    assert grp.getgrgid(latest.stat().st_gid).gr_name == "users"
+                    assert grp.getgrgid(latest_checksum.stat().st_gid).gr_name == "users"
                     subprocess.run(["zstd", "-q", "-t", str(latest)], check=True)
                     subprocess.run(["sha256sum", "-c", latest.name + ".sha256"],
                                    cwd=latest.parent, check=True, capture_output=True)
@@ -176,6 +183,17 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
                 assert entry["last_success_ms"] >= entry["last_attempt_ms"] > 0
                 assert entry["integrity"] == "ok" and entry["pushed_to_peer"]
                 assert entry["error"] is None and entry["size_bytes"] > 0
+        # The production service runs this root-owned script. Exercise its SSH
+        # branch with a DB name that did not exist when the host tree was made.
+        fresh = root / "freshly-added.db"
+        with contextlib.closing(sqlite3.connect(fresh)) as db:
+            db.execute("CREATE TABLE sample(value INTEGER)")
+        ssh_snapshot = dict(environments["factory-gpu"], BACKUP_TRANSPORT="ssh", LOCAL_ROOT=str(root / "ssh-local"),
+                            STAMP="20261025T191000.000000000Z")
+        run("factory-backup.sh", ssh_snapshot, "--snapshot", "freshly-added", str(fresh))
+        fresh_directory = Path(ssh_snapshot["LOCAL_ROOT"]) / "factory-gpu" / "freshly-added"
+        assert fresh_directory.stat().st_mode & 0o777 == 0o750
+        assert grp.getgrgid(fresh_directory.stat().st_gid).gr_name == "users"
         print("PASS: five live WAL snapshots including Atuin, integrity, zstd, checksum, local/replica retention")
     finally:
         stop.set()

@@ -26,4 +26,9 @@ install -d -m 0755 /etc/systemd/system/amp-runner.service.d
 install -o root -g root -m 0644 "$here/amp-runner-agent-env.conf" "$target"
 systemctl daemon-reload
 cmp "$here/amp-runner-agent-env.conf" "$target"
-printf 'Prepared only. Snapshot: %s\nRestart explicitly when ready: systemctl restart amp-runner.service\n' "$snapshot"
+printf 'Prepared only. Snapshot: %s\n' "$snapshot"
+printf '%s\n' \
+    'Follow up explicitly, in order:' \
+    '1. systemctl restart amp-runner.service' \
+    "2. pid=\$(systemctl show amp-runner.service -p MainPID --value); tr '\\0' '\\n' < \"/proc/\$pid/environ\" | grep -Fx 'NO_COLOR=1'" \
+    '3. rm /etc/factory/agent.env'

@@ -98,7 +98,12 @@ exit 97''')
             self.success("install-agent-env.sh", TEST_HOST=host)
             self.assertEqual(target.read_bytes(), (HERE / "amp-runner-agent-env.conf").read_bytes())
             initial = self.snapshot("agent-env")
-            self.success("install-agent-env.sh", TEST_HOST=host)
+            result = self.success("install-agent-env.sh", TEST_HOST=host)
+            self.assertIn("Follow up explicitly, in order:", result.stdout)
+            self.assertLess(result.stdout.index("systemctl restart amp-runner.service"),
+                            result.stdout.index("NO_COLOR=1"))
+            self.assertLess(result.stdout.index("NO_COLOR=1"),
+                            result.stdout.index("rm /etc/factory/agent.env"))
             self.success("rollback-agent-env.sh", str(initial).replace(str(self.root), ""), TEST_HOST=host)
             self.assertFalse(target.exists())
             shutil.rmtree(self.root / "var/backups/factory-agent-env")
