@@ -82,7 +82,8 @@ with tempfile.TemporaryDirectory(prefix="factory-offsite-test ' ") as temp:
                                  "INSERT INTO events VALUES(7, 'synthetic private data'), (29, 'second row');")
             original = database.read_bytes()
             config = root / "nodes.conf"
-            config.write_text(f'''source '{HERE / "nodes.conf"}'
+            config.write_text((HERE / "nodes.conf").read_text().replace(
+                "/etc/factory-backup/r2.conf", shlex.quote(str(root / "r2.conf"))) + f'''
 BACKUP_USER='{grp.getgrgid(os.getgid()).gr_name}'
 DBS=("meter:$METER_DB")
 ''')

@@ -398,7 +398,7 @@ not prerequisites for this rollout. The 26-hour budget, static token, shared
 Factory vault recovery with Dave, and lack of off-house monitoring are approved.
 
 Run these commands in Devon's existing Mac zsh session with the client helpers
-loaded from `~/factory/client/factory.zsh`, as described in the
+loaded from `client/factory.zsh` in your factory clone (e.g. `~/Code/factory`), as described in the
 [Mac client setup](../client/README.md). Do not start Bash or source that file
 in Bash. It uses zsh-only syntax. Use an approved maintenance window.
 The backup-permissions hotfix and API monitoring
@@ -548,19 +548,22 @@ gpu-ssh 'sudo /usr/local/lib/factory-backup/restore-check.sh all' </dev/null
 ```
 
 Each installer stops and restarts backup units, replaces installed `nodes.conf`,
-runs a local backup with peer replication, and enables the timer. Record each
+runs a local backup with peer replication, and enables the timer. It never writes
+the operator-owned `/etc/factory-backup/r2.conf`. On a reinstall after activation,
+that file preserves R2 settings. Record each
 printed configuration rollback path. Require checksum and integrity success
 on both nodes. Atuin may be skipped if its database has not been created.
 Do not change ownership or modes to bypass a failed check.
 
 ### 5. Enable R2 on GPU and run one backup
 
-Append these non-secret overrides to GPU's root-owned configuration. Leave
-console disabled. Re-running this block repeats the same effective settings.
+Write these non-secret overrides to GPU's operator-owned `r2.conf`,
+`root:root 0644`. `nodes.conf` sources it after the R2 defaults; artifact
+reinstalls and configuration rollback never write it. Leave console disabled.
+Re-running this block replaces the file with the same settings.
 
 ```sh
-gpu-ssh 'sudo tee -a /etc/factory-backup/nodes.conf >/dev/null <<\CONFIG
-
+gpu-ssh 'sudo install -o root -g root -m 0644 /dev/stdin /etc/factory-backup/r2.conf <<\CONFIG
 # MET-334 approved off-site backup settings.
 R2_ENABLED=1
 R2_ENDPOINT=https://25c7d5cf9a2dbcd9238a95f54cfeedff.r2.cloudflarestorage.com
@@ -674,21 +677,23 @@ gpu-ssh 'sudo -iu agent git -C /home/agent/work/factory worktree remove /tmp/fac
 
 ### Disable or roll back R2
 
-To disable R2, append `R2_ENABLED=0` to GPU's installed `nodes.conf`. Run the
+To disable R2, replace GPU's `/etc/factory-backup/r2.conf` with the explicit
+override below, keeping it `root:root 0644`. Run the
 backup service once to remove the off-site status entry and verify that the
 local and peer path still succeeds. Preserve remote objects, old identities,
 and receipts. Revoke upload credentials separately.
 
 ```sh
-gpu-ssh 'sudo tee -a /etc/factory-backup/nodes.conf >/dev/null <<\CONFIG
-
+gpu-ssh 'sudo install -o root -g root -m 0644 /dev/stdin /etc/factory-backup/r2.conf <<\CONFIG
 R2_ENABLED=0
 CONFIG' </dev/null
 gpu-ssh 'sudo systemctl start factory-backup.service' </dev/null
 ```
 
 If an artifact install needs rollback, use its recorded snapshot with
-`rollback-backup-config.sh SNAPSHOT` on that node. Configuration rollback
+`rollback-backup-config.sh SNAPSHOT` on that node. First disable R2 using
+`r2.conf` above; rollback deliberately preserves that operator-owned file.
+To re-enable it later, repeat step 5. Configuration rollback
 includes `offsite.py`, but never deletes vault items, credstore files,
 encryption keys, or remote backups. To roll back the runtime, first disable R2
 and wait for any running backup to finish. Then run
