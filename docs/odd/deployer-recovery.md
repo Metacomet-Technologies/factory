@@ -1,65 +1,103 @@
-# Recover the automatic deployer after v0.2.10
+# Reconcile the manually recovered v0.2.49 host
 
-Operator procedure, not an instruction for an agent to execute. Nothing in this
-patch authorizes a host change, deployment, publication, or recovery issue write.
-Run the Mac commands below only after approving the corrected tools commit and
-the backlog deployment (including any DB migrations). Replace `FIX_SHA` with
-that exact reviewed, merged commit, never a moving `origin/main` expression.
+**Keep `factory-deploy.timer` paused.** This replaces the earlier blind-backlog
+recovery instructions. Neither this document nor PR #203 authorizes host access,
+deployment, ledger writes, receipt writes, publishing, merging or timer resumption.
+Commands below are for Devon to run from the Mac with `gpu-ssh`, only after the
+specific approval named in each section. Agents must not run them.
 
-The incident has two separate observations: the timer cannot load `deploy.ts`
-after its checkout of v0.2.10, and the old meter installer rejected the full-SHA
-artifact before creating a snapshot. `lastTag=v0.2.10` / meter `health=fail`
-records a handled failed attempt, not the identity or health of the live meter.
-Do not roll back a service merely because that field is red.
+## Actual baseline and preserved recovery evidence
 
-The deployer selects stable published tags **oldest first above `lastTag`**.
-That is why it chose v0.2.10, not the newest release. Recovery preserves this
-ordering and drains the backlog to the newest eligible release containing both
-this fix and PR #201; it does not jump the ledger to that release. The corrected
-tools stay pinned while source moves in a separate worktree. Never copy scripts
-into an old checkout, checkout an old release over the tools, or force a dirty
-tree clean. A source checkout aliasing the tools is explicitly refused.
+Devon manually installed verified immutable **v0.2.49**, source
+`6c157fe65cb9e4c4e07d55548b4cd3f6f2253240` (PR #199), on 2026-10-25.
+No agent accessed or changed the host. This is operator-reported acceptance,
+not historical CI evidence or a claim that automation has recovered.
 
-## Release prerequisite: both fixes must be published
+- `/home/agent/work/factory` is clean and detached at v0.2.49, **not current
+  main**. No local changes were discarded. It contains neither #201 nor #203.
+- The timer was stopped and confirmed inactive/dead throughout verification.
+  The old service had failed with exit 1 because `scripts/odd/deploy.ts` was
+  missing after the historical checkout.
+- The ledger is **unchanged**: `lastTag=v0.2.10`, meter `health=fail`. That is a
+  failed-but-handled preflight with no snapshot, not current meter health.
+- Original ledger and installed deploy units:
+  `/var/backups/factory-recovery/20261025T231919Z`.
+- Verified downloads and verifier/inventory copies:
+  `/home/agent/.local/state/factory-odd/recovery-v0.2.49.OQJGo1Eu`;
+  assets in `assets/`, extracted kiosk in `kiosk/`. Anonymous verification said
+  `complete: exact SHA, inventory and every digest verified`.
+- Meter snapshot: `/var/backups/meter/20261025T232402.354793393Z.4w93jR`.
+- API snapshot: `/var/backups/factory-api/20261025T232511.471622044Z.vLvf4i`.
+  Private install log:
+  `/var/backups/factory-recovery/20261025T231919Z/factory-api-install-20261025T232511Z.log`.
+  Do not publish its fleet or production contents.
+- Kiosk snapshot: `/var/backups/factory-kiosk/20261025T232610.784694875Z.QpszNR`.
 
-PR #201 merged as `dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef`. At the
-2026-10-25 investigation, published releases ended at v0.2.44 and none contained
-it. In the current patch-only sequence #201 would first be v0.2.51, but this is
-not a confirmed published tag. Do not use that prediction as a deployment
-target. The ancestry and immutable-bundle checks below determine the real tag.
+Meter reported preflight mode=v2; API requests=v6, pricing=v1. No schema-version
+upgrade was indicated. Meter's fresh archive checksum, restored-copy integrity/
+counts and rollup checks passed. API exited 0 with health/pricing/fleet/service-user
+checks passing. Kiosk's atomic install and GET `/` comparison passed. Ollama was
+not restarted; kiosk needed no restart.
 
-Pause the timer and preserve evidence (step 1) before approving publication.
-Merge the deployer fix only after review and green PR CI, then require successful
-exact-merge-SHA main CI (`rust`, `kiosk`, `scripts`, `sandbox`). Let the existing
-publisher reconcile and continue its batches. If it stalls, inspect its error
-and reservations using [release recovery](../release.md); do not skip a failed
-predecessor, move a tag, delete a draft, or change the activation baseline.
-If a publication wakeup is needed, the operator may separately approve and run
-this **publishing** command on the Mac (not during patch development):
+Three checks 20 seconds apart found all three components at the full v0.2.49
+SHA, `git_dirty=false`; meter/API version=0.2.49 and status=ok. API expected and
+observed meter OpenAPI fingerprints matched meter. Meter, API, Ollama and
+amp-runner were active, and the deploy timer remained inactive. The refreshed
+dashboard showed matching versions/SHAs and live data. A synthetic inference
+through meter on the existing qwen2.5-coder:14b returned `FACTORY_OK` (36 input,
+4 output tokens); the same request appeared in Live requests (45.9 seconds).
+Preserve this evidence and the snapshots; do not rerun the installations as
+part of reconciling deployment bookkeeping.
+
+## Why neither replay nor an edited cursor is acceptable
+
+The old deployer chose the oldest pending stable tag above `lastTag`, hence
+v0.2.10 rather than the newest release. After manual recovery, replay beginning
+at v0.2.11 would downgrade all three components: a reverse Git diff still lists
+changed files. Runtime isolation alone did not prevent this.
+
+The revised planner refuses a target older than, or divergent from, any known
+installed/recorded baseline before an installer or new receipt can run. Dirty
+or unresolvable reported identities are not treated as absent to evade that
+guard. An approved manual baseline also supplies a minimum SHA, and unexpected
+live drift below it or unavailable/degraded baseline evidence stops deployment
+(an already recorded in-flight component retains its probe/rollback recovery).
+
+`reconcile-manual v0.2.49` previews an explicit adoption. It fetches tags, verifies
+a fresh immutable release bundle with the current verifier, then checks all
+three live components three times 20 seconds apart: full SHA, clean flag,
+version, build timestamp and input fingerprint must match the verified manifest;
+meter/API must be healthy and their OpenAPI contracts must agree. Mixed versions,
+dirty tools/source, incompatible ledger identities, pending receipts/in-flight
+installs, missing PR lookups and non-monotonic ancestry stop reconciliation.
+It does not install, roll back, change services, write the ledger or contact Linear.
+It writes only verification scratch files and its preview output.
+
+With a separately reviewed `--approve PREVIEW_SHA256`, it repeats verification
+and atomically **adds** `manualBaseline`: exact approved tag/SHA, tools commit,
+manifest digest, a preserved copy of the original ledger, and a per-release issue
+inventory. `lastTag`, failed component records and snapshots remain unchanged.
+Changes to the ledger, tools, release/issue inventory or manifest invalidate the
+approval. An interrupted acknowledgement can be retried with the same hash; it
+does not rewrite an existing adoption. A second adoption needs a new reviewed
+recovery design, not replacement of the first record.
+
+This recorded adoption is an explicit no-replay floor, **not a historical success
+receipt**. v0.2.10 remains `prior-attempt`; intervening releases are `not-replayed`;
+v0.2.49 is `manual-install`. Every entry's requirements remain `unverified`.
+Only a later real forward deployment and receipt delivery advance `lastTag`.
+
+## Approval 1: install corrected machinery, without starting it
+
+After PR #203 has separately passed review and been merged, approve its exact
+merged tools commit. Pause any other operator changes. First confirm the timer
+is inactive and the service has `MainPID=0`; do not interrupt an active installer.
 
 ```sh
-gh workflow run release.yml --ref main --repo Metacomet-Technologies/factory
+gpu-ssh 'systemctl show factory-deploy.timer -p ActiveState -p SubState; systemctl show factory-deploy.service -p ActiveState -p MainPID'
 ```
 
-Leave `tag` empty: that input only verifies an existing release. Existing hidden
-drafts or release-less reservations need the explicit, inspected recovery inputs
-documented in `docs/release.md`, not a blind retry. Keep GPU's timer paused until
-a verified target containing both commits exists. Publication alone does not
-install backup infrastructure: #201's API backup-health monitoring also needs
-the existing backup timer/log prerequisites. Do not run unrelated installers as
-part of this repair.
-
-## 1. Pause launches, let any current attempt finish, preserve evidence
-
-```sh
-gpu-ssh 'sudo systemctl disable --now factory-deploy.timer; systemctl show factory-deploy.service -p ActiveState -p SubState -p MainPID; systemctl list-timers --all factory-deploy.timer'
-```
-
-Require the service to be `inactive` or `failed`, with `MainPID=0`. If it is
-`activating`, wait and repeat the read-only `systemctl show`; the unit has a
-30-minute cap. Do not use `systemctl stop` to interrupt an installer. Keep other
-operators from running manual deploys or changing the tools checkout throughout
-this procedure. The job's lock is also used for the evidence copy:
+Preserve a new copy without overwriting the original recovery evidence:
 
 ```sh
 gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
@@ -68,39 +106,20 @@ umask 0077
 state=/home/agent/.local/state/factory-odd
 exec 9>>"$state/deploy.lock"
 flock -n 9
-backup=$(mktemp -d "$state/recovery-v0.2.10.XXXXXX")
+audit=$(mktemp -d "$state/reconciliation.XXXXXX")
 test -s "$state/deploy.json"
 python3 -m json.tool "$state/deploy.json" >/dev/null
-cp -p "$state/deploy.json" "$backup/deploy.json"
-sha256sum "$state/deploy.json" > "$backup/ledger.sha256"
-git -C /home/agent/work/factory rev-parse HEAD > "$backup/tools-before.sha"
-journalctl -u factory-deploy --since '2026-10-24' -o cat > "$backup/deploy.journal"
-printf 'Preserve recovery directory: %s\n' "$backup"
+cp -p "$state/deploy.json" "$audit/ledger-before.json"
+sha256sum "$state/deploy.json" > "$audit/ledger-before.sha256"
+git -C /home/agent/work/factory rev-parse HEAD > "$audit/tools-before.sha"
+printf 'AUDIT_DIR=%s\n' "$audit"
 AGENT
 ```
 
-Keep that printed path as `RECOVERY_DIR` below. Preserve release downloads,
-snapshots, `inFlight`, pending `receipt` and its `delivered` list. Never delete,
-reset, or advance the ledger to bootstrap past pending releases.
-
-## 2. Check what is actually running before changing anything
-
-```sh
-gpu-ssh 'systemctl show meter.service factory-api.service -p Id -p ActiveState -p MainPID -p ExecMainStartTimestamp; curl -fsS --max-time 10 http://127.0.0.1:11434/meter/health; echo; curl -fsS --max-time 10 http://127.0.0.1:8080/v1/health; echo; curl -fsS --max-time 10 http://127.0.0.1:8080/version.json; echo'
-```
-
-Save the reported SHAs, dirty flags, statuses and start times with the recovery
-evidence. A healthy pre-existing SHA is consistent with rejection before any
-deployment changes. An unreachable/degraded service requires investigation;
-do not infer that v0.2.10 replaced it or invent a rollback snapshot. Correlate
-with the saved journal's identity rejection and “No deployment changes made;
-no rollback snapshot exists.” Do not restart meter/API just to repair the timer.
-
-## 3. Install corrected machinery without starting the backlog
-
-After the patch is separately merged and approved, update only the clean tools
-checkout. The following stops on local changes; preserve and review them rather
-than forcing checkout, resetting, or cleaning the tree.
+Keep that printed `AUDIT_DIR`. A missing/corrupt ledger is a stop, not permission
+to bootstrap. Install the approved tools by Git checkout, never by copying files
+over historical source or relaxing the clean-tree checks. This changes deployment
+machinery, not the healthy running binaries or kiosk.
 
 ```sh
 gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
@@ -108,6 +127,7 @@ set -euo pipefail
 FIX_SHA=REPLACE_WITH_REVIEWED_MERGED_COMMIT
 cd /home/agent/work/factory
 test -z "$(git status --porcelain)"
+test "$(git rev-parse HEAD)" = 6c157fe65cb9e4c4e07d55548b4cd3f6f2253240
 git fetch --quiet --tags origin
 git merge-base --is-ancestor "$FIX_SHA" origin/main
 git checkout --detach "$FIX_SHA"
@@ -116,224 +136,135 @@ test -z "$(git status --porcelain)"
 scripts/env/check --env factory-gpu
 AGENT
 gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-deploy.sh --install-only'
-gpu-ssh 'systemctl cat factory-deploy.service; systemctl is-active factory-deploy.timer'
+gpu-ssh 'systemctl cat factory-deploy.service; systemctl show factory-deploy.timer -p ActiveState -p SubState'
 ```
 
-The final `is-active` should print `inactive` and return nonzero. The unit still
-executes `/home/agent/work/factory/scripts/odd/deploy.ts`, under its existing
-`flock`; sudoers is unchanged. `--install-only` snapshots/replaces the units,
-but does not start the job, enable the timer or touch the ledger. It refuses an
-active deploy service. Compare the preserved ledger before proceeding:
+Require the timer still inactive. Do not use the installer's default mode: that
+starts the job. If the tools were already updated, inspect the exact HEAD and
+unit rather than bypassing the v0.2.49 precondition or reinstalling blindly.
+
+## Approval 2: preview, review every deferred issue, then adopt
+
+Approve read-only service probes, GitHub reads and temporary verification
+downloads first. Both preview and adoption must hold the job's existing lock.
 
 ```sh
 gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
 set -euo pipefail
-RECOVERY_DIR=REPLACE_WITH_PRINTED_RECOVERY_DIRECTORY
-sha256sum -c "$RECOVERY_DIR/ledger.sha256"
-cmp "$RECOVERY_DIR/deploy.json" /home/agent/.local/state/factory-odd/deploy.json
-AGENT
-```
-
-Select and verify the newest stable immutable published release containing both
-commits. This reads every release page; GitHub's “latest” flag or a limited list
-is not an ancestry check. Run with the timer still stopped. The target is a
-minimum recovery goal, not a cap: a later eligible publication may also be
-processed by the job. A verification failure stops recovery, not selects an older
-target silently.
-
-```sh
-gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
-set -euo pipefail
-FIX_SHA=REPLACE_WITH_REVIEWED_MERGED_COMMIT
-RECOVERY_DIR=REPLACE_WITH_PRINTED_RECOVERY_DIRECTORY
-BACKUP_SHA=dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef
-cd /home/agent/work/factory
-test "$(git rev-parse HEAD)" = "$FIX_SHA"
-git fetch --quiet --tags origin
-gh api --paginate --slurp 'repos/Metacomet-Technologies/factory/releases?per_page=100' > "$RECOVERY_DIR/releases.json"
-python3 - "$RECOVERY_DIR/releases.json" <<'PY' > "$RECOVERY_DIR/candidates.txt"
-import json, re, sys
-releases = [r for page in json.load(open(sys.argv[1])) for r in page]
-tags = [r['tag_name'] for r in releases if not r['draft'] and not r['prerelease']
-        and r.get('immutable') is True and re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', r['tag_name'])]
-print('\n'.join(sorted(tags, key=lambda t: tuple(map(int, t[1:].split('.'))), reverse=True)))
-PY
-target=
-while IFS= read -r tag; do
-    test -n "$tag" || continue
-    sha=$(git rev-parse --verify "refs/tags/$tag^{commit}")
-    if git merge-base --is-ancestor "$FIX_SHA" "$sha" &&
-       git merge-base --is-ancestor "$BACKUP_SHA" "$sha" &&
-       git merge-base --is-ancestor "$sha" origin/main; then
-        target=$tag
-        break
-    fi
-done < "$RECOVERY_DIR/candidates.txt"
-test -n "$target" || { echo 'No published target contains both fixes; keep timer stopped and finish publication.' >&2; exit 1; }
-git show "$sha:deploy/components.json" > "$RECOVERY_DIR/target-inventory.json"
-bundle=$(mktemp -d "$RECOVERY_DIR/verified.XXXXXX")
-python3 scripts/release/release.py verify --anonymous --tag "$target" --sha "$sha" --inventory "$RECOVERY_DIR/target-inventory.json" --directory "$bundle"
-jq -n --arg tag "$target" --arg sha "$sha" --arg tools "$FIX_SHA" '{tag:$tag, sha:$sha, tools:$tools}' > "$RECOVERY_DIR/target.json"
-cat "$RECOVERY_DIR/target.json"
-AGENT
-```
-
-## 4. Explicitly reconcile the handled failure; do not rewrite it as success
-
-Inspect the ledger as `agent` and resolve the immutable tag's full commit:
-
-```sh
-gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
-set -euo pipefail
-cd /home/agent/work/factory
-sha=$(git rev-parse 'refs/tags/v0.2.10^{commit}')
-jq --arg sha "$sha" -e '
-  .lastTag == "v0.2.10" and .components.meter.tag == "v0.2.10" and
-  .components.meter.sha == $sha and .components.meter.health == "fail" and
-  (.components.meter.snapshot == null) and (.inFlight == null) and (.receipt == null)
-' /home/agent/.local/state/factory-odd/deploy.json
-git log --first-parent --format='%s' v0.2.9..v0.2.10
-AGENT
-```
-
-This predicate is specific to the confirmed incident. If it fails, stop and
-inspect the differing state. A pending receipt is resumed, not deleted; an
-in-flight install may need its recorded snapshot. Do not apply these assumptions
-to another failure.
-
-For the PRs printed above, read their `closes`/`contributes` issue references
-(`gh pr view NUMBER --repo Metacomet-Technologies/factory --json body`). Compare
-the saved journal's `receipt`, `receipt-exists` or `receipt-skipped` entries with
-the actual issue comments. `lastTag` means the job finished its delivery loop,
-not that every issue was in Deploying or received a comment. Record which
-issues received the exact v0.2.10 `health=fail rollback=none` receipt and which
-were skipped. Missing promised delivery needs separate investigation, not a
-forged pass receipt or a replay by editing the ledger.
-
-Record the operator decision with the recovery evidence: **retain v0.2.10 as a
-failed-but-handled attempt with no deployment changes; resume at the next
-published tag in order.** Keep `lastTag=v0.2.10` and its failed meter record
-untouched. The corrected machinery does not silently reattempt handled tags.
-The failed record is not a healthy baseline; subsequent releases evaluate the
-real healthy running SHA and retry missing component inputs. If an exact
-v0.2.10 replay is required, stop for a separately reviewed recovery plan.
-
-Do not clear an escalation or mark v0.2.10's issues Done from the ledger or a
-later unrelated receipt. Later receipts cover their own release's issues;
-earlier issues still need their own evidence-based reconciliation after health
-is confirmed. Issue changes require separate operator authorization.
-
-## 5. Resume, confirm deployment and receipts, then re-enable the timer
-
-Starting this service deploys the pending backlog, not only one canary. Approve
-that effect first, including migrations and their backup/rollback prerequisites.
-
-```sh
-gpu-ssh 'sudo systemctl reset-failed factory-deploy.service; sudo systemctl start factory-deploy.service'
-gpu-ssh 'journalctl -u factory-deploy --since -1h -o cat; systemctl show factory-deploy.service -p Result -p ExecMainStatus'
-gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
-set -euo pipefail
-cd /home/agent/work/factory
-git rev-parse HEAD
-git status --porcelain
-git -C /home/agent/.local/state/factory-odd/source rev-parse HEAD
-git -C /home/agent/.local/state/factory-odd/source status --porcelain
-jq '{lastTag, components, inFlight, receipt}' /home/agent/.local/state/factory-odd/deploy.json
-AGENT
-```
-
-Require the tools HEAD to remain `FIX_SHA`, both checkouts clean, no
-`MODULE_NOT_FOUND`, and the pending log to start with the oldest tag after
-v0.2.10 (not the newest published tag). Match each plan/install/probe/rollback
-to its ledger result. Repeat step 2: successful changed components must report
-their deployed full SHA (or valid short prefix), clean and healthy. Check the
-actual recipient issue comments against the journal receipts; no duplicates,
-and no unexplained skips. A delivery error leaves `receipt` pending; rerun the
-service after resolving the error to finish delivery without reinstalling.
-A new handled failure exits nonzero and retains its failed record: investigate
-before allowing the next tick, never edit `lastTag` to get past it.
-
-Require `Result=success` and `ExecMainStatus=0` from a completed service run,
-then verify the deployed tag against the target and #201. Components unchanged
-by later tags can correctly run an earlier SHA; the API itself must contain
-#201, not just the tools or `lastTag`.
-
-```sh
-gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
-set -euo pipefail
-RECOVERY_DIR=REPLACE_WITH_PRINTED_RECOVERY_DIRECTORY
+umask 0077
+AUDIT_DIR=REPLACE_WITH_PRINTED_AUDIT_DIRECTORY
 state=/home/agent/.local/state/factory-odd
 cd /home/agent/work/factory
-test "$(git rev-parse HEAD)" = "$(jq -r .tools "$RECOVERY_DIR/target.json")"
-test -z "$(git status --porcelain)"
-jq -e '(.inFlight == null) and (.receipt == null) and ([.components[].health] | all(. == "pass"))' "$state/deploy.json"
-tag=$(jq -er .lastTag "$state/deploy.json")
-sha=$(git rev-parse --verify "refs/tags/$tag^{commit}")
-git merge-base --is-ancestor "$(jq -r .sha "$RECOVERY_DIR/target.json")" "$sha"
-test "$(git -C "$state/source" rev-parse HEAD)" = "$sha"
-test -z "$(git -C "$state/source" status --porcelain)"
-curl -fsS --max-time 10 http://127.0.0.1:8080/v1/health > "$RECOVERY_DIR/api-after.json"
-jq -e '.status == "ok" and .git_dirty == false' "$RECOVERY_DIR/api-after.json"
-api_sha=$(jq -er .git_sha "$RECOVERY_DIR/api-after.json")
-git merge-base --is-ancestor dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef "$api_sha"
-printf 'Handled deployed tag: %s (%s); healthy API: %s\n' "$tag" "$sha" "$api_sha"
+sha256sum -c "$AUDIT_DIR/ledger-before.sha256"
+flock -n "$state/deploy.lock" node scripts/odd/deploy.ts reconcile-manual v0.2.49 > "$AUDIT_DIR/preview.json"
+cmp "$AUDIT_DIR/ledger-before.json" "$state/deploy.json"
+jq '{tag,sha,toolsSha,manifestSha256,priorLedger,releases,approval}' "$AUDIT_DIR/preview.json"
 AGENT
 ```
 
-Inspect `backup:status` in `GET /v1/alerts` and the API-readable
-`/var/lib/factory-backup-status/status.json`; `/v1/health` does not expose backup
-health. Correlate with the existing backup timer, log freshness and journal
-([alert contract](../alerts.md)). A red backup status must be reconciled
-on its own evidence; do not disable monitoring to obtain green health. Preserve
-the final ledger, health responses, service result and actual issue receipts with
-the recovery evidence. A no-op run or a green timer alone does not prove the
-backlog or receipt delivery succeeded.
+Review all `releases[].issues`, **including v0.2.10's failed attempt**. Ancestry
+establishes source containment only: it cannot establish Done means, prove a
+change was not reverted, install disabled components on another host, apply a
+migration, or prove operational behavior. For each issue, read its current
+Isolation/Build/Done means/Evidence and latest merge, check the deployed source
+still implements it, and identify which evidence can be rerun on v0.2.49.
+Evidence requiring #201, #203, another host or an undeployed installer remains
+outstanding. Unmapped PRs, incomplete issue references and skipped earlier
+receipts require investigation; an empty list is not proof of completion.
 
-Once the backlog and receipts are accounted for:
+Before approving adoption, explicitly accept and assign the deferred verification
+work in this inventory. Keep findings in the private audit record. Approve any
+live evidence execution separately. Do not turn ancestry or the synthetic
+inference alone into blanket acceptance. Preserve the original red receipt and
+escalation until its actual requirements are checked.
+
+Only after Devon approves **this exact preview hash and its no-replay floor**:
 
 ```sh
-gpu-ssh 'sudo systemctl enable --now factory-deploy.timer; systemctl is-enabled factory-deploy.timer; systemctl is-active factory-deploy.timer; systemctl list-timers --all factory-deploy.timer'
+gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
+set -euo pipefail
+umask 0077
+AUDIT_DIR=REPLACE_WITH_PRINTED_AUDIT_DIRECTORY
+APPROVAL=REPLACE_WITH_REVIEWED_PREVIEW_SHA256
+state=/home/agent/.local/state/factory-odd
+cd /home/agent/work/factory
+flock -n "$state/deploy.lock" node scripts/odd/deploy.ts reconcile-manual v0.2.49 --approve "$APPROVAL" > "$AUDIT_DIR/adoption.json"
+jq -e --arg approval "$APPROVAL" '.lastTag == "v0.2.10" and .components.meter.health == "fail" and .manualBaseline.tag == "v0.2.49" and .manualBaseline.approval == $approval' "$state/deploy.json"
+jq -e --slurpfile before "$AUDIT_DIR/ledger-before.json" '.manualBaseline.priorLedger == $before[0] and (del(.manualBaseline) == $before[0])' "$state/deploy.json"
+AGENT
 ```
 
-After at least two minutes, inspect `journalctl -u factory-deploy --since -5min
--o cat` and the ledger again. Confirm a subsequent timer invocation loads the
-same tools and either reports no pending releases or processes the next release
-normally. Timer `active` alone is not success. If recovery must stop, disable
-the timer again and preserve state.
+This is the sole approved ledger mutation in this step: adding the bound adoption
+record. No hand-edit, reset or cursor rewrite. The command makes no Linear writes.
+Any eventual issue comment, status change or deploy/verify receipt needs explicit
+per-issue approval, names the **actual deployed v0.2.49 SHA**, and cites that
+issue's executed evidence. Never emit `odd-deploy health=pass` for an uninstalled
+historical SHA. Machine receipts trigger the control plane; their effects must
+be included in that approval. Adoption itself leaves requirements unverified.
 
-## 6. Roll back without restoring the broken runtime
+## Forward deployment remains a separate approval
 
-First disable the timer as in step 1, wait for `MainPID=0`, and preserve a new
-copy of the ledger and journal. Do not restore the pre-recovery ledger: it would
-replay deployments and receipts. Do not check out v0.2.10 or the saved
-`tools-before.sha` over the corrected tools. Keep `FIX_SHA` in place.
+Do not start the service or enable the timer merely because adoption passed.
+Historical exact-SHA CI/publishing recovery is independently owned by
+[the release recovery thread](https://ampcode.com/threads/T-d71886d4-9b1b-40d6-a00f-7ce0ea1e0cad).
+Its historical CI gate is unresolved; #202's green CI and this manual acceptance
+cannot replace #201's failed historical CI. This runbook does not rerun CI,
+change publisher policy, move tags or skip unpublished commits.
 
-To remove the deploy machinery after the job has finished:
+After that blocker and the separate merge/publication steps are resolved, select
+the newest published immutable stable release whose Git commit contains **both**
+the reviewed #203 merge and #201 (`dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef`).
+Verify its exact bundle using `release.py verify --anonymous` with its source
+inventory as described in [release verification](../release.md). Do not use the
+predicted v0.2.51 number as evidence of publication. v0.2.49 contains neither fix.
+
+Obtain explicit approval for the forward backlog above v0.2.49, its migrations,
+backups/rollback prerequisites, normal receipt writes and deferred issue handling.
+The service processes **all** newer published pending tags, not just one canary.
+Only then may Devon authorize a service start. The first pending tag must be
+above the adopted baseline; any attempt at v0.2.11 or another older target is a
+stop. No resume commands are supplied here to execute prematurely.
+
+Acceptance before separately enabling the timer:
+
+- A completed `factory-deploy.service` run with `Result=success`,
+  `ExecMainStatus=0`; unchanged clean tools HEAD at the approved commit.
+- Ledger `lastTag` and the clean source worktree identify the handled forward
+  release; no pending `inFlight` or `receipt`. The `manualBaseline.priorLedger`
+  still contains the original failed attempt, and its deferred issues remain
+  accounted for independently.
+- Three healthy identity/contract probes 20 seconds apart. Components unchanged
+  in a later release may run an older SHA, but no component may fall below the
+  adopted floor; the healthy API must contain #201. Inspect `backup:status` via
+  `/v1/alerts` and its status file, not `/v1/health` alone.
+- Match actual issue comments to forward receipts. Retry delivery after resolving
+  errors without reinstalling; do not forge success or edit delivery state.
+- After explicit timer approval, confirm a subsequent scheduled run succeeds.
+  Timer `active` alone is not deployment/receipt evidence.
+
+## Rollback: preserve tools and evidence, do not restore an old ledger
+
+If any step fails, keep the timer paused, preserve the new journal/ledger and
+investigate. A failed preview/adoption does not require an application rollback.
+Do not restore `ledger-before.json` after adoption or forward work: that can
+replay deployments and receipts. Do not checkout an old release over fixed tools.
+
+To remove corrected timer machinery only, after separate approval and after
+confirming the service has finished (`MainPID=0`):
 
 ```sh
 gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-deploy.sh'
-gpu-ssh 'systemctl list-timers --all factory-deploy.timer; systemctl show factory-deploy.service -p LoadState -p ActiveState -p MainPID'
 ```
 
-This removes the units, not the ledger, downloads, source worktree or application
-services. Reinstall later with `--install-only` from the same corrected tools;
-never restore an old active timer pointing at missing code.
+This retains the ledger, downloads, source worktree and running applications.
+Reinstallation later must use `--install-only` and a newly reviewed plan.
 
-Application rollback is separate and requires the **actual complete snapshot**
-printed for that component's failed/reverted install. A successful automatic
-rollback needs a healthy re-probe; do not run it again merely because the receipt
-is red. v0.2.10 had no snapshot and must not use any of these commands. For a
-separately approved later rollback, run only the matching command, substituting
-the inspected absolute snapshot path (not all three):
-
-```sh
-gpu-ssh 'sudo /usr/bin/bash /home/agent/work/factory/deploy/rollback-meter-v1.sh /var/backups/meter/REPLACE_WITH_ACTUAL_SNAPSHOT'
-gpu-ssh 'sudo /usr/bin/bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/REPLACE_WITH_ACTUAL_SNAPSHOT'
-gpu-ssh 'sudo /usr/bin/bash /home/agent/work/factory/deploy/rollback-kiosk.sh /var/backups/factory-kiosk/REPLACE_WITH_ACTUAL_SNAPSHOT'
-```
-
-Review each snapshot's DB migration/restore contract first; restoring old data
-can lose newer writes. Never bypass an incomplete-snapshot or schema refusal.
-Repeat step 2 and match each restored SHA with the snapshot's previous binary
-and service state. Preserve and reconcile that manual rollback with the latest
-ledger before any later resumption; leave the timer disabled until reviewed.
+The v0.2.49 application snapshots above are real but would restore the versions
+**before** manual recovery. Do not run them merely because v0.2.10 remains red.
+For a separately approved application rollback, use only its matching script
+(`rollback-meter-v1.sh`, `rollback-factory-api.sh`, `rollback-kiosk.sh`) from the
+fixed tools checkout, with the exact inspected complete snapshot. Review DB
+restore/data-loss consequences first, and never bypass schema/snapshot refusal.
+Verify the restored SHA and service health. A rollback below the adopted floor
+intentionally blocks automatic forward deployment until a new recovery plan is
+approved; leave the timer paused and preserve all ledger history.

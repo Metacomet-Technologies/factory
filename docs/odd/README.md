@@ -287,8 +287,12 @@ Each artifact is machine-checkable before the next role starts.
   Job state: ledger `~/.local/state/factory-odd/deploy.json` (`lastTag`,
   per-component `sha`/`tag`/`health`/`snapshot`, `inFlight` for resume,
   `receipt` with the issues already handled so a crashed delivery resumes
-  without redeploying), log `journalctl -u factory-deploy`. A failed
-  component record is never a baseline, so the next release retries it.
+  without redeploying, optional approved `manualBaseline` preserving the prior
+  ledger and deferred issue inventory), log `journalctl -u factory-deploy`.
+  A failed component record is never a healthy baseline. Older/divergent
+  targets are refused, including when a manual recovery is ahead of `lastTag`.
+  Manual adoption adds a verified no-replay floor, not historical success
+  receipts; deferred issues need their own evidence and approval.
 - Verifier → Done: issue comment whose first line is `odd-verify
   sha=<receipt sha> result=<pass|fail> bug=<MET-n|none>`, then one line per
   Done-means item with its evidence link. The control plane sets `Done` on
@@ -391,8 +395,10 @@ by the previous one).
    Historical-release repair: the job now checks out source in a separate
    worktree and keeps compatible installers, verifier and timer entry point
    at the approved tools commit. See [recovery](deployer-recovery.md) for the
-   v0.2.10 failed-but-handled attempt; never reset the ledger to bootstrap
-   past the backlog.
+   healthy manual v0.2.49 install with a stale failed-but-handled v0.2.10
+   ledger. Keep the timer paused until explicit baseline reconciliation and
+   forward-deployment approval; never blindly replay older releases or reset
+   the ledger to bootstrap past them. Ancestry does not establish Done means.
 6. Verifier and Watchdog (MET-281): a green receipt spawns an Amp low
    verifier whose `odd-verify` line sets `Done`; the plugin runs a
    deterministic sweep every 10 minutes (`scripts/odd/watchdog.ts`) that

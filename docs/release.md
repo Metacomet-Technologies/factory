@@ -412,16 +412,27 @@ gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-deploy.sh'   # remov
 
 A failed component stops the release and exits non-zero; `lastTag` still
 advances and the failed record is not a baseline, so the next release is the
-retry even when it touches only docs. A run killed mid-component resumes that
-component first; a run killed while posting receipts posts the rest without
-redeploying, never twice to the same issue. A failed `gh pr view` keeps the
+retry even when it touches only docs. A target older than or divergent from any
+known live/healthy recorded baseline is refused before installation or a new
+receipt; reverse Git diffs must never authorize a downgrade. A run killed
+mid-component resumes that component after checking the whole plan; a run killed
+while posting receipts posts the rest without redeploying, never twice to the
+same issue. A failed `gh pr view` keeps the
 release pending until the issues can be found. Deleting the ledger makes the next
 run bootstrap again without deploying: never delete it as recovery. A dirty tools
 or source checkout blocks deployment until reviewed, and the job logs it each tick.
 
-For the v0.2.10 runtime-removal incident, use the separate
-[operator recovery procedure](odd/deployer-recovery.md). `install-deploy.sh
---install-only` installs the units with the timer stopped and without running
+GPU is now manually recovered to healthy immutable v0.2.49, with the original
+failed-but-handled v0.2.10 ledger and timer paused. Do not replay the older backlog.
+Use the separate [operator reconciliation procedure](odd/deployer-recovery.md).
+`reconcile-manual TAG` freshly verifies the immutable bundle and all live component
+identities/health, then previews a digest-bound adoption. Separate approval adds
+`manualBaseline` without changing `lastTag` or erasing failed records. This explicit
+no-replay floor preserves the old ledger and inventories deferred releases/issues
+as requirements-unverified, with no historical success receipts or Linear writes.
+Ancestry alone does not prove an issue's Done means. Forward deployment, deferred
+issue verification/receipts and timer resumption each need operator approval.
+`install-deploy.sh --install-only` installs the units with the timer stopped and without running
 the job or changing the ledger, allowing reconciliation before backlog deployment.
 `rollback-deploy.sh` still removes the units and retains all state, now including
 the source worktree; it does not rewind application deployments or the ledger.

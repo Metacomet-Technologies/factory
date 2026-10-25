@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, sym
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { ROOT, deployComponent, emptyLedger, issuesFromSubjects, main, parseSnapshot, pendingTags, plan, probeResult, receiptLine, recipes, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
+import { ROOT, deployComponent, emptyLedger, issuesFromSubjects, main, parseSnapshot, pendingTags, plan, probeResult, receiptLine, recipes, reconcileManual, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
 import { nextAction, parseDeployReceipt, type Action } from './lifecycle.ts';
 import plugin, { diagnose, page, setStatus } from '../../.amp/plugins/factory-odd.ts';
 
@@ -70,15 +70,15 @@ test('plan: changed inputs since the baseline, recipe order, skips components th
   const sources = { meter: ['meter', 'shared', 'factory-db'], 'factory-api': ['factory-api', 'shared', 'factory-db', 'pricing'], kiosk: ['kiosk', 'factory-api/openapi.json'], usage: ['scripts/usage'] };
   const changed = ['kiosk/src/App.tsx', 'docs/x.md', 'shared/build.rs', 'scripts/usage/collect.ts', 'deploy/factory-usage.timer'];
   const names = (ledger: Ledger, baselines: Record<string, string | undefined>) =>
-    plan({ sha, sources, baselines, ledger, changedSince: () => changed }).map(recipe => recipe.name);
+    plan({ sha, sources, baselines, ledger, changedSince: () => changed, isAncestor: () => true }).map(recipe => recipe.name);
   const all = { meter: 'base', 'factory-api': 'base', kiosk: 'base' };
   // Usage changed too, but it is not in the enabled set.
   assert.deepEqual(names(emptyLedger(), all), ['meter', 'factory-api', 'kiosk']);
   assert.deepEqual(names({ components: { meter: { sha, tag: 'v', health: 'pass' } } }, all), ['factory-api', 'kiosk']);
   // A failed attempt at this SHA is retried; a component with no baseline installs; a prefix match needs a path boundary.
   assert.deepEqual(names({ components: { meter: { sha, tag: 'v', health: 'fail' } } }, { ...all, kiosk: undefined }), ['meter', 'factory-api', 'kiosk']);
-  assert.deepEqual(plan({ sha, sources, baselines: all, ledger: emptyLedger(), changedSince: () => ['kiosk/x.ts'] }).map(recipe => recipe.name), ['kiosk']);
-  assert.deepEqual(plan({ sha, sources, baselines: all, ledger: emptyLedger(), changedSince: () => ['kiosk-docs/readme.md', 'docs/odd/README.md'] }), []);
+  assert.deepEqual(plan({ sha, sources, baselines: all, ledger: emptyLedger(), changedSince: () => ['kiosk/x.ts'], isAncestor: () => true }).map(recipe => recipe.name), ['kiosk']);
+  assert.deepEqual(plan({ sha, sources, baselines: all, ledger: emptyLedger(), changedSince: () => ['kiosk-docs/readme.md', 'docs/odd/README.md'], isAncestor: () => true }), []);
 });
 
 test('issues come from squash subjects and PR bodies; snapshots and probes parse installer and health output', () => {
@@ -103,7 +103,8 @@ test('issues come from squash subjects and PR bodies; snapshots and probes parse
 // executable bit; fake gh, git, sudo (installers move the live SHA, rollbacks restore it), curl
 // (health bodies from the live SHA) and Linear. No real sudo, network or Linear write.
 
-const shas = { 'v0.2.9': '0'.repeat(40), 'v0.3.0': '1'.repeat(40), 'v0.3.1': '2'.repeat(40) } as const;
+const shas = { 'v0.2.9': '0'.repeat(40), 'v0.2.10': 'a'.repeat(40), 'v0.2.11': 'b'.repeat(40),
+  'v0.2.49': '6c157fe65cb9e4c4e07d55548b4cd3f6f2253240', 'v0.2.50': 'c'.repeat(40), 'v0.3.0': '1'.repeat(40), 'v0.3.1': '2'.repeat(40) } as const;
 type Tag = keyof typeof shas;
 const order = Object.values(shas);
 const sources = { meter: ['meter', 'shared', 'factory-db'], 'factory-api': ['factory-api', 'shared', 'factory-db', 'pricing'], kiosk: ['kiosk', 'factory-api/openapi.json'], usage: ['scripts/usage'] };
@@ -147,14 +148,16 @@ function world(options: {
   let lostComment = options.lostComment;
   let failPrView = options.failPrView;
   const index = (value: string) => order.findIndex(full => full.startsWith(value));
-  const changedBetween = (from: string, to: string) => order.slice(index(from) + 1, index(to) + 1)
+  const changedBetween = (from: string, to: string) => order.slice(Math.min(index(from), index(to)) + 1, Math.max(index(from), index(to)) + 1)
     .flatMap(full => options.changes[(Object.keys(shas) as Tag[]).find(tag => shas[tag] === full)!] ?? []);
   const tagOf = (full: string) => (Object.keys(shas) as Tag[]).find(tag => shas[tag] === full)!;
+  const identity = (full: string) => ({ git_sha: full, git_dirty: false, version: tagOf(full).slice(1), built_at_ms: 1792900000000, inputs_fingerprint: '012345abcdef' });
   const healthBody = (component: string) => {
     const reported = live[component];
     const degraded = (options.broken?.includes(component) && reported !== before[component] && before[component] !== undefined)
       || (options.startDegraded?.includes(component) && reported === start[component]);
-    return JSON.stringify({ git_sha: reported, git_dirty: false, status: degraded ? 'degraded' : 'ok' });
+    return JSON.stringify({ ...identity(reported), status: degraded ? 'degraded' : 'ok',
+      openapi_sha256: 'abcdef123456', meter_openapi_expected: 'abcdef123456', meter_openapi_sha256: 'abcdef123456' });
   };
   const effects: Effects = {
     stateDir,
@@ -173,6 +176,7 @@ function world(options: {
         calls.push(`verify ${args[args.indexOf('--tag') + 1]}`);
         mkdirSync(dir, { recursive: true });
         for (const asset of ['meter-linux-x86_64', 'factory-api-linux-x86_64', 'kiosk.tar.gz']) writeFileSync(join(dir, asset), '#!/bin/sh\nexit 0\n', { mode: 0o644 });
+        writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ build_identity: Object.fromEntries(recipes.map(recipe => [recipe.name, identity(args[args.indexOf('--sha') + 1])])) }));
         return out('complete: exact SHA, inventory and every digest verified\n');
       }
       if (command === 'tar') return out('');
@@ -189,7 +193,8 @@ function world(options: {
       if (git[0] === 'diff') { const [from, to] = git[2].split('..'); return out(changedBetween(from, to).join('\n')); }
       if (git[0] === 'log') {
         const [from, to] = git.at(-1)!.split('..');
-        return out(order.slice(index(shas[from as Tag]) + 1, index(to) + 1).flatMap(full => (options.issues?.[tagOf(full)] ?? []).map(issue => `${issue}: change (#${issue.slice(4)})`)).join('\n'));
+        const before = from.endsWith('^') ? index(shas[from.slice(0, -1) as Tag]) - 1 : index(shas[from as Tag] ?? from);
+        return out(order.slice(before + 1, index(to) + 1).flatMap(full => (options.issues?.[tagOf(full)] ?? []).map(issue => `${issue}: change (#${issue.slice(4)})`)).join('\n'));
       }
       if (git[0] === 'checkout' && git.includes('--detach')) calls.push(`checkout ${git.at(-1)!.slice(0, 7)}`);
       return out('');
@@ -240,6 +245,166 @@ function world(options: {
 const baseline = (extra: Partial<Ledger> = {}): Ledger => ({ lastTag: 'v0.2.9', components: {}, ...extra });
 const sudoCalls = (calls: string[]) => calls.filter(call => call.startsWith('sudo'));
 const line = (fields: string) => `odd-deploy host=factory-gpu ${fields}`;
+
+function manuallyRecovered() {
+  const tags: Tag[] = ['v0.2.10', 'v0.2.11', 'v0.2.49'];
+  const host = world({ tags, ledger: { lastTag: 'v0.2.10', components: { meter: { tag: 'v0.2.10', sha: shas['v0.2.10'], health: 'fail' } } },
+    live: Object.fromEntries(recipes.map(recipe => [recipe.name, shas['v0.2.49']])),
+    changes: { 'v0.2.49': ['shared/build.rs', 'kiosk/src/App.tsx'], 'v0.2.50': ['shared/build.rs', 'kiosk/src/App.tsx'] },
+    issues: { 'v0.2.10': ['MET-310'], 'v0.2.11': ['MET-311'], 'v0.2.49': ['MET-349'], 'v0.2.50': ['MET-350'] }, failComment: 'MET-350' });
+  return { ...host, tags };
+}
+
+test('manual v0.2.49 / failed v0.2.10 ledger: refuse v0.2.11, explicitly adopt without historical receipts, then deploy forward and resume delivery', async t => {
+  const host = manuallyRecovered();
+  t.after(host.cleanup);
+  const original = host.ledger();
+  // The old planner selected all three: reverse git diff still lists changed files.
+  await assert.rejects(main(host.effects), /Refusing older or divergent release/);
+  assert.deepEqual(sudoCalls(host.calls), []);
+  assert.deepEqual(host.comments, []);
+  assert.deepEqual(host.ledger(), original);
+  const probe = host.effects.probe;
+  for (const override of [{ status: 'degraded' }, { git_dirty: true }, { git_sha: 'f'.repeat(40) }]) {
+    host.effects.probe = url => JSON.stringify({ ...JSON.parse(probe(url)), ...override });
+    await assert.rejects(main(host.effects), /older or divergent|Unverifiable|unknown revision/);
+    assert.deepEqual(sudoCalls(host.calls), []);
+    assert.deepEqual(host.ledger(), original, 'unhealthy or unverifiable identity cannot hide a newer install');
+  }
+  host.effects.probe = probe;
+  const preview = await reconcileManual(host.effects, 'v0.2.49');
+  assert.equal(preview.sha, '6c157fe65cb9e4c4e07d55548b4cd3f6f2253240');
+  assert.deepEqual(preview.priorLedger, original);
+  assert.deepEqual(preview.releases.map(({ tag, disposition, issues, requirements }) => ({ tag, disposition, issues, requirements })), [
+    { tag: 'v0.2.10', disposition: 'prior-attempt', issues: ['MET-310'], requirements: 'unverified' },
+    { tag: 'v0.2.11', disposition: 'not-replayed', issues: ['MET-311'], requirements: 'unverified' },
+    { tag: 'v0.2.49', disposition: 'manual-install', issues: ['MET-349'], requirements: 'unverified' },
+  ]);
+  assert.deepEqual(host.ledger(), original, 'preview writes no deployment state');
+  await assert.rejects(reconcileManual(host.effects, 'v0.2.49', '0'.repeat(64)), /plan changed/);
+  assert.deepEqual(host.ledger(), original);
+  await reconcileManual(host.effects, 'v0.2.49', preview.approval);
+  assert.deepEqual(host.ledger(), { ...original, manualBaseline: preview });
+  // An acknowledgement lost after the atomic write does not adopt twice or replay old tags.
+  await reconcileManual(host.effects, 'v0.2.49', preview.approval);
+  await main(host.effects);
+  assert.deepEqual(host.ledger(), { ...original, manualBaseline: preview });
+  assert.deepEqual(sudoCalls(host.calls), []);
+  assert.deepEqual(host.comments, [], 'ancestry never fabricates a historical pass or completes an issue');
+
+  host.tags.push('v0.2.50');
+  await assert.rejects(main(host.effects), /Linear 503/);
+  assert.equal(host.ledger().lastTag, 'v0.2.10', 'only actual forward receipt delivery may move lastTag');
+  assert.equal(host.ledger().receipt?.tag, 'v0.2.50');
+  assert.equal(sudoCalls(host.calls).length, 3);
+  await main(host.effects);
+  assert.equal(sudoCalls(host.calls).length, 3, 'receipt retry does not reinstall');
+  assert.deepEqual(host.live, Object.fromEntries(recipes.map(recipe => [recipe.name, shas['v0.2.50']])));
+  assert.equal(host.ledger().lastTag, 'v0.2.50');
+  assert.equal(host.ledger().receipt, undefined);
+  assert.deepEqual(host.ledger().manualBaseline?.priorLedger, original, 'original failed attempt survives later component replacement');
+  assert.deepEqual(host.comments, [['MET-350', line(`component=meter+factory-api+kiosk sha=${shas['v0.2.50']} health=pass rollback=none`)]]);
+});
+
+test('manual reconciliation fails closed on mixed, dirty, stale or unverifiable evidence without state/receipt writes', async t => {
+  const alterations: [string, (host: ReturnType<typeof manuallyRecovered>) => void][] = [
+    ['mixed', host => { host.live.kiosk = shas['v0.2.11']; }],
+    ...Object.entries({ git_dirty: true, git_sha: shas['v0.2.49'].slice(0, 7), version: '0.2.48', built_at_ms: 1,
+      inputs_fingerprint: '000000000000', meter_openapi_sha256: '111111111111', status: 'degraded' }).map(([key, value]) =>
+      [key, (host: ReturnType<typeof manuallyRecovered>) => {
+        const probe = host.effects.probe;
+        host.effects.probe = url => JSON.stringify({ ...JSON.parse(probe(url)), [key]: value });
+      }] as [string, (host: ReturnType<typeof manuallyRecovered>) => void]),
+    ['missing dirty flag', host => {
+      const probe = host.effects.probe;
+      host.effects.probe = url => { const body = JSON.parse(probe(url)); delete body.git_dirty; return JSON.stringify(body); };
+    }],
+    ['unreachable', host => { host.effects.probe = () => { throw new Error('unreachable'); }; }],
+    ['unstable third window', host => {
+      const probe = host.effects.probe;
+      let count = 0;
+      host.effects.probe = url => ++count >= 7 ? JSON.stringify({ ...JSON.parse(probe(url)), git_dirty: true }) : probe(url);
+    }],
+    ['invalid bundle', host => {
+      const run = host.effects.run;
+      host.effects.run = (command, args, options) => { if (command === 'python3') throw new Error('digest mismatch'); return run(command, args, options); };
+    }],
+    ['dirty tools', host => {
+      const run = host.effects.run;
+      host.effects.run = (command, args, options) => command === 'git' && args.includes('status') ? { stdout: ' M operator-edit', stderr: '' } : run(command, args, options);
+    }],
+    ['divergent ancestry', host => { host.effects.ok = () => false; }],
+    ['missing PR', host => {
+      const run = host.effects.run;
+      host.effects.run = (command, args, options) => { if (command === 'gh' && args[0] === 'pr') throw new Error('Could not resolve to a PullRequest'); return run(command, args, options); };
+    }],
+    ['pending receipt', host => host.effects.writeLedger({ ...host.ledger(), receipt: { tag: 'v0.2.11', receipt: { component: 'meter', sha: shas['v0.2.11'], health: 'fail', rollback: 'none' }, delivered: [] } })],
+    ['in-flight install', host => host.effects.writeLedger({ ...host.ledger(), inFlight: { tag: 'v0.2.11', sha: shas['v0.2.11'], component: 'meter', phase: 'installing' } })],
+    ['inconsistent ledger identity', host => host.effects.writeLedger({ ...host.ledger(), components: { meter: { tag: 'v0.2.10', sha: shas['v0.2.11'], health: 'fail' } } })],
+  ];
+  for (const [name, alter] of alterations) {
+    const host = manuallyRecovered();
+    t.after(host.cleanup);
+    alter(host);
+    const original = host.ledger();
+    await assert.rejects(reconcileManual(host.effects, 'v0.2.49'), undefined, name);
+    assert.deepEqual(host.ledger(), original, name);
+    assert.deepEqual(sudoCalls(host.calls), [], name);
+    assert.deepEqual(host.comments, [], name);
+  }
+});
+
+test('reconciliation approval binds issue inventory; adopted baseline drift and divergent planning cannot downgrade', async t => {
+  const host = manuallyRecovered();
+  t.after(host.cleanup);
+  const preview = await reconcileManual(host.effects, 'v0.2.49');
+  const run = host.effects.run;
+  host.effects.run = (command, args, options) => command === 'gh' && args[0] === 'pr'
+    ? { stdout: JSON.stringify({ body: 'closes MET-999' }), stderr: '' } : run(command, args, options);
+  await assert.rejects(reconcileManual(host.effects, 'v0.2.49', preview.approval), /plan changed/);
+  assert.equal(host.ledger().manualBaseline, undefined);
+  host.effects.run = run;
+  await reconcileManual(host.effects, 'v0.2.49', preview.approval);
+  host.tags.push('v0.2.50');
+  host.live.kiosk = shas['v0.2.11'];
+  await assert.rejects(main(host.effects), /Manual baseline drift/);
+  assert.deepEqual(sudoCalls(host.calls), []);
+  assert.deepEqual(host.comments, []);
+  assert.throws(() => plan({ sha: shas['v0.2.11'], baselines: { meter: shas['v0.2.49'] }, ledger: emptyLedger(), sources,
+    changedSince: () => [], isAncestor: () => false }), /older or divergent/, 'even a docs-only target cannot fabricate a historical pass');
+});
+
+test('adoption retains rollback recovery for an interrupted forward attempt with an unreachable component', async t => {
+  const host = manuallyRecovered();
+  t.after(host.cleanup);
+  const preview = await reconcileManual(host.effects, 'v0.2.49');
+  await reconcileManual(host.effects, 'v0.2.49', preview.approval);
+  host.tags.push('v0.2.50');
+  const snapshot = '/var/backups/meter/forward-snapshot';
+  host.effects.writeLedger({ ...host.ledger(), inFlight: { tag: 'v0.2.50', sha: shas['v0.2.50'], component: 'meter', phase: 'probing', snapshot } });
+  const probe = host.effects.probe;
+  let unreachable = true;
+  host.effects.probe = url => {
+    if (unreachable && url === recipes[0].health) throw new Error('connection refused');
+    return probe(url);
+  };
+  host.effects.sudo = (script, args) => {
+    assert.equal(script, 'deploy/rollback-meter-v1.sh');
+    assert.deepEqual(args, [snapshot]);
+    host.calls.push('rollback');
+    unreachable = false;
+    return { ok: true, output: '' };
+  };
+  await assert.rejects(main(host.effects), /Linear 503/);
+  assert.equal(host.ledger().receipt?.receipt.rollback, snapshot);
+  await assert.rejects(main(host.effects), /health=fail/);
+  assert.equal(host.calls.filter(call => call === 'rollback').length, 1);
+  assert.equal(host.ledger().lastTag, 'v0.2.50');
+  assert.equal(host.ledger().inFlight, undefined);
+  assert.deepEqual(host.ledger().manualBaseline, preview);
+  assert.deepEqual(host.live, Object.fromEntries(recipes.map(recipe => [recipe.name, shas['v0.2.49']])));
+  assert.deepEqual(host.comments, [['MET-350', line(`component=meter sha=${shas['v0.2.50']} health=fail rollback=${snapshot}`)]]);
+});
 
 test('real Git: releases predating the deployer cannot remove its runtime or tools, including the tick after a failed install', async t => {
   const temp = mkdtempSync(join(tmpdir(), 'odd-history-'));
@@ -313,7 +478,10 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
       live.set(recipes.find(recipe => recipe.installer === script)!.health, target);
       return { ok: true, output: 'Rollback snapshot: /var/backups/fixture/snap\n' };
     },
-    probe: url => JSON.stringify({ git_sha: live.get(url), git_dirty: false, status: 'ok' }),
+    probe: url => {
+      if (!live.has(url)) throw new Error('service unavailable');
+      return JSON.stringify({ git_sha: live.get(url), git_dirty: false, status: 'ok' });
+    },
     readLedger: () => structuredClone(ledger), writeLedger: next => { ledger = structuredClone(next); },
     linear: { deploying: async () => true, posted: async (id, body) => comments.some(([i, b]) => i === id && b === body), comment: async (id, body) => { comments.push([id, body]); } },
   };
