@@ -1,0 +1,30 @@
+[Unit]
+Description=Atuin history sync server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=atuin
+Group=atuin
+StateDirectory=atuin
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/atuin
+Environment=ATUIN_CONFIG_DIR=/etc/atuin
+ExecStart=/usr/local/bin/atuin-server start
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

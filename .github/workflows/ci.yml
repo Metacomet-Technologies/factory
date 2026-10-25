@@ -111,13 +111,19 @@ jobs:
         run: python3 scripts/release/test-release.py
       - name: Install script check dependencies
         run: |
+          # Shared host tools belong to the runner image, not Factory provisioning.
+          command -v shellcheck
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y shellcheck sqlite3 zstd rsync
+          sudo apt-get install --no-install-recommends -y sqlite3 zstd rsync
       - name: Check every deployment and version script
         run: |
           mapfile -d '' scripts < <(find deploy scripts -type f -name '*.sh' -print0)
           for script in "${scripts[@]}"; do bash -n "$script"; done
           shellcheck -x "${scripts[@]}"
+      - name: Lint shared client helpers
+        run: |
+          shellcheck -s bash -x client/factory.zsh
+          shellcheck -s bash -e SC2034 client/factory.env
       - name: Lint the installer and rollback contract
         run: |
           bash deploy/lint-installers.sh
@@ -135,6 +141,20 @@ jobs:
           DEVICES_TEST_GROUP="$devices_test_group" python3 -B deploy/devices/test-install.py
           python3 -B deploy/devices-agent/test-install.py
 
+  client:
+    name: client
+    timeout-minutes: 5
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Check shared Mac helpers offline
+        run: |
+          zsh -n client/factory.zsh
+          python3 -B client/test_factory.py
+
   sandbox:
     name: sandbox
     # 24.04's AppArmor policy blocks unprivileged network namespaces. Do not disable it.
@@ -147,6 +167,8 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
       - name: Converge to the sandbox toolchain contract (docs/environments.md)
         run: scripts/env/setup.sh --ci --env sandbox
+      - name: Test host configuration installers in isolated namespaces
+        run: python3 -B deploy/test-agent-host-config.py
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |

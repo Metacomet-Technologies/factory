@@ -108,7 +108,7 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
     threads = []
     environments = {}
     try:
-        for host, names in (("factory-gpu", ["meter", "requests", "pricing", "ups-control"]),):
+        for host, names in (("factory-gpu", ["meter", "requests", "pricing", "ups-control", "atuin"]),):
             peer = "factory-console" if host == "factory-gpu" else "factory-gpu"
             env = dict(os.environ, BACKUP_HOST=host, BACKUP_TRANSPORT="local",
                        LOCAL_ROOT=str(root / "local"),
@@ -176,7 +176,7 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
                 assert entry["last_success_ms"] >= entry["last_attempt_ms"] > 0
                 assert entry["integrity"] == "ok" and entry["pushed_to_peer"]
                 assert entry["error"] is None and entry["size_bytes"] > 0
-        print("PASS: four live WAL snapshots including ups-control, integrity, zstd, checksum, local/replica retention")
+        print("PASS: five live WAL snapshots including Atuin, integrity, zstd, checksum, local/replica retention")
     finally:
         stop.set()
         for thread in threads:
@@ -216,8 +216,8 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
     live_files = {path: hashlib.sha256(path.read_bytes()).digest() for path in root.glob("*.db*")}
     for env in environments.values():
         output = run("restore-check.sh", env, "all")
-        assert output.count("integrity_check=ok") == 4, output
-        assert output.count('odd"table: 3 rows') == 4, output
+        assert output.count("integrity_check=ok") == 5, output
+        assert output.count('odd"table: 3 rows') == 5, output
     assert all(hashlib.sha256(path.read_bytes()).digest() == digest for path, digest in live_files.items())
     print("PASS: restore-check reports every table and never changes live databases")
 
@@ -503,7 +503,8 @@ prepare_backup_account
             (fixture / "run/systemd/system").mkdir(parents=True)
             (fixture / "etc/systemd/system").mkdir(parents=True)
             for path in ("srv/factory/meter/meter.db", "var/lib/factory-api/requests.db",
-                         "var/lib/factory-api/pricing.db", "var/lib/factory-ups-control/audit.db"):
+                         "var/lib/factory-api/pricing.db", "var/lib/factory-ups-control/audit.db",
+                         "var/lib/atuin/atuin.db"):
                 db = fixture / path
                 db.parent.mkdir(parents=True, exist_ok=True)
                 db.touch()

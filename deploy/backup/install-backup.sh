@@ -7,7 +7,7 @@ fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ $# -eq 0 || ( $# -eq 1 && $1 == --prepare-only ) ]] || fail 'Expected --prepare-only or no arguments.'
 trap 'printf "ERROR: backup installation failed at line %s. Fix the error and rerun; no automatic rollback.\n" "$LINENO" >&2' ERR
 # Ignore development overrides during installation.
-unset BACKUP_CONFIG BACKUP_HOST BACKUP_HOME LOCAL_ROOT STATUS_FILE PUBLISHED_STATUS REPLICA_ROOT PEER_REPLICA_ROOT METER_DB REQUESTS_DB PRICING_DB UPS_CONTROL_DB BACKUP_TRANSPORT
+unset BACKUP_CONFIG BACKUP_HOST BACKUP_HOME LOCAL_ROOT STATUS_FILE PUBLISHED_STATUS REPLICA_ROOT PEER_REPLICA_ROOT METER_DB REQUESTS_DB PRICING_DB UPS_CONTROL_DB ATUIN_DB BACKUP_TRANSPORT
 # shellcheck source=deploy/backup/nodes.conf
 source "$here/nodes.conf"
 # shellcheck source=deploy/backup/account.sh

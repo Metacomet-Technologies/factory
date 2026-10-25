@@ -10,6 +10,10 @@
     "deploy/meter.service", "deploy/factory-api.service",
     "deploy/install-meter.sh", "deploy/rollback-meter.sh",
     "deploy/install-factory-api.sh", "deploy/rollback-factory-api.sh",
+    "deploy/atuin-server.service", "deploy/atuin-server.toml",
+    "deploy/install-atuin-server.sh", "deploy/rollback-atuin-server.sh",
+    "deploy/amp-runner-agent-env.conf", "deploy/install-agent-env.sh", "deploy/rollback-agent-env.sh",
+    "deploy/clean-environment.py", "deploy/install-environment-cleanup.sh", "deploy/rollback-environment-cleanup.sh",
     "deploy/install-kiosk.sh", "deploy/rollback-kiosk.sh",
     "deploy/factory-dispatch.service", "deploy/factory-dispatch.timer",
     "deploy/install-dispatch.sh", "deploy/rollback-dispatch.sh",
@@ -133,11 +137,11 @@
     {
       "id": "migration-and-host-tools", "artifact": "deployment.tar.gz", "sources": ["deploy", "scripts/release", "scripts/build-fingerprint.sh", "scripts/bump-version.sh"],
       "nodes": ["factory-gpu", "factory-console"],
-      "services": ["factory-devices-smart.service", "factory-devices-smart.timer", "factory-devices-maintenance.service", "factory-devices-maintenance.timer", "factory-devices-agent.service", "factory-deploy.service", "factory-deploy.timer"],
+      "services": ["factory-devices-smart.service", "factory-devices-smart.timer", "factory-devices-maintenance.service", "factory-devices-maintenance.timer", "factory-devices-agent.service", "factory-deploy.service", "factory-deploy.timer", "atuin-server.service"],
       "installer": null, "health": "No automatic health contract for migration, relocation or host changes",
       "rollback": "Procedure-specific human recovery; no automatic data restore",
       "eligibility": "ineligible", "reversible_candidate": false,
-      "constraints": "Packaging a script is not authority to execute it. Unknown components fail closed. deploy/devices and deploy/devices-agent installers are human-run; the devices-agent binary is not a release artifact."
+      "constraints": "Packaging a script is not authority to execute it. Unknown components fail closed. deploy/devices and deploy/devices-agent installers are human-run; the devices-agent binary is not a release artifact. Atuin server installation, runner environment and host cleanup are human-run only; the upstream Atuin binary is downloaded with its pinned checksum, not shipped as a Factory binary."
     },
     {
       "id": "external-host-services", "artifact": null, "sources": [],
