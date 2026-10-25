@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 
 REPO = "Metacomet-Technologies/factory"
@@ -212,7 +213,8 @@ def git(root, *args):
 
 
 class GitHub:
-    """Fixed repository/hosts; no alternate credential transport or automatic write retry."""
+    """Fixed repository/hosts; no alternate credential transport or automatic write retry.
+    Authenticated GETs retry HTTP 5xx at most three attempts in total."""
     def __init__(self, anonymous=False):
         self.tag_objects = {}
         self.release_ids = None
@@ -245,7 +247,13 @@ class GitHub:
         elif data is not None:
             args += ["--input", "-"]
             payload = canonical(data)
-        result = subprocess.run(args, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+        for attempt in range(3):
+            result = subprocess.run(args, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+            # Only reads retry, and only on 5xx; writes and uploads never retry.
+            if (result.returncode == 0 or method != "GET" or upload is not None or attempt == 2
+                    or not re.search(rb"HTTP 5\d\d", result.stderr)):
+                break
+            time.sleep(5)
         require(result.returncode == 0, f"GitHub {method} {path} failed; inspect remote state before retry: "
                 + result.stderr.decode(errors="replace")[-1200:])
         return result.stdout if binary else json.loads(result.stdout or b"null")
@@ -662,10 +670,15 @@ def publish_downloaded(api, root, inventory, directory):
     directory = Path(directory)
     plans = json.loads((directory / "plans.json").read_bytes())
     current = list(planned(api, root, inventory))
-    if api.waiting_for_ci and plans != current:
+    # planned() is first-parent ordered and each plan depends only on earlier
+    # history and tags, so merges during the build only append plans. Publish
+    # the downloaded prefix; the queued run reconciles the newer SHAs.
+    prefix = plans == current or (plans and plans == current[:len(plans)])
+    if api.waiting_for_ci and not prefix:
         return  # CI restarted during the build; wait without reserving anything.
-    require(plans == current,
-            "downloaded plans differ from current reconciliation; rebuild before publishing")
+    require(prefix, "downloaded plans differ from current reconciliation; rebuild before publishing")
+    if len(current) > len(plans):
+        print(f"{len(current) - len(plans)} newer plans remain for the next run", file=sys.stderr)
     inventories = []
     for plan in plans:
         source_inventory = json.loads(git(root, "show", f"{plan['source_sha']}:deploy/components.json"))
