@@ -112,7 +112,7 @@ jobs:
       - name: Install script check dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y shellcheck sqlite3 zstd rsync
+          sudo apt-get install --no-install-recommends -y shellcheck sqlite3 zstd rsync python3-venv
       - name: Check every deployment and version script
         run: |
           mapfile -d '' scripts < <(find deploy scripts -type f -name '*.sh' -print0)
@@ -129,6 +129,7 @@ jobs:
       - run: python3 -B deploy/test_set_ollama_host.py
       - run: python3 -B deploy/test-install-dispatch.py
       - run: python3 -B deploy/backup/test-backup.py
+      - run: python3 -B deploy/backup/test-offsite-runtime.py
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
       - name: Test encrypted off-site backups against loopback moto
         run: uvx --from 'moto[server]==5.2.4' --with 'pyrage==1.4.0' --with 'boto3==1.43.118' python -B deploy/backup/test-offsite.py

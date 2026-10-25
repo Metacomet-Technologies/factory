@@ -41,6 +41,8 @@ exemptions=(
     'deploy/rollback-environment-cleanup.sh|health|Configuration-only: cmp verifies the restored environment; no service action.'
     'deploy/install-atuin-server.sh|health|Prepare-only: checksum, binary version and systemd-analyze verify; activation and live HTTP probe are explicit operator steps.'
     'deploy/rollback-atuin-server.sh|health|Restore-only, refuses an active service; activation and live HTTP probe are explicit operator steps.'
+    'deploy/backup/install-offsite-runtime.sh|health|Runtime only: bounded imports, exact versions and pip check verify the venv; no network service to probe.'
+    'deploy/backup/rollback-offsite-runtime.sh|health|Runtime only: bounded imports verify the restored venv, or absence is checked; no service action.'
     'deploy/rollback-meter.sh|snapshot|By design it rewrites only OLLAMA_HOST; install-meter.sh snapshots the full drop-in (README, proxy-removal rollback).'
     'deploy/devices/install-devices.sh|trap|TODO MET-<new>: the ERR trap is set after mkdir -p of the lib, state and unit directories.'
     'deploy/devices/install-devices.sh|snapshot|TODO MET-<new>: mkdir -p of the lib, state and unit directories runs before the snapshot.'

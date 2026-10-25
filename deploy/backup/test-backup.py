@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
 import tempfile
@@ -56,6 +57,9 @@ def writer(path, stop, ready):
 
 with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
     root = Path(temp)
+    config = root / "nodes.conf"
+    config.write_text((HERE / "nodes.conf").read_text().replace(
+        "/etc/factory-backup/r2.conf", shlex.quote(str(root / "r2.conf"))))
     spec = importlib.util.spec_from_file_location("backup_state", HERE / "backup-state.py")
     state_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(state_module)
@@ -126,7 +130,7 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
                        BACKUP_USER="users",
                        PUBLISHED_STATUS="",
                        STATUS_FILE=str(root / host / "status" / "status.json"))
-            env.pop("BACKUP_CONFIG", None)
+            env["BACKUP_CONFIG"] = str(config)
             environments[host] = env
             for name in names:
                 db = root / f"{name}.db"
@@ -510,7 +514,7 @@ prepare_backup_account
             builtin.write_text(default_account if already_restored else
                                f"backup:!*:34:34:backup:{replica}:/bin/sh\n")
             migration_env = dict(os.environ, FIXTURE=str(fixture), ACCOUNT_SCRIPT=str(HERE / "account.sh"),
-                                 BACKUP_CONFIG=str(HERE / "nodes.conf"), BACKUP_HOST=host,
+                                 BACKUP_CONFIG=str(config), BACKUP_HOST=host,
                                  BACKUP_USER="factory-backup", BACKUP_HOME=str(home),
                                  REPLICA_ROOT=str(replica), LOCAL_ROOT=str(local))
             for attempt in range(2):
@@ -551,7 +555,7 @@ prepare_backup_account
     # Run the real installer against rewritten absolute paths. Reuse the account
     # stubs above; systemctl is an executable stub so child rollback is safe too.
     with tempfile.TemporaryDirectory(prefix="backup-installer-") as install_temp:
-        for scenario in ("new", "existing", "missing-group", "console", "symlink", "missing-atuin"):
+        for scenario in ("new", "existing", "missing-group", "console", "symlink", "missing-atuin", "r2-enabled"):
             fixture = Path(install_temp) / scenario
             artifact = fixture / "artifact"
             artifact.mkdir(parents=True)
@@ -579,6 +583,12 @@ prepare_backup_account
             status = home / "status.json"
             status.write_text('{"meter":{"error":"current status"}}\n')
             status.chmod(0o600)
+            r2_config = fixture / "etc/factory-backup/r2.conf"
+            r2_contents = 'R2_ENABLED=1\nR2_BUCKET=preserved-bucket\nR2_PYTHON=/operator/runtime/bin/python\n'
+            if scenario == "r2-enabled":
+                r2_config.parent.mkdir(parents=True)
+                r2_config.write_text(r2_contents)
+                r2_config.chmod(0o644)
             published = fixture / "var/lib/factory-backup-status/status.json"
             if scenario == "existing":
                 published.parent.mkdir()
@@ -625,7 +635,7 @@ export -f id getent usermod useradd install chown chgrp runuser python3
 bash "$INSTALL_SCRIPT" --prepare-only
 '''
             snapshots = []
-            for attempt in range(2 if scenario in ("new", "existing") else 1):
+            for attempt in range(2 if scenario in ("new", "existing", "r2-enabled") else 1):
                 result = subprocess.run(["bash", "-c", harness], env=env,
                                         capture_output=True, text=True, timeout=30)
                 output = result.stdout + result.stderr
@@ -638,7 +648,7 @@ bash "$INSTALL_SCRIPT" --prepare-only
                 snapshots.append(snapshot)
                 enabled = scenario not in ("missing-group", "console")
                 assert published.exists() == enabled
-                assert (snapshot / "published-status.created").exists() == (scenario in ("new", "missing-atuin") and attempt == 0)
+                assert (snapshot / "published-status.created").exists() == (scenario in ("new", "missing-atuin", "r2-enabled") and attempt == 0)
                 if enabled:
                     assert published.read_bytes() == status.read_bytes()
                     assert published.stat().st_mode & 0o777 == 0o640
@@ -648,15 +658,26 @@ bash "$INSTALL_SCRIPT" --prepare-only
                     assert "factory-api group is missing" in output
                 if scenario == "missing-atuin":
                     assert "Skipping atuin: database not created yet" in output
+                if scenario == "r2-enabled":
+                    assert r2_config.read_text() == r2_contents
+                    assert r2_config.stat().st_mode & 0o777 == 0o644
+                    configured = subprocess.run(
+                        ["bash", "-c", 'source "$1"; printf "%s\\n" "$R2_ENABLED" "$R2_BUCKET" "$R2_PYTHON"',
+                         "bash", str(fixture / "etc/factory-backup/nodes.conf")],
+                        env=dict(env, R2_ENABLED="0", R2_BUCKET="", R2_PYTHON="python3"),
+                        capture_output=True, text=True, check=True, timeout=10)
+                    assert configured.stdout == '1\npreserved-bucket\n/operator/runtime/bin/python\n', configured.stdout
                 assert home.stat().st_mode & 0o777 == 0o700
                 assert status.stat().st_mode & 0o777 == 0o600
             if scenario == "symlink":
                 continue
             for snapshot in reversed(snapshots):
                 run("rollback-backup-config.sh", env, str(snapshot))
+            if scenario == "r2-enabled":
+                assert r2_config.read_text() == r2_contents
             assert published.parent.exists() == (scenario == "existing")
             if scenario == "existing":
                 assert (published.parent / "keep").read_text() == "administrator file"
             assert status.read_text() == '{"meter":{"error":"current status"}}\n'
             assert home.stat().st_mode & 0o777 == 0o700
-    print("PASS: installer publishes immediately, permits absent Atuin, reruns safely, skips missing groups/console, refuses symlinks; rollback removes only newly created directory")
+    print("PASS: installer publishes immediately, permits absent Atuin, reruns safely, preserves enabled r2.conf, skips missing groups/console, refuses symlinks; rollback preserves r2.conf and removes only newly created directory")
