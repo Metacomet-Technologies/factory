@@ -686,6 +686,33 @@ class Releases(unittest.TestCase):
             r.GitHub(anonymous=True).request("releases")
             self.assertEqual(request.call_args.args[0].get_header("X-github-api-version"), "2026-03-10")
 
+    def test_only_authenticated_reads_retry_transient_server_errors(self):
+        ok = subprocess.CompletedProcess([], 0, stdout=b'{"jobs": []}', stderr=b"")
+
+        def failure(status):
+            return subprocess.CompletedProcess([], 1, stdout=b"", stderr=f"gh: error (HTTP {status})".encode())
+
+        upload = self.directory / "asset"
+        upload.write_bytes(b"asset")
+        path = "actions/runs/40067773473/attempts/1/jobs"
+        for name, kwargs, responses, calls in (
+                ("get-502-then-ok", {}, [failure(502), ok], 2),
+                ("get-502-persistent", {}, [failure(502)] * 4, 3),
+                ("get-503-then-500", {}, [failure(503), failure(500), failure(502), ok], 3),
+                ("get-403", {}, [failure(403), ok], 1),
+                ("get-404", {}, [failure(404), ok], 1),
+                ("post-502", {"method": "POST", "data": {"tag": "v0.2.1"}}, [failure(502), ok], 1),
+                ("upload-502", {"method": "POST", "upload": upload}, [failure(502), ok], 1)):
+            with self.subTest(name), patch.object(subprocess, "run", side_effect=responses) as request, \
+                    patch.object(r.time, "sleep") as sleep:
+                if responses[calls - 1] is ok:
+                    self.assertEqual(r.GitHub().request(path, **kwargs), {"jobs": []})
+                else:
+                    with self.assertRaisesRegex(ValueError, "inspect remote state before retry"):
+                        r.GitHub().request(path, **kwargs)
+                self.assertEqual(request.call_count, calls)
+                self.assertEqual(sleep.call_count, calls - 1)
+
     def test_exact_merge_and_ci_evidence(self):
         api = FakeGitHub()
         api.eligible(SHA, 1, "minor")
@@ -853,6 +880,83 @@ class Releases(unittest.TestCase):
             for p in plans:
                 r.verify_bundle(handoff / "bundles" / p["release_tag"], inventory, p["source_sha"],
                                 r.release_for(api, p["release_tag"]))
+
+    def test_advancing_history_publishes_downloaded_prefix_then_next_run_reconciles(self):
+        root, inventory, first, second = self.history()
+        api = FakeGitHub()
+        api.eligible(first, 1)
+        api.eligible(second, 2)
+        handoff = self.directory / "handoff"
+        with patch.object(r, "build_exact", side_effect=lambda root, p, d: fixture_build(p, d, inventory)):
+            r.build_pending(api, root, inventory, handoff)
+        plans_path = handoff / "plans.json"
+        plans = json.loads(plans_path.read_bytes())
+        self.assertEqual([(p["source_sha"], p["release_tag"]) for p in plans], [(first, "v0.2.1"), (second, "v0.2.2")])
+        # An eligible merge lands on main while the build runs.
+        (root / "third").write_text("third merge")
+        commit(root, "third merge")
+        third = r.git(root, "rev-parse", "HEAD")
+        run(root, "git", "update-ref", "refs/remotes/origin/main", third)
+        api.eligible(third, 3)
+        current = list(r.planned(api, root, inventory))
+        self.assertEqual(current[:2], plans)
+        self.assertEqual([(p["source_sha"], p["release_tag"]) for p in current[2:]], [(third, "v0.2.3")])
+
+        def publish(github, directory=handoff):
+            argv = ["release.py", "publish", "--root", str(root), "--directory", str(directory)]
+            with patch.object(r, "GitHub", return_value=github), patch.object(sys, "argv", argv), \
+                    patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "GITHUB_REF": "refs/heads/main"}), \
+                    patch.object(r, "build_exact", side_effect=AssertionError("publisher built code")), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as message:
+                r.main()
+            return message.getvalue()
+
+        # Negative controls: a changed plan inside the prefix or an extra plan never writes.
+        for field, value in (("release_tag", "v0.2.9"), ("bump", "minor"), ("ci_run", 9)):
+            changed = copy.deepcopy(plans)
+            changed[1][field] = value
+            plans_path.write_bytes(r.canonical(changed))
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "downloaded plans differ"):
+                publish(api)
+            self.assertEqual(api.writes, 0)
+        plans_path.write_bytes(r.canonical(current + [plan("e" * 40, "v0.2.4")]))
+        with self.assertRaisesRegex(ValueError, "downloaded plans differ"):
+            publish(api)
+        self.assertEqual(api.writes, 0)
+        plans_path.write_bytes(r.canonical(plans))
+        # Current reconciliation starting later because the first release completed.
+        partial = copy.deepcopy(api)
+        r.publish_one(partial, plans[0], inventory, self.directory / "partial",
+                      lambda p, d: fixture_build(p, d, inventory))
+        retry = TokenGitHub(partial, draft_reads=True)
+        with self.assertRaisesRegex(ValueError, "downloaded plans differ"):
+            publish(retry)
+        self.assertEqual(retry.writes, 0)
+        binary = handoff / "bundles/v0.2.2/meter-linux-x86_64"
+        original = binary.read_bytes()
+        binary.write_bytes(original + b"tamper")
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            publish(api)
+        self.assertEqual(api.writes, 0)
+        binary.write_bytes(original)
+
+        self.assertIn("1 newer plans remain for the next run", publish(api))
+        self.assertEqual([(x["tag_name"], x["draft"]) for x in api.releases], [("v0.2.1", False), ("v0.2.2", False)])
+        self.assertEqual({tag for tag, _ in api.uploaded}, {"v0.2.1", "v0.2.2"})
+        self.assertEqual({tag: value["sha"] for tag, value in api.tags().items()},
+                         {"v0.2.1": first, "v0.2.2": second})
+        remaining = list(r.planned(api, root, inventory))
+        self.assertEqual(remaining, current[2:])
+        # The queued run builds and publishes only the newer SHA, matching exactly.
+        successor = self.directory / "successor"
+        with patch.object(r, "build_exact", side_effect=lambda root, p, d: fixture_build(p, d, inventory)):
+            r.build_pending(api, root, inventory, successor)
+        self.assertEqual(json.loads((successor / "plans.json").read_bytes()), remaining)
+        self.assertNotIn("newer plans remain", publish(api, successor))
+        self.assertEqual({tag: value["sha"] for tag, value in api.tags().items()},
+                         {"v0.2.1": first, "v0.2.2": second, "v0.2.3": third})
+        self.assertTrue(all(not release["draft"] and release["immutable"] for release in api.releases))
+        self.assertEqual(list(r.planned(api, root, inventory)), [])
 
     def test_adjacent_merges_missed_trigger_and_failed_tail(self):
         root, inventory, first, second = self.history()

@@ -81,15 +81,28 @@ CI retention does not invalidate an already completed immutable release.
 The read-only job computes plans, builds exact-SHA bundles and verifies them before
 uploading `plans.json` and the bundles through a SHA-pinned artifact action. No
 plans means no publish job. The dependent publish job downloads only this run's
-artifact, recomputes the current plans from GitHub/main and requires an exact
-match. A changed plan requires a fresh build; pending CI instead waits without
-writes. It verifies every bundle and its plan before the first remote write.
+artifact and recomputes the current plans from GitHub/main. The downloaded plans
+must be non-empty and equal the first plans of the current list, in order (an
+empty handoff must match exactly). `planned()` walks first-parent history and
+each plan depends only on earlier history and existing tags, so an eligible
+merge during the build only appends plans. The publisher publishes just the
+downloaded plans, prints `N newer plans remain for the next run` to stderr and
+leaves later SHAs unreserved; the run that merge queued in the same concurrency
+group reconciles them. Any other difference, including a changed plan inside the
+prefix, an extra downloaded plan or a current list starting later because a
+downloaded release already completed, requires a fresh build; pending CI instead
+waits without writes. It verifies every bundle and its plan before the first
+remote write.
 Its builder callback only copies those verified files, never executes them.
 
 Crash recovery is monotonic: build and verify, reserve tag, create draft, upload manifest and
 six assets, download and validate all assets, then publish with a manifest digest
-receipt. Every upload inspects existing assets first. Lost write acknowledgements
-stop the attempt; rerunning inspects remote state before another write. A reserved
+receipt. Every upload inspects existing assets first. There is no automatic write
+retry: lost write acknowledgements stop the attempt; rerunning inspects remote
+state before another write. Authenticated GET reads (never writes, uploads or
+4xx responses) retry an `HTTP 5xx` response after a short fixed pause, at most
+three attempts in total; a persistent failure still stops with "inspect remote
+state before retry". Anonymous verification reads do not retry. A reserved
 tag absent from release listings now requires explicit operator recovery, including
 a crash after tag reservation but before draft creation. Identical
 content is reused; conflicting, duplicate or starter/partial assets stop with the
@@ -132,15 +145,16 @@ or its assets: GitHub may hide drafts from the contents:read credential. If the
 collection explicitly identifies that tag as non-draft, the build job may read and
 verify that public completed release, making a completed recovery retry a no-op.
 An omitted release is never assumed complete. If it completed but remains hidden
-from the read-only job, the publisher rejects the differing plans without writes;
+from the read-only job, the downloaded plans are no longer a prefix of the current
+plans, so the publisher rejects them without writes;
 inspect visibility before retrying; completed-history verification needs a
 publicly readable release. The hint
 only permits planning that reserved tag; it is never permission to create a draft.
 The publish job must independently read the ID using its existing contents:write
 credential and validate the exact ID, tag and state before recomputing plans or
 performing any write. Verified IDs remain pinned across collection reads. The
-publish job then compares the complete recomputed plans with the downloaded plans
-and verifies every bundle before publication. No new credential or permission is
+publish job then requires the downloaded plans to be a prefix of the recomputed
+plans and verifies every bundle before publication. No new credential or permission is
 needed or requested. If the publish credential cannot read the release or assets,
 recovery stops; owner-browser visibility alone does not prove workflow access.
 
