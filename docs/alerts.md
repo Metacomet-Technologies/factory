@@ -89,7 +89,7 @@ test in `#factory-alerts`. Payload tests do not prove Slack's rendered layout.
 | `gpu:temperature` | GPU 0 is above 85 °C for 2 min | critical | meter `/meter/gpu` sample (15 s) |
 | `meter:sync` | no successful meter sync for 5 min (10 cycles) | warning | factory-api meter sync |
 | `pricing:<family>:<model>` | `pricing.changed`: a new reference model is pending | info | pricing DB |
-| `backup:status` | a MET-74 backup failed, a pending marker is stuck for 2 h, or the last success is older than 36 h | warning | `/var/lib/factory-backup-status/status.json` |
+| `backup:status` | status is unavailable/unreadable, a backup or off-site push failed, a pending marker is stuck for 2 h, local success is older than 26 h, or the off-site recovery point is older than 26 h | warning | `/var/lib/factory-backup-status/status.json` |
 | `clock:ntp` | `timedatectl show -p NTPSynchronized --value` is `no` | warning | timedatectl |
 | `dispatch:timer` | `factory-dispatch.timer` last fired more than 5 min ago, or never | warning | `systemctl show --timestamp=unix -p LastTriggerUSec` |
 | `usage:stale` | a collected tool's `observed_at_ms` is older than 45 min (3 collector intervals) | warning | `/var/lib/factory-usage/usage.json` |
@@ -143,13 +143,19 @@ Production note: the one manual production test measured 404 Mb/s upload against
 
 **Unavailable sources.** A source that cannot be read (missing file, permission
 denied, `tailscale status` failing, a stale GPU sample, a timer that is not
-installed) is logged once as `alert source unavailable` and never alerts. Its
+installed) is normally logged once as `alert source unavailable` and never alerts. Its
 open alerts are held until it is readable again, then they clear normally.
 
-**Known gap: backup status is root-only today.** `backup-state.py` writes
-`status.json` 0600 inside the 0700 `/var/lib/factory-backup`, so in production
-factory-api logs the backup source as unavailable. Making the file readable by
-`factory-api` belongs to the MET-74 backup scripts: MET-152.
+**Backup status is an exception.** The collector turns missing, unreadable,
+malformed, empty, or oversized backup status into a `backup:status` failure.
+It uses the same Slack notification, deduplication, and recovery path as backup
+errors. `backup-state.py` keeps the private original and atomically publishes
+a `root:factory-api 0640` copy at the path above. No backup permissions are widened.
+Local freshness uses `last_success_ms`; the optional `r2` entry uses
+`recovery_point_ms`, not the upload receipt time. Both thresholds are 26 hours,
+matching the proposed daily RPO with schedule margin. Pending attempts do not
+hide an expired recovery point. See [off-site monitoring](offsite-backups.md#monitoring)
+for detection ownership, tests, and the independent off-house monitoring requirement.
 
 ## State and configuration
 

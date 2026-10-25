@@ -80,6 +80,14 @@ with tempfile.TemporaryDirectory(prefix="factory-backup-test ' ") as temp:
             assert owners[published.parent] == ("root", "factory-api")
             assert main_status.stat().st_mode & 0o777 == 0o600
             assert home.stat().st_mode & 0o777 == 0o700
+        with patch.dict(os.environ, R2_ENABLED="1"):
+            state_module.status(main_status, "attempt", ["meter"])
+            state_module.status(main_status, "offsite", ["failed"])
+            state_module.status(main_status, "result", ["meter", "321", "ok", "true", ""])
+            assert published.read_bytes() == main_status.read_bytes()
+            data = json.loads(published.read_text())
+            assert data["r2"]["error"].startswith("Off-site push failed")
+            assert data["meter"]["error"] is None
         previous_copy = published.read_bytes()
         replace = os.replace
 

@@ -40,7 +40,7 @@ const GPU_HOT_MS: i64 = 2 * 60_000;
 const GPU_SAMPLE_MAX_AGE_MS: i64 = 2 * 60_000;
 /// Meter sync runs every 30 s; ten missed cycles is a gap.
 const METER_GAP_MS: i64 = 5 * 60_000;
-const BACKUP_STALE_MS: i64 = 36 * 3_600_000;
+const BACKUP_STALE_MS: i64 = 26 * 3_600_000;
 /// Request retention may skip transiently while rollups or costs catch up.
 const RETENTION_SKIP_MS: i64 = 24 * 3_600_000;
 /// factory-backup.service TimeoutStartSec: in-run "pending" markers older than this are stuck.
@@ -165,6 +165,7 @@ pub struct BackupEntry {
     pub name: String,
     pub last_success_ms: Option<i64>,
     pub last_attempt_ms: Option<i64>,
+    pub recovery_point_ms: Option<i64>,
     pub error: Option<String>,
 }
 /// Latest collector read and the start of its communication-loss grace period.
@@ -1545,22 +1546,32 @@ impl Engine {
                 for entry in entries {
                     let running = matches!(
                         entry.error.as_deref(),
-                        Some("Peer push pending" | "Retention pending")
+                        Some("Peer push pending" | "Retention pending" | "Off-site push pending")
                     ) && entry
                         .last_attempt_ms
                         .is_some_and(|at| now - at < BACKUP_RUN_MS);
+                    let (success, description) = if entry.name == "r2" {
+                        (entry.recovery_point_ms, "recovery point")
+                    } else {
+                        (entry.last_success_ms, "last succeeded")
+                    };
                     if let Some(error) = entry.error.as_deref().filter(|_| !running) {
                         problems.push(format!("{} failed: {}", entry.name, one_line(error, 120)));
-                    } else if let Some(at) = entry.last_success_ms {
+                    } else if let Some(at) = success {
                         if now - at > BACKUP_STALE_MS {
                             problems.push(format!(
-                                "{} last succeeded {} ago",
+                                "{} {} {} ago",
                                 entry.name,
+                                description,
                                 duration(now - at)
                             ));
                         }
                     } else if !running && entry.error.is_none() {
-                        problems.push(format!("{} has never succeeded", entry.name));
+                        problems.push(if entry.name == "r2" {
+                            "r2 has no successful recovery point".into()
+                        } else {
+                            format!("{} has never succeeded", entry.name)
+                        });
                     }
                 }
                 if !problems.is_empty() {
@@ -1850,6 +1861,7 @@ fn parse_backup(bytes: &[u8]) -> Option<Vec<BackupEntry>> {
                 name,
                 last_success_ms: entry["last_success_ms"].as_i64(),
                 last_attempt_ms: entry["last_attempt_ms"].as_i64(),
+                recovery_point_ms: entry["recovery_point_ms"].as_i64(),
                 error: entry["error"].as_str().map(str::to_owned),
             })
         })
@@ -1970,7 +1982,19 @@ impl AppState {
             gpu,
             meter_synced_at_ms: Some(self.meter_synced_at_ms.load(Ordering::Acquire)),
             pricing_pending,
-            backup,
+            backup: Some(
+                backup
+                    .filter(|entries| !entries.is_empty())
+                    .unwrap_or_else(|| {
+                        vec![BackupEntry {
+                            name: "status".into(),
+                            last_success_ms: None,
+                            last_attempt_ms: None,
+                            recovery_point_ms: None,
+                            error: Some("Backup status unavailable or unreadable".into()),
+                        }]
+                    }),
+            ),
             clock_synchronized,
             dispatch_last_trigger_ms,
             usage,
@@ -3174,6 +3198,7 @@ mod tests {
                     name: "meter".into(),
                     last_success_ms: Some(now),
                     last_attempt_ms: Some(now),
+                    recovery_point_ms: None,
                     error: None,
                 }]),
                 clock_synchronized: Some(true),
@@ -3445,7 +3470,7 @@ mod tests {
         engine.evaluate(T0 + 11 * MIN, &gpu(T0 + 11 * MIN, 85.0));
         assert!(keys(&engine).is_empty());
 
-        // Backup: stale > 36 h, failed, stuck pending; an in-progress run is fine.
+        // Backup: stale > 26 h, failed, stuck pending; an in-progress run is fine.
         let backup = |entries: Vec<BackupRow>| Signals {
             backup: Some(
                 entries
@@ -3454,6 +3479,7 @@ mod tests {
                         name: name.into(),
                         last_success_ms: success,
                         last_attempt_ms: attempt,
+                        recovery_point_ms: (name == "r2").then_some(success).flatten(),
                         error: error.map(str::to_owned),
                     })
                     .collect(),
@@ -3466,7 +3492,7 @@ mod tests {
             &backup(vec![
                 (
                     "meter",
-                    Some(T0 - 35 * h),
+                    Some(T0 - 26 * h),
                     Some(T0 - 10 * MIN),
                     Some("Peer push pending"),
                 ),
@@ -3477,7 +3503,7 @@ mod tests {
         engine.evaluate(
             T0,
             &backup(vec![
-                ("meter", Some(T0 - 37 * h), Some(T0 - 37 * h), None),
+                ("meter", Some(T0 - 26 * h - 1), Some(T0 - 26 * h - 1), None),
                 (
                     "requests",
                     Some(T0 - 3 * h),
@@ -3494,8 +3520,29 @@ mod tests {
         );
         assert_eq!(
             keys(&engine),
-            [("backup:status".into(), "backup: meter last succeeded 37 h ago; requests failed: Peer push pending; pricing failed: rsync: connection refused".into())]
+            [("backup:status".into(), "backup: meter last succeeded 26 h ago; requests failed: Peer push pending; pricing failed: rsync: connection refused".into())]
         );
+
+        for (error, age, fires) in [
+            (Some("Off-site push pending"), h, false),
+            (Some("Off-site push pending"), 2 * h, true),
+            (Some("Off-site push failed"), 0, true),
+            (None, 26 * h + 1, true),
+            (None, 26 * h, false),
+            (None, 0, false),
+        ] {
+            engine.evaluate(
+                T0,
+                &backup(vec![
+                    ("meter", Some(T0), Some(T0), None),
+                    ("r2", Some(T0 - age), Some(T0 - age), error),
+                ]),
+            );
+            assert_eq!(
+                keys(&engine).iter().any(|(key, _)| key == "backup:status"),
+                fires
+            );
+        }
 
         // Dispatch timer and usage snapshot staleness.
         engine.evaluate(
@@ -3621,6 +3668,7 @@ mod tests {
                 name: "meter".into(),
                 last_success_ms: Some(5),
                 last_attempt_ms: Some(6),
+                recovery_point_ms: None,
                 error: None,
             }])
         );
@@ -3929,6 +3977,68 @@ mod tests {
         }
         assert!(!console_alert(&engine, "cpu:temperature:sustained"));
         assert!(!console_alert(&engine, "power:discharging-on-mains"));
+    }
+
+    #[tokio::test]
+    async fn backup_status_failures_and_freshness_reach_slack() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        pricing::migrate(dir.path().join("pricing.db")).unwrap();
+        let mut state = AppState::new(
+            "http://127.0.0.1:1".into(),
+            dir.path().join("requests.db"),
+            dir.path().join("pricing.db"),
+            fleet::Config { nodes: vec![] },
+        )
+        .await
+        .unwrap();
+        state.backup_status = dir.path().join("backup.json");
+        state.usage_snapshot = dir.path().join("usage.json");
+        let healthy = json!({
+            "meter": {"last_success_ms": T0},
+            "r2": {"last_success_ms": T0, "recovery_point_ms": T0}
+        })
+        .to_string();
+        for (case, contents, expected) in [
+            ("missing", None, "unavailable"),
+            ("unreadable", Some(healthy.clone()), "unavailable"),
+            ("malformed", Some("not json".into()), "unavailable"),
+            ("empty", Some("{}".into()), "unavailable"),
+            ("oversize", Some(" ".repeat(1_000_001)), "unavailable"),
+            ("stale local", Some(json!({"meter": {"last_success_ms": T0 - 26 * 3_600_000 - 1}}).to_string()), "meter last succeeded"),
+            ("offsite failure", Some(json!({"r2": {"last_success_ms": T0, "recovery_point_ms": T0, "error": "Off-site push failed"}}).to_string()), "Off-site push failed"),
+            ("stale offsite", Some(json!({"r2": {"last_success_ms": T0, "recovery_point_ms": T0 - 26 * 3_600_000 - 1}}).to_string()), "r2 recovery point"),
+        ] {
+            if let Some(contents) = contents {
+                std::fs::write(&state.backup_status, contents).unwrap();
+            } else {
+                let _ = std::fs::remove_file(&state.backup_status);
+            }
+            if case == "unreadable" {
+                std::fs::set_permissions(&state.backup_status, std::fs::Permissions::from_mode(0o0)).unwrap();
+                assert_eq!(std::fs::read(&state.backup_status).unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            let (slack, url) = fake_slack().await;
+            let mut engine = Engine::load(config(&url, None, true));
+            let signals = Signals { backup: state.alert_signals().await.backup, ..Default::default() };
+            engine.tick(T0, &signals).await;
+            let active = engine.view().active;
+            assert_eq!(active.len(), 1, "{case}");
+            assert_eq!(active[0].key, "backup:status", "{case}");
+            assert!(active[0].summary.contains(expected), "{case}: {}", active[0].summary);
+            assert!(slack.posts.lock().unwrap()[0].to_string().contains(expected), "{case}");
+            engine.tick(T0 + 1, &signals).await;
+            assert_eq!(slack.posts.lock().unwrap().len(), 1, "{case}: duplicate notification");
+            if case == "unreadable" {
+                std::fs::set_permissions(&state.backup_status, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            std::fs::write(&state.backup_status, &healthy).unwrap();
+            engine.tick(T0 + MIN, &Signals { backup: state.alert_signals().await.backup, ..Default::default() }).await;
+            assert!(engine.view().active.is_empty(), "{case}: recovery");
+            assert!(slack.posts.lock().unwrap().len() > 1, "{case}: recovery notification");
+        }
+        state.db.close().await.unwrap();
     }
 
     #[tokio::test]

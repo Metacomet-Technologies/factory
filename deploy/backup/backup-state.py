@@ -39,7 +39,11 @@ def status(path, operation, args):
     now = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
     if operation == "attempt":
         # Status describes current origins, not retired rollback archives.
+        offsite = data.get("r2", dict(last_success_ms=None, last_attempt_ms=now,
+                                    error="Off-site push pending"))
         data = {name: data[name] for name in args if name in data}
+        if os.environ.get("R2_ENABLED") == "1" and args:
+            data["r2"] = offsite
         for name in args:
             previous = data.get(name, {})
             data[name] = dict(last_success_ms=previous.get("last_success_ms"),
@@ -52,9 +56,20 @@ def status(path, operation, args):
                      pushed_to_peer=pushed == "true", error=error or None)
         if not error:
             entry["last_success_ms"] = now
+    elif operation == "offsite":
+        entry = data["r2"]
+        if args[0] == "pending":
+            entry["last_attempt_ms"] = now
+            entry["error"] = entry.get("error") or "Off-site push pending"
+        elif args[0] == "ok":
+            recovery_point = dt.datetime.fromisoformat(args[1])
+            entry.update(last_success_ms=now, error=None,
+                         recovery_point_ms=int(recovery_point.timestamp() * 1000))
+        else:
+            entry["error"] = "Off-site push failed; local backup and peer retention completed"
     elif operation == "fatal":
-        for entry in data.values():
-            if entry["error"] in (None, "Peer push pending", "Retention pending"):
+        for name, entry in data.items():
+            if name != "r2" and entry["error"] in (None, "Peer push pending", "Retention pending"):
                 entry["error"] = args[0]
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
         json.dump(data, out, indent=2)
