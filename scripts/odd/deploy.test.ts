@@ -176,6 +176,9 @@ function world(options: {
         return out(JSON.stringify({ body: `closes MET-${args[2]}` }));
       }
       if (command === 'python3') {
+        assert.equal(args[0], join(ROOT, 'scripts/release/release.py'));
+        assert.equal(args[1], 'verify');
+        assert.ok(!args.includes('--anonymous'), 'deployment verification must use existing gh authentication');
         const dir = args[args.indexOf('--directory') + 1];
         calls.push(`verify ${args[args.indexOf('--tag') + 1]}`);
         mkdirSync(dir, { recursive: true });
@@ -266,6 +269,41 @@ function manuallyRecovered() {
     issues: { 'v0.2.10': ['MET-310'], 'v0.2.11': ['MET-311'], 'v0.2.49': ['MET-349'], 'v0.2.50': ['MET-350'] }, failComment: 'MET-350' });
   return { ...host, tags };
 }
+
+test('authenticated verification failures stop forward preparation and manual preview/adoption without side effects', async t => {
+  for (const mode of ['forward', 'preview', 'adopt']) {
+    for (const message of ['gh: HTTP 401', 'gh: HTTP 403', 'digest mismatch']) {
+      await t.test(`${mode}: ${message}`, async t => {
+        const host = mode === 'forward'
+          ? world({ tags: ['v0.2.9', 'v0.3.0'], changes: { 'v0.3.0': ['kiosk/src/App.tsx'] }, ledger: baseline() })
+          : manuallyRecovered();
+        t.after(host.cleanup);
+        const approval = mode === 'adopt' ? (await reconcileManual(host.effects, 'v0.2.49')).approval : undefined;
+        const original = structuredClone(host.ledger());
+        const live = { ...host.live };
+        const run = host.effects.run;
+        const failure = new Error(message);
+        let verifications = 0;
+        let directory = '';
+        host.calls.length = 0;
+        host.effects.run = (command, args, options) => {
+          if (command !== 'python3') return run(command, args, options);
+          assert.ok(!args.includes('--anonymous'), 'no anonymous fallback');
+          verifications++;
+          directory = args[args.indexOf('--directory') + 1];
+          throw failure;
+        };
+        await assert.rejects(mode === 'forward' ? main(host.effects) : reconcileManual(host.effects, 'v0.2.49', approval), error => error === failure);
+        assert.equal(verifications, 1);
+        assert.ok(!existsSync(join(directory, '.verified')));
+        assert.deepEqual(host.calls, [], 'no checkout, probes or installers after verifier failure');
+        assert.deepEqual(host.ledger(), original);
+        assert.deepEqual(host.live, live);
+        assert.deepEqual(host.comments, []);
+      });
+    }
+  }
+});
 
 test('manual v0.2.49 / failed v0.2.10 ledger: refuse v0.2.11, explicitly adopt without historical receipts, then deploy forward and resume delivery', async t => {
   const host = manuallyRecovered();

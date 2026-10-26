@@ -286,7 +286,7 @@ function prepareRelease(effects: Effects, tag: string): { sha: string; dir: stri
     mkdirSync(dirname(dir), { recursive: true });
     const inventory = join(effects.stateDir, `components-${sha}.json`);
     writeFileSync(inventory, effects.run('git', ['-C', ROOT, 'show', `${sha}:deploy/components.json`]).stdout);
-    effects.run('python3', [join(ROOT, 'scripts/release/release.py'), 'verify', '--anonymous', '--tag', tag, '--sha', sha, '--inventory', inventory, '--directory', dir]);
+    effects.run('python3', [join(ROOT, 'scripts/release/release.py'), 'verify', '--tag', tag, '--sha', sha, '--inventory', inventory, '--directory', dir]);
     mkdirSync(join(dir, 'kiosk'));
     effects.run('tar', ['--no-same-owner', '-xzf', join(dir, 'kiosk.tar.gz'), '-C', join(dir, 'kiosk')]);
     writeFileSync(join(dir, '.verified'), `${sha}\n`);
@@ -428,7 +428,7 @@ export async function reconcileManual(effects: Effects, tag: string, approval?: 
   let kioskVersion: { build: string; git_sha: string; git_dirty: boolean };
   try {
     // Never trust a cached .verified marker or a handoff alone for adoption.
-    effects.run('python3', [join(ROOT, 'scripts/release/release.py'), 'verify', '--anonymous', '--tag', tag, '--sha', sha, '--inventory', inventory, '--directory', dir]);
+    effects.run('python3', [join(ROOT, 'scripts/release/release.py'), 'verify', '--tag', tag, '--sha', sha, '--inventory', inventory, '--directory', dir]);
     const raw = readFileSync(join(dir, 'manifest.json'));
     manifest = JSON.parse(raw.toString());
     manifestSha256 = createHash('sha256').update(raw).digest('hex');
