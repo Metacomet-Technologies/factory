@@ -60,6 +60,17 @@ test('an installer failure after its snapshot rolls back and re-probes; before a
   const unchanged = fixture({ bodies: [], installOk: false });
   unchanged.effects.sudo = () => ({ ok: false, output: 'ERROR: preflight failed\nNo deployment changes made; no rollback snapshot exists.\n' });
   assert.deepEqual(await deployComponent(unchanged.effects, kiosk, 'v0.3.0', sha, '/tmp/rel'), { component: 'kiosk', sha, health: 'fail', rollback: 'none' });
+  // Meter: a generation change by a writer that bypassed the backup lock is caught by the post-stop
+  // recheck after the snapshot (deploy/install-meter.sh output; MeterPlanTest). The service is already
+  // stopped, so it is not a not-executed refusal: the v2 snapshot is rolled back once, binaries only.
+  const meter = recipes.find(recipe => recipe.name === 'meter')!;
+  const stopped = fixture({ bodies: [previous, previous, previous] });
+  const sudo = stopped.effects.sudo;
+  stopped.effects.sudo = (script, args) => script.startsWith('deploy/install-')
+    ? (sudo(script, args), { ok: false, output: `Rollback snapshot: ${snapshot}\nERROR: DB version changed since preflight.\nRecover with: sudo bash deploy/rollback-meter-v1.sh ${snapshot}\n` })
+    : sudo(script, args);
+  assert.deepEqual(await deployComponent(stopped.effects, meter, 'v0.3.0', sha, '/tmp/rel'), { component: 'meter', sha, health: 'fail', rollback: snapshot });
+  assert.deepEqual(stopped.calls.filter(call => call.startsWith('sudo')), [`sudo deploy/install-meter.sh --source-checkout /nonexistent/source --no-db-change ${meter.artifact('/tmp/rel')}`, `sudo deploy/rollback-meter-v1.sh ${snapshot}`]);
 });
 
 test('the enabled set is meter, factory-api and kiosk in install order, each with a restoring rollback', () => {
@@ -110,6 +121,7 @@ const shas = { 'v0.2.9': '0'.repeat(40), 'v0.2.10': 'a'.repeat(40), 'v0.2.11': '
 type Tag = keyof typeof shas;
 const order = Object.values(shas);
 const sources = { meter: ['meter', 'shared', 'factory-db'], 'factory-api': ['factory-api', 'shared', 'factory-db', 'pricing'], kiosk: ['kiosk', 'factory-api/openapi.json'], usage: ['scripts/usage'] };
+const v2Plan = 'meter-plan mode=v2 user_version=2 db_changing=no';
 const ports: Record<string, string> = { '11434': 'meter', '8080/v1': 'factory-api', '8080/version': 'kiosk' };
 
 function world(options: {
@@ -139,6 +151,8 @@ function world(options: {
   unreachable?: string[];
   /** Comments already on the issues. */
   comments?: [string, string][];
+  /** What `install-meter.sh --plan` reports (default an eligible v2 rerun). */
+  meterPlan?: { ok: boolean; output: string };
 }) {
   const stateDir = mkdtempSync(join(tmpdir(), 'odd-deploy-'));
   let ledger = structuredClone(options.ledger);
@@ -229,8 +243,10 @@ function world(options: {
       const component = /deploy\/(?:install|rollback)-(.+?)(?:-v1)?\.sh$/.exec(script)![1];
       if (script.includes('/install-')) {
         assert.deepEqual(args.slice(0, 2), ['--source-checkout', join(stateDir, 'source')]);
+        // The read-only plan is recorded apart from sudo installs and rollbacks.
+        if (args[2] === '--plan') { calls.push(`plan ${component}`); return options.meterPlan ?? { ok: true, output: `${v2Plan}\n` }; }
         calls.push(`sudo ${script} ${args.slice(2).join(' ')}`);
-        const target = order.find(full => args[2].includes(`/releases/${tagOf(full)}/`))!;
+        const target = order.find(full => args.at(-1)!.includes(`/releases/${tagOf(full)}/`))!;
         before[component] = live[component];
         live[component] = target;
         return { ok: true, output: `Rollback snapshot: /var/backups/${component}/snap\n` };
@@ -451,14 +467,17 @@ test('adoption retains rollback recovery for an interrupted forward attempt with
   await reconcileManual(host.effects, 'v0.2.49', preview.approval);
   host.tags.push('v0.2.50');
   const snapshot = '/var/backups/meter/forward-snapshot';
-  host.effects.writeLedger({ ...host.ledger(), inFlight: { tag: 'v0.2.50', sha: shas['v0.2.50'], component: 'meter', phase: 'probing', snapshot } });
+  // A snapshot this deployer's --no-db-change install took: proven binary-only, so its rollback may run.
+  host.effects.writeLedger({ ...host.ledger(), inFlight: { tag: 'v0.2.50', sha: shas['v0.2.50'], component: 'meter', phase: 'probing', snapshot, noDbChange: true } });
   const probe = host.effects.probe;
   let unreachable = true;
   host.effects.probe = url => {
     if (unreachable && url === recipes[0].health) throw new Error('connection refused');
     return probe(url);
   };
+  const sudo = host.effects.sudo;
   host.effects.sudo = (script, args) => {
+    if (args[2] === '--plan') return sudo(script, args);
     assert.equal(script, 'deploy/rollback-meter-v1.sh');
     assert.deepEqual(args, [snapshot]);
     host.calls.push('rollback');
@@ -907,6 +926,7 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
       assert.equal(args[1], join(stateDir, 'source'));
       assert.equal(existsSync(join(args[1], 'scripts/odd/deploy.ts')), false);
       const target = run('git', ['-C', args[1], 'rev-parse', 'HEAD']).stdout.trim();
+      if (args[2] === '--plan') return { ok: true, output: `${v2Plan}\n` };
       if (failInstall) { failInstall = false; return { ok: false, output: 'No deployment changes made; no rollback snapshot exists.' }; }
       live.set(recipes.find(recipe => recipe.installer === script)!.health, target);
       return { ok: true, output: 'Rollback snapshot: /var/backups/fixture/snap\n' };
@@ -1392,6 +1412,138 @@ test('control plane: a failed rollback pages even when its log reader cannot sta
   assert.deepEqual(tools.at(-1), ['linear.save_issue', { id: 'MET-311', addLabels: ['escalated'] }]);
 });
 
+// MET-364: automatic deploys never change the meter DB generation.
+const plans = {
+  fresh: { ok: true, output: 'meter-plan mode=fresh user_version=none db_changing=yes\n' },
+  legacy: { ok: true, output: 'meter-plan mode=legacy user_version=0 db_changing=yes\n' },
+  v1: { ok: true, output: 'meter-plan mode=v1 user_version=1 db_changing=yes\n' },
+  unknown: { ok: true, output: 'meter-plan mode=unknown user_version=3 db_changing=yes\n' },
+  'failed plan': { ok: false, output: `${v2Plan}\nERROR: interrupted\n` },
+  'no plan line': { ok: true, output: 'Artifact meter built at 1111111 matches checkout\n' },
+  'two plan lines': { ok: true, output: `${v2Plan}\n${v2Plan}\n` },
+  'changing v2': { ok: true, output: 'meter-plan mode=v2 user_version=2 db_changing=yes\n' },
+};
+const refusalOf = (mode: keyof typeof plans) => mode === 'fresh' || mode === 'legacy' || mode === 'v1' ? `db-changing-${mode}` : 'db-changing-unknown';
+const meterRelease = { tags: ['v0.2.9', 'v0.3.0', 'v0.3.1'] as Tag[], changes: { 'v0.3.0': ['shared/build.rs', 'kiosk/src/App.tsx'], 'v0.3.1': ['kiosk/src/App.tsx'] }, issues: { 'v0.3.0': ['MET-364'], 'v0.3.1': ['MET-365'] } };
+
+test('sandbox: a fresh, legacy, v1 or unknown meter plan refuses the whole release before any installer; the refusal is durable and pages irreversible-action', async t => {
+  for (const mode of Object.keys(plans) as (keyof typeof plans)[]) {
+    await t.test(mode, async t => {
+      const host = world({ ...meterRelease, ledger: baseline(), meterPlan: plans[mode] });
+      t.after(host.cleanup);
+      await assert.rejects(main(host.effects), /health=refused/);
+      assert.deepEqual(sudoCalls(host.calls), [], 'no install, migration or rollback for any component');
+      assert.deepEqual(host.calls.filter(call => call.startsWith('plan')), ['plan meter']);
+      const refused = line(`component=meter sha=${shas['v0.3.0']} health=refused rollback=none refusal=${refusalOf(mode)}`);
+      assert.deepEqual(host.comments, [['MET-364', refused]]);
+      assert.equal(host.ledger().lastTag, 'v0.2.9', 'lastTag never moves past an unhandled refusal');
+      assert.deepEqual(host.ledger().components, {});
+      assert.deepEqual(host.ledger().receipt, { tag: 'v0.3.0', receipt: { component: 'meter', sha: shas['v0.3.0'], health: 'refused', rollback: 'none', refusal: refusalOf(mode) }, delivered: ['MET-364'] });
+      // Durable: later ticks redeliver nothing, re-plan nothing and never reach the next release.
+      await assert.rejects(main(host.effects), /health=refused/);
+      assert.deepEqual(sudoCalls(host.calls), []);
+      assert.deepEqual(host.calls.filter(call => call.startsWith('plan')), ['plan meter']);
+      assert.deepEqual(host.comments, [['MET-364', refused]]);
+      assert.equal(host.ledger().lastTag, 'v0.2.9');
+      assert.deepEqual(host.live, { meter: shas['v0.2.9'], 'factory-api': shas['v0.2.9'], kiosk: shas['v0.2.9'] });
+      const action = deploying(refused) as Extract<Action, { kind: 'page' }>;
+      assert.equal(action.kind, 'page');
+      assert.equal(action.reason, 'irreversible-action');
+      assert.equal(action.diagnose, undefined, 'no log reader');
+    });
+  }
+});
+
+test('sandbox: the plan guards an interrupted meter resume too: a refused plan runs neither its rollback nor a reinstall', async t => {
+  const inFlight = { tag: 'v0.3.0', sha: shas['v0.3.0'], component: 'meter', phase: 'probing' as const, snapshot: '/var/backups/meter/snap' };
+  const host = world({ ...meterRelease, tags: ['v0.2.9', 'v0.3.0'], ledger: baseline({ inFlight }), meterPlan: plans.legacy });
+  t.after(host.cleanup);
+  await assert.rejects(main(host.effects), /health=refused rollback=none refusal=db-changing-legacy/);
+  assert.deepEqual(sudoCalls(host.calls), []);
+  assert.deepEqual(host.ledger().inFlight, inFlight, 'resume state is kept for Devon');
+  assert.equal(host.ledger().lastTag, 'v0.2.9');
+});
+
+test('sandbox: an interrupted meter resume with a red probe never runs a rollback that may restore an older DB generation; a --no-db-change snapshot still rolls back', async t => {
+  // Live meter DB is already v2 (the plan is eligible), but the snapshot came from an older installer that migrated v1 → v2.
+  for (const proven of [false, true]) {
+    const inFlight = { tag: 'v0.3.0', sha: shas['v0.3.0'], component: 'meter', phase: 'probing' as const, snapshot: '/var/backups/meter/previous-v1-db-changing',
+      ...(proven ? { noDbChange: true as const } : {}) };
+    const host = world({ ...meterRelease, tags: ['v0.2.9', 'v0.3.0'], ledger: baseline({ inFlight }) });
+    t.after(host.cleanup);
+    await assert.rejects(main(host.effects), proven ? /health=fail/ : /health=refused rollback=none refusal=db-changing-snapshot/);
+    assert.deepEqual(host.calls.filter(call => call.startsWith('plan')), ['plan meter'], 'the plan precedes the resume');
+    if (proven) {
+      assert.deepEqual(sudoCalls(host.calls), ['sudo deploy/rollback-meter-v1.sh /var/backups/meter/previous-v1-db-changing']);
+      continue;
+    }
+    assert.deepEqual(sudoCalls(host.calls), [], 'no rollback and no install');
+    const refused = line(`component=meter sha=${shas['v0.3.0']} health=refused rollback=none refusal=db-changing-snapshot`);
+    assert.deepEqual(host.comments, [['MET-364', refused]]);
+    assert.deepEqual(host.ledger().inFlight, inFlight, 'recovery state is kept for Devon');
+    assert.equal(host.ledger().lastTag, 'v0.2.9');
+    assert.equal((deploying(refused) as Extract<Action, { kind: 'page' }>).reason, 'irreversible-action');
+  }
+});
+
+test('sandbox: the installer rechecks after an eligible plan; a generation change or unsafe DB path in between is a refusal, not a failed rollback', async t => {
+  // Real installer output for each drift (deploy/test-install-artifact.py MeterPlanTest): v1, and the DB replaced by a symlink.
+  for (const [mode, refusal] of [['v1', 'db-changing-v1'], ['unknown', 'db-changing-unknown']] as const) {
+    const host = world({ ...meterRelease, tags: ['v0.2.9', 'v0.3.0'], ledger: baseline() });
+    t.after(host.cleanup);
+    const sudo = host.effects.sudo;
+    host.effects.sudo = (script, args) => {
+      if (!args.includes('--no-db-change')) return sudo(script, args);
+      host.calls.push(`sudo ${script} ${args.slice(2).join(' ')}`);
+      return { ok: false, output: `Artifact meter built at 1111111 matches checkout\nmeter-plan mode=${mode} user_version=${mode === 'v1' ? 1 : 'none'} db_changing=yes\nERROR: Refusing automatic meter install: mode ${mode} changes the DB generation; migration is Devon's explicit manual operation.\nNo deployment changes made; no rollback snapshot exists.\n` };
+    };
+    await assert.rejects(main(host.effects), /health=refused/);
+    const meter = `${host.stateDir}/releases/v0.3.0/meter-linux-x86_64`;
+    assert.deepEqual(host.calls.filter(call => /^(plan|sudo)/.test(call)), ['plan meter', `sudo deploy/install-meter.sh --no-db-change ${meter}`]);
+    const refused = line(`component=meter sha=${shas['v0.3.0']} health=refused rollback=none refusal=${refusal}`);
+    assert.deepEqual(host.comments, [['MET-364', refused]]);
+    assert.equal(host.ledger().lastTag, 'v0.2.9');
+    assert.equal(host.ledger().receipt?.tag, 'v0.3.0', 'the refusal is held, not completed as a failed release');
+    assert.equal(host.ledger().components.meter, undefined);
+    const action = deploying(refused) as Extract<Action, { kind: 'page' }>;
+    assert.equal(action.reason, 'irreversible-action');
+    assert.equal(action.diagnose, undefined, 'no log reader');
+  }
+  // Control: an installer failure without a refusal plan line is still an ordinary red receipt.
+  const red = world({ ...meterRelease, tags: ['v0.2.9', 'v0.3.0'], ledger: baseline() });
+  t.after(red.cleanup);
+  const redSudo = red.effects.sudo;
+  red.effects.sudo = (script, args) => args.includes('--no-db-change') ? { ok: false, output: `${v2Plan}\nERROR: Required command missing: zstd\nNo deployment changes made; no rollback snapshot exists.\n` } : redSudo(script, args);
+  await assert.rejects(main(red.effects), /health=fail rollback=none/);
+});
+
+test('sandbox: an eligible v2 plan precedes every installer, meter installs with --no-db-change, and the pass receipt is unchanged', async t => {
+  const host = world({ ...meterRelease, tags: ['v0.2.9', 'v0.3.0'], ledger: baseline() });
+  t.after(host.cleanup);
+  await main(host.effects);
+  const dir = `${host.stateDir}/releases/v0.3.0`;
+  assert.deepEqual(host.calls.filter(call => /^(plan|sudo)/.test(call)), ['plan meter', `sudo deploy/install-meter.sh --no-db-change ${dir}/meter-linux-x86_64`,
+    `sudo deploy/install-factory-api.sh ${dir}/factory-api-linux-x86_64`, `sudo deploy/install-kiosk.sh ${dir}/kiosk`]);
+  assert.deepEqual(host.comments, [['MET-364', line(`component=meter+factory-api+kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
+  assert.equal(host.ledger().lastTag, 'v0.3.0');
+});
+
+test('control plane: a refused receipt pages irreversible-action with default not executed, files no Bug and starts no log reader', async () => {
+  const refused = line(`component=meter sha=${shas['v0.3.0']} health=refused rollback=none refusal=db-changing-legacy`);
+  const issue = { identifier: 'MET-364', status: 'Deploying' as const, labels: ['odd'], description: '', openBlockers: [], deployReceipt: parseDeployReceipt(refused) };
+  const action = nextAction(issue, idle) as Extract<Action, { kind: 'page' }>;
+  const { ctx, tools } = pluginContext();
+  const spawned = flakySpawn(false);
+  await page(ctx, issue, action, spawned.spawn);
+  const slack = tools.find(([tool]) => tool === 'slack_write')?.[1] as { text: string };
+  assert.match(slack.text, /ODD page: irreversible-action \| issue MET-364 \| - \| 1{40} \| default if silent: not executed\./);
+  assert.ok(slack.text.includes(refused), slack.text);
+  assert.deepEqual(spawned.spawned, []);
+  assert.equal(tools.filter(([tool, input]) => tool === 'linear.save_issue' && (input.title || input.state)).length, 0, 'no Bug, no status change');
+  assert.deepEqual(tools.at(-1), ['linear.save_issue', { id: 'MET-364', addLabels: ['escalated'] }]);
+  assert.deepEqual(nextAction({ ...issue, labels: ['odd', 'escalated'] }, idle), { kind: 'wait', reason: 'escalated to Devon' });
+});
+
 test('sandbox: a release that touches no enabled component posts component=none and its issues move to Done', async t => {
   const host = world({ tags: ['v0.2.9', 'v0.3.0'], changes: { 'v0.3.0': ['docs/odd/README.md', 'kiosk-docs/readme.md'] }, issues: { 'v0.3.0': ['MET-301'] }, ledger: baseline() });
   t.after(host.cleanup);
@@ -1425,7 +1577,7 @@ test('sandbox: killed between install and probe, the rerun resumes the in-flight
   const earlier = world({ tags: ['v0.2.9', 'v0.3.0'], changes: { 'v0.3.0': ['kiosk/src/App.tsx'] }, issues: { 'v0.3.0': ['MET-301'] }, live: { kiosk: shas['v0.3.0'] }, unreachable: ['meter'], ledger: baseline({ inFlight }) });
   t.after(earlier.cleanup);
   await main(earlier.effects);
-  assert.deepEqual(sudoCalls(earlier.calls), [`sudo deploy/install-meter.sh ${earlier.stateDir}/releases/v0.3.0/meter-linux-x86_64`]);
+  assert.deepEqual(sudoCalls(earlier.calls), [`sudo deploy/install-meter.sh --no-db-change ${earlier.stateDir}/releases/v0.3.0/meter-linux-x86_64`]);
   assert.deepEqual(earlier.ledger().components.kiosk, { sha: shas['v0.3.0'], tag: 'v0.3.0', health: 'pass', snapshot: '/var/backups/kiosk/snap' });
   assert.deepEqual(earlier.comments, [['MET-301', line(`component=meter+kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
 });

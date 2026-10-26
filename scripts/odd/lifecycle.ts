@@ -71,8 +71,12 @@ export type IssueSnapshot = {
   steers?: Readonly<Record<string, string>>;
 };
 
-/** `component` is the `+`-joined set the release installed (`none` when it touched no enabled component), or the component that failed. */
-export type DeployReceipt = { host: string; component: string; sha: string; health: 'pass' | 'fail'; rollback: 'none' | string };
+/** `component` is the `+`-joined set the release installed (`none` when it touched no enabled component), or the component that failed or was refused. */
+export type DeployReceipt = { host: string; component: string; sha: string; health: 'pass' | 'fail' | 'refused'; rollback: 'none' | string; refusal?: Refusal };
+
+/** Why the Deployer installed nothing: the meter plan would change the DB generation (fresh, legacy or v1 migration) or could not be
+ * classified, or an interrupted install's rollback snapshot is not proven free of a DB-generation restore (`snapshot`). */
+export type Refusal = 'db-changing-fresh' | 'db-changing-legacy' | 'db-changing-v1' | 'db-changing-unknown' | 'db-changing-snapshot';
 
 /** The Verifier's receipt: `bug` is the Bug issue it filed for a failing Done-means item. */
 export type Verify = { sha: string; result: 'pass' | 'fail'; bug?: string };
@@ -227,12 +231,15 @@ export function issueTriaged(issue: { status: string; labels: readonly string[] 
 }
 
 export const deployReceiptLine = (receipt: DeployReceipt) =>
-  `odd-deploy host=${receipt.host} component=${receipt.component} sha=${receipt.sha} health=${receipt.health} rollback=${receipt.rollback}`;
+  `odd-deploy host=${receipt.host} component=${receipt.component} sha=${receipt.sha} health=${receipt.health} rollback=${receipt.rollback}${receipt.refusal ? ` refusal=${receipt.refusal}` : ''}`;
 
+/** Legacy pass/fail receipts parse unchanged. `health=refused` needs `rollback=none` and a known `refusal=`, which no other receipt may carry. */
 export function parseDeployReceipt(text: string): DeployReceipt | undefined {
-  const match = /^odd-deploy host=(\S+) component=(\S+) sha=([a-f0-9]{7,40}) health=(pass|fail) rollback=(\S+)$/m.exec(text);
+  const match = /^odd-deploy host=(\S+) component=(\S+) sha=([a-f0-9]{7,40}) health=(pass|fail|refused) rollback=(\S+)(?: refusal=(db-changing-(?:fresh|legacy|v1|unknown|snapshot)))?$/m.exec(text);
   if (!match) return undefined;
-  return { host: match[1], component: match[2], sha: match[3], health: match[4] as 'pass' | 'fail', rollback: match[5] };
+  const refused = match[4] === 'refused';
+  if (refused !== (match[6] !== undefined) || (refused && match[5] !== 'none')) return undefined;
+  return { host: match[1], component: match[2], sha: match[3], health: match[4] as DeployReceipt['health'], rollback: match[5], ...(refused ? { refusal: match[6] as Refusal } : {}) };
 }
 
 const free = (executor: Executor, load: Load) =>
@@ -328,6 +335,11 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
     const receipt = issue.deployReceipt;
     if (!receipt) return waiting('release not published', 'receipt', `receipt-${(pr?.mergeSha ?? pr?.headSha ?? 'unknown').slice(0, 12)}`, pr?.mergedAt);
     const line = deployReceiptLine(receipt);
+    // Nothing was installed, migrated or rolled back: neither a failed rollback nor a retry Bug. Devon decides.
+    if (receipt.health === 'refused') {
+      return { kind: 'page', reason: 'irreversible-action', sha: receipt.sha,
+        detail: `${receipt.component} on ${receipt.host} not installed at ${receipt.sha} (${receipt.refusal}): automatic deploys never change the meter DB generation; migration stays Devon's explicit manual operation. ${line}` };
+    }
     if (receipt.health === 'fail' && receipt.rollback === 'none') return { kind: 'page', reason: 'failed-rollback', detail: `${receipt.component} on ${receipt.host} unhealthy at ${receipt.sha}: ${line}`, diagnose: receipt };
     if (receipt.health === 'fail') {
       return { kind: 'set-status', status: 'Todo', reason: `rolled back to ${receipt.rollback}`, diagnose: receipt, followUp: {

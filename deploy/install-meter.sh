@@ -7,9 +7,17 @@ if [[ ${1:-} == --source-checkout ]]; then
     checkout=${2:?Supply a clean source checkout after --source-checkout.}
     shift 2
 fi
-check_only=0
+# --plan prints one machine-readable meter-plan line and exits before staging,
+# service changes, backup locks or snapshots. --no-db-change is the automatic
+# deploy mode: it rechecks that plan before its first change and refuses any
+# DB-generation change. Migration is Devon's explicit manual operation.
+check_only=0 plan=0 no_db_change=0
 binary=${1:-}
-if [[ "$binary" == --check-only ]]; then check_only=1; binary=${2:-}; fi
+case "$binary" in
+    --check-only) check_only=1; binary=${2:-} ;;
+    --plan) plan=1; binary=${2:-} ;;
+    --no-db-change) no_db_change=1; binary=${2:-} ;;
+esac
 destination=/usr/local/bin/meter
 installed_unit=/etc/systemd/system/meter.service
 db=/srv/factory/meter/meter.db
@@ -97,14 +105,83 @@ assert_meter_ready() {
         fi
     done
 }
+# Read-only DB-generation classification shared by --plan, --no-db-change and
+# the install. No DB and no sidecars is fresh; a regular DB is legacy, v1 or v2
+# by its committed user_version. Anything else is unknown and callers fail
+# closed: an unreadable DB, a hot rollback journal, a symlinked or non-regular
+# DB or sidecar, a symlinked or non-directory parent, or no coherent capture.
+# Only a v2 rerun leaves the DB generation unchanged. SQLite creates WAL/SHM
+# files even for -readonly opens, so the live files are never opened: the
+# committed generation (main file plus any WAL, which may hold a newer
+# user_version) is read from a private scratch copy removed before returning.
+classify_meter_db() {
+    local scratch suffix parent wal
+    mode=unknown
+    version=
+    parent=$(dirname "$db")
+    while [[ "$parent" != / ]]; do
+        [[ ! -L "$parent" && ( ! -e "$parent" || -d "$parent" ) ]] || { classified_plan; return 0; }
+        parent=$(dirname "$parent")
+    done
+    for suffix in '' -wal -shm -journal; do
+        [[ ! -L "$db$suffix" && ( ! -e "$db$suffix" || -f "$db$suffix" ) ]] || { classified_plan; return 0; }
+    done
+    if [[ ! -e "$db" ]]; then
+        if [[ ! -e "$db-wal" && ! -e "$db-shm" && ! -e "$db-journal" ]]; then mode=fresh; fi
+    elif [[ ! -e "$db-journal" ]] && scratch=$(mktemp -d); then
+        # A checkpoint between the two copies would pair a stale main file with
+        # a consumed WAL, and a commit before the read would make the scratch
+        # generation stale. Accept a read only when the live main file and WAL
+        # are byte-identical to the scratch copy before it, after it and after
+        # the mode is chosen (a WAL that grew is a newer commit); otherwise
+        # retry, then fail closed. Comparisons narrow the window but cannot
+        # close it; --no-db-change binds its final read to the backup lock.
+        for _ in 1 2 3 4 5; do
+            rm -f -- "$scratch/meter.db" "$scratch/meter.db-wal" "$scratch/meter.db-shm"
+            wal=
+            if [[ -e "$db-wal" ]]; then wal=$scratch/wal-copy; fi
+            if cp -- "$db" "$scratch/meter.db" \
+                && { [[ -z "$wal" ]] || { cp -- "$db-wal" "$wal" && cp -- "$wal" "$scratch/meter.db-wal"; }; } \
+                && capture_current "$scratch" "$wal" \
+                && version=$(sqlite3 -readonly "$scratch/meter.db" 'PRAGMA user_version;' 2>/dev/null) \
+                && capture_current "$scratch" "$wal"; then
+                case "$version" in 0) mode=legacy ;; 1) mode=v1 ;; 2) mode=v2 ;; esac
+                if capture_current "$scratch" "$wal"; then break; fi
+            fi
+            mode=unknown
+            version=
+            sleep 0.2
+        done
+        rm -rf -- "$scratch"
+    fi
+    classified_plan
+}
+# Are the live main file and WAL still exactly the copies: main file in $1,
+# untouched WAL copy at $2 (empty when none was copied, then no live WAL bytes)?
+capture_current() {
+    cmp -s -- "$db" "$1/meter.db" || return 1
+    if [[ -n "$2" ]]; then cmp -s -- "$db-wal" "$2"; else [[ ! -s "$db-wal" ]]; fi
+}
+classified_plan() {
+    [[ "$version" =~ ^[0-9]+$ ]] || version=
+    db_changing=yes
+    if [[ "$mode" == v2 ]]; then db_changing=no; fi
+    printf -v meter_plan 'meter-plan mode=%s user_version=%s db_changing=%s' "$mode" "${version:-none}" "$db_changing"
+}
 # Source only the DB helpers for non-root shell regression tests.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
-[[ $# -eq $((1 + check_only)) ]] || fail 'Supply exactly one prebuilt binary path, optionally after --check-only.'
+flags=$((check_only + plan + no_db_change))
+[[ $# -eq $((1 + flags)) ]] || fail 'Supply exactly one prebuilt binary path, optionally after --check-only, --plan or --no-db-change.'
 [[ -f "$binary" && -x "$binary" ]] || fail 'Supply an executable prebuilt meter binary.'
 info=$(sudo -u agent "$binary" --build-info) || fail "meter --build-info failed; rebuild from $root."
 verify_artifact meter "$info" "$checkout"
-[[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-meter.sh [--check-only] <prebuilt-binary>.'
+[[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-meter.sh [--check-only|--plan|--no-db-change] <prebuilt-binary>.'
 trap 'printf "ERROR: meter install failed at line %s.\n" "$LINENO" >&2; rollback_hint' ERR
+if (( plan )); then
+    classify_meter_db
+    printf '%s\n' "$meter_plan"
+    exit 0
+fi
 
 # Read-only preflight: no accounts, DBs or deployment files are created here.
 for command in systemctl curl sudo tailscale nvidia-smi useradd getent id install cp touch date mktemp realpath ss sqlite3 mv flock stat df awk sha256sum zstd python3 cmp chmod chown hostname env cat rm dirname bash sleep; do
@@ -135,6 +212,14 @@ if id meter >/dev/null 2>&1; then
 else
     ! getent group meter >/dev/null || fail 'meter group exists without its account.'
 fi
+# The automatic recheck comes before the path-safety checks so an unsafe DB
+# path is reported as a machine-readable refusal; only read-only checks remain
+# between it and the first change (staging).
+classify_meter_db
+if (( no_db_change )) && [[ "$db_changing" != no ]]; then
+    printf '%s\n' "$meter_plan"
+    fail "Refusing automatic meter install: mode $mode changes the DB generation; migration is Devon's explicit manual operation."
+fi
 for path in "$destination" /usr/local/bin/meter.new "$installed_unit" "$db" "$db-wal" "$db-shm" "$legacy" "$legacy-wal" "$legacy-shm" "$drop_in" /var/backups/factory-db/.backup.lock; do
     [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || fail "Unsafe file: $path"
     parent=$(dirname "$path")
@@ -144,6 +229,32 @@ for path in "$destination" /usr/local/bin/meter.new "$installed_unit" "$db" "$db
     done
 done
 [[ ! -L /var/backups/meter && ( ! -e /var/backups/meter || -d /var/backups/meter ) ]] || fail 'Unsafe meter snapshot directory.'
+if [[ "$mode" == unknown ]]; then
+    [[ -e "$db" || -L "$db" ]] || fail 'Orphan meter sidecars; recover first.'
+    fail "Unsupported meter user_version: ${version:-unreadable}"
+fi
+# Every DB-generation writer (this installer and rollback-meter-v1.sh) holds
+# the backup lock, and meter serve never writes user_version. The automatic
+# path therefore takes the lock on the existing lock file (no write) and
+# classifies again under it, so the generation it accepts cannot change
+# before staging, the snapshot or the post-stop recheck. The lock, not the
+# file comparisons, is the exclusion: no comparison can see a writer that
+# bypasses it (a manual sqlite3 or meter migrate outside these scripts). The
+# post-stop recheck is the last check; it fails such a change before the
+# backup, migration or binary swap, leaving a binaries-only v2 snapshot.
+lock=/var/backups/factory-db/.backup.lock
+locked=0
+if (( no_db_change )); then
+    [[ -f "$lock" && ! -L "$lock" ]] || fail 'Install MET-74 backups first.'
+    exec 9>>"$lock"
+    flock -n 9 || fail 'Backup or deployment is running; retry later.'
+    locked=1
+    classify_meter_db
+    if [[ "$db_changing" != no ]]; then
+        printf '%s\n' "$meter_plan"
+        fail "Refusing automatic meter install: mode $mode under the backup lock changes the DB generation; migration is Devon's explicit manual operation."
+    fi
+fi
 # Temporary executable staging lets meter run preflight without traversing the
 # agent's private checkout. No installed binary or service is changed here.
 stage=$(mktemp -d /usr/local/bin/.meter-stage.XXXXXX)
@@ -152,19 +263,11 @@ verification_dir=
 trap 'rm -rf -- "$stage"; if [[ -n "$migration_dir" ]]; then rm -rf -- "$migration_dir"; fi; if [[ -n "$verification_dir" ]]; then rm -rf -- "$verification_dir"; fi' EXIT
 chmod 0755 "$stage"
 install -m 0755 "$binary" "$stage/meter"
-mode=fresh
-if [[ -f "$db" ]]; then
-    version=$(meter_sqlite "$db" 'PRAGMA user_version;')
-    case "$version" in
-        0) mode=legacy; sudo -u meter "$stage/meter" migrate --legacy "$db" --check-only ;;
-        # v1 upgrades in place to v2 (MET-205 rollups); v2 is a rerun.
-        1) mode=v1; sudo -u meter "$stage/meter" migrate --check-only --db "$db" ;;
-        2) mode=v2; sudo -u meter "$stage/meter" migrate --check-only --db "$db" ;;
-        *) fail "Unsupported meter user_version: $version" ;;
-    esac
-else
-    [[ ! -e "$db-wal" && ! -e "$db-shm" ]] || fail 'Orphan meter sidecars; recover first.'
-fi
+case "$mode" in
+    legacy) sudo -u meter "$stage/meter" migrate --legacy "$db" --check-only ;;
+    # v1 upgrades in place to v2 (MET-205 rollups); v2 is a rerun.
+    v1|v2) sudo -u meter "$stage/meter" migrate --check-only --db "$db" ;;
+esac
 if [[ "$mode" == legacy ]]; then
     [[ -f "$destination" && -f "$installed_unit" ]] || fail 'Legacy conversion requires a previous binary and unit.'
     for suffix in '' -wal -shm; do [[ ! -e "$legacy$suffix" ]] || fail "Preserved v0 collision: $legacy$suffix"; done
@@ -190,8 +293,10 @@ fi
 
 # --snapshot and restore-check local do not acquire the lock again. FD 9 stays
 # open in this parent through verification; never invoke the locking backup job.
-exec 9>>/var/backups/factory-db/.backup.lock
-flock -n 9 || fail 'Backup or deployment is running; retry later.'
+if (( ! locked )); then
+    exec 9>>"$lock"
+    flock -n 9 || fail 'Backup or deployment is running; retry later.'
+fi
 install -d -m 0700 /var/backups/meter
 snapshot=$(mktemp -d "/var/backups/meter/$(date -u +%Y%m%dT%H%M%S.%NZ).XXXXXX")
 printf '%s\n' "$enabled" > "$snapshot/enabled"

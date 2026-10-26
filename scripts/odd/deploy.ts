@@ -15,7 +15,7 @@
 // Devon-approved `/home/agent/work/factory` revision (ROOT); this job never moves that checkout.
 //
 // Pure planning (`plan`, `pendingTags`, `issuesFromSubjects`, `parseSnapshot`, `healthySha`,
-// `probeResult`, `restoredResult`, `receiptLine`, `resume`) is exported for tests; effects go
+// `probeResult`, `restoredResult`, `receiptLine`, `meterPlan`, `resume`) is exported for tests; effects go
 // through `Effects` so the sandbox fixture fakes sudo, curl, git, the release download and Linear.
 
 import { spawnSync } from 'node:child_process';
@@ -24,6 +24,7 @@ import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, 
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { Refusal } from './lifecycle.ts';
 
 /** The allowlisted installer checkout: sudo, Git history and the release verifier. Never the runtime. */
 export const ROOT = '/home/agent/work/factory';
@@ -50,6 +51,8 @@ export type Recipe = {
   rollback: string;
   /** Health endpoint reporting `git_sha`. */
   health: string;
+  /** The installer classifies DB-generation changes: preflighted with `--plan`, installed with `--no-db-change`. */
+  dbGuard?: true;
 };
 
 /** Auto-deploy set settled by Devon 2026-10-24, in install order. The dispatcher's installer needs
@@ -59,7 +62,7 @@ export type Recipe = {
 export const recipes: readonly Recipe[] = [
   { name: 'meter', deployFiles: ['deploy/install-meter.sh', 'deploy/meter.service'], artifact: dir => join(dir, 'meter-linux-x86_64'),
     installer: 'deploy/install-meter.sh', rollback: 'deploy/rollback-meter-v1.sh',
-    health: 'http://127.0.0.1:11434/meter/health' },
+    health: 'http://127.0.0.1:11434/meter/health', dbGuard: true },
   { name: 'factory-api', deployFiles: ['deploy/install-factory-api.sh', 'deploy/factory-api.service'], artifact: dir => join(dir, 'factory-api-linux-x86_64'),
     installer: 'deploy/install-factory-api.sh', rollback: 'deploy/rollback-factory-api.sh',
     health: 'http://127.0.0.1:8080/v1/health' },
@@ -69,7 +72,8 @@ export const recipes: readonly Recipe[] = [
 ];
 
 export type ComponentRecord = { sha: string; tag: string; health: 'pass' | 'fail'; snapshot?: string };
-export type InFlight = { tag: string; sha: string; component: string; phase: 'installing' | 'probing'; snapshot?: string };
+/** `noDbChange`: the install ran with `--no-db-change`, so its snapshot never restores a DB generation (no `db-changing` marker). */
+export type InFlight = { tag: string; sha: string; component: string; phase: 'installing' | 'probing'; snapshot?: string; noDbChange?: true };
 /** A release's receipt, saved before delivery so a crashed delivery resumes without redeploying. `delivered` lists issues already handled. */
 export type PendingReceipt = { tag: string; receipt: Receipt; delivered: string[] };
 /** A tools tree: release tag/SHA and the installer checkout's HEAD it ran beside. */
@@ -137,9 +141,20 @@ export function restoredResult(sha: string, body: string): 'pass' | 'fail' {
   return reported && !sha.startsWith(reported) ? 'pass' : 'fail';
 }
 
-export type Receipt = { component: string; sha: string; health: 'pass' | 'fail'; rollback: string };
+/** `refused`: nothing was installed, migrated or rolled back; the control plane pages irreversible-action. */
+export type Receipt = { component: string; sha: string; health: 'pass' | 'fail' | 'refused'; rollback: string; refusal?: Refusal };
 export const receiptLine = (receipt: Receipt) =>
-  `odd-deploy host=${HOST} component=${receipt.component} sha=${receipt.sha} health=${receipt.health} rollback=${receipt.rollback}`;
+  `odd-deploy host=${HOST} component=${receipt.component} sha=${receipt.sha} health=${receipt.health} rollback=${receipt.rollback}${receipt.refusal ? ` refusal=${receipt.refusal}` : ''}`;
+
+/** A DB-guarded installer's verdict: `eligible` for exactly one v2 no-DB-change `meter-plan` line,
+ * a refusal for any other plan line, undefined when the output carries no plan line. */
+export function meterPlan(output: string): 'eligible' | Refusal | undefined {
+  const lines = [...output.matchAll(/^meter-plan mode=(\S+) user_version=(?:\d+|none) db_changing=(yes|no)$/gm)];
+  if (lines.length !== 1) return lines.length ? 'db-changing-unknown' : undefined;
+  const [, mode, changing] = lines[0];
+  if (mode === 'v2' && changing === 'no') return 'eligible';
+  return mode === 'fresh' || mode === 'legacy' || mode === 'v1' ? `db-changing-${mode}` : 'db-changing-unknown';
+}
 
 /**
  * Components to install for a release, in recipe order: enabled recipes whose sources or deploy
@@ -264,19 +279,28 @@ export async function deployComponent(effects: Effects, recipe: Recipe, tag: str
     effects.log('resume', { component: recipe.name, phase: inFlight.phase, action });
     snapshot = inFlight.snapshot;
     if (action === 'installed') needInstall = false;
+    // Only a snapshot a --no-db-change install took is proven binary-only; any other snapshot
+    // (an older installer's, possibly marked db-changing) may restore an older DB generation.
+    if (action === 'rollback' && recipe.dbGuard && snapshot && !inFlight.noDbChange) {
+      return refuse(effects, tag, { component: recipe.name, sha, health: 'refused', rollback: 'none', refusal: 'db-changing-snapshot' });
+    }
     if (action === 'rollback') return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: await rollback(effects, recipe, sha, snapshot) }, snapshot);
   }
   if (needInstall) {
-    effects.writeLedger({ ...ledger, inFlight: { tag, sha, component: recipe.name, phase: 'installing' } });
-    const install = effects.sudo(recipe.installer, ['--source-checkout', join(effects.stateDir, 'source'), recipe.artifact(releaseDir)]);
+    const guarded = recipe.dbGuard ? { noDbChange: true as const } : {};
+    effects.writeLedger({ ...ledger, inFlight: { tag, sha, component: recipe.name, phase: 'installing', ...guarded } });
+    const install = effects.sudo(recipe.installer, ['--source-checkout', join(effects.stateDir, 'source'), ...(recipe.dbGuard ? ['--no-db-change'] : []), recipe.artifact(releaseDir)]);
     snapshot = parseSnapshot(install.output);
     effects.log('install', { component: recipe.name, ok: install.ok, snapshot });
     if (!install.ok) {
       effects.log('installer-output', { component: recipe.name, tail: install.output.split('\n').slice(-20) });
+      // The installer's own recheck saw the DB generation change after the preflight: nothing changed.
+      const verdict = recipe.dbGuard && !snapshot ? meterPlan(install.output) : undefined;
+      if (verdict && verdict !== 'eligible') return refuse(effects, tag, { component: recipe.name, sha, health: 'refused', rollback: 'none', refusal: verdict });
       // The installer's own ERR path already restored or never changed anything; a snapshot means it changed something.
       return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: snapshot ? await rollback(effects, recipe, sha, snapshot) : 'none' }, snapshot);
     }
-    effects.writeLedger({ ...effects.readLedger(), inFlight: { tag, sha, component: recipe.name, phase: 'probing', snapshot } });
+    effects.writeLedger({ ...effects.readLedger(), inFlight: { tag, sha, component: recipe.name, phase: 'probing', snapshot, ...guarded } });
     if ((await probeWindow(effects, recipe, sha)) === 'fail') {
       return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: await rollback(effects, recipe, sha, snapshot) }, snapshot);
     }
@@ -285,13 +309,20 @@ export async function deployComponent(effects: Effects, recipe: Recipe, tag: str
 }
 
 /** Record the component; a failure also saves the release's receipt in the same write, so a rerun delivers it instead of redeploying. */
-function finish(effects: Effects, recipe: Recipe, tag: string, sha: string, receipt: Receipt, snapshot: string | undefined): Receipt {
+function finish(effects: Effects, recipe: Recipe, tag: string, sha: string, receipt: Receipt & { health: 'pass' | 'fail' }, snapshot: string | undefined): Receipt {
   const ledger = effects.readLedger();
   effects.writeLedger({
     ...ledger, inFlight: undefined,
     components: { ...ledger.components, [recipe.name]: { sha, tag, health: receipt.health, snapshot } },
     ...(receipt.health === 'fail' ? { receipt: { tag, receipt, delivered: [] } } : {}),
   });
+  return receipt;
+}
+
+/** A refusal changed nothing, so only its receipt is saved: components, inFlight and lastTag stay as they were. */
+function refuse(effects: Effects, tag: string, receipt: Receipt): Receipt {
+  effects.log('refused', { tag, ...receipt });
+  effects.writeLedger({ ...effects.readLedger(), receipt: { tag, receipt, delivered: [] } });
   return receipt;
 }
 
@@ -355,18 +386,35 @@ async function installRelease(effects: Effects, tag: string, sha: string, dir: s
       isAncestor: (baseline, target) => effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', baseline, target]),
       changedSince: baseline => effects.run('git', ['-C', ROOT, 'diff', '--name-only', `${baseline}..${sha}`]).stdout.split('\n').filter(Boolean) });
   };
+  // Read-only installer plans for every DB-guarded component, before any install, rollback or resume.
+  // Only an eligible plan proceeds; a refused, unparseable or failed plan refuses the whole release.
+  const planned = new Set<Recipe>();
+  const preflight = (selected: readonly Recipe[]): Receipt | undefined => {
+    for (const recipe of selected) {
+      if (!recipe.dbGuard || planned.has(recipe)) continue;
+      planned.add(recipe);
+      const result = effects.sudo(recipe.installer, ['--source-checkout', join(effects.stateDir, 'source'), '--plan', recipe.artifact(dir)]);
+      const verdict = result.ok ? meterPlan(result.output) : undefined;
+      effects.log('preflight', { component: recipe.name, ok: result.ok, verdict });
+      if (verdict !== 'eligible') return refuse(effects, tag, { component: recipe.name, sha, health: 'refused', rollback: 'none', refusal: verdict ?? 'db-changing-unknown' });
+    }
+  };
   let changed = select(true);
   effects.log('plan', { tag, sha, components: changed.map(recipe => recipe.name) });
   // Guard the entire plan before resuming even one interrupted installer.
+  const refused = preflight(resumed ? [resumed, ...changed] : changed);
+  if (refused) return refused;
   if (resumed) {
     const result = await deployComponent(effects, resumed, tag, sha, dir);
     if (resumed.name === 'factory-api') changed = select();
-    if (result.health === 'fail') return result;
+    if (result.health !== 'pass') return result;
+    const again = preflight(changed);
+    if (again) return again;
   }
   for (const recipe of changed) {
     if (recipe === resumed) continue;
     const result = await deployComponent(effects, recipe, tag, sha, dir);
-    if (result.health === 'fail') return result;
+    if (result.health !== 'pass') return result;
   }
   // Everything healthy at this SHA, including components a killed run finished.
   const done = effects.readLedger().components;
@@ -405,6 +453,8 @@ async function deployRelease(effects: Effects, tag: string, previousTag: string)
     } else effects.log('receipt-skipped', { issue: identifier, reason: 'not Deploying' });
     effects.writeLedger({ ...effects.readLedger(), receipt: { ...pending, delivered: [...pending.delivered, identifier] } });
   }
+  // An unhandled refusal holds lastTag and its delivered receipt: every rerun stops here until Devon acts.
+  if (receipt.health === 'refused') throw new Error(`${tag}: ${line}; held until Devon handles the refusal`);
   effects.writeLedger({ ...effects.readLedger(), lastTag: tag, receipt: undefined });
   if (receipt.health === 'fail') throw new Error(`${tag}: ${line}`);
 }
