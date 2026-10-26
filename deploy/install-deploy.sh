@@ -44,6 +44,10 @@ for script in install-meter.sh rollback-meter-v1.sh install-factory-api.sh rollb
     [[ "$allowed" == *"/usr/bin/bash /home/agent/work/factory/deploy/$script *"* ]] || fail "Allowlist lacks deploy/$script."
 done
 sudo -u agent test -r /etc/factory-dispatch/linear-api-key || fail 'agent cannot read /etc/factory-dispatch/linear-api-key.'
+# Starting the job needs a reviewed baseline; install-only never creates one.
+ledger=/home/agent/.local/state/factory-odd/deploy.json
+[[ ${1:-} == --install-only ]] || sudo -u agent test -s "$ledger" ||
+    fail "No deploy ledger at $ledger; nothing changed. Use --install-only, investigate, establish a reviewed baseline with deploy.ts --bootstrap TAG (docs/odd/deployer-recovery.md), then rerun."
 cd /home/agent/work
 sudo -u agent test -x /home/agent/work
 path=/usr/local/bin:/usr/bin:/bin
@@ -89,11 +93,11 @@ if [[ ${1:-} == --install-only ]]; then
     systemctl disable --now factory-deploy.timer
     [[ $(systemctl show factory-deploy.timer --property=UnitFileState --value) == disabled ]] || fail 'Deploy timer is not persistently disabled.'
     [[ $(systemctl show factory-deploy.timer --property=ActiveState --value) == inactive ]] || fail 'Deploy timer is not inactive.'
-    printf '%s\n' 'Deploy units installed; timer disabled and inactive, ledger unchanged. Reconcile before starting factory-deploy.service and enabling the timer.'
+    printf '%s\n' 'Deploy units installed; timer disabled and inactive, ledger unchanged (never created). Reconcile or bootstrap explicitly before starting factory-deploy.service and enabling the timer.'
     exit 0
 fi
-# First run records the latest release in the ledger without deploying (deploy.ts bootstrap);
-# later runs deploy pending releases, bounded by the unit's TimeoutStartSec.
+# Each run deploys releases pending above the existing ledger, bounded by the unit's TimeoutStartSec;
+# deploy.ts fails without deploying when the ledger is missing or invalid.
 systemctl start factory-deploy.service
 systemctl enable --now factory-deploy.timer
 systemctl is-active --quiet factory-deploy.timer
