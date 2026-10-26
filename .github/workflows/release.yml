@@ -65,7 +65,7 @@ jobs:
           # Historical scripts/sandbox clears PATH to /usr/bin:/bin at runtime.
           # Match sandbox CI provisioning; GITHUB_PATH alone cannot reach it.
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y bubblewrap
+          sudo apt-get install --no-install-recommends -y bubblewrap lld
           env -i PATH=/usr/bin:/bin bwrap --unshare-net --ro-bind / / true
       - name: Restore release build cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

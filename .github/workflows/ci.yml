@@ -56,7 +56,11 @@ jobs:
             cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain*') }}-
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --workspace --locked
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: nextest@0.9.149
+      - run: cargo nextest run --workspace --locked
+      - run: cargo test --doc --workspace --locked
       - name: Install installer test dependencies
         run: |
           sudo apt-get update
