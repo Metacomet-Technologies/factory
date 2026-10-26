@@ -1,7 +1,7 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, slackMessages, staleThreads, sweepMs, staleMs, type DigestInput, type Episode } from './watchdog.ts';
-import { heartbeatLine, parseHeartbeat } from './lifecycle.ts';
+import { deployReceiptLine, heartbeatLine, parseHeartbeat, verifyLine } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
 import { receiptLabel, type LiveThread } from './snapshot.ts';
 import plugin, { followUp } from '../../.amp/plugins/factory-odd.ts';
@@ -102,6 +102,7 @@ test('a digest longer than one Slack message is split on line breaks', () => {
 /** Linear, thread search and #factory-alerts shared by every plugin instance; each `start()` is a fresh plugin load arming the control thread and returns its `odd_control_status` tool. `override` also sees `thread.labels` and `createWebhook`. */
 function controlOrb(override: (name: string, input: Record<string, unknown>) => unknown = () => undefined) {
   const evaluated: string[] = [];
+  const spawned: string[] = [];
   const alerts: string[] = [];
   const dms: string[] = [];
   const calls: string[] = [];
@@ -145,7 +146,7 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
     const amp = {
       // `override('$', { command })` may answer a shell command with its stdout.
       $: fakeShell(command => override('$', { command }) as string | undefined).$,
-      createAgent: () => ({ definition: {} }), registerAgentMode: () => {}, registerTool: (tool: typeof status) => { status = tool; },
+      createAgent: () => ({ definition: {}, createThread: async () => ({ id: `T-spawned-${spawned.length + 1}`, setLabels: async () => {}, appendUserMessage: async (message: { content: string }) => { spawned.push(message.content); } }) }), registerAgentMode: () => {}, registerTool: (tool: typeof status) => { status = tool; },
       on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
       createWebhook: async (options: Record<string, unknown>) => (await override('createWebhook', options)) ?? { url: 'https://hooks.example/x' },
       system: { executor: { kind: 'remote', keepAlive: async () => {} } },
@@ -154,9 +155,9 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
     const thread = { id: 'T-control', labels: async () => (await override('thread.labels', {})) ?? ['odd-control-plane', 'odd-perform'] };
     const ctx = { thread, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools };
     await handlers.get('session.start')!({}, ctx);
-    return async (input: Record<string, unknown>) => JSON.parse(await status!.execute(input, ctx)) as { armed: boolean; error?: string };
+    return async (input: Record<string, unknown>) => JSON.parse(await status!.execute(input, ctx)) as { armed: boolean; error?: string; slack: { error?: string } };
   };
-  return { start, evaluated, alerts, dms, calls, updates, reads: () => alertReads };
+  return { start, evaluated, spawned, alerts, dms, calls, updates, reads: () => alertReads };
 }
 
 const until = async (done: () => boolean) => {
@@ -439,7 +440,7 @@ function factory() {
   const threads = new Map<string, { labels: string[]; state: string; archived: boolean; updatedAt: string }>();
   const dms: string[] = [];
   const steers: string[] = [];
-  const control = { slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '', gh: undefined as ((command: string) => Shell | undefined) | undefined, inject: undefined as ((name: string, input: Record<string, unknown>) => unknown) | undefined };
+  const control = { slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '', gh: undefined as ((command: string) => Shell | undefined) | undefined, inject: undefined as ((name: string, input: Record<string, unknown>) => unknown) | undefined, commentCursor: '' as '' | 'repeated' | 'missing' };
   /** Lifecycle mutations: status writes, builder launches and heartbeats (comments, archives, steers and DMs are kept above). */
   const saves: string[] = [];
   const launches: string[] = [];
@@ -457,7 +458,14 @@ function factory() {
       case 'linear.get_issue':
         if (input.id === control.unreadable) throw new Error('Linear 503');
         return { ...issues.get(String(input.id))!, relations: { blockedBy: [] } };
-      case 'linear.list_comments': return { comments: [...(comments.get(String(input.issueId)) ?? [])].reverse() };
+      case 'linear.list_comments': {
+        // Newest first, `limit` per page; each page repeats the previous page's last comment, as overlapping pages can.
+        const all = [...(comments.get(String(input.issueId)) ?? [])].reverse();
+        if (control.commentCursor) return { comments: all.slice(0, 1), hasNextPage: true, ...(control.commentCursor === 'repeated' ? { cursor: 'same' } : {}) };
+        const from = Number(input.cursor ?? 0);
+        const to = from + Number(input.limit ?? 50);
+        return { comments: all.slice(from, to), hasNextPage: to < all.length, cursor: String(to - 1) };
+      }
       case 'linear.save_comment': {
         if (input.id) {
           for (const list of comments.values()) for (const comment of list) if (comment.id === input.id) comment.body = String(input.body);
@@ -515,6 +523,7 @@ function factory() {
   const ends = new Map<number, (event: unknown, ctx: unknown) => Promise<unknown>>();
   const statuses = new Map<number, (input: Record<string, unknown>, ctx: unknown) => Promise<string>>();
   const builder = (issue: string, state = 'idle', updatedAt = new Date().toISOString()) => threads.set(`T-${issue}`, { labels: [`odd-issue-${issue.toLowerCase()}`, 'odd-role-builder', 'odd-round-1', 'odd-engine-anthropic'], state, archived: false, updatedAt });
+  let said = 0;
   const openPr = (issue: string, sha: string, over: Partial<Pr> = {}) => {
     const n = Number(issue.slice(4));
     prs.push({ number: n, headRefName: `${issue.toLowerCase()}-x`, headRefOid: sha, state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: sha, committedDate: new Date().toISOString() }], statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }], body: `closes ${issue}`, ...over });
@@ -525,6 +534,8 @@ function factory() {
     events: async () => (JSON.parse(await statuses.get(generation)!({}, { thread: { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] } })) as { events: { issue: string | null; stage: string; error?: string }[] }).events,
     /** The Ralph guard as the latest plugin load runs it at the end of a role thread's turn. */
     guard: (labels: string[]) => ends.get(generation)!({ status: 'done', message: '', thread: { id: 'T-role' } }, { thread: { id: 'T-role', labels: async () => labels }, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools, $ }),
+    /** A comment one second after the previous planted one, so creation order is unambiguous. */
+    say: (issue: string, body: string) => comments.set(issue, [...(comments.get(issue) ?? []), { id: `said-${++said}`, body, createdAt: new Date(Date.parse('2026-10-26T12:00:00Z') + said * 1000).toISOString() }]),
     issue: (id: string, status: string) => issues.set(id, { id, status, labels: ['odd', 'Bug', 'area:agents'], description: fullSpec }),
     episodes: (id: string) => (comments.get(id) ?? []).filter(comment => comment.body.startsWith('odd-failure')).map(comment => comment.body.split('\n')[0]),
     async start() {
@@ -1449,4 +1460,123 @@ test('P4.6-webhooks: without a secret (first arm, dismissed dialog, plugin reloa
     assert.ok(!orb.output.some(text => text.includes(secret)), 'a secret leaked into status, logs, errors or tool inputs');
   }
   assert.ok(orb.output.some(text => text.includes('"signing"')), 'status output was captured');
+});
+
+// --- P4.5: every authoritative lifecycle read follows its pages --------------------------
+
+const unrelatedPr = (n: number, state: Pr['state'] = 'OPEN'): Pr =>
+  ({ number: 1000 + n, headRefName: `renovate-${n}`, headRefOid: 'f'.repeat(40), state, mergeCommit: null, mergeable: 'MERGEABLE', commits: [], statusCheckRollup: [], body: `Mentions MET-30 and MET-32 without owning them (${n}).` });
+const rolesOf = (plant: ReturnType<typeof factory>, issue: string, role: string) =>
+  [...plant.threads.values()].filter(thread => thread.labels.includes(`odd-issue-${issue.toLowerCase()}`) && thread.labels.includes(`odd-role-${role}`));
+
+test('P4.5: a receipt beyond comment 50 starts the verifier, and the verifier\'s guard reads it and the verdict on another page', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  const sha = 'e'.repeat(40);
+  plant.issue('MET-20', 'Deploying');
+  plant.say('MET-20', deployReceiptLine({ host: 'gpu', component: 'api', sha, health: 'pass', rollback: 'none' }));
+  for (let i = 0; i < 120; i++) plant.say('MET-20', `note ${i}`);
+  await plant.start();
+  await settle();
+  assert.equal(rolesOf(plant, 'MET-20', 'verifier').length, 1, 'the receipt is the oldest of 121 comments');
+  const labels = ['odd-issue-met-20', 'odd-role-verifier', 'odd-round-1'];
+  const unmet = await plant.guard(labels) as Promise<{ userMessage: string } | undefined>;
+  assert.match(unmet?.userMessage ?? '', new RegExp(`odd-verify sha=${sha}`), 'the guard found the receipt and waits for its verdict');
+  plant.say('MET-20', verifyLine({ sha, result: 'pass' }));
+  assert.equal(await plant.guard(labels) as Promise<{ userMessage: string } | undefined>, undefined, 'verdict on page 1, receipt on page 2: stop met');
+});
+
+for (const kind of ['repeated', 'missing'] as const) {
+  test(`P4.5: a ${kind} comment cursor fails the evaluation closed instead of acting on the first page`, async t => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+    t.after(() => mock.timers.reset());
+    const plant = factory();
+    plant.issue('MET-21', 'Deploying');
+    plant.say('MET-21', deployReceiptLine({ host: 'gpu', component: 'api', sha: 'e'.repeat(40), health: 'pass', rollback: 'none' }));
+    plant.control.commentCursor = kind;
+    await plant.start();
+    await advance(5 * 60_000);
+    assert.deepEqual(rolesOf(plant, 'MET-21', 'verifier'), [], 'the receipt on page 1 is not acted on');
+    plant.control.commentCursor = '';
+    await advance(10 * 60_000);
+    assert.equal(rolesOf(plant, 'MET-21', 'verifier').length, 1, 'normal pages resume');
+  });
+}
+
+test('P4.5: an owned open PR beyond the first 100 and a merged one beyond 100 search results both count; mentions do not own', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  for (let i = 0; i < 150; i++) plant.prs.push(unrelatedPr(i));
+  plant.issue('MET-30', 'In Progress');
+  plant.builder('MET-30');
+  plant.openPr('MET-30', 'a'.repeat(40));
+  // 150 merged PRs the quoted search matches (they mention MET-32) but that do not own it, newer than the owner.
+  plant.prs.push({ ...unrelatedPr(999, 'MERGED'), number: 32, headRefName: 'met-32-x', headRefOid: '3'.repeat(40), mergeCommit: { oid: '4'.repeat(40) } as never, mergedAt: '2026-10-26T14:00:00Z', commits: [{ oid: '3'.repeat(40), committedDate: '2026-10-26T13:00:00Z' }], body: 'MET-32' } as Pr);
+  for (let i = 0; i < 150; i++) plant.prs.unshift({ ...unrelatedPr(i, 'MERGED'), mergeCommit: { oid: '5'.repeat(40) } as never, mergedAt: '2026-10-26T14:00:00Z' } as Pr);
+  plant.issue('MET-32', 'In Progress');
+  plant.builder('MET-32');
+  await plant.start();
+  await settle();
+  assert.equal(rolesOf(plant, 'MET-30', 'reviewer').length, 1, 'open PR #30 is the 151st open PR');
+  assert.ok(plant.saves.includes('MET-32 "Deploying"'), 'merged PR #32 is the 151st search result');
+});
+
+test('P4.5: the digest counts a Done issue on page 2 and a merged PR past the old limit', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const old = Array.from({ length: 100 }, (_, i) => ({ id: `MET-${i + 1}`, title: 'long done', completedAt: '2026-10-01T00:00:00Z' }));
+  const orb = controlOrb((name, input) => {
+    if (name === 'linear.list_issues' && input.state === 'Done') {
+      return input.cursor === 'done-2'
+        ? { issues: [old[99], { id: 'MET-900', title: 'late Done sentinel', completedAt: '2026-10-24T14:00:00Z' }], hasNextPage: false }
+        : { issues: old, hasNextPage: true, cursor: 'done-2' };
+    }
+    if (name !== '$') return emptyWork(name);
+    const command = String(input.command);
+    if (!command.startsWith('gh pr list --state merged --search merged:')) return undefined;
+    const limit = Number(/--limit (\d+)/.exec(command)?.[1]);
+    const prs = Array.from({ length: 60 }, (_, i) => ({ number: 100 + i, title: i === 59 ? 'late merged sentinel' : 'merged', headRefOid: 'a'.repeat(40), mergeCommit: { oid: 'b'.repeat(40) }, mergedAt: '2026-10-24T14:00:00Z' }));
+    return JSON.stringify(prs.slice(0, limit));
+  });
+  await orb.start();
+  await until(() => orb.alerts.some(text => text.startsWith('ODD digest')));
+  const text = orb.alerts.join('\n');
+  assert.match(text, /^- MET-900 late Done sentinel$/m);
+  assert.match(text, /^- #159 late merged sentinel /m);
+  assert.match(text, /^Issues Done \(1\):/m, 'the Done issue repeated across pages is listed once');
+});
+
+const intakeMessage = (ts: string, text: string) => ({ ts, text, userID: 'U1' });
+
+test('P4.5: a Slack intake message on page 2 gets an Intake thread; one repeated across pages gets one', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const first = intakeMessage('1761310000.000100', 'first intake');
+  const orb = controlOrb((name, input) => {
+    if (name === 'slack_read' && input.channelName === '#factory-intake' && input.operation === 'read_messages') {
+      return input.cursor === 'intake-2' ? { messages: [first, intakeMessage('1761310000.000200', 'late intake sentinel')] } : { messages: [first], nextCursor: 'intake-2' };
+    }
+    return emptyWork(name);
+  });
+  await orb.start();
+  await until(() => orb.spawned.length === 2);
+  await settle();
+  assert.equal(orb.spawned.length, 2);
+  assert.equal(orb.spawned.filter(prompt => prompt.includes('first intake')).length, 1);
+  assert.ok(orb.spawned.some(prompt => prompt.includes('late intake sentinel')));
+});
+
+test('P4.5: a repeated Slack cursor fails the intake poll closed; nothing is handed to Intake', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const orb = controlOrb((name, input) => {
+    if (name === 'slack_read' && input.channelName === '#factory-intake') return { messages: [intakeMessage('1761310000.000100', 'first intake')], nextCursor: 'loop' };
+    return emptyWork(name);
+  });
+  const status = await orb.start();
+  await settle();
+  assert.match((await status({})).slack.error ?? '', /repeated cursor loop/);
+  assert.deepEqual(orb.spawned, []);
 });
