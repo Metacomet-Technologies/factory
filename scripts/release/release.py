@@ -646,6 +646,15 @@ def package(root, output, plan):
     verify_bundle(output, inventory, sha)
 
 
+def discard_checkout(checkout):
+    """Delete a disposable checkout. A target symlink points at the shared cargo cache."""
+    checkout = Path(checkout)
+    target = checkout / "target"
+    if target.is_symlink():
+        target.unlink()
+    shutil.rmtree(checkout)
+
+
 def build_exact(root, plan, output):
     # Clone only committed source into disposable state, never switch the caller's branch.
     exclude = Path(git(root, "rev-parse", "--git-path", "info/exclude"))
@@ -672,7 +681,7 @@ def build_exact(root, plan, output):
                         str(plan_path), str(output.resolve())], cwd=checkout, env=env, check=True)
         plan_path.unlink()
     finally:
-        shutil.rmtree(checkout)
+        discard_checkout(checkout)
 
 
 def build_pending(api, root, inventory, directory):

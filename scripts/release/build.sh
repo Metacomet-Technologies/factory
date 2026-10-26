@@ -47,12 +47,27 @@ export PATH="$tools/node_modules/.bin:$PATH"
 vp install --frozen-lockfile
 export PATH="$root/kiosk/node_modules/.bin:$PATH"
 cd "$root"
-cargo build --release --locked -p meter -p factory-api -p pricing -p factory-ups-control
-trap 'scripts/sandbox down; rm -rf -- "$tools"' EXIT
+# The publisher deletes this checkout after every SHA. Keep the cargo output
+# in a sibling directory and point target/ at it, so scripts/sandbox and
+# package() still use target/release. The committed target/ ignore matches a
+# directory, not this symlink.
+cache=$(dirname "$root")/cargo-target
+mkdir -p -- "$cache"
+exclude=$(git -C "$root" rev-parse --git-path info/exclude)
+[[ "$exclude" == /* ]] || exclude="$root/$exclude"
+mkdir -p -- "$(dirname "$exclude")"
+if [[ ! -f "$exclude" ]] || ! grep -qxF /target "$exclude"; then
+    printf '%s\n' /target >> "$exclude"
+fi
+[[ ! -e "$root/target" && ! -L "$root/target" ]] || { echo 'Release checkout target already exists' >&2; exit 1; }
+ln -s -- "$cache" "$root/target"
+trap '[[ -L "$root/target" ]] && rm -f -- "$root/target"; rm -rf -- "$tools"' EXIT
+cargo build --release --locked -p meter -p factory-api -p pricing -p factory-ups-control -p sandbox
+trap 'scripts/sandbox down; [[ -L "$root/target" ]] && rm -f -- "$root/target"; rm -rf -- "$tools"' EXIT
 if ! scripts/sandbox up --rows 1k --kiosk; then
     for service in runtime seed meter factory-api; do scripts/sandbox logs "$service" || true; done
     exit 1
 fi
-python3 scripts/sandbox-shims/smoke.py --kiosk
+# CI already ran smoke.py for this SHA. package() reads the live health endpoints.
 python3 scripts/release/release.py package --root "$root" --plan-file "$plan" --directory "$output"
 [[ -z $(git status --porcelain) ]] || { echo 'Build dirtied source' >&2; exit 1; }

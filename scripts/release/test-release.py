@@ -1497,7 +1497,10 @@ class RunnerProvisioning(unittest.TestCase):
         self.assertIn(probe, build)
         self.assertLess(build.index("sudo apt-get update"), build.index(install))
         self.assertLess(build.index(install), build.index(probe))
-        self.assertLess(build.index(probe), build.index("python3 scripts/release/release.py build"))
+        self.assertLess(build.index(probe), build.index("release-target-v1-"))
+        self.assertLess(build.index("release-target-v1-"), build.index("python3 scripts/release/release.py build"))
+        self.assertIn(".amp/in/cargo-target", build)
+        self.assertNotIn("actions/cache@", publish)
         self.assertNotIn("apt-get download bubblewrap", build)
         self.assertNotIn("dpkg-deb", build)
         self.assertIn("contents: read", build)
@@ -1518,6 +1521,25 @@ class RunnerProvisioning(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ github.token }}", continuation)
         self.assertIn("if: needs.publish.outputs.published == 'true'", continuation)
         self.assertIn("gh workflow run release.yml --repo Metacomet-Technologies/factory --ref main", continuation)
+
+    def test_release_build_reuses_cargo_target_without_a_second_smoke(self):
+        script = (ROOT / "scripts/release/build.sh").read_text()
+        self.assertIn("-p sandbox", script)
+        self.assertIn("cargo-target", script)
+        self.assertNotIn("sandbox-shims/smoke.py", script)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout = root / "release"
+            cache = root / "cargo-target"
+            cache.mkdir()
+            marker = cache / "marker"
+            marker.write_text("keep")
+            checkout.mkdir()
+            (checkout / "source").write_text("gone")
+            (checkout / "target").symlink_to(cache, target_is_directory=True)
+            r.discard_checkout(checkout)
+            self.assertFalse(checkout.exists())
+            self.assertEqual(marker.read_text(), "keep")
 
     def test_sanitized_runtime_ignores_user_space_bubblewrap(self):
         # Reproduce why an outer PATH/GITHUB_PATH entry cannot fix old checkouts.
@@ -1572,6 +1594,25 @@ class BuildMetadata(unittest.TestCase):
                 self.assertFalse(kiosk["git_dirty"])
                 if override:
                     self.assertEqual(int(rust[3]), kiosk["built_at_ms"])
+            dev = dict(base)
+            first_dev = run(root, "cargo", "build", "--locked", env=dev)
+            second_dev = run(root, "cargo", "build", "--locked", env=dev)
+            self.assertIn("Compiling", first_dev.stderr)
+            self.assertIn("Compiling", second_dev.stderr)
+            # Release checkouts are detached, so .git/HEAD itself holds the SHA.
+            run(root, "git", "checkout", "-q", "--detach")
+            rel = {**base, "FACTORY_RELEASE_VERSION": "0.2.1"}
+            first_rel = run(root, "cargo", "build", "--release", "--locked", env=rel)
+            second_rel = run(root, "cargo", "build", "--release", "--locked", env=rel)
+            self.assertIn("Compiling", first_rel.stderr)
+            self.assertNotIn("Compiling", second_rel.stderr)
+            (root / "note.txt").write_text("n\n")
+            commit(root, "move HEAD")
+            moved = run(root, "cargo", "build", "--release", "--locked", env=rel)
+            self.assertIn("Compiling", moved.stderr)
+            stamped = run(root, "cargo", "run", "--quiet", "--release", "--locked", env=rel).stdout.strip().split("|")
+            self.assertEqual(stamped[0], "0.2.1")
+            self.assertEqual(stamped[1], r.git(root, "rev-parse", "HEAD"))
             for invalid in ("", "0.1.99", "0.02.1", "1.2.3-rc1", "1.2.3+meta", "1.2.3\n", "4294967296.0.0"):
                 env = {**base, "FACTORY_RELEASE_VERSION": invalid}
                 self.assertNotEqual(run(root, "cargo", "run", "--quiet", env=env, check=False).returncode, 0, invalid)
