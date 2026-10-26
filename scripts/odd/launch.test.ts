@@ -128,6 +128,8 @@ function controlPlane(options: { status?: string; threads?: Omit<FakeThread, 'ar
   const webhooks = new Map<string, (event: unknown, ctx: unknown) => Promise<void>>();
   // Orbs only run plugin agents whose definition is registered as an active agent mode.
   const modes = new Map<string, unknown>();
+  // The label a mode shows: its own, else its agent's display label (plugin API default).
+  const modeLabels = new Map<string, string | undefined>();
   const amp = {
     $,
     createAgent: (config: { model?: string; reasoningEffort?: string }) => {
@@ -140,7 +142,7 @@ function controlPlane(options: { status?: string; threads?: Omit<FakeThread, 'ar
         return { id, setLabels: async (labels: string[]) => { threads.get(id)!.labels = labels; return labels; }, appendUserMessage: async () => {} };
       } };
     },
-    registerAgentMode: ({ key, agent }: { key: string; agent: unknown }) => { modes.set(key, agent); }, registerTool: () => {},
+    registerAgentMode: ({ key, label, agent }: { key: string; label?: string; agent: { display?: { label?: string } } }) => { modes.set(key, agent); modeLabels.set(key, label ?? agent.display?.label); }, registerTool: () => {},
     on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
     createWebhook: async ({ key, handler }: { key: string; handler: (event: unknown, ctx: unknown) => Promise<void> }) => { webhooks.set(key, handler); return { url: `https://hooks.example/${key}` }; },
     system: { executor: { kind: 'remote', keepAlive: async () => {} } },
@@ -150,7 +152,7 @@ function controlPlane(options: { status?: string; threads?: Omit<FakeThread, 'ar
   const ctx = { thread: control, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools, $ };
   let events = 0;
   return {
-    issue, threads, comments, dms, commands, agentModels, modes,
+    issue, threads, comments, dms, commands, agentModels, modes, modeLabels,
     setPr: (next: Pr | undefined) => { pr = next; },
     async start() {
       if (options.launcher) mock.method(io, 'start', options.launcher.start);
@@ -272,8 +274,8 @@ test('control plane: every registered mode is discoverable from the plugin heade
   t.after(() => mock.timers.reset());
   const plane = controlPlane();
   await plane.start();
-  const header = [...readFileSync(new URL('../../.amp/plugins/factory-odd.ts', import.meta.url), 'utf8').matchAll(/^\/\/ @amp-agent-mode (.+)$/gm)].map(m => (JSON.parse(m[1]) as { key: string }).key);
-  assert.deepEqual([...plane.modes.keys()].sort(), [...header].sort());
+  const header = [...readFileSync(new URL('../../.amp/plugins/factory-odd.ts', import.meta.url), 'utf8').matchAll(/^\/\/ @amp-agent-mode (.+)$/gm)].map(m => JSON.parse(m[1]) as { key: string; label: string });
+  assert.deepEqual(Object.fromEntries([...plane.modeLabels].sort()), Object.fromEntries(header.map(({ key, label }) => [key, label]).sort()));
   const reviewerModels = [...plane.modes].filter(([key]) => key.startsWith('odd-reviewer')).map(([, agent]) => (agent as { model: string }).model).sort();
   assert.deepEqual(reviewerModels, reviewerEngines.map(engine => engine.model).sort());
 });

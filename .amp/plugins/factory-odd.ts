@@ -102,6 +102,7 @@ export default async function (amp: PluginAPI) {
 	for (const { key, label, agent } of [...modes, ...reviewerModes, { key: 'control', label: 'ODD Control', agent: control }]) {
 		amp.registerAgentMode({
 			key: `odd-${key}`,
+			label,
 			description: `${label}: the ${key} role of outcome driven development. Use only when the ODD control plane or Devon starts it.`,
 			agent: agent.definition,
 		})
