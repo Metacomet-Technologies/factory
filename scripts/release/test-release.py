@@ -1045,6 +1045,23 @@ class Releases(unittest.TestCase):
             r.GitHub(anonymous=True).request("releases")
             self.assertEqual(request.call_args.args[0].get_header("X-github-api-version"), "2026-03-10")
 
+    def test_binary_download_media_types(self):
+        raw = b"PK\x03\x04\xffartifact bytes"
+        for path, accept in (("actions/artifacts/123/zip", "application/vnd.github+json"),
+                             ("releases/assets/456", "application/octet-stream")):
+            def download(args, **kwargs):
+                valid = f"Accept: {accept}" in args
+                return subprocess.CompletedProcess(args, 0 if valid else 1,
+                                                   stdout=raw if valid else b"",
+                                                   stderr=b"" if valid else b"Unsupported Accept header (HTTP 415)")
+
+            with self.subTest(path=path), patch.object(subprocess, "run", side_effect=download):
+                self.assertEqual(r.GitHub().request(path, binary=True), raw)
+            with self.subTest(path=path, anonymous=True), patch.object(r.urllib.request, "urlopen") as request:
+                request.return_value.__enter__.return_value.read.return_value = raw
+                self.assertEqual(r.GitHub(anonymous=True).request(path, binary=True), raw)
+                self.assertEqual(request.call_args.args[0].get_header("Accept"), accept)
+
     def test_only_authenticated_reads_retry_transient_server_errors(self):
         ok = subprocess.CompletedProcess([], 0, stdout=b'{"jobs": []}', stderr=b"")
 
