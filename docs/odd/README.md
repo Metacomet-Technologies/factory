@@ -466,11 +466,14 @@ by the previous one).
    lock or snapshot; the committed version, WAL included, is read from a
    private scratch copy because SQLite creates sidecars even for read-only
    opens, accepted only when the live main file and WAL are byte-identical
-   to the copies both before and after the read (a grown WAL is a newer
-   commit), else retried up to five attempts and then `unknown`;
-   an unsafe DB, sidecar or parent path is `unknown`) and installs meter only
-   with `--no-db-change`, which rechecks before its path checks and first
-   change. Only a v2 rerun is eligible. A fresh, legacy,
+   to the copies before the read, after it and after the mode is chosen (a
+   grown WAL is a newer commit), else retried up to five attempts and then
+   `unknown`; an unsafe DB, sidecar or parent path is `unknown`) and installs
+   meter only with `--no-db-change`, which rechecks before its path checks,
+   then takes the backup lock (held by every generation writer: the installer
+   and `rollback-meter-v1.sh`; `meter serve` never writes `user_version`) and
+   classifies again under it before its first change, so comparisons are not
+   the only guard against a later commit. Only a v2 rerun is eligible. A fresh, legacy,
    v1, unclassifiable or failed plan installs nothing in the release, and a
    generation change caught by the recheck installs nothing further. An
    interrupted meter install whose resume probe is red rolls back only a

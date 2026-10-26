@@ -132,8 +132,10 @@ classify_meter_db() {
         # A checkpoint between the two copies would pair a stale main file with
         # a consumed WAL, and a commit before the read would make the scratch
         # generation stale. Accept a read only when the live main file and WAL
-        # are byte-identical to the scratch copy both before and after it (a WAL
-        # that grew is a newer commit); otherwise retry, then fail closed.
+        # are byte-identical to the scratch copy before it, after it and after
+        # the mode is chosen (a WAL that grew is a newer commit); otherwise
+        # retry, then fail closed. Comparisons narrow the window but cannot
+        # close it; --no-db-change binds its final read to the backup lock.
         for _ in 1 2 3 4 5; do
             rm -f -- "$scratch/meter.db" "$scratch/meter.db-wal" "$scratch/meter.db-shm"
             wal=
@@ -144,8 +146,9 @@ classify_meter_db() {
                 && version=$(sqlite3 -readonly "$scratch/meter.db" 'PRAGMA user_version;' 2>/dev/null) \
                 && capture_current "$scratch" "$wal"; then
                 case "$version" in 0) mode=legacy ;; 1) mode=v1 ;; 2) mode=v2 ;; esac
-                break
+                if capture_current "$scratch" "$wal"; then break; fi
             fi
+            mode=unknown
             version=
             sleep 0.2
         done
@@ -230,6 +233,24 @@ if [[ "$mode" == unknown ]]; then
     [[ -e "$db" || -L "$db" ]] || fail 'Orphan meter sidecars; recover first.'
     fail "Unsupported meter user_version: ${version:-unreadable}"
 fi
+# Every DB-generation writer (this installer and rollback-meter-v1.sh) holds
+# the backup lock, and meter serve never writes user_version. The automatic
+# path therefore takes the lock on the existing lock file (no write) and
+# classifies again under it, so the generation it accepts cannot change
+# before staging, the snapshot or the post-stop recheck.
+lock=/var/backups/factory-db/.backup.lock
+locked=0
+if (( no_db_change )); then
+    [[ -f "$lock" && ! -L "$lock" ]] || fail 'Install MET-74 backups first.'
+    exec 9>>"$lock"
+    flock -n 9 || fail 'Backup or deployment is running; retry later.'
+    locked=1
+    classify_meter_db
+    if [[ "$db_changing" != no ]]; then
+        printf '%s\n' "$meter_plan"
+        fail "Refusing automatic meter install: mode $mode under the backup lock changes the DB generation; migration is Devon's explicit manual operation."
+    fi
+fi
 # Temporary executable staging lets meter run preflight without traversing the
 # agent's private checkout. No installed binary or service is changed here.
 stage=$(mktemp -d /usr/local/bin/.meter-stage.XXXXXX)
@@ -268,8 +289,10 @@ fi
 
 # --snapshot and restore-check local do not acquire the lock again. FD 9 stays
 # open in this parent through verification; never invoke the locking backup job.
-exec 9>>/var/backups/factory-db/.backup.lock
-flock -n 9 || fail 'Backup or deployment is running; retry later.'
+if (( ! locked )); then
+    exec 9>>"$lock"
+    flock -n 9 || fail 'Backup or deployment is running; retry later.'
+fi
 install -d -m 0700 /var/backups/meter
 snapshot=$(mktemp -d "/var/backups/meter/$(date -u +%Y%m%dT%H%M%S.%NZ).XXXXXX")
 printf '%s\n' "$enabled" > "$snapshot/enabled"
