@@ -703,6 +703,8 @@ test('P3.7: open-PR discovery stays under GitHub\'s node bound, finds an owned P
   const sha = 'f'.repeat(40);
   plant.issue('MET-7', 'In Progress');
   plant.builder('MET-7');
+  // A comment with an empty body is a valid row.
+  plant.comments.set('MET-7', [{ id: 'c-0', body: '', createdAt: '2026-10-26T14:00:00.000Z' }]);
   // An earlier merged PR of MET-7 must not win over its open PR (that would move MET-7 to Deploying).
   plant.prs.push({ ...otherPr(6), headRefName: 'met-7-first-try', state: 'MERGED', mergeCommit: { oid: '9'.repeat(40) }, mergedAt: '2026-10-25T12:00:00Z', body: 'closes MET-7' });
   for (let n = 1000; n < 1140; n++) plant.prs.push(otherPr(n));
@@ -750,6 +752,17 @@ test('P3.7: a failed, malformed or truncated read is never missing work: no canc
       plant.control.inject = (name, input) => name === 'get_thread_status' && input.thread === 'T-MET-7' ? { metadata: { labels: plant.threads.get('T-MET-7')!.labels, archived: false } } : undefined; } },
     { name: 'list_comments isError', error: /linear\.list_comments returned an error/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? envelope({ comments: [] }) : undefined; } },
     { name: 'get_issue isError', error: /linear\.get_issue returned an error/, setup: plant => { plant.control.inject = name => name === 'linear.get_issue' ? envelope({ id: 'MET-7', status: 'Todo', labels: ['odd'], description: fullSpec }) : undefined; } },
+    // Re-review of 91d176c, and the same boundaries' equivalent omissions.
+    { name: 'a comment row without a body', error: /linear\.list_comments returned a malformed comments row at 0/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? { comments: [{}] } : undefined; } },
+    { name: 'a null comment row', error: /linear\.list_comments returned a malformed comments row at 0/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? { comments: [null] } : undefined; } },
+    { name: 'get_issue with an empty id', error: /linear\.get_issue MET-7 returned a malformed issue/, setup: plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, id: '', relations: { blockedBy: [] } } : undefined; } },
+    { name: 'get_issue with an empty status', error: /linear\.get_issue MET-7 returned a malformed issue/, setup: plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, status: '', relations: { blockedBy: [] } } : undefined; } },
+    { name: 'get_issue with a whitespace status', error: /linear\.get_issue MET-7 returned a malformed issue/, setup: plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, status: '  ', relations: { blockedBy: [] } } : undefined; } },
+    { name: 'get_issue without labels', error: /linear\.get_issue MET-7 returned a malformed issue/, setup: plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, labels: undefined, relations: { blockedBy: [] } } : undefined; } },
+    { name: 'a blocker without an id', error: /linear\.get_issue MET-7 returned a malformed issue/, setup: plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, relations: { blockedBy: [{}] } } : undefined; } },
+    { name: 'a thread search row without an id', error: /find_thread returned a malformed threads row at 0/, setup: plant => { plant.control.inject = name => name === 'find_thread' ? { threads: [{ updatedAt: '2026-10-26T14:30:00.000Z' }] } : undefined; } },
+    { name: 'thread labels that are not strings', error: /get_thread_status T-MET-7 returned no labels or agent state/, setup: plant => { plant.control.inject = (name, input) => name === 'get_thread_status' && input.thread === 'T-MET-7' ? { metadata: { labels: [null], archived: false }, agentState: { state: 'idle' } } : undefined; } },
+    { name: 'a merged PR without its merge commit', error: /gh pr view 7 returned malformed or changed details for merged MET-7/, guard: /malformed or changed details for merged/, setup: plant => { plant.prs[0] = { ...plant.prs[0], state: 'MERGED', mergeCommit: null, mergedAt: '2026-10-26T14:00:00Z' }; } },
     { name: 'list_comments without its payload', error: /linear\.list_comments returned no comments list/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? {} : undefined; } },
   ];
   for (const { name, error, guard, setup } of cases) {
@@ -844,4 +857,32 @@ test('P3.7: any failed derivation withholds the sweep heartbeat even when other 
   await advance(21 * 60_000);
   assert.ok(refusing.heartbeats() >= 3, 'a failed action keeps the heartbeat');
   assert.match(refusing.dms.join('\n'), /ODD page: action-failed \| issue MET-8 \| .*spawn-reviewer failing/);
+});
+
+test('P3.7: a malformed comment or issue read on a Todo issue launches no Builder and writes no heartbeat; valid reads launch one', async t => {
+  const payloads: [string, (plant: ReturnType<typeof factory>) => void][] = [
+    ['valid (control)', () => {}],
+    ['comments [{}]', plant => { plant.control.inject = name => name === 'linear.list_comments' ? { comments: [{}] } : undefined; }],
+    ['id ""', plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, id: '', relations: { blockedBy: [] } } : undefined; }],
+    ['status ""', plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, status: '', relations: { blockedBy: [] } } : undefined; }],
+  ];
+  for (const [name, inject] of payloads) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        plant.issue('MET-7', 'Todo');
+        inject(plant);
+        await plant.start();
+        await settle();
+        const valid = name.startsWith('valid');
+        // The fixture's launcher refuses every launch, so the valid control records one attempt.
+        assert.equal(plant.launches.length, valid ? 1 : 0, valid ? 'a valid Todo issue launches its Builder' : 'no Builder launch');
+        assert.equal(plant.heartbeats(), valid ? 1 : 0);
+        assert.deepEqual(plant.saves, []);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
 });

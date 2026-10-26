@@ -484,9 +484,13 @@ by the previous one).
    whole sweep, digest and heartbeat included, succeeds; a rejected labels
    read fails one sweep and never blocks the next (MET-342). Authoritative
    reads fail closed (MET-344): an MCP `isError` envelope, a missing payload
-   or a malformed issue, thread or PR collection (an issue row without an
-   identifier, a PR row without its ownership fields, a thread without its
-   agent state) is a failed read, never an empty one or an idle thread; a
+   or a malformed issue, comment, thread or PR collection or record (an
+   issue row or issue without a non-blank identifier, status or labels, a
+   comment that is not a record with a string body, a PR row without its
+   ownership fields, a merged PR without its merge commit and time, a thread
+   without its labels or agent state) is a failed read, never an empty one,
+   a Backlog issue or an idle thread; empty lists and empty bodies stay
+   valid; a
    nonzero `gh` exit throws instead of meaning "no PR", so the Ralph guard,
    stale-thread cancellation and evaluation neither continue, cancel, archive
    nor claim a missing PR off it. Open PRs are listed with flat ownership

@@ -77,7 +77,7 @@ const spec = `## Goal\nShip it.\n\n## Isolation\nscripts/odd/\n\n## Build\n- cha
 const sha = 'a'.repeat(40);
 
 type FakeThread = { id: string; labels: string[]; state: string; archived: boolean; model?: string; mode?: string; steers: string[] };
-type Pr = { number: number; headRefName: string; headRefOid: string; state: 'OPEN' | 'MERGED'; mergeCommit?: { oid: string } | null; commits: { oid: string; committedDate: string }[]; statusCheckRollup: { name: string; conclusion: string }[]; body: string };
+type Pr = { number: number; headRefName: string; headRefOid: string; state: 'OPEN' | 'MERGED'; mergeCommit?: { oid: string } | null; mergedAt?: string | null; commits: { oid: string; committedDate: string }[]; statusCheckRollup: { name: string; conclusion: string }[]; body: string };
 
 function controlPlane(options: { status?: string; threads?: Omit<FakeThread, 'archived' | 'steers'>[]; usage?: (id: string) => string; checkAccess?: (model: string) => unknown; launcher?: ReturnType<typeof fakeLauncher> } = {}) {
   const issue = { id: 'MET-7', status: options.status ?? 'Todo', labels: ['odd', 'Improvement', 'area:agents'], description: spec };
@@ -182,7 +182,7 @@ function launcherFor(plane: () => ReturnType<typeof controlPlane>, options: { ex
   } });
 }
 
-const prWith = (state: 'OPEN' | 'MERGED', conclusion: string): Pr => ({ number: 41, headRefName: 'met-7-change', headRefOid: sha, state, mergeCommit: state === 'MERGED' ? { oid: 'b'.repeat(40) } : null, commits: [{ oid: sha, committedDate: '2026-10-26T00:00:00Z' }], statusCheckRollup: [{ name: 'scripts', conclusion }], body: 'closes MET-7' });
+const prWith = (state: 'OPEN' | 'MERGED', conclusion: string): Pr => ({ number: 41, headRefName: 'met-7-change', headRefOid: sha, state, mergeCommit: state === 'MERGED' ? { oid: 'b'.repeat(40) } : null, mergedAt: state === 'MERGED' ? new Date().toISOString() : null, commits: [{ oid: sha, committedDate: '2026-10-26T00:00:00Z' }], statusCheckRollup: [{ name: 'scripts', conclusion }], body: 'closes MET-7' });
 const claudeUsage = `## Model Routing\n\n| Model ID | Purpose | Routing | Requests | Cost |\n| --- | --- | --- | ---: | ---: |\n| anthropic/claude-opus-5-5 | Agent | Via [Subscription](https://ampcode.com/settings/model-routing#${fakeConnections[0].id}) | 40 | $0 |\n`;
 const live = (plane: ReturnType<typeof controlPlane>) => [...plane.threads.values()].filter(thread => !thread.archived);
 

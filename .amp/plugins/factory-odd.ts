@@ -616,8 +616,9 @@ export default async function (amp: PluginAPI) {
 		if (!state.watchdog.heartbeatId) {
 			let cursor: string | undefined
 			do {
-				const page = await callJson<{ statusUpdates?: { id?: string; body?: string }[]; hasNextPage?: boolean; cursor?: string }>(ctx.tools, 'linear.get_status_updates', { type: 'project', project: heartbeatProject, orderBy: 'updatedAt', limit: 50, ...(cursor ? { cursor } : {}) })
-				state.watchdog.heartbeatId = page.statusUpdates?.find(update => parseHeartbeat(update.body ?? ''))?.id
+				const page = await callJson<{ hasNextPage?: boolean; cursor?: string }>(ctx.tools, 'linear.get_status_updates', { type: 'project', project: heartbeatProject, orderBy: 'updatedAt', limit: 50, ...(cursor ? { cursor } : {}) })
+				// A failed lookup must not look like no row: it would add a second heartbeat row.
+				state.watchdog.heartbeatId = listOf<{ id?: string; body?: string }>(page, 'statusUpdates', 'linear.get_status_updates', row => optional(row, 'id', 'string') && optional(row, 'body', 'string')).find(update => parseHeartbeat(update.body ?? ''))?.id
 				cursor = page.hasNextPage ? page.cursor : undefined
 			} while (!state.watchdog.heartbeatId && cursor)
 		}
@@ -642,10 +643,7 @@ export default async function (amp: PluginAPI) {
 		let cursor: string | undefined
 		do {
 			const page = await callJson<{ hasNextPage?: boolean; cursor?: string }>(tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields: ['id'], ...(cursor ? { cursor } : {}) })
-			for (const issue of listOf<{ id?: unknown }>(page, 'issues', 'linear.list_issues')) {
-				if (typeof issue?.id !== 'string' || !issue.id) throw new Error('linear.list_issues returned an issue without an identifier')
-				ids.push(issue.id)
-			}
+			for (const issue of listOf<{ id: string }>(page, 'issues', 'linear.list_issues', row => named(row.id))) ids.push(issue.id)
 			cursor = page.hasNextPage ? page.cursor : undefined
 		} while (cursor)
 		return ids
@@ -1015,22 +1013,37 @@ async function callJson<T>(tools: Tools, name: string, input: Record<string, unk
 	return JSON.parse(textBlock.text as string) as T
 }
 
-/** The `key` collection of a read; a missing or malformed one is a failed read, never an empty list. */
-function listOf<T>(payload: unknown, key: string, name: string): T[] {
+// Read-boundary shapes (MET-344): a field the lifecycle reads is present with its type, and an
+// identifier or status is never blank. Empty lists and empty bodies stay valid.
+type Row = Record<string, unknown>
+const isRow = (value: unknown): value is Row => typeof value === 'object' && value !== null && !Array.isArray(value)
+const named = (value: unknown): value is string => typeof value === 'string' && value.trim() !== ''
+const optional = (row: Row, key: string, type: 'string' | 'boolean') => row[key] === undefined || row[key] === null || typeof row[key] === type
+const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(item => typeof item === 'string')
+
+/** The `key` collection of a read; a missing or malformed one, or one bad row, is a failed read, never an empty list. */
+function listOf<T>(payload: unknown, key: string, name: string, valid: (row: Row) => boolean = () => true): T[] {
 	const list = (payload as Record<string, unknown> | null | undefined)?.[key]
 	if (!Array.isArray(list)) throw new Error(`${name} returned no ${key} list`)
+	const bad = list.findIndex(row => !isRow(row) || !valid(row))
+	if (bad >= 0) throw new Error(`${name} returned a malformed ${key} row at ${bad}`)
 	return list as T[]
 }
 
-/** An issue read without its identifier and status is a failed read, not a Backlog issue. */
+/** An issue read without its identifier, status or labels is a failed read, not a Backlog issue. */
 async function getIssue(tools: Tools, input: Record<string, unknown>): Promise<LinearIssue> {
-	const issue = await callJson<LinearIssue>(tools, 'linear.get_issue', input)
-	if (typeof issue?.id !== 'string' || typeof issue.status !== 'string') throw new Error(`linear.get_issue ${String(input.id)} returned no issue`)
-	return issue
+	const issue = await callJson<unknown>(tools, 'linear.get_issue', input)
+	const blockedBy = isRow(issue) && isRow(issue.relations) ? issue.relations.blockedBy : undefined
+	if (!isRow(issue) || !named(issue.id) || !named(issue.status) || !strings(issue.labels) || !optional(issue, 'description', 'string')
+		|| (issue.relations !== undefined && issue.relations !== null && !isRow(issue.relations))
+		|| (blockedBy !== undefined && blockedBy !== null && !(Array.isArray(blockedBy) && blockedBy.every(row => isRow(row) && named(row.id))))) {
+		throw new Error(`linear.get_issue ${String(input.id)} returned a malformed issue`)
+	}
+	return issue as unknown as LinearIssue
 }
 
 const listComments = async (tools: Tools, issueId: string): Promise<Comment[]> =>
-	listOf<Comment>(await callJson(tools, 'linear.list_comments', { issueId, limit: 50 }), 'comments', 'linear.list_comments')
+	listOf<Comment>(await callJson(tools, 'linear.list_comments', { issueId, limit: 50 }), 'comments', 'linear.list_comments', row => typeof row.body === 'string' && optional(row, 'id', 'string') && optional(row, 'createdAt', 'string'))
 
 type Comment = { id?: string; body: string; createdAt?: string }
 
@@ -1136,7 +1149,10 @@ async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifie
 	const owned = (listed as GitHubPullRequest[]).find(pr => prOwnsIssue(pr, identifier))
 	if (!owned) return undefined
 	const pr = ghJson(await ctx.$`gh pr view ${String(owned.number)} --json ${prFields}`, `gh pr view ${owned.number}`) as GitHubPullRequest | null
-	if (pr?.number !== owned.number || pr.state !== state.toUpperCase() || !/^[0-9a-f]{40}$/.test(String(pr.headRefOid)) || !Array.isArray(pr.statusCheckRollup) || !prOwnsIssue(pr, identifier)) {
+	const sha = (value: unknown) => /^[0-9a-f]{40}$/.test(String(value))
+	const merged = state === 'merged' ? isRow(pr?.mergeCommit) && sha(pr.mergeCommit.oid) && named(pr.mergedAt) : true
+	if (!isRow(pr) || pr.number !== owned.number || pr.state !== state.toUpperCase() || !sha(pr.headRefOid) || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string' || !optional(pr, 'mergeable', 'string')
+		|| !merged || !Array.isArray(pr.statusCheckRollup) || !pr.statusCheckRollup.every(isRow) || !prOwnsIssue(pr, identifier)) {
 		throw new Error(`gh pr view ${owned.number} returned malformed or changed details for ${state} ${identifier}`)
 	}
 	const head = await ctx.$`gh api ${`repos/{owner}/{repo}/commits/${pr.headRefOid}`} --jq .commit.committer.date`
@@ -1158,7 +1174,7 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 	let cursor: string | undefined
 	do {
 		const page = await callJson<{ nextCursor?: string }>(tools, 'find_thread', { query, limit: 100, ...(cursor ? { cursor } : {}) })
-		const threads = listOf<{ id: string; updatedAt?: string }>(page, 'threads', 'find_thread')
+		const threads = listOf<{ id: string; updatedAt?: string }>(page, 'threads', 'find_thread', row => named(row.id) && optional(row, 'updatedAt', 'string'))
 		found.push(...threads)
 		cursor = threads.length ? page.nextCursor : undefined
 	} while (cursor)
@@ -1167,7 +1183,7 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 	const threads = await Promise.all([...ids].map(async id => {
 		const status = await callJson<{ metadata: { labels: string[]; archived?: boolean }; agentState?: { state?: string } }>(tools, 'get_thread_status', { thread: id })
 		// An unknown execution state is not idleness: it would let the Watchdog cancel a running thread.
-		if (!Array.isArray(status?.metadata?.labels) || typeof status.agentState?.state !== 'string') throw new Error(`get_thread_status ${id} returned no labels or agent state`)
+		if (!strings(status?.metadata?.labels) || !named(status.agentState?.state) || !optional(status.metadata, 'archived', 'boolean')) throw new Error(`get_thread_status ${id} returned no labels or agent state`)
 		return { id, labels: status.metadata.labels, state: status.agentState.state, archived: status.metadata.archived === true, updatedAt: updated.get(id) }
 	}))
 	return threads.filter(thread => !thread.archived).map(({ archived: _, ...thread }) => thread)
