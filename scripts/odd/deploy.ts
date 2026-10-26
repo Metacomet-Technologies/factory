@@ -13,8 +13,8 @@
 // through `Effects` so the sandbox fixture fakes sudo, curl, git, the release download and Linear.
 
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -174,8 +174,10 @@ export type Effects = {
   sudo: (script: string, args: readonly string[]) => { ok: boolean; output: string };
   /** GET a health endpoint; throws when unreachable. */
   probe: (url: string) => string;
+  /** Throws when unreadable; an absent ledger throws with code ENOENT. */
   readLedger: () => Ledger;
-  writeLedger: (ledger: Ledger) => void;
+  /** Atomic replace; `create` refuses to overwrite an existing ledger. */
+  writeLedger: (ledger: Ledger, options?: { create?: boolean }) => void;
   linear: {
     deploying: (identifier: string) => Promise<boolean>;
     /** Does the issue already carry a comment whose body is exactly `body`? */
@@ -477,17 +479,44 @@ export async function reconcileManual(effects: Effects, tag: string, approval?: 
   return result;
 }
 
-export async function main(effects: Effects): Promise<void> {
-  const tags = publishedTags(effects);
-  const ledger = effects.readLedger();
-  if (!ledger.lastTag) {
-    // First run records where the host already is; the next published release is the first auto-deploy.
-    const latest = pendingTags(tags, undefined).at(-1);
-    if (!latest) { effects.log('no-releases'); return; }
-    effects.writeLedger({ ...ledger, lastTag: latest });
-    effects.log('bootstrap', { lastTag: latest });
-    return;
+const absent = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT';
+
+/** Explicit baseline for an absent ledger only: a published stable tag at an immutable SHA on
+ * main that every enabled component already reports healthy. Records `lastTag` and nothing else:
+ * no install, component health or receipt. Existing ledgers use reconcile-manual. */
+export async function bootstrap(effects: Effects, tag: string): Promise<void> {
+  if (!semver(tag)) throw new Error(`Bootstrap needs a vX.Y.Z release tag, not ${tag}`);
+  // An unreadable or corrupt ledger is existing state too: its read error propagates.
+  let exists = true;
+  try { effects.readLedger(); } catch (error) { if (!absent(error)) throw error; exists = false; }
+  if (exists) throw new Error('A deploy ledger already exists; bootstrap never overwrites it (use reconcile-manual for a stale ledger)');
+  effects.run('git', ['-C', ROOT, 'fetch', '--quiet', '--tags', 'origin']);
+  if (!publishedTags(effects).includes(tag)) throw new Error(`${tag} is not a published stable release`);
+  const sha = effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `refs/tags/${tag}^{commit}`]).stdout.trim();
+  effects.run('git', ['-C', ROOT, 'merge-base', '--is-ancestor', sha, 'origin/main']);
+  const incompatible: string[] = [];
+  for (const recipe of recipes) if ((await probeWindow(effects, recipe, sha, probeResult, 'bootstrap-probe')) === 'fail') incompatible.push(recipe.name);
+  if (incompatible.length) throw new Error(`Refusing bootstrap at ${tag}: ${incompatible.join(', ')} not healthy at ${sha}`);
+  effects.writeLedger({ lastTag: tag, components: {} }, { create: true });
+  effects.log('bootstrap', { lastTag: tag, sha });
+}
+
+/** The job never adopts a missing, unreadable or malformed ledger: it stops before any remote read. */
+function readValidLedger(effects: Effects): Ledger & { lastTag: string } {
+  const stop = (reason: string) => new Error(`Deploy ledger ${LEDGER} ${reason}; not deploying. Investigate (docs/odd/deployer-recovery.md); a genuinely missing ledger needs an explicit reviewed \`deploy.ts --bootstrap TAG\`.`);
+  let ledger: Ledger;
+  try { ledger = effects.readLedger(); } catch (error) {
+    throw stop(absent(error) ? 'is missing' : `is unreadable (${error instanceof Error ? error.message : error})`);
   }
+  const components = (ledger as Partial<Ledger> | null)?.components;
+  if (!ledger || typeof ledger !== 'object' || Array.isArray(ledger) || typeof ledger.lastTag !== 'string' || !semver(ledger.lastTag) ||
+      !components || typeof components !== 'object' || Array.isArray(components)) throw stop('has no valid lastTag and components');
+  return ledger as Ledger & { lastTag: string };
+}
+
+export async function main(effects: Effects): Promise<void> {
+  const ledger = readValidLedger(effects);
+  const tags = publishedTags(effects);
   const cursor = ledger.manualBaseline && compareTags(ledger.manualBaseline.tag, ledger.lastTag) > 0 ? ledger.manualBaseline.tag : ledger.lastTag;
   const pending = pendingTags(tags, cursor);
   effects.log('pending', { lastTag: ledger.lastTag, tags: pending });
@@ -530,15 +559,20 @@ export function liveEffects(): Effects {
       return { ok: result.status === 0, output: `${result.stdout}${result.stderr}` };
     },
     probe: url => run('curl', ['-fsS', '--max-time', '10', url]).stdout,
-    readLedger: () => {
-      try { return JSON.parse(readFileSync(LEDGER, 'utf8')) as Ledger; } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyLedger();
-        throw error;
-      }
-    },
-    writeLedger: ledger => {
+    readLedger: () => JSON.parse(readFileSync(LEDGER, 'utf8')) as Ledger,
+    writeLedger: (ledger, options) => {
       mkdirSync(STATE_DIR, { recursive: true });
-      writeFileSync(`${LEDGER}.tmp`, `${JSON.stringify(ledger, null, 2)}\n`);
+      const body = `${JSON.stringify(ledger, null, 2)}\n`;
+      if (options?.create) {
+        // link(2) publishes the complete file atomically and fails with EEXIST instead of replacing.
+        // The staging name is this call's alone: a crash after the link must not leave the ledger
+        // hard-linked to the `.tmp` that ordinary writes truncate.
+        const staging = `${LEDGER}.create-${randomUUID()}`;
+        writeFileSync(staging, body, { flag: 'wx' });
+        try { linkSync(staging, LEDGER); } finally { rmSync(staging, { force: true }); }
+        return;
+      }
+      writeFileSync(`${LEDGER}.tmp`, body);
       renameSync(`${LEDGER}.tmp`, LEDGER);
     },
     linear: {
@@ -557,9 +591,10 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const args = process.argv.slice(2);
   const run = async () => {
     if (!args.length) return main(effects);
+    if (args[0] === '--bootstrap' && args.length === 2 && semver(args[1])) return bootstrap(effects, args[1]);
     if (args[0] !== 'reconcile-manual' || !semver(args[1] ?? '') ||
         !(args.length === 2 || (args.length === 4 && args[2] === '--approve' && /^[a-f0-9]{64}$/.test(args[3])))) {
-      throw new Error('Usage: deploy.ts [reconcile-manual TAG [--approve PREVIEW_SHA256]]');
+      throw new Error('Usage: deploy.ts [--bootstrap TAG | reconcile-manual TAG [--approve PREVIEW_SHA256]]');
     }
     await reconcileManual(effects, args[1], args[3]);
   };

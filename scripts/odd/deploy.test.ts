@@ -1,11 +1,11 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { ROOT, deployComponent, emptyLedger, issuesFromSubjects, main, parseSnapshot, pendingTags, plan, probeResult, receiptLine, recipes, reconcileManual, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
+import { ROOT, bootstrap, deployComponent, emptyLedger, issuesFromSubjects, main, parseSnapshot, pendingTags, plan, probeResult, receiptLine, recipes, reconcileManual, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
 import { nextAction, parseDeployReceipt, type Action } from './lifecycle.ts';
 import plugin, { diagnose, page, setStatus } from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
@@ -117,7 +117,8 @@ function world(options: {
   changes: Partial<Record<Tag, string[]>>;
   /** Issues each release closes, as `MET-n: subject (#pr)` with PR body `closes MET-n`. */
   issues?: Partial<Record<Tag, string[]>>;
-  ledger: Ledger;
+  /** `undefined` is an absent ledger file: reads throw ENOENT. */
+  ledger: Ledger | undefined;
   live?: Record<string, string>;
   /** Components whose new release reports degraded health. */
   broken?: string[];
@@ -241,8 +242,14 @@ function world(options: {
       if (options.unreachable?.includes(component) && live[component] === start[component]) throw new Error('curl: (7) Failed to connect');
       return healthBody(component);
     },
-    readLedger: () => structuredClone(ledger),
-    writeLedger: next => { ledger = structuredClone(next); },
+    readLedger: () => {
+      if (!ledger) throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+      return structuredClone(ledger);
+    },
+    writeLedger: (next, write) => {
+      if (write?.create && ledger) throw Object.assign(new Error('EEXIST: file already exists'), { code: 'EEXIST' });
+      ledger = structuredClone(next);
+    },
     linear: {
       deploying: async identifier => !options.notDeploying?.includes(identifier),
       posted: async (identifier, body) => comments.some(([issue, text]) => issue === identifier && text === body),
@@ -254,7 +261,7 @@ function world(options: {
     },
   };
   const cleanup = () => rmSync(stateDir, { recursive: true, force: true });
-  return { effects, calls, comments, live, ledger: () => ledger, stateDir, cleanup };
+  return { effects, calls, comments, live, ledger: () => ledger!, stateDir, cleanup, exists: () => ledger !== undefined };
 }
 
 // Components have no ledger records yet; baselines come from the health endpoints.
@@ -594,7 +601,7 @@ test('API recovery does not excuse a usable unsafe kiosk identity or an unrelate
   }
 });
 
-test('install-only persistently disables an enabled-but-stopped timer; normal install and removal preserve ledger', t => {
+test('install-only persistently disables an enabled-but-stopped timer; normal install and removal preserve ledger; a missing ledger is never initialized and blocks the default install', t => {
   const temp = mkdtempSync(join(tmpdir(), 'odd-units-'));
   t.after(() => rmSync(temp, { recursive: true, force: true }));
   const root = join(temp, 'home/agent/work/factory');
@@ -691,6 +698,23 @@ esac`,
   assert.equal(readFileSync(join(temp, 'enabled'), 'utf8'), 'disabled\n');
   assert.equal(readFileSync(join(temp, 'active'), 'utf8'), 'inactive\n');
   assert.equal(readFileSync(ledgerPath, 'utf8'), ledger);
+  // Missing ledger: the default install refuses before any snapshot or unit change; install-only never initializes one.
+  rmSync(ledgerPath);
+  const snapshots = () => readdirSync(join(temp, 'var/backups/factory-deploy')).sort();
+  const before = snapshots();
+  const absent = run('install-deploy.sh');
+  assert.equal(absent.status, 1);
+  assert.match(absent.stderr, /No deploy ledger at \S+deploy\.json; nothing changed\. Use --install-only, .*deploy\.ts --bootstrap TAG/);
+  assert.deepEqual(snapshots(), before);
+  assert.equal(existsSync(join(units, 'factory-deploy.timer')), false);
+  assert.equal(existsSync(join(temp, 'service-started')), false);
+  assert.equal(readFileSync(join(temp, 'enabled'), 'utf8'), 'disabled\n');
+  const installOnly = run('install-deploy.sh', ['--install-only']);
+  assert.equal(installOnly.status, 0, installOnly.stdout + installOnly.stderr);
+  assert.equal(existsSync(join(units, 'factory-deploy.timer')), true);
+  assert.equal(readFileSync(join(temp, 'enabled'), 'utf8'), 'disabled\n');
+  assert.equal(existsSync(join(temp, 'service-started')), false);
+  assert.deepEqual(readdirSync(dirname(ledgerPath)), [], 'install-only never initializes the ledger');
 });
 
 test('real Git: releases predating the deployer cannot remove its runtime or tools, including the tick after a failed install', async t => {
@@ -1109,14 +1133,216 @@ test('sandbox: a transient PR lookup failure keeps the release pending; the reru
   assert.equal(rerun.ledger().lastTag, 'v0.3.0');
 });
 
-test('pending releases are immutable v-tags newer than the ledger, oldest first; bootstrap records the latest without deploying', async t => {
+test('pending releases are immutable v-tags newer than the ledger, oldest first; a missing or cursorless ledger is never silently adopted', async t => {
   assert.deepEqual(pendingTags(['v0.2.10', 'v0.2.9', 'latest', 'v0.3.0', 'v0.2.8-rc1'], 'v0.2.9'), ['v0.2.10', 'v0.3.0']);
   assert.deepEqual(pendingTags(['v0.2.9'], 'v0.2.9'), []);
-  const host = world({ tags: ['v0.2.9', 'v0.3.0'], changes: { 'v0.3.0': ['kiosk/src/App.tsx'] }, ledger: emptyLedger() });
-  t.after(host.cleanup);
-  await main(host.effects);
-  assert.equal(host.ledger().lastTag, 'v0.3.0');
-  assert.deepEqual(host.calls, []);
+  for (const ledger of [undefined, emptyLedger()]) {
+    const host = world({ tags: ['v0.2.9', 'v0.3.0'], changes: { 'v0.3.0': ['kiosk/src/App.tsx'] }, ledger });
+    t.after(host.cleanup);
+    await assert.rejects(main(host.effects), /Deploy ledger .* (is missing|has no valid lastTag and components); not deploying\. .*--bootstrap TAG/);
+    assert.equal(host.exists(), ledger !== undefined);
+    if (ledger) assert.deepEqual(host.ledger(), emptyLedger());
+    assert.deepEqual(host.calls, []);
+    assert.deepEqual(host.comments, []);
+  }
   assert.equal(resume({ tag: 'v', sha, component: 'kiosk', phase: 'probing' }, 'fail'), 'rollback');
   assert.equal(resume({ tag: 'v', sha, component: 'kiosk', phase: 'installing' }, 'fail'), 'reinstall');
+});
+
+// --- Explicit bootstrap (MET-362): an absent ledger is adopted only on request, never by the job.
+
+test('bootstrap: an absent ledger adopts one healthy published release without installing or historical receipts, then deploys forward only', async t => {
+  const tags: Tag[] = ['v0.2.9', 'v0.3.0'];
+  const host = world({ tags, ledger: undefined, live: Object.fromEntries(recipes.map(recipe => [recipe.name, shas['v0.3.0']])),
+    changes: { 'v0.3.0': ['kiosk/src/App.tsx'], 'v0.3.1': ['kiosk/src/App.tsx'] }, issues: { 'v0.3.0': ['MET-300'], 'v0.3.1': ['MET-301'] } });
+  t.after(host.cleanup);
+  await bootstrap(host.effects, 'v0.3.0');
+  assert.deepEqual(host.ledger(), { lastTag: 'v0.3.0', components: {} }, 'a cursor only: no invented component health');
+  assert.deepEqual(host.calls, Array(9).fill('probe'), 'three healthy probes per component; no verify, checkout or installer');
+  assert.deepEqual(host.comments, []);
+  // Repeated invocation (a lost acknowledgement or a second operator) never replaces the baseline.
+  for (const tag of ['v0.3.0', 'v0.2.9']) await assert.rejects(bootstrap(host.effects, tag), /already exists; bootstrap never overwrites it/);
+  assert.deepEqual(host.ledger(), { lastTag: 'v0.3.0', components: {} });
+  await main(host.effects);
+  assert.deepEqual(sudoCalls(host.calls), []);
+  assert.deepEqual(host.comments, [], 'no receipt for the adopted release');
+  tags.push('v0.3.1');
+  await main(host.effects);
+  assert.deepEqual(sudoCalls(host.calls), [`sudo deploy/install-kiosk.sh ${host.stateDir}/releases/v0.3.1/kiosk`]);
+  assert.deepEqual(host.comments, [['MET-301', line(`component=kiosk sha=${shas['v0.3.1']} health=pass rollback=none`)]]);
+  assert.equal(host.ledger().lastTag, 'v0.3.1');
+});
+
+test('bootstrap refuses malformed, unpublished or off-main tags, mixed or unhealthy identities and existing or unreadable state, writing nothing', async t => {
+  type Host = ReturnType<typeof world>;
+  const probeWith = (override: object, only?: string) => (host: Host) => {
+    const probe = host.effects.probe;
+    host.effects.probe = url => !only || url === only ? JSON.stringify({ ...JSON.parse(probe(url)), ...override }) : probe(url);
+  };
+  const readFails = (error: Error) => (host: Host) => { host.effects.readLedger = () => { throw error; }; };
+  const refusals: [string, string, RegExp, (host: Host) => void][] = [
+    ['malformed', 'latest', /vX\.Y\.Z release tag/, () => {}],
+    ['prerelease', 'v0.3.0-rc1', /vX\.Y\.Z release tag/, () => {}],
+    ['unpublished', 'v0.3.1', /v0\.3\.1 is not a published stable release/, () => {}],
+    ['off main', 'v0.3.0', /merge-base --is-ancestor/, host => {
+      const run = host.effects.run;
+      host.effects.run = (command, args, options) => {
+        if (args.includes('merge-base')) throw new Error(`git ${args.join(' ')} exited 1`);
+        return run(command, args, options);
+      };
+    }],
+    ['mixed identities', 'v0.3.0', /Refusing bootstrap at v0\.3\.0: kiosk not healthy/, host => { host.live.kiosk = shas['v0.2.9']; }],
+    ['newer identity', 'v0.3.0', /: meter not healthy/, host => { host.live.meter = shas['v0.3.1']; }],
+    ['dirty', 'v0.3.0', /: meter, factory-api, kiosk not healthy/, probeWith({ git_dirty: true })],
+    ['degraded', 'v0.3.0', /: factory-api not healthy/, probeWith({ status: 'degraded' }, recipes[1].health)],
+    ['unreachable', 'v0.3.0', /: factory-api not healthy/, host => {
+      const probe = host.effects.probe;
+      host.effects.probe = url => { if (url === recipes[1].health) throw new Error('curl: (7) Failed to connect'); return probe(url); };
+    }],
+    ['existing ledger', 'v0.3.0', /already exists/, host => host.effects.writeLedger(baseline())],
+    ['existing cursorless ledger', 'v0.3.0', /already exists/, host => host.effects.writeLedger(emptyLedger())],
+    ['corrupt ledger', 'v0.3.0', /Unexpected end of JSON/, readFails(new SyntaxError('Unexpected end of JSON input'))],
+    ['unreadable ledger', 'v0.3.0', /EACCES/, readFails(Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }))],
+  ];
+  for (const [name, tag, error, alter] of refusals) {
+    const host = world({ tags: ['v0.2.9', 'v0.3.0'], ledger: undefined, changes: {},
+      live: Object.fromEntries(recipes.map(recipe => [recipe.name, shas['v0.3.0']])) });
+    t.after(host.cleanup);
+    alter(host);
+    const before = host.exists() ? host.ledger() : undefined;
+    const write = host.effects.writeLedger;
+    let writes = 0;
+    host.effects.writeLedger = (ledger, options) => { writes++; write(ledger, options); };
+    await assert.rejects(bootstrap(host.effects, tag), error, name);
+    assert.equal(writes, 0, name);
+    assert.equal(host.exists(), before !== undefined, name);
+    if (before) assert.deepEqual(host.ledger(), before, name);
+    assert.deepEqual(sudoCalls(host.calls), [], name);
+    assert.deepEqual(host.comments, [], name);
+  }
+  // A ledger created while the probes ran (another writer) is kept: the exclusive create fails.
+  const host = world({ tags: ['v0.2.9', 'v0.3.0'], ledger: undefined, changes: {}, live: Object.fromEntries(recipes.map(recipe => [recipe.name, shas['v0.3.0']])) });
+  t.after(host.cleanup);
+  const probe = host.effects.probe;
+  host.effects.probe = url => { if (!host.exists()) host.effects.writeLedger(baseline()); return probe(url); };
+  await assert.rejects(bootstrap(host.effects, 'v0.3.0'), /EEXIST/);
+  assert.deepEqual(host.ledger(), baseline());
+});
+
+/** The real CLI with HOME relocating the ledger; stub gh, git, sudo, curl, python3 and tar record every call. */
+const deployCli = new URL('./deploy.ts', import.meta.url).pathname;
+function cliHost(t: { after: (fn: () => void) => void }) {
+  const home = mkdtempSync(join(tmpdir(), 'odd-cli-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const bin = join(home, 'bin');
+  const state = join(home, '.local/state/factory-odd');
+  for (const path of [bin, state]) mkdirSync(path, { recursive: true });
+  const record = join(home, 'calls');
+  for (const name of ['gh', 'git', 'sudo', 'curl', 'python3', 'tar']) {
+    writeFileSync(join(bin, name), `#!/bin/bash
+printf '%s\\n' "${name} $*" >> '${record}'
+exit 1
+`, { mode: 0o755 });
+  }
+  const run = (args: string[] = []) => spawnSync(process.execPath, [deployCli, ...args], { encoding: 'utf8', env: { HOME: home, PATH: bin } });
+  const calls = () => existsSync(record) ? readFileSync(record, 'utf8').split('\n').filter(Boolean) : [];
+  return { home, bin, state, ledger: join(state, 'deploy.json'), run, calls };
+}
+
+test('real CLI: a missing, corrupt, invalid-shape or unreadable ledger exits nonzero before any remote read, sudo or ledger write; a valid ledger still runs', t => {
+  const root = process.getuid?.() === 0;
+  const cases: { name: string; content?: string; directory?: boolean; unreadable?: boolean; error: RegExp }[] = [
+    { name: 'missing', error: /is missing/ },
+    { name: 'corrupt', content: '{"lastTag": "v0.2.9", "compo', error: /is unreadable \(.*JSON/ },
+    { name: 'empty', content: '', error: /is unreadable \(.*JSON/ },
+    ...['null', '[]', '"v0.2.9"', '{"components":{}}', '{"lastTag":"latest","components":{}}', '{"lastTag":"v0.2.9"}', '{"lastTag":"v0.2.9","components":[]}']
+      .map(content => ({ name: `shape ${content}`, content, error: /has no valid lastTag and components/ })),
+    { name: 'directory', directory: true, error: /is unreadable \(EISDIR/ },
+    // root reads mode 0000; the in-process EACCES refusal above still covers it there.
+    ...(root ? [] : [{ name: 'permission', content: '{"lastTag":"v0.2.9","components":{}}', unreadable: true, error: /is unreadable \(EACCES/ }]),
+  ];
+  for (const { name, content, directory, unreadable, error } of cases) {
+    const host = cliHost(t);
+    if (directory) mkdirSync(host.ledger);
+    if (content !== undefined) writeFileSync(host.ledger, content);
+    if (unreadable) chmodSync(host.ledger, 0o000);
+    const result = host.run();
+    assert.equal(result.status, 1, name);
+    assert.match(result.stderr, error, name);
+    assert.match(result.stderr, /not deploying\. Investigate \(docs\/odd\/deployer-recovery\.md\); .*`deploy\.ts --bootstrap TAG`/, name);
+    assert.deepEqual(host.calls(), [], `${name}: no gh, git, curl, release download or sudo`);
+    if (unreadable) chmodSync(host.ledger, 0o600);
+    if (content !== undefined) assert.equal(readFileSync(host.ledger, 'utf8'), content, `${name}: byte-for-byte preserved`);
+    assert.deepEqual(readdirSync(host.state), content !== undefined || directory ? ['deploy.json'] : [], `${name}: no ledger created`);
+  }
+  // Control: the same live ledger read accepts an established file. Only the release listing is
+  // faked (gh runs in ROOT, which fixtures lack); nothing is pending, so nothing else runs.
+  const host = cliHost(t);
+  const ledger = '{"lastTag":"v0.2.9","components":{}}\n';
+  writeFileSync(host.ledger, ledger);
+  const releases = JSON.stringify([[{ tag_name: 'v0.2.9', draft: false, prerelease: false }]]);
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `import { liveEffects, main } from ${JSON.stringify(pathToFileURL(deployCli).href)};
+const effects = liveEffects();
+const run = effects.run;
+effects.run = (command, args, options) => command === 'gh' ? { stdout: ${JSON.stringify(releases)}, stderr: '' } : run(command, args, options);
+await main(effects);`], { encoding: 'utf8', env: { HOME: host.home, PATH: host.bin } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /"decision":"pending","lastTag":"v0.2.9","tags":\[\]/);
+  assert.deepEqual(host.calls(), []);
+  assert.equal(readFileSync(host.ledger, 'utf8'), ledger);
+});
+
+test('real CLI and files: --bootstrap never overwrites an existing or unreadable ledger, rejects malformed tags, and its exclusive create is atomic', t => {
+  const host = cliHost(t);
+  for (const [content, error] of [['{"lastTag":"v0.2.9","components":{}}\n', /already exists; bootstrap never overwrites it/], ['{"corrupt', /JSON/]] as const) {
+    writeFileSync(host.ledger, content);
+    for (const tag of ['v0.3.0', 'v0.2.9']) {
+      const result = host.run(['--bootstrap', tag]);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, error);
+      assert.equal(readFileSync(host.ledger, 'utf8'), content);
+    }
+  }
+  rmSync(host.ledger);
+  for (const args of [['--bootstrap'], ['--bootstrap', 'latest'], ['--bootstrap', 'v0.3'], ['--bootstrap', 'v0.3.0', 'extra']]) {
+    const result = host.run(args);
+    assert.equal(result.status, 1, args.join(' '));
+    assert.match(result.stderr, /Usage: deploy\.ts \[--bootstrap TAG \|/);
+  }
+  assert.deepEqual(host.calls(), []);
+  assert.deepEqual(readdirSync(host.state), []);
+  // liveEffects' create: link(2) publishes a complete file and refuses to replace one.
+  const create = (tag: string) => spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import { liveEffects } from ${JSON.stringify(pathToFileURL(deployCli).href)};
+liveEffects().writeLedger({ lastTag: ${JSON.stringify(tag)}, components: {} }, { create: true });`], { encoding: 'utf8', env: { HOME: host.home } });
+  const first = create('v0.3.0');
+  assert.equal(first.status, 0, first.stderr);
+  const created = readFileSync(host.ledger, 'utf8');
+  assert.deepEqual(JSON.parse(created), { lastTag: 'v0.3.0', components: {} });
+  const second = create('v0.3.1');
+  assert.notEqual(second.status, 0);
+  assert.match(second.stderr, /EEXIST/);
+  assert.equal(readFileSync(host.ledger, 'utf8'), created);
+  assert.deepEqual(readdirSync(host.state), ['deploy.json'], 'no temporary file left behind');
+  // Killed right after link(2), then the next ordinary write is interrupted before its rename:
+  // the published baseline must stay byte-for-byte intact (no staging name shares its inode).
+  rmSync(host.ledger);
+  const instrumented = (fn: string, patch: string, tag: string, create: boolean) => spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const real = fs.${fn};
+fs.${fn} = (...args) => { ${patch} };
+syncBuiltinESMExports();
+const { liveEffects } = await import(${JSON.stringify(pathToFileURL(deployCli).href)});
+liveEffects().writeLedger({ lastTag: ${JSON.stringify(tag)}, components: {} }, { create: ${create} });`], { encoding: 'utf8', env: { HOME: host.home } });
+  const crashed = instrumented('linkSync', 'real(...args); process.exit(77);', 'v0.3.0', true);
+  assert.equal(crashed.status, 77, crashed.stderr);
+  const baseline = readFileSync(host.ledger, 'utf8');
+  assert.deepEqual(JSON.parse(baseline), { lastTag: 'v0.3.0', components: {} });
+  const interrupted = instrumented('renameSync', "throw new Error('interrupted before rename');", 'v0.3.1', false);
+  assert.notEqual(interrupted.status, 0);
+  assert.match(interrupted.stderr, /interrupted before rename/);
+  assert.equal(readFileSync(host.ledger, 'utf8'), baseline);
+  assert.equal(create('v0.3.1').status === 0, false, 'a retried create still refuses the published baseline');
+  assert.equal(readFileSync(host.ledger, 'utf8'), baseline);
 });

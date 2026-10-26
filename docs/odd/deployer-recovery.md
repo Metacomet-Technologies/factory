@@ -130,9 +130,10 @@ AGENT
 ```
 
 Keep that printed `AUDIT_DIR`. A missing/corrupt ledger is a stop, not permission
-to bootstrap. Install the approved tools by Git checkout, never by copying files
-over historical source or relaxing the clean-tree checks. This changes deployment
-machinery, not the healthy running binaries or kiosk.
+to bootstrap (see [missing ledger](#missing-ledger-explicit-bootstrap)). Install
+the approved tools by Git checkout, never by copying files over historical source
+or relaxing the clean-tree checks. This changes deployment machinery, not the
+healthy running binaries or kiosk.
 
 ```sh
 gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
@@ -161,9 +162,9 @@ CHECK
 Require `UnitFileState=disabled` **and** `ActiveState=inactive`. The installer
 snapshots prior unit files and enablement before disabling; do not restore old
 enablement during reconciliation. Default installation still starts the job and
-enables the timer, so do not use it here. If the tools were already updated,
-inspect the exact HEAD and unit rather than bypassing the v0.2.49 precondition
-or reinstalling blindly.
+enables the timer (it refuses an absent ledger), so do not use it here. If the
+tools were already updated, inspect the exact HEAD and unit rather than bypassing
+the v0.2.49 precondition or reinstalling blindly.
 
 ## Approval 2: preview, review every deferred issue, then adopt
 
@@ -263,6 +264,52 @@ Acceptance before separately enabling the timer:
   errors without reinstalling; do not forge success or edit delivery state.
 - After explicit timer approval, confirm a subsequent scheduled run succeeds.
   Timer `active` alone is not deployment/receipt evidence.
+
+## Missing ledger: explicit bootstrap
+
+The job never adopts a ledger by itself. When `deploy.json` is missing,
+unreadable, corrupt, or lacks a `vX.Y.Z` `lastTag` and a `components` object,
+`deploy.ts` exits 1 with the reason on stderr before any GitHub, Git, probe,
+install, receipt or ledger write; the failed service is the host alert.
+`install-deploy.sh --install-only` never creates a ledger, and the default
+installation refuses to start the job or enable the timer without one. Healthy
+hosts with a ledger need nothing here.
+
+Bootstrap only after investigation shows the ledger is genuinely absent, not
+hidden by a wrong `HOME`, permissions or missing state that a backup can restore.
+Never delete, move or reset an existing ledger to use it: bootstrap refuses any
+existing file, readable or not. A stale ledger keeps `reconcile-manual` above.
+
+With Devon's approval of the reviewed tag, and the timer installed with
+`--install-only` (disabled and inactive):
+
+```sh
+gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
+set -euo pipefail
+umask 0077
+TAG=REPLACE_WITH_REVIEWED_TAG
+state=/home/agent/.local/state/factory-odd
+cd /home/agent/work/factory
+test ! -e "$state/deploy.json"
+mkdir -p "$state"
+flock -n "$state/deploy.lock" node scripts/odd/deploy.ts --bootstrap "$TAG"
+jq -e --arg tag "$TAG" '. == {lastTag: $tag, components: {}}' "$state/deploy.json"
+AGENT
+```
+
+`--bootstrap` requires a published non-draft, non-prerelease `vX.Y.Z` release,
+fetches tags, resolves its immutable commit and requires it on `origin/main`.
+Meter, factory-api and kiosk must each report a clean, healthy identity at that
+SHA in three probes 20 seconds apart; a mixed, older, newer, dirty, degraded or
+unreachable component stops it. It then writes only `{lastTag, components: {}}`
+with an exclusive atomic create that fails if any ledger appeared meanwhile. It
+installs nothing, records no component health, and writes no receipt or Linear
+comment. The job never deploys or receipts releases at or below the tag, so
+their issues need their own evidence.
+
+Review the result, then a separately approved default installation
+(`install-deploy.sh` without flags) starts the first run and enables the timer.
+That run deploys every published release above the baseline.
 
 ## Rollback: preserve tools and evidence, do not restore an old ledger
 

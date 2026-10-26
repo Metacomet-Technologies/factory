@@ -324,6 +324,9 @@ Each artifact is machine-checkable before the next role starts.
   `receipt` with the issues already handled so a crashed delivery resumes
   without redeploying, optional approved `manualBaseline` preserving the prior
   ledger and deferred issue inventory), log `journalctl -u factory-deploy`.
+  A missing, unreadable or malformed ledger stops the job before any remote
+  read or write; only Devon's reviewed `deploy.ts --bootstrap TAG` creates one
+  ([recovery](deployer-recovery.md#missing-ledger-explicit-bootstrap)).
   A failed component record is never a healthy baseline. Older/divergent
   targets are refused, including when a manual recovery is ahead of `lastTag`.
   Manual adoption adds a verified no-replay floor, not historical success
