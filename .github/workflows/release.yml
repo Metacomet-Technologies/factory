@@ -67,6 +67,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y bubblewrap
           env -i PATH=/usr/bin:/bin bwrap --unshare-net --ro-bind / / true
+      - name: Restore release build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .amp/in/cargo-target
+          key: release-target-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: |
+            release-target-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Plan and build or verify (read-only)
         id: bundles
         env:

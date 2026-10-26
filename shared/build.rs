@@ -2,12 +2,25 @@ use std::{env, fs, path::Path, process::Command, time::SystemTime};
 
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    // Refresh on every Cargo invocation, including unstaged edits and new commits.
-    // This intentionally absent file prevents Cargo from caching build identity.
-    println!(
-        "cargo:rerun-if-changed={}/build-info-refresh",
-        env::var("OUT_DIR").unwrap()
-    );
+    // Local builds must notice unstaged edits and new commits, so they depend
+    // on a file that is never created and Cargo rebuilds identity every time.
+    // A release build is a clean exact SHA. Rebuild only when its version,
+    // VERSION, or HEAD changes, so a later cargo in that checkout can reuse
+    // the binaries. meter and factory-api include this script.
+    println!("cargo:rerun-if-env-changed=FACTORY_RELEASE_VERSION");
+    let release = env::var("FACTORY_RELEASE_VERSION").ok();
+    if release.is_some() {
+        println!("cargo:rerun-if-changed={}", root.join("VERSION").display());
+        let head = root.join(".git").join("HEAD");
+        if head.is_file() {
+            println!("cargo:rerun-if-changed={}", head.display());
+        }
+    } else {
+        println!(
+            "cargo:rerun-if-changed={}/build-info-refresh",
+            env::var("OUT_DIR").unwrap()
+        );
+    }
     let version = fs::read_to_string(root.join("VERSION")).expect("read root VERSION");
     let version = version.trim();
     assert_eq!(
@@ -15,8 +28,6 @@ fn main() {
         env!("CARGO_PKG_VERSION"),
         "workspace version must match VERSION"
     );
-    println!("cargo:rerun-if-env-changed=FACTORY_RELEASE_VERSION");
-    let release = env::var("FACTORY_RELEASE_VERSION").ok();
     if let Some(release) = &release {
         let parse = |text: &str| -> Vec<u32> {
             let parts: Vec<_> = text.split('.').collect();
