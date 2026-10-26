@@ -1597,8 +1597,12 @@ class BuildMetadata(unittest.TestCase):
             dev = dict(base)
             first_dev = run(root, "cargo", "build", "--locked", env=dev)
             second_dev = run(root, "cargo", "build", "--locked", env=dev)
-            self.assertIn("Compiling", first_dev.stderr)
-            self.assertIn("Compiling", second_dev.stderr)
+            self.assertNotIn("Compiling", first_dev.stderr)
+            self.assertNotIn("Compiling", second_dev.stderr)
+            (root / "branch.txt").write_text("b\n")
+            commit(root, "move branch HEAD")
+            branched = run(root, "cargo", "build", "--locked", env=dev)
+            self.assertIn("Compiling", branched.stderr)
             # Release checkouts are detached, so .git/HEAD itself holds the SHA.
             run(root, "git", "checkout", "-q", "--detach")
             rel = {**base, "FACTORY_RELEASE_VERSION": "0.2.1"}

@@ -1,26 +1,52 @@
-use std::{env, fs, path::Path, process::Command, time::SystemTime};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+    time::SystemTime,
+};
+
+fn git_metadata_dir(root: &Path) -> Option<PathBuf> {
+    let dot = root.join(".git");
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    let text = fs::read_to_string(dot).ok()?;
+    let line = text.lines().find_map(|line| line.strip_prefix("gitdir:"))?;
+    let rel = PathBuf::from(line.trim());
+    let path = if rel.is_absolute() {
+        rel
+    } else {
+        root.join(rel)
+    };
+    path.is_dir().then_some(path)
+}
+
+fn watch_git(root: &Path) {
+    let Some(git_dir) = git_metadata_dir(root) else {
+        return;
+    };
+    let head = git_dir.join("HEAD");
+    let Ok(text) = fs::read_to_string(&head) else {
+        return;
+    };
+    println!("cargo:rerun-if-changed={}", head.display());
+    if let Some(name) = text.trim().strip_prefix("ref:") {
+        let ref_file = git_dir.join(name.trim());
+        if ref_file.is_file() {
+            println!("cargo:rerun-if-changed={}", ref_file.display());
+        }
+    }
+}
 
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    // Local builds must notice unstaged edits and new commits, so they depend
-    // on a file that is never created and Cargo rebuilds identity every time.
-    // A release build is a clean exact SHA. Rebuild only when its version,
-    // VERSION, or HEAD changes, so a later cargo in that checkout can reuse
-    // the binaries. meter and factory-api include this script.
+    // Crate sources already invalidate themselves. Also rebuild when VERSION
+    // or the git checkout moves, including a worktree gitdir and a branch ref.
+    // meter and factory-api include this script.
     println!("cargo:rerun-if-env-changed=FACTORY_RELEASE_VERSION");
+    println!("cargo:rerun-if-changed={}", root.join("VERSION").display());
+    watch_git(root);
     let release = env::var("FACTORY_RELEASE_VERSION").ok();
-    if release.is_some() {
-        println!("cargo:rerun-if-changed={}", root.join("VERSION").display());
-        let head = root.join(".git").join("HEAD");
-        if head.is_file() {
-            println!("cargo:rerun-if-changed={}", head.display());
-        }
-    } else {
-        println!(
-            "cargo:rerun-if-changed={}/build-info-refresh",
-            env::var("OUT_DIR").unwrap()
-        );
-    }
     let version = fs::read_to_string(root.join("VERSION")).expect("read root VERSION");
     let version = version.trim();
     assert_eq!(

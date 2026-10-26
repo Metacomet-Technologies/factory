@@ -22,7 +22,7 @@ print(plan['release_tag'][1:])
 PY
 )
 export RUSTUP_TOOLCHAIN=1.99.0 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4
-export RUSTFLAGS="--remap-path-prefix=$root=/factory --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+export RUSTFLAGS="--remap-path-prefix=$root=/factory --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo -C link-arg=-fuse-ld=lld"
 export VITE_API_BASE=''
 [[ $(rustc --version) == 'rustc 1.99.0 '* && $(rustc -vV | sed -n 's/^host: //p') == x86_64-unknown-linux-gnu ]] || {
     echo 'Release requires Rust 1.99.0 on x86_64-unknown-linux-gnu' >&2; exit 1;

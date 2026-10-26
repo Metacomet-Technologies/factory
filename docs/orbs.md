@@ -106,15 +106,14 @@ their matching browser installation; that download is not part of setup.
 
 ## Cost and verification limits
 
-The approved project default is `a1.medium` (4 CPUs, 8 GB), with project-scoped
-`CARGO_BUILD_JOBS=2`. Standard pricing is $0.33/hour versus $0.17/hour for small
-(2 CPUs, 4 GB). Small passed builds/tests but repeatedly failed Vite+ linting:
-oxc's approximately 4 GiB aligned virtual allocation returned ENOMEM before
-analysis. Medium passed the same check twice without security-policy changes.
-Use medium for reliable full checks; the lower small hourly price does not cover
-this workload. Fetch/install caches are reused, and builds/tests remain on demand.
-Routine setup edits suit low agent mode; troubleshooting may need medium. No
-premium features are needed.
+The approved project default is `a1.large` (8 CPUs, 16 GB), with project-scoped
+`CARGO_BUILD_JOBS=8`. Standard pricing is $0.66/hour. Small (2 CPUs, 4 GB,
+$0.17/hour) passed builds/tests but repeatedly failed Vite+ linting: oxc's
+approximately 4 GiB aligned virtual allocation returned ENOMEM before analysis.
+Medium (4 CPUs, 8 GB, $0.33/hour) passed that check, and a full run peaked at
+6 GiB. Large is the default so eight compile jobs fit. Fetch/install caches are
+reused, and builds/tests remain on demand. Routine setup edits suit low agent
+mode; troubleshooting may need medium. No premium features are needed.
 
 Clean medium measurement at the initial setup merge: cold setup 26.16 seconds,
 warm setup 0.59 seconds, clippy 37.53 seconds, Rust tests 117.88 seconds, kiosk
