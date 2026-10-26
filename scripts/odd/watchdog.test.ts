@@ -89,7 +89,7 @@ test('a digest longer than one Slack message is split on line breaks', () => {
   assert.deepEqual(slackMessages('short'), ['short']);
 });
 
-/** Linear, thread search and #factory-alerts shared by every plugin instance; each `start()` is a fresh plugin load arming the control thread. */
+/** Linear, thread search and #factory-alerts shared by every plugin instance; each `start()` is a fresh plugin load arming the control thread and returns its `odd_control_status` tool. `override` also sees `thread.labels` and `createWebhook`. */
 function controlOrb(override: (name: string, input: Record<string, unknown>) => unknown = () => undefined) {
   const evaluated: string[] = [];
   const alerts: string[] = [];
@@ -131,16 +131,19 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
   } };
   const start = async () => {
     const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+    let status: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> } | undefined;
     const amp = {
       $: async () => ({ exitCode: 0, stdout: '[]', stderr: '' }),
-      createAgent: () => ({ definition: {} }), registerAgentMode: () => {}, registerTool: () => {},
+      createAgent: () => ({ definition: {} }), registerAgentMode: () => {}, registerTool: (tool: typeof status) => { status = tool; },
       on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
-      createWebhook: async () => ({ url: 'https://hooks.example/x' }),
+      createWebhook: async (options: Record<string, unknown>) => (await override('createWebhook', options)) ?? { url: 'https://hooks.example/x' },
       system: { executor: { kind: 'remote', keepAlive: async () => {} } },
     };
     await (plugin as unknown as (api: unknown) => Promise<void>)(amp);
-    const thread = { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] };
-    await handlers.get('session.start')!({}, { thread, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools });
+    const thread = { id: 'T-control', labels: async () => (await override('thread.labels', {})) ?? ['odd-control-plane', 'odd-perform'] };
+    const ctx = { thread, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools };
+    await handlers.get('session.start')!({}, ctx);
+    return async (input: Record<string, unknown>) => JSON.parse(await status!.execute(input, ctx)) as { armed: boolean; error?: string };
   };
   return { start, evaluated, alerts, dms, calls, updates, reads: () => alertReads };
 }
@@ -242,4 +245,78 @@ test('a digest that Slack keeps rejecting leaves the control plane blind until i
   await until(() => orb.dms.length === 1);
   assert.match(orb.dms[0], /control-plane-blind/);
   assert.match(orb.dms[0], /invalid_blocks/);
+});
+
+const emptyWork = (name: string) => {
+  if (name === 'linear.list_issues') return { issues: [], hasNextPage: false, cursor: '' };
+  if (name === 'find_thread') return { threads: [] };
+  return undefined;
+};
+const settle = async () => { for (let i = 0; i < 200; i++) await new Promise(resolve => setImmediate(resolve)); };
+
+test('P3.6: a rejected labels read fails that sweep only; the next sweep runs and writes the heartbeat', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  let labelReads = 0;
+  const orb = controlOrb((name) => {
+    // Read 1 arms the control thread; read 2 is the first sweep's.
+    if (name === 'thread.labels' && ++labelReads === 2) throw new Error('labels 503');
+    return emptyWork(name);
+  });
+  await orb.start();
+  await until(() => labelReads >= 2);
+  await settle();
+  assert.equal(orb.updates.length, 0, 'the sweep whose labels read failed writes no heartbeat');
+  mock.timers.tick(sweepMs);
+  await until(() => orb.updates.length === 1);
+  assert.equal(parseHeartbeat(orb.updates[0].body), '2026-10-24T15:10:00.000Z');
+});
+
+test('P3.6: a heartbeat write that keeps failing pages control-plane-blind once, 15 minutes into the episode', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  let heartbeats = 0;
+  const orb = controlOrb((name) => {
+    if (name === 'linear.save_status_update') { heartbeats += 1; throw new Error('Linear 500'); }
+    return emptyWork(name);
+  });
+  await orb.start();
+  await until(() => heartbeats === 1);
+  mock.timers.tick(sweepMs);
+  await until(() => heartbeats === 2);
+  await settle();
+  assert.deepEqual(orb.dms, [], 'no page 10 minutes into the episode');
+  mock.timers.tick(sweepMs);
+  await until(() => orb.dms.length === 1);
+  assert.match(orb.dms[0], /control-plane-blind/);
+  assert.match(orb.dms[0], /since 2026-10-24T15:00:00\.000Z/);
+  assert.match(orb.dms[0], /Linear 500/);
+  mock.timers.tick(sweepMs);
+  await until(() => heartbeats === 4);
+  await settle();
+  assert.equal(orb.dms.length, 1, 'one page per episode');
+});
+
+test('P3.6: a partially failed arm keeps its error, and arm: true retries it with one timer per purpose', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  const intervals = new Map<unknown, number>();
+  const { setInterval: set, clearInterval: clear } = globalThis;
+  globalThis.setInterval = ((fn: () => void, ms: number) => { const timer = set(fn, ms); intervals.set(timer, ms); return timer; }) as typeof setInterval;
+  globalThis.clearInterval = ((timer: ReturnType<typeof setInterval>) => { intervals.delete(timer); clear(timer); }) as typeof clearInterval;
+  t.after(() => { Object.assign(globalThis, { setInterval: set, clearInterval: clear }); mock.timers.reset(); });
+  let githubFailures = 1;
+  const orb = controlOrb((name, input) => {
+    if (name === 'createWebhook' && input.key === 'github' && githubFailures-- > 0) throw new Error('webhook 503');
+    return emptyWork(name);
+  });
+  const status = await orb.start();
+  const failed = await status({});
+  assert.equal(failed.armed, false);
+  assert.match(failed.error ?? '', /webhook 503/, 'the failure stays visible');
+  assert.equal(intervals.size, 0);
+  const armed = await status({ arm: true });
+  assert.equal(armed.armed, true);
+  assert.equal(armed.error, undefined);
+  await status({ arm: true });
+  assert.deepEqual([...intervals.values()].sort((a, b) => a - b), [5 * 60_000, sweepMs], 'one Slack poll and one sweep interval');
 });

@@ -166,7 +166,7 @@ export default async function (amp: PluginAPI) {
 		},
 		async execute(input, ctx) {
 			const labels = await ctx.thread.labels()
-			if (input.arm === true) await arm(ctx, labels)
+			if (input.arm === true) await arm(ctx, labels, true)
 			const current = armState.get(ctx.thread.id)
 			if (input.poll_slack === true && current?.armed) await pollSlackIntake(ctx, current)
 			if (input.sweep === true && current?.armed) await sweep({ ...ctx, $: amp.$ }, current)
@@ -182,8 +182,11 @@ export default async function (amp: PluginAPI) {
 	type ArmContext = Pick<WebhookHandlerContext, 'thread' | 'ui' | 'logger' | 'tools'>
 	type EvalContext = ArmContext & Pick<WebhookHandlerContext, '$'>
 
-	async function arm(ctx: ArmContext & Partial<Pick<WebhookHandlerContext, '$'>>, labels: readonly string[]) {
-		if (!labels.includes(controlLabel) || armState.has(ctx.thread.id)) return
+	// A failed arm stays registered so odd_control_status keeps its error and turn boundaries do
+	// not renotify; only an explicit `arm: true` (`retry`) replaces it with a fresh attempt.
+	async function arm(ctx: ArmContext & Partial<Pick<WebhookHandlerContext, '$'>>, labels: readonly string[], retry = false) {
+		const previous = armState.get(ctx.thread.id)
+		if (!labels.includes(controlLabel) || (previous && !(retry && previous.error))) return
 		const state = emptyState()
 		armState.set(ctx.thread.id, state)
 		try {
@@ -197,6 +200,8 @@ export default async function (amp: PluginAPI) {
 			void pollSlackIntake(ctx, state)
 			void sweep(evalCtx, state)
 		} catch (error: unknown) {
+			for (const timer of state.timers.splice(0)) clearInterval(timer)
+			state.armed = false
 			state.error = String(error)
 			ctx.logger.log(marker, 'arming failed', state.error)
 			await ctx.ui.notify(`${marker} control plane arming failed: ${state.error}`)
@@ -329,10 +334,13 @@ export default async function (amp: PluginAPI) {
 		const now = new Date()
 		const at = now.toISOString()
 		const { watchdog } = state
-		const performing = (await ctx.thread.labels()).includes(performLabel)
-		const entry = record(state, { at, source: 'watchdog', issue: null, stage: performing ? 'performed' : 'dry-run' })
+		const entry = record(state, { at, source: 'watchdog', issue: null, stage: 'dry-run' })
 		watchdog.sweptAt = at
+		// The labels read is inside the try: a rejection fails this sweep and still releases `sweeping`.
+		let performing = false
 		try {
+			performing = (await ctx.thread.labels()).includes(performLabel)
+			if (performing) entry.stage = 'performed'
 			const threads = (await Promise.all(roleLabelQueries.map(query => threadsFor(ctx.tools, query)))).flat()
 			const identifiers = new Set<string>()
 			for (const thread of threads) {
@@ -369,14 +377,14 @@ export default async function (amp: PluginAPI) {
 				watchdog.digestDay = day
 				watchdog.cancelled = []
 			}
-			// A blind episode ends only when a whole sweep, digest included, succeeds.
-			delete watchdog.error
-			delete watchdog.blindSince
-			watchdog.paged = false
 			// The heartbeat is the poller's only view of this sweep (docs/odd/README.md §9). A failed
 			// sweep writes nothing, so the row aging past 20 minutes is the silence signal. Dry-run
 			// writes nothing either: a plane that is not performing must not look alive.
 			if (performing) await writeHeartbeat(ctx, state, at)
+			// A blind episode ends only when a whole sweep, digest and heartbeat included, succeeds.
+			delete watchdog.error
+			delete watchdog.blindSince
+			watchdog.paged = false
 		} catch (error: unknown) {
 			watchdog.error = String(error)
 			entry.stage = 'failed'
