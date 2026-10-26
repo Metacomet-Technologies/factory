@@ -108,13 +108,13 @@ defines Amp-native agents for the roles that need Amp coordination tools.
 
 | Role | Trigger | Produces | Authority | Engine | Loop budget | Escalates when |
 | --- | --- | --- | --- | --- | --- | --- |
-| Intake | Slack message in `#factory-intake`; Linear issue in `Triage` without a type or area label (Backlog is never triaged). | A Linear issue in the template, or a comment on the existing issue, with `area:*`, type and a duplicate check. | Create and edit *its own* issue; link duplicates. | Amp low (plugin agent). | 1 turn + 2 continuations. | Never. Ambiguity becomes a question inside the spec. |
-| Spec | Issue reaches `Triage` with a type and area. | `## Isolation`, `## Build`, `## Done means`, `## Evidence`, size estimate, risk class. Status moves to `Todo`. | Edit its own issue; split into children; mark blocked-by. | Amp medium or Claude high for `security`/`data` areas. | 1 turn + 3 continuations. | Risk class is `irreversible` or `security` and no existing pattern covers it. |
-| Builder | Issue in `Todo` labelled `odd` with a free build slot. | A PR whose body carries the Evidence section filled with real output; the same thread and branch across review rounds. | Push to its own branch; open and update its PR; comment on its issue. | Amp medium (plugin agent); the engine table returns in a later phase (see §6). | 3 review rounds per PR. | Third `changes` verdict, or Isolation cannot be respected. |
-| Reviewer | PR head SHA with CI green and no verdict for that SHA. | Verdict `ready` or `changes` as a PR comment and the thread label `odd-verdict-<ready\|changes>-<sha12>`, findings bound to the SHA; reruns Evidence commands itself in its own orb. | Request changes; approve. Never pushes to the builder's branch. GitHub refuses a review on a PR the same account opened, so the verdict is a comment, not a review. | Amp high (plugin agent); opposite family returns with the engine table. | 1 per SHA; 2 rounds after a Watchdog cancellation. | Third `changes` verdict on one issue (page: third failed QA round); second spent round (page: budget ceiling). |
+| Intake | Slack message in `#factory-intake`; Linear issue in `Triage` without a type or area label (Backlog is never triaged). | A Linear issue in the template, or a comment on the existing issue, with `area:*`, type and a duplicate check. | Create and edit *its own* issue; link duplicates. | Plugin agent pinned to `openai/gpt-6-astra` low (ChatGPT). | 1 turn + 2 continuations. | Never. Ambiguity becomes a question inside the spec. |
+| Spec | Issue reaches `Triage` with a type and area. | `## Isolation`, `## Build`, `## Done means`, `## Evidence`, size estimate, risk class. Status moves to `Todo`. | Edit its own issue; split into children; mark blocked-by. | Plugin agent pinned to `openai/gpt-6-astra` medium (ChatGPT). | 1 turn + 3 continuations. | Risk class is `irreversible` or `security` and no existing pattern covers it. |
+| Builder | Issue in `Todo` labelled `odd` with a free build slot. | A PR whose body carries the Evidence section filled with real output; the same thread and branch across review rounds. | Push to its own branch; open and update its PR; comment on its issue. | Claude Code (`claude-opus-5-5`, effort high) on an orb, launched through the CLI and served by the Claude Subscription (§6). | 3 review rounds per PR. | Third `changes` verdict, or Isolation cannot be respected. |
+| Reviewer | PR head SHA with CI green and no verdict for that SHA. | Verdict `ready` or `changes` as a PR comment and the thread label `odd-verdict-<ready\|changes>-<sha12>`, findings bound to the SHA; reruns Evidence commands itself in its own orb. | Request changes; approve. Never pushes to the builder's branch. GitHub refuses a review on a PR the same account opened, so the verdict is a comment, not a review. | Plugin agent pinned to ChatGPT `openai/gpt-6-astra` or SuperGrok (`Cursor`) `xai/grok-4.7`, high reasoning, never the Builder's lab (§6). | 1 per SHA; 2 rounds after a Watchdog cancellation. | Third `changes` verdict on one issue (page: third failed QA round); second spent round (page: budget ceiling). |
 | Shipper | Verdict `ready` on the current head. | Squash merge with `--match-head-commit`; merge receipt `odd-merge pr=<n> head=<sha> merge=<sha>` on the issue; release tag per `docs/release.md` from phase 5. | Merge; tag; close superseded PRs. | Deterministic (`qa.ts check --self-deploying-ok` + `gh pr merge` inside the control plane), no agent. | n/a | `qa.ts check` refuses: the refusal is posted once per head as `odd-merge-refused`; the builder's next push re-enters the loop. |
-| Deployer | GitHub release newer than the host ledger's `lastTag` (`factory-deploy.timer` on factory-gpu, every 2 min). | Verified release unpacked under `~/.local/state/factory-odd/releases/<tag>`, each changed enabled component (`meter`, `factory-api`, `kiosk`) installed and probed at the exact SHA, one deploy receipt per issue the release closes. | `sudo -n /usr/bin/bash <allowlisted script>` on the runner; detaches `~/.local/state/factory-odd/source` at the release SHA, leaving tools in `/home/agent/work/factory` unchanged. | Deterministic job (`scripts/odd/deploy.ts`); on a red receipt the control plane starts one Amp low agent on the factory-gpu runner (`odd-deployer`) that only reads logs and attaches them to the Bug. | 1 deploy + 1 rollback per component per release. | Rollback missing, fails, or leaves the component unhealthy on re-probe (`rollback=none`, page: failed rollback). |
-| Verifier | Green deploy receipt (`health=pass`) with no `odd-verify` comment for its SHA. | Issue comment `odd-verify sha=<receipt sha> result=pass\|fail bug=<MET-n\|none>` plus one line per Done-means item; a `Bug` issue in `Triage` on fail. The control plane sets `Done` on `pass`. | Comment on its issue; file Bugs. Never sets status. | Amp low (plugin agent); reruns the Evidence lines against the deployed system. | 1 turn + 2 continuations; 2 rounds. | Never pages; files a bug and lets Intake handle it. Second spent round pages (budget ceiling). |
+| Deployer | GitHub release newer than the host ledger's `lastTag` (`factory-deploy.timer` on factory-gpu, every 2 min). | Verified release unpacked under `~/.local/state/factory-odd/releases/<tag>`, each changed enabled component (`meter`, `factory-api`, `kiosk`) installed and probed at the exact SHA, one deploy receipt per issue the release closes. | `sudo -n /usr/bin/bash <allowlisted script>` on the runner; detaches `~/.local/state/factory-odd/source` at the release SHA, leaving tools in `/home/agent/work/factory` unchanged. | Deterministic job (`scripts/odd/deploy.ts`); on a red receipt the control plane starts one plugin agent (`odd-deployer`, `openai/gpt-6-astra` low) on the factory-gpu runner that only reads logs and attaches them to the Bug. | 1 deploy + 1 rollback per component per release. | Rollback missing, fails, or leaves the component unhealthy on re-probe (`rollback=none`, page: failed rollback). |
+| Verifier | Green deploy receipt (`health=pass`) with no `odd-verify` comment for its SHA. | Issue comment `odd-verify sha=<receipt sha> result=pass\|fail bug=<MET-n\|none>` plus one line per Done-means item; a `Bug` issue in `Triage` on fail. The control plane sets `Done` on `pass`. | Comment on its issue; file Bugs. Never sets status. | Plugin agent pinned to `openai/gpt-6-astra` low (ChatGPT); reruns the Evidence lines against the deployed system. | 1 turn + 2 continuations; 2 rounds. | Never pages; files a bug and lets Intake handle it. Second spent round pages (budget ceiling). |
 | Watchdog | Every 10 minutes (`setInterval` in the plugin). | Stale idle role threads archived with an `odd-watchdog cancelled` comment and the issue restored (builder without PR → `Todo`); caps alert after 60 min over; `control-plane-blind` page after 15 min of failed sweeps; daily digest at 08:00 America/New_York. | Archive threads; comment; restore status; add `escalated`; post alerts and pages. | Deterministic (`scripts/odd/watchdog.ts`), no agent. | n/a | Every sweep failing for 15 minutes; soft caps exceeded for an hour. |
 | Advisor | A role asks a bounded question (`advisor` label or in-thread). | A report-only opinion. | None. | Kimi K3 / Grok advisor tools (existing). | 1 call. | Never. |
 
@@ -239,22 +239,57 @@ SHA x with this output; Done means item 3 has no evidence".
   issue to the control plane; without it the dispatcher (`dispatch` label and
   `factory-dispatch` markers) keeps it. ODD owns `Triage` for every issue;
   `Backlog` belongs to Devon. The two never act on the same issue.
-- Phase 4 builders are Amp medium plugin agents. The engine table in
-  `scripts/dispatch/dispatch.ts` (`engine/{amp,claude,chatgpt,ultra,cursor,
-  grok,go,docs}` × `agent-effort/*`) and the usage-weighted round-robin come
-  back with the runner launcher (`amp -x --mode <plugin mode> --executor
-  orb`, requested through a Linear label), because plugin agents created with
-  `Agent.createThread` can only use plugin-defined or built-in modes.
+- Engines (MET-337): `scripts/odd/engines.ts` is the one source of truth.
+  It holds the dispatcher's CLI subscription modes (`engine/*` ×
+  `agent-effort/*` → `amp -x --mode <key>`, Claude Code `--features
+  model:…,effort:…`; `scripts/dispatch/dispatch.ts` re-exports them) and the
+  control plane's plugin model pins (`createAgent({ model, reasoningEffort })`,
+  untouched by Tune Modes). Every plugin agent, the control thread included,
+  pins its model: intake, spec, verifier, deployer and control run
+  `openai/gpt-6-astra` (ChatGPT) at low or medium effort. Role threads carry
+  `odd-engine-<lab>`.
+- Builder: Claude Code on an orb, not a plugin agent (`Agent.createThread`
+  cannot run it, and Amp-native Anthropic models bill Amp credits). The
+  plugin runs `amp -ox <prompt> --mode external-agent:claude-code --features
+  model:claude-opus-5-5,effort:high --project Metacomet-Technologies/factory
+  --stream-json --no-archive-after-execute` with every thread label passed as
+  `--label`, reads the child's `session_id` from the stream, confirms its
+  labels, records it, and only then ends the local launcher; the child keeps
+  running in its own orb (`scripts/odd/launch.ts`). Steering, caps, crash
+  reconciliation (the labels exist from creation) and stage-based archiving
+  work on it like on any role thread. A launch that yields no child posts
+  `odd-launch-failed` on the issue and fails the evaluation (retried with
+  backoff); no plugin agent or other engine stands in, and the plane never
+  falls back to a runner. Runner Claude builds stay the dispatcher's
+  `engine/claude` path within its runner slots.
+- Reviewer: a plugin agent on ChatGPT `openai/gpt-6-astra` or the SuperGrok
+  connection `Cursor` `xai/grok-4.7`, both at high reasoning. The plane picks
+  the candidate with the fewest live role threads on its lab (ties: ChatGPT)
+  and refuses the lab on the issue's builder thread label (the configured
+  builder lab when there is none), so a changed default never lets one lab
+  approve its own change. A verdict label on a thread of the builder's lab
+  never counts.
+- Routing checks: at arm the plane runs `amp config model-providers
+  check-access` once per pinned plugin model against the control thread and
+  requires an active Claude Subscription connection. `check-access` probes
+  Amp's own routing, which reports Amp's paid Anthropic upstream for
+  `claude-opus-5-5` (observed 2026-10-26), so the Claude Code builder is
+  checked from its thread usage instead. Before archiving any labelled role
+  thread the plane reads `amp threads usage <id> --details` and posts
+  `odd-routing thread=<id> role=<role> engine=<lab> model=<model>
+  result=<match|mismatch|missing>` on the issue with one line per route
+  (model, purpose, requests, connection name and type; no costs, IDs or
+  links). Every non-title route must come from the thread's lab through its
+  subscription (Claude Subscription; ChatGPT; SuperGrok named `Cursor`);
+  anything else, or no route, pages `subscription-mismatch`.
 - Executor: orb by default for Builder, Reviewer, Spec, Intake, Verifier
   (judgement part). Runner only for Deployer, hardware checks, and anything
   whose Isolation names a device, a production DB or Tailscale. Caps: 4 orbs,
   2 runner slots, 2 issues in build or review at once, counted from live
   thread labels, not from a ledger. An issue holds its build slot from the
   builder's spawn until the merge, including while it waits for review.
-- Reviewer family is opposite to the builder family once the engine table
-  returns, so no change is approved by the model that wrote it. Until then
-  the reviewer is a separate Amp high thread that reruns the Evidence in its
-  own orb.
+- The reviewer reruns the Evidence in its own orb, on a lab other than the
+  builder's, so no change is approved by the model family that wrote it.
 
 ## 7. Handoff contracts
 
@@ -310,6 +345,7 @@ Each artifact is machine-checkable before the next role starts.
 | Role round budget spent (builder 3, reviewer 2, verifier 2, intake and spec 1) after a Watchdog cancellation | Control plane | Slack DM (`budget-ceiling`), `escalated` label, `odd-escalated` comment, PR back to draft when one exists | Issue waits with no owner thread until Devon removes `escalated`; the next evaluation starts a fresh round. |
 | Soft caps exceeded for 60 min | Watchdog sweep | `#factory-alerts`, once per episode | Launches already stop at the caps; the alert only reports it. |
 | Control plane blind (every sweep failing for 15 min) | Watchdog sweep | Slack DM (`control-plane-blind`), once per episode | Backstop poller runs the lifecycle at 60 s cadence (phase 7). |
+| Pinned model served off its subscription (arm check), or a role thread's usage routed elsewhere or missing (on archive) | Control plane | Slack DM (`subscription-mismatch`) once per thread; `odd-routing` comment on the issue | Roles keep their pinned models; nothing is relaunched on another engine. |
 | Control plane silent (no heartbeat for 20 min) | Runner poller | Journal line `odd-backstop-resume`, once per episode | The poller runs the lifecycle until a fresh heartbeat. |
 | Everything else | role | Linear comment | Proceed. |
 
@@ -325,7 +361,8 @@ carries `escalated`.
 │ .amp/plugins/factory-odd.ts                                                           │
 │  webhooks: /linear /github /slack  ─▶ dedupe ─▶ derive state ─▶ next action           │
 │  dry run unless the thread carries label odd-perform                                  │
-│  agents: odd-intake, odd-spec, odd-builder, odd-reviewer, odd-verifier (Amp-native)   │
+│  agents: odd-intake, odd-spec, odd-reviewer, odd-verifier (pinned models)             │
+│  builder: amp -ox --mode external-agent:claude-code (Claude Subscription)             │
 │  setInterval: 10 min watchdog sweep (scripts/odd/watchdog.ts), 08:00 ET digest       │
 └───────────────┬───────────────────────────────────────────────────────────┬───────────┘
                 │ Agent.createThread({executor:'orb'})                      │ Linear label (later phase)

@@ -428,6 +428,36 @@ GitHub auth is preconfigured for agent (gh + git credential helper); don't set G
 Keep the PLAYBOOK start-fresh sequence: inside the thread, fetch, then create
 its worktree using the preconfigured auth.
 
+## ODD builder launch and routing checks (MET-337)
+
+Observed 2026-10-26 in an orb with Amp `0.0.1792987309-gb46681`.
+
+* `amp -l, --label <label>` (repeatable) labels the thread a `-x`/`-ox` command
+  creates. ODD passes every role label at creation, so a launcher that dies
+  still leaves a derivable owner.
+* `--stream-json` lines carry `session_id` (the thread ID; see the result line
+  in Raw evidence). ODD reads the first one, records the child, then ends the
+  local launcher; the orb child keeps running. Ending the launcher mid-turn
+  is exercised by fixtures only; the first normal correction issue is the
+  live acceptance.
+* `amp config model-providers check-access --provider-model <provider/model>
+  --reasoning-effort <e> --thread <owned thread>` runs one small inference and
+  prints JSON. `openai/gpt-6-astra` reported `modelRouting.kind
+  "model-provider"`, `connectionType "model_provider_chatgpt"`,
+  `modelProviderName "ChatGPT"`; `xai/grok-4.7` reported
+  `model_provider_xai_grok` named `Cursor`; `anthropic/claude-opus-5-5`
+  reported `kind "upstream-model-provider"`, `modelProviderName "Anthropic"`:
+  Amp's paid route. Claude Code's subscription is not visible to this probe.
+* `amp config model-providers list --json` gives each connection's `id`,
+  `type` (`model_provider_claude_sub`, `model_provider_chatgpt`,
+  `model_provider_xai_grok`, …), `name` and `active` without secrets.
+* `amp threads usage <thread> --details` (no `--json`) prints a Model Routing
+  table: `| Model ID | Purpose | Routing | Requests | Cost |`, routing `Via Amp`
+  or `Via [<connection name>](https://ampcode.com/settings/model-routing#<id>)`.
+  A Claude Code thread on the subscription showed `anthropic/claude-opus-5-5 |
+  Agent | Via [Subscription](…)`; an older one showed
+  `external-agent:claude-code/<model> | Unspecified (legacy) | Via Amp`.
+
 ## Recommended dispatcher invocation
 
 **All commands in this section are from documented flag contracts plus the

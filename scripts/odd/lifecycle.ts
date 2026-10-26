@@ -83,7 +83,7 @@ export type Action =
   | { kind: 'wait'; reason: string; stuck?: Role };
 
 /** `diagnose` on a red deploy: after acting, the control plane starts one log-reading Deployer on the receipt's host (odd-deployer skill). */
-export type PageReason = 'third-failed-qa-round' | 'failed-rollback' | 'irreversible-action' | 'security-finding' | 'budget-ceiling' | 'control-plane-blind' | 'control-plane-silent';
+export type PageReason = 'third-failed-qa-round' | 'failed-rollback' | 'irreversible-action' | 'security-finding' | 'budget-ceiling' | 'control-plane-blind' | 'control-plane-silent' | 'subscription-mismatch';
 
 /** What happens when Devon does not answer a page (docs/odd/README.md §8); every page states it. */
 export const pageDefaults: Record<PageReason, string> = Object.freeze({
@@ -94,6 +94,7 @@ export const pageDefaults: Record<PageReason, string> = Object.freeze({
   'budget-ceiling': 'issue waits with no owner thread until the `escalated` label is removed',
   'control-plane-blind': 'the runner backstop poller runs the lifecycle at 60 s cadence',
   'control-plane-silent': 'the runner backstop poller runs the lifecycle until a fresh heartbeat',
+  'subscription-mismatch': 'roles keep their pinned models; nothing is relaunched on another engine',
 });
 
 /** The one page format (§8): `ODD page: <condition> | issue MET-<n> | <pr or host> | <sha> | default if silent: <action>`. */
