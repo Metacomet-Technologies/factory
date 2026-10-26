@@ -20,6 +20,8 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -380,9 +382,15 @@ DB_STATES = {
     "unreadable": ("meter-plan mode=unknown user_version=none db_changing=yes", "garbage"),
     "orphan sidecar": ("meter-plan mode=unknown user_version=none db_changing=yes", "orphan"),
     "symlink": ("meter-plan mode=unknown user_version=none db_changing=yes", "symlink"),
+    "hot journal": ("meter-plan mode=unknown user_version=none db_changing=yes", "journal"),
+    # The application runs WAL: a stopped WAL DB has no sidecars, and a committed version can still be in the WAL.
+    "stopped WAL v1": ("meter-plan mode=v1 user_version=1 db_changing=yes", ("wal", 1)),
+    "v1 committed in WAL over a v2 file": ("meter-plan mode=v1 user_version=1 db_changing=yes", ("pending", 2, 1)),
 }
 V2_PLAN = "meter-plan mode=v2 user_version=2 db_changing=no"
-MUTATIONS = re.compile(r"^(mktemp|install|useradd|flock|systemctl (?!show|is-)|meter migrate(?!.*--check-only))", re.M)
+V2_STATES = {"v2": 2, "stopped WAL v2": ("wal", 2), "v2 committed in WAL over a v1 file": ("pending", 1, 2)}
+# Scratch mktemp (no template, under TMPDIR) is allowed; any templated host path is a mutation.
+MUTATIONS = re.compile(r"^(mktemp .*/|install|useradd|flock|systemctl (?!show|is-)|meter migrate(?!.*--check-only))", re.M)
 
 
 class MeterPlanTest(unittest.TestCase):
@@ -421,13 +429,16 @@ class MeterPlanTest(unittest.TestCase):
         self.env = {
             **os.environ, "PATH": f"{shims}:/usr/sbin:/usr/bin:/sbin:/bin", "CALLS": str(self.calls),
             "FAKE_HEAD": HEAD, "FAKE_STATUS": "", "FAKE_BUILD_INFO": json.dumps({"git_sha": HEAD, "git_dirty": False}),
+            "TMPDIR": str(base / "tmp"),
         }
+        (base / "tmp").mkdir()
+        self.scratch = base / "tmp"
 
     def tearDown(self):
         self.temp.cleanup()
 
     def make_db(self, state):
-        for path in self.db.parent.glob("meter.db*"):
+        for path in self.db.parent.iterdir():
             path.unlink()
         if state is None:
             return
@@ -437,6 +448,32 @@ class MeterPlanTest(unittest.TestCase):
             self.db.write_bytes(b"not a sqlite database, " * 64)
         elif state == "orphan":
             pathlib.Path(f"{self.db}-wal").write_bytes(b"wal")
+        elif state == "journal":
+            self.make_db(2)
+            pathlib.Path(f"{self.db}-journal").write_bytes(b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7" + b"\0" * 504)
+        elif state[0] == "wal":
+            con = sqlite3.connect(self.db, isolation_level=None)
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("CREATE TABLE requests(id INTEGER)")
+            con.execute(f"PRAGMA user_version={state[1]}")
+            con.close()
+            self.assertEqual(sorted(path.name for path in self.db.parent.iterdir()), ["meter.db"])
+        elif state[0] == "pending":
+            # Committed to the WAL but not checkpointed: the main file still says the other version.
+            build = self.db.parent.parent / "build.db"
+            con = sqlite3.connect(build, isolation_level=None)
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("CREATE TABLE requests(id INTEGER)")
+            con.execute(f"PRAGMA user_version={state[1]}")
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            con.execute("PRAGMA wal_autocheckpoint=0")
+            con.execute(f"PRAGMA user_version={state[2]}")
+            shutil.copyfile(build, self.db)
+            shutil.copyfile(f"{build}-wal", f"{self.db}-wal")
+            con.close()
+            build.unlink()
+            self.assertEqual(int.from_bytes(self.db.read_bytes()[60:64], "big"), state[1])
+            self.assertGreater(pathlib.Path(f"{self.db}-wal").stat().st_size, 0)
         else:
             target = self.db.parent / "elsewhere.db"
             subprocess.run(["sqlite3", target, "PRAGMA user_version=2; CREATE TABLE t(x);"], check=True)
@@ -464,10 +501,11 @@ class MeterPlanTest(unittest.TestCase):
         self.assertEqual(self.state(), before, f"{flag} changed host state")
         self.assertIsNone(MUTATIONS.search(calls), calls)
         self.assertNotIn(".meter-stage", calls)
+        self.assertEqual(list(self.scratch.iterdir()), [], "scratch copy not removed")
         return result
 
     def test_plan_reports_each_generation_read_only_and_fails_closed(self):
-        for case, (line, state) in {**DB_STATES, "v2": (V2_PLAN, 2)}.items():
+        for case, (line, state) in {**DB_STATES, **{name: (V2_PLAN, state) for name, state in V2_STATES.items()}}.items():
             with self.subTest(case=case):
                 self.make_db(state)
                 result = self.assert_unchanged("--plan", 0)
@@ -488,20 +526,22 @@ class MeterPlanTest(unittest.TestCase):
                 self.assertIn("Refusing automatic meter install", result.stderr)
 
     def test_v2_stays_eligible_and_a_generation_change_after_plan_is_refused(self):
-        self.make_db(2)
-        self.assertEqual(self.assert_unchanged("--plan", 0).stdout.splitlines()[-1], V2_PLAN)
-        db = self.db.read_bytes()
-        # Control: v2 passes the recheck, stages and read-only checks, then stops at the busy
-        # backup lock (shim) before any snapshot, service change or DB write.
-        result, calls = self.run_installer("--no-db-change")
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertNotIn("meter-plan", result.stdout)
-        self.assertIn("Backup or deployment is running", result.stderr)
-        self.assertRegex(calls, r"mktemp -d .*/usr/local/bin/\.meter-stage\.")
-        self.assertRegex(calls, r"meter migrate --check-only --db .*/meter\.db")
-        self.assertNotRegex(calls, "systemctl (?!show|is-)")
-        self.assertEqual(self.db.read_bytes(), db)
-        self.assertFalse((self.tree / "var/backups/meter").exists())
+        for case, state in V2_STATES.items():
+            with self.subTest(eligible=case):
+                self.make_db(state)
+                self.assertEqual(self.assert_unchanged("--plan", 0).stdout.splitlines()[-1], V2_PLAN)
+                files = {path.name: path.read_bytes() for path in self.db.parent.iterdir()}
+                # Control: v2 passes the recheck, stages and read-only checks, then stops at the busy
+                # backup lock (shim) before any snapshot, service change or DB write.
+                result, calls = self.run_installer("--no-db-change")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertNotIn("meter-plan", result.stdout)
+                self.assertIn("Backup or deployment is running", result.stderr)
+                self.assertRegex(calls, r"mktemp -d .*/usr/local/bin/\.meter-stage\.")
+                self.assertRegex(calls, r"meter migrate --check-only --db .*/meter\.db")
+                self.assertNotRegex(calls, "systemctl (?!show|is-)")
+                self.assertEqual({path.name: path.read_bytes() for path in self.db.parent.iterdir()}, files)
+                self.assertFalse((self.tree / "var/backups/meter").exists())
         # Drift between the Deployer's plan and its install: v1 or a vanished DB is refused unchanged.
         for state, line in ((1, DB_STATES["v1"][0]), (None, DB_STATES["fresh"][0])):
             with self.subTest(drift=state):

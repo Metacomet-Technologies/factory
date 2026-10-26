@@ -444,7 +444,8 @@ test('adoption retains rollback recovery for an interrupted forward attempt with
   await reconcileManual(host.effects, 'v0.2.49', preview.approval);
   host.tags.push('v0.2.50');
   const snapshot = '/var/backups/meter/forward-snapshot';
-  host.effects.writeLedger({ ...host.ledger(), inFlight: { tag: 'v0.2.50', sha: shas['v0.2.50'], component: 'meter', phase: 'probing', snapshot } });
+  // A snapshot this deployer's --no-db-change install took: proven binary-only, so its rollback may run.
+  host.effects.writeLedger({ ...host.ledger(), inFlight: { tag: 'v0.2.50', sha: shas['v0.2.50'], component: 'meter', phase: 'probing', snapshot, noDbChange: true } });
   const probe = host.effects.probe;
   let unreachable = true;
   host.effects.probe = url => {
@@ -1065,6 +1066,28 @@ test('sandbox: the plan guards an interrupted meter resume too: a refused plan r
   assert.deepEqual(sudoCalls(host.calls), []);
   assert.deepEqual(host.ledger().inFlight, inFlight, 'resume state is kept for Devon');
   assert.equal(host.ledger().lastTag, 'v0.2.9');
+});
+
+test('sandbox: an interrupted meter resume with a red probe never runs a rollback that may restore an older DB generation; a --no-db-change snapshot still rolls back', async t => {
+  // Live meter DB is already v2 (the plan is eligible), but the snapshot came from an older installer that migrated v1 → v2.
+  for (const proven of [false, true]) {
+    const inFlight = { tag: 'v0.3.0', sha: shas['v0.3.0'], component: 'meter', phase: 'probing' as const, snapshot: '/var/backups/meter/previous-v1-db-changing',
+      ...(proven ? { noDbChange: true as const } : {}) };
+    const host = world({ ...meterRelease, tags: ['v0.2.9', 'v0.3.0'], ledger: baseline({ inFlight }) });
+    t.after(host.cleanup);
+    await assert.rejects(main(host.effects), proven ? /health=fail/ : /health=refused rollback=none refusal=db-changing-snapshot/);
+    assert.deepEqual(host.calls.filter(call => call.startsWith('plan')), ['plan meter'], 'the plan precedes the resume');
+    if (proven) {
+      assert.deepEqual(sudoCalls(host.calls), ['sudo deploy/rollback-meter-v1.sh /var/backups/meter/previous-v1-db-changing']);
+      continue;
+    }
+    assert.deepEqual(sudoCalls(host.calls), [], 'no rollback and no install');
+    const refused = line(`component=meter sha=${shas['v0.3.0']} health=refused rollback=none refusal=db-changing-snapshot`);
+    assert.deepEqual(host.comments, [['MET-364', refused]]);
+    assert.deepEqual(host.ledger().inFlight, inFlight, 'recovery state is kept for Devon');
+    assert.equal(host.ledger().lastTag, 'v0.2.9');
+    assert.equal((deploying(refused) as Extract<Action, { kind: 'page' }>).reason, 'irreversible-action');
+  }
 });
 
 test('sandbox: the installer rechecks after an eligible plan; a generation change in between is a refusal, not a failed rollback', async t => {

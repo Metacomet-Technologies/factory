@@ -107,15 +107,28 @@ assert_meter_ready() {
 }
 # Read-only DB-generation classification shared by --plan, --no-db-change and
 # the install. No DB and no sidecars is fresh; a regular DB is legacy, v1 or v2
-# by user_version; anything else, including an unreadable DB, is unknown and
-# callers fail closed. Only a v2 rerun leaves the DB generation unchanged.
+# by its committed user_version; anything else, including an unreadable DB or a
+# hot rollback journal, is unknown and callers fail closed. Only a v2 rerun
+# leaves the DB generation unchanged. SQLite creates WAL/SHM files even for
+# -readonly opens, so the live files are never opened: the committed generation
+# (main file plus any WAL, which may hold a newer user_version) is read from a
+# private scratch copy that is removed before returning.
 classify_meter_db() {
+    local scratch suffix
     mode=unknown
     version=
     if [[ ! -e "$db" && ! -L "$db" ]]; then
-        if [[ ! -e "$db-wal" && ! -L "$db-wal" && ! -e "$db-shm" && ! -L "$db-shm" ]]; then mode=fresh; fi
-    elif [[ -f "$db" && ! -L "$db" ]] && version=$(meter_sqlite "$db" 'PRAGMA user_version;' 2>/dev/null); then
-        case "$version" in 0) mode=legacy ;; 1) mode=v1 ;; 2) mode=v2 ;; esac
+        mode=fresh
+        for suffix in -wal -shm -journal; do
+            if [[ -e "$db$suffix" || -L "$db$suffix" ]]; then mode=unknown; fi
+        done
+    elif [[ -f "$db" && ! -L "$db" && ! -e "$db-journal" && ! -L "$db-journal" ]] && scratch=$(mktemp -d); then
+        if cp -- "$db" "$scratch/meter.db" \
+            && { [[ ! -e "$db-wal" && ! -L "$db-wal" ]] || { [[ -f "$db-wal" && ! -L "$db-wal" ]] && cp -- "$db-wal" "$scratch/meter.db-wal"; }; } \
+            && version=$(sqlite3 -readonly "$scratch/meter.db" 'PRAGMA user_version;' 2>/dev/null); then
+            case "$version" in 0) mode=legacy ;; 1) mode=v1 ;; 2) mode=v2 ;; esac
+        fi
+        rm -rf -- "$scratch"
     fi
     [[ "$version" =~ ^[0-9]+$ ]] || version=
     db_changing=yes

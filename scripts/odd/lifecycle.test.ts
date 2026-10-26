@@ -116,6 +116,9 @@ test('a refused deploy receipt is its own type: it pages irreversible-action, ne
   assert.deepEqual(action, { kind: 'page', reason: 'irreversible-action', sha: 'abcdef1234',
     detail: `meter on factory-gpu not installed at abcdef1234 (db-changing-v1): automatic deploys never change the meter DB generation; migration stays Devon's explicit manual operation. ${refused}` });
   assert.match(pageText('MET-1', action as Extract<Action, { kind: 'page' }>), /^ODD page: irreversible-action \| issue MET-1 \| - \| abcdef1234 \| default if silent: not executed\./);
+  const snapshot = refused.replace('db-changing-v1', 'db-changing-snapshot');
+  assert.equal(parseDeployReceipt(snapshot)?.refusal, 'db-changing-snapshot');
+  assert.equal((nextAction(issue({ status: 'Deploying', deployReceipt: parseDeployReceipt(snapshot) }), idle) as { reason?: string }).reason, 'irreversible-action');
   // Legacy receipts parse exactly as before and carry no refusal.
   const legacy = 'odd-deploy host=factory-gpu component=meter sha=abcdef1234 health=fail rollback=none';
   assert.deepEqual(parseDeployReceipt(legacy), { host: 'factory-gpu', component: 'meter', sha: 'abcdef1234', health: 'fail', rollback: 'none' });

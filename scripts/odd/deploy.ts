@@ -60,7 +60,8 @@ export const recipes: readonly Recipe[] = [
 ];
 
 export type ComponentRecord = { sha: string; tag: string; health: 'pass' | 'fail'; snapshot?: string };
-export type InFlight = { tag: string; sha: string; component: string; phase: 'installing' | 'probing'; snapshot?: string };
+/** `noDbChange`: the install ran with `--no-db-change`, so its snapshot never restores a DB generation (no `db-changing` marker). */
+export type InFlight = { tag: string; sha: string; component: string; phase: 'installing' | 'probing'; snapshot?: string; noDbChange?: true };
 /** A release's receipt, saved before delivery so a crashed delivery resumes without redeploying. `delivered` lists issues already handled. */
 export type PendingReceipt = { tag: string; receipt: Receipt; delivered: string[] };
 export type Ledger = { lastTag?: string; components: Record<string, ComponentRecord>; inFlight?: InFlight; receipt?: PendingReceipt; manualBaseline?: ManualBaseline };
@@ -258,10 +259,16 @@ export async function deployComponent(effects: Effects, recipe: Recipe, tag: str
     effects.log('resume', { component: recipe.name, phase: inFlight.phase, action });
     snapshot = inFlight.snapshot;
     if (action === 'installed') needInstall = false;
+    // Only a snapshot a --no-db-change install took is proven binary-only; any other snapshot
+    // (an older installer's, possibly marked db-changing) may restore an older DB generation.
+    if (action === 'rollback' && recipe.dbGuard && snapshot && !inFlight.noDbChange) {
+      return refuse(effects, tag, { component: recipe.name, sha, health: 'refused', rollback: 'none', refusal: 'db-changing-snapshot' });
+    }
     if (action === 'rollback') return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: await rollback(effects, recipe, sha, snapshot) }, snapshot);
   }
   if (needInstall) {
-    effects.writeLedger({ ...ledger, inFlight: { tag, sha, component: recipe.name, phase: 'installing' } });
+    const guarded = recipe.dbGuard ? { noDbChange: true as const } : {};
+    effects.writeLedger({ ...ledger, inFlight: { tag, sha, component: recipe.name, phase: 'installing', ...guarded } });
     const install = effects.sudo(recipe.installer, ['--source-checkout', join(effects.stateDir, 'source'), ...(recipe.dbGuard ? ['--no-db-change'] : []), recipe.artifact(releaseDir)]);
     snapshot = parseSnapshot(install.output);
     effects.log('install', { component: recipe.name, ok: install.ok, snapshot });
@@ -273,7 +280,7 @@ export async function deployComponent(effects: Effects, recipe: Recipe, tag: str
       // The installer's own ERR path already restored or never changed anything; a snapshot means it changed something.
       return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: snapshot ? await rollback(effects, recipe, sha, snapshot) : 'none' }, snapshot);
     }
-    effects.writeLedger({ ...effects.readLedger(), inFlight: { tag, sha, component: recipe.name, phase: 'probing', snapshot } });
+    effects.writeLedger({ ...effects.readLedger(), inFlight: { tag, sha, component: recipe.name, phase: 'probing', snapshot, ...guarded } });
     if ((await probeWindow(effects, recipe, sha)) === 'fail') {
       return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: await rollback(effects, recipe, sha, snapshot) }, snapshot);
     }

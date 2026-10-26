@@ -283,7 +283,7 @@ Each artifact is machine-checkable before the next role starts.
   component. `rollback` is the snapshot the rollback restored, and only when
   a re-probe finds the previous release healthy. A refused release (§10
   phase 5, meter DB generations) posts `health=refused rollback=none
-  refusal=db-changing-<fresh|legacy|v1|unknown>` for the refused component;
+  refusal=db-changing-<fresh|legacy|v1|unknown|snapshot>` for the refused component;
   older pass/fail receipts parse unchanged, and a malformed refusal does not
   parse. Only receipts newer than the
   issue's latest `odd-merge` comment (by creation time) count, so a stale
@@ -397,11 +397,16 @@ by the previous one).
    (MET-364): before any install, rollback or resume the job runs the
    read-only `install-meter.sh --plan` (one `meter-plan mode=<m>
    user_version=<n|none> db_changing=<yes|no>` line, no staging, service,
-   lock or snapshot) and installs meter only with `--no-db-change`, which
-   rechecks before its first change. Only a v2 rerun is eligible. A fresh,
-   legacy, v1, unclassifiable or failed plan installs nothing in the release,
-   and a generation change caught by the recheck installs nothing further;
-   both post `health=refused rollback=none refusal=db-changing-<mode>`; the control
+   lock or snapshot; the committed version, WAL included, is read from a
+   private scratch copy because SQLite creates sidecars even for read-only
+   opens) and installs meter only with `--no-db-change`, which rechecks
+   before its first change. Only a v2 rerun is eligible. A fresh, legacy,
+   v1, unclassifiable or failed plan installs nothing in the release, and a
+   generation change caught by the recheck installs nothing further. An
+   interrupted meter install whose resume probe is red rolls back only a
+   snapshot its `--no-db-change` install took (`inFlight.noDbChange`); any
+   other snapshot is refused (`db-changing-snapshot`). Every refusal posts
+   `health=refused rollback=none refusal=db-changing-<mode>`; the control
    plane pages `irreversible-action` (not executed), files no Bug, and
    `lastTag` stays on the previous release. `rollback-meter-v1.sh` is not
    binaries-only: for a db-changing snapshot it moves the current DB, WAL and
