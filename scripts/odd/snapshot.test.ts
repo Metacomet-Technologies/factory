@@ -202,3 +202,30 @@ test('a new release starts a fresh verifier budget despite the old receipt\'s ve
   assert.equal(delivered(old, b), true);
   assert.equal(delivered(current, b), false);
 });
+
+test('P3.1: wait ages come from the head commit, the merge and the steer comment, never from the sweep; a missing source stays unknown', () => {
+  const builder: LiveThread = { id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1'], state: 'idle' };
+  const older = 'f'.repeat(40);
+  const open: GitHubPullRequest = { number: 9, headRefOid: sha, state: 'OPEN', statusCheckRollup: [check(null, 'PENDING')], mergeable: 'MERGEABLE',
+    commits: [{ oid: older, committedDate: '2026-10-26T08:00:00Z' }, { oid: sha, committedDate: '2026-10-26T09:00:00Z' }] };
+  const issue = { id: 'MET-1', status: 'In Progress', labels: ['odd'] };
+  const pending = toSnapshot({ issue, pr: open, threads: [builder] });
+  assert.equal(pending.pr?.headAt, '2026-10-26T09:00:00Z', 'the head commit, not an older one');
+  assert.deepEqual((nextAction(pending, { orbs: 0, runnerSlots: 0, buildIssues: 1 }) as { wait?: object }).wait, { kind: 'ci', key: `ci-${sha.slice(0, 12)}`, since: '2026-10-26T09:00:00Z' });
+  // GitHub did not report the head commit: the age is unknown, not "since this sweep".
+  const undated = toSnapshot({ issue, pr: { ...open, commits: [{ oid: older, committedDate: '2026-10-26T08:00:00Z' }] }, threads: [builder] });
+  assert.equal(undated.pr?.headAt, undefined);
+  // CONFLICTING: CI never runs, so the builder is steered to rebase instead of waiting on pending CI.
+  const conflicting = toSnapshot({ issue, pr: { ...open, mergeable: 'CONFLICTING' }, threads: [builder] });
+  assert.equal((nextAction(conflicting, { orbs: 0, runnerSlots: 0, buildIssues: 1 }) as { key?: string }).key, `conflict-${sha.slice(0, 12)}`);
+  const merged = toSnapshot({ issue: { ...issue, status: 'Deploying' }, pr: { ...open, state: 'MERGED', mergeCommit: { oid: 'e'.repeat(40) }, mergedAt: '2026-10-26T10:00:00Z' } });
+  assert.deepEqual((nextAction(merged, { orbs: 0, runnerSlots: 0, buildIssues: 0 }) as { wait?: object }).wait, { kind: 'receipt', key: `receipt-${'e'.repeat(12)}`, since: '2026-10-26T10:00:00Z' });
+  // The steer record dates the unanswered steer; the first record of a key wins over a later duplicate.
+  const key = `ci-failed-${sha.slice(0, 12)}`;
+  const steered = toSnapshot({ issue: { ...issue, comments: [
+    { body: `odd-steer key=${key} thread=T-b`, createdAt: '2026-10-26T11:05:00Z' },
+    { body: `odd-steer key=${key} thread=T-b`, createdAt: '2026-10-26T11:00:00Z' },
+  ] }, pr: { ...open, statusCheckRollup: [check('FAILURE')] }, threads: [builder] });
+  assert.deepEqual(steered.steers, { [key]: '2026-10-26T11:00:00Z' });
+  assert.deepEqual((nextAction(steered, { orbs: 0, runnerSlots: 0, buildIssues: 1 }) as { wait?: object }).wait, { kind: 'steer', key: `steer-${key}`, since: '2026-10-26T11:00:00Z' });
+});
