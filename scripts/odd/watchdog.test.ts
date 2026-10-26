@@ -440,7 +440,7 @@ function factory() {
   const threads = new Map<string, { labels: string[]; state: string; archived: boolean; updatedAt: string }>();
   const dms: string[] = [];
   const steers: string[] = [];
-  const control = { slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '', gh: undefined as ((command: string) => Shell | undefined) | undefined, inject: undefined as ((name: string, input: Record<string, unknown>) => unknown) | undefined, commentCursor: '' as '' | 'repeated' | 'missing' };
+  const control = { slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '', gh: undefined as ((command: string) => Shell | undefined) | undefined, inject: undefined as ((name: string, input: Record<string, unknown>) => unknown) | undefined };
   /** Lifecycle mutations: status writes, builder launches and heartbeats (comments, archives, steers and DMs are kept above). */
   const saves: string[] = [];
   const launches: string[] = [];
@@ -461,7 +461,6 @@ function factory() {
       case 'linear.list_comments': {
         // Newest first, `limit` per page; each page repeats the previous page's last comment, as overlapping pages can.
         const all = [...(comments.get(String(input.issueId)) ?? [])].reverse();
-        if (control.commentCursor) return { comments: all.slice(0, 1), hasNextPage: true, ...(control.commentCursor === 'repeated' ? { cursor: 'same' } : {}) };
         const from = Number(input.cursor ?? 0);
         const to = from + Number(input.limit ?? 50);
         return { comments: all.slice(from, to), hasNextPage: to < all.length, cursor: String(to - 1) };
@@ -1487,23 +1486,6 @@ test('P4.5: a receipt beyond comment 50 starts the verifier, and the verifier\'s
   assert.equal(await plant.guard(labels) as Promise<{ userMessage: string } | undefined>, undefined, 'verdict on page 1, receipt on page 2: stop met');
 });
 
-for (const kind of ['repeated', 'missing'] as const) {
-  test(`P4.5: a ${kind} comment cursor fails the evaluation closed instead of acting on the first page`, async t => {
-    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
-    t.after(() => mock.timers.reset());
-    const plant = factory();
-    plant.issue('MET-21', 'Deploying');
-    plant.say('MET-21', deployReceiptLine({ host: 'gpu', component: 'api', sha: 'e'.repeat(40), health: 'pass', rollback: 'none' }));
-    plant.control.commentCursor = kind;
-    await plant.start();
-    await advance(5 * 60_000);
-    assert.deepEqual(rolesOf(plant, 'MET-21', 'verifier'), [], 'the receipt on page 1 is not acted on');
-    plant.control.commentCursor = '';
-    await advance(10 * 60_000);
-    assert.equal(rolesOf(plant, 'MET-21', 'verifier').length, 1, 'normal pages resume');
-  });
-}
-
 test('P4.5: an owned open PR beyond the first 100 and a merged one beyond 100 search results both count; mentions do not own', async t => {
   mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
   t.after(() => mock.timers.reset());
@@ -1523,60 +1505,125 @@ test('P4.5: an owned open PR beyond the first 100 and a merged one beyond 100 se
   assert.ok(plant.saves.includes('MET-32 "Deploying"'), 'merged PR #32 is the 151st search result');
 });
 
-test('P4.5: the digest counts a Done issue on page 2 and a merged PR past the old limit', async t => {
-  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
-  t.after(() => mock.timers.reset());
-  const old = Array.from({ length: 100 }, (_, i) => ({ id: `MET-${i + 1}`, title: 'long done', completedAt: '2026-10-01T00:00:00Z' }));
-  const orb = controlOrb((name, input) => {
-    if (name === 'linear.list_issues' && input.state === 'Done') {
-      return input.cursor === 'done-2'
-        ? { issues: [old[99], { id: 'MET-900', title: 'late Done sentinel', completedAt: '2026-10-24T14:00:00Z' }], hasNextPage: false }
-        : { issues: old, hasNextPage: true, cursor: 'done-2' };
-    }
-    if (name !== '$') return emptyWork(name);
-    const command = String(input.command);
-    if (!command.startsWith('gh pr list --state merged --search merged:')) return undefined;
-    const limit = Number(/--limit (\d+)/.exec(command)?.[1]);
-    const prs = Array.from({ length: 60 }, (_, i) => ({ number: 100 + i, title: i === 59 ? 'late merged sentinel' : 'merged', headRefOid: 'a'.repeat(40), mergeCommit: { oid: 'b'.repeat(40) }, mergedAt: '2026-10-24T14:00:00Z' }));
-    return JSON.stringify(prs.slice(0, limit));
+
+// The P4.5 proof matrix: each paged read the lifecycle acts on, through the real plugin, under
+// every page shape. Rows are cut at the plugin's `limit` and each page repeats the previous
+// page's last row, as overlapping pages can. A shape breaks the page after the first (or the
+// first page's cursor) until `broken` is cleared; the recovery step then reruns the consumer.
+// Every row asserts what the plane did, so a failure prints the concrete wrong decision.
+type Shape = 'complete' | 'empty' | 'malformed' | 'error' | 'no-cursor' | 'repeated-cursor';
+const shapes: readonly Shape[] = ['complete', 'empty', 'malformed', 'error', 'no-cursor', 'repeated-cursor'];
+// Slack's read_messages has no hasNextPage: a page without nextCursor is the last page by contract, so no-cursor is not a Slack shape.
+const slackShapes = shapes.filter(shape => shape !== 'no-cursor');
+const failing = (shape: Shape) => shape !== 'complete' && shape !== 'empty';
+
+function pager<T>(all: readonly T[], shape: Shape, style: 'linear' | 'slack', key: string) {
+  const state = { broken: true, reads: 0 };
+  const read = (input: Record<string, unknown>) => {
+    state.reads += 1;
+    const rows = shape === 'empty' ? [] : all;
+    const size = Number(input.limit);
+    const from = Number(input.cursor ?? 0);
+    const to = from + size;
+    let page: unknown[] = rows.slice(from, to);
+    let more = to < rows.length;
+    let next: string | undefined = more ? String(to - 1) : undefined;
+    const late = state.broken && from > 0;
+    if (late && shape === 'error') throw new Error(`${style} 503 on page 2`);
+    if (late && shape === 'malformed') page = [...page, null];
+    if (state.broken && shape === 'no-cursor' && more) next = undefined;
+    // A server that keeps handing back the cursor it was sent; it gives up after ten reads so an unguarded reader ends.
+    if (late && shape === 'repeated-cursor' && state.reads < 10) { next = String(input.cursor); more = true; }
+    return style === 'linear' ? { [key]: page, hasNextPage: more, ...(next ? { cursor: next } : {}) } : { [key]: page, ...(next ? { nextCursor: next } : {}) };
+  };
+  return { state, read };
+}
+
+const verifierLabels = ['odd-issue-met-40', 'odd-role-verifier', 'odd-round-1'];
+for (const shape of shapes) for (const total of shape === 'complete' ? [100, 101, 200, 201] : [201]) {
+  test(`P4.5 matrix: issue comments ${shape}${shape === 'complete' ? ` (${total})` : ''}: the verdict on the oldest comment is read or nothing acts`, async t => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+    t.after(() => mock.timers.reset());
+    const plant = factory();
+    const sha = 'e'.repeat(40);
+    plant.issue('MET-40', 'Deploying');
+    // Newest first: the green receipt, notes, and the pass verdict for it as the oldest comment.
+    const at = (i: number) => new Date(Date.parse('2026-10-26T14:00:00Z') - i * 1000).toISOString();
+    const rows = Array.from({ length: total }, (_, i) => ({ id: `c-${i}`, createdAt: at(i),
+      body: i === 0 ? deployReceiptLine({ host: 'gpu', component: 'api', sha, health: 'pass', rollback: 'none' }) : i === total - 1 ? verifyLine({ sha, result: 'pass' }) : `note ${i}` }));
+    const comments = pager(rows, shape, 'linear', 'comments');
+    plant.control.inject = (name, input) => name === 'linear.list_comments' && input.issueId === 'MET-40' ? comments.read(input) : undefined;
+    const outcome = async () => {
+      const guard = await (plant.guard(verifierLabels) as Promise<{ userMessage: string } | undefined>).then(result => !result ? 'stop' : result.userMessage.includes('no odd-deploy receipt') ? 'continue: no receipt' : result.userMessage.includes('odd-verify sha=') ? 'continue: no verdict' : `continue: ${result.userMessage}`, (error: unknown) => `refused: ${String(error).slice(0, 40)}`);
+      return { status: plant.saves.filter(save => save.startsWith('MET-40 ')), verifiers: rolesOf(plant, 'MET-40', 'verifier').length, guard: guard.startsWith('refused') ? 'refused' : guard };
+    };
+    await plant.start();
+    await settle();
+    const empty = { status: [], verifiers: 0, guard: 'continue: no receipt' };
+    const done = { status: ['MET-40 "Done"'], verifiers: 0, guard: 'stop' };
+    assert.deepEqual(await outcome(), shape === 'empty' ? empty : failing(shape) ? { status: [], verifiers: 0, guard: 'refused' } : done);
+    comments.state.broken = false;
+    await advance(90_000);
+    if (failing(shape)) assert.deepEqual(await outcome(), done, 'the recheck reads every page and acts once');
   });
-  await orb.start();
-  await until(() => orb.alerts.some(text => text.startsWith('ODD digest')));
-  const text = orb.alerts.join('\n');
-  assert.match(text, /^- MET-900 late Done sentinel$/m);
-  assert.match(text, /^- #159 late merged sentinel /m);
-  assert.match(text, /^Issues Done \(1\):/m, 'the Done issue repeated across pages is listed once');
-});
+}
 
 const intakeMessage = (ts: string, text: string) => ({ ts, text, userID: 'U1' });
-
-test('P4.5: a Slack intake message on page 2 gets an Intake thread; one repeated across pages gets one', async t => {
-  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
-  t.after(() => mock.timers.reset());
-  const first = intakeMessage('1761310000.000100', 'first intake');
-  const orb = controlOrb((name, input) => {
-    if (name === 'slack_read' && input.channelName === '#factory-intake' && input.operation === 'read_messages') {
-      return input.cursor === 'intake-2' ? { messages: [first, intakeMessage('1761310000.000200', 'late intake sentinel')] } : { messages: [first], nextCursor: 'intake-2' };
-    }
-    return emptyWork(name);
+for (const shape of slackShapes) {
+  test(`P4.5 matrix: Slack intake ${shape}: the message on page 2 gets one Intake thread or none does`, async t => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+    t.after(() => mock.timers.reset());
+    const rows = Array.from({ length: 51 }, (_, i) => intakeMessage(`1761310000.${String(i).padStart(6, '0')}`, i === 50 ? 'late intake sentinel' : `intake ${i}`));
+    const intake = pager(rows, shape, 'slack', 'messages');
+    const orb = controlOrb((name, input) => name === 'slack_read' && input.channelName === '#factory-intake' && input.operation === 'read_messages' ? intake.read(input) : emptyWork(name));
+    const status = await orb.start();
+    await settle();
+    const outcome = async () => ({ spawned: orb.spawned.length, sentinel: orb.spawned.filter(prompt => prompt.includes('late intake sentinel')).length, error: Boolean((await status({})).slack.error) });
+    assert.deepEqual(await outcome(), shape === 'empty' ? { spawned: 0, sentinel: 0, error: false } : failing(shape) ? { spawned: 0, sentinel: 0, error: true } : { spawned: 51, sentinel: 1, error: false });
+    intake.state.broken = false;
+    await advance(5 * 60_000);
+    if (failing(shape)) assert.deepEqual(await outcome(), { spawned: 51, sentinel: 1, error: false }, 'the next poll hands every message to Intake once');
   });
-  await orb.start();
-  await until(() => orb.spawned.length === 2);
-  await settle();
-  assert.equal(orb.spawned.length, 2);
-  assert.equal(orb.spawned.filter(prompt => prompt.includes('first intake')).length, 1);
-  assert.ok(orb.spawned.some(prompt => prompt.includes('late intake sentinel')));
-});
+}
 
-test('P4.5: a repeated Slack cursor fails the intake poll closed; nothing is handed to Intake', async t => {
-  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
-  t.after(() => mock.timers.reset());
-  const orb = controlOrb((name, input) => {
-    if (name === 'slack_read' && input.channelName === '#factory-intake') return { messages: [intakeMessage('1761310000.000100', 'first intake')], nextCursor: 'loop' };
-    return emptyWork(name);
+for (const shape of shapes) {
+  test(`P4.5 matrix: digest Done issues ${shape}: the issue done on page 2 is listed once, or no digest and no heartbeat`, async t => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+    t.after(() => mock.timers.reset());
+    const rows = Array.from({ length: 101 }, (_, i) => ({ id: `MET-${i + 1}`, title: i === 100 ? 'late Done sentinel' : 'long done', completedAt: i === 100 ? '2026-10-24T14:00:00Z' : '2026-10-01T00:00:00Z' }));
+    const done = pager(rows, shape, 'linear', 'issues');
+    const orb = controlOrb((name, input) => name === 'linear.list_issues' && input.state === 'Done' ? done.read(input) : emptyWork(name));
+    await orb.start();
+    await settle();
+    const outcome = () => ({ digests: orb.alerts.filter(text => text.startsWith('ODD digest')).length, sentinel: orb.alerts.filter(text => /^- MET-101 late Done sentinel$/m.test(text)).length, heartbeats: orb.updates.length });
+    assert.deepEqual(outcome(), shape === 'empty' ? { digests: 1, sentinel: 0, heartbeats: 1 } : failing(shape) ? { digests: 0, sentinel: 0, heartbeats: 0 } : { digests: 1, sentinel: 1, heartbeats: 1 });
+    done.state.broken = false;
+    await advance(sweepMs);
+    if (failing(shape)) assert.deepEqual(outcome(), { digests: 1, sentinel: 1, heartbeats: 1 }, 'the next sweep posts the full digest once');
   });
-  const status = await orb.start();
-  await settle();
-  assert.match((await status({})).slack.error ?? '', /repeated cursor loop/);
-  assert.deepEqual(orb.spawned, []);
-});
+
+}
+
+for (const shape of slackShapes) {
+  test(`P4.5 matrix: digest-posted check ${shape}: a digest posted on page 2 is never posted again`, async t => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+    t.after(() => mock.timers.reset());
+    // #factory-alerts today: other alerts, then the day's digest past the first page. Slack filters each page after the limit.
+    const rows = Array.from({ length: 101 }, (_, i) => ({ ts: `1761300000.${String(i).padStart(6, '0')}`, text: i === 100 ? 'ODD digest 2026-10-24\nMerged PRs (0):' : `alert ${i}` }));
+    const alerts = pager(rows, shape, 'slack', 'messages');
+    const orb = controlOrb((name, input) => {
+      if (name !== 'slack_read' || input.channelName !== 'factory-alerts') return emptyWork(name);
+      const page = alerts.read(input) as { messages: ({ text: string } | null)[] };
+      const terms = (input.filter as { containsAll: string[] }).containsAll;
+      return { ...page, messages: page.messages.filter(message => message === null || terms.every(term => message.text.includes(term))) };
+    });
+    await orb.start();
+    await settle();
+    const outcome = () => ({ reposted: orb.alerts.filter(text => text.startsWith('ODD digest')).length, heartbeats: orb.updates.length });
+    // An empty channel is a true "not posted yet": the digest goes out.
+    assert.deepEqual(outcome(), shape === 'empty' ? { reposted: 1, heartbeats: 1 } : failing(shape) ? { reposted: 0, heartbeats: 0 } : { reposted: 0, heartbeats: 1 });
+    alerts.state.broken = false;
+    await advance(sweepMs);
+    if (failing(shape)) assert.deepEqual(outcome(), { reposted: 0, heartbeats: 1 }, 'the next sweep finds the digest and still does not repost');
+  });
+}
