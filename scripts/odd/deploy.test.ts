@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createHmac } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { CHECK_TIMEOUT_MS, ROOT, toolChecks, bootstrap, deployComponent, emptyLedger, issuesFromSubjects, liveEffects, main, parseSnapshot, pendingTags, plan, probeResult, promoteTools, receiptLine, recipes, reconcileManual, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
@@ -1330,7 +1331,7 @@ async function controlPlane(options: { issue: string; receipt: string; failOnce:
     }
   } };
   const thread = { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] };
-  const ui = { confirm: async () => true, notify: async () => {} };
+  const ui = { confirm: async () => true, notify: async () => {}, input: async () => signingSecret };
   const logger = { log: () => {} };
   const agent = { definition: {}, createThread: async (options: { executor: unknown }) => ({
     id: 'T-deployer', setLabels: async (labels: string[]) => { calls.push(`log reader ${JSON.stringify(options.executor)} ${labels.at(-1)}`); }, appendUserMessage: async () => {},
@@ -1345,10 +1346,17 @@ async function controlPlane(options: { issue: string; receipt: string; failOnce:
   await (plugin as unknown as (api: unknown) => Promise<void>)(amp);
   await handlers.get('session.start')!({}, { thread, ui, logger, tools });
   const deliver = (id: string) => webhooks.get('linear')!(
-    { id, receivedAt: '2026-10-24T15:00:01Z', body: new TextEncoder().encode(JSON.stringify({ data: { identifier: options.issue } })) },
+    signedLinear(id, '2026-10-24T15:00:01Z', { identifier: options.issue }),
     { thread, ui, logger, tools, $ });
   return { deliver, calls, alerts, status: () => status };
 }
+
+/** The private test signing secret the control thread's secret dialogs receive, and a Linear delivery signed with it the way Linear signs: HMAC-SHA256 of the raw body, `webhookTimestamp` at send time. */
+const signingSecret = 'test-signing-secret';
+const signedLinear = (id: string, receivedAt: string, data: Record<string, unknown>) => {
+  const body = JSON.stringify({ data, webhookId: id, webhookTimestamp: Date.parse(receivedAt) - 1_000 });
+  return { id, receivedAt, body: new TextEncoder().encode(body), headers: { 'linear-signature': createHmac('sha256', signingSecret).update(body).digest('hex') } };
+};
 
 const settle = async () => { for (let i = 0; i < 50; i++) await new Promise(resolve => setImmediate(resolve)); };
 

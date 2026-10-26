@@ -1,6 +1,7 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { createHmac } from 'node:crypto';
 import { builderArgs, io, launch, type Launcher } from './launch.ts';
 import { reviewerEngines } from './engines.ts';
 import { fakeConnections, fakeShell, servedBy } from './fixtures.ts';
@@ -153,7 +154,7 @@ function controlPlane(options: { status?: string; threads?: Omit<FakeThread, 'ar
     threads: { get: handle },
   };
   const control = { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] };
-  const ctx = { thread: control, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools, $ };
+  const ctx = { thread: control, ui: { confirm: async () => true, notify: async () => {}, input: async () => signingSecret }, logger: { log: () => {} }, tools, $ };
   let events = 0;
   return {
     issue, threads, comments, dms, commands, agentModels, modes, modeLabels,
@@ -165,11 +166,18 @@ function controlPlane(options: { status?: string; threads?: Omit<FakeThread, 'ar
       await settle();
     },
     async deliver() {
-      await webhooks.get('linear')!({ id: `evt-${++events}`, receivedAt: '2026-10-26T00:00:01Z', body: new TextEncoder().encode(JSON.stringify({ data: { identifier: 'MET-7' } })) }, ctx);
+      await webhooks.get('linear')!(signedLinear(`evt-${++events}`, '2026-10-26T00:00:01Z', { identifier: 'MET-7' }), ctx);
       await settle();
     },
   };
 }
+
+/** The private test signing secret the control thread's secret dialogs receive, and a Linear delivery signed with it the way Linear signs: HMAC-SHA256 of the raw body, `webhookTimestamp` at send time. */
+const signingSecret = 'test-signing-secret';
+const signedLinear = (id: string, receivedAt: string, data: Record<string, unknown>) => {
+  const body = JSON.stringify({ data, webhookId: id, webhookTimestamp: Date.parse(receivedAt) - 1_000 });
+  return { id, receivedAt, body: new TextEncoder().encode(body), headers: { 'linear-signature': createHmac('sha256', signingSecret).update(body).digest('hex') } };
+};
 
 const settle = async () => { for (let i = 0; i < 100; i++) await new Promise(resolve => setImmediate(resolve)); };
 

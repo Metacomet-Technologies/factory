@@ -7,6 +7,7 @@ import { receiptLabel, type LiveThread } from './snapshot.ts';
 import plugin, { followUp } from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
 import { io } from './launch.ts';
+import { createHmac } from 'node:crypto';
 
 const now = new Date('2026-10-24T15:16:00Z');
 const idleFor = (minutes: number, over: Partial<LiveThread> = {}): LiveThread =>
@@ -1263,4 +1264,189 @@ test('P3.7: a recovered receipt keeps a deployment of a release containing the m
       }
     });
   }
+});
+
+// --- P4.6-webhooks: signed deliveries only ---------------------------------------------------
+
+const githubSecret = 'p46-github-signing-secret-fixture';
+const linearSecret = 'p46-linear-signing-secret-fixture';
+const hmac = (secret: string, bytes: Uint8Array | string) => createHmac('sha256', secret).update(bytes).digest('hex');
+const received = '2026-10-26T15:00:00.000Z';
+
+/** A control orb with every external transport faked: Linear, thread search, Slack and the shell. `answers` feeds the secret dialogs, in order. Counts snapshot reads and lifecycle effects. */
+function signedOrb() {
+  const reads: string[] = [];
+  const effects: string[] = [];
+  const output: string[] = [];
+  const dialogs: Record<string, unknown>[] = [];
+  const registrations: string[] = [];
+  let answers: (string | undefined)[] = [];
+  const tools = { call: async (name: string, input: Record<string, unknown>) => {
+    output.push(JSON.stringify(input));
+    switch (name) {
+      case 'linear.list_issues': return { issues: [], hasNextPage: false };
+      case 'find_thread': return { threads: [] };
+      case 'linear.get_issue': reads.push(String(input.id)); return { id: input.id, status: 'Todo', labels: ['odd'], description: '', relations: { blockedBy: [] } };
+      case 'linear.list_comments': return { comments: [] };
+      case 'slack_read': return { messages: [] };
+      case 'linear.get_status_updates': return { statusUpdates: [], hasNextPage: false };
+      default: if (name !== 'linear.save_status_update') effects.push(name); return {};
+    }
+  } };
+  const { $, commands } = fakeShell();
+  const logger = { log: (...args: unknown[]) => { output.push(args.map(String).join(' ')); } };
+  const ui = {
+    input: async (options: Record<string, unknown>) => { dialogs.push(options); return answers.shift(); },
+    confirm: async (options: unknown) => { output.push(JSON.stringify(options)); dialogs.push({ confirm: true }); return true; },
+    notify: async (message: string) => { output.push(message); },
+  };
+  let webhooks = new Map<string, (event: unknown, ctx: unknown) => Promise<void>>();
+  let status: (input: Record<string, unknown>) => Promise<Record<string, unknown>>;
+  const thread = { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] };
+  const ctx = { thread, ui, logger, tools, $ };
+  return {
+    reads, effects, output, dialogs, registrations, commands,
+    /** A fresh plugin load arming the control thread; `secrets` answer its dialogs (undefined = dismissed). */
+    async start(...secrets: (string | undefined)[]) {
+      answers = secrets;
+      webhooks = new Map();
+      let tool: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> } | undefined;
+      const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+      await (plugin as unknown as (api: unknown) => Promise<void>)({
+        $, createAgent: () => ({ definition: {} }), registerAgentMode: () => {}, registerTool: (definition: typeof tool) => { tool = definition; },
+        on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
+        createWebhook: async ({ key, handler }: { key: string; handler: (event: unknown, ctx: unknown) => Promise<void> }) => { registrations.push(key); webhooks.set(key, handler); return { url: `https://hooks.example/${key}` }; },
+        system: { executor: { kind: 'remote', keepAlive: async () => {} } },
+      });
+      await handlers.get('session.start')!({}, ctx);
+      await settle();
+      // The arming sweep posts the day's digest; only effects of deliveries are under test.
+      effects.length = 0;
+      commands.length = 0;
+      status = async input => { const text = await tool!.execute(input, ctx); output.push(text); return JSON.parse(text); };
+    },
+    status: (input: Record<string, unknown> = {}) => status(input),
+    answer: (...secrets: (string | undefined)[]) => { answers = secrets; },
+    async deliver(key: string, id: string, body: string, headers: Record<string, string>, at = received) {
+      try {
+        await webhooks.get(key)!({ id, receivedAt: at, body: new TextEncoder().encode(body), headers }, ctx);
+      } catch (error: unknown) {
+        output.push(String(error));
+        throw error;
+      } finally {
+        await settle();
+      }
+    },
+  };
+}
+
+const githubBody = JSON.stringify({ action: 'synchronize', pull_request: { head: { ref: 'met-7-signed' }, body: 'closes MET-7' } });
+const linearBody = (sentAt: number, spacing = 0) => JSON.stringify({ action: 'update', type: 'Issue', data: { identifier: 'MET-8' }, webhookTimestamp: sentAt }, null, spacing);
+const sent = Date.parse(received) - 5_000;
+
+test('P4.6-webhooks: GitHub and Linear deliveries are evaluated once only when HMAC-SHA256 over the exact bytes matches; missing, malformed, bad, tampered, stale and replayed ones read nothing', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse(received) });
+  t.after(() => mock.timers.reset());
+  const orb = signedOrb();
+  await orb.start(linearSecret, githubSecret);
+  assert.deepEqual(orb.registrations, ['linear', 'github'], 'no Slack webhook: intake is polled');
+  assert.deepEqual(orb.reads, [], 'arming reads no issue');
+
+  const refused = async (key: string, id: string, body: string, headers: Record<string, string>, at?: string) => {
+    await orb.deliver(key, id, body, headers, at);
+    assert.deepEqual(orb.reads, [], `${id} must not be read`);
+    assert.deepEqual(orb.effects, [], `${id} must cause no lifecycle action`);
+    assert.ok(!orb.commands.some(command => command.startsWith('gh ')), `${id} must not query GitHub`);
+  };
+  const githubSig = `sha256=${hmac(githubSecret, githubBody)}`;
+  await refused('github', 'gh-missing', githubBody, {});
+  await refused('github', 'gh-bare-hex', githubBody, { 'x-hub-signature-256': hmac(githubSecret, githubBody) });
+  await refused('github', 'gh-sha1', githubBody, { 'x-hub-signature-256': `sha1=${hmac(githubSecret, githubBody).slice(0, 40)}` });
+  await refused('github', 'gh-wrong-secret', githubBody, { 'x-hub-signature-256': `sha256=${hmac(linearSecret, githubBody)}` });
+  await refused('github', 'gh-linear-header', githubBody, { 'linear-signature': hmac(githubSecret, githubBody) });
+  // The same JSON with one space added is different bytes: a verifier that re-serializes would accept it.
+  await refused('github', 'gh-tampered', githubBody.replace('"closes', ' "closes'), { 'x-hub-signature-256': githubSig });
+  await refused('github', 'gh-short', githubBody, { 'x-hub-signature-256': githubSig.slice(0, -2) });
+
+  const fresh = linearBody(sent);
+  await refused('linear', 'lin-missing', fresh, {});
+  await refused('linear', 'lin-github-format', fresh, { 'linear-signature': `sha256=${hmac(linearSecret, fresh)}` });
+  await refused('linear', 'lin-wrong-secret', fresh, { 'linear-signature': hmac(githubSecret, fresh) });
+  await refused('linear', 'lin-tampered', fresh.replace('MET-8', 'MET-9'), { 'linear-signature': hmac(linearSecret, fresh) });
+  const stale = linearBody(Date.parse(received) - 60_000 - 1_000);
+  await refused('linear', 'lin-stale', stale, { 'linear-signature': hmac(linearSecret, stale) });
+  const future = linearBody(Date.parse(received) + 60_000 + 1_000);
+  await refused('linear', 'lin-future', future, { 'linear-signature': hmac(linearSecret, future) });
+  const unstamped = JSON.stringify({ data: { identifier: 'MET-8' } });
+  await refused('linear', 'lin-unstamped', unstamped, { 'linear-signature': hmac(linearSecret, unstamped) });
+
+  // Valid: evaluated once, and Amp redelivering the same event is deduplicated.
+  await orb.deliver('github', 'gh-ok', githubBody, { 'x-hub-signature-256': githubSig.toUpperCase().replace('SHA256=', 'sha256=') });
+  await orb.deliver('github', 'gh-ok', githubBody, { 'x-hub-signature-256': githubSig });
+  assert.deepEqual(orb.reads, ['MET-7']);
+  // Linear signs the raw bytes it sent, whitespace included, and 59 s from receipt is fresh.
+  const edge = linearBody(Date.parse(received) - 59_000);
+  await orb.deliver('linear', 'lin-edge', edge, { 'linear-signature': hmac(linearSecret, edge) });
+  assert.deepEqual(orb.reads, ['MET-7', 'MET-8']);
+  const spaced = linearBody(Date.parse(received) - 30_000, 2);
+  await orb.deliver('linear', 'lin-ok', spaced, { 'linear-signature': hmac(linearSecret, spaced) });
+  assert.deepEqual(orb.reads, ['MET-7', 'MET-8', 'MET-8']);
+  // The same signed bytes under a new event ID inside the window are a replay.
+  await orb.deliver('linear', 'lin-replay', spaced, { 'linear-signature': hmac(linearSecret, spaced) }, '2026-10-26T15:00:20.000Z');
+  assert.deepEqual(orb.reads, ['MET-7', 'MET-8', 'MET-8'], 'a replay inside the freshness window is not read');
+
+  const { events } = await orb.status() as { events: { source: string; stage: string; error?: string }[] };
+  const rejected = events.filter(event => event.stage === 'rejected').map(event => `${event.source} ${event.error}`);
+  assert.ok(rejected.includes('linear replayed delivery'));
+  assert.ok(rejected.some(reason => /^linear stale delivery/.test(reason)));
+  assert.ok(rejected.includes('github invalid x-hub-signature-256'));
+});
+
+test('P4.6-webhooks: without a secret (first arm, dismissed dialog, plugin reload) every delivery is refused and retried; private setup recovers without new URLs; no secret reaches status, logs, errors or tools', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse(received) });
+  t.after(() => mock.timers.reset());
+  const orb = signedOrb();
+  const linearSig = (body: string) => ({ 'linear-signature': hmac(linearSecret, body) });
+  const body = linearBody(sent);
+
+  // Arm with both dialogs dismissed: secret, owner-only dialogs, and the URLs are not shown.
+  await orb.start(undefined, undefined);
+  assert.equal(orb.dialogs.length, 2);
+  assert.ok(orb.dialogs.every(dialog => dialog.secret === true && dialog.requireHuman === true && dialog.initialValue === undefined));
+  assert.ok(!orb.dialogs.some(dialog => dialog.confirm), 'arming shows no URL dialog');
+  assert.deepEqual((await orb.status()).signing, { linear: 'missing', github: 'missing' });
+  // A validly signed delivery fails its handler, so Amp retries it, and nothing is read.
+  await assert.rejects(orb.deliver('linear', 'lin-1', body, linearSig(body)), /linear signing secret not set/);
+  await assert.rejects(orb.deliver('github', 'gh-1', githubBody, { 'x-hub-signature-256': `sha256=${hmac(githubSecret, githubBody)}` }), /github signing secret not set/);
+  assert.deepEqual(orb.reads, []);
+  assert.deepEqual(orb.effects, []);
+
+  // Private setup: only secret dialogs, no re-registration, so the URLs Linear and GitHub hold stay valid.
+  orb.answer(linearSecret, `  ${githubSecret}\n`);
+  assert.deepEqual((await orb.status({ set_secrets: true })).signing, { linear: 'set', github: 'set' });
+  assert.deepEqual(orb.registrations, ['linear', 'github']);
+  assert.ok(!orb.dialogs.some(dialog => dialog.confirm));
+  // Amp's retry of the refused event (same ID, same receipt time) is now evaluated, once.
+  await orb.deliver('linear', 'lin-1', body, linearSig(body));
+  await orb.deliver('github', 'gh-1', githubBody, { 'x-hub-signature-256': `sha256=${hmac(githubSecret, githubBody)}` });
+  assert.deepEqual(orb.reads, ['MET-8', 'MET-7']);
+
+  // Reload: the secrets lived in memory only, so the new instance fails closed until set again.
+  await orb.start(undefined, undefined);
+  assert.deepEqual(orb.registrations, ['linear', 'github', 'linear', 'github'], 'the same stable keys');
+  assert.deepEqual((await orb.status()).signing, { linear: 'missing', github: 'missing' });
+  const later = linearBody(sent + 1_000);
+  await assert.rejects(orb.deliver('linear', 'lin-2', later, linearSig(later)), /signing secret not set/);
+  assert.deepEqual(orb.reads, ['MET-8', 'MET-7']);
+  orb.answer(linearSecret, githubSecret);
+  await orb.status({ set_secrets: true });
+  await orb.deliver('linear', 'lin-2', later, linearSig(later));
+  assert.deepEqual(orb.reads, ['MET-8', 'MET-7', 'MET-8']);
+
+  // Redaction: nothing the plane wrote, logged, returned or threw carries a secret.
+  await orb.status({ show_urls: true });
+  for (const secret of [githubSecret, linearSecret]) {
+    assert.ok(!orb.output.some(text => text.includes(secret)), 'a secret leaked into status, logs, errors or tool inputs');
+  }
+  assert.ok(orb.output.some(text => text.includes('"signing"')), 'status output was captured');
 });

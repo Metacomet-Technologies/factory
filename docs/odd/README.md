@@ -388,7 +388,7 @@ carries `escalated`.
 ```diagram
 ┌──────────────────────── Amp orb: thread "Factory ODD control" ───────────────────────┐
 │ .amp/plugins/factory-odd.ts                                                           │
-│  webhooks: /linear /github /slack  ─▶ dedupe ─▶ derive state ─▶ next action           │
+│  webhooks: /linear /github ─▶ verify signature ─▶ dedupe ─▶ derive ─▶ next action     │
 │  dry run unless the thread carries label odd-perform                                  │
 │  agents: odd-intake, odd-spec, odd-reviewer[-xai], odd-verifier (pinned models)       │
 │  builder: amp -ox --mode external-agent:claude-code (Claude Subscription)             │
@@ -418,6 +418,24 @@ run the lifecycle. Missing or older, it runs the lifecycle and logs
 credential, so that journal line is the page; `control-plane-blind` stays the
 Slack page for a sweep that keeps failing.
 
+Webhook authenticity (P4.6-webhooks). Amp hands the handler the exact request
+bytes and the requested headers but verifies no upstream signature, so the
+plugin does, before dedupe or any snapshot read: HMAC-SHA256 of the raw body
+with the provider's signing secret, compared in constant time. GitHub's
+`X-Hub-Signature-256` must be `sha256=<hex>`; Linear's `Linear-Signature` is
+bare hex, and the signed `webhookTimestamp` must be within 60 s of Amp's
+`receivedAt` (so Amp's own retries stay valid). The same signed Linear bytes
+under another event ID inside that window are a replay. A missing, malformed,
+invalid, stale or replayed delivery is recorded `rejected` and read no
+further. Slack has no webhook; `#factory-intake` is polled. The two signing
+secrets live only in the control orb's memory, entered by Devon through
+owner-only `ui.input({ secret: true })` dialogs at arm or with
+`odd_control_status set_secrets:true`. Status shows only `signing: set |
+missing`. After a reload they are gone: until set again, every delivery's
+handler fails, so nothing is evaluated and Amp retries the event for up to an
+hour; the sweep keeps running. Setting them never re-registers or shows the
+webhook URLs.
+
 What stays in `scripts/dispatch/`: the launcher (`amp -x` construction,
 worktrees, caps), `qa.ts check` and merge, the ledger as the backstop's cache,
 and the stage-policy evaluator. What leaves it: polling as the primary
@@ -435,7 +453,8 @@ by the previous one).
    change.
 2. Control-plane skeleton in an orb: plugin registers webhooks, logs derived
    state, spawns nothing. Linear and GitHub webhooks configured by Devon
-   (URLs are secrets; the plugin prints them once to the control thread).
+   (URLs are secrets; `odd_control_status show_urls:true` shows them in a
+   confirm dialog in the control thread).
 3. Intake and Spec live: Slack and Linear events create specs; builds still
    go through the `dispatch` label so the poller remains in charge.
 4. Builder and Reviewer on orbs (MET-279): for issues labelled `odd` the
