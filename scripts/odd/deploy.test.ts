@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { ROOT, deployComponent, emptyLedger, issuesFromSubjects, main, parseSnapshot, pendingTags, plan, probeResult, receiptLine, recipes, reconcileManual, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
 import { nextAction, parseDeployReceipt, type Action } from './lifecycle.ts';
 import plugin, { diagnose, page, setStatus } from '../../.amp/plugins/factory-odd.ts';
+import { fakeShell } from './fixtures.ts';
 
 const sha = 'a'.repeat(40);
 const kiosk = recipes.find(recipe => recipe.name === 'kiosk')!;
@@ -958,7 +959,7 @@ async function controlPlane(options: { issue: string; receipt: string; failOnce:
   const agent = { definition: {}, createThread: async (options: { executor: unknown }) => ({
     id: 'T-deployer', setLabels: async (labels: string[]) => { calls.push(`log reader ${JSON.stringify(options.executor)} ${labels.at(-1)}`); }, appendUserMessage: async () => {},
   }) };
-  const $ = async () => ({ exitCode: 0, stdout: '[]', stderr: '' });
+  const { $ } = fakeShell();
   const amp = {
     $, createAgent: () => agent, registerAgentMode: () => {}, registerTool: () => {},
     on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },

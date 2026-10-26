@@ -4,3 +4,5 @@ import './snapshot.test.ts';
 import './intake.test.ts';
 import './deploy.test.ts';
 import './watchdog.test.ts';
+import './engines.test.ts';
+import './launch.test.ts';

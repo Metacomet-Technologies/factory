@@ -29,6 +29,23 @@ test('a PR owns an issue by branch prefix or closes/contributes line, not by a m
   assert.equal(prOwnsIssue({}, 'MET-301'), false);
 });
 
+test('a ready verdict from the builder\'s lab never merges, whether the builder thread names its lab, lacks the label, or is gone', () => {
+  const issue = { id: 'MET-1', status: 'In Progress', labels: ['odd'] };
+  const pr: GitHubPullRequest = { number: 9, headRefOid: sha, state: 'OPEN', statusCheckRollup: [check('SUCCESS')] };
+  const ready = (lab: string): LiveThread => ({ id: `T-${lab}`, labels: ['odd-issue-met-1', 'odd-role-reviewer', 'odd-round-1', `odd-engine-${lab}`, `odd-verdict-ready-${sha.slice(0, 12)}`], state: 'idle' });
+  const builder = (labels: string[]): LiveThread => ({ id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1', ...labels], state: 'idle' });
+  const idle = { orbs: 0, runnerSlots: 0, buildIssues: 1 };
+  const next = (threads: LiveThread[]) => nextAction(toSnapshot({ issue, pr, threads }), idle);
+  for (const builders of [[builder(['odd-engine-anthropic'])], [builder([])], []]) {
+    assert.equal(next([...builders, ready('anthropic')]).kind, 'spawn', JSON.stringify(builders));
+    // Positive control: the same verdict from another lab merges.
+    assert.deepEqual(next([...builders, ready('openai')]), { kind: 'merge', pr: 9, sha });
+  }
+  // A builder labelled with another lab makes that lab's verdict the refused one.
+  assert.equal(next([builder(['odd-engine-openai']), ready('openai')]).kind, 'spawn');
+  assert.deepEqual(next([builder(['odd-engine-openai']), ready('anthropic')]), { kind: 'merge', pr: 9, sha });
+});
+
 test('CI rollup: any failure beats pending, pending beats success, no checks is pending', () => {
   assert.equal(ciState([check('SUCCESS'), check(null, 'PENDING')]), 'pending');
   assert.equal(ciState([check('SUCCESS'), check('FAILURE'), check(null, 'PENDING')]), 'failure');

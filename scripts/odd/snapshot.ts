@@ -1,6 +1,7 @@
 // Outcome driven development: derive an IssueSnapshot from what Linear, GitHub and Amp
 // report (docs/odd/README.md §9). Pure functions; the control-plane plugin does the IO.
 
+import { builderEngine, labOf } from './engines.ts';
 import { capacity, contracts, parseCancelled, parseDeployReceipt, parseThreadLabels, parseVerify, roles, type DeployReceipt, type IssueSnapshot, type Load, type RiskClass, type Role, type Status, type Verdict, type Verify } from './lifecycle.ts';
 
 export type WebhookSource = 'linear' | 'github' | 'slack';
@@ -85,9 +86,16 @@ export function ciState(checks: GitHubPullRequest['statusCheckRollup'] = []): 'p
 /** A reviewer thread's verdict label: state and the 12-character head prefix it judged. */
 export const verdictPattern = /^odd-verdict-(ready|changes)-([a-f0-9]{12})$/;
 
-/** The newest reviewer verdict label, matched to the PR head by its 12-character SHA prefix. */
+/**
+ * The newest reviewer verdict label, matched to the PR head by its 12-character SHA prefix. A
+ * verdict from a thread of the Builder's own lab (`odd-engine-<lab>`) never counts (§6); a builder
+ * thread without that label, or no live builder, falls back to the configured builder lab, as
+ * `selectReviewer` does.
+ */
 export function verdictFor(threads: readonly LiveThread[], headSha: string): Verdict | undefined {
+  const builderLab = labOf(threads.find(thread => parseThreadLabels(thread.labels).role === 'builder')?.labels ?? []) ?? builderEngine.lab;
   for (const thread of threads) {
+    if (labOf(thread.labels) === builderLab) continue;
     for (const label of thread.labels) {
       const match = verdictPattern.exec(label);
       if (match && headSha.startsWith(match[2])) return { state: match[1] as Verdict['state'], sha: headSha };

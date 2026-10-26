@@ -8,6 +8,7 @@ import { repos, issueRepo } from './repos.ts';
 import { observeStagePolicy } from './policy.ts';
 import { openLedger, markerConflicts, commentId, type Ledger } from './ledger.ts';
 import { controlPlaneSilent, heartbeatProjectId, pageText, parseHeartbeat, silenceMs } from '../odd/lifecycle.ts';
+import { modes, pluginEngines, advisors, assignment, engineArgs } from '../odd/engines.ts';
 
 export const mainCheckout = '/home/agent/work/factory';
 export function runnerCommand(runner: string, args: string[]) {
@@ -38,36 +39,8 @@ export function supportedNode(version: string): boolean {
   return match !== null && Number(match[1]) >= 12;
 }
 
-export const CLAUDE_MODEL = 'claude-opus-5-5';
-export const modes = {
-  amp: { low: 'low', medium: 'medium', high: 'high' },
-  claude: { low: 'external-agent:claude-code', medium: 'external-agent:claude-code', high: 'external-agent:claude-code' },
-  chatgpt: { low: 'gpt56l', medium: 'gpt61s', high: 'gpt61s' },
-  ultra: { low: 'ultra', medium: 'ultra', high: 'ultra' },
-  // Devon's User Plugins (subscription-backed, no Claude models). Checked with
-  // `amp plugins list` before launch; never substituted when missing.
-  grok: { low: 'grok-low', medium: 'grok-medium', high: 'grok-high', ultra: 'grok-ultra' },
-  go: { low: 'go-low', medium: 'go-medium', high: 'go-high', ultra: 'go-ultra' },
-  docs: { low: 'docs', medium: 'docs', high: 'docs' },
-};
-export const families = { amp: 'Amp', claude: 'Claude Code subscription', chatgpt: 'ChatGPT through Amp', ultra: 'Amp credits',
-  grok: 'Grok subscription', go: 'OpenCode Go subscription', docs: 'OpenCode Go subscription' };
-export const pluginEngines = ['grok', 'go', 'docs'];
-// Report-only advisor tools each plugin mode registers; low and docs have none.
-export const advisors = { grok: { medium: 'grok_advisor_high', high: 'grok_advisor_high', ultra: 'grok_advisor_xhigh' },
-  go: { medium: 'go_advisor_high', high: 'go_advisor_high', ultra: 'go_advisor_max' } };
-const effortIgnored = (engine: string) => engine === 'ultra' || engine === 'docs';
-export function assignment(engine: string, effort: string, advisor: boolean) {
-  const tool = advisors[engine]?.[effort];
-  const advice = !tool ? 'none for this mode' : advisor
-    ? `warranted for the unresolved question named in Context; ${tool} is optional, report-only and bounded to two consultations, never a review or a second builder`
-    : `not warranted; do not call ${tool}`;
-  return `Mode: ${modes[engine][effort]} (${families[engine]}, ${effortIgnored(engine) ? 'agent-effort ignored' : `effort ${effort}`}). Advisor: ${advice}.`;
-}
-export function engineArgs(engine: string, effort: string) {
-  return ['--mode', modes[engine][effort],
-    ...(engine === 'claude' ? ['--features', `model:${CLAUDE_MODEL},effort:${effort}`] : [])];
-}
+// The engine table lives with the ODD pins (scripts/odd/engines.ts); re-exported for legacy callers.
+export { CLAUDE_MODEL, modes, families, pluginEngines, advisors, assignment, engineArgs } from '../odd/engines.ts';
 const marker = (name: string) => `<!-- factory-dispatch:${name} -->`;
 const threadPattern = /^<!-- factory-dispatch:thread (T-[a-f0-9-]{36})(?: runner:(gpu|console|orb))? -->$/;
 const claimPattern = /^<!-- factory-dispatch:claim runner:(gpu|console|orb) -->$/;

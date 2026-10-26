@@ -5,6 +5,7 @@ import { heartbeatLine, parseHeartbeat } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
 import { receiptLabel, type LiveThread } from './snapshot.ts';
 import plugin from '../../.amp/plugins/factory-odd.ts';
+import { fakeShell } from './fixtures.ts';
 
 const now = new Date('2026-10-24T15:16:00Z');
 const idleFor = (minutes: number, over: Partial<LiveThread> = {}): LiveThread =>
@@ -133,7 +134,7 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
     const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
     let status: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> } | undefined;
     const amp = {
-      $: async () => ({ exitCode: 0, stdout: '[]', stderr: '' }),
+      $: fakeShell().$,
       createAgent: () => ({ definition: {} }), registerAgentMode: () => {}, registerTool: (tool: typeof status) => { status = tool; },
       on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
       createWebhook: async (options: Record<string, unknown>) => (await override('createWebhook', options)) ?? { url: 'https://hooks.example/x' },

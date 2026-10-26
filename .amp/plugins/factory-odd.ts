@@ -33,6 +33,8 @@ import {
 } from '../../scripts/odd/lifecycle.ts'
 import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
 import { finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, receiptLabel, roleLabelQueries, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
+import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
+import { builderArgs, launch } from '../../scripts/odd/launch.ts'
 import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, digestHeading, overCaps, restoreStatus, slackMessages, staleThreads, sweepMs, type DigestInput } from '../../scripts/odd/watchdog.ts'
 
 export const description =
@@ -53,9 +55,12 @@ const slackPollMs = 5 * 60_000
 const deployRunner = 'factory-gpu'
 
 export default async function (amp: PluginAPI) {
-	const roleAgent = (role: Role, extendsMode: 'low' | 'medium' | 'high', label: string, extra: string, tools?: { exclude?: string[] }): Agent =>
+	// Every agent pins its model and effort (scripts/odd/engines.ts); none inherits a mode default.
+	const roleAgent = (role: Role, extendsMode: 'low' | 'medium' | 'high', label: string, extra: string, pin: Engine, tools?: { exclude?: string[] }): Agent =>
 		amp.createAgent({
 			extends: extendsMode,
+			model: pin.model,
+			reasoningEffort: pin.effort,
 			instructions: [
 				`You are the Factory ${role} role under outcome driven development (docs/odd/README.md).`,
 				`Load the project skill \`${contracts[role].skill}\` first and follow it as your contract.`,
@@ -68,17 +73,24 @@ export default async function (amp: PluginAPI) {
 			display: { label, color: '#0f766e' },
 		})
 
+	const reviewerExtra = 'Rerun the Evidence commands yourself at the exact head SHA. Verdict is bound to that SHA: a PR comment plus the odd-verdict thread label.'
+	const readOnly = { exclude: ['edit_file', 'create_file'] }
+	// One reviewer agent per lab; the control plane picks one outside the Builder's lab (selectReviewer).
+	const reviewerAgents = new Map<Lab, Agent>(reviewerEngines.map(engine => [engine.lab, roleAgent('reviewer', 'high', 'ODD Reviewer', reviewerExtra, engine, readOnly)]))
 	const modes: { key: string; label: string; agent: Agent }[] = [
-		{ key: 'intake', label: 'ODD Intake', agent: roleAgent('intake', 'low', 'ODD Intake', 'Turn a message or bare issue into a Linear issue in the team template, with type and area labels and a duplicate check.') },
-		{ key: 'spec', label: 'ODD Spec', agent: roleAgent('spec', 'medium', 'ODD Spec', 'Write Isolation, Build, Done means and Evidence; one Evidence line per Done-means item; set priority and risk.') },
-		{ key: 'builder', label: 'ODD Builder', agent: roleAgent('builder', 'medium', 'ODD Builder', 'Implement the smallest correct change on your own branch, open the PR with the Evidence output in its body, and keep the same thread and branch across review rounds.') },
-		{ key: 'reviewer', label: 'ODD Reviewer', agent: roleAgent('reviewer', 'high', 'ODD Reviewer', 'Rerun the Evidence commands yourself at the exact head SHA. Verdict is bound to that SHA: a PR comment plus the odd-verdict thread label.', { exclude: ['edit_file', 'create_file'] }) },
-		{ key: 'verifier', label: 'ODD Verifier', agent: roleAgent('verifier', 'low', 'ODD Verifier', 'Check each Done-means item against the deployed system using the Evidence lines and the deploy receipt.', { exclude: ['edit_file', 'create_file'] }) },
-		{ key: 'deployer', label: 'ODD Deployer', agent: roleAgent('deployer', 'low', 'ODD Deployer', 'Read the factory-deploy journal and ledger for the red receipt you were given and attach the installer and journal excerpts to the named issue. Never run installers, rollbacks, sudo or systemctl.', { exclude: ['edit_file', 'create_file'] }) },
+		{ key: 'intake', label: 'ODD Intake', agent: roleAgent('intake', 'low', 'ODD Intake', 'Turn a message or bare issue into a Linear issue in the team template, with type and area labels and a duplicate check.', pluginPins.intake) },
+		{ key: 'spec', label: 'ODD Spec', agent: roleAgent('spec', 'medium', 'ODD Spec', 'Write Isolation, Build, Done means and Evidence; one Evidence line per Done-means item; set priority and risk.', pluginPins.spec) },
+		// Manual use only: the control plane launches Claude Code builders through the CLI (launchBuilder).
+		{ key: 'builder', label: 'ODD Builder', agent: roleAgent('builder', 'medium', 'ODD Builder', 'Implement the smallest correct change on your own branch, open the PR with the Evidence output in its body, and keep the same thread and branch across review rounds.', pluginPins.builder) },
+		{ key: 'reviewer', label: 'ODD Reviewer', agent: reviewerAgents.get(reviewerEngines[0].lab)! },
+		{ key: 'verifier', label: 'ODD Verifier', agent: roleAgent('verifier', 'low', 'ODD Verifier', 'Check each Done-means item against the deployed system using the Evidence lines and the deploy receipt.', pluginPins.verifier, readOnly) },
+		{ key: 'deployer', label: 'ODD Deployer', agent: roleAgent('deployer', 'low', 'ODD Deployer', 'Read the factory-deploy journal and ledger for the red receipt you were given and attach the installer and journal excerpts to the named issue. Never run installers, rollbacks, sudo or systemctl.', pluginPins.deployer, readOnly) },
 	]
 	const agents: Partial<Record<Role, Agent>> = Object.fromEntries(modes.map((m) => [m.key, m.agent]))
 	const control = amp.createAgent({
 		extends: 'low',
+		model: pluginPins.control.model,
+		reasoningEffort: pluginPins.control.effort,
 		instructions: `You are the Factory ODD control thread. You own the webhooks and the watchdog schedule. Do not build, review or deploy yourself; the plugin spawns roles. When asked, summarise derived state. Label this thread ${controlLabel} to arm the plugin.`,
 		tools: { add: ['mcp__linear__*', 'get_thread_status', 'send_thread_message'] },
 		display: { label: 'ODD Control', color: '#b45309' },
@@ -134,10 +146,12 @@ export default async function (amp: PluginAPI) {
 		slack: { polledAt?: string; error?: string; spawned: string[] }
 		/** Watchdog sweep (scripts/odd/watchdog.ts): last run, issues swept, episodes in progress, digest day, cancellations today. */
 		watchdog: { sweptAt?: string; error?: string; issues?: number; overSince?: string; alerted?: boolean; blindSince?: string; paged?: boolean; digestDay?: string; heartbeatId?: string; cancelled: string[] }
+		/** Arm-time check that each pinned model is served by its subscription (checkPins): when it ran and what failed. */
+		pins: { checkedAt?: string; problems?: string[] }
 		timers: ReturnType<typeof setInterval>[]
 	}
 	const armState = new Map<ThreadID, ArmState>()
-	const emptyState = (): ArmState => ({ armed: false, webhooks: [], urls: [], events: [], slack: { spawned: [] }, watchdog: { cancelled: [] }, timers: [] })
+	const emptyState = (): ArmState => ({ armed: false, webhooks: [], urls: [], events: [], slack: { spawned: [] }, watchdog: { cancelled: [] }, pins: {}, timers: [] })
 	const record = (state: ArmState, event: HandledEvent) => {
 		state.events.push(event)
 		state.events.splice(0, Math.max(0, state.events.length - 20))
@@ -199,6 +213,7 @@ export default async function (amp: PluginAPI) {
 			state.timers.push(setInterval(() => void pollSlackIntake(ctx, state), slackPollMs), setInterval(() => void sweep(evalCtx, state), sweepMs))
 			void pollSlackIntake(ctx, state)
 			void sweep(evalCtx, state)
+			void checkPins(evalCtx, state)
 		} catch (error: unknown) {
 			for (const timer of state.timers.splice(0)) clearInterval(timer)
 			state.armed = false
@@ -239,6 +254,34 @@ export default async function (amp: PluginAPI) {
 		void showUrls(ctx, state.urls).catch((error: unknown) => ctx.logger.log(marker, 'webhook dialog failed', String(error)))
 	}
 
+	// Arm-time routing check (§6): each pinned plugin model runs one small check-access inference
+	// against the control thread and must be served by its subscription. Claude Code is served
+	// inside the builder's orb, not through Amp's routing (check-access reports Amp's Anthropic
+	// upstream for it), so the builder needs an active Claude Subscription connection here and is
+	// checked from its thread usage when it is archived (recordRouting). A failure pages; output
+	// beyond the route (headers, IDs) is never kept.
+	async function checkPins(ctx: EvalContext, state: ArmState) {
+		const problems: string[] = []
+		try {
+			const engines = [...reviewerEngines, ...Object.values(pluginPins)].filter((engine, i, all) => all.findIndex(other => other.model === engine.model) === i)
+			for (const engine of engines) {
+				const result = await ctx.$`amp config model-providers check-access --provider-model ${engine.model} --reasoning-effort ${engine.effort} --thread ${ctx.thread.id}`
+				let output: unknown
+				try { output = JSON.parse(result.stdout) } catch { output = undefined }
+				problems.push(...(result.exitCode === 0 ? checkAccess(engine, output).problems : [`${engine.model}: check-access exited ${result.exitCode}`]))
+			}
+			if (!(await connections(ctx)).some(connection => connection.active && connection.type === builderEngine.subscription.type)) {
+				problems.push(`${builderEngine.model}: no active ${builderEngine.subscription.label} connection`)
+			}
+		} catch (error: unknown) {
+			problems.push(`pin check failed: ${String(error)}`)
+		}
+		state.pins = { checkedAt: new Date().toISOString(), problems }
+		if (!problems.length) return
+		ctx.logger.log(marker, 'pin check', problems.join('; '))
+		if ((await ctx.thread.labels()).includes(performLabel)) await pageMismatch(ctx, '-', `pinned models at arm: ${problems.join('; ')}`)
+	}
+
 	// One evaluation of one issue: derive, decide, act (or dry-run). A role thread's end raises
 	// no event here (its agent.end runs in its own orb), and a reviewer's verdict changes neither
 	// Linear nor the PR head, so after a spawn, and while the owner is still running, the issue
@@ -273,7 +316,8 @@ export default async function (amp: PluginAPI) {
 			const performing = (await ctx.thread.labels()).includes(performLabel)
 			const finished = finishedThreads(issue.status, threads)
 			if (finished.length && performing) await archiveThreads(ctx, finished)
-			const action = nextAction(issue, await currentLoad(ctx))
+			const { load, usage } = await currentLoad(ctx)
+			const action = nextAction(issue, load)
 			ctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
 			entry.status = issue.status
 			entry.action = action
@@ -290,7 +334,7 @@ export default async function (amp: PluginAPI) {
 				entry.stage = 'performed'
 				recheck(ctx, state, identifier, 0)
 			} else {
-				entry.stage = (await perform(ctx, state, issue, action, threads)) ? 'performed' : 'ignored'
+				entry.stage = (await perform(ctx, state, issue, action, threads, usage)) ? 'performed' : 'ignored'
 			}
 			failures.delete(identifier)
 		} catch (error: unknown) {
@@ -486,7 +530,7 @@ export default async function (amp: PluginAPI) {
 				const entry = record(state, { at, source: 'slack-poll', issue: null, stage: perform ? 'performed' : 'dry-run', action })
 				if (!perform) continue
 				try {
-					const load = await currentLoad(ctx)
+					const { load } = await currentLoad(ctx)
 					if (load.orbs >= capacity.orbs) {
 						entry.stage = 'dry-run'
 						entry.action = { kind: 'wait', reason: 'orb capacity (intake)' }
@@ -507,7 +551,7 @@ export default async function (amp: PluginAPI) {
 			if (perform) {
 				const idle = (await threadsFor(ctx.tools, 'label:odd-role-intake archived:false'))
 					.filter(thread => thread.labels.some(label => label.startsWith('odd-slack-')) && thread.state === 'idle')
-				await archiveThreads(ctx, idle)
+				await archiveThreads({ ...ctx, $: amp.$ }, idle)
 			}
 		} catch (error: unknown) {
 			state.slack.error = String(error)
@@ -515,13 +559,40 @@ export default async function (amp: PluginAPI) {
 		}
 	}
 
-	async function spawnThread(parentThreadID: ThreadID, role: Role, labels: string[], content: string, executor: AgentThreadExecutor = 'orb'): Promise<string> {
-		const agent = agents[role]
-		if (!agent) throw new Error(`no plugin agent for role ${role}`)
+	// Plugin agents run every role but the builder; `engine` is the reviewer's lab choice, else the role's pin.
+	async function spawnThread(parentThreadID: ThreadID, role: Role, labels: string[], content: string, executor: AgentThreadExecutor = 'orb', engine?: Engine): Promise<string> {
+		const pin = engine ?? pluginPins[role as keyof typeof pluginPins]
+		const agent = role === 'builder' ? undefined : role === 'reviewer' ? reviewerAgents.get(pin?.lab as Lab) : agents[role]
+		if (!agent || !pin) throw new Error(`no plugin agent for role ${role}${engine ? ` on ${engine.lab}` : ''}`)
 		const thread = await agent.createThread({ executor, parentThreadID, visibility: 'workspace' })
-		await thread.setLabels(labels)
+		await thread.setLabels([engineLabel(pin.lab), ...labels])
 		await thread.appendUserMessage({ type: 'user-message', content })
 		return thread.id
+	}
+
+	// The builder is Claude Code on an orb (§6): `amp -ox` through the CLI, labelled at creation and
+	// again once its session_id is read, recorded, and only then the local launcher is ended. A
+	// failure is posted on the issue once per error and thrown; no plugin agent or other engine
+	// stands in for it.
+	const launchFailures = new Set<string>()
+	async function launchBuilder(ctx: EvalContext, issue: IssueSnapshot, labels: string[], content: string, round: number): Promise<string> {
+		const expected = [...labels, engineLabel(builderEngine.lab)]
+		try {
+			return await launch(builderArgs(content, labels, `${issue.identifier} builder round ${round}`), async id => {
+				const child = amp.threads.get(id as ThreadID)
+				const present = await child.labels()
+				if (expected.some(label => !present.includes(label))) await child.addLabels(expected)
+				spawned.set(issue.identifier, [...(spawned.get(issue.identifier) ?? []), id])
+				ctx.logger.log(marker, 'builder launched', issue.identifier, id, builderEngine.model)
+			})
+		} catch (error: unknown) {
+			const line = `odd-launch-failed role=builder engine=${builderEngine.lab} model=${builderEngine.model}\n\n${String(error).slice(0, 400)}`
+			if (!launchFailures.has(`${issue.identifier}:${line}`)) {
+				launchFailures.add(`${issue.identifier}:${line}`)
+				await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: line })
+			}
+			throw error
+		}
 	}
 
 	// The URLs are credentials, shown only in the control thread for Devon to paste into Linear,
@@ -540,7 +611,7 @@ export default async function (amp: PluginAPI) {
 	// same evaluation repeats on every webhook until the builder pushes.
 	const steered = new Set<string>()
 	/** Returns false when nothing was done because the action is not this control plane's to take. */
-	async function perform(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, action: Action, threads: readonly LiveThread[]): Promise<boolean> {
+	async function perform(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, action: Action, threads: readonly LiveThread[], usage: Partial<Record<Lab, number>> = {}): Promise<boolean> {
 		const owned = issue.status === 'Triage' || issue.labels.includes(oddLabel)
 		if (!owned) {
 			ctx.logger.log(marker, 'deferred: dispatcher owns', issue.identifier, issue.status, action.kind)
@@ -559,13 +630,21 @@ export default async function (amp: PluginAPI) {
 				}
 				// A verifier is labelled with the receipt it verifies, so the next release's receipt starts a fresh budget.
 				const receipt = action.role === 'verifier' && issue.deployReceipt ? [receiptLabel(issue.deployReceipt.sha)] : []
-				const threadID = await spawnThread(
-					ctx.thread.id,
-					action.role,
-					[...threadLabels(issue.identifier, action.role, action.round), ...receipt],
-					`${marker} Outcome ${issue.identifier}. Role: ${action.role}. Reason: ${action.reason}.${spawnTarget(issue, action.role)} Load the \`${contracts[action.role].skill}\` skill and start.`,
-				)
-				spawned.set(issue.identifier, [...(spawned.get(issue.identifier) ?? []), threadID])
+				const labels = [...threadLabels(issue.identifier, action.role, action.round), ...receipt]
+				const content = `${marker} Outcome ${issue.identifier}. Role: ${action.role}. Reason: ${action.reason}.${spawnTarget(issue, action.role)} Load the \`${contracts[action.role].skill}\` skill and start.`
+				if (action.role === 'builder') {
+					await launchBuilder(ctx, issue, labels, content, action.round)
+				} else {
+					// Cross-lab review: never the lab the issue's builder thread runs on.
+					let engine: Engine | undefined
+					if (action.role === 'reviewer') {
+						const builderLab = labOf(threads.find(thread => parseThreadLabels(thread.labels).role === 'builder')?.labels ?? [])
+						engine = selectReviewer(builderLab, usage)
+						if (!engine) throw new Error(`no reviewer engine outside the builder's lab ${builderLab ?? builderEngine.lab}`)
+					}
+					const threadID = await spawnThread(ctx.thread.id, action.role, labels, content, 'orb', engine)
+					spawned.set(issue.identifier, [...(spawned.get(issue.identifier) ?? []), threadID])
+				}
 				// Todo -> In Progress is the builder's claim; the status change is the handoff artifact (§7).
 				if (action.role === 'builder' && issue.status === 'Todo') await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: 'In Progress' })
 				return true
@@ -764,11 +843,51 @@ async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 }
 
 // Finished role threads are archived so the thread list shows only live work; an archived
-// thread keeps its labels, so a later `find_thread … archived:false` no longer counts it.
-async function archiveThreads(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, threads: readonly LiveThread[]) {
+// thread keeps its labels, so a later `find_thread … archived:false` no longer counts it, and its
+// orb pauses. Each thread's actual routing is recorded first: a failed record keeps the thread
+// for the next evaluation, like a Watchdog cancellation.
+async function archiveThreads(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger' | '$'>, threads: readonly LiveThread[]) {
 	for (const thread of threads) {
+		await recordRouting(ctx, thread)
 		await callJson(ctx.tools, 'update_thread', { thread: thread.id, archived: true })
 		ctx.logger.log(marker, 'archived finished thread', thread.id)
+	}
+}
+
+type ShellContext = Pick<WebhookHandlerContext, 'tools' | 'logger' | '$'>
+
+/** Non-secret connection data (`amp config model-providers list --json`): ID, type, name, active. */
+async function connections(ctx: Pick<WebhookHandlerContext, '$'>): Promise<(Connection & { active?: boolean })[]> {
+	const result = await ctx.$`amp config model-providers list --json`
+	if (result.exitCode !== 0) throw new Error(`amp config model-providers list exited ${result.exitCode}`)
+	return (JSON.parse(result.stdout) as { id: string; type: string; name?: string; active?: boolean }[]).map(({ id, type, name, active }) => ({ id, type, name: name ?? '', active }))
+}
+
+/** One page (pageText) per mismatch; best effort, so a Slack failure never holds an archive. */
+async function pageMismatch(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: string, detail: string) {
+	const text = `${marker} ${pageText(issue, { kind: 'page', reason: 'subscription-mismatch', detail })}`
+	await ctx.tools.call('slack_write', { text }).catch((error: unknown) => ctx.logger.log(marker, 'mismatch page failed', String(error)))
+}
+
+// After a role thread ends (its stage passed, or the Watchdog cancelled it): read the thread's
+// Model Routing from `amp threads usage --details`, post the sanitized record on its issue
+// (models, purposes, connection names; no costs, IDs or links), and page when it was not served
+// by the engine its labels name. Threads without an `odd-engine-*` label predate the pins.
+const routed = new Set<string>()
+async function recordRouting(ctx: ShellContext, thread: LiveThread) {
+	const { role, issue } = parseThreadLabels(thread.labels)
+	const engine = role ? expectedEngine(role, labOf(thread.labels)) : undefined
+	if (!role || !engine) {
+		ctx.logger.log(marker, 'no engine pin to check', thread.id)
+		return
+	}
+	const usage = await ctx.$`amp threads usage ${thread.id} --details`
+	const routes = usage.exitCode === 0 ? parseRouting(usage.stdout, await connections(ctx)) : []
+	const routing: Routing = usage.exitCode === 0 ? checkRouting(engine, routes) : { result: 'missing', problems: [`amp threads usage exited ${usage.exitCode}`] }
+	if (issue) await callJson(ctx.tools, 'linear.save_comment', { issueId: issue, body: routingRecord(thread.id, role, engine, routes, routing) })
+	if (routing.result !== 'match' && !routed.has(thread.id)) {
+		routed.add(thread.id)
+		await pageMismatch(ctx, issue ?? '-', `${role} thread ${thread.id} (${engine.model}): ${routing.problems.join('; ')}`)
 	}
 }
 
@@ -817,11 +936,12 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 	return threads.filter(thread => !thread.archived).map(({ archived: _, ...thread }) => thread)
 }
 
-async function currentLoad(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>): Promise<Load> {
+/** Caps from live role threads, and the live role threads per lab that weight reviewer selection. */
+async function currentLoad(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>): Promise<{ load: Load; usage: Partial<Record<Lab, number>> }> {
 	const threads = (await Promise.all(roleLabelQueries.map(query => threadsFor(ctx.tools, query)))).flat()
 	const load = loadFrom(threads)
 	ctx.logger.log(marker, 'load', JSON.stringify(load), 'of', JSON.stringify(capacity))
-	return load
+	return { load, usage: engineUsage(threads) }
 }
 
 // The Ralph guard's external checks: each is read from Linear or GitHub, never from the agent.

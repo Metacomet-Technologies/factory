@@ -17,6 +17,15 @@ A Linear issue labelled `odd` with `Isolation`, `Build`, `Done means` and
 orb checkout is yours alone: fetch `origin/main` and create the branch
 `met-<n>-<slug>` from it. Never work on `main`.
 
+## Engine
+
+The control plane launches you as Claude Code (`external-agent:claude-code`,
+`claude-opus-5-5`, effort high) on an orb through the CLI, served by the Claude
+Subscription; your thread carries `odd-engine-anthropic`. The `odd-builder`
+plugin mode is for manual use and is pinned to ChatGPT. Never switch engine or
+model yourself: the plane reads your thread's model routing when it archives
+it and pages on any other route. Model pins live in `scripts/odd/engines.ts`.
+
 ## Rules you inherit
 
 Everything in `AGENTS.md`. Read `docs/agents/<area>.md` for each area in
