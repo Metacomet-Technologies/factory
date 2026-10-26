@@ -117,6 +117,7 @@ function controlPlane(options: { status?: string; threads?: Omit<FakeThread, 'ar
     if (command.startsWith('gh pr list --state open')) return listed('OPEN');
     if (command.startsWith('gh pr list --search')) return listed('MERGED');
     if (pr && command.startsWith(`gh pr view ${pr.number} --json number,`)) return JSON.stringify(pr);
+    if (pr && command === `gh api repos/{owner}/{repo}/commits/${pr.headRefOid} --jq .commit.committer.date`) return `${pr.commits.find(commit => commit.oid === pr.headRefOid)!.committedDate}\n`;
     if (command.startsWith('amp threads usage')) return options.usage?.(String(values[0])) ?? '';
     if (command.startsWith('amp config model-providers check-access') && options.checkAccess) return JSON.stringify(options.checkAccess(String(values[0])));
     return undefined;

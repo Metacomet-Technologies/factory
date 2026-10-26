@@ -579,6 +579,16 @@ export default async function (amp: PluginAPI) {
 			// The heartbeat is the poller's only view of this sweep (docs/odd/README.md §9). A failed
 			// sweep writes nothing, so the row aging past 20 minutes is the silence signal. Dry-run
 			// writes nothing either: a plane that is not performing must not look alive.
+			// Any failed derivation withholds it too (MET-344): the failing issue pages through its own
+			// incident, the poller sees the silence, and a blind episode in progress is not ended. A
+			// failed action (a refused merge, a spawn) is an incident only and keeps the heartbeat.
+			if (failed) {
+				watchdog.error = `${failed} of ${identifiers.size} evaluations failed`
+				entry.stage = 'failed'
+				entry.error = watchdog.error
+				ctx.logger.log(marker, 'sweep degraded; no heartbeat', watchdog.error)
+				return
+			}
 			if (performing) await writeHeartbeat(ctx, state, at)
 			// A blind episode ends only when a whole sweep, digest and heartbeat included, succeeds.
 			delete watchdog.error
@@ -632,7 +642,10 @@ export default async function (amp: PluginAPI) {
 		let cursor: string | undefined
 		do {
 			const page = await callJson<{ hasNextPage?: boolean; cursor?: string }>(tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields: ['id'], ...(cursor ? { cursor } : {}) })
-			for (const issue of listOf<{ id?: string }>(page, 'issues', 'linear.list_issues')) if (issue.id) ids.push(issue.id)
+			for (const issue of listOf<{ id?: unknown }>(page, 'issues', 'linear.list_issues')) {
+				if (typeof issue?.id !== 'string' || !issue.id) throw new Error('linear.list_issues returned an issue without an identifier')
+				ids.push(issue.id)
+			}
 			cursor = page.hasNextPage ? page.cursor : undefined
 		} while (cursor)
 		return ids
@@ -1103,9 +1116,10 @@ async function recordRouting(ctx: ShellContext, thread: LiveThread) {
 // Ownership is listed with flat fields only and the owning PR alone is read in full: nested
 // commits on a 100-PR page ask GitHub for 1,000,000 nodes, over its 500,000 bound (MET-344).
 // A failed or malformed read, or a list that fills its limit, throws: it is never "no PR".
+// gh reads only a PR's first 100 commits, so the head time is read from the head commit itself.
 const prListFields = 'number,headRefName,body'
 const prListLimit = 1000
-const prFields = 'number,headRefName,headRefOid,state,mergeCommit,mergedAt,mergeable,commits,statusCheckRollup,body'
+const prFields = 'number,headRefName,headRefOid,state,mergeCommit,mergedAt,mergeable,statusCheckRollup,body'
 
 function ghJson(result: { exitCode: number; stdout: string; stderr: string }, command: string): unknown {
 	if (result.exitCode !== 0) throw new Error(`${command} failed: ${result.stderr.trim()}`)
@@ -1117,15 +1131,19 @@ async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifie
 	const listed = ghJson(state === 'open'
 		? await ctx.$`gh pr list --state open --json ${prListFields} --limit ${String(prListLimit)}`
 		: await ctx.$`gh pr list --search ${`"${identifier}"`} --state merged --json ${prListFields} --limit ${String(prListLimit)}`, command)
-	if (!Array.isArray(listed) || listed.some(pr => typeof pr?.number !== 'number')) throw new Error(`${command} returned a malformed PR list`)
+	if (!Array.isArray(listed) || listed.some(pr => typeof pr?.number !== 'number' || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string')) throw new Error(`${command} returned a malformed PR list`)
 	if (listed.length >= prListLimit) throw new Error(`${command} filled its ${prListLimit} limit; PRs past it are unread`)
 	const owned = (listed as GitHubPullRequest[]).find(pr => prOwnsIssue(pr, identifier))
 	if (!owned) return undefined
 	const pr = ghJson(await ctx.$`gh pr view ${String(owned.number)} --json ${prFields}`, `gh pr view ${owned.number}`) as GitHubPullRequest | null
-	if (pr?.number !== owned.number || pr.state !== state.toUpperCase() || !/^[0-9a-f]{40}$/.test(String(pr.headRefOid)) || !Array.isArray(pr.commits) || !Array.isArray(pr.statusCheckRollup) || !prOwnsIssue(pr, identifier)) {
+	if (pr?.number !== owned.number || pr.state !== state.toUpperCase() || !/^[0-9a-f]{40}$/.test(String(pr.headRefOid)) || !Array.isArray(pr.statusCheckRollup) || !prOwnsIssue(pr, identifier)) {
 		throw new Error(`gh pr view ${owned.number} returned malformed or changed details for ${state} ${identifier}`)
 	}
-	return pr
+	const head = await ctx.$`gh api ${`repos/{owner}/{repo}/commits/${pr.headRefOid}`} --jq .commit.committer.date`
+	if (head.exitCode !== 0) throw new Error(`gh api head commit ${pr.headRefOid} failed: ${head.stderr.trim()}`)
+	const committedDate = head.stdout.trim()
+	if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/.test(committedDate) || !Number.isFinite(Date.parse(committedDate))) throw new Error(`gh api head commit ${pr.headRefOid} returned no commit time`)
+	return { ...pr, commits: [{ oid: pr.headRefOid, committedDate }] }
 }
 
 async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string): Promise<GitHubPullRequest | undefined> {
@@ -1148,8 +1166,9 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 	const ids = new Set([...found.map(({ id }) => id), ...known])
 	const threads = await Promise.all([...ids].map(async id => {
 		const status = await callJson<{ metadata: { labels: string[]; archived?: boolean }; agentState?: { state?: string } }>(tools, 'get_thread_status', { thread: id })
-		if (!Array.isArray(status?.metadata?.labels)) throw new Error(`get_thread_status ${id} returned no labels`)
-		return { id, labels: status.metadata.labels, state: status.agentState?.state ?? 'idle', archived: status.metadata.archived === true, updatedAt: updated.get(id) }
+		// An unknown execution state is not idleness: it would let the Watchdog cancel a running thread.
+		if (!Array.isArray(status?.metadata?.labels) || typeof status.agentState?.state !== 'string') throw new Error(`get_thread_status ${id} returned no labels or agent state`)
+		return { id, labels: status.metadata.labels, state: status.agentState.state, archived: status.metadata.archived === true, updatedAt: updated.get(id) }
 	}))
 	return threads.filter(thread => !thread.archived).map(({ archived: _, ...thread }) => thread)
 }

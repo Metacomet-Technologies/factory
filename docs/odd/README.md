@@ -484,15 +484,21 @@ by the previous one).
    whole sweep, digest and heartbeat included, succeeds; a rejected labels
    read fails one sweep and never blocks the next (MET-342). Authoritative
    reads fail closed (MET-344): an MCP `isError` envelope, a missing payload
-   or a malformed issue, thread or PR collection is a failed read, never an
-   empty one; a nonzero `gh` exit throws instead of meaning "no PR", so the
-   Ralph guard, stale-thread cancellation and evaluation neither continue,
-   cancel, archive nor claim a missing PR off it. Open PRs are listed with
-   flat ownership fields only (`number,headRefName,body`, limit 1000; a list
-   that fills the limit fails) and only the owning PR is read in full with
-   `gh pr view`, because nested `commits` on a 100-PR page exceeds GitHub's
-   500,000-node bound. An empty issue enumeration while live role threads
-   hold open issues fails the sweep and writes no heartbeat; the digest is
+   or a malformed issue, thread or PR collection (an issue row without an
+   identifier, a PR row without its ownership fields, a thread without its
+   agent state) is a failed read, never an empty one or an idle thread; a
+   nonzero `gh` exit throws instead of meaning "no PR", so the Ralph guard,
+   stale-thread cancellation and evaluation neither continue, cancel, archive
+   nor claim a missing PR off it. Open PRs are listed with flat ownership
+   fields only (`number,headRefName,body`, limit 1000; a list that fills the
+   limit fails), because nested `commits` on a 100-PR page exceeds GitHub's
+   500,000-node bound. Only the owning PR is read in full with `gh pr view`,
+   and its head time comes from the head commit itself (`gh api
+   repos/{owner}/{repo}/commits/<sha>`), since gh reads only a PR's first 100
+   commits; an unreadable head time fails the read. Any failed derivation
+   withholds the sweep's heartbeat, even when other issues evaluate, while a
+   failed action stays an incident; an empty issue enumeration while live
+   role threads hold open issues fails the sweep too; the digest is
    split into Slack messages of at most 2800 characters. Removing the
    `odd-perform` label is the off-switch: the plane keeps evaluating but
    records `dry-run`.

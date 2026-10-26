@@ -392,13 +392,20 @@ type Shell = { exitCode: number; stdout: string; stderr: string };
  * commands are left to the caller.
  */
 function github(command: string, prs: readonly Pr[]): Shell | undefined {
+  // `gh api repos/{owner}/{repo}/commits/<sha>`: one commit, from any PR's full history.
+  const commit = /^gh api repos\/\{owner\}\/\{repo\}\/commits\/([0-9a-f]{40}) --jq \.commit\.committer\.date$/.exec(command);
+  if (commit) {
+    const found = prs.flatMap(pr => pr.commits).find(candidate => candidate.oid === commit[1]);
+    return found ? { exitCode: 0, stdout: `${found.committedDate}\n`, stderr: '' } : { exitCode: 1, stdout: '', stderr: 'gh: No commit found for SHA (HTTP 422)' };
+  }
   const view = /^gh pr view (\d+) --json ([\w,]+)$/.exec(command);
   const list = /^gh pr list (?:--search "([^"]+)" )?--state (open|merged) --json ([\w,]+) --limit (\d+)$/.exec(command);
   if (!view && !list) return undefined;
   const fields = (view ? view[2] : list![3]).split(',');
   const nodes = (view ? 1 : Math.min(Number(list![4]), 100)) * (fields.includes('commits') ? 100 * 100 : 1);
   if (nodes > 500_000) return { exitCode: 1, stdout: '', stderr: `GraphQL: By the time this query traverses to the authors connection, it is requesting up to ${nodes.toLocaleString('en-US')} possible nodes which exceeds the maximum limit of 500,000.` };
-  const row = (pr: Pr) => Object.fromEntries(fields.map(field => [field, pr[field as keyof Pr]]));
+  // gh requests `commits(first: 100)` and does not paginate it.
+  const row = (pr: Pr) => Object.fromEntries(fields.map(field => [field, field === 'commits' ? pr.commits.slice(0, 100) : pr[field as keyof Pr]]));
   if (view) {
     const pr = prs.find(candidate => candidate.number === Number(view[1]));
     return pr ? { exitCode: 0, stdout: JSON.stringify(row(pr)), stderr: '' } : { exitCode: 1, stdout: '', stderr: `GraphQL: Could not resolve to a PullRequest with the number of ${view[1]}.` };
@@ -689,7 +696,7 @@ test('P3.1: a failed steer is retried and recorded only after delivery; the reco
 const otherPr = (n: number): Pr => ({ number: n, headRefName: `met-${n}-other`, headRefOid: 'e'.repeat(40), state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: 'e'.repeat(40), committedDate: '2026-10-26T10:00:00Z' }], statusCheckRollup: [], body: `closes MET-${n}` });
 const builderLabels = ['odd-issue-met-7', 'odd-role-builder', 'odd-round-1', 'odd-engine-anthropic'];
 
-test('P3.7: open-PR discovery stays under GitHub\'s node bound, finds an owned PR past the first 100 with its head time, and an open PR wins over a merged one', async t => {
+test('P3.7: open-PR discovery stays under GitHub\'s node bound, finds an owned PR past the first 100 with the time of a head past its first 100 commits, and an open PR wins over a merged one', async t => {
   mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
   t.after(() => mock.timers.reset());
   const plant = factory();
@@ -700,7 +707,9 @@ test('P3.7: open-PR discovery stays under GitHub\'s node bound, finds an owned P
   plant.prs.push({ ...otherPr(6), headRefName: 'met-7-first-try', state: 'MERGED', mergeCommit: { oid: '9'.repeat(40) }, mergedAt: '2026-10-25T12:00:00Z', body: 'closes MET-7' });
   for (let n = 1000; n < 1140; n++) plant.prs.push(otherPr(n));
   // The owned open PR is the 141st open PR, past gh's first 100-PR page; CI is still running.
-  plant.openPr('MET-7', sha, { statusCheckRollup: [{ name: 'ci', conclusion: '' }], commits: [{ oid: 'a'.repeat(40), committedDate: '2026-10-26T13:00:00Z' }, { oid: sha, committedDate: '2026-10-26T13:30:00Z' }] });
+  // Its head is commit 150, past the 100 commits gh reads with a PR.
+  const history = Array.from({ length: 149 }, (_, i) => ({ oid: (i + 1).toString(16).padStart(40, '0'), committedDate: '2026-10-26T13:00:00Z' }));
+  plant.openPr('MET-7', sha, { statusCheckRollup: [{ name: 'ci', conclusion: '' }], commits: [...history, { oid: sha, committedDate: '2026-10-26T13:30:00Z' }] });
   // A merged-only issue still derives Deploying from its merged PR.
   plant.issue('MET-8', 'In Progress');
   plant.prs.push({ ...otherPr(8), headRefName: 'met-8-done', state: 'MERGED', mergeCommit: { oid: '8'.repeat(40) }, mergedAt: '2026-10-26T14:00:00Z', body: 'closes MET-8' });
@@ -728,7 +737,17 @@ test('P3.7: a failed, malformed or truncated read is never missing work: no canc
     { name: 'gh pr list returns no list', error: /gh pr list --state open returned a malformed PR list/, guard: /malformed PR list/, setup: plant => { plant.control.gh = refused('gh pr list --state open', '{"message":"Bad credentials"}', '', 0); } },
     { name: 'gh pr list fills its limit', error: /filled its 1000 limit/, guard: /filled its 1000 limit/, setup: plant => { plant.prs.unshift(...Array.from({ length: 1000 }, (_, i) => otherPr(2000 + i))); } },
     { name: 'gh pr view fails', error: /gh pr view 7 failed: HTTP 502/, guard: /gh pr view 7 failed/, setup: plant => { plant.control.gh = refused('gh pr view 7 --json number'); } },
-    { name: 'gh pr view drops the commits', error: /gh pr view 7 returned malformed or changed details/, guard: /malformed or changed details/, setup: plant => { plant.control.gh = refused('gh pr view 7 --json number', JSON.stringify({ number: 7, headRefName: 'met-7-x', headRefOid: sha, state: 'OPEN', statusCheckRollup: [], body: 'closes MET-7' }), '', 0); } },
+    { name: 'gh pr view drops the checks', error: /gh pr view 7 returned malformed or changed details/, guard: /malformed or changed details/, setup: plant => { plant.control.gh = refused('gh pr view 7 --json number', JSON.stringify({ number: 7, headRefName: 'met-7-x', headRefOid: sha, state: 'OPEN', body: 'closes MET-7' }), '', 0); } },
+    // Review of aeae4e3: list rows missing their ownership fields hid the owning PR.
+    { name: 'gh pr list rows lack ownership fields', error: /gh pr list --state open returned a malformed PR list/, guard: /malformed PR list/, setup: plant => { plant.control.gh = refused('gh pr list --state open', '[{"number":7}]', '', 0); } },
+    { name: 'the head commit time is unreadable', error: /gh api head commit c{40} failed: HTTP 502/, guard: /gh api head commit c{40} failed/, setup: plant => { plant.control.gh = refused('gh api '); } },
+    { name: 'the head commit time is malformed', error: /gh api head commit c{40} returned no commit time/, guard: /returned no commit time/, setup: plant => { plant.control.gh = refused('gh api ', 'null\n', '', 0); } },
+    // An unknown execution state is not idleness: the Builder may be running.
+    { name: 'thread status without agent state', error: /get_thread_status T-MET-7 returned no labels or agent state/, setup: plant => {
+      // A running Builder with no PR yet and an old search timestamp: only its state keeps it from looking stale.
+      plant.threads.get('T-MET-7')!.state = 'running';
+      plant.prs.length = 0;
+      plant.control.inject = (name, input) => name === 'get_thread_status' && input.thread === 'T-MET-7' ? { metadata: { labels: plant.threads.get('T-MET-7')!.labels, archived: false } } : undefined; } },
     { name: 'list_comments isError', error: /linear\.list_comments returned an error/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? envelope({ comments: [] }) : undefined; } },
     { name: 'get_issue isError', error: /linear\.get_issue returned an error/, setup: plant => { plant.control.inject = name => name === 'linear.get_issue' ? envelope({ id: 'MET-7', status: 'Todo', labels: ['odd'], description: fullSpec }) : undefined; } },
     { name: 'list_comments without its payload', error: /linear\.list_comments returned no comments list/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? {} : undefined; } },
@@ -754,10 +773,10 @@ test('P3.7: a failed, malformed or truncated read is never missing work: no canc
         assert.deepEqual(plant.steers, []);
         assert.equal(plant.heartbeats(), 0, 'a sweep whose only evaluation failed is not healthy');
         assert.equal(plant.dms.length, 1);
-        const failed = (await plant.events()).filter(event => event.issue === 'MET-7');
-        assert.ok(failed.length && failed.every(event => event.stage === 'failed'), 'every evaluation of MET-7 failed');
-        assert.match(failed[0].error ?? '', error);
-        assert.match(plant.dms[0], /^\[odd\] ODD page: control-plane-blind \| .*every sweep since 2026-10-26T15:00:00\.000Z failed: Error: all 1 evaluations failed/);
+        const events = await plant.events();
+        assert.ok(events.filter(event => event.issue === 'MET-7').every(event => event.stage === 'failed'), 'no evaluation of MET-7 succeeded');
+        assert.ok(events.some(event => event.stage === 'failed' && error.test(event.error ?? '')), 'the read error is recorded');
+        assert.match(plant.dms[0], /^\[odd\] ODD page: control-plane-blind \| .*every sweep since 2026-10-26T15:00:00\.000Z failed: /);
         // The Ralph guard neither continues the Builder nor tells it its PR is missing.
         if (guard) await assert.rejects(plant.guard(builderLabels), guard);
       } finally {
@@ -788,4 +807,41 @@ test('P3.7: an empty enumeration is healthy only when no live role thread holds 
   const listed = (result: unknown) => controlOrb(name => name === 'linear.list_issues' ? result : emptyWork(name));
   assert.equal(await swept(listed({ isError: true, content: [{ type: 'text', text: '{"issues":[],"hasNextPage":false}' }] })), 0, 'an isError envelope is a failed read');
   assert.equal(await swept(listed({})), 0, 'a missing issues payload is a failed read');
+  assert.equal(await swept(listed({ issues: [{}], hasNextPage: false })), 0, 'an issue row without an identifier is a failed read, not an empty workspace');
+  assert.equal(await swept(listed({ issues: [{ id: '' }], hasNextPage: false })), 0);
+});
+
+test('P3.7: any failed derivation withholds the sweep heartbeat even when other issues evaluate; a failed action does not', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = (unreadable: boolean) => {
+    const it = factory();
+    for (const id of ['MET-7', 'MET-8']) {
+      it.issue(id, 'In Progress');
+      it.builder(id, 'running');
+      it.openPr(id, id === 'MET-7' ? 'c'.repeat(40) : 'd'.repeat(40), { statusCheckRollup: [{ name: 'ci', conclusion: '' }] });
+    }
+    if (unreadable) it.control.inject = (name, input) => name === 'linear.get_issue' && input.id === 'MET-7' ? { isError: true, content: [{ type: 'text', text: '{"id":"MET-7","status":"Todo"}' }] } : undefined;
+    return it;
+  };
+  const mixed = plant(true);
+  await mixed.start();
+  await advance(21 * 60_000);
+  const events = await mixed.events();
+  assert.ok(events.some(event => event.issue === 'MET-8' && event.stage !== 'failed'), 'MET-8 evaluates normally');
+  assert.equal(mixed.heartbeats(), 0, 'one failed authoritative read keeps every sweep from looking healthy');
+  assert.ok(events.some(event => event.issue === null && event.stage === 'failed' && /1 of 2 evaluations failed/.test(event.error ?? '')));
+  assert.match(mixed.dms.join('\n'), /ODD page: action-failed \| issue MET-7 \| .*linear\.get_issue returned an error/, 'the failing issue pages its own incident');
+  assert.doesNotMatch(mixed.dms.join('\n'), /control-plane-blind/, 'a partly failing sweep is not a blind plane');
+
+  // Control: every read succeeds, and only an action fails (no reviewer can spawn): the sweep stays healthy.
+  const refusing = factory();
+  refusing.issue('MET-8', 'In Progress');
+  refusing.builder('MET-8');
+  refusing.openPr('MET-8', 'd'.repeat(40));
+  refusing.control.spawnFails = true;
+  await refusing.start();
+  await advance(21 * 60_000);
+  assert.ok(refusing.heartbeats() >= 3, 'a failed action keeps the heartbeat');
+  assert.match(refusing.dms.join('\n'), /ODD page: action-failed \| issue MET-8 \| .*spawn-reviewer failing/);
 });
