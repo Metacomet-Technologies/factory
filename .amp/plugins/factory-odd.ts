@@ -887,7 +887,9 @@ export default async function (amp: PluginAPI) {
 	async function merge(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, pr: number, sha: string): Promise<string | undefined> {
 		const draft = await shellRead(ctx.$`gh pr view ${String(pr)} --json isDraft --jq .isDraft`, `gh pr view ${pr} --json isDraft`)
 		if (draft.exitCode !== 0) throw new ReadError(`gh pr view ${pr} --json isDraft failed: ${draft.stderr.trim()}`)
-		if (draft.stdout.trim() === 'true') {
+		const isDraft = draft.stdout.trim()
+		if (isDraft !== 'true' && isDraft !== 'false') throw new ReadError(`gh pr view ${pr} --json isDraft returned ${JSON.stringify(isDraft.slice(0, 60))}, not true or false`)
+		if (isDraft === 'true') {
 			const ready = await ctx.$`gh pr ready ${String(pr)}`
 			if (ready.exitCode !== 0) throw new Error(`gh pr ready ${pr} failed: ${ready.stderr.trim()}`)
 			ctx.logger.log(marker, 'un-drafted', issue.identifier, pr)
@@ -957,19 +959,25 @@ export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 			detail += ` (log reader not started: ${String(error)}; read journalctl -u factory-deploy on ${action.diagnose.host})`
 		}
 	}
-	if (action.pr !== undefined) {
-		const draft = await ctx.$`gh pr ready ${String(action.pr)} --undo`
-		if (draft.exitCode !== 0) ctx.logger.log(marker, 'draft failed', action.pr, draft.stderr.trim())
+	try {
+		if (action.pr !== undefined) {
+			const draft = await ctx.$`gh pr ready ${String(action.pr)} --undo`
+			if (draft.exitCode !== 0) ctx.logger.log(marker, 'draft failed', action.pr, draft.stderr.trim())
+		}
+		await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-escalated reason=${action.reason}\n\n${detail}` })
+		await ctx.tools.call('slack_write', { text: `${marker} ${pageText(issue.identifier, { ...action, detail })} Remove the \`${escalatedLabel}\` label to resume.` })
+		const head = issue.pr?.headSha.slice(0, 12)
+		const spent = threads.filter(thread => thread.labels.some(label => {
+			const match = verdictPattern.exec(label)
+			return match?.[1] === 'changes' && match[2] !== head
+		}))
+		await archiveThreads(ctx, spent)
+		await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, addLabels: [escalatedLabel] })
+	} catch (error: unknown) {
+		// A failed page write after a failed read keeps the read classification, and names both failures.
+		if (unread) throw new ReadError(`${unread.message}; then the page failed: ${String(error)}`)
+		throw error
 	}
-	await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-escalated reason=${action.reason}\n\n${detail}` })
-	await ctx.tools.call('slack_write', { text: `${marker} ${pageText(issue.identifier, { ...action, detail })} Remove the \`${escalatedLabel}\` label to resume.` })
-	const head = issue.pr?.headSha.slice(0, 12)
-	const spent = threads.filter(thread => thread.labels.some(label => {
-		const match = verdictPattern.exec(label)
-		return match?.[1] === 'changes' && match[2] !== head
-	}))
-	await archiveThreads(ctx, spent)
-	await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, addLabels: [escalatedLabel] })
 	ctx.logger.log(marker, 'paged', issue.identifier, action.reason)
 	if (unread) throw unread
 }
@@ -1068,18 +1076,34 @@ const mergeReceipt = (pr: number, head: string, merge: string) => `odd-merge pr=
  * A merged PR without its receipt (the confirmation read after `gh pr merge` failed) gets it before the issue moves to
  * Deploying, from the merge commit the PR read has validated. The receipt is what makes older deploy receipts stale.
  */
-async function receiptMerge(ctx: Pick<WebhookHandlerContext, 'tools'>, issue: IssueSnapshot, comments: readonly { body: string; createdAt?: string }[]) {
+async function receiptMerge(ctx: Pick<WebhookHandlerContext, 'tools' | '$'>, issue: IssueSnapshot, comments: readonly { body: string; createdAt?: string }[]) {
 	const pr = issue.pr
 	if (!pr?.merged || !sha40(pr.mergeSha)) return
 	if (comments.some(comment => comment.body.startsWith(`odd-merge pr=${pr.number} head=${pr.headSha} `))) return
 	// A late receipt resets every deploy receipt before it (snapshot.toSnapshot orders by comment time). A deploy
-	// receipt posted at or after the merge is this release's evidence, so no receipt is recovered over it; earlier
-	// ones are stale and the recovered receipt retires them. Receipts that cannot be ordered are a failed read.
+	// receipt is this release's evidence only if it was posted at or after the merge and its deployed revision
+	// contains the merge commit (equal, or a descendant carrying later PRs too); then no receipt is recovered over
+	// it. Every other deploy receipt is stale, delivered late or not, and the recovered receipt retires it.
+	// Receipts that cannot be ordered, and an unreadable ancestry, are a failed read.
 	if (!timestamp(pr.mergedAt)) throw new ReadError(`PR #${pr.number} has no merge time to order its receipt by`)
 	const deploys = comments.filter(comment => parseDeployReceipt(comment.body))
 	if (deploys.some(comment => !timestamp(comment.createdAt))) throw new ReadError(`${issue.identifier} has a deploy receipt without a creation time`)
-	if (deploys.some(comment => Date.parse(comment.createdAt!) >= Date.parse(pr.mergedAt!))) return
+	for (const comment of deploys) {
+		if (Date.parse(comment.createdAt!) < Date.parse(pr.mergedAt)) continue
+		if (await contains(ctx, parseDeployReceipt(comment.body)!.sha, pr.mergeSha)) return
+	}
 	await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: mergeReceipt(pr.number, pr.headSha, pr.mergeSha) })
+}
+
+/** Whether the deployed revision `release` contains `merge`, from GitHub's compare of the two. */
+async function contains(ctx: Pick<WebhookHandlerContext, '$'>, release: string, merge: string): Promise<boolean> {
+	if (release === merge) return true
+	const name = `gh api compare ${merge}...${release}`
+	const compare = await shellRead(ctx.$`gh api ${`repos/{owner}/{repo}/compare/${merge}...${release}`} --jq .status`, name)
+	const status = compare.stdout.trim()
+	if (compare.exitCode !== 0) throw new ReadError(`${name} failed: ${compare.stderr.trim()}`)
+	if (!['identical', 'ahead', 'behind', 'diverged'].includes(status)) throw new ReadError(`${name} returned ${JSON.stringify(status.slice(0, 60))}`)
+	return status === 'identical' || status === 'ahead'
 }
 
 /** The cursor of a Linear page: `hasNextPage` is a boolean, and a next page has a cursor. Ending without one would drop the rest. */

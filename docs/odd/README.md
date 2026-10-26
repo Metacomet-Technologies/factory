@@ -512,9 +512,14 @@ by the previous one).
    evaluation finds the PR merged and posts the receipt once, from the
    validated merge commit, before the issue moves to Deploying. That
    recovery runs only for issues ODD owns, and never over a deploy receipt
-   posted at or after the merge time (that deployment is the release's
-   evidence); a rejected shell read and a failed log-reader lookup during a
-   failed-rollback page are failed reads too, and the page still goes out; an empty issue enumeration while live
+   posted at or after the merge time whose deployed revision contains the
+   merge commit (GitHub's compare reports it identical or ahead; that
+   deployment is the release's evidence). Any other deploy receipt, an old
+   release delivered late included, is stale and the recovered receipt
+   retires it; an unreadable compare is a failed read. A rejected shell read,
+   a draft read that is not `true` or `false`, and a failed log-reader
+   lookup during a failed-rollback page are failed reads too; the page still
+   goes out, and a page write that then fails keeps the read failure; an empty issue enumeration while live
    role threads hold open issues fails the sweep too; the digest is
    split into Slack messages of at most 2800 characters. Removing the
    `odd-perform` label is the off-switch: the plane keeps evaluating but

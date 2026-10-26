@@ -392,13 +392,19 @@ type Shell = { exitCode: number; stdout: string; stderr: string };
  * with GitHub's own error (the full-field `--limit 100` list asked for 1,000,000). Other
  * commands are left to the caller.
  */
-function github(command: string, prs: readonly Pr[]): Shell | undefined {
+function github(command: string, prs: readonly Pr[], releases: ReadonlyMap<string, readonly string[]> = new Map()): Shell | undefined {
+  // `gh api repos/{owner}/{repo}/compare/<base>...<head>`: `ahead` when the head release contains the base.
+  const compare = /^gh api repos\/\{owner\}\/\{repo\}\/compare\/([0-9a-f]{7,40})\.\.\.([0-9a-f]{7,40}) --jq \.status$/.exec(command);
+  if (compare) return { exitCode: 0, stdout: `${compare[1] === compare[2] ? 'identical' : releases.get(compare[2])?.includes(compare[1]) ? 'ahead' : 'diverged'}\n`, stderr: '' };
   // `gh api repos/{owner}/{repo}/commits/<sha>`: one commit, from any PR's full history.
   const commit = /^gh api repos\/\{owner\}\/\{repo\}\/commits\/([0-9a-f]{40}) --jq \.commit\.committer\.date$/.exec(command);
   if (commit) {
     const found = prs.flatMap(pr => pr.commits).find(candidate => candidate.oid === commit[1]);
     return found ? { exitCode: 0, stdout: `${found.committedDate}\n`, stderr: '' } : { exitCode: 1, stdout: '', stderr: 'gh: No commit found for SHA (HTTP 422)' };
   }
+  // `gh pr view <n> --json isDraft --jq .isDraft`: the fixture's PRs are ready for review.
+  const draft = /^gh pr view (\d+) --json isDraft --jq \.isDraft$/.exec(command);
+  if (draft) return prs.some(pr => pr.number === Number(draft[1])) ? { exitCode: 0, stdout: 'false\n', stderr: '' } : { exitCode: 1, stdout: '', stderr: `GraphQL: Could not resolve to a PullRequest with the number of ${draft[1]}.` };
   const view = /^gh pr view (\d+) --json ([\w,]+)$/.exec(command);
   const list = /^gh pr list (?:--search "([^"]+)" )?--state (open|merged) --json ([\w,]+) --limit (\d+)$/.exec(command);
   if (!view && !list) return undefined;
@@ -427,6 +433,8 @@ function factory() {
   const issues = new Map<string, { id: string; status: string; labels: string[]; description: string }>();
   const comments = new Map<string, { id: string; body: string; createdAt: string }[]>();
   const prs: Pr[] = [];
+  /** Deployed revision → the merge commits it contains, for GitHub's compare. */
+  const releases = new Map<string, string[]>();
   const threads = new Map<string, { labels: string[]; state: string; archived: boolean; updatedAt: string }>();
   const dms: string[] = [];
   const steers: string[] = [];
@@ -482,7 +490,7 @@ function factory() {
   const $ = async (strings: TemplateStringsArray, ...values: unknown[]) => {
     if (control.refuse && strings.join('').includes(' check ')) return { exitCode: 1, stdout: '', stderr: control.refuse };
     const command = strings.reduce((text, part, i) => text + part + (i < values.length ? String(values[i]) : ''), '');
-    return control.gh?.(command) ?? github(command, prs) ?? shell(strings, ...values);
+    return control.gh?.(command) ?? github(command, prs, releases) ?? shell(strings, ...values);
   };
   let created = 0;
   const amp = (mine: number) => ({
@@ -511,7 +519,7 @@ function factory() {
     prs.push({ number: n, headRefName: `${issue.toLowerCase()}-x`, headRefOid: sha, state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: sha, committedDate: new Date().toISOString() }], statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }], body: `closes ${issue}`, ...over });
   };
   return {
-    issues, comments, prs, threads, dms, steers, control, builder, openPr, saves, launches, heartbeats: () => heartbeats, slackAttempts: () => slackAttempts,
+    issues, comments, prs, releases, threads, dms, steers, control, builder, openPr, saves, launches, heartbeats: () => heartbeats, slackAttempts: () => slackAttempts,
     /** The latest plugin load's `odd_control_status`: its handled events. */
     events: async () => (JSON.parse(await statuses.get(generation)!({}, { thread: { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] } })) as { events: { issue: string | null; stage: string; error?: string }[] }).events,
     /** The Ralph guard as the latest plugin load runs it at the end of a role thread's turn. */
@@ -1110,27 +1118,77 @@ test('P3.7: a failed log-reader lookup still pages a failed rollback, but the sw
       }
     });
   }
+  // A page write failing after the failed lookup is still a failed read; with a valid lookup it stays an action failure.
+  const writes: [string, (call: string, input: Record<string, unknown>) => boolean][] = [
+    ['escalation comment', (call, input) => call === 'linear.save_comment' && String(input.body).startsWith('odd-escalated')],
+    ['Slack page', (call, input) => call === 'slack_write' && !input.channelName],
+    ['escalated label', (call, input) => call === 'linear.save_issue' && Array.isArray(input.addLabels)],
+  ];
+  for (const [write, fails] of writes) {
+    for (const failedLookup of [true, false]) {
+      await t.test(`${failedLookup ? 'lookup isError' : 'valid lookup (control)'}, then the ${write} fails`, async () => {
+        mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+        try {
+          const plant = factory();
+          plant.issue('MET-9', 'Deploying');
+          plant.comments.set('MET-9', [{ id: 'c-r', body: deployLine('e'.repeat(40), 'fail', 'none'), createdAt: '2026-10-26T14:00:00.000Z' }]);
+          plant.control.inject = (call, input) => {
+            if (fails(call, input)) throw new Error(`${write} 503`);
+            return failedLookup && call === 'find_thread' && String(input.query).startsWith('label:odd-deploy-') ? { isError: true, content: [{ type: 'text', text: '{"threads":[]}' }] } : undefined;
+          };
+          await plant.start();
+          await settle();
+          const failed = (await plant.events() as { issue: string | null; stage: string; error?: string; read?: boolean }[]).filter(event => event.issue === 'MET-9' && event.stage === 'failed');
+          assert.ok(failed.length > 0 && failed.every(event => String(event.error).includes(`${write} 503`)), 'the write failure stays observable');
+          assert.deepEqual([...new Set(failed.map(event => event.read === true))], [failedLookup], failedLookup ? 'the read failure is kept' : 'an action failure stays one');
+          if (failedLookup) assert.equal(plant.heartbeats(), 0);
+        } finally {
+          mock.timers.reset();
+        }
+      });
+    }
+  }
 });
 
-test('P3.7: a rejected draft read before a merge merges nothing and writes no heartbeat', async t => {
-  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
-  t.after(() => mock.timers.reset());
-  const plant = factory();
-  const sha = 'c'.repeat(40);
-  plant.issue('MET-8', 'In Progress');
-  plant.builder('MET-8');
-  plant.threads.set('T-review', { labels: ['odd-issue-met-8', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-ready-${sha.slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
-  plant.openPr('MET-8', sha);
-  const merges: string[] = [];
-  plant.control.gh = command => {
-    if (command.startsWith('gh pr view 8 --json isDraft')) throw new Error('spawn gh ENOENT');
-    if (command.startsWith('gh pr merge')) merges.push(command);
-    return undefined;
-  };
-  await plant.start();
-  await settle();
-  assert.deepEqual(merges, []);
-  assert.equal(plant.heartbeats(), 0);
+test('P3.7: a rejected or malformed draft read before a merge merges nothing and writes no heartbeat; true and false merge', async t => {
+  const reads: [string, string | undefined, boolean][] = [
+    ['rejected', undefined, false],
+    ['null', 'null\n', false],
+    ['empty', '', false],
+    ['not a boolean', '{"isDraft":false}\n', false],
+    ['false (control)', 'false\n', true],
+    ['true (control)', 'true\n', true],
+  ];
+  for (const [name, stdout, merges] of reads) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        const sha = 'c'.repeat(40);
+        plant.issue('MET-8', 'In Progress');
+        plant.builder('MET-8');
+        plant.threads.set('T-review', { labels: ['odd-issue-met-8', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-ready-${sha.slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+        plant.openPr('MET-8', sha);
+        const merged: string[] = [];
+        plant.control.gh = command => {
+          if (command.startsWith('gh pr view 8 --json isDraft')) {
+            if (stdout === undefined) throw new Error('spawn gh ENOENT');
+            return { exitCode: 0, stdout, stderr: '' };
+          }
+          if (command.startsWith('gh pr ready 8')) return { exitCode: 0, stdout: '', stderr: '' };
+          if (command.startsWith('gh pr merge')) { merged.push(command); return { exitCode: 0, stdout: '', stderr: '' }; }
+          if (command.startsWith('gh pr view 8 --json mergeCommit')) return { exitCode: 0, stdout: `${'7'.repeat(40)}\n`, stderr: '' };
+          return undefined;
+        };
+        await plant.start();
+        await settle();
+        assert.equal(merged.length, merges ? 1 : 0);
+        assert.equal(plant.heartbeats(), merges ? 1 : 0);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
 });
 
 test('P3.7: receipt recovery never writes to an issue ODD does not own', async t => {
@@ -1146,21 +1204,29 @@ test('P3.7: receipt recovery never writes to an issue ODD does not own', async t
   assert.deepEqual(plant.saves, []);
 });
 
-test('P3.7: a recovered receipt keeps a deployment made after the merge and retires one made before it', async t => {
-  const cases: [string, string, boolean][] = [
-    ['deployed after the merge', '2026-10-26T14:10:00.000Z', true],
-    ['deployed before the merge (stale)', '2026-10-26T13:50:00.000Z', false],
+test('P3.7: a recovered receipt keeps a deployment of a release containing the merge and retires every other', async t => {
+  const mergeSha = '7'.repeat(40);
+  const cases: [string, string, string, boolean][] = [
+    ['the merge deployed after it', '2026-10-26T14:10:00.000Z', mergeSha, true],
+    ['the merge deployed at the merge time', '2026-10-26T14:00:00.000Z', mergeSha, true],
+    ['a descendant release deployed after the merge', '2026-10-26T14:10:00.000Z', 'd'.repeat(40), true],
+    ['an old release delivered after the merge (stale)', '2026-10-26T14:10:00.000Z', 'e'.repeat(40), false],
+    ['deployed before the merge (stale)', '2026-10-26T13:50:00.000Z', 'e'.repeat(40), false],
   ];
-  for (const [name, deployedAt, current] of cases) {
+  for (const [name, deployedAt, deployed, current] of cases) {
     await t.test(name, async () => {
       mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
       try {
         const plant = factory();
-        const mergeSha = '7'.repeat(40);
         plant.issue('MET-8', 'In Progress');
         plant.builder('MET-8');
         plant.prs.push(merged8('2026-10-26T14:00:00Z', mergeSha));
-        plant.comments.set('MET-8', [{ id: 'c-d', body: deployLine(current ? mergeSha : 'e'.repeat(40)), createdAt: deployedAt }]);
+        plant.releases.set('d'.repeat(40), ['e'.repeat(40), mergeSha]);
+        // The old release's own passing verification must not finish the new work.
+        plant.comments.set('MET-8', [
+          { id: 'c-v', body: `odd-verify sha=${'e'.repeat(40)} result=pass bug=none`, createdAt: '2026-10-26T13:40:00.000Z' },
+          { id: 'c-d', body: deployLine(deployed), createdAt: deployedAt },
+        ]);
         // Let the issue follow its status writes, so the next evaluation sees Deploying.
         plant.control.inject = (call, input) => {
           if (call === 'linear.save_issue' && typeof input.state === 'string') plant.issues.get(String(input.id))!.status = input.state;
@@ -1174,6 +1240,8 @@ test('P3.7: a recovered receipt keeps a deployment made after the merge and reti
         assert.equal(plant.issues.get('MET-8')!.status, 'Deploying');
         const verifiers = [...plant.threads.values()].filter(thread => thread.labels.includes('odd-role-verifier'));
         assert.equal(verifiers.length, current ? 1 : 0, current ? 'the post-merge deployment is verified' : 'the stale deployment waits for a new release');
+        await advance(11 * 60_000);
+        assert.equal(plant.issues.get('MET-8')!.status, 'Deploying', 'no earlier verification marks it Done');
       } finally {
         mock.timers.reset();
       }
