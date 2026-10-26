@@ -200,7 +200,7 @@ function newest(effects: Effects, candidates: readonly (string | undefined)[]): 
 
 /** An unavailable/degraded service can need repair. A reported dirty, unknown,
  * newer or divergent identity must never be discarded to permit a downgrade. */
-function healthSha(effects: Effects, recipe: Recipe, target: string): string | undefined {
+function healthIdentity(effects: Effects, recipe: Recipe, target: string): { sha: string; healthy: boolean } | undefined {
   let body: string;
   try { body = effects.probe(recipe.health); } catch { return undefined; }
   const json = JSON.parse(body);
@@ -209,7 +209,7 @@ function healthSha(effects: Effects, recipe: Recipe, target: string): string | u
   }
   const sha = effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `${json.git_sha}^{commit}`]).stdout.trim();
   if (!effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', sha, target])) throw new Error(`Refusing older or divergent release for ${recipe.name}; reconcile the manual baseline first`);
-  return healthySha(body) ? sha : undefined;
+  return { sha, healthy: !!healthySha(body) };
 }
 
 async function probeWindow(effects: Effects, recipe: Recipe, sha: string, check = probeResult, event = 'probe'): Promise<'pass' | 'fail'> {
@@ -314,24 +314,35 @@ async function installRelease(effects: Effects, tag: string, sha: string, dir: s
   const resumed = inFlight?.sha === sha ? recipes.find(recipe => recipe.name === inFlight.component) : undefined;
   const inventory = JSON.parse(effects.run('git', ['-C', ROOT, 'show', `${sha}:deploy/components.json`]).stdout) as { components: { id: string; sources: string[] }[] };
   const sources = Object.fromEntries(inventory.components.map(component => [component.id, component.sources]));
-  const ledger = effects.readLedger();
-  // Only a healthy record is a baseline: a failed target was rolled back, so its inputs are still undeployed.
-  const recorded = (name: string) => ledger.components[name]?.health === 'pass' ? ledger.components[name].sha : undefined;
-  const baselines = Object.fromEntries(recipes.map(recipe => {
-    const live = healthSha(effects, recipe, sha);
-    const floor = ledger.manualBaseline?.sha;
-    if (floor && ((!live && recipe !== resumed) || (live && !effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', floor, live])))) {
-      throw new Error(`Manual baseline drift for ${recipe.name}; review before deployment`);
-    }
-    return [recipe.name, newest(effects, [floor, recorded(recipe.name), live])];
-  }));
-  const changed = plan({ sha, sources, baselines, ledger,
-    isAncestor: (baseline, target) => effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', baseline, target]),
-    changedSince: baseline => effects.run('git', ['-C', ROOT, 'diff', '--name-only', `${baseline}..${sha}`]).stdout.split('\n').filter(Boolean) });
+  let deferredKiosk = false;
+  const select = (recovering = false) => {
+    const ledger = effects.readLedger();
+    // Only a healthy record is a baseline: a failed target was rolled back, so its inputs are still undeployed.
+    const recorded = (name: string) => ledger.components[name]?.health === 'pass' ? ledger.components[name].sha : undefined;
+    const baselines = Object.fromEntries(recipes.map(recipe => {
+      const identity = healthIdentity(effects, recipe, sha);
+      const live = identity?.healthy ? identity.sha : undefined;
+      // API serves /version.json too. Only a transport outage during recorded API recovery
+      // can defer kiosk evidence; any usable identity must still pass all ancestry checks.
+      const dependentOutage = recovering && resumed?.name === 'factory-api' && recipe.name === 'kiosk' && !identity;
+      if (dependentOutage) deferredKiosk = true;
+      const floor = ledger.manualBaseline?.sha;
+      if (floor && ((!live && !(recovering && recipe === resumed) && !dependentOutage) ||
+          (identity && !effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', floor, identity.sha])))) {
+        throw new Error(`Manual baseline drift for ${recipe.name}; review before deployment`);
+      }
+      return [recipe.name, newest(effects, [floor, recorded(recipe.name), live])];
+    }));
+    return plan({ sha, sources, baselines, ledger,
+      isAncestor: (baseline, target) => effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', baseline, target]),
+      changedSince: baseline => effects.run('git', ['-C', ROOT, 'diff', '--name-only', `${baseline}..${sha}`]).stdout.split('\n').filter(Boolean) });
+  };
+  let changed = select(true);
   effects.log('plan', { tag, sha, components: changed.map(recipe => recipe.name) });
   // Guard the entire plan before resuming even one interrupted installer.
   if (resumed) {
     const result = await deployComponent(effects, resumed, tag, sha, dir);
+    if (deferredKiosk) changed = select();
     if (result.health === 'fail') return result;
   }
   for (const recipe of changed) {
@@ -416,20 +427,27 @@ export async function reconcileManual(effects: Effects, tag: string, approval?: 
   const dir = mkdtempSync(join(effects.stateDir, 'manual-verify-'));
   let manifest: { build_identity: Record<string, Record<string, unknown>> };
   let manifestSha256: string;
+  let kioskVersion: { build: string; git_sha: string; git_dirty: boolean };
   try {
     // Never trust a cached .verified marker or a handoff alone for adoption.
     effects.run('python3', [join(ROOT, 'scripts/release/release.py'), 'verify', '--anonymous', '--tag', tag, '--sha', sha, '--inventory', inventory, '--directory', dir]);
     const raw = readFileSync(join(dir, 'manifest.json'));
     manifest = JSON.parse(raw.toString());
     manifestSha256 = createHash('sha256').update(raw).digest('hex');
+    // The verifier has checked every archive entry/digest. Read data only, without extracting
+    // or executing it: the live endpoint exposes this bundle hash, not release-build.json.
+    kioskVersion = JSON.parse(effects.run('tar', ['-xOf', join(dir, 'kiosk.tar.gz'), 'version.json']).stdout);
+    if (!kioskVersion || kioskVersion.git_sha !== sha || kioskVersion.git_dirty !== false ||
+        typeof kioskVersion.build !== 'string' || !/^[a-f0-9]{64}$/.test(kioskVersion.build)) throw new Error('Invalid verified kiosk version identity');
   } finally { rmSync(dir, { recursive: true, force: true }); }
   for (let attempt = 0; attempt < PROBES; attempt++) {
     const bodies: Record<string, Record<string, unknown>> = {};
     for (const recipe of recipes) {
       const body = JSON.parse(effects.probe(recipe.health));
-      if (!body || body.git_sha !== sha || body.git_dirty !== false || body.version !== tag.slice(1) ||
-          ['version', 'git_sha', 'git_dirty', 'built_at_ms', 'inputs_fingerprint'].some(key => body[key] !== manifest.build_identity[recipe.name][key]) ||
-          (recipe.name !== 'kiosk' && body.status !== 'ok')) throw new Error(`Manual baseline is not uniformly clean and healthy at ${tag}: ${recipe.name}`);
+      const matches = recipe.name === 'kiosk' ? body?.build === kioskVersion.build :
+        body?.version === tag.slice(1) && body?.status === 'ok' &&
+        ['version', 'git_sha', 'git_dirty', 'built_at_ms', 'inputs_fingerprint'].every(key => body[key] === manifest.build_identity[recipe.name][key]);
+      if (!body || body.git_sha !== sha || body.git_dirty !== false || !matches) throw new Error(`Manual baseline is not uniformly clean and healthy at ${tag}: ${recipe.name}`);
       bodies[recipe.name] = body;
     }
     const contract = bodies.meter.openapi_sha256;

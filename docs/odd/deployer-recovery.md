@@ -17,7 +17,9 @@ not historical CI evidence or a claim that automation has recovered.
   main**. No local changes were discarded. It contains neither #201 nor #203.
 - The timer was stopped and confirmed inactive/dead throughout verification.
   The old service had failed with exit 1 because `scripts/odd/deploy.ts` was
-  missing after the historical checkout.
+  missing after the historical checkout. It was still boot-enabled: stopped
+  is not disabled, and a reboot can reactivate it. Corrected `--install-only`
+  must persistently disable it before recovery is considered safely paused.
 - The ledger is **unchanged**: `lastTag=v0.2.10`, meter `health=fail`. That is a
   failed-but-handled preflight with no snapshot, not current meter health.
 - Original ledger and installed deploy units:
@@ -62,12 +64,22 @@ or unresolvable reported identities are not treated as absent to evade that
 guard. An approved manual baseline also supplies a minimum SHA, and unexpected
 live drift below it or unavailable/degraded baseline evidence stops deployment
 (an already recorded in-flight component retains its probe/rollback recovery).
+Because factory-api also serves kiosk, an unreachable kiosk endpoint may be
+deferred only while recovering a recorded in-flight API attempt. Usable identities
+still undergo ancestry/clean checks. After API reinstall or rollback, the job
+rechecks dependent health and replans before any other installation or success
+receipt; a continued outage or unsafe identity stops forward progress.
 
 `reconcile-manual v0.2.49` previews an explicit adoption. It fetches tags, verifies
 a fresh immutable release bundle with the current verifier, then checks all
-three live components three times 20 seconds apart: full SHA, clean flag,
-version, build timestamp and input fingerprint must match the verified manifest;
-meter/API must be healthy and their OpenAPI contracts must agree. Mixed versions,
+three live components three times 20 seconds apart. All must report the full SHA
+and clean flag. Meter/API version, timestamp and input fingerprint must match the
+verified manifest, health must be good and their OpenAPI contracts must agree.
+Kiosk `/version.json` exposes only `build`, `git_sha` and `git_dirty`: its 64-digit
+bundle hash must match `version.json` read from the freshly verified kiosk archive.
+That archive's digest and member inventory are manifest-bound; its separate
+`release-build.json` metadata is already checked by the bundle verifier. Do not
+expect version/timestamp/input fields from the live kiosk endpoint. Mixed versions,
 dirty tools/source, incompatible ledger identities, pending receipts/in-flight
 installs, missing PR lookups and non-monotonic ancestry stop reconciliation.
 It does not install, roll back, change services, write the ledger or contact Linear.
@@ -136,12 +148,21 @@ test -z "$(git status --porcelain)"
 scripts/env/check --env factory-gpu
 AGENT
 gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-deploy.sh --install-only'
-gpu-ssh 'systemctl cat factory-deploy.service; systemctl show factory-deploy.timer -p ActiveState -p SubState'
+gpu-ssh 'bash -s' <<'CHECK'
+set -euo pipefail
+systemctl cat factory-deploy.service
+systemctl show factory-deploy.timer -p UnitFileState -p ActiveState -p SubState
+test "$(systemctl show factory-deploy.timer -p UnitFileState --value)" = disabled
+test "$(systemctl show factory-deploy.timer -p ActiveState --value)" = inactive
+CHECK
 ```
 
-Require the timer still inactive. Do not use the installer's default mode: that
-starts the job. If the tools were already updated, inspect the exact HEAD and
-unit rather than bypassing the v0.2.49 precondition or reinstalling blindly.
+Require `UnitFileState=disabled` **and** `ActiveState=inactive`. The installer
+snapshots prior unit files and enablement before disabling; do not restore old
+enablement during reconciliation. Default installation still starts the job and
+enables the timer, so do not use it here. If the tools were already updated,
+inspect the exact HEAD and unit rather than bypassing the v0.2.49 precondition
+or reinstalling blindly.
 
 ## Approval 2: preview, review every deferred issue, then adopt
 

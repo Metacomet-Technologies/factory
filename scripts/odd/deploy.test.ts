@@ -152,10 +152,14 @@ function world(options: {
     .flatMap(full => options.changes[(Object.keys(shas) as Tag[]).find(tag => shas[tag] === full)!] ?? []);
   const tagOf = (full: string) => (Object.keys(shas) as Tag[]).find(tag => shas[tag] === full)!;
   const identity = (full: string) => ({ git_sha: full, git_dirty: false, version: tagOf(full).slice(1), built_at_ms: 1792900000000, inputs_fingerprint: '012345abcdef' });
+  // Actual v0.2.49 version.json shape and build hash; release-build.json is not this endpoint.
+  const kioskIdentity = (full: string) => ({ build: full === shas['v0.2.49']
+    ? '704da8361162b180e372d1fb7c3b5b27cb1212b6297fb571413ad71546598e1a' : full.padEnd(64, 'f'), git_sha: full, git_dirty: false });
   const healthBody = (component: string) => {
     const reported = live[component];
     const degraded = (options.broken?.includes(component) && reported !== before[component] && before[component] !== undefined)
       || (options.startDegraded?.includes(component) && reported === start[component]);
+    if (component === 'kiosk') return JSON.stringify({ ...kioskIdentity(reported), ...(degraded ? { status: 'degraded' } : {}) });
     return JSON.stringify({ ...identity(reported), status: degraded ? 'degraded' : 'ok',
       openapi_sha256: 'abcdef123456', meter_openapi_expected: 'abcdef123456', meter_openapi_sha256: 'abcdef123456' });
   };
@@ -177,9 +181,17 @@ function world(options: {
         mkdirSync(dir, { recursive: true });
         for (const asset of ['meter-linux-x86_64', 'factory-api-linux-x86_64', 'kiosk.tar.gz']) writeFileSync(join(dir, asset), '#!/bin/sh\nexit 0\n', { mode: 0o644 });
         writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ build_identity: Object.fromEntries(recipes.map(recipe => [recipe.name, identity(args[args.indexOf('--sha') + 1])])) }));
+        writeFileSync(join(dir, 'version.json'), JSON.stringify(kioskIdentity(args[args.indexOf('--sha') + 1])));
+        assert.equal(spawnSync('tar', ['-czf', join(dir, 'kiosk.tar.gz'), '-C', dir, 'version.json']).status, 0);
+        rmSync(join(dir, 'version.json'));
         return out('complete: exact SHA, inventory and every digest verified\n');
       }
-      if (command === 'tar') return out('');
+      if (command === 'tar') {
+        if (args[0] !== '-xOf') return out('');
+        const result = spawnSync(command, args, { encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr);
+        return out(result.stdout);
+      }
       const git = args.slice(2);
       if (git[0] === 'rev-parse' && git[1] === '--absolute-git-dir') return out(`${args[1]}/.git`);
       if (git[0] === 'rev-parse' && git[1] === '--verify') {
@@ -260,6 +272,10 @@ test('manual v0.2.49 / failed v0.2.10 ledger: refuse v0.2.11, explicitly adopt w
   t.after(host.cleanup);
   const original = host.ledger();
   // The old planner selected all three: reverse git diff still lists changed files.
+  assert.deepEqual(JSON.parse(host.effects.probe(recipes[2].health)), {
+    build: '704da8361162b180e372d1fb7c3b5b27cb1212b6297fb571413ad71546598e1a',
+    git_sha: shas['v0.2.49'], git_dirty: false,
+  });
   await assert.rejects(main(host.effects), /Refusing older or divergent release/);
   assert.deepEqual(sudoCalls(host.calls), []);
   assert.deepEqual(host.comments, []);
@@ -309,6 +325,10 @@ test('manual v0.2.49 / failed v0.2.10 ledger: refuse v0.2.11, explicitly adopt w
 test('manual reconciliation fails closed on mixed, dirty, stale or unverifiable evidence without state/receipt writes', async t => {
   const alterations: [string, (host: ReturnType<typeof manuallyRecovered>) => void][] = [
     ['mixed', host => { host.live.kiosk = shas['v0.2.11']; }],
+    ...[undefined, '0'.repeat(64)].map(build => ['kiosk build fingerprint', (host: ReturnType<typeof manuallyRecovered>) => {
+      const probe = host.effects.probe;
+      host.effects.probe = url => url === recipes[2].health ? JSON.stringify({ ...JSON.parse(probe(url)), build }) : probe(url);
+    }] as [string, (host: ReturnType<typeof manuallyRecovered>) => void]),
     ...Object.entries({ git_dirty: true, git_sha: shas['v0.2.49'].slice(0, 7), version: '0.2.48', built_at_ms: 1,
       inputs_fingerprint: '000000000000', meter_openapi_sha256: '111111111111', status: 'degraded' }).map(([key, value]) =>
       [key, (host: ReturnType<typeof manuallyRecovered>) => {
@@ -404,6 +424,191 @@ test('adoption retains rollback recovery for an interrupted forward attempt with
   assert.deepEqual(host.ledger().manualBaseline, preview);
   assert.deepEqual(host.live, Object.fromEntries(recipes.map(recipe => [recipe.name, shas['v0.2.49']])));
   assert.deepEqual(host.comments, [['MET-350', line(`component=meter sha=${shas['v0.2.50']} health=fail rollback=${snapshot}`)]]);
+});
+
+test('recorded API recovery restores its dependent kiosk endpoint before any further install or success receipt', async t => {
+  for (const phase of ['installing', 'probing'] as const) {
+    for (const kioskAfter of ['healthy', 'unreachable', 'older', 'newer'] as const) {
+      const host = manuallyRecovered();
+      t.after(host.cleanup);
+      const preview = await reconcileManual(host.effects, 'v0.2.49');
+      await reconcileManual(host.effects, 'v0.2.49', preview.approval);
+      host.tags.push('v0.2.50');
+      host.live.meter = shas['v0.2.50'];
+      const snapshot = '/var/backups/factory-api/interrupted';
+      host.effects.writeLedger({ ...host.ledger(), components: { meter: { tag: 'v0.2.50', sha: shas['v0.2.50'], health: 'pass' } },
+        inFlight: { tag: 'v0.2.50', sha: shas['v0.2.50'], component: 'factory-api', phase, snapshot } });
+      let recovered = false;
+      let dependentChecks = 0;
+      const probe = host.effects.probe;
+      host.effects.probe = url => {
+        if (!recovered && url.includes(':8080/')) throw new Error('connection refused');
+        if (recovered && url === recipes[2].health) {
+          dependentChecks++;
+          if (kioskAfter === 'unreachable') throw new Error('still unavailable');
+        }
+        return probe(url);
+      };
+      const sudo = host.effects.sudo;
+      host.effects.sudo = (script, args) => {
+        if (!recovered) {
+          assert.equal(script, phase === 'probing' ? 'deploy/rollback-factory-api.sh' : 'deploy/install-factory-api.sh');
+          recovered = true;
+          if (kioskAfter === 'older') host.live.kiosk = shas['v0.2.11'];
+          if (kioskAfter === 'newer') host.live.kiosk = shas['v0.3.0'];
+          if (phase === 'probing') {
+            assert.deepEqual(args, [snapshot]);
+            host.calls.push(`sudo ${script} ${snapshot}`);
+            return { ok: true, output: '' };
+          }
+        } else assert.ok(dependentChecks > 0, 'recheck kiosk before installing it');
+        return sudo(script, args);
+      };
+      host.effects.linear.comment = async (issue, body) => { host.comments.push([issue, body]); };
+      if (kioskAfter !== 'healthy') {
+        await assert.rejects(main(host.effects), /baseline drift|older or divergent/);
+        assert.equal(sudoCalls(host.calls).length, 1, `${phase}/${kioskAfter}: only API recovery may run`);
+        assert.deepEqual(host.comments, []);
+        assert.equal(host.ledger().lastTag, 'v0.2.10');
+      } else if (phase === 'probing') {
+        await assert.rejects(main(host.effects), /health=fail/);
+        assert.equal(sudoCalls(host.calls).length, 1);
+        assert.equal(host.live['factory-api'], shas['v0.2.49']);
+        assert.deepEqual(host.comments, [['MET-350', line(`component=factory-api sha=${shas['v0.2.50']} health=fail rollback=${snapshot}`)]]);
+      } else {
+        await main(host.effects);
+        assert.equal(sudoCalls(host.calls).length, 2, 'API reinstall and kiosk install, no meter replay');
+        assert.equal(host.live.kiosk, shas['v0.2.50']);
+        assert.deepEqual(host.comments, [['MET-350', line(`component=meter+factory-api+kiosk sha=${shas['v0.2.50']} health=pass rollback=none`)]]);
+      }
+      assert.ok(dependentChecks > 0, 'both recovery outcomes recheck dependent health');
+      assert.deepEqual(host.ledger().manualBaseline, preview);
+    }
+  }
+});
+
+test('API recovery does not excuse a usable unsafe kiosk identity or an unrelated outage', async t => {
+  for (const control of ['dirty', 'newer', 'degraded', 'unrecorded', 'meter-outage']) {
+    const host = manuallyRecovered();
+    t.after(host.cleanup);
+    const preview = await reconcileManual(host.effects, 'v0.2.49');
+    await reconcileManual(host.effects, 'v0.2.49', preview.approval);
+    host.tags.push('v0.2.50');
+    if (control !== 'unrecorded') host.effects.writeLedger({ ...host.ledger(), inFlight: {
+      tag: 'v0.2.50', sha: shas['v0.2.50'], component: 'factory-api', phase: 'probing', snapshot: '/var/backups/factory-api/interrupted',
+    } });
+    const probe = host.effects.probe;
+    host.effects.probe = url => {
+      if (url === recipes[1].health || control === 'unrecorded' || control === 'meter-outage') throw new Error('connection refused');
+      if (url === recipes[2].health) return JSON.stringify({ ...JSON.parse(probe(url)),
+        ...(control === 'dirty' ? { git_dirty: true } : control === 'newer' ? { git_sha: shas['v0.3.0'] } : { status: 'degraded' }) });
+      return probe(url);
+    };
+    const before = host.ledger();
+    await assert.rejects(main(host.effects), /Unverifiable|older or divergent|baseline drift/);
+    assert.deepEqual(host.ledger(), before);
+    assert.deepEqual(sudoCalls(host.calls), []);
+    assert.deepEqual(host.comments, []);
+  }
+});
+
+test('install-only persistently disables an enabled-but-stopped timer; normal install and removal preserve ledger', t => {
+  const temp = mkdtempSync(join(tmpdir(), 'odd-units-'));
+  t.after(() => rmSync(temp, { recursive: true, force: true }));
+  const root = join(temp, 'home/agent/work/factory');
+  const bin = join(temp, 'bin');
+  const units = join(temp, 'etc/systemd/system');
+  for (const path of [bin, units, join(temp, 'etc/factory-dispatch'), join(temp, 'home/agent/.local/state/factory-odd'), join(root, 'deploy'), join(root, 'scripts/odd'), join(root, 'scripts/release')]) mkdirSync(path, { recursive: true });
+  const paths = ['scripts/odd/deploy.ts', 'scripts/odd/lifecycle.ts', 'scripts/release/release.py', 'deploy/components.json',
+    'deploy/factory-deploy.service', 'deploy/factory-deploy.timer', 'deploy/install-deploy.sh', 'deploy/rollback-deploy.sh',
+    ...recipes.flatMap(recipe => [recipe.installer, recipe.rollback]), 'deploy/install-usage.sh', 'deploy/rollback-usage.sh'];
+  for (const path of paths) {
+    // Existing installer-test convention: relocate fixed paths and simulate root, never run sudo.
+    const text = readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8')
+      .replaceAll('[[ $EUID -eq 0 ]]', 'true').replaceAll('/home/agent', `${temp}/home/agent`)
+      .replaceAll('/etc/', `${temp}/etc/`).replaceAll('/var/backups', `${temp}/var/backups`);
+    writeFileSync(join(root, path), text);
+  }
+  writeFileSync(join(temp, 'etc/factory-dispatch/linear-api-key'), 'synthetic key');
+  const ledgerPath = join(temp, 'home/agent/.local/state/factory-odd/deploy.json');
+  const ledger = JSON.stringify({ lastTag: 'v0.2.10', components: { meter: { health: 'fail' } } });
+  writeFileSync(ledgerPath, ledger);
+  writeFileSync(join(units, 'factory-deploy.timer'), 'old timer');
+  writeFileSync(join(units, 'factory-deploy.service'), 'old service');
+  writeFileSync(join(temp, 'enabled'), 'enabled\n');
+  writeFileSync(join(temp, 'active'), 'inactive\n');
+  const shims = {
+    hostname: 'echo factory-gpu',
+    getent: `echo 'agent:x:1000:1000::${temp}/home/agent:/bin/bash'`,
+    node: 'echo v24.22.1',
+    gh: '[[ $* == "auth status" ]]',
+    git: '[[ $* == *"fetch --quiet --tags origin" || $* == *"status --porcelain" ]]',
+    sudo: `if [[ $* == '-n -l' ]]; then
+  printf '%s\\n' ${paths.filter(path => /deploy\/(install|rollback)-/.test(path)).map(path => `' /usr/bin/bash ${root}/${path} *'`).join(' ')}
+  exit 0
+fi
+while [[ $1 == -* ]]; do case $1 in -u|-iu) shift 2 ;; *) shift ;; esac; done
+exec "$@"`,
+    install: 'args=(); while (($#)); do case $1 in -o|-g) shift 2 ;; *) args+=("$1"); shift ;; esac; done; exec /usr/bin/install "${args[@]}"',
+    systemctl: `state='${temp}'
+case "$1" in
+  show) case "$*" in
+    *DropInPaths*) ;;
+    *LoadState*) echo loaded ;;
+    *UnitFileState*) cat "$state/enabled" ;;
+    *ActiveState*) if [[ $2 == factory-deploy.timer ]]; then cat "$state/active"; else echo "\${SERVICE_ACTIVE:-inactive}"; fi ;;
+    *) exit 98 ;;
+  esac ;;
+  is-enabled) [[ $* == *--quiet* ]] || cat "$state/enabled"; [[ $(cat "$state/enabled") == enabled ]] ;;
+  is-active) [[ $(cat "$state/active") == active ]] ;;
+  stop) echo inactive > "$state/active" ;;
+  disable) [[ -n \${BROKEN_DISABLE:-} ]] || echo disabled > "$state/enabled"; echo "\${DISABLE_ACTIVE:-inactive}" > "$state/active" ;;
+  enable) echo enabled > "$state/enabled"; echo active > "$state/active" ;;
+  start) touch "$state/service-started" ;;
+  daemon-reload) ;;
+  *) exit 99 ;;
+esac`,
+  };
+  for (const [name, body] of Object.entries(shims)) {
+    const path = join(bin, name);
+    writeFileSync(path, `#!/bin/bash\nset -euo pipefail\n${body}\n`, { mode: 0o755 });
+  }
+  const run = (script: string, args: string[] = [], env = {}) => spawnSync('bash', [join(root, 'deploy', script), ...args],
+    { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:/usr/bin:/bin`, ...env } });
+  const installed = run('install-deploy.sh', ['--install-only']);
+  assert.equal(installed.status, 0, installed.stdout + installed.stderr);
+  const snapshot = /^Snapshot: (.+)$/m.exec(installed.stdout)![1];
+  assert.equal(readFileSync(join(snapshot, 'factory-deploy.timer.enabled'), 'utf8'), 'enabled\n');
+  assert.equal(readFileSync(join(snapshot, 'factory-deploy.timer'), 'utf8'), 'old timer');
+  assert.equal(readFileSync(join(temp, 'enabled'), 'utf8'), 'disabled\n');
+  assert.equal(readFileSync(join(temp, 'active'), 'utf8'), 'inactive\n');
+  assert.equal(existsSync(join(temp, 'service-started')), false);
+  assert.equal(readFileSync(ledgerPath, 'utf8'), ledger);
+  const normal = run('install-deploy.sh');
+  assert.equal(normal.status, 0, normal.stdout + normal.stderr);
+  assert.equal(existsSync(join(temp, 'service-started')), true);
+  assert.equal(readFileSync(join(temp, 'enabled'), 'utf8'), 'enabled\n');
+  assert.equal(readFileSync(join(temp, 'active'), 'utf8'), 'active\n');
+  rmSync(join(temp, 'service-started'));
+  const refused = run('install-deploy.sh', ['--install-only'], { BROKEN_DISABLE: '1' });
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /not persistently disabled/);
+  const stillActive = run('install-deploy.sh', ['--install-only'], { DISABLE_ACTIVE: 'active' });
+  assert.notEqual(stillActive.status, 0);
+  assert.match(stillActive.stderr, /not inactive/);
+  writeFileSync(join(units, 'factory-deploy.timer'), 'do not replace while deploy is running');
+  const busy = run('install-deploy.sh', ['--install-only'], { SERVICE_ACTIVE: 'activating' });
+  assert.notEqual(busy.status, 0);
+  assert.match(busy.stderr, /Wait for the running deploy service/);
+  assert.equal(readFileSync(join(units, 'factory-deploy.timer'), 'utf8'), 'do not replace while deploy is running');
+  assert.equal(existsSync(join(temp, 'service-started')), false);
+  const removed = run('rollback-deploy.sh');
+  assert.equal(removed.status, 0, removed.stdout + removed.stderr);
+  assert.equal(existsSync(join(units, 'factory-deploy.timer')), false);
+  assert.equal(existsSync(join(units, 'factory-deploy.service')), false);
+  assert.equal(readFileSync(join(temp, 'enabled'), 'utf8'), 'disabled\n');
+  assert.equal(readFileSync(join(temp, 'active'), 'utf8'), 'inactive\n');
+  assert.equal(readFileSync(ledgerPath, 'utf8'), ledger);
 });
 
 test('real Git: releases predating the deployer cannot remove its runtime or tools, including the tick after a failed install', async t => {

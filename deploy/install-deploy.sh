@@ -72,7 +72,11 @@ for unit in factory-deploy.service factory-deploy.timer; do
     systemctl is-enabled "$unit" > "$snapshot/$unit.enabled" 2>/dev/null || true
 done
 printf 'Snapshot: %s\n' "$snapshot"
-if [[ $(systemctl show factory-deploy.timer --property=LoadState --value) != not-found ]]; then systemctl stop factory-deploy.timer; fi
+if [[ $(systemctl show factory-deploy.timer --property=LoadState --value) != not-found ]]; then
+    if [[ ${1:-} == --install-only ]]; then systemctl disable --now factory-deploy.timer
+    else systemctl stop factory-deploy.timer
+    fi
+fi
 case $(systemctl show factory-deploy.service --property=ActiveState --value) in
     inactive|failed) ;;
     *) fail 'Wait for the running deploy service to finish before replacing its units.' ;;
@@ -82,7 +86,10 @@ install -o root -g root -m 0644 "$snapshot/new.service" /etc/systemd/system/fact
 install -o root -g root -m 0644 "$root/deploy/factory-deploy.timer" /etc/systemd/system/factory-deploy.timer
 systemctl daemon-reload
 if [[ ${1:-} == --install-only ]]; then
-    printf '%s\n' 'Deploy units installed; timer left stopped, ledger unchanged. Reconcile before starting factory-deploy.service and enabling the timer.'
+    systemctl disable --now factory-deploy.timer
+    [[ $(systemctl show factory-deploy.timer --property=UnitFileState --value) == disabled ]] || fail 'Deploy timer is not persistently disabled.'
+    [[ $(systemctl show factory-deploy.timer --property=ActiveState --value) == inactive ]] || fail 'Deploy timer is not inactive.'
+    printf '%s\n' 'Deploy units installed; timer disabled and inactive, ledger unchanged. Reconcile before starting factory-deploy.service and enabling the timer.'
     exit 0
 fi
 # First run records the latest release in the ledger without deploying (deploy.ts bootstrap);

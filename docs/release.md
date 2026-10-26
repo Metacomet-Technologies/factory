@@ -432,7 +432,9 @@ no-replay floor preserves the old ledger and inventories deferred releases/issue
 as requirements-unverified, with no historical success receipts or Linear writes.
 Ancestry alone does not prove an issue's Done means. Forward deployment, deferred
 issue verification/receipts and timer resumption each need operator approval.
-`install-deploy.sh --install-only` installs the units with the timer stopped and without running
-the job or changing the ledger, allowing reconciliation before backlog deployment.
+`install-deploy.sh --install-only` snapshots prior enablement and installs the
+units with the timer persistently disabled and inactive, without running the job
+or changing the ledger. Both states are verified: merely stopping an enabled
+timer would allow its boot trigger to bypass reconciliation approval.
 `rollback-deploy.sh` still removes the units and retains all state, now including
 the source worktree; it does not rewind application deployments or the ledger.
