@@ -7,6 +7,7 @@
 // @amp-agent-mode {"key":"odd-deployer","label":"ODD Deployer"}
 // @amp-agent-mode {"key":"odd-control","label":"ODD Control"}
 
+import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { Agent, AgentThreadExecutor, PluginAPI, PluginEventContext, ThreadID, WebhookEvent, WebhookHandlerContext } from '@ampcode/plugin'
 import {
 	cancelledLine,
@@ -57,6 +58,39 @@ const liveRoles: ReadonlySet<Role> = new Set<Role>(['intake', 'spec', 'builder',
 const slackPollMs = 5 * 60_000
 /** Runner ID of the host the deploy job runs on; the red-deploy log reader runs there. */
 const deployRunner = 'factory-gpu'
+
+// --- Webhook authenticity (docs/odd/README.md §9). Amp hands the handler the exact request
+// bytes and the requested headers but authenticates nothing upstream, so every delivery is
+// checked against its provider's signing secret before it is deduplicated or read.
+type Provider = 'github' | 'linear'
+const providers: readonly Provider[] = ['linear', 'github']
+/** GitHub signs as `sha256=<hex>`, Linear as bare `<hex>`: HMAC-SHA256 of the raw body. */
+const signatureHeaders: Record<Provider, { name: string; format: RegExp }> = {
+	github: { name: 'x-hub-signature-256', format: /^sha256=([0-9a-f]{64})$/i },
+	linear: { name: 'linear-signature', format: /^([0-9a-f]{64})$/i },
+}
+/** Linear's documented replay guard: the signed `webhookTimestamp` within a minute of receipt. */
+export const linearFreshMs = 60_000
+
+/**
+ * Why a delivery is not authentic, or undefined when it is. Freshness is measured against
+ * Amp's server-side `receivedAt`, so Amp's own retries of a failed handler stay valid. The
+ * reason never contains the secret or the signature.
+ */
+export function rejectDelivery(provider: Provider, secret: string, event: Pick<WebhookEvent, 'body' | 'headers' | 'receivedAt'>): string | undefined {
+	const { name, format } = signatureHeaders[provider]
+	const header = event.headers[name]
+	if (!header) return `missing ${name}`
+	const hex = format.exec(header.trim())?.[1]
+	if (!hex) return `malformed ${name}`
+	if (!timingSafeEqual(createHmac('sha256', secret).update(event.body).digest(), Buffer.from(hex, 'hex'))) return `invalid ${name}`
+	if (provider === 'github') return undefined
+	let sent: unknown
+	try { sent = (JSON.parse(new TextDecoder().decode(event.body)) as { webhookTimestamp?: unknown }).webhookTimestamp } catch { return 'unparseable body' }
+	const received = Date.parse(event.receivedAt)
+	if (typeof sent !== 'number' || !Number.isFinite(received)) return 'missing webhookTimestamp'
+	return Math.abs(received - sent) > linearFreshMs ? `stale delivery (${Math.round((received - sent) / 1000)} s from receipt)` : undefined
+}
 
 export default async function (amp: PluginAPI) {
 	// Every agent pins its model and effort (scripts/odd/engines.ts); none inherits a mode default.
@@ -138,7 +172,7 @@ export default async function (amp: PluginAPI) {
 		at: string
 		source: string
 		issue: string | null
-		stage: 'received' | 'ignored' | 'dry-run' | 'performed' | 'failed'
+		stage: 'received' | 'ignored' | 'rejected' | 'dry-run' | 'performed' | 'failed'
 		status?: string
 		action?: Action
 		error?: string
@@ -152,6 +186,8 @@ export default async function (amp: PluginAPI) {
 		error?: string
 		webhooks: string[]
 		urls: string[]
+		/** Signing secrets, in memory only: entered through secret dialogs, never logged, returned or persisted, so a reload starts without them. */
+		secrets: Partial<Record<Provider, string>>
 		events: HandledEvent[]
 		/** Slack intake poll: last run, last error, and the message timestamps handed to Intake. */
 		slack: { polledAt?: string; error?: string; spawned: string[] }
@@ -165,7 +201,7 @@ export default async function (amp: PluginAPI) {
 		timers: ReturnType<typeof setInterval>[]
 	}
 	const armState = new Map<ThreadID, ArmState>()
-	const emptyState = (): ArmState => ({ armed: false, webhooks: [], urls: [], events: [], slack: { spawned: [] }, watchdog: { cancelled: [], waits: {}, overdue: [] }, episodes: {}, plane: { load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, building: [], waiting: [] }, pins: {}, timers: [] })
+	const emptyState = (): ArmState => ({ armed: false, webhooks: [], urls: [], secrets: {}, events: [], slack: { spawned: [] }, watchdog: { cancelled: [], waits: {}, overdue: [] }, episodes: {}, plane: { load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, building: [], waiting: [] }, pins: {}, timers: [] })
 	const record = (state: ArmState, event: HandledEvent) => {
 		state.events.push(event)
 		state.events.splice(0, Math.max(0, state.events.length - 20))
@@ -182,7 +218,7 @@ export default async function (amp: PluginAPI) {
 	amp.registerTool({
 		name: 'odd_control_status',
 		description:
-			'ODD control plane state for this thread: labels, executor kind, whether webhooks are armed, last arming error, the last 20 handled events (webhooks, Slack intake polls, Watchdog sweeps), Slack poll and Watchdog state. Pass arm: true to arm now (control thread in an orb only). Pass poll_slack: true to poll #factory-intake now. Pass sweep: true to run the Watchdog sweep now. Pass show_urls: true to show the webhook URLs to the human in a confirm dialog; the call blocks until they answer. URLs are never returned to the agent.',
+			'ODD control plane state for this thread: labels, executor kind, whether webhooks are armed, last arming error, the last 20 handled events (webhooks, Slack intake polls, Watchdog sweeps), Slack poll and Watchdog state. Pass arm: true to arm now (control thread in an orb only). Pass poll_slack: true to poll #factory-intake now. Pass sweep: true to run the Watchdog sweep now. Pass show_urls: true to show the webhook URLs to the human in a confirm dialog; the call blocks until they answer. URLs are never returned to the agent. Pass set_secrets: true to ask the human for the GitHub and Linear signing secrets in private dialogs; until a provider\'s secret is set its deliveries are refused and nothing is evaluated. Secrets are never returned; status shows only set or missing.',
 		inputSchema: {
 			type: 'object',
 			properties: {
@@ -190,6 +226,7 @@ export default async function (amp: PluginAPI) {
 				poll_slack: { type: 'boolean', description: 'Poll #factory-intake now and hand new messages to Intake (dry run without the odd-perform label)' },
 				sweep: { type: 'boolean', description: 'Run the Watchdog sweep now: re-evaluate every live or ODD-owned issue' },
 				show_urls: { type: 'boolean', description: 'Show the webhook URLs to the human in a dialog and wait for them to confirm' },
+				set_secrets: { type: 'boolean', description: 'Ask the human for the GitHub and Linear webhook signing secrets in private dialogs (URLs unchanged)' },
 			},
 		},
 		async execute(input, ctx) {
@@ -198,9 +235,11 @@ export default async function (amp: PluginAPI) {
 			const current = armState.get(ctx.thread.id)
 			if (input.poll_slack === true && current?.armed) await pollSlackIntake(ctx, current)
 			if (input.sweep === true && current?.armed) await sweep({ ...ctx, $: amp.$ }, current)
-			const { urls, timers: _timers, ...state } = current ?? emptyState()
+			if (input.set_secrets === true && current) await setSecrets(ctx, current, true)
+			const { urls, secrets, timers: _timers, ...state } = current ?? emptyState()
 			const dialog = input.show_urls === true && urls.length > 0 ? await showUrls(ctx, urls) : undefined
-			return JSON.stringify({ thread: ctx.thread.id, labels, executor: amp.system.executor.kind, ...state, dialog })
+			const signing = Object.fromEntries(providers.map(provider => [provider, secrets[provider] ? 'set' : 'missing']))
+			return JSON.stringify({ thread: ctx.thread.id, labels, executor: amp.system.executor.kind, ...state, signing, dialog })
 		},
 	})
 
@@ -215,7 +254,8 @@ export default async function (amp: PluginAPI) {
 	async function arm(ctx: ArmContext & Partial<Pick<WebhookHandlerContext, '$'>>, labels: readonly string[], retry = false) {
 		const previous = armState.get(ctx.thread.id)
 		if (!labels.includes(controlLabel) || (previous && !(retry && previous.error))) return
-		const state = emptyState()
+		// A retried arm keeps the secrets already entered; a plugin reload has none.
+		const state = { ...emptyState(), secrets: previous?.secrets ?? {} }
 		armState.set(ctx.thread.id, state)
 		try {
 			await armWebhooks(ctx, state)
@@ -243,7 +283,31 @@ export default async function (amp: PluginAPI) {
 		}
 		await amp.system.executor.keepAlive().catch((error: unknown) => ctx.logger.log(marker, 'keepAlive failed', String(error)))
 		const seen = new Set<string>()
-		const handle = (source: 'linear' | 'github' | 'slack') => async (event: WebhookEvent, hctx: WebhookHandlerContext) => {
+		// Linear signatures accepted in the freshness window, by event: the same signed bytes under
+		// another event ID are a replay; the same event ID is Amp retrying its own delivery.
+		const accepted = new Map<string, { id: string; at: number }>()
+		const replayed = (event: WebhookEvent): string | undefined => {
+			const signature = event.headers[signatureHeaders.linear.name].trim().toLowerCase()
+			const at = Date.parse(event.receivedAt)
+			for (const [key, prior] of accepted) if (prior.at < at - 2 * linearFreshMs) accepted.delete(key)
+			const prior = accepted.get(signature)
+			if (prior && prior.id !== event.id) return 'replayed delivery'
+			accepted.set(signature, { id: event.id, at })
+			return undefined
+		}
+		const handle = (source: Provider) => async (event: WebhookEvent, hctx: WebhookHandlerContext) => {
+			const secret = state.secrets[source]
+			if (!secret) {
+				// Fail closed and let Amp retry (up to an hour) until the secret is set in private.
+				record(state, { at: event.receivedAt, source, issue: null, stage: 'rejected', error: 'signing secret not set' })
+				throw new Error(`${source} signing secret not set; odd_control_status set_secrets:true`)
+			}
+			const rejected = rejectDelivery(source, secret, event) ?? (source === 'linear' ? replayed(event) : undefined)
+			if (rejected) {
+				record(state, { at: event.receivedAt, source, issue: null, stage: 'rejected', error: rejected })
+				hctx.logger.log(marker, source, 'delivery rejected', event.id, rejected)
+				return
+			}
 			if (seen.has(event.id)) return
 			seen.add(event.id)
 			const identifier = issueFromEvent(source, new TextDecoder().decode(event.body))
@@ -258,14 +322,31 @@ export default async function (amp: PluginAPI) {
 				throw new Error(entry.error)
 			}
 		}
-		for (const key of ['linear', 'github', 'slack'] as const) {
-			const { url } = await amp.createWebhook({ key, headers: ['x-hub-signature-256', 'linear-signature', 'x-slack-signature'], handler: handle(key) })
+		// Slack intake is polled (pollSlackIntake), so no Slack webhook is registered. Keys are
+		// stable, so re-registering after a reload returns the same URLs.
+		for (const key of providers) {
+			const { url } = await amp.createWebhook({ key, headers: [signatureHeaders[key].name], handler: handle(key) })
 			state.webhooks.push(key)
 			state.urls.push(`${key}: ${url}`)
 		}
-		// Not awaited: the dialog waits for a human and must not hold the turn boundary that
-		// armed it. odd_control_status({ show_urls: true }) shows it again on demand and waits.
-		void showUrls(ctx, state.urls).catch((error: unknown) => ctx.logger.log(marker, 'webhook dialog failed', String(error)))
+		// Not awaited: the dialogs wait for a human and must not hold the turn boundary that armed
+		// it. URLs are shown only on demand (odd_control_status show_urls:true).
+		void setSecrets(ctx, state).catch((error: unknown) => ctx.logger.log(marker, 'signing secret dialog failed', String(error)))
+	}
+
+	// Each missing (or, with `all`, every) signing secret through an owner-only secret dialog. A
+	// dismissed dialog leaves that provider refusing deliveries.
+	async function setSecrets(ctx: Pick<ArmContext, 'ui'>, state: ArmState, all = false) {
+		for (const provider of providers) {
+			if (state.secrets[provider] && !all) continue
+			const value = (await ctx.ui.input({
+				title: `ODD ${provider === 'github' ? 'GitHub' : 'Linear'} webhook signing secret`,
+				helpText: `The signing secret of the existing ${provider} webhook. Until it is set, ${provider} deliveries are refused and nothing is evaluated. The URL does not change.`,
+				secret: true,
+				requireHuman: true,
+			}))?.trim()
+			if (value) state.secrets[provider] = value
+		}
 	}
 
 	// Arm-time routing check (§6): each pinned plugin model runs one small check-access inference
