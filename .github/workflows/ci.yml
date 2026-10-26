@@ -130,7 +130,7 @@ jobs:
       - run: python3 -B deploy/test-install-dispatch.py
       - run: python3 -B deploy/backup/test-backup.py
       - run: python3 -B deploy/backup/test-offsite-runtime.py
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Test encrypted off-site backups against loopback moto
         run: uvx --from 'moto[server]==5.2.4' --with 'pyrage==1.4.0' --with 'boto3==1.43.118' python -B deploy/backup/test-offsite.py
       - run: python3 -B deploy/reboot/test-reboot.py
