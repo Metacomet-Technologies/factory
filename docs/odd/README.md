@@ -399,8 +399,11 @@ by the previous one).
    user_version=<n|none> db_changing=<yes|no>` line, no staging, service,
    lock or snapshot; the committed version, WAL included, is read from a
    private scratch copy because SQLite creates sidecars even for read-only
-   opens) and installs meter only with `--no-db-change`, which rechecks
-   before its first change. Only a v2 rerun is eligible. A fresh, legacy,
+   opens, accepted only when the live main file is unchanged and the live WAL
+   still begins with the copied bytes, else retried twice and then `unknown`;
+   an unsafe DB, sidecar or parent path is `unknown`) and installs meter only
+   with `--no-db-change`, which rechecks before its path checks and first
+   change. Only a v2 rerun is eligible. A fresh, legacy,
    v1, unclassifiable or failed plan installs nothing in the release, and a
    generation change caught by the recheck installs nothing further. An
    interrupted meter install whose resume probe is red rolls back only a

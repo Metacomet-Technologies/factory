@@ -371,7 +371,21 @@ esac""",
     "ss": "true",
     **{name: f'echo "{name} $*" >> "$CALLS"; exec /usr/bin/{name} "$@"' for name in ("mktemp", "install")},
     "useradd": 'echo "useradd $*" >> "$CALLS"; exit 99',
+    # A concurrent writer: CP_HOOK runs right after the classifier copies the main file into scratch.
+    "cp": '/usr/bin/cp "$@" || exit; if [[ -n ${CP_HOOK:-} && ${*: -1} == */meter.db ]]; then python3 "$CP_HOOK" "${@: -2:1}"; fi',
 }
+# `once`: one real TRUNCATE checkpoint (no version change); `churn`: a commit and a checkpoint on every copy.
+CP_HOOK = """import os, pathlib, sqlite3, sys
+marker = pathlib.Path(os.environ["CP_HOOK_MARK"])
+if os.environ["CP_HOOK_MODE"] == "once" and marker.exists():
+    sys.exit()
+marker.write_text(marker.read_text() + "x" if marker.exists() else "x")
+con = sqlite3.connect(sys.argv[1], isolation_level=None)
+if os.environ["CP_HOOK_MODE"] == "churn":
+    con.execute("INSERT INTO requests VALUES (1)")
+con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+con.close()
+"""
 # Relocate the installer's fixed host paths into the fixture tree, as deploy.test.ts does.
 HOST_PATHS = re.compile(r"/srv/factory|/usr/local/|/etc/|/var/backups|/run/systemd/system")
 DB_STATES = {
@@ -382,6 +396,8 @@ DB_STATES = {
     "unreadable": ("meter-plan mode=unknown user_version=none db_changing=yes", "garbage"),
     "orphan sidecar": ("meter-plan mode=unknown user_version=none db_changing=yes", "orphan"),
     "symlink": ("meter-plan mode=unknown user_version=none db_changing=yes", "symlink"),
+    "symlinked parent": ("meter-plan mode=unknown user_version=none db_changing=yes", "parent symlink"),
+    "symlinked shm": ("meter-plan mode=unknown user_version=none db_changing=yes", "shm symlink"),
     "hot journal": ("meter-plan mode=unknown user_version=none db_changing=yes", "journal"),
     # The application runs WAL: a stopped WAL DB has no sidecars, and a committed version can still be in the WAL.
     "stopped WAL v1": ("meter-plan mode=v1 user_version=1 db_changing=yes", ("wal", 1)),
@@ -438,6 +454,10 @@ class MeterPlanTest(unittest.TestCase):
         self.temp.cleanup()
 
     def make_db(self, state):
+        if self.db.parent.is_symlink():
+            self.db.parent.unlink()
+            shutil.rmtree(self.db.parent.parent / "meter-real")
+            self.db.parent.mkdir()
         for path in self.db.parent.iterdir():
             path.unlink()
         if state is None:
@@ -448,6 +468,15 @@ class MeterPlanTest(unittest.TestCase):
             self.db.write_bytes(b"not a sqlite database, " * 64)
         elif state == "orphan":
             pathlib.Path(f"{self.db}-wal").write_bytes(b"wal")
+        elif state == "parent symlink":
+            real = self.db.parent.parent / "meter-real"
+            self.db.parent.rmdir()
+            real.mkdir()
+            self.db.parent.symlink_to(real)
+            subprocess.run(["sqlite3", real / "meter.db", "PRAGMA user_version=2; CREATE TABLE t(x);"], check=True)
+        elif state == "shm symlink":
+            self.make_db(2)
+            pathlib.Path(f"{self.db}-shm").symlink_to(self.db.parent.parent / "elsewhere-shm")
         elif state == "journal":
             self.make_db(2)
             pathlib.Path(f"{self.db}-journal").write_bytes(b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7" + b"\0" * 504)
@@ -518,10 +547,6 @@ class MeterPlanTest(unittest.TestCase):
                 self.make_db(state)
                 result = self.assert_unchanged("--no-db-change", 1)
                 self.assertIn("No deployment changes made; no rollback snapshot exists.", result.stderr)
-                if case == "symlink":
-                    # The existing path-safety preflight refuses it first; --plan above still reports unknown.
-                    self.assertIn("Unsafe file", result.stderr)
-                    continue
                 self.assertIn(line, result.stdout.splitlines())
                 self.assertIn("Refusing automatic meter install", result.stderr)
 
@@ -543,12 +568,61 @@ class MeterPlanTest(unittest.TestCase):
                 self.assertEqual({path.name: path.read_bytes() for path in self.db.parent.iterdir()}, files)
                 self.assertFalse((self.tree / "var/backups/meter").exists())
         # Drift between the Deployer's plan and its install: v1 or a vanished DB is refused unchanged.
-        for state, line in ((1, DB_STATES["v1"][0]), (None, DB_STATES["fresh"][0])):
+        for state, line in ((1, DB_STATES["v1"][0]), (None, DB_STATES["fresh"][0]), ("symlink", DB_STATES["symlink"][0])):
             with self.subTest(drift=state):
                 self.make_db(state)
                 result = self.assert_unchanged("--no-db-change", 1)
                 self.assertIn(line, result.stdout.splitlines())
                 self.assertIn("Refusing automatic meter install", result.stderr)
+
+    def run_with_writer(self, flag, mode):
+        hook = self.scratch.parent / "cp-hook.py"
+        hook.write_text(CP_HOOK)
+        marker = self.scratch.parent / "cp-hook-ran"
+        marker.unlink(missing_ok=True)
+        self.env.update(CP_HOOK=str(hook), CP_HOOK_MODE=mode, CP_HOOK_MARK=str(marker))
+        try:
+            result, calls = self.run_installer(flag)
+        finally:
+            for name in ("CP_HOOK", "CP_HOOK_MODE", "CP_HOOK_MARK"):
+                self.env.pop(name)
+        self.assertTrue(marker.exists(), "the writer never ran between the copies")
+        # No staging, migration, service action or snapshot; scratch removed.
+        self.assertIsNone(MUTATIONS.search(calls), calls)
+        self.assertNotIn(".meter-stage", calls)
+        self.assertEqual(list(self.scratch.iterdir()), [])
+        self.assertFalse((self.tree / "var/backups/meter").exists())
+        return result, marker.read_text()
+
+    def assert_plan(self, flag, result, line):
+        self.assertIn(line, result.stdout.splitlines())
+        if flag == "--plan":
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        else:
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("Refusing automatic meter install", result.stderr)
+
+    def test_a_checkpoint_between_the_copies_never_reads_a_stale_v2(self):
+        # The main file says 2 while the committed generation (in the WAL) is 1 or 3 throughout;
+        # a real checkpoint right after the main-file copy must not pair it with the consumed WAL.
+        for flag in ("--plan", "--no-db-change"):
+            for committed, line in ((1, DB_STATES["v1"][0]), (3, DB_STATES["future"][0])):
+                with self.subTest(flag=flag, committed=committed):
+                    self.make_db(("pending", 2, committed))
+                    con = sqlite3.connect(self.db, isolation_level=None)
+                    self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], committed)
+                    result, _ = self.run_with_writer(flag, "once")
+                    self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], committed)
+                    con.close()
+                    self.assert_plan(flag, result, line)
+
+    def test_a_db_changing_on_every_capture_fails_closed_after_bounded_retries(self):
+        for flag in ("--plan", "--no-db-change"):
+            with self.subTest(flag=flag):
+                self.make_db(("wal", 2))
+                result, runs = self.run_with_writer(flag, "churn")
+                self.assertEqual(runs, "xxx")
+                self.assert_plan(flag, result, "meter-plan mode=unknown user_version=none db_changing=yes")
 
 
 if __name__ == "__main__":

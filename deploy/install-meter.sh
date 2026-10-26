@@ -107,29 +107,49 @@ assert_meter_ready() {
 }
 # Read-only DB-generation classification shared by --plan, --no-db-change and
 # the install. No DB and no sidecars is fresh; a regular DB is legacy, v1 or v2
-# by its committed user_version; anything else, including an unreadable DB or a
-# hot rollback journal, is unknown and callers fail closed. Only a v2 rerun
-# leaves the DB generation unchanged. SQLite creates WAL/SHM files even for
-# -readonly opens, so the live files are never opened: the committed generation
-# (main file plus any WAL, which may hold a newer user_version) is read from a
-# private scratch copy that is removed before returning.
+# by its committed user_version. Anything else is unknown and callers fail
+# closed: an unreadable DB, a hot rollback journal, a symlinked or non-regular
+# DB or sidecar, a symlinked or non-directory parent, or no coherent capture.
+# Only a v2 rerun leaves the DB generation unchanged. SQLite creates WAL/SHM
+# files even for -readonly opens, so the live files are never opened: the
+# committed generation (main file plus any WAL, which may hold a newer
+# user_version) is read from a private scratch copy removed before returning.
 classify_meter_db() {
-    local scratch suffix
+    local scratch suffix parent
     mode=unknown
     version=
-    if [[ ! -e "$db" && ! -L "$db" ]]; then
-        mode=fresh
-        for suffix in -wal -shm -journal; do
-            if [[ -e "$db$suffix" || -L "$db$suffix" ]]; then mode=unknown; fi
+    parent=$(dirname "$db")
+    while [[ "$parent" != / ]]; do
+        [[ ! -L "$parent" && ( ! -e "$parent" || -d "$parent" ) ]] || { classified_plan; return 0; }
+        parent=$(dirname "$parent")
+    done
+    for suffix in '' -wal -shm -journal; do
+        [[ ! -L "$db$suffix" && ( ! -e "$db$suffix" || -f "$db$suffix" ) ]] || { classified_plan; return 0; }
+    done
+    if [[ ! -e "$db" ]]; then
+        if [[ ! -e "$db-wal" && ! -e "$db-shm" && ! -e "$db-journal" ]]; then mode=fresh; fi
+    elif [[ ! -e "$db-journal" ]] && scratch=$(mktemp -d); then
+        # A checkpoint between the two copies would pair a stale main file with
+        # a consumed WAL. Accept a capture only when the live main file is still
+        # byte-identical and the live WAL still begins with the copied bytes
+        # (later appends are later commits); otherwise retry, then fail closed.
+        for _ in 1 2 3; do
+            rm -f -- "$scratch/meter.db" "$scratch/meter.db-wal" "$scratch/meter.db-shm"
+            if cp -- "$db" "$scratch/meter.db" \
+                && { [[ ! -e "$db-wal" ]] || cp -- "$db-wal" "$scratch/meter.db-wal"; } \
+                && cmp -s -- "$db" "$scratch/meter.db" \
+                && { [[ ! -e "$scratch/meter.db-wal" ]] \
+                    || cmp -s -n "$(stat -c %s "$scratch/meter.db-wal")" -- "$db-wal" "$scratch/meter.db-wal"; }; then
+                version=$(sqlite3 -readonly "$scratch/meter.db" 'PRAGMA user_version;' 2>/dev/null) || version=
+                case "$version" in 0) mode=legacy ;; 1) mode=v1 ;; 2) mode=v2 ;; esac
+                break
+            fi
         done
-    elif [[ -f "$db" && ! -L "$db" && ! -e "$db-journal" && ! -L "$db-journal" ]] && scratch=$(mktemp -d); then
-        if cp -- "$db" "$scratch/meter.db" \
-            && { [[ ! -e "$db-wal" && ! -L "$db-wal" ]] || { [[ -f "$db-wal" && ! -L "$db-wal" ]] && cp -- "$db-wal" "$scratch/meter.db-wal"; }; } \
-            && version=$(sqlite3 -readonly "$scratch/meter.db" 'PRAGMA user_version;' 2>/dev/null); then
-            case "$version" in 0) mode=legacy ;; 1) mode=v1 ;; 2) mode=v2 ;; esac
-        fi
         rm -rf -- "$scratch"
     fi
+    classified_plan
+}
+classified_plan() {
     [[ "$version" =~ ^[0-9]+$ ]] || version=
     db_changing=yes
     if [[ "$mode" == v2 ]]; then db_changing=no; fi
@@ -179,6 +199,14 @@ if id meter >/dev/null 2>&1; then
 else
     ! getent group meter >/dev/null || fail 'meter group exists without its account.'
 fi
+# The automatic recheck comes before the path-safety checks so an unsafe DB
+# path is reported as a machine-readable refusal; only read-only checks remain
+# between it and the first change (staging).
+classify_meter_db
+if (( no_db_change )) && [[ "$db_changing" != no ]]; then
+    printf '%s\n' "$meter_plan"
+    fail "Refusing automatic meter install: mode $mode changes the DB generation; migration is Devon's explicit manual operation."
+fi
 for path in "$destination" /usr/local/bin/meter.new "$installed_unit" "$db" "$db-wal" "$db-shm" "$legacy" "$legacy-wal" "$legacy-shm" "$drop_in" /var/backups/factory-db/.backup.lock; do
     [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] || fail "Unsafe file: $path"
     parent=$(dirname "$path")
@@ -188,11 +216,6 @@ for path in "$destination" /usr/local/bin/meter.new "$installed_unit" "$db" "$db
     done
 done
 [[ ! -L /var/backups/meter && ( ! -e /var/backups/meter || -d /var/backups/meter ) ]] || fail 'Unsafe meter snapshot directory.'
-classify_meter_db
-if (( no_db_change )) && [[ "$db_changing" != no ]]; then
-    printf '%s\n' "$meter_plan"
-    fail "Refusing automatic meter install: mode $mode changes the DB generation; migration is Devon's explicit manual operation."
-fi
 if [[ "$mode" == unknown ]]; then
     [[ -e "$db" || -L "$db" ]] || fail 'Orphan meter sidecars; recover first.'
     fail "Unsupported meter user_version: ${version:-unreadable}"

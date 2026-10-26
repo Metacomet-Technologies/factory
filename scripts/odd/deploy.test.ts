@@ -1090,23 +1090,29 @@ test('sandbox: an interrupted meter resume with a red probe never runs a rollbac
   }
 });
 
-test('sandbox: the installer rechecks after an eligible plan; a generation change in between is a refusal, not a failed rollback', async t => {
-  const host = world({ ...meterRelease, tags: ['v0.2.9', 'v0.3.0'], ledger: baseline() });
-  t.after(host.cleanup);
-  const sudo = host.effects.sudo;
-  host.effects.sudo = (script, args) => {
-    if (!args.includes('--no-db-change')) return sudo(script, args);
-    host.calls.push(`sudo ${script} ${args.slice(2).join(' ')}`);
-    return { ok: false, output: `Artifact meter built at 1111111 matches checkout\n${plans.v1.output}ERROR: Refusing automatic meter install: mode v1 changes the DB generation; migration is Devon's explicit manual operation.\nNo deployment changes made; no rollback snapshot exists.\n` };
-  };
-  await assert.rejects(main(host.effects), /health=refused/);
-  const meter = `${host.stateDir}/releases/v0.3.0/meter-linux-x86_64`;
-  assert.deepEqual(host.calls.filter(call => /^(plan|sudo)/.test(call)), ['plan meter', `sudo deploy/install-meter.sh --no-db-change ${meter}`]);
-  const refused = line(`component=meter sha=${shas['v0.3.0']} health=refused rollback=none refusal=db-changing-v1`);
-  assert.deepEqual(host.comments, [['MET-364', refused]]);
-  assert.equal(host.ledger().lastTag, 'v0.2.9');
-  assert.equal(host.ledger().components.meter, undefined);
-  assert.equal((deploying(refused) as Extract<Action, { kind: 'page' }>).reason, 'irreversible-action');
+test('sandbox: the installer rechecks after an eligible plan; a generation change or unsafe DB path in between is a refusal, not a failed rollback', async t => {
+  // Real installer output for each drift (deploy/test-install-artifact.py MeterPlanTest): v1, and the DB replaced by a symlink.
+  for (const [mode, refusal] of [['v1', 'db-changing-v1'], ['unknown', 'db-changing-unknown']] as const) {
+    const host = world({ ...meterRelease, tags: ['v0.2.9', 'v0.3.0'], ledger: baseline() });
+    t.after(host.cleanup);
+    const sudo = host.effects.sudo;
+    host.effects.sudo = (script, args) => {
+      if (!args.includes('--no-db-change')) return sudo(script, args);
+      host.calls.push(`sudo ${script} ${args.slice(2).join(' ')}`);
+      return { ok: false, output: `Artifact meter built at 1111111 matches checkout\nmeter-plan mode=${mode} user_version=${mode === 'v1' ? 1 : 'none'} db_changing=yes\nERROR: Refusing automatic meter install: mode ${mode} changes the DB generation; migration is Devon's explicit manual operation.\nNo deployment changes made; no rollback snapshot exists.\n` };
+    };
+    await assert.rejects(main(host.effects), /health=refused/);
+    const meter = `${host.stateDir}/releases/v0.3.0/meter-linux-x86_64`;
+    assert.deepEqual(host.calls.filter(call => /^(plan|sudo)/.test(call)), ['plan meter', `sudo deploy/install-meter.sh --no-db-change ${meter}`]);
+    const refused = line(`component=meter sha=${shas['v0.3.0']} health=refused rollback=none refusal=${refusal}`);
+    assert.deepEqual(host.comments, [['MET-364', refused]]);
+    assert.equal(host.ledger().lastTag, 'v0.2.9');
+    assert.equal(host.ledger().receipt?.tag, 'v0.3.0', 'the refusal is held, not completed as a failed release');
+    assert.equal(host.ledger().components.meter, undefined);
+    const action = deploying(refused) as Extract<Action, { kind: 'page' }>;
+    assert.equal(action.reason, 'irreversible-action');
+    assert.equal(action.diagnose, undefined, 'no log reader');
+  }
   // Control: an installer failure without a refusal plan line is still an ordinary red receipt.
   const red = world({ ...meterRelease, tags: ['v0.2.9', 'v0.3.0'], ledger: baseline() });
   t.after(red.cleanup);
