@@ -3,10 +3,13 @@
 import base64
 import copy
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
+import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -19,6 +22,10 @@ import zipfile
 
 import release as r
 import ci_recovery as recovery
+
+_spec = importlib.util.spec_from_file_location("prove_cache", Path(__file__).with_name("prove-cache.py"))
+prove_cache = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(prove_cache)
 
 ROOT = Path(__file__).resolve().parents[2]
 INVENTORY = json.loads((ROOT / "deploy/components.json").read_bytes())
@@ -1497,8 +1504,8 @@ class RunnerProvisioning(unittest.TestCase):
         self.assertIn(probe, build)
         self.assertLess(build.index("sudo apt-get update"), build.index(install))
         self.assertLess(build.index(install), build.index(probe))
-        self.assertLess(build.index(probe), build.index("release-target-v1-"))
-        self.assertLess(build.index("release-target-v1-"), build.index("python3 scripts/release/release.py build"))
+        self.assertLess(build.index(probe), build.index("release-target-v2-"))
+        self.assertLess(build.index("release-target-v2-"), build.index("python3 scripts/release/release.py build"))
         self.assertIn(".amp/in/cargo-target", build)
         self.assertNotIn("actions/cache@", publish)
         self.assertNotIn("apt-get download bubblewrap", build)
@@ -1521,6 +1528,63 @@ class RunnerProvisioning(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ github.token }}", continuation)
         self.assertIn("if: needs.publish.outputs.published == 'true'", continuation)
         self.assertIn("gh workflow run release.yml --repo Metacomet-Technologies/factory --ref main", continuation)
+
+    def test_release_cache_falls_back_across_locks_but_never_across_toolchains(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        step = workflow.split("- name: Restore release build cache\n", 1)[1].split("\n      - name:", 1)[0]
+        key = re.search(r"^ +key: (.+)$", step, re.M).group(1)
+        prefixes = re.search(r"^ +restore-keys: \|\n((?: {12}\S.*(?:\n|$))+)", step, re.M).group(1).strip().splitlines()
+        prefixes = [prefix.strip() for prefix in prefixes]
+
+        def evaluate(template, files):
+            def value(match):
+                if match.group(1) in ("runner.os", "runner.arch"):
+                    return {"runner.os": "Linux", "runner.arch": "X64"}[match.group(1)]
+                names = re.findall(r"'([^']+)'", re.fullmatch(r"hashFiles\((.+)\)", match.group(1)).group(1))
+                return hashlib.sha256(b"".join(hashlib.sha256(files[n]).digest() for n in names)).hexdigest()
+            return re.sub(r"\$\{\{ (.+?) \}\}", value, template)
+
+        def restored(saved, files):
+            # actions/cache: the exact key, else the newest entry under each restore-key prefix.
+            if evaluate(key, files) in saved:
+                return evaluate(key, files)
+            for prefix in prefixes:
+                matches = [entry for entry in saved if entry.startswith(evaluate(prefix, files))]
+                if matches:
+                    return matches[-1]
+            return None
+
+        base = {"rust-toolchain.toml": b'channel = "1.99.0"\n', "Cargo.lock": b"lock one\n"}
+        saved = [evaluate(key, base)]
+        self.assertEqual(restored(saved, base), saved[0])
+        self.assertEqual(restored(saved, {**base, "Cargo.lock": b"lock two\n"}), saved[0])
+        self.assertIsNone(restored(saved, {**base, "rust-toolchain.toml": b'channel = "1.100.0"\n'}))
+        self.assertIsNone(restored(saved, {"rust-toolchain.toml": b'channel = "1.100.0"\n', "Cargo.lock": b"lock two\n"}))
+        # Entries written under the broken v1 key never restore.
+        self.assertTrue(saved[0].startswith("release-target-v2-Linux-X64-"))
+
+    def test_cache_proof_refuses_any_difference_and_reads_per_plan_timing(self):
+        builds = {scenario: {name: {"sha256": "a" * 64, "size": 1, "identity": None} for name in prove_cache.BINARIES}
+                  for scenario in ("warm", "cold", "seeded")}
+        prove_cache.compare(builds)
+        builds["seeded"]["pricing"] = {**builds["seeded"]["pricing"], "sha256": "b" * 64}
+        with self.assertRaisesRegex(ValueError, "pricing"):
+            prove_cache.compare(builds)
+        environment = prove_cache.release_environment((ROOT / "scripts/release/build.sh").read_text())
+        self.assertIn("RUSTUP_TOOLCHAIN=1.99.0", environment[0])
+        self.assertTrue(environment[2].startswith("cargo build --release --locked -p meter"))
+        log = "\n".join([
+            "build\tUNKNOWN STEP\t2026-10-26T02:07:51.36Z Cloning into '/w/f/.amp/in/release'...",
+            "build\tUNKNOWN STEP\t2026-10-26T02:07:51.55Z HEAD is now at 627cfe5 First",
+            "build\tUNKNOWN STEP\t2026-10-26T02:10:07.18Z     Finished `release` profile [optimized] target(s) in 1m 58s",
+            "build\tUNKNOWN STEP\t2026-10-26T02:11:54.34Z Cloning into '/w/f/.amp/in/release'...",
+            "build\tUNKNOWN STEP\t2026-10-26T02:11:54.45Z HEAD is now at dcc0b84 Second",
+            "build\tUNKNOWN STEP\t2026-10-26T02:12:30.00Z     Finished `release` profile [optimized] target(s) in 30s",
+            "build\tUNKNOWN STEP\t2026-10-26T02:13:00.00Z ##[group]Run actions/upload-artifact@cf43",
+            "build\tUNKNOWN STEP\t2026-10-26T02:14:00.00Z Cleaning up orphan processes"])
+        plans = prove_cache.parse_build_log(log)
+        self.assertEqual([(p["short_sha"], p["seconds"]) for p in plans], [("627cfe5", 243.0), ("dcc0b84", 66.0)])
+        self.assertEqual(plans[1]["cargo"], ["`release` profile [optimized] target(s) in 30s"])
 
     def test_release_build_reuses_cargo_target_without_a_second_smoke(self):
         script = (ROOT / "scripts/release/build.sh").read_text()

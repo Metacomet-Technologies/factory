@@ -74,9 +74,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             .amp/in/cargo-target
-          key: release-target-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          # The fallback must be the key exactly through the toolchain segment:
+          # a changed Cargo.lock restores same-toolchain output, a toolchain never crosses.
+          key: release-target-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            release-target-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+            release-target-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Plan and build or verify (read-only)
         id: bundles
         env:
