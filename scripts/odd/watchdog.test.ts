@@ -1307,7 +1307,11 @@ function signedOrb() {
       default: if (name !== 'linear.save_status_update') effects.push(name); return {};
     }
   } };
-  const { $, commands } = fakeShell();
+  const { $: shell, commands } = fakeShell();
+  /** While set, every gh read fails the way an unreachable GitHub does (P3.7 fail-closed control). */
+  const github = { down: false };
+  const $ = async (strings: TemplateStringsArray, ...values: unknown[]) =>
+    github.down && strings[0].startsWith('gh ') ? { exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway' } : shell(strings, ...values);
   const logger = { log: (...args: unknown[]) => { output.push(args.map(String).join(' ')); } };
   const ui = {
     input: async (options: Record<string, unknown>) => { dialogs.push(options); return answers.shift(); },
@@ -1319,7 +1323,7 @@ function signedOrb() {
   const thread = { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] };
   const ctx = { thread, ui, logger, tools, $ };
   return {
-    reads, effects, output, dialogs, registrations, commands,
+    reads, effects, output, dialogs, registrations, commands, github,
     /** A fresh plugin load arming the control thread with no project secrets; `secrets` answer its dialogs (undefined = dismissed). */
     start(...secrets: (string | undefined)[]) { return this.startWith({}, ...secrets); },
     /** `start` with the project environment `env` in place while the plugin loads and arms. */
@@ -1368,62 +1372,105 @@ const githubBody = JSON.stringify({ action: 'synchronize', pull_request: { head:
 const linearBody = (sentAt: number, spacing = 0) => JSON.stringify({ action: 'update', type: 'Issue', data: { identifier: 'MET-8' }, webhookTimestamp: sentAt }, null, spacing);
 const sent = Date.parse(received) - 5_000;
 
-test('P4.6-webhooks: GitHub and Linear deliveries are evaluated once only when HMAC-SHA256 over the exact bytes matches; missing, malformed, bad, tampered, stale and replayed ones read nothing', async t => {
+/** One delivery as the provider would send it. `secret` signs `signed` (default: `body`); `header` overrides the signature header. */
+type Delivery = { provider: 'github' | 'linear'; id: string; body: string; at?: string; header?: Record<string, string>; secret?: string; signed?: string };
+const sign = ({ provider, body, header, secret, signed }: Delivery): Record<string, string> => {
+  if (header) return header;
+  const hex = hmac(secret ?? (provider === 'github' ? githubSecret : linearSecret), signed ?? body);
+  return provider === 'github' ? { 'x-hub-signature-256': `sha256=${hex}` } : { 'linear-signature': hex };
+};
+const ghSig = (hex: string) => ({ 'x-hub-signature-256': hex });
+const linSig = (hex: string) => ({ 'linear-signature': hex });
+const fresh = linearBody(sent);
+const spaced = linearBody(sent, 2);
+const at = (offsetMs: number) => linearBody(Date.parse(received) + offsetMs);
+
+/**
+ * The webhook-to-decision matrix. `evaluated`: the delivery reaches a lifecycle decision (the
+ * fixture issue sits in Todo without a spec, so the decision is `set-status Triage`, one
+ * `linear.save_issue`). `rejected`: recorded with `reason` and nothing else happens: no Linear
+ * read, no gh read, no write. `retried`: the handler throws so Amp redelivers, and nothing
+ * happens. `before` deliveries run first on the same plane and must be evaluated.
+ */
+const matrix: { name: string; delivery: Delivery; expect: 'evaluated' | 'rejected' | 'retried'; reason?: RegExp; before?: Delivery[]; setup?: 'no-secrets' | 'github-down' }[] = [
+  // Valid controls.
+  { name: 'GitHub: valid sha256= signature', delivery: { provider: 'github', id: 'g', body: githubBody }, expect: 'evaluated' },
+  { name: 'GitHub: valid signature in upper-case hex', delivery: { provider: 'github', id: 'g', body: githubBody, header: ghSig(`sha256=${hmac(githubSecret, githubBody).toUpperCase()}`) }, expect: 'evaluated' },
+  { name: 'Linear: valid bare-hex signature', delivery: { provider: 'linear', id: 'l', body: fresh }, expect: 'evaluated' },
+  { name: 'Linear: valid over the exact raw bytes, whitespace included', delivery: { provider: 'linear', id: 'l', body: spaced }, expect: 'evaluated' },
+  { name: 'Linear: sent 59 s before receipt is fresh', delivery: { provider: 'linear', id: 'l', body: at(-59_000) }, expect: 'evaluated' },
+  // Absent, malformed or wrong signatures.
+  { name: 'GitHub: no signature header', delivery: { provider: 'github', id: 'g', body: githubBody, header: {} }, expect: 'rejected', reason: /^missing x-hub-signature-256$/ },
+  { name: 'GitHub: bare hex without sha256=', delivery: { provider: 'github', id: 'g', body: githubBody, header: ghSig(hmac(githubSecret, githubBody)) }, expect: 'rejected', reason: /^malformed/ },
+  { name: 'GitHub: legacy sha1= signature', delivery: { provider: 'github', id: 'g', body: githubBody, header: ghSig(`sha1=${hmac(githubSecret, githubBody).slice(0, 40)}`) }, expect: 'rejected', reason: /^malformed/ },
+  { name: 'GitHub: truncated signature', delivery: { provider: 'github', id: 'g', body: githubBody, header: ghSig(`sha256=${hmac(githubSecret, githubBody).slice(0, -2)}`) }, expect: 'rejected', reason: /^malformed/ },
+  { name: 'GitHub: signed with the Linear secret', delivery: { provider: 'github', id: 'g', body: githubBody, secret: linearSecret }, expect: 'rejected', reason: /^invalid/ },
+  { name: 'GitHub: only a Linear-style header', delivery: { provider: 'github', id: 'g', body: githubBody, header: linSig(hmac(githubSecret, githubBody)) }, expect: 'rejected', reason: /^missing/ },
+  { name: 'Linear: no signature header', delivery: { provider: 'linear', id: 'l', body: fresh, header: {} }, expect: 'rejected', reason: /^missing linear-signature$/ },
+  { name: 'Linear: GitHub-style sha256= header', delivery: { provider: 'linear', id: 'l', body: fresh, header: linSig(`sha256=${hmac(linearSecret, fresh)}`) }, expect: 'rejected', reason: /^malformed/ },
+  { name: 'Linear: signed with the GitHub secret', delivery: { provider: 'linear', id: 'l', body: fresh, secret: githubSecret }, expect: 'rejected', reason: /^invalid/ },
+  // Raw bytes: a verifier that parses and re-serializes would accept these.
+  { name: 'GitHub: one space added after signing', delivery: { provider: 'github', id: 'g', body: githubBody.replace('"closes', ' "closes'), signed: githubBody }, expect: 'rejected', reason: /^invalid/ },
+  { name: 'Linear: issue identifier changed after signing', delivery: { provider: 'linear', id: 'l', body: fresh.replace('MET-8', 'MET-9'), signed: fresh }, expect: 'rejected', reason: /^invalid/ },
+  { name: 'Linear: same JSON re-serialized compactly', delivery: { provider: 'linear', id: 'l', body: fresh, signed: spaced }, expect: 'rejected', reason: /^invalid/ },
+  // Linear freshness.
+  { name: 'Linear: sent 61 s before receipt is stale', delivery: { provider: 'linear', id: 'l', body: at(-61_000) }, expect: 'rejected', reason: /^stale delivery/ },
+  { name: 'Linear: stamped 61 s after receipt is stale', delivery: { provider: 'linear', id: 'l', body: at(61_000) }, expect: 'rejected', reason: /^stale delivery/ },
+  { name: 'Linear: signed body without webhookTimestamp', delivery: { provider: 'linear', id: 'l', body: JSON.stringify({ data: { identifier: 'MET-8' } }) }, expect: 'rejected', reason: /^missing webhookTimestamp$/ },
+  { name: 'Linear: signed body that is not JSON', delivery: { provider: 'linear', id: 'l', body: 'MET-8' }, expect: 'rejected', reason: /^unparseable body$/ },
+  // Duplicates and replays.
+  { name: 'Linear: same signed bytes under a new event ID is a replay', before: [{ provider: 'linear', id: 'l-first', body: spaced }], delivery: { provider: 'linear', id: 'l-replay', body: spaced, at: '2026-10-26T15:00:20.000Z' }, expect: 'rejected', reason: /^replayed delivery$/ },
+  { name: 'Linear: Amp redelivering the same event is deduplicated', before: [{ provider: 'linear', id: 'l', body: fresh }], delivery: { provider: 'linear', id: 'l', body: fresh }, expect: 'rejected' },
+  { name: 'GitHub: Amp redelivering the same event is deduplicated', before: [{ provider: 'github', id: 'g', body: githubBody }], delivery: { provider: 'github', id: 'g', body: githubBody }, expect: 'rejected' },
+  // Arming and #222.
+  { name: 'GitHub: valid signature, secret never entered', setup: 'no-secrets', delivery: { provider: 'github', id: 'g', body: githubBody }, expect: 'retried' },
+  { name: 'Linear: valid signature, secret never entered', setup: 'no-secrets', delivery: { provider: 'linear', id: 'l', body: fresh }, expect: 'retried' },
+  { name: 'Linear: valid signature, GitHub unreadable (P3.7 fails closed)', setup: 'github-down', delivery: { provider: 'linear', id: 'l', body: fresh }, expect: 'retried' },
+];
+
+test('P4.6-webhooks: webhook-to-decision matrix', async t => {
   mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse(received) });
   t.after(() => mock.timers.reset());
-  const orb = signedOrb();
-  await orb.start(linearSecret, githubSecret);
-  assert.deepEqual(orb.registrations, ['linear', 'github'], 'no Slack webhook: intake is polled');
-  assert.deepEqual(orb.reads, [], 'arming reads no issue');
-
-  const refused = async (key: string, id: string, body: string, headers: Record<string, string>, at?: string) => {
-    await orb.deliver(key, id, body, headers, at);
-    assert.deepEqual(orb.reads, [], `${id} must not be read`);
-    assert.deepEqual(orb.effects, [], `${id} must cause no lifecycle action`);
-    assert.ok(!orb.commands.some(command => command.startsWith('gh ')), `${id} must not query GitHub`);
-  };
-  const githubSig = `sha256=${hmac(githubSecret, githubBody)}`;
-  await refused('github', 'gh-missing', githubBody, {});
-  await refused('github', 'gh-bare-hex', githubBody, { 'x-hub-signature-256': hmac(githubSecret, githubBody) });
-  await refused('github', 'gh-sha1', githubBody, { 'x-hub-signature-256': `sha1=${hmac(githubSecret, githubBody).slice(0, 40)}` });
-  await refused('github', 'gh-wrong-secret', githubBody, { 'x-hub-signature-256': `sha256=${hmac(linearSecret, githubBody)}` });
-  await refused('github', 'gh-linear-header', githubBody, { 'linear-signature': hmac(githubSecret, githubBody) });
-  // The same JSON with one space added is different bytes: a verifier that re-serializes would accept it.
-  await refused('github', 'gh-tampered', githubBody.replace('"closes', ' "closes'), { 'x-hub-signature-256': githubSig });
-  await refused('github', 'gh-short', githubBody, { 'x-hub-signature-256': githubSig.slice(0, -2) });
-
-  const fresh = linearBody(sent);
-  await refused('linear', 'lin-missing', fresh, {});
-  await refused('linear', 'lin-github-format', fresh, { 'linear-signature': `sha256=${hmac(linearSecret, fresh)}` });
-  await refused('linear', 'lin-wrong-secret', fresh, { 'linear-signature': hmac(githubSecret, fresh) });
-  await refused('linear', 'lin-tampered', fresh.replace('MET-8', 'MET-9'), { 'linear-signature': hmac(linearSecret, fresh) });
-  const stale = linearBody(Date.parse(received) - 60_000 - 1_000);
-  await refused('linear', 'lin-stale', stale, { 'linear-signature': hmac(linearSecret, stale) });
-  const future = linearBody(Date.parse(received) + 60_000 + 1_000);
-  await refused('linear', 'lin-future', future, { 'linear-signature': hmac(linearSecret, future) });
-  const unstamped = JSON.stringify({ data: { identifier: 'MET-8' } });
-  await refused('linear', 'lin-unstamped', unstamped, { 'linear-signature': hmac(linearSecret, unstamped) });
-
-  // Valid: evaluated once, and Amp redelivering the same event is deduplicated.
-  await orb.deliver('github', 'gh-ok', githubBody, { 'x-hub-signature-256': githubSig.toUpperCase().replace('SHA256=', 'sha256=') });
-  await orb.deliver('github', 'gh-ok', githubBody, { 'x-hub-signature-256': githubSig });
-  assert.deepEqual(orb.reads, ['MET-7']);
-  // Linear signs the raw bytes it sent, whitespace included, and 59 s from receipt is fresh.
-  const edge = linearBody(Date.parse(received) - 59_000);
-  await orb.deliver('linear', 'lin-edge', edge, { 'linear-signature': hmac(linearSecret, edge) });
-  assert.deepEqual(orb.reads, ['MET-7', 'MET-8']);
-  const spaced = linearBody(Date.parse(received) - 30_000, 2);
-  await orb.deliver('linear', 'lin-ok', spaced, { 'linear-signature': hmac(linearSecret, spaced) });
-  assert.deepEqual(orb.reads, ['MET-7', 'MET-8', 'MET-8']);
-  // The same signed bytes under a new event ID inside the window are a replay.
-  await orb.deliver('linear', 'lin-replay', spaced, { 'linear-signature': hmac(linearSecret, spaced) }, '2026-10-26T15:00:20.000Z');
-  assert.deepEqual(orb.reads, ['MET-7', 'MET-8', 'MET-8'], 'a replay inside the freshness window is not read');
-
-  const { events } = await orb.status() as { events: { source: string; stage: string; error?: string }[] };
-  const rejected = events.filter(event => event.stage === 'rejected').map(event => `${event.source} ${event.error}`);
-  assert.ok(rejected.includes('linear replayed delivery'));
-  assert.ok(rejected.some(reason => /^linear stale delivery/.test(reason)));
-  assert.ok(rejected.includes('github invalid x-hub-signature-256'));
+  for (const row of matrix) {
+    await t.test(`${row.expect}: ${row.name}`, async () => {
+      const orb = signedOrb();
+      await (row.setup === 'no-secrets' ? orb.start(undefined, undefined) : orb.start(linearSecret, githubSecret));
+      const send = (delivery: Delivery) => orb.deliver(delivery.provider, delivery.id, delivery.body, sign(delivery), delivery.at);
+      const issue = (delivery: Delivery) => (delivery.provider === 'github' ? 'MET-7' : 'MET-8');
+      for (const prior of row.before ?? []) await send(prior);
+      assert.deepEqual(orb.reads, (row.before ?? []).map(issue), 'every prior delivery is evaluated');
+      const [reads, effects, commands] = [orb.reads.length, orb.effects.length, orb.commands.length];
+      orb.github.down = row.setup === 'github-down';
+      if (row.expect === 'retried') await assert.rejects(send(row.delivery), row.setup === 'github-down' ? /HTTP 502/ : /signing secret not set/);
+      else await send(row.delivery);
+      const { events } = await orb.status() as { events: { source: string; issue: string | null; stage: string; error?: string; action?: { kind: string; status?: string } }[] };
+      const last = events.findLast(event => event.source === row.delivery.provider)!;
+      const newReads = orb.reads.slice(reads);
+      const newEffects = orb.effects.slice(effects);
+      if (row.expect === 'evaluated') {
+        assert.deepEqual(newReads, [issue(row.delivery)], 'one snapshot read');
+        assert.deepEqual([last.issue, last.stage, last.action?.kind, last.action?.status], [issue(row.delivery), 'performed', 'set-status', 'Triage'], 'the lifecycle decision');
+        assert.deepEqual(newEffects, ['linear.save_issue'], 'the decision is carried out');
+        return;
+      }
+      assert.deepEqual(newEffects, [], 'no lifecycle action');
+      // An authenticated delivery may read; P3.7 holds its decision when GitHub is unreadable.
+      if (row.setup !== 'github-down') {
+        assert.deepEqual(newReads, [], 'no Linear read');
+        assert.deepEqual(orb.commands.slice(commands), [], 'no gh read');
+      } else assert.equal(last.stage, 'failed');
+      if (row.reason) assert.deepEqual([last.stage, last.issue], ['rejected', null]), assert.match(last.error ?? '', row.reason);
+      if (row.expect === 'retried') {
+        // Recovery: the same event, redelivered once the cause is gone, is decided exactly once.
+        orb.github.down = false;
+        orb.answer(linearSecret, githubSecret);
+        if (row.setup === 'no-secrets') await orb.status({ set_secrets: true });
+        await send(row.delivery);
+        assert.deepEqual(orb.reads.slice(reads).filter(id => id === issue(row.delivery)).length, row.setup === 'github-down' ? 2 : 1, 'the redelivery is evaluated');
+        assert.deepEqual(orb.effects.slice(effects), ['linear.save_issue'], 'and decided once');
+      }
+    });
+  }
 });
 
 test('P4.6-webhooks: without a secret (first arm, dismissed dialog, plugin reload) every delivery is refused and retried; private setup recovers without new URLs; no secret reaches status, logs, errors or tools', async t => {
