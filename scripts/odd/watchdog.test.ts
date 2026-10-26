@@ -4,7 +4,7 @@ import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, inc
 import { heartbeatLine, parseHeartbeat } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
 import { receiptLabel, type LiveThread } from './snapshot.ts';
-import plugin from '../../.amp/plugins/factory-odd.ts';
+import plugin, { followUp } from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
 import { io } from './launch.ts';
 
@@ -381,7 +381,7 @@ test('P3.1: one shared blocker is one incident; it is plane-blocked only when ev
   assert.equal(incidentPageDue({ ...incident, due: true, delivered: 'action-failed' }), true, 'an action-failed page is raised to plane-blocked once');
 });
 
-type Pr = { number: number; headRefName: string; headRefOid: string; state: 'OPEN' | 'MERGED'; mergeCommit: { oid: string } | null; mergedAt?: string; mergeable: string; commits: { oid: string; committedDate: string }[]; statusCheckRollup: { name: string; conclusion: string }[]; body: string };
+type Pr = { number: number; headRefName: string; headRefOid: string; state: 'OPEN' | 'MERGED'; mergeCommit: { oid: string } | null; mergedAt?: string; mergeable: string; commits: { oid: string; committedDate: string }[]; statusCheckRollup: Record<string, unknown>[]; body: string };
 type Shell = { exitCode: number; stdout: string; stderr: string };
 
 /**
@@ -711,7 +711,7 @@ test('P3.7: open-PR discovery stays under GitHub\'s node bound, finds an owned P
   // The owned open PR is the 141st open PR, past gh's first 100-PR page; CI is still running.
   // Its head is commit 150, past the 100 commits gh reads with a PR.
   const history = Array.from({ length: 149 }, (_, i) => ({ oid: (i + 1).toString(16).padStart(40, '0'), committedDate: '2026-10-26T13:00:00Z' }));
-  plant.openPr('MET-7', sha, { statusCheckRollup: [{ name: 'ci', conclusion: '' }], commits: [...history, { oid: sha, committedDate: '2026-10-26T13:30:00Z' }] });
+  plant.openPr('MET-7', sha, { statusCheckRollup: [{ name: 'ci', conclusion: '', status: 'IN_PROGRESS' }], commits: [...history, { oid: sha, committedDate: '2026-10-26T13:30:00Z' }] });
   // A merged-only issue still derives Deploying from its merged PR.
   plant.issue('MET-8', 'In Progress');
   plant.prs.push({ ...otherPr(8), headRefName: 'met-8-done', state: 'MERGED', mergeCommit: { oid: '8'.repeat(40) }, mergedAt: '2026-10-26T14:00:00Z', body: 'closes MET-8' });
@@ -763,6 +763,13 @@ test('P3.7: a failed, malformed or truncated read is never missing work: no canc
     { name: 'a thread search row without an id', error: /find_thread returned a malformed threads row at 0/, setup: plant => { plant.control.inject = name => name === 'find_thread' ? { threads: [{ updatedAt: '2026-10-26T14:30:00.000Z' }] } : undefined; } },
     { name: 'thread labels that are not strings', error: /get_thread_status T-MET-7 returned no labels or agent state/, setup: plant => { plant.control.inject = (name, input) => name === 'get_thread_status' && input.thread === 'T-MET-7' ? { metadata: { labels: [null], archived: false }, agentState: { state: 'idle' } } : undefined; } },
     { name: 'a merged PR without its merge commit', error: /gh pr view 7 returned malformed or changed details for merged MET-7/, guard: /malformed or changed details for merged/, setup: plant => { plant.prs[0] = { ...plant.prs[0], state: 'MERGED', mergeCommit: null, mergedAt: '2026-10-26T14:00:00Z' }; } },
+    // Re-review of 223e4f5, and the same boundaries' equivalent omissions.
+    ...([['omitted', undefined], ['empty', {}], ['with a null blocker list', { blockedBy: null }]] as const).map(([how, relations]) => ({ name: `get_issue with requested relations ${how}`, error: /linear\.get_issue MET-7 returned a malformed issue/, setup: (plant: ReturnType<typeof factory>) => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, relations } : undefined; } })),
+    { name: 'a check record without its fields', error: /gh pr view 7 returned malformed or changed details for open MET-7/, guard: /malformed or changed details/, setup: plant => { plant.prs[0].statusCheckRollup = [{}]; } },
+    { name: 'a check record with a numeric conclusion', error: /gh pr view 7 returned malformed or changed details for open MET-7/, guard: /malformed or changed details/, setup: plant => { plant.prs[0].statusCheckRollup = [{ name: 'ci', conclusion: 1 }]; } },
+    { name: 'a status context without its state', error: /gh pr view 7 returned malformed or changed details for open MET-7/, guard: /malformed or changed details/, setup: plant => { plant.prs[0].statusCheckRollup = [{ __typename: 'StatusContext', context: 'buildkite' }]; } },
+    { name: 'a merged PR with an unusable merge time', error: /gh pr view 7 returned malformed or changed details for merged MET-7/, guard: /malformed or changed details for merged/, setup: plant => { plant.prs[0] = { ...plant.prs[0], state: 'MERGED', mergeCommit: { oid: '9'.repeat(40) }, mergedAt: 'not-a-date' }; } },
+    { name: 'a thread search page with a malformed cursor', error: /find_thread returned a malformed nextCursor/, setup: plant => { plant.control.inject = name => name === 'find_thread' ? { threads: [], nextCursor: 7 } : undefined; } },
     { name: 'list_comments without its payload', error: /linear\.list_comments returned no comments list/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? {} : undefined; } },
   ];
   for (const { name, error, guard, setup } of cases) {
@@ -822,6 +829,8 @@ test('P3.7: an empty enumeration is healthy only when no live role thread holds 
   assert.equal(await swept(listed({})), 0, 'a missing issues payload is a failed read');
   assert.equal(await swept(listed({ issues: [{}], hasNextPage: false })), 0, 'an issue row without an identifier is a failed read, not an empty workspace');
   assert.equal(await swept(listed({ issues: [{ id: '' }], hasNextPage: false })), 0);
+  assert.equal(await swept(listed({ issues: [{ id: 'MET-9' }], hasNextPage: true })), 0, 'a next page without a cursor is an incomplete read');
+  assert.equal(await swept(listed({ issues: [] })), 0, 'a page without hasNextPage is an incomplete read');
 });
 
 test('P3.7: any failed derivation withholds the sweep heartbeat even when other issues evaluate; a failed action does not', async t => {
@@ -832,7 +841,7 @@ test('P3.7: any failed derivation withholds the sweep heartbeat even when other 
     for (const id of ['MET-7', 'MET-8']) {
       it.issue(id, 'In Progress');
       it.builder(id, 'running');
-      it.openPr(id, id === 'MET-7' ? 'c'.repeat(40) : 'd'.repeat(40), { statusCheckRollup: [{ name: 'ci', conclusion: '' }] });
+      it.openPr(id, id === 'MET-7' ? 'c'.repeat(40) : 'd'.repeat(40), { statusCheckRollup: [{ name: 'ci', conclusion: '', status: 'IN_PROGRESS' }] });
     }
     if (unreadable) it.control.inject = (name, input) => name === 'linear.get_issue' && input.id === 'MET-7' ? { isError: true, content: [{ type: 'text', text: '{"id":"MET-7","status":"Todo"}' }] } : undefined;
     return it;
@@ -865,6 +874,15 @@ test('P3.7: a malformed comment or issue read on a Todo issue launches no Builde
     ['comments [{}]', plant => { plant.control.inject = name => name === 'linear.list_comments' ? { comments: [{}] } : undefined; }],
     ['id ""', plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, id: '', relations: { blockedBy: [] } } : undefined; }],
     ['status ""', plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, status: '', relations: { blockedBy: [] } } : undefined; }],
+    ['relations omitted', plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))! } : undefined; }],
+    ['relations {}', plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, relations: {} } : undefined; }],
+    ['blockedBy null', plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, relations: { blockedBy: null } } : undefined; }],
+    // Control: an open blocker holds a valid issue back, and the sweep stays healthy.
+    ['valid, blocked by an open issue (control)', plant => {
+      // The blocker is not an ODD issue, so the sweep does not work it.
+      plant.issues.set('MET-8', { id: 'MET-8', status: 'In Progress', labels: [], description: '' });
+      plant.control.inject = (name, input) => name === 'linear.get_issue' && input.id === 'MET-7' ? { ...plant.issues.get('MET-7')!, relations: { blockedBy: [{ id: 'MET-8' }] } } : undefined;
+    }],
   ];
   for (const [name, inject] of payloads) {
     await t.test(name, async () => {
@@ -876,13 +894,82 @@ test('P3.7: a malformed comment or issue read on a Todo issue launches no Builde
         await plant.start();
         await settle();
         const valid = name.startsWith('valid');
+        const blocked = name.includes('blocked by');
         // The fixture's launcher refuses every launch, so the valid control records one attempt.
-        assert.equal(plant.launches.length, valid ? 1 : 0, valid ? 'a valid Todo issue launches its Builder' : 'no Builder launch');
+        assert.equal(plant.launches.length, valid && !blocked ? 1 : 0, valid && !blocked ? 'a valid Todo issue launches its Builder' : 'no Builder launch');
         assert.equal(plant.heartbeats(), valid ? 1 : 0);
         assert.deepEqual(plant.saves, []);
       } finally {
         mock.timers.reset();
       }
     });
+  }
+});
+
+test('P3.7: the heartbeat lookup needs every row\'s id and body; a malformed lookup writes no new heartbeat row', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const writes = async (page: unknown) => {
+    const saved: Record<string, unknown>[] = [];
+    const orb = controlOrb((name, input) => {
+      if (name === 'linear.get_status_updates') return page;
+      if (name === 'linear.save_status_update') { saved.push(input); return { id: String(input.id ?? 'update-new') }; }
+      return emptyWork(name);
+    });
+    await orb.start();
+    await until(() => orb.calls.includes('linear.get_status_updates'));
+    await settle();
+    return saved.map(input => input.id ?? 'new');
+  };
+  assert.deepEqual(await writes({ statusUpdates: [], hasNextPage: false }), ['new'], 'no row yet: the first heartbeat row is created');
+  assert.deepEqual(await writes({ statusUpdates: [{ id: 'u-1', body: 'weekly update' }, { id: 'u-2', body: heartbeatLine('2026-10-26T14:00:00.000Z') }], hasNextPage: false }), ['u-2'], 'the existing row is updated in place');
+  assert.deepEqual(await writes({ statusUpdates: [{}], hasNextPage: false }), [], 'a row without id or body');
+  assert.deepEqual(await writes({ statusUpdates: [{ body: heartbeatLine('2026-10-26T14:00:00.000Z') }], hasNextPage: false }), [], 'the heartbeat row without its id');
+  assert.deepEqual(await writes({ statusUpdates: [{ id: 'u-3' }], hasNextPage: false }), [], 'a row without its body');
+  assert.deepEqual(await writes({ statusUpdates: [{ id: 'u-1', body: 'weekly update' }], hasNextPage: true }), [], 'a next page without a cursor');
+});
+
+test('P3.7: genuine pending CheckRuns, status contexts and an empty rollup are valid check reads', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const rollups: [string, Record<string, unknown>[], RegExp | undefined][] = [
+    ['a queued CheckRun with a null conclusion', [{ __typename: 'CheckRun', name: 'ci', conclusion: null, status: 'QUEUED' }], /CI still running/],
+    ['an in-progress CheckRun with an empty conclusion', [{ __typename: 'CheckRun', name: 'ci', conclusion: '', status: 'IN_PROGRESS' }], /CI still running/],
+    ['a failed CheckRun', [{ __typename: 'CheckRun', name: 'ci', conclusion: 'FAILURE', status: 'COMPLETED' }], /CI job ci failed/],
+    ['a pending status context', [{ __typename: 'StatusContext', context: 'buildkite/amp', state: 'PENDING' }], /CI still running/],
+    ['an empty rollup', [], undefined],
+  ];
+  for (const [name, rollup, expected] of rollups) {
+    const plant = factory();
+    plant.issue('MET-7', 'In Progress');
+    plant.builder('MET-7', 'running');
+    plant.openPr('MET-7', 'c'.repeat(40), { statusCheckRollup: rollup });
+    await plant.start();
+    await settle();
+    const verdict = await plant.guard(builderLabels) as { userMessage?: string } | undefined;
+    if (expected) assert.match(verdict?.userMessage ?? '', expected, name);
+    else assert.equal(verdict, undefined, name);
+  }
+});
+
+test('P3.7: the follow-up Bug lookup rejects malformed rows instead of filing a duplicate; valid empty and matching lookups create or reuse', async () => {
+  const title = 'Release 1.2.3 rolled back (abcdef123456)';
+  const run = async (lookup: unknown) => {
+    const saves: Record<string, unknown>[] = [];
+    const tools = { call: async (name: string, input: Record<string, unknown>) => {
+      if (name === 'linear.list_issues') return lookup;
+      if (name === 'linear.save_issue') { saves.push(input); return { id: 'uuid-new', identifier: 'MET-900' }; }
+      return {};
+    } };
+    const issue = { identifier: 'MET-7' } as Parameters<typeof followUp>[1];
+    const result = await followUp({ tools, logger: { log: () => {} } } as Parameters<typeof followUp>[0], issue, { title, body: 'x' }).then(id => ({ id }), (error: unknown) => ({ error: String(error) }));
+    return { result, saves: saves.map(input => (input.title ? 'create' : `relate ${String(input.id)}`)) };
+  };
+  assert.deepEqual(await run({ issues: [] }), { result: { id: 'MET-900' }, saves: ['create'] });
+  assert.deepEqual(await run({ issues: [{ id: 'MET-55', title }] }), { result: { id: 'MET-55' }, saves: ['relate MET-55'] });
+  for (const rows of [[{}], [{ title }], [{ id: '', title }], [{ id: 'MET-55' }]]) {
+    const { result, saves } = await run({ issues: rows });
+    assert.match((result as { error?: string }).error ?? '', /linear\.list_issues returned a malformed issues row at 0/, JSON.stringify(rows));
+    assert.deepEqual(saves, [], `no Bug filed for ${JSON.stringify(rows)}`);
   }
 });

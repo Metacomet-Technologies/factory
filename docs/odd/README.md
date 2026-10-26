@@ -487,10 +487,13 @@ by the previous one).
    or a malformed issue, comment, thread or PR collection or record (an
    issue row or issue without a non-blank identifier, status or labels, a
    comment that is not a record with a string body, a PR row without its
-   ownership fields, a merged PR without its merge commit and time, a thread
-   without its labels or agent state) is a failed read, never an empty one,
-   a Backlog issue or an idle thread; empty lists and empty bodies stay
-   valid; a
+   ownership fields, a merged PR without its merge commit or a usable merge
+   time, a CI check without the fields the lifecycle reads, a thread without
+   its labels or agent state, a requested blocker list that is absent, a
+   heartbeat or follow-up Bug row without its id, a next page without a
+   cursor) is a failed read, never an empty one, an unblocked or Backlog
+   issue, an idle thread or a missing row; empty lists, empty bodies, null
+   pending conclusions and unrequested relations stay valid; a
    nonzero `gh` exit throws instead of meaning "no PR", so the Ralph guard,
    stale-thread cancellation and evaluation neither continue, cancel, archive
    nor claim a missing PR off it. Open PRs are listed with flat ownership

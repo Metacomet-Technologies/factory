@@ -616,10 +616,10 @@ export default async function (amp: PluginAPI) {
 		if (!state.watchdog.heartbeatId) {
 			let cursor: string | undefined
 			do {
-				const page = await callJson<{ hasNextPage?: boolean; cursor?: string }>(ctx.tools, 'linear.get_status_updates', { type: 'project', project: heartbeatProject, orderBy: 'updatedAt', limit: 50, ...(cursor ? { cursor } : {}) })
-				// A failed lookup must not look like no row: it would add a second heartbeat row.
-				state.watchdog.heartbeatId = listOf<{ id?: string; body?: string }>(page, 'statusUpdates', 'linear.get_status_updates', row => optional(row, 'id', 'string') && optional(row, 'body', 'string')).find(update => parseHeartbeat(update.body ?? ''))?.id
-				cursor = page.hasNextPage ? page.cursor : undefined
+				const page = await callJson<unknown>(ctx.tools, 'linear.get_status_updates', { type: 'project', project: heartbeatProject, orderBy: 'updatedAt', limit: 50, ...(cursor ? { cursor } : {}) })
+				// A failed lookup must not look like no row: it would add a second heartbeat row. Every row has its id and body.
+				state.watchdog.heartbeatId = listOf<{ id: string; body: string }>(page, 'statusUpdates', 'linear.get_status_updates', row => named(row.id) && typeof row.body === 'string').find(update => parseHeartbeat(update.body))?.id
+				cursor = nextPage(page, 'linear.get_status_updates')
 			} while (!state.watchdog.heartbeatId && cursor)
 		}
 		const saved = await callJson<{ id?: string }>(ctx.tools, 'linear.save_status_update', { type: 'project', project: heartbeatProject, health: 'onTrack', body, ...(state.watchdog.heartbeatId ? { id: state.watchdog.heartbeatId } : {}) })
@@ -642,9 +642,9 @@ export default async function (amp: PluginAPI) {
 		const ids: string[] = []
 		let cursor: string | undefined
 		do {
-			const page = await callJson<{ hasNextPage?: boolean; cursor?: string }>(tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields: ['id'], ...(cursor ? { cursor } : {}) })
+			const page = await callJson<unknown>(tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields: ['id'], ...(cursor ? { cursor } : {}) })
 			for (const issue of listOf<{ id: string }>(page, 'issues', 'linear.list_issues', row => named(row.id))) ids.push(issue.id)
-			cursor = page.hasNextPage ? page.cursor : undefined
+			cursor = nextPage(page, 'linear.list_issues')
 		} while (cursor)
 		return ids
 	}
@@ -953,7 +953,8 @@ export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 // A rolled-back release returns its issues to Todo and files one Bug in Triage per failed
 // release (the title carries the SHA; a second issue of the same release reuses it). Returns the Bug.
 export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, followUp: { title: string; body: string }): Promise<string | undefined> {
-	const existing = listOf<{ id?: string; title?: string }>(await callJson(ctx.tools, 'linear.list_issues', { team: 'Metacomet', query: followUp.title, limit: 10 }), 'issues', 'linear.list_issues')
+	// A malformed row is a failed lookup, never "no Bug yet": that would file a duplicate.
+	const existing = listOf<{ id: string; title: string }>(await callJson(ctx.tools, 'linear.list_issues', { team: 'Metacomet', query: followUp.title, limit: 10 }), 'issues', 'linear.list_issues', row => named(row.id) && typeof row.title === 'string')
 	const match = existing.find(candidate => candidate.title === followUp.title)
 	if (match?.id) {
 		await callJson(ctx.tools, 'linear.save_issue', { id: match.id, relatedTo: [issue.identifier] })
@@ -971,7 +972,7 @@ export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logge
 const diagnosed = new Set<string>()
 export async function diagnose(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, receipt: DeployReceipt, bug: string | undefined, spawn: Spawn) {
 	const label = `odd-deploy-${receipt.sha.slice(0, 12)}`
-	const found = listOf(await callJson(ctx.tools, 'find_thread', { query: `label:${label}`, limit: 1 }), 'threads', 'find_thread')
+	const found = listOf(await callJson(ctx.tools, 'find_thread', { query: `label:${label}`, limit: 1 }), 'threads', 'find_thread', row => named(row.id))
 	if (diagnosed.has(label) || found.length) {
 		ctx.logger.log(marker, 'deploy log reader exists', issue.identifier, label)
 		return
@@ -1020,6 +1021,27 @@ const isRow = (value: unknown): value is Row => typeof value === 'object' && val
 const named = (value: unknown): value is string => typeof value === 'string' && value.trim() !== ''
 const optional = (row: Row, key: string, type: 'string' | 'boolean') => row[key] === undefined || row[key] === null || typeof row[key] === type
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(item => typeof item === 'string')
+const timestamp = (value: unknown): value is string => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/.test(value) && Number.isFinite(Date.parse(value))
+
+/** The cursor of a Linear page: `hasNextPage` is a boolean, and a next page has a cursor. Ending without one would drop the rest. */
+function nextPage(page: unknown, name: string): string | undefined {
+	if (!isRow(page) || typeof page.hasNextPage !== 'boolean') throw new Error(`${name} returned no hasNextPage`)
+	if (!page.hasNextPage) return undefined
+	if (!named(page.cursor)) throw new Error(`${name} reported a next page without a cursor`)
+	return page.cursor
+}
+
+/**
+ * The fields the lifecycle reads from a `statusCheckRollup` record (ciState, externalStop): a
+ * CheckRun has a name and a string or null conclusion, and without a conclusion it is pending
+ * with a status; a StatusContext has a context and a state. An empty rollup is valid.
+ */
+const checkRecord = (row: unknown): boolean => {
+	if (!isRow(row)) return false
+	if (row.__typename === 'StatusContext' || 'context' in row) return named(row.context) && named(row.state)
+	if (!named(row.name) || !(row.conclusion === null || row.conclusion === undefined || typeof row.conclusion === 'string') || !optional(row, 'status', 'string')) return false
+	return named(row.conclusion) || named(row.status)
+}
 
 /** The `key` collection of a read; a missing or malformed one, or one bad row, is a failed read, never an empty list. */
 function listOf<T>(payload: unknown, key: string, name: string, valid: (row: Row) => boolean = () => true): T[] {
@@ -1033,10 +1055,14 @@ function listOf<T>(payload: unknown, key: string, name: string, valid: (row: Row
 /** An issue read without its identifier, status or labels is a failed read, not a Backlog issue. */
 async function getIssue(tools: Tools, input: Record<string, unknown>): Promise<LinearIssue> {
 	const issue = await callJson<unknown>(tools, 'linear.get_issue', input)
-	const blockedBy = isRow(issue) && isRow(issue.relations) ? issue.relations.blockedBy : undefined
-	if (!isRow(issue) || !named(issue.id) || !named(issue.status) || !strings(issue.labels) || !optional(issue, 'description', 'string')
-		|| (issue.relations !== undefined && issue.relations !== null && !isRow(issue.relations))
-		|| (blockedBy !== undefined && blockedBy !== null && !(Array.isArray(blockedBy) && blockedBy.every(row => isRow(row) && named(row.id))))) {
+	// Requested relations must be present: an absent blocker list would lift the dependency gate.
+	const requested = input.includeRelations === true
+	const relations = isRow(issue) ? issue.relations : undefined
+	const blockedBy = isRow(relations) ? relations.blockedBy : undefined
+	const relationsValid = relations === undefined || relations === null
+		? !requested
+		: isRow(relations) && (blockedBy === undefined || blockedBy === null ? !requested : Array.isArray(blockedBy) && blockedBy.every(row => isRow(row) && named(row.id)))
+	if (!isRow(issue) || !named(issue.id) || !named(issue.status) || !strings(issue.labels) || !optional(issue, 'description', 'string') || !relationsValid) {
 		throw new Error(`linear.get_issue ${String(input.id)} returned a malformed issue`)
 	}
 	return issue as unknown as LinearIssue
@@ -1150,15 +1176,16 @@ async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifie
 	if (!owned) return undefined
 	const pr = ghJson(await ctx.$`gh pr view ${String(owned.number)} --json ${prFields}`, `gh pr view ${owned.number}`) as GitHubPullRequest | null
 	const sha = (value: unknown) => /^[0-9a-f]{40}$/.test(String(value))
-	const merged = state === 'merged' ? isRow(pr?.mergeCommit) && sha(pr.mergeCommit.oid) && named(pr.mergedAt) : true
+	// A merged PR's merge time is the durable start of its receipt wait, so it must be a usable timestamp.
+	const merged = state === 'merged' ? isRow(pr?.mergeCommit) && sha(pr.mergeCommit.oid) && timestamp(pr.mergedAt) : pr?.mergedAt === null || pr?.mergedAt === undefined || timestamp(pr.mergedAt)
 	if (!isRow(pr) || pr.number !== owned.number || pr.state !== state.toUpperCase() || !sha(pr.headRefOid) || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string' || !optional(pr, 'mergeable', 'string')
-		|| !merged || !Array.isArray(pr.statusCheckRollup) || !pr.statusCheckRollup.every(isRow) || !prOwnsIssue(pr, identifier)) {
+		|| !merged || !Array.isArray(pr.statusCheckRollup) || !pr.statusCheckRollup.every(checkRecord) || !prOwnsIssue(pr, identifier)) {
 		throw new Error(`gh pr view ${owned.number} returned malformed or changed details for ${state} ${identifier}`)
 	}
 	const head = await ctx.$`gh api ${`repos/{owner}/{repo}/commits/${pr.headRefOid}`} --jq .commit.committer.date`
 	if (head.exitCode !== 0) throw new Error(`gh api head commit ${pr.headRefOid} failed: ${head.stderr.trim()}`)
 	const committedDate = head.stdout.trim()
-	if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/.test(committedDate) || !Number.isFinite(Date.parse(committedDate))) throw new Error(`gh api head commit ${pr.headRefOid} returned no commit time`)
+	if (!timestamp(committedDate)) throw new Error(`gh api head commit ${pr.headRefOid} returned no commit time`)
 	return { ...pr, commits: [{ oid: pr.headRefOid, committedDate }] }
 }
 
@@ -1174,6 +1201,7 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 	let cursor: string | undefined
 	do {
 		const page = await callJson<{ nextCursor?: string }>(tools, 'find_thread', { query, limit: 100, ...(cursor ? { cursor } : {}) })
+		if (!optional(page as Row, 'nextCursor', 'string')) throw new Error('find_thread returned a malformed nextCursor')
 		const threads = listOf<{ id: string; updatedAt?: string }>(page, 'threads', 'find_thread', row => named(row.id) && optional(row, 'updatedAt', 'string'))
 		found.push(...threads)
 		cursor = threads.length ? page.nextCursor : undefined
