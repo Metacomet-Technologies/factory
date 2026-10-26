@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline release contracts; all publication requests go to FakeGitHub."""
+import base64
 import copy
 from contextlib import redirect_stderr, redirect_stdout
 import io
@@ -14,8 +15,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
+import zipfile
 
 import release as r
+import ci_recovery as recovery
 
 ROOT = Path(__file__).resolve().parents[2]
 INVENTORY = json.loads((ROOT / "deploy/components.json").read_bytes())
@@ -180,6 +183,360 @@ class TokenGitHub(FakeGitHub):
         if route == "releases" and method == "GET" and not self.draft_reads and not self.list_drafts:
             return [release for release in result if not release["draft"]]
         return result
+
+
+class RecoveryGitHub(FakeGitHub):
+    """GitHub wire-format fixtures, never accepted evidence outside the test."""
+    def __init__(self):
+        super().__init__()
+        self.controller, self.approval = "c" * 40, "d" * 40
+        self.eligible(recovery.SOURCE, 201)
+        original = self.runs.pop(201)
+        self.original = {**original, "id": recovery.ORIGINAL_RUN, "workflow_id": 381513212,
+                         "conclusion": "failure", "repository": {"id": recovery.REPO_ID},
+                         "head_repository": {"id": recovery.REPO_ID}}
+        self.runs[recovery.ORIGINAL_RUN] = self.original
+        self.jobs[recovery.ORIGINAL_RUN] = self.jobs.pop(201)
+        for job in self.jobs[recovery.ORIGINAL_RUN]:
+            job.update(run_attempt=1, conclusion="failure" if job["name"] == "scripts" else "success")
+            job["steps"] = [{"name": "Test encrypted off-site backups against loopback moto", "conclusion": "failure"}] if job["name"] == "scripts" else []
+        self.recovery_run = {"id": 900, "run_attempt": 2, "workflow_id": 700, "head_sha": self.controller,
+                             "head_branch": "main", "path": recovery.WORKFLOW, "event": "workflow_dispatch",
+                             "status": "completed", "conclusion": "success", "repository": {"id": recovery.REPO_ID},
+                             "head_repository": {"id": recovery.REPO_ID}, "actor": {"id": recovery.DEVON},
+                             "triggering_actor": {"id": recovery.DEVON}}
+        self.latest = self.recovery_run
+        self.record = {"source_sha": recovery.SOURCE, "repair": "dcc0b84-backup-group-v1",
+                       "workflow_sha": self.controller, "workflow_id": 700, "run_id": 900, "attempt": 2,
+                       "approval_pr": 300, "jobs": {}}
+        self.approval_pr = {"merged": True, "merged_at": "2026-10-26T00:00:00Z", "merge_commit_sha": self.approval,
+                            "merged_by": {"id": recovery.DEVON}, "base": {"ref": "main", "repo": {"id": recovery.REPO_ID}}}
+        self.approval_files = [{"filename": recovery.POLICY_PATH, "status": "modified"}]
+        self.recovery_jobs, self.artifacts, self.archives = [], [], {}
+        self.remote_record = self.record
+        self.approved_record = self.record
+        self.controller_policy = {}
+        self.controller_files = {p: (ROOT / p).read_bytes() for p in recovery.CONTROLLER_FILES}
+        self.revoke_after_upload = False
+        for index, name in enumerate(("rust", "kiosk", "scripts", "sandbox")):
+            receipt = {"repository_id": recovery.REPO_ID, "source_sha": recovery.SOURCE, "source_tree": recovery.TREE,
+                       "repair": "dcc0b84-backup-group-v1", "workflow_sha": self.controller,
+                       "run_id": 900, "attempt": 2, "job": name, "uid": 1001, "gid": 1002,
+                       "image": "ubuntu22" if name == "sandbox" else "ubuntu24", "image_version": "20261012.334.1",
+                       "offsite": {"uid": 1001, "gid": 1002, "groups": [1002, 998], "backup_gid": 998} if name == "scripts" else None}
+            item = {"job_id": 100 + index, "artifact_id": 200 + index, "receipt": receipt}
+            self.record["jobs"][name] = item
+            names = ("Validate source", *recovery.STEPS[name], "Record evidence", "Upload evidence")
+            self.recovery_jobs.append({"name": name, "id": item["job_id"], "run_id": 900, "run_attempt": 2,
+                                       "head_sha": self.controller, "status": "completed", "conclusion": "success",
+                                       "started_at": "2026-10-25T23:00:00Z", "completed_at": "2026-10-25T23:30:00Z",
+                                       "steps": [{"name": s, "number": n + 1, "status": "completed", "conclusion": "success"}
+                                                 for n, s in enumerate(names)]})
+            self.artifacts.append({"id": item["artifact_id"], "name": f"ci-recovery-900-2-{name}", "expired": False,
+                                   "created_at": "2026-10-25T23:29:00Z", "updated_at": "2026-10-25T23:29:01Z",
+                                   "expires_at": "2099-01-01T00:00:00Z", "workflow_run": {
+                                       "id": 900, "head_sha": self.controller, "head_branch": "main",
+                                       "repository_id": recovery.REPO_ID, "head_repository_id": recovery.REPO_ID}})
+            self.replace_receipt(name)
+
+    def replace_receipt(self, name, raw=None):
+        item = self.record["jobs"][name]
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, "w") as archive:
+            archive.writestr("receipt.json", raw if raw is not None else r.canonical(item["receipt"]))
+        raw = data.getvalue()
+        item["artifact_sha256"] = r.digest(raw)
+        artifact = next(a for a in self.artifacts if a["id"] == item["artifact_id"])
+        artifact.update(size_in_bytes=len(raw), digest="sha256:" + r.digest(raw))
+        self.archives[item["artifact_id"]] = raw
+
+    def handle(self, path, method, data, binary, upload):
+        url = urlsplit(path)
+        if url.path.startswith("contents/"):
+            name, ref = url.path[len("contents/"):], parse_qs(url.query)["ref"][0]
+            if name == recovery.POLICY_PATH:
+                value = self.remote_record if ref == "main" else self.approved_record
+                if ref == self.controller:
+                    value = self.controller_policy
+                if ref == "main" and self.revoke_after_upload and self.uploaded:
+                    value = {}
+                raw = r.canonical(value)
+            else:
+                raw = self.controller_files[name]
+            return {"type": "file", "encoding": "base64", "size": len(raw), "content": base64.b64encode(raw).decode()}
+        if url.path == "git/ref/heads/main":
+            return {"object": {"sha": self.approval}}
+        if url.path == "pulls/300":
+            return self.approval_pr
+        if url.path == "pulls/300/files":
+            return self.approval_files
+        if url.path == f"actions/runs/{recovery.ORIGINAL_RUN}":
+            return self.original
+        if url.path == "actions/workflows/700/runs":
+            return {"workflow_runs": [self.latest]}
+        if url.path == "actions/runs/900/attempts/2":
+            return self.recovery_run
+        if url.path == "actions/runs/900/attempts/2/jobs":
+            return {"jobs": self.recovery_jobs}
+        if url.path == "actions/runs/900/artifacts":
+            return {"artifacts": self.artifacts}
+        if url.path.startswith("actions/artifacts/"):
+            identifier = int(url.path.split("/")[2])
+            return self.archives[identifier] if binary else next(a for a in self.artifacts if a["id"] == identifier)
+        return super().handle(path, method, data, binary, upload)
+
+
+class HistoricalRecovery(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.policy = self.root / "approval.json"
+        self.enterContext(patch.object(recovery, "POLICY_FILE", self.policy))
+        self.history = ["d" * 40, "c" * 40, recovery.SOURCE]
+        self.merge_files = recovery.POLICY_PATH
+        self.enterContext(patch.object(recovery, "git", side_effect=self.git_evidence))
+
+    def git_evidence(self, root, *args):
+        if args[:2] == ("rev-list", "--first-parent"):
+            return "\n".join(self.history)
+        if args[0] == "diff-tree":
+            return self.merge_files
+        raise AssertionError(args)
+
+    def evidence(self, api):
+        self.policy.write_bytes(r.canonical(api.record))
+        return api.evidence(recovery.SOURCE, INVENTORY)
+
+    def test_dormant_and_normal_ci_unchanged(self):
+        self.policy.write_text('{}')
+        api = RecoveryGitHub()
+        with self.assertRaisesRegex(ValueError, "exact-SHA main CI incomplete"):
+            api.evidence(recovery.SOURCE, INVENTORY)
+        self.assertEqual(api.writes, 0)
+        api.original["conclusion"] = "success"
+        for job in api.jobs[recovery.ORIGINAL_RUN]:
+            job["conclusion"] = "success"
+        self.assertNotIn("ci_recovery", api.evidence(recovery.SOURCE, INVENTORY))
+        # Even a malformed recovery policy cannot authorize or obstruct another SHA.
+        self.policy.write_text('{bad')
+        api.eligible(SHA, 2)
+        self.assertEqual(api.evidence(SHA, INVENTORY)["ci_run"], 2)
+        api.runs[2]["conclusion"] = "failure"
+        with self.assertRaisesRegex(ValueError, "exact-SHA main CI incomplete"):
+            api.evidence(SHA, INVENTORY)
+
+    def test_exact_recovery_roundtrip_and_immutable_resume(self):
+        api = RecoveryGitHub()
+        evidence = self.evidence(api)
+        self.assertEqual((evidence["ci_run"], evidence["ci_attempt"], evidence["pull_request"]), (900, 2, 201))
+        self.assertEqual(evidence["ci_recovery"]["event"], "workflow_dispatch")
+        reservation = {**plan(recovery.SOURCE), **evidence}
+        self.assertEqual(r.publish_one(api, reservation, INVENTORY, self.root / "bundle", fixture_build), "complete")
+        manifest = r.verify_bundle(self.root / "bundle", INVENTORY, recovery.SOURCE)
+        self.assertEqual(manifest["evidence"], reservation)
+        # Completed immutable releases no longer depend on retained CI artifacts.
+        api.artifacts.clear()
+        self.policy.write_text('{}')
+        writes = api.writes
+        self.assertEqual(r.publish_one(api, reservation, INVENTORY, self.root / "retry", fixture_build), "already complete")
+        self.assertEqual(api.writes, writes)
+        altered = copy.deepcopy(manifest)
+        altered["evidence"]["ci_recovery"]["record"]["jobs"]["scripts"]["receipt"]["offsite"]["groups"] = [1002]
+        with self.assertRaisesRegex(ValueError, "membership"):
+            r.validate_manifest(altered, INVENTORY, recovery.SOURCE)
+
+    def test_wrong_identity_approval_and_job_evidence(self):
+        cases = [
+            ("record.source_sha", "a" * 40), ("record.workflow_sha", "b" * 40), ("record.repair", "other"),
+            ("recovery_run.event", "push"), ("recovery_run.path", ".github/workflows/ci.yml"),
+            ("recovery_run.head_sha", recovery.SOURCE), ("recovery_run.head_branch", "feature"),
+            ("recovery_run.repository.id", 77), ("recovery_run.head_repository.id", 77),
+            ("recovery_run.actor.id", 77), ("recovery_run.triggering_actor.id", 77),
+            ("recovery_run.conclusion", "failure"), ("recovery_run.run_attempt", 3),
+            ("approval_pr.merged", False), ("approval_pr.merged_by.id", 77),
+            ("approval_pr.base.ref", "feature"), ("approval_pr.base.repo.id", 77),
+            ("approval_pr.merged_at", "2026-10-25T23:15:00Z"),
+            ("original.run_attempt", 2), ("original.head_repository.id", 77),
+        ]
+        for path, value in cases:
+            with self.subTest(path=path):
+                api = RecoveryGitHub()
+                head, *keys = path.split(".")
+                target = getattr(api, head)
+                for key in keys[:-1]:
+                    target = target[key]
+                target[keys[-1]] = value
+                with self.assertRaises(ValueError):
+                    self.evidence(api)
+                self.assertEqual(api.writes, 0)
+        for field, value in (("head_sha", recovery.SOURCE), ("run_attempt", 1), ("run_id", 901),
+                             ("conclusion", "skipped"), ("id", 999)):
+            with self.subTest(job_field=field):
+                api = RecoveryGitHub()
+                api.recovery_jobs[0][field] = value
+                with self.assertRaises(ValueError):
+                    self.evidence(api)
+        api = RecoveryGitHub()
+        next(j for j in api.jobs[recovery.ORIGINAL_RUN] if j["name"] == "scripts")["steps"][0]["name"] = "Other failure"
+        with self.assertRaisesRegex(ValueError, "differs from diagnosed fixture"):
+            self.evidence(api)
+        for condition in ("skipped", "failure", "missing", "duplicate"):
+            api = RecoveryGitHub()
+            steps = api.recovery_jobs[2]["steps"]
+            step = next(s for s in steps if s["name"] == "Offsite tests")
+            if condition == "missing":
+                steps.remove(step)
+            elif condition == "duplicate":
+                steps.append(copy.deepcopy(step))
+            else:
+                step["conclusion"] = condition
+            with self.subTest(step=condition), self.assertRaisesRegex(ValueError, "step"):
+                self.evidence(api)
+
+    def test_artifact_substitution_expiry_and_nonroot_membership(self):
+        for field, value in (("expired", True), ("expires_at", "2020-01-01T00:00:00Z"),
+                             ("id", 777), ("digest", "sha256:" + "0" * 64),
+                             ("created_at", "2026-10-25T22:00:00Z"), ("updated_at", "2026-10-25T23:31:00Z"),
+                             ("name", "ci-recovery-900-1-rust")):
+            with self.subTest(artifact=field):
+                api = RecoveryGitHub()
+                api.artifacts[0][field] = value
+                with self.assertRaises(ValueError):
+                    self.evidence(api)
+        for field, value in (("uid", 0), ("source_tree", "b" * 40), ("attempt", 1), ("repository_id", 99)):
+            with self.subTest(receipt=field):
+                api = RecoveryGitHub()
+                api.record["jobs"]["scripts"]["receipt"][field] = value
+                api.replace_receipt("scripts")
+                with self.assertRaises(ValueError):
+                    self.evidence(api)
+        for field, value in (("uid", 0), ("gid", 55), ("groups", [1002]), ("backup_gid", 0)):
+            with self.subTest(group=field):
+                api = RecoveryGitHub()
+                api.record["jobs"]["scripts"]["receipt"]["offsite"][field] = value
+                api.replace_receipt("scripts")
+                with self.assertRaises(ValueError):
+                    self.evidence(api)
+        api = RecoveryGitHub()
+        api.replace_receipt("rust", r.canonical({**api.record["jobs"]["rust"]["receipt"], "attempt": 1}))
+        with self.assertRaisesRegex(ValueError, "substitution"):
+            self.evidence(api)
+        api = RecoveryGitHub()
+        api.artifacts[0]["workflow_run"]["id"] = 901
+        with self.assertRaisesRegex(ValueError, "origin"):
+            self.evidence(api)
+        api = RecoveryGitHub()
+        api.archives[200] = b"altered bytes"
+        with self.assertRaisesRegex(ValueError, "bytes/digest"):
+            self.evidence(api)
+
+    def test_approval_controller_history_and_newer_runs_fail_closed(self):
+        for change in ("remote", "approved", "controller", "controller-policy", "files", "merge-files", "history", "new-run"):
+            api = RecoveryGitHub()
+            with self.subTest(change=change):
+                if change == "remote":
+                    api.remote_record = {}
+                elif change == "approved":
+                    api.approved_record = {}
+                elif change == "controller":
+                    api.controller_files[recovery.WORKFLOW] += b"# changed\n"
+                elif change == "controller-policy":
+                    api.controller_policy = api.record
+                elif change == "files":
+                    api.approval_files.append({"filename": "other", "status": "modified"})
+                elif change == "merge-files":
+                    self.merge_files = recovery.POLICY_PATH + "\nother"
+                elif change == "history":
+                    self.history = [api.approval, recovery.SOURCE]
+                else:
+                    api.latest = {**api.recovery_run, "id": 901, "conclusion": "failure"}
+                with self.assertRaises(ValueError):
+                    self.evidence(api)
+                self.history = [api.approval, api.controller, recovery.SOURCE]
+                self.merge_files = recovery.POLICY_PATH
+        api = RecoveryGitHub()
+        api.latest = {**api.recovery_run, "id": 901, "status": "queued", "conclusion": None}
+        self.assertIsNone(self.evidence(api))
+        self.assertTrue(api.waiting_for_ci)
+
+    def test_changed_approval_stops_before_reservation_and_before_publication(self):
+        for boundary in ("reserve", "publish"):
+            with self.subTest(boundary=boundary):
+                api = RecoveryGitHub()
+                reservation = {**plan(recovery.SOURCE), **self.evidence(api)}
+                if boundary == "reserve":
+                    api.remote_record = {}
+                else:
+                    api.revoke_after_upload = True
+                with self.assertRaisesRegex(ValueError, "approval changed"):
+                    r.publish_one(api, reservation, INVENTORY, self.root / boundary, fixture_build)
+                if boundary == "reserve":
+                    self.assertEqual(api.writes, 0)
+                else:
+                    self.assertTrue(api.releases[0]["draft"])
+                    self.assertEqual(api.tags()["v0.2.1"]["reservation"], reservation)
+                    api.revoke_after_upload = False
+                    self.assertEqual(r.publish_one(api, reservation, INVENTORY, self.root / "resume", fixture_build), "complete")
+
+    def test_missing_and_malformed_evidence_never_authorizes(self):
+        for condition in ("no-job", "duplicate-job", "no-artifact", "duplicate-artifact", "wrong-order", "bad-zip", "bad-receipt"):
+            api = RecoveryGitHub()
+            if condition == "no-job":
+                api.recovery_jobs.pop()
+            elif condition == "duplicate-job":
+                api.recovery_jobs[-1] = copy.deepcopy(api.recovery_jobs[0])
+            elif condition == "no-artifact":
+                api.artifacts.clear()
+            elif condition == "duplicate-artifact":
+                api.artifacts.append(copy.deepcopy(api.artifacts[0]))
+            elif condition == "wrong-order":
+                api.recovery_jobs[0]["steps"][1]["number"] = 999
+            elif condition == "bad-zip":
+                raw = b"not a zip"
+                api.archives[200] = raw
+                api.record["jobs"]["rust"]["artifact_sha256"] = r.digest(raw)
+                api.artifacts[0].update(size_in_bytes=len(raw), digest="sha256:" + r.digest(raw))
+            else:
+                api.replace_receipt("rust", b"not json")
+            with self.subTest(condition=condition), self.assertRaises((ValueError, zipfile.BadZipFile)):
+                self.evidence(api)
+            self.assertEqual(api.writes, 0)
+
+    def test_first_parent_order_and_reserved_evidence_cannot_change(self):
+        def history(root, *args):
+            if args[0] == "rev-list":
+                return "\n".join((INVENTORY["activation_baseline"], recovery.SOURCE, SHA))
+            if args[0] == "ls-tree":
+                return "deploy/components.json"
+            if args[0] == "show":
+                return "0.2.0" if args[1].endswith(":VERSION") else json.dumps(INVENTORY)
+            raise AssertionError(args)
+
+        api = RecoveryGitHub()
+        api.eligible(SHA, 202)
+        self.policy.write_text('{}')
+        with patch.object(r, "git", side_effect=history):
+            with self.assertRaisesRegex(ValueError, "exact-SHA main CI incomplete"):
+                next(r.planned(api, self.root, INVENTORY))
+            self.evidence(api)
+            plans = list(r.planned(api, self.root, INVENTORY))
+            self.assertEqual([(p["source_sha"], p["release_tag"]) for p in plans],
+                             [(recovery.SOURCE, "v0.2.1"), (SHA, "v0.2.2")])
+            reservation = plans[0]
+            r.reserve(api, reservation)
+            # A later independently valid approval is not the reserved identity.
+            replacement = copy.deepcopy(reservation)
+            replacement["ci_recovery"]["approval_merge"] = "e" * 40
+            with patch.object(api, "evidence", return_value=replacement):
+                with self.assertRaisesRegex(ValueError, "reserved recovery evidence changed"):
+                    list(r.planned(api, self.root, INVENTORY))
+            replacement = copy.deepcopy(reservation)
+            replacement["ci_attempt"] = 3
+            with patch.object(api, "evidence", return_value=replacement):
+                with self.assertRaisesRegex(ValueError, "reserved recovery evidence changed"):
+                    list(r.planned(api, self.root, INVENTORY))
+            self.assertEqual(api.tags()["v0.2.1"]["reservation"], reservation)
 
 
 class Releases(unittest.TestCase):

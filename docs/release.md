@@ -148,6 +148,110 @@ content is reused; conflicting, duplicate or starter/partial assets stop with th
 draft retained. Never delete a conflicting asset, use `--clobber`, force a tag,
 recycle a release version, or hide a failure by releasing the next SHA.
 
+### Dormant historical backup-group recovery
+
+`ci-recovery.yml` is a separate acceptance policy, **not historical push/main CI**.
+It supports only source `dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef`, original failed
+push/main run `40227924006` attempt 1, and repair `dcc0b84-backup-group-v1`.
+That source's offsite test assumes the `factory-backup` group exists; #202 repairs
+newer source, but cannot change this historical run. An unchanged ordinary rerun
+on the same standard runner does not repair the missing fixture. No tag, check
+name, manifest success flag, source overlay or test assertion substitutes for CI.
+
+Support ships with `scripts/release/ci-recoveries.json` equal to `{}`. Normal
+exact-SHA push/main eligibility is unchanged. An empty record cannot authorize
+recovery, and neither support merge nor a successful recovery run fills it.
+There are three distinct future approvals:
+
+1. **Support merge:** review/merge this dormant policy and workflow. Commit,
+   push, PR creation and merge need their own delivery authorization. The
+   existing publisher may wake up, but still stops at the failed predecessor.
+2. **Hosted execution:** Devon separately authorizes and dispatches Historical
+   CI recovery on `main`, supplying its reviewed full tip SHA as
+   `expected_controller`. A race moving main fails the controller check; inspect
+   and approve a new dispatch, rather than silently testing another revision.
+   Dispatch does not publish, write approval records or invoke host operations.
+3. **Evidence approval/publication activation:** only after all tests finish,
+   review the live evidence and open a PR changing **only** the record file.
+   Devon must merge it himself; the numeric GitHub identity is checked. This
+   merge authorizes consumption of precisely that run/attempt and wakes the
+   existing publisher. It is publication activation, not a harmless evidence
+   upload. Coordinate it separately from host/deployer reconciliation (#203).
+
+The workflow checks out trusted controller code and the fixed historical source
+in separate directories, with checkout credentials disabled and only contents:read.
+It has no publishing secret. All four release-required jobs (`rust`, `kiosk`,
+`scripts`, `sandbox`) repeat that source's recipes, action/tool/dependency pins
+and runner families. The Mac `client` job is not release-required. Build caches
+are omitted and job caps are 30 minutes. Tool versions remain in normal job
+logs; receipts record the hosted image/version. Runner images and apt repositories
+are rolling inputs, not a claim of a bit-reproducible historical environment.
+
+Only the disposable scripts runner receives the added group fixture. It creates
+a real system group, adds the runner user, then launches the **unchanged** pinned
+offsite command through native `setpriv --init-groups`, dropping to the original
+non-root UID/GID, removing capabilities, and setting no-new-privileges. Merely
+editing `/etc/group` would not update the existing process's supplementary groups.
+The wrapper checks actual process membership and records it after test success;
+backup code still performs real group ownership and 0640 installation. Source
+HEAD/tree, index and tracked worktree changes are checked before and after tests.
+No production backup configuration, owner, permissions or assertion is changed.
+Provisioning and the complete hosted lane require the separately approved live
+execution; local fixture tests do not establish their success.
+
+The evidence-only PR must use actual GitHub API results, not guessed IDs. Its
+closed-schema record contains `source_sha`, `repair`, `workflow_sha`, numeric
+`workflow_id`, `run_id`, `attempt`, `approval_pr`, and exactly four `jobs` entries.
+Each job entry holds its `job_id`, `artifact_id`, `artifact_sha256` (ZIP digest,
+without the `sha256:` prefix), and the downloaded `receipt` object unchanged.
+Each receipt binds repository ID, source SHA/tree, repair, controller SHA,
+run/attempt, job, non-root UID/GID, image/version and scripts-only offsite
+credentials. The workflow uploads one `receipt.json` per job under the name
+`ci-recovery-RUN-ATTEMPT-JOB`, without overwrite, with 30-day retention.
+Open the PR only after execution; use that PR's real number in its final record.
+There is deliberately no command to create an approval or accept a generic flag.
+
+Before planning, reservation and final publication, the publisher independently
+reads GitHub's run, attempt, jobs/steps, artifacts, approval PR and main policy.
+It requires the fixed original failure, same-repository main dispatch by Devon,
+exact successful required steps in order, and one complete attempt. GitHub run
+`head_sha` is the **controller**, not the tested source; the pinned workflow,
+source checks and receipts supply that separate binding. GitHub artifact metadata
+has no attempt field, so artifact ID/name, digest, receipt, originating run and
+creation/update interval within the approved job are checked together. Bounded
+single-file ZIP parsing does not extract or execute downloaded content.
+
+The controller must be on first-parent main after the source, with an empty
+approval file. Its workflow/helper bytes must match the trusted publisher's
+checkout. The later evidence-only merge must be on first-parent main, match the
+current/local record, and follow all job completions. Missing/deleted/replaced/
+expired artifacts, failed/skipped/missing steps, mixed attempts, another actor,
+changed approval/controller, and contradictory API evidence stop acceptance.
+The newest recovery run wins: a pending run waits; a newer failed run or attempt
+invalidates older approval. No automatic rerun or dispatch is performed.
+
+Recovery adds typed `historical-ci-recovery-v1` provenance to schema-1 reservation
+and manifest evidence, retaining both original failure and approved dispatch
+identities. Older manifests need no recovery field; historical packaging already
+preserves the whole reservation. The reservation pins recovery evidence immutably.
+An interrupted publication may reuse identical artifacts/evidence, but cannot
+replace its run, attempt or approval. Preserve tags/drafts on any mismatch.
+If evidence expires or is superseded **after reservation**, stop for a separately
+reviewed recovery; this implementation intentionally has no replacement escape.
+Completed immutable releases remain verifiable without retained CI artifacts.
+
+Before reservation, a failed/expired recovery can be replaced only by separately
+authorized execution of **all jobs** and a new evidence-only approval; partial-job
+reruns cannot mix previous successes into a new attempt. If an approved record
+already exists, rerunning the original controller uses that run's frozen revision;
+a new main dispatch requires the support/evidence separation to be restored first.
+Approve promptly within retention and avoid superseding runs during publication.
+The publisher resumes at the same historical SHA, then handles each successor in
+first-parent order under its own normal gates. It never skips the predecessor.
+A future environment failure needs its own diagnosis and reviewed source-specific
+support change plus fresh execution/approval, preserving validation of already
+published provenance, not another arbitrary record here.
+
 ### Recovering a draft omitted from release listings
 
 A successful create response supplies the release ID. The publisher validates its
