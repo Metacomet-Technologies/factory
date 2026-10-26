@@ -1080,18 +1080,15 @@ async function receiptMerge(ctx: Pick<WebhookHandlerContext, 'tools' | '$'>, iss
 	const pr = issue.pr
 	if (!pr?.merged || !sha40(pr.mergeSha)) return
 	if (comments.some(comment => comment.body.startsWith(`odd-merge pr=${pr.number} head=${pr.headSha} `))) return
-	// A late receipt resets every deploy receipt before it (snapshot.toSnapshot orders by comment time). A deploy
-	// receipt is this release's evidence only if it was posted at or after the merge and its deployed revision
-	// contains the merge commit (equal, or a descendant carrying later PRs too); then no receipt is recovered over
-	// it. Every other deploy receipt is stale, delivered late or not, and the recovered receipt retires it.
+	// A late receipt resets every deploy receipt before it. The receipt the lifecycle acts on is the snapshot's
+	// (snapshot.toSnapshot: the latest by comment time after the latest merge receipt), so only that one is checked:
+	// it is this release's evidence only if its deployed revision contains the merge commit (equal, or a descendant
+	// carrying later PRs too, so necessarily deployed after the merge), and then no receipt is recovered over it.
+	// Otherwise it is stale, however many earlier receipts were valid, and the recovered receipt retires it.
 	// Receipts that cannot be ordered, and an unreadable ancestry, are a failed read.
 	if (!timestamp(pr.mergedAt)) throw new ReadError(`PR #${pr.number} has no merge time to order its receipt by`)
-	const deploys = comments.filter(comment => parseDeployReceipt(comment.body))
-	if (deploys.some(comment => !timestamp(comment.createdAt))) throw new ReadError(`${issue.identifier} has a deploy receipt without a creation time`)
-	for (const comment of deploys) {
-		if (Date.parse(comment.createdAt!) < Date.parse(pr.mergedAt)) continue
-		if (await contains(ctx, parseDeployReceipt(comment.body)!.sha, pr.mergeSha)) return
-	}
+	if (comments.some(comment => parseDeployReceipt(comment.body) && !timestamp(comment.createdAt))) throw new ReadError(`${issue.identifier} has a deploy receipt without a creation time`)
+	if (issue.deployReceipt && await contains(ctx, issue.deployReceipt.sha, pr.mergeSha)) return
 	await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: mergeReceipt(pr.number, pr.headSha, pr.mergeSha) })
 }
 

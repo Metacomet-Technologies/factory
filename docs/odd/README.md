@@ -511,11 +511,12 @@ by the previous one).
    merge-commit read fails posts no `merge=unknown` receipt: the next
    evaluation finds the PR merged and posts the receipt once, from the
    validated merge commit, before the issue moves to Deploying. That
-   recovery runs only for issues ODD owns, and never over a deploy receipt
-   posted at or after the merge time whose deployed revision contains the
-   merge commit (GitHub's compare reports it identical or ahead; that
-   deployment is the release's evidence). Any other deploy receipt, an old
-   release delivered late included, is stale and the recovered receipt
+   recovery runs only for issues ODD owns, and never over the effective
+   deploy receipt (the latest one, the receipt the lifecycle acts on) when
+   its deployed revision contains the merge commit (GitHub's compare reports
+   it identical or ahead; that deployment is the release's evidence).
+   Otherwise the effective receipt is stale, an old release delivered late
+   included, even if an earlier receipt was valid, and the recovered receipt
    retires it; an unreadable compare is a failed read. A rejected shell read,
    a draft read that is not `true` or `false`, and a failed log-reader
    lookup during a failed-rollback page are failed reads too; the page still

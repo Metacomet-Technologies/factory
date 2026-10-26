@@ -1206,14 +1206,23 @@ test('P3.7: receipt recovery never writes to an issue ODD does not own', async t
 
 test('P3.7: a recovered receipt keeps a deployment of a release containing the merge and retires every other', async t => {
   const mergeSha = '7'.repeat(40);
-  const cases: [string, string, string, boolean][] = [
-    ['the merge deployed after it', '2026-10-26T14:10:00.000Z', mergeSha, true],
-    ['the merge deployed at the merge time', '2026-10-26T14:00:00.000Z', mergeSha, true],
-    ['a descendant release deployed after the merge', '2026-10-26T14:10:00.000Z', 'd'.repeat(40), true],
-    ['an old release delivered after the merge (stale)', '2026-10-26T14:10:00.000Z', 'e'.repeat(40), false],
-    ['deployed before the merge (stale)', '2026-10-26T13:50:00.000Z', 'e'.repeat(40), false],
+  const [d, e] = ['d'.repeat(40), 'e'.repeat(40)];
+  // [name, deploy receipts (sha, posted at), outcome, Linear returns comments oldest first, the compare of this release fails]
+  const cases: [string, [string, string][], 'current' | 'stale' | 'unread', boolean?, string?][] = [
+    ['the merge deployed after it', [[mergeSha, '2026-10-26T14:10:00.000Z']], 'current'],
+    ['the merge deployed at the merge time', [[mergeSha, '2026-10-26T14:00:00.000Z']], 'current'],
+    ['a descendant release deployed after the merge', [[d, '2026-10-26T14:10:00.000Z']], 'current'],
+    ['an old release delivered after the merge (stale)', [[e, '2026-10-26T14:10:00.000Z']], 'stale'],
+    ['deployed before the merge (stale)', [[e, '2026-10-26T13:50:00.000Z']], 'stale'],
+    // Only the effective (latest) receipt counts: an earlier valid one never vouches for a later stale one.
+    ['a valid descendant, then an old release (newest first)', [[d, '2026-10-26T14:10:00.000Z'], [e, '2026-10-26T14:20:00.000Z']], 'stale'],
+    ['a valid descendant, then an old release (oldest first)', [[d, '2026-10-26T14:10:00.000Z'], [e, '2026-10-26T14:20:00.000Z']], 'stale', true],
+    ['a valid descendant, then a release whose compare fails (oldest first)', [[d, '2026-10-26T14:10:00.000Z'], [e, '2026-10-26T14:20:00.000Z']], 'unread', true, e],
+    ['an old release, then a valid descendant (control)', [[e, '2026-10-26T14:10:00.000Z'], [d, '2026-10-26T14:20:00.000Z']], 'current'],
+    ['an old release, then a valid descendant (control, oldest first)', [[e, '2026-10-26T14:10:00.000Z'], [d, '2026-10-26T14:20:00.000Z']], 'current', true],
   ];
-  for (const [name, deployedAt, deployed, current] of cases) {
+  for (const [name, deploys, outcome, oldestFirst, unreadable] of cases) {
+    const current = outcome === 'current';
     await t.test(name, async () => {
       mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
       try {
@@ -1225,18 +1234,25 @@ test('P3.7: a recovered receipt keeps a deployment of a release containing the m
         // The old release's own passing verification must not finish the new work.
         plant.comments.set('MET-8', [
           { id: 'c-v', body: `odd-verify sha=${'e'.repeat(40)} result=pass bug=none`, createdAt: '2026-10-26T13:40:00.000Z' },
-          { id: 'c-d', body: deployLine(deployed), createdAt: deployedAt },
+          ...deploys.map(([sha, createdAt], i) => ({ id: `c-d${i}`, body: deployLine(sha), createdAt })),
         ]);
         // Let the issue follow its status writes, so the next evaluation sees Deploying.
         plant.control.inject = (call, input) => {
           if (call === 'linear.save_issue' && typeof input.state === 'string') plant.issues.get(String(input.id))!.status = input.state;
+          if (call === 'linear.list_comments' && oldestFirst) return { comments: [...(plant.comments.get(String(input.issueId)) ?? [])] };
           return undefined;
         };
+        if (unreadable) plant.control.gh = command => command.startsWith('gh api repos/{owner}/{repo}/compare/') && command.includes(`...${unreadable}`) ? { exitCode: 1, stdout: '', stderr: 'HTTP 502' } : undefined;
         await plant.start();
         // The status write, then the next sweep evaluates MET-8 in Deploying.
         await advance(11 * 60_000);
         const receipts = (plant.comments.get('MET-8') ?? []).filter(comment => comment.body.startsWith('odd-merge pr=')).map(comment => comment.body);
-        assert.deepEqual(receipts, current ? [] : [`odd-merge pr=8 head=${'c'.repeat(40)} merge=${mergeSha} release=none`]);
+        assert.deepEqual(receipts, outcome === 'stale' ? [`odd-merge pr=8 head=${'c'.repeat(40)} merge=${mergeSha} release=none`] : []);
+        if (outcome === 'unread') {
+          assert.equal(plant.issues.get('MET-8')!.status, 'In Progress', 'an unread ancestry moves nothing');
+          assert.equal(plant.heartbeats(), 0);
+          return;
+        }
         assert.equal(plant.issues.get('MET-8')!.status, 'Deploying');
         const verifiers = [...plant.threads.values()].filter(thread => thread.labels.includes('odd-role-verifier'));
         assert.equal(verifiers.length, current ? 1 : 0, current ? 'the post-merge deployment is verified' : 'the stale deployment waits for a new release');
