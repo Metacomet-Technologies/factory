@@ -13,7 +13,7 @@
 // through `Effects` so the sandbox fixture fakes sudo, curl, git, the release download and Linear.
 
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -562,10 +562,18 @@ export function liveEffects(): Effects {
     readLedger: () => JSON.parse(readFileSync(LEDGER, 'utf8')) as Ledger,
     writeLedger: (ledger, options) => {
       mkdirSync(STATE_DIR, { recursive: true });
-      writeFileSync(`${LEDGER}.tmp`, `${JSON.stringify(ledger, null, 2)}\n`);
-      // link(2) publishes the complete file atomically and fails with EEXIST instead of replacing.
-      if (options?.create) { try { linkSync(`${LEDGER}.tmp`, LEDGER); } finally { rmSync(`${LEDGER}.tmp`, { force: true }); } }
-      else renameSync(`${LEDGER}.tmp`, LEDGER);
+      const body = `${JSON.stringify(ledger, null, 2)}\n`;
+      if (options?.create) {
+        // link(2) publishes the complete file atomically and fails with EEXIST instead of replacing.
+        // The staging name is this call's alone: a crash after the link must not leave the ledger
+        // hard-linked to the `.tmp` that ordinary writes truncate.
+        const staging = `${LEDGER}.create-${randomUUID()}`;
+        writeFileSync(staging, body, { flag: 'wx' });
+        try { linkSync(staging, LEDGER); } finally { rmSync(staging, { force: true }); }
+        return;
+      }
+      writeFileSync(`${LEDGER}.tmp`, body);
+      renameSync(`${LEDGER}.tmp`, LEDGER);
     },
     linear: {
       deploying: async identifier => (await graphql<IssueData>(issueQuery, { id: identifier })).issue.state.name === 'Deploying',

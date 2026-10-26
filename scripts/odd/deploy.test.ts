@@ -1323,4 +1323,25 @@ liveEffects().writeLedger({ lastTag: ${JSON.stringify(tag)}, components: {} }, {
   assert.match(second.stderr, /EEXIST/);
   assert.equal(readFileSync(host.ledger, 'utf8'), created);
   assert.deepEqual(readdirSync(host.state), ['deploy.json'], 'no temporary file left behind');
+  // Killed right after link(2), then the next ordinary write is interrupted before its rename:
+  // the published baseline must stay byte-for-byte intact (no staging name shares its inode).
+  rmSync(host.ledger);
+  const instrumented = (fn: string, patch: string, tag: string, create: boolean) => spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const real = fs.${fn};
+fs.${fn} = (...args) => { ${patch} };
+syncBuiltinESMExports();
+const { liveEffects } = await import(${JSON.stringify(pathToFileURL(deployCli).href)});
+liveEffects().writeLedger({ lastTag: ${JSON.stringify(tag)}, components: {} }, { create: ${create} });`], { encoding: 'utf8', env: { HOME: host.home } });
+  const crashed = instrumented('linkSync', 'real(...args); process.exit(77);', 'v0.3.0', true);
+  assert.equal(crashed.status, 77, crashed.stderr);
+  const baseline = readFileSync(host.ledger, 'utf8');
+  assert.deepEqual(JSON.parse(baseline), { lastTag: 'v0.3.0', components: {} });
+  const interrupted = instrumented('renameSync', "throw new Error('interrupted before rename');", 'v0.3.1', false);
+  assert.notEqual(interrupted.status, 0);
+  assert.match(interrupted.stderr, /interrupted before rename/);
+  assert.equal(readFileSync(host.ledger, 'utf8'), baseline);
+  assert.equal(create('v0.3.1').status === 0, false, 'a retried create still refuses the published baseline');
+  assert.equal(readFileSync(host.ledger, 'utf8'), baseline);
 });
