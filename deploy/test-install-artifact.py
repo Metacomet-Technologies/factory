@@ -15,6 +15,7 @@ temporary tree with command stubs and temporary DBs; --plan and --no-db-change
 must classify read-only and refuse DB-generation changes before any change.
 """
 
+import fcntl
 import hashlib
 import json
 import os
@@ -354,6 +355,7 @@ if [[ $1 == -u && $2 == agent && ${*: -1} == --build-info ]]; then printf '%s\\n
 exec "$@\"""",
     "git": GIT,
     "systemctl": """echo "systemctl $*" >> "$CALLS"
+if [[ ${WRITER_ON:-} == systemctl && $1 == stop ]]; then python3 "$WRITER" "$WRITER_DB"; fi
 case "$*" in
   *--property=DropInPaths*) echo ;;
   *--property=LoadState*) echo loaded ;;
@@ -362,25 +364,31 @@ case "$*" in
   "is-active "*) echo active ;;
   *) exit 0 ;;
 esac""",
-    # The backup lock is busy unless FLOCK_OK is set.
-    "flock": 'echo "flock $*" >> "$CALLS"; [[ -n ${FLOCK_OK:-} ]]',
+    # The real flock(1): the installer really holds the fixture's backup lock (hold_backup_lock makes it busy).
+    "flock": 'echo "flock $*" >> "$CALLS"; exec /usr/bin/flock "$@"',
     "hostname": "echo factory-gpu",
     "tailscale": 'echo "{}"',
     "nvidia-smi": 'echo "GPU 0: fake"',
     "id": 'if [[ $1 == -u ]]; then echo 999; else echo "uid=999($1) gid=999($1)"; fi',
     "getent": 'echo "$2:x:999:"',
     "ss": "true",
-    **{name: f'echo "{name} $*" >> "$CALLS"; exec /usr/bin/{name} "$@"' for name in ("mktemp", "install")},
+    "install": 'echo "install $*" >> "$CALLS"; exec /usr/bin/install "$@"',
+    "mktemp": """echo "mktemp $*" >> "$CALLS"
+if [[ ${WRITER_ON:-} == mktemp && $* == *"$WRITER_MATCH"* ]]; then python3 "$WRITER" "$WRITER_DB"; fi
+exec /usr/bin/mktemp "$@\"""",
     "useradd": 'echo "useradd $*" >> "$CALLS"; exit 99',
     # A concurrent writer: WRITER runs right after the classifier copies the main file into scratch
-    # (WRITER_ON=cp), or right after a successful comparison of the live WAL (WRITER_ON=cmp).
+    # (WRITER_ON=cp), right after a successful comparison of the live WAL (WRITER_ON=cmp), right before
+    # a mktemp whose arguments contain WRITER_MATCH (staging, snapshot), or right before `systemctl stop`.
     "cp": '/usr/bin/cp "$@" || exit; if [[ ${WRITER_ON:-} == cp && ${*: -1} == */meter.db ]]; then python3 "$WRITER" "${@: -2:1}"; fi',
     "cmp": '/usr/bin/cmp "$@" || exit; if [[ ${WRITER_ON:-} == cmp && ${*: -2:1} == */meter.db-wal ]]; then python3 "$WRITER" "${@: -2:1}"; fi',
 }
 # `once`: one real TRUNCATE checkpoint (no version change); `churn`: a commit and a checkpoint on every
 # copy; `downgrade`: one commit setting user_version=1, left in the WAL; `downgrade checkpoint`: the same
 # commit, then checkpointed into the main-file header. Non-churn writers act on hook call WRITER_AFTER (0-based).
-WRITER = """import os, pathlib, sqlite3, sys
+# With WRITER_LOCK set the writer follows the generation-writer protocol of install-meter.sh and
+# rollback-meter-v1.sh: it writes only after taking the backup lock nonblocking, else records `b`.
+WRITER = """import fcntl, os, pathlib, sqlite3, sys
 marker = pathlib.Path(os.environ["WRITER_MARK"])
 mode = os.environ["WRITER_MODE"]
 seen = marker.read_text() if marker.exists() else ""
@@ -388,6 +396,13 @@ if mode != "churn" and len(seen) != int(os.environ.get("WRITER_AFTER", "0")):
     if len(seen) < int(os.environ.get("WRITER_AFTER", "0")):
         marker.write_text(seen + ".")
     sys.exit()
+if os.environ.get("WRITER_LOCK"):
+    lock = open(os.environ["WRITER_LOCK"], "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        marker.write_text(seen + "b")
+        sys.exit()
 marker.write_text(seen + "x")
 con = sqlite3.connect(sys.argv[1].removesuffix("-wal"), isolation_level=None)
 if mode.startswith("downgrade"):
@@ -454,6 +469,7 @@ class MeterPlanTest(unittest.TestCase):
                      "var/backups/factory-db/.backup.lock"):
             (self.tree / path).write_text("")
         self.db = self.tree / "srv/factory/meter/meter.db"
+        self.lock = self.tree / "var/backups/factory-db/.backup.lock"
         self.binary = base / "prebuilt"
         self.binary.write_text('#!/bin/bash\necho "meter $*" >> "$CALLS"\n')
         self.binary.chmod(0o755)
@@ -467,6 +483,12 @@ class MeterPlanTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def hold_backup_lock(self):
+        """A running backup or deployment: the real lock, held from another open file description."""
+        handle = open(self.lock, "a")
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
 
     def make_db(self, state):
         if self.db.parent.is_symlink():
@@ -571,9 +593,10 @@ class MeterPlanTest(unittest.TestCase):
                 self.make_db(state)
                 self.assertEqual(self.assert_unchanged("--plan", 0).stdout.splitlines()[-1], V2_PLAN)
                 files = {path.name: path.read_bytes() for path in self.db.parent.iterdir()}
-                # Control: v2 passes the recheck, then stops at the busy backup lock (shim) before
+                # Control: v2 passes the recheck, then stops at the busy backup lock before
                 # staging, any snapshot, service change or DB write.
-                result, calls = self.run_installer("--no-db-change")
+                with self.hold_backup_lock():
+                    result, calls = self.run_installer("--no-db-change")
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertNotIn("meter-plan", result.stdout)
                 self.assertIn("Backup or deployment is running", result.stderr)
@@ -582,13 +605,9 @@ class MeterPlanTest(unittest.TestCase):
                 self.assertNotRegex(calls, "meter migrate|systemctl (?!show|is-)")
                 self.assertEqual({path.name: path.read_bytes() for path in self.db.parent.iterdir()}, files)
                 self.assertFalse((self.tree / "var/backups/meter").exists())
-                # Control: with the lock held, v2 passes the locked recheck and stages, and the read-only
+                # Control: with the lock free, v2 passes the locked recheck and stages, and the read-only
                 # check runs on the unchanged DB; the fixture then stops at the stopped-PID check.
-                self.env["FLOCK_OK"] = "1"
-                try:
-                    result, calls = self.run_installer("--no-db-change")
-                finally:
-                    self.env.pop("FLOCK_OK")
+                result, calls = self.run_installer("--no-db-change")
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertNotIn("meter-plan", result.stdout)
                 self.assertIn("Meter PID remains after stop", result.stderr)
@@ -605,21 +624,21 @@ class MeterPlanTest(unittest.TestCase):
                 self.assertIn(line, result.stdout.splitlines())
                 self.assertIn("Refusing automatic meter install", result.stderr)
 
-    def run_with_writer(self, flag, mode, on="cp", after=0, lock=False):
+    def run_with_writer(self, flag, mode, on="cp", after=0, locked=False):
         hook = self.scratch.parent / "writer.py"
         hook.write_text(WRITER)
         marker = self.scratch.parent / "writer-ran"
         marker.unlink(missing_ok=True)
         self.env.update(WRITER=str(hook), WRITER_MODE=mode, WRITER_MARK=str(marker), WRITER_ON=on,
-                        WRITER_AFTER=str(after), **({"FLOCK_OK": "1"} if lock else {}))
+                        WRITER_AFTER=str(after))
         try:
             result, calls = self.run_installer(flag)
         finally:
-            for name in ("WRITER", "WRITER_MODE", "WRITER_MARK", "WRITER_ON", "WRITER_AFTER", "FLOCK_OK"):
+            for name in ("WRITER", "WRITER_MODE", "WRITER_MARK", "WRITER_ON", "WRITER_AFTER"):
                 self.env.pop(name, None)
         self.assertIn("x", marker.read_text() if marker.exists() else "", "the writer never ran")
         # No staging, migration, service action or snapshot; scratch removed. Taking the lock writes nothing.
-        self.assertIsNone(MUTATIONS.search(calls.replace("flock -n 9\n", "") if lock else calls), calls)
+        self.assertIsNone(MUTATIONS.search(calls.replace("flock -n 9\n", "") if locked else calls), calls)
         self.assertNotIn(".meter-stage", calls)
         self.assertEqual(list(self.scratch.iterdir()), [])
         self.assertFalse((self.tree / "var/backups/meter").exists())
@@ -678,7 +697,7 @@ class MeterPlanTest(unittest.TestCase):
         for flag, mode, after, lock in cases:
             with self.subTest(flag=flag, mode=mode, after=after):
                 self.make_db(("pending", 1, 2))
-                result, _ = self.run_with_writer(flag, mode, on="cmp", after=after, lock=lock)
+                result, _ = self.run_with_writer(flag, mode, on="cmp", after=after, locked=lock)
                 con = sqlite3.connect(self.db, isolation_level=None)
                 self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 1)
                 con.close()
@@ -687,6 +706,51 @@ class MeterPlanTest(unittest.TestCase):
                 self.assert_plan(flag, result, DB_STATES["v1"][0])
                 if lock:
                     self.assertIn("under the backup lock", result.stderr)
+
+
+    def test_generation_writers_are_excluded_by_the_backup_lock_from_classification_to_service_stop(self):
+        # The exclusion is the lock, not the comparisons: every DB-generation writer (this installer and
+        # rollback-meter-v1.sh) takes the backup lock nonblocking, and meter serve never writes
+        # user_version. A protocol writer that tries to commit user_version=1 (and checkpoint it) after the
+        # locked classification's last WAL comparison, before staging, before the snapshot or before the stop
+        # finds the lock busy and writes nothing, so the v2 the install accepted is the live generation
+        # through every mutation up to the stop; the fixture then stops at the stopped-PID check.
+        boundaries = {"last locked comparison": {"WRITER_ON": "cmp", "WRITER_AFTER": "5"},
+                      "staging": {"WRITER_ON": "mktemp", "WRITER_MATCH": ".meter-stage"},
+                      "snapshot": {"WRITER_ON": "mktemp", "WRITER_MATCH": "var/backups/meter/"},
+                      "service stop": {"WRITER_ON": "systemctl"}}
+        hook = self.scratch.parent / "writer.py"
+        hook.write_text(WRITER)
+        marker = self.scratch.parent / "writer-ran"
+        for boundary, hook_env in boundaries.items():
+            with self.subTest(boundary=boundary):
+                self.make_db(("pending", 1, 2))
+                shutil.rmtree(self.tree / "var/backups/meter", ignore_errors=True)
+                marker.unlink(missing_ok=True)
+                env = {"WRITER": str(hook), "WRITER_MODE": "downgrade checkpoint", "WRITER_MARK": str(marker),
+                       "WRITER_DB": str(self.db), "WRITER_LOCK": str(self.lock), **hook_env}
+                self.env.update(env)
+                try:
+                    result, calls = self.run_installer("--no-db-change")
+                finally:
+                    for name in env:
+                        self.env.pop(name)
+                self.assertTrue(marker.read_text().endswith("b"), "the writer did not meet the held lock")
+                self.assertIn("Meter PID remains after stop", result.stderr)
+                self.assertRegex(calls, r"meter migrate --check-only --db .*/meter\.db")
+                (snapshot,) = (self.tree / "var/backups/meter").iterdir()
+                self.assertEqual((snapshot / "mode").read_text(), "v2\n")
+                self.assertFalse((snapshot / "db-changing").exists())
+                con = sqlite3.connect(self.db, isolation_level=None)
+                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 2)
+                con.close()
+                # Control: once the installer exits and releases the lock, the same writer commits.
+                marker.unlink()
+                subprocess.run(["python3", hook, self.db], env={**self.env, **env, "WRITER_AFTER": "0"}, check=True)
+                self.assertEqual(marker.read_text(), "x")
+                con = sqlite3.connect(self.db, isolation_level=None)
+                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 1)
+                con.close()
 
 
 if __name__ == "__main__":

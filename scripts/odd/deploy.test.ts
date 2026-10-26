@@ -59,6 +59,17 @@ test('an installer failure after its snapshot rolls back and re-probes; before a
   const unchanged = fixture({ bodies: [], installOk: false });
   unchanged.effects.sudo = () => ({ ok: false, output: 'ERROR: preflight failed\nNo deployment changes made; no rollback snapshot exists.\n' });
   assert.deepEqual(await deployComponent(unchanged.effects, kiosk, 'v0.3.0', sha, '/tmp/rel'), { component: 'kiosk', sha, health: 'fail', rollback: 'none' });
+  // Meter: a generation change by a writer that bypassed the backup lock is caught by the post-stop
+  // recheck after the snapshot (deploy/install-meter.sh output; MeterPlanTest). The service is already
+  // stopped, so it is not a not-executed refusal: the v2 snapshot is rolled back once, binaries only.
+  const meter = recipes.find(recipe => recipe.name === 'meter')!;
+  const stopped = fixture({ bodies: [previous, previous, previous] });
+  const sudo = stopped.effects.sudo;
+  stopped.effects.sudo = (script, args) => script.startsWith('deploy/install-')
+    ? (sudo(script, args), { ok: false, output: `Rollback snapshot: ${snapshot}\nERROR: DB version changed since preflight.\nRecover with: sudo bash deploy/rollback-meter-v1.sh ${snapshot}\n` })
+    : sudo(script, args);
+  assert.deepEqual(await deployComponent(stopped.effects, meter, 'v0.3.0', sha, '/tmp/rel'), { component: 'meter', sha, health: 'fail', rollback: snapshot });
+  assert.deepEqual(stopped.calls.filter(call => call.startsWith('sudo')), [`sudo deploy/install-meter.sh --source-checkout /nonexistent/source --no-db-change ${meter.artifact('/tmp/rel')}`, `sudo deploy/rollback-meter-v1.sh ${snapshot}`]);
 });
 
 test('the enabled set is meter, factory-api and kiosk in install order, each with a restoring rollback', () => {

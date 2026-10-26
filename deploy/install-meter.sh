@@ -237,7 +237,11 @@ fi
 # the backup lock, and meter serve never writes user_version. The automatic
 # path therefore takes the lock on the existing lock file (no write) and
 # classifies again under it, so the generation it accepts cannot change
-# before staging, the snapshot or the post-stop recheck.
+# before staging, the snapshot or the post-stop recheck. The lock, not the
+# file comparisons, is the exclusion: no comparison can see a writer that
+# bypasses it (a manual sqlite3 or meter migrate outside these scripts). The
+# post-stop recheck is the last check; it fails such a change before the
+# backup, migration or binary swap, leaving a binaries-only v2 snapshot.
 lock=/var/backups/factory-db/.backup.lock
 locked=0
 if (( no_db_change )); then

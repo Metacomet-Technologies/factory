@@ -472,8 +472,14 @@ by the previous one).
    meter only with `--no-db-change`, which rechecks before its path checks,
    then takes the backup lock (held by every generation writer: the installer
    and `rollback-meter-v1.sh`; `meter serve` never writes `user_version`) and
-   classifies again under it before its first change, so comparisons are not
-   the only guard against a later commit. Only a v2 rerun is eligible. A fresh, legacy,
+   classifies again under it before its first change. The lock is the
+   exclusion; the comparisons only make the unlocked plan coherent. A writer
+   that bypasses the lock (a manual `sqlite3` or `meter migrate` outside
+   these scripts) is invisible to every comparison, so Devon's migration
+   runs through `install-meter.sh` or holds the lock. The post-stop recheck
+   still fails such a change before the backup, migration or binary swap,
+   leaving a v2 snapshot whose rollback restores binaries only and never
+   the DB. Only a v2 rerun is eligible. A fresh, legacy,
    v1, unclassifiable or failed plan installs nothing in the release, and a
    generation change caught by the recheck installs nothing further. An
    interrupted meter install whose resume probe is red rolls back only a
