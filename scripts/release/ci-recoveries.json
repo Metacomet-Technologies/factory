@@ -1,1 +1,102 @@
-{}
+{
+  "source_sha": "dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef",
+  "repair": "dcc0b84-backup-group-v1",
+  "workflow_sha": "d3daaafe14fda033a7f2bd6cdb2bc65b1ff175d1",
+  "workflow_id": 396511785,
+  "run_id": 40249779422,
+  "attempt": 1,
+  "jobs": {
+    "rust": {
+      "job_id": 121338936519,
+      "artifact_id": 12619533636,
+      "artifact_sha256": "ff8a19ba54fc7342c856182fa026e04baa6f57a9ab4e329fc21b15033c122076",
+      "receipt": {
+        "attempt": 1,
+        "gid": 1001,
+        "image": "ubuntu24",
+        "image_version": "20261023.334.3",
+        "job": "rust",
+        "offsite": null,
+        "repair": "dcc0b84-backup-group-v1",
+        "repository_id": 1413941821,
+        "run_id": 40249779422,
+        "source_sha": "dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef",
+        "source_tree": "df95e0488f56f98a8deffc1c0c8a7fd434bb840a",
+        "uid": 1001,
+        "workflow_sha": "d3daaafe14fda033a7f2bd6cdb2bc65b1ff175d1"
+      }
+    },
+    "kiosk": {
+      "job_id": 121338936817,
+      "artifact_id": 12619554990,
+      "artifact_sha256": "e5eff6f74efd1003e2dd05db81aa010ae96ebb22e717fc47c0a7c4805760a5d3",
+      "receipt": {
+        "attempt": 1,
+        "gid": 1001,
+        "image": "ubuntu24",
+        "image_version": "20261023.334.3",
+        "job": "kiosk",
+        "offsite": null,
+        "repair": "dcc0b84-backup-group-v1",
+        "repository_id": 1413941821,
+        "run_id": 40249779422,
+        "source_sha": "dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef",
+        "source_tree": "df95e0488f56f98a8deffc1c0c8a7fd434bb840a",
+        "uid": 1001,
+        "workflow_sha": "d3daaafe14fda033a7f2bd6cdb2bc65b1ff175d1"
+      }
+    },
+    "scripts": {
+      "job_id": 121338936742,
+      "artifact_id": 12619583550,
+      "artifact_sha256": "a4a80295db994f4934e3263c316e5731497fc07ec8e0221cfbb1c6196f73c5af",
+      "receipt": {
+        "attempt": 1,
+        "gid": 1001,
+        "image": "ubuntu24",
+        "image_version": "20261023.334.3",
+        "job": "scripts",
+        "offsite": {
+          "backup_gid": 987,
+          "gid": 1001,
+          "groups": [
+            4,
+            100,
+            118,
+            987,
+            999,
+            1001
+          ],
+          "uid": 1001
+        },
+        "repair": "dcc0b84-backup-group-v1",
+        "repository_id": 1413941821,
+        "run_id": 40249779422,
+        "source_sha": "dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef",
+        "source_tree": "df95e0488f56f98a8deffc1c0c8a7fd434bb840a",
+        "uid": 1001,
+        "workflow_sha": "d3daaafe14fda033a7f2bd6cdb2bc65b1ff175d1"
+      }
+    },
+    "sandbox": {
+      "job_id": 121338936631,
+      "artifact_id": 12619588388,
+      "artifact_sha256": "a533d8725b6328b3ee18476fc7030e0c1c90aabb9570e0568792bf2c4043b010",
+      "receipt": {
+        "attempt": 1,
+        "gid": 1001,
+        "image": "ubuntu22",
+        "image_version": "20261023.322.3",
+        "job": "sandbox",
+        "offsite": null,
+        "repair": "dcc0b84-backup-group-v1",
+        "repository_id": 1413941821,
+        "run_id": 40249779422,
+        "source_sha": "dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef",
+        "source_tree": "df95e0488f56f98a8deffc1c0c8a7fd434bb840a",
+        "uid": 1001,
+        "workflow_sha": "d3daaafe14fda033a7f2bd6cdb2bc65b1ff175d1"
+      }
+    }
+  }
+}
