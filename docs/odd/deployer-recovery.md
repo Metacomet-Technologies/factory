@@ -130,9 +130,10 @@ AGENT
 ```
 
 Keep that printed `AUDIT_DIR`. A missing/corrupt ledger is a stop, not permission
-to bootstrap. Install the approved tools by Git checkout, never by copying files
-over historical source or relaxing the clean-tree checks. This changes deployment
-machinery, not the healthy running binaries or kiosk.
+to bootstrap (see [missing ledger](#missing-ledger-explicit-bootstrap)). Install
+the approved tools by Git checkout, never by copying files over historical source
+or relaxing the clean-tree checks. This changes deployment machinery, not the
+healthy running binaries or kiosk.
 
 ```sh
 gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
@@ -161,9 +162,9 @@ CHECK
 Require `UnitFileState=disabled` **and** `ActiveState=inactive`. The installer
 snapshots prior unit files and enablement before disabling; do not restore old
 enablement during reconciliation. Default installation still starts the job and
-enables the timer, so do not use it here. If the tools were already updated,
-inspect the exact HEAD and unit rather than bypassing the v0.2.49 precondition
-or reinstalling blindly.
+enables the timer (it refuses an absent ledger), so do not use it here. If the
+tools were already updated, inspect the exact HEAD and unit rather than bypassing
+the v0.2.49 precondition or reinstalling blindly.
 
 ## Approval 2: preview, review every deferred issue, then adopt
 
@@ -263,6 +264,159 @@ Acceptance before separately enabling the timer:
   errors without reinstalling; do not forge success or edit delivery state.
 - After explicit timer approval, confirm a subsequent scheduled run succeeds.
   Timer `active` alone is not deployment/receipt evidence.
+
+## Missing ledger: explicit bootstrap
+
+The job never adopts a ledger by itself. When `deploy.json` is missing,
+unreadable, corrupt, or lacks a `vX.Y.Z` `lastTag` and a `components` object,
+`deploy.ts` exits 1 with the reason on stderr before any GitHub, Git, probe,
+install, receipt or ledger write; the failed service is the host alert.
+`install-deploy.sh --install-only` never creates a ledger, and the default
+installation refuses to start the job or enable the timer without one. Healthy
+hosts with a ledger need nothing here.
+
+Bootstrap only after investigation shows the ledger is genuinely absent, not
+hidden by a wrong `HOME`, permissions or missing state that a backup can restore.
+Never delete, move or reset an existing ledger to use it: bootstrap refuses any
+existing file, readable or not. A stale ledger keeps `reconcile-manual` above.
+
+With Devon's approval of the reviewed tag, and the timer installed with
+`--install-only` (disabled and inactive):
+
+```sh
+gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
+set -euo pipefail
+umask 0077
+TAG=REPLACE_WITH_REVIEWED_TAG
+state=/home/agent/.local/state/factory-odd
+cd /home/agent/work/factory
+test ! -e "$state/deploy.json"
+mkdir -p "$state"
+flock -n "$state/deploy.lock" node scripts/odd/deploy.ts --bootstrap "$TAG"
+jq -e --arg tag "$TAG" '. == {lastTag: $tag, components: {}}' "$state/deploy.json"
+AGENT
+```
+
+`--bootstrap` requires a published non-draft, non-prerelease `vX.Y.Z` release,
+fetches tags, resolves its immutable commit and requires it on `origin/main`.
+Meter, factory-api and kiosk must each report a clean, healthy identity at that
+SHA in three probes 20 seconds apart; a mixed, older, newer, dirty, degraded or
+unreachable component stops it. It then writes only `{lastTag, components: {}}`
+with an exclusive atomic create that fails if any ledger appeared meanwhile. It
+installs nothing, records no component health, and writes no receipt or Linear
+comment. The job never deploys or receipts releases at or below the tag, so
+their issues need their own evidence.
+
+Review the result, then a separately approved default installation
+(`install-deploy.sh` without flags) starts the first run and enables the timer.
+That run deploys every published release above the baseline.
+
+## Tools runtime cutover (MET-346, P2.8)
+
+The deploy, dispatch and usage units execute
+`/home/agent/factory-tools/current/scripts/...`. `current` links to an immutable
+`/home/agent/factory-tools/<tag>` tree that `deploy.ts` stages with `git archive`
+from a release it verified itself (`releases/<tag>/.verified`). The installers,
+release verifier and Git history stay in `/home/agent/work/factory` (ROOT), at the
+revision Devon approved. Nothing in this section uses ROOT as the runtime.
+
+The job ends each tick by promoting the newest handled tag, never an older one.
+It first records `tools.pending` (tag, SHA, ROOT HEAD as `installerSha`, prior
+link) in the ledger. Then it runs `deploy.ts --self-check`, `dispatch.ts check` and
+`collect.ts --self-check` on the candidate tree, each under
+`node --permission --allow-fs-read=*` (no writes or subprocesses) and with a
+60-second timeout. Next it swaps `current` atomically and repeats the three checks
+through the link. Only then does it record `tools.current` and log
+`tools-promoted` with `installerChanges`, the `deploy/` files that differ from the
+installer revision. A failed or timed-out check, or a failed activation, restores
+the prior link and records `tools.rejected`; that tag is not retried, and the next
+release is. A crash or a staging error keeps `tools.pending`, and the next tick
+resumes it. A release that predates the self-checks, or one this job did not
+verify, never replaces the running tools. Running processes keep the version they
+started with: Node resolves the link before loading. Lock inodes stay at their
+fixed paths (`~/.local/state/factory-odd/deploy.lock` and the tracked ROOT
+`dispatch.lock` and `collect.lock`).
+
+### Batch 1 (Devon): pin the merged SHA and wait for the first promotion
+
+Confirm the three services are idle (`ActiveState=inactive` or `failed`,
+`MainPID=0`). Then move only ROOT, as `agent`, to the reviewed merge. The deploy
+unit installed today still runs `deploy.ts` from ROOT, so its next tick promotes
+the newest handled release that contains this change.
+
+```sh
+gpu-ssh 'systemctl show factory-deploy.service factory-dispatch.service factory-usage.service -p Id -p ActiveState -p MainPID'
+gpu-ssh 'sudo -iu agent bash -s' <<'AGENT'
+set -euo pipefail
+MERGED_SHA=REPLACE_WITH_REVIEWED_MERGED_COMMIT
+cd /home/agent/work/factory
+test -z "$(git status --porcelain)"
+git fetch --quiet --tags origin
+git merge-base --is-ancestor "$MERGED_SHA" origin/main
+git checkout --detach "$MERGED_SHA"
+test "$(git rev-parse HEAD)" = "$MERGED_SHA"
+test -z "$(git status --porcelain)"
+cp -p /home/agent/.local/state/factory-odd/deploy.json "/home/agent/.local/state/factory-odd/deploy.json.before-p2.8"
+AGENT
+```
+
+After a release containing the merge is published and handled:
+
+```sh
+gpu-ssh 'journalctl -u factory-deploy --since -2h | grep -E "tools-(staged|promoted|rejected|resume|waiting)"'
+gpu-ssh 'sudo -iu agent bash -c "readlink -f ~/factory-tools/current; cat ~/factory-tools/current/.factory-tools.json; jq .tools ~/.local/state/factory-odd/deploy.json"'
+```
+
+Continue only when `tools.current` names that tag and `pending` is absent. A tag
+handled before the merge has no self-checks: its promotion is rejected once, that
+tick's run fails with `tools-rejected` and the link stays absent. This is expected
+and does not need a retry.
+
+### Batch 2 (Devon): cut the three units over
+
+```sh
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-deploy.sh --tools-cutover'
+gpu-ssh 'systemctl cat factory-deploy.service factory-dispatch.service factory-usage.service | grep ^ExecStart='
+```
+
+The cutover runs the same preflight as the default install (clean ROOT,
+allowlist, ledger present). It also reruns the three self-checks through the link
+and prints `Tools:` with the tag and SHA and `Installer:` with ROOT HEAD. It
+refuses unless each installed unit has exactly one `ExecStart` running its
+`/home/agent/work/factory/scripts/...` entrypoint, with no drop-in override. It
+snapshots the three services, their timers and `factory-usage-refresh.path`
+(file, enablement, activity) into `/var/backups/factory-deploy/tools-cutover-*`
+and prints `Snapshot:`. It then stops the triggers, requires idle services and
+rewrites only the script path. Node, PATH, environment, limits and drop-ins are
+preserved. It reloads systemd and restarts only the triggers that were active;
+enablement is never changed. The ledger is never written.
+
+After the cutover, `install-dispatch.sh` and `install-usage.sh` render the same
+link from their templates. Do not run them on a host that has not been cut over.
+
+Reverse, with the printed snapshot, after the services are idle:
+
+```sh
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-deploy.sh --revert-tools-cutover /var/backups/factory-deploy/tools-cutover-REPLACE'
+```
+
+This restores the three unit files byte for byte and the trigger activity. It
+leaves the ledger, `factory-tools` and ROOT unchanged, and the units execute ROOT
+again.
+
+Record acceptance as a comment on the merged PR beginning
+`P2.8 post-install acceptance:`. Include the accepted tools tag and SHA, the
+three resolved `ExecStart` paths, a later release promoted automatically
+(`tools-promoted`), and the next scheduled deploy, dispatch and usage results.
+
+### Installer changes stay a separate batched move
+
+`tools-promoted` lists `installerChanges`. When it is non-empty, the runtime has
+advanced but the allowlisted installers have not. Review those files, then repeat
+the Batch 1 checkout with the newly approved SHA in a separate Devon move,
+batched with any other installer changes. Units that changed under `deploy/` are
+never installed automatically. A rejected tag stays rejected; do not edit the
+ledger to retry it, and fix forward in the next release.
 
 ## Rollback: preserve tools and evidence, do not restore an old ledger
 

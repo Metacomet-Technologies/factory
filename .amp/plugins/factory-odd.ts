@@ -2,6 +2,7 @@
 // @amp-agent-mode {"key":"odd-spec","label":"ODD Spec"}
 // @amp-agent-mode {"key":"odd-builder","label":"ODD Builder"}
 // @amp-agent-mode {"key":"odd-reviewer","label":"ODD Reviewer"}
+// @amp-agent-mode {"key":"odd-reviewer-xai","label":"ODD Reviewer (xai)"}
 // @amp-agent-mode {"key":"odd-verifier","label":"ODD Verifier"}
 // @amp-agent-mode {"key":"odd-deployer","label":"ODD Deployer"}
 // @amp-agent-mode {"key":"odd-control","label":"ODD Control"}
@@ -23,8 +24,10 @@ import {
 	parseThreadLabels,
 	ralphGuard,
 	specComplete,
+	steerLine,
 	threadLabels,
 	verifyLine,
+	waitAge,
 	type Action,
 	type DeployReceipt,
 	type IssueSnapshot,
@@ -33,7 +36,9 @@ import {
 } from '../../scripts/odd/lifecycle.ts'
 import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
 import { finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, receiptLabel, roleLabelQueries, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
-import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, digestHeading, overCaps, restoreStatus, slackMessages, staleThreads, sweepMs, type DigestInput } from '../../scripts/odd/watchdog.ts'
+import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
+import { builderArgs, launch } from '../../scripts/odd/launch.ts'
+import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, digestHeading, episodeLine, incidentPageDue, incidentText, incidents, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, resolutionText, restoreStatus, sanitizeError, slackMessages, staleThreads, sweepMs, unknownAge, type DigestInput, type DigestWait, type Episode, type Plane } from '../../scripts/odd/watchdog.ts'
 
 export const description =
 	'Factory ODD control plane: Linear, GitHub and Slack webhooks drive a deterministic outcome lifecycle; role agents run in orbs; Ralph loops are bounded by external checks. See docs/odd/README.md.'
@@ -53,9 +58,12 @@ const slackPollMs = 5 * 60_000
 const deployRunner = 'factory-gpu'
 
 export default async function (amp: PluginAPI) {
-	const roleAgent = (role: Role, extendsMode: 'low' | 'medium' | 'high', label: string, extra: string, tools?: { exclude?: string[] }): Agent =>
+	// Every agent pins its model and effort (scripts/odd/engines.ts); none inherits a mode default.
+	const roleAgent = (role: Role, extendsMode: 'low' | 'medium' | 'high', label: string, extra: string, pin: Engine, tools?: { exclude?: string[] }): Agent =>
 		amp.createAgent({
 			extends: extendsMode,
+			model: pin.model,
+			reasoningEffort: pin.effort,
 			instructions: [
 				`You are the Factory ${role} role under outcome driven development (docs/odd/README.md).`,
 				`Load the project skill \`${contracts[role].skill}\` first and follow it as your contract.`,
@@ -68,25 +76,35 @@ export default async function (amp: PluginAPI) {
 			display: { label, color: '#0f766e' },
 		})
 
+	const reviewerExtra = 'Rerun the Evidence commands yourself at the exact head SHA. Verdict is bound to that SHA: a PR comment plus the odd-verdict thread label.'
+	const readOnly = { exclude: ['edit_file', 'create_file'] }
+	// One reviewer agent per lab; the control plane picks one outside the Builder's lab (selectReviewer).
+	const reviewerAgents = new Map<Lab, Agent>(reviewerEngines.map(engine => [engine.lab, roleAgent('reviewer', 'high', 'ODD Reviewer', reviewerExtra, engine, readOnly)]))
 	const modes: { key: string; label: string; agent: Agent }[] = [
-		{ key: 'intake', label: 'ODD Intake', agent: roleAgent('intake', 'low', 'ODD Intake', 'Turn a message or bare issue into a Linear issue in the team template, with type and area labels and a duplicate check.') },
-		{ key: 'spec', label: 'ODD Spec', agent: roleAgent('spec', 'medium', 'ODD Spec', 'Write Isolation, Build, Done means and Evidence; one Evidence line per Done-means item; set priority and risk.') },
-		{ key: 'builder', label: 'ODD Builder', agent: roleAgent('builder', 'medium', 'ODD Builder', 'Implement the smallest correct change on your own branch, open the PR with the Evidence output in its body, and keep the same thread and branch across review rounds.') },
-		{ key: 'reviewer', label: 'ODD Reviewer', agent: roleAgent('reviewer', 'high', 'ODD Reviewer', 'Rerun the Evidence commands yourself at the exact head SHA. Verdict is bound to that SHA: a PR comment plus the odd-verdict thread label.', { exclude: ['edit_file', 'create_file'] }) },
-		{ key: 'verifier', label: 'ODD Verifier', agent: roleAgent('verifier', 'low', 'ODD Verifier', 'Check each Done-means item against the deployed system using the Evidence lines and the deploy receipt.', { exclude: ['edit_file', 'create_file'] }) },
-		{ key: 'deployer', label: 'ODD Deployer', agent: roleAgent('deployer', 'low', 'ODD Deployer', 'Read the factory-deploy journal and ledger for the red receipt you were given and attach the installer and journal excerpts to the named issue. Never run installers, rollbacks, sudo or systemctl.', { exclude: ['edit_file', 'create_file'] }) },
+		{ key: 'intake', label: 'ODD Intake', agent: roleAgent('intake', 'low', 'ODD Intake', 'Turn a message or bare issue into a Linear issue in the team template, with type and area labels and a duplicate check.', pluginPins.intake) },
+		{ key: 'spec', label: 'ODD Spec', agent: roleAgent('spec', 'medium', 'ODD Spec', 'Write Isolation, Build, Done means and Evidence; one Evidence line per Done-means item; set priority and risk.', pluginPins.spec) },
+		// Manual use only: the control plane launches Claude Code builders through the CLI (launchBuilder).
+		{ key: 'builder', label: 'ODD Builder', agent: roleAgent('builder', 'medium', 'ODD Builder', 'Implement the smallest correct change on your own branch, open the PR with the Evidence output in its body, and keep the same thread and branch across review rounds.', pluginPins.builder) },
+		{ key: 'reviewer', label: 'ODD Reviewer', agent: reviewerAgents.get(reviewerEngines[0].lab)! },
+		{ key: 'verifier', label: 'ODD Verifier', agent: roleAgent('verifier', 'low', 'ODD Verifier', 'Check each Done-means item against the deployed system using the Evidence lines and the deploy receipt.', pluginPins.verifier, readOnly) },
+		{ key: 'deployer', label: 'ODD Deployer', agent: roleAgent('deployer', 'low', 'ODD Deployer', 'Read the factory-deploy journal and ledger for the red receipt you were given and attach the installer and journal excerpts to the named issue. Never run installers, rollbacks, sudo or systemctl.', pluginPins.deployer, readOnly) },
 	]
 	const agents: Partial<Record<Role, Agent>> = Object.fromEntries(modes.map((m) => [m.key, m.agent]))
 	const control = amp.createAgent({
 		extends: 'low',
+		model: pluginPins.control.model,
+		reasoningEffort: pluginPins.control.effort,
 		instructions: `You are the Factory ODD control thread. You own the webhooks and the watchdog schedule. Do not build, review or deploy yourself; the plugin spawns roles. When asked, summarise derived state. Label this thread ${controlLabel} to arm the plugin.`,
 		tools: { add: ['mcp__linear__*', 'get_thread_status', 'send_thread_message'] },
 		display: { label: 'ODD Control', color: '#b45309' },
 	})
 
-	for (const { key, label, agent } of [...modes, { key: 'control', label: 'ODD Control', agent: control }]) {
+	// Orbs run only registered agent definitions, so every other reviewer engine gets its own mode.
+	const reviewerModes = reviewerEngines.slice(1).map(engine => ({ key: `reviewer-${engine.lab}`, label: `ODD Reviewer (${engine.lab})`, agent: reviewerAgents.get(engine.lab)! }))
+	for (const { key, label, agent } of [...modes, ...reviewerModes, { key: 'control', label: 'ODD Control', agent: control }]) {
 		amp.registerAgentMode({
 			key: `odd-${key}`,
+			label,
 			description: `${label}: the ${key} role of outcome driven development. Use only when the ODD control plane or Devon starts it.`,
 			agent: agent.definition,
 		})
@@ -123,6 +141,8 @@ export default async function (amp: PluginAPI) {
 		status?: string
 		action?: Action
 		error?: string
+		/** The wait's age against its budget (`ci 12 min`), or `unknown` when no durable start time exists. */
+		wait?: string
 	}
 	type ArmState = {
 		armed: boolean
@@ -133,11 +153,16 @@ export default async function (amp: PluginAPI) {
 		/** Slack intake poll: last run, last error, and the message timestamps handed to Intake. */
 		slack: { polledAt?: string; error?: string; spawned: string[] }
 		/** Watchdog sweep (scripts/odd/watchdog.ts): last run, issues swept, episodes in progress, digest day, cancellations today. */
-		watchdog: { sweptAt?: string; error?: string; issues?: number; overSince?: string; alerted?: boolean; blindSince?: string; paged?: boolean; digestDay?: string; heartbeatId?: string; cancelled: string[] }
+		watchdog: { sweptAt?: string; error?: string; issues?: number; overSince?: string; alerted?: boolean; blindSince?: string; paged?: boolean; digestDay?: string; heartbeatId?: string; cancelled: string[]; waits: Record<string, DigestWait & { list: 'risk' | 'failedVerification' | 'unknownAge' }>; overdue: string[] }
+		/** Failing actions by `<issue> <episode key>` (scripts/odd/watchdog.ts Episode), and the build slots the incidents are judged against. */
+		episodes: Record<string, Episode>
+		plane: Plane
+		/** Arm-time check that each pinned model is served by its subscription (checkPins): when it ran and what failed. */
+		pins: { checkedAt?: string; problems?: string[] }
 		timers: ReturnType<typeof setInterval>[]
 	}
 	const armState = new Map<ThreadID, ArmState>()
-	const emptyState = (): ArmState => ({ armed: false, webhooks: [], urls: [], events: [], slack: { spawned: [] }, watchdog: { cancelled: [] }, timers: [] })
+	const emptyState = (): ArmState => ({ armed: false, webhooks: [], urls: [], events: [], slack: { spawned: [] }, watchdog: { cancelled: [], waits: {}, overdue: [] }, episodes: {}, plane: { load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, building: [], waiting: [] }, pins: {}, timers: [] })
 	const record = (state: ArmState, event: HandledEvent) => {
 		state.events.push(event)
 		state.events.splice(0, Math.max(0, state.events.length - 20))
@@ -199,6 +224,7 @@ export default async function (amp: PluginAPI) {
 			state.timers.push(setInterval(() => void pollSlackIntake(ctx, state), slackPollMs), setInterval(() => void sweep(evalCtx, state), sweepMs))
 			void pollSlackIntake(ctx, state)
 			void sweep(evalCtx, state)
+			void checkPins(evalCtx, state)
 		} catch (error: unknown) {
 			for (const timer of state.timers.splice(0)) clearInterval(timer)
 			state.armed = false
@@ -239,6 +265,34 @@ export default async function (amp: PluginAPI) {
 		void showUrls(ctx, state.urls).catch((error: unknown) => ctx.logger.log(marker, 'webhook dialog failed', String(error)))
 	}
 
+	// Arm-time routing check (§6): each pinned plugin model runs one small check-access inference
+	// against the control thread and must be served by its subscription. Claude Code is served
+	// inside the builder's orb, not through Amp's routing (check-access reports Amp's Anthropic
+	// upstream for it), so the builder needs an active Claude Subscription connection here and is
+	// checked from its thread usage when it is archived (recordRouting). A failure pages; output
+	// beyond the route (headers, IDs) is never kept.
+	async function checkPins(ctx: EvalContext, state: ArmState) {
+		const problems: string[] = []
+		try {
+			const engines = [...reviewerEngines, ...Object.values(pluginPins)].filter((engine, i, all) => all.findIndex(other => other.model === engine.model) === i)
+			for (const engine of engines) {
+				const result = await ctx.$`amp config model-providers check-access --provider-model ${engine.model} --reasoning-effort ${engine.effort} --thread ${ctx.thread.id}`
+				let output: unknown
+				try { output = JSON.parse(result.stdout) } catch { output = undefined }
+				problems.push(...(result.exitCode === 0 ? checkAccess(engine, output).problems : [`${engine.model}: check-access exited ${result.exitCode}`]))
+			}
+			if (!(await connections(ctx)).some(connection => connection.active && connection.type === builderEngine.subscription.type)) {
+				problems.push(`${builderEngine.model}: no active ${builderEngine.subscription.label} connection`)
+			}
+		} catch (error: unknown) {
+			problems.push(`pin check failed: ${String(error)}`)
+		}
+		state.pins = { checkedAt: new Date().toISOString(), problems }
+		if (!problems.length) return
+		ctx.logger.log(marker, 'pin check', problems.join('; '))
+		if ((await ctx.thread.labels()).includes(performLabel)) await pageMismatch(ctx, '-', `pinned models at arm: ${problems.join('; ')}`)
+	}
+
 	// One evaluation of one issue: derive, decide, act (or dry-run). A role thread's end raises
 	// no event here (its agent.end runs in its own orb), and a reviewer's verdict changes neither
 	// Linear nor the PR head, so after a spawn, and while the owner is still running, the issue
@@ -268,15 +322,25 @@ export default async function (amp: PluginAPI) {
 	}
 	async function evaluateNow(ctx: EvalContext, state: ArmState, source: string, identifier: string, at: string): Promise<HandledEvent> {
 		const entry = record(state, { at, source, issue: identifier, stage: 'received' })
+		// Episode keys this evaluation failed or was refused on; every other open episode of the issue has recovered.
+		const touched = new Set<string>()
+		let performing = false
+		let issue: IssueSnapshot | undefined
 		try {
-			const { snapshot: issue, threads } = await snapshotFor(ctx, identifier, spawned.get(identifier) ?? [])
-			const performing = (await ctx.thread.labels()).includes(performLabel)
+			const derived = await snapshotFor(ctx, identifier, spawned.get(identifier) ?? [])
+			const { threads, comments } = derived
+			issue = derived.snapshot
+			loadEpisodes(state, issue.identifier, comments)
+			performing = (await ctx.thread.labels()).includes(performLabel)
 			const finished = finishedThreads(issue.status, threads)
 			if (finished.length && performing) await archiveThreads(ctx, finished)
-			const action = nextAction(issue, await currentLoad(ctx))
+			const { load, usage, threads: live } = await currentLoad(ctx)
+			state.plane = { load, building: [...new Set(live.flatMap(thread => { const labels = parseThreadLabels(thread.labels); return labels.role === 'builder' && labels.issue ? [labels.issue] : [] }))].sort(), waiting: state.plane.waiting }
+			const action = nextAction(issue, load)
 			ctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
 			entry.status = issue.status
 			entry.action = action
+			noteWait(ctx, state, entry, issue.identifier, action)
 			const ownerBusy = action.kind === 'spawn' || (action.kind === 'wait' && action.reason.endsWith('running'))
 			if (ownerBusy) recheck(ctx, state, identifier, recheckMs)
 			if (!performing) {
@@ -290,8 +354,10 @@ export default async function (amp: PluginAPI) {
 				entry.stage = 'performed'
 				recheck(ctx, state, identifier, 0)
 			} else {
-				entry.stage = (await perform(ctx, state, issue, action, threads)) ? 'performed' : 'ignored'
+				entry.stage = (await perform(ctx, state, issue, action, threads, usage, touched)) ? 'performed' : 'ignored'
 			}
+			if (action.kind === 'wait') await alertOverdue(ctx, state, issue, action, comments)
+			await resolveEpisodes(ctx, state, issue.identifier, touched)
 			failures.delete(identifier)
 		} catch (error: unknown) {
 			entry.stage = 'failed'
@@ -299,10 +365,133 @@ export default async function (amp: PluginAPI) {
 			ctx.logger.log(marker, source, 'evaluation failed', entry.error)
 			const count = (failures.get(identifier) ?? 0) + 1
 			failures.set(identifier, count)
+			const episode = await recordFailure(ctx, state, identifier, failureKey(issue, entry.action), entry.error)
 			if (count <= failureRechecks) recheck(ctx, state, identifier, recheckMs * 2 ** (count - 1))
-			else ctx.logger.log(marker, 'giving up rechecks after failures', identifier, count)
+			else {
+				// Rechecks end here, so the episode is due now: the incident page goes out (or is retried by every sweep), never only this log line.
+				episode.exhausted = true
+				ctx.logger.log(marker, 'recheck budget spent; incident due', identifier, count)
+			}
 		}
+		if (performing) await raiseIncidents(ctx, state)
 		return entry
+	}
+
+	// Human waits and waits of unknown age go to the digest; the entry shows every wait's age.
+	function noteWait(ctx: EvalContext, state: ArmState, entry: HandledEvent, identifier: string, action: Action) {
+		const atCapacity = action.kind === 'wait' && action.reason.startsWith('build capacity')
+		state.plane.waiting = [...state.plane.waiting.filter(id => id !== identifier), ...(atCapacity ? [identifier] : [])].sort()
+		delete state.watchdog.waits[identifier]
+		if (action.kind !== 'wait' || !action.wait) return
+		const age = waitAge(action.wait, Date.now())
+		entry.wait = age.state === 'within' || age.state === 'over' ? `${action.wait.kind} ${Math.floor(age.ageMs / 60_000)} min` : `${action.wait.kind} ${age.state}`
+		if (age.state === 'human') state.watchdog.waits[identifier] = { list: action.wait.kind === 'risk' ? 'risk' : 'failedVerification', identifier, reason: action.reason }
+		if (age.state === 'unknown') {
+			state.watchdog.waits[identifier] = { list: 'unknownAge', ...unknownAge(identifier, action.reason, action.wait) }
+			ctx.logger.log(marker, 'wait age unknown', identifier, action.wait.key)
+		}
+	}
+
+	// A machine wait past its budget pages once per episode. The `odd-overdue` comment is the
+	// durable record and is written only after Slack confirms; a failed delivery is retried by
+	// the next evaluation.
+	async function alertOverdue(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, action: Extract<Action, { kind: 'wait' }>, comments: readonly { body: string }[]) {
+		const text = overduePage(issue.identifier, action, Date.now(), issue.pr)
+		if (!text || !action.wait) return
+		const id = `${issue.identifier} ${action.wait.key}`
+		if (state.watchdog.overdue.includes(id) || overdueKeys(comments).has(action.wait.key)) return
+		if (!(await deliver(ctx, `${marker} ${text}`))) return
+		state.watchdog.overdue.push(id)
+		await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: overdueLine(action.wait.key) })
+	}
+
+	// --- Failure episodes (scripts/odd/watchdog.ts). The first failure lives in memory; from the
+	// second attempt on the episode is an `odd-failure` comment updated in place, so its first
+	// failure, attempts and delivered alert survive sweeps and plugin reloads. A one-off failure
+	// leaves no comment.
+	function failureKey(issue: IssueSnapshot | undefined, action: Action | undefined): { stage: string; key: string } {
+		const head = issue?.pr?.headSha.slice(0, 12)
+		if (!action) return { stage: 'evaluate', key: 'evaluate' }
+		if (action.kind === 'spawn') return { stage: `spawn-${action.role}`, key: `spawn-${action.role}-r${action.round}${head ? `-${head}` : ''}` }
+		if (action.kind === 'steer') return { stage: 'steer', key: `steer-${action.key}` }
+		if (action.kind === 'merge') return { stage: 'merge', key: `merge-${action.sha.slice(0, 12)}` }
+		const stage = action.kind === 'wait' ? 'cancel' : action.kind
+		return { stage, key: `${stage}-${head ?? issue?.status.toLowerCase().replace(/\s+/g, '-') ?? 'none'}` }
+	}
+
+	function loadEpisodes(state: ArmState, identifier: string, comments: readonly { id?: string; body: string }[]) {
+		for (const comment of comments) {
+			const durable = parseEpisode(identifier, comment)
+			// Resolved episodes matter only while their resolution notice is owed.
+			if (!durable || (durable.state === 'resolved' && (durable.alert === 'pending' || durable.alert === 'closed'))) continue
+			const id = `${identifier} ${durable.key}`
+			const memory = state.episodes[id]
+			if (!memory || (memory.commentId === durable.commentId ? durable.attempts > memory.attempts : !memory.commentId)) {
+				state.episodes[id] = { ...durable, attempts: Math.max(durable.attempts, memory?.attempts ?? 0), ...(memory?.exhausted ? { exhausted: true } : {}) }
+			}
+		}
+	}
+
+	async function persistEpisode(ctx: EvalContext, episode: Episode) {
+		try {
+			const saved = await callJson<{ id?: string }>(ctx.tools, 'linear.save_comment', episode.commentId ? { id: episode.commentId, body: episodeLine(episode) } : { issueId: episode.issue, body: episodeLine(episode) })
+			if (saved?.id) episode.commentId = saved.id
+		} catch (error: unknown) {
+			ctx.logger.log(marker, 'failure episode not recorded', episode.issue, episode.key, String(error))
+		}
+	}
+
+	async function recordFailure(ctx: EvalContext, state: ArmState, identifier: string, { stage, key }: { stage: string; key: string }, error: string): Promise<Episode> {
+		const id = `${identifier} ${key}`
+		const previous = state.episodes[id]
+		const episode: Episode = previous
+			? { ...previous, state: 'open', attempts: previous.attempts + 1 }
+			: { issue: identifier, key, stage, first: new Date().toISOString(), attempts: 1, state: 'open', alert: 'pending', error: sanitizeError(error) }
+		state.episodes[id] = episode
+		if (episode.attempts >= 2 && stage !== 'evaluate') await persistEpisode(ctx, episode)
+		return episode
+	}
+
+	// A successful evaluation is progress for every open episode it did not fail on again. An
+	// episode no page went out for is closed; one that paged waits for its incident's resolution.
+	async function resolveEpisodes(ctx: EvalContext, state: ArmState, identifier: string, touched: ReadonlySet<string>) {
+		for (const [id, episode] of Object.entries(state.episodes)) {
+			if (episode.issue !== identifier || episode.state !== 'open' || touched.has(episode.key)) continue
+			episode.state = 'resolved'
+			if (episode.alert === 'pending') {
+				episode.alert = 'closed'
+				delete state.episodes[id]
+			}
+			if (episode.commentId) await persistEpisode(ctx, episode)
+		}
+	}
+
+	// One incident per shared blocker (watchdog.incidents): its page goes out once through the
+	// page path and is marked delivered only after Slack confirms, so a failed delivery or a
+	// reload leaves it pending for the next evaluation or sweep. Recovery sends one resolution and
+	// closes the episodes; a later failure opens a new episode and a new incident.
+	let alerting: Promise<void> = Promise.resolve()
+	function raiseIncidents(ctx: EvalContext, state: ArmState): Promise<void> {
+		alerting = alerting.then(async () => {
+			const now = Date.now()
+			for (const incident of incidents(Object.values(state.episodes), state.plane, now)) {
+				if (incidentPageDue(incident)) {
+					if (!(await deliver(ctx, `${marker} ${incidentText(incident, state.plane, now)}`))) continue
+					for (const episode of incident.episodes.filter(candidate => candidate.state === 'open')) {
+						episode.alert = incident.reason
+						if (episode.commentId || episode.attempts >= 2) await persistEpisode(ctx, episode)
+					}
+				} else if (incident.resolved) {
+					if (incident.delivered && !(await deliver(ctx, `${marker} ${resolutionText(incident, now)}`))) continue
+					for (const episode of incident.episodes) {
+						episode.alert = 'closed'
+						delete state.episodes[`${episode.issue} ${episode.key}`]
+						if (episode.commentId) await persistEpisode(ctx, episode)
+					}
+				}
+			}
+		}).catch((error: unknown) => ctx.logger.log(marker, 'incident alerting failed', String(error)))
+		return alerting
 	}
 
 	// The Watchdog's cancel (§8): an idle thread the lifecycle waits on past `staleMs` is archived
@@ -353,9 +542,13 @@ export default async function (amp: PluginAPI) {
 			watchdog.issues = identifiers.size
 			let failed = 0
 			for (const identifier of identifiers) {
-				if ((await evaluate(ctx, state, 'watchdog', identifier, at)).stage === 'failed') failed += 1
+				// Only a failed derivation is blindness; an action that fails (no reviewer can spawn) is an incident, not a blind plane.
+				const evaluated = await evaluate(ctx, state, 'watchdog', identifier, at)
+				if (evaluated.stage === 'failed' && !evaluated.action) failed += 1
 			}
 			if (identifiers.size && failed === identifiers.size) throw new Error(`all ${failed} evaluations failed`)
+			// Episodes also come due by age alone (five minutes), and a page Slack refused is retried here.
+			if (performing) await raiseIncidents(ctx, state)
 			const load = loadFrom(threads)
 			if (!overCaps(load)) {
 				delete watchdog.overSince
@@ -372,7 +565,7 @@ export default async function (amp: PluginAPI) {
 			const day = digestDue(watchdog.digestDay, now)
 			if (day && performing) {
 				if (!(await digestPosted(ctx.tools, day))) {
-					for (const text of slackMessages(digest(await digestInput(ctx, day, now, load, watchdog.cancelled)))) await ctx.tools.call('slack_write', { channelName: alertsChannel, text })
+					for (const text of slackMessages(digest(await digestInput(ctx, day, now, load, watchdog.cancelled, Object.values(watchdog.waits))))) await ctx.tools.call('slack_write', { channelName: alertsChannel, text })
 				}
 				watchdog.digestDay = day
 				watchdog.cancelled = []
@@ -440,7 +633,8 @@ export default async function (amp: PluginAPI) {
 	}
 
 	// Yesterday's facts for the digest: identifiers, titles and SHAs only (digest() formats them).
-	async function digestInput(ctx: EvalContext, day: string, now: Date, load: Load, cancelled: readonly string[]): Promise<DigestInput> {
+	async function digestInput(ctx: EvalContext, day: string, now: Date, load: Load, cancelled: readonly string[], waits: readonly (DigestWait & { list: string })[]): Promise<DigestInput> {
+		const listed = (list: string) => waits.filter(wait => wait.list === list).map(({ identifier, reason }) => ({ identifier, reason }))
 		const since = new Date(now.getTime() - 24 * 60 * 60_000).toISOString()
 		const merged = await ctx.$`gh pr list --state merged --search ${`merged:>=${since.slice(0, 10)}`} --json number,title,headRefOid,mergeCommit,mergedAt --limit 50`
 		if (merged.exitCode !== 0) throw new Error(`gh pr list for the digest failed: ${merged.stderr.trim()}`)
@@ -463,6 +657,9 @@ export default async function (amp: PluginAPI) {
 			escalated: named(escalated),
 			load,
 			cancelled,
+			risk: listed('risk'),
+			failedVerification: listed('failedVerification'),
+			unknownAge: listed('unknownAge'),
 		}
 	}
 
@@ -486,7 +683,7 @@ export default async function (amp: PluginAPI) {
 				const entry = record(state, { at, source: 'slack-poll', issue: null, stage: perform ? 'performed' : 'dry-run', action })
 				if (!perform) continue
 				try {
-					const load = await currentLoad(ctx)
+					const { load } = await currentLoad(ctx)
 					if (load.orbs >= capacity.orbs) {
 						entry.stage = 'dry-run'
 						entry.action = { kind: 'wait', reason: 'orb capacity (intake)' }
@@ -507,7 +704,7 @@ export default async function (amp: PluginAPI) {
 			if (perform) {
 				const idle = (await threadsFor(ctx.tools, 'label:odd-role-intake archived:false'))
 					.filter(thread => thread.labels.some(label => label.startsWith('odd-slack-')) && thread.state === 'idle')
-				await archiveThreads(ctx, idle)
+				await archiveThreads({ ...ctx, $: amp.$ }, idle)
 			}
 		} catch (error: unknown) {
 			state.slack.error = String(error)
@@ -515,13 +712,40 @@ export default async function (amp: PluginAPI) {
 		}
 	}
 
-	async function spawnThread(parentThreadID: ThreadID, role: Role, labels: string[], content: string, executor: AgentThreadExecutor = 'orb'): Promise<string> {
-		const agent = agents[role]
-		if (!agent) throw new Error(`no plugin agent for role ${role}`)
+	// Plugin agents run every role but the builder; `engine` is the reviewer's lab choice, else the role's pin.
+	async function spawnThread(parentThreadID: ThreadID, role: Role, labels: string[], content: string, executor: AgentThreadExecutor = 'orb', engine?: Engine): Promise<string> {
+		const pin = engine ?? pluginPins[role as keyof typeof pluginPins]
+		const agent = role === 'builder' ? undefined : role === 'reviewer' ? reviewerAgents.get(pin?.lab as Lab) : agents[role]
+		if (!agent || !pin) throw new Error(`no plugin agent for role ${role}${engine ? ` on ${engine.lab}` : ''}`)
 		const thread = await agent.createThread({ executor, parentThreadID, visibility: 'workspace' })
-		await thread.setLabels(labels)
+		await thread.setLabels([engineLabel(pin.lab), ...labels])
 		await thread.appendUserMessage({ type: 'user-message', content })
 		return thread.id
+	}
+
+	// The builder is Claude Code on an orb (§6): `amp -ox` through the CLI, labelled at creation and
+	// again once its session_id is read, recorded, and only then the local launcher is ended. A
+	// failure is posted on the issue once per error and thrown; no plugin agent or other engine
+	// stands in for it.
+	const launchFailures = new Set<string>()
+	async function launchBuilder(ctx: EvalContext, issue: IssueSnapshot, labels: string[], content: string, round: number): Promise<string> {
+		const expected = [...labels, engineLabel(builderEngine.lab)]
+		try {
+			return await launch(builderArgs(content, labels, `${issue.identifier} builder round ${round}`), async id => {
+				const child = amp.threads.get(id as ThreadID)
+				const present = await child.labels()
+				if (expected.some(label => !present.includes(label))) await child.addLabels(expected)
+				spawned.set(issue.identifier, [...(spawned.get(issue.identifier) ?? []), id])
+				ctx.logger.log(marker, 'builder launched', issue.identifier, id, builderEngine.model)
+			})
+		} catch (error: unknown) {
+			const line = `odd-launch-failed role=builder engine=${builderEngine.lab} model=${builderEngine.model}\n\n${String(error).slice(0, 400)}`
+			if (!launchFailures.has(`${issue.identifier}:${line}`)) {
+				launchFailures.add(`${issue.identifier}:${line}`)
+				await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: line })
+			}
+			throw error
+		}
 	}
 
 	// The URLs are credentials, shown only in the control thread for Devon to paste into Linear,
@@ -536,11 +760,13 @@ export default async function (amp: PluginAPI) {
 	// ODD owns Triage for every issue (Backlog waits for Devon). From Todo on, the dispatcher still owns an
 	// issue unless it carries the `odd` label (§6), so an issue the orchestrator created in Todo
 	// without an Evidence section is neither pulled back into Triage nor built twice.
-	// A steer is delivered once per (thread, message): the message names the head SHA, and the
-	// same evaluation repeats on every webhook until the builder pushes.
+	// A steer is delivered once per key (its cause and head SHA): the `odd-steer` comment written
+	// after delivery makes the lifecycle wait on the builder's answer instead, across reloads. A
+	// failed delivery writes nothing and is retried; a delivered steer whose comment failed is
+	// only recorded on the retry (`steered`).
 	const steered = new Set<string>()
-	/** Returns false when nothing was done because the action is not this control plane's to take. */
-	async function perform(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, action: Action, threads: readonly LiveThread[]): Promise<boolean> {
+	/** Returns false when nothing was done because the action is not this control plane's to take. `touched` collects episode keys refused without an exception. */
+	async function perform(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, action: Action, threads: readonly LiveThread[], usage: Partial<Record<Lab, number>> = {}, touched = new Set<string>()): Promise<boolean> {
 		const owned = issue.status === 'Triage' || issue.labels.includes(oddLabel)
 		if (!owned) {
 			ctx.logger.log(marker, 'deferred: dispatcher owns', issue.identifier, issue.status, action.kind)
@@ -559,13 +785,21 @@ export default async function (amp: PluginAPI) {
 				}
 				// A verifier is labelled with the receipt it verifies, so the next release's receipt starts a fresh budget.
 				const receipt = action.role === 'verifier' && issue.deployReceipt ? [receiptLabel(issue.deployReceipt.sha)] : []
-				const threadID = await spawnThread(
-					ctx.thread.id,
-					action.role,
-					[...threadLabels(issue.identifier, action.role, action.round), ...receipt],
-					`${marker} Outcome ${issue.identifier}. Role: ${action.role}. Reason: ${action.reason}.${spawnTarget(issue, action.role)} Load the \`${contracts[action.role].skill}\` skill and start.`,
-				)
-				spawned.set(issue.identifier, [...(spawned.get(issue.identifier) ?? []), threadID])
+				const labels = [...threadLabels(issue.identifier, action.role, action.round), ...receipt]
+				const content = `${marker} Outcome ${issue.identifier}. Role: ${action.role}. Reason: ${action.reason}.${spawnTarget(issue, action.role)} Load the \`${contracts[action.role].skill}\` skill and start.`
+				if (action.role === 'builder') {
+					await launchBuilder(ctx, issue, labels, content, action.round)
+				} else {
+					// Cross-lab review: never the lab the issue's builder thread runs on.
+					let engine: Engine | undefined
+					if (action.role === 'reviewer') {
+						const builderLab = labOf(threads.find(thread => parseThreadLabels(thread.labels).role === 'builder')?.labels ?? [])
+						engine = selectReviewer(builderLab, usage)
+						if (!engine) throw new Error(`no reviewer engine outside the builder's lab ${builderLab ?? builderEngine.lab}`)
+					}
+					const threadID = await spawnThread(ctx.thread.id, action.role, labels, content, 'orb', engine)
+					spawned.set(issue.identifier, [...(spawned.get(issue.identifier) ?? []), threadID])
+				}
 				// Todo -> In Progress is the builder's claim; the status change is the handoff artifact (§7).
 				if (action.role === 'builder' && issue.status === 'Todo') await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: 'In Progress' })
 				return true
@@ -574,15 +808,23 @@ export default async function (amp: PluginAPI) {
 				await setStatus(ctx, issue, action, spawnDeployer(ctx))
 				return true
 			case 'steer': {
-				const key = `${action.threadID}:${action.message}`
-				if (steered.has(key)) return true
-				steered.add(key)
-				await amp.threads.get(action.threadID as ThreadID).appendUserMessage({ type: 'user-message', content: `${marker} ${action.message}` }, { steer: true })
+				const key = `${issue.identifier} ${action.key}`
+				if (!steered.has(key)) {
+					await amp.threads.get(action.threadID as ThreadID).appendUserMessage({ type: 'user-message', content: `${marker} ${action.message}` }, { steer: true })
+					steered.add(key)
+				}
+				await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: steerLine(action.key, action.threadID) })
 				return true
 			}
-			case 'merge':
-				await merge(ctx, state, issue, action.pr, action.sha)
+			case 'merge': {
+				const refusal = await merge(ctx, state, issue, action.pr, action.sha)
+				if (refusal) {
+					const failure = failureKey(issue, action)
+					touched.add(failure.key)
+					await recordFailure(ctx, state, issue.identifier, failure, `merge refused at ${action.sha}: ${refusal}`)
+				}
 				return true
+			}
 			case 'page':
 				await page(ctx, issue, action, spawnDeployer(ctx), threads)
 				return true
@@ -609,7 +851,8 @@ export default async function (amp: PluginAPI) {
 	// CI by a minute or so (MET-280's PR #182), so the issue is re-checked instead of waiting for
 	// a webhook that nothing will send.
 	const refused = new Set<string>()
-	async function merge(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, pr: number, sha: string) {
+	// Every refusal and failed merge at one head counts toward that head's failure episode, which pages at the third attempt.
+	async function merge(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, pr: number, sha: string): Promise<string | undefined> {
 		const draft = await ctx.$`gh pr view ${String(pr)} --json isDraft --jq .isDraft`
 		if (draft.exitCode === 0 && draft.stdout.trim() === 'true') {
 			const ready = await ctx.$`gh pr ready ${String(pr)}`
@@ -626,7 +869,7 @@ export default async function (amp: PluginAPI) {
 				await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-merge-refused pr=${pr} head=${sha}\n\n${cause}` })
 			}
 			recheck(ctx, state, issue.identifier, recheckMs)
-			return
+			return cause
 		}
 		const merged = await ctx.$`gh pr merge ${String(pr)} --squash --match-head-commit ${sha}`
 		if (merged.exitCode !== 0) throw new Error(`gh pr merge ${pr} at ${sha} failed: ${merged.stderr.trim()}`)
@@ -634,6 +877,7 @@ export default async function (amp: PluginAPI) {
 		const mergeSha = view.exitCode === 0 ? view.stdout.trim() : 'unknown'
 		await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-merge pr=${pr} head=${sha} merge=${mergeSha} release=none` })
 		ctx.logger.log(marker, 'merged', issue.identifier, pr, sha, mergeSha)
+		return undefined
 	}
 
 	// The red-deploy log reader (§4 Deployer, Build 6): an Amp low thread on the deploy host.
@@ -750,25 +994,79 @@ async function callJson<T>(tools: Tools, name: string, input: Record<string, unk
 	return JSON.parse(textBlock.text as string) as T
 }
 
-async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, knownThreads: readonly string[]): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[] }> {
+type Comment = { id?: string; body: string; createdAt?: string }
+
+async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, knownThreads: readonly string[]): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
 	const [issue, comments, pr, threads] = await Promise.all([
 		callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: identifier, includeRelations: true }),
-		callJson<{ comments?: { body: string; createdAt?: string }[] }>(ctx.tools, 'linear.list_comments', { issueId: identifier, limit: 50 }).then(result => result.comments ?? []),
+		callJson<{ comments?: Comment[] }>(ctx.tools, 'linear.list_comments', { issueId: identifier, limit: 50 }).then(result => result.comments ?? []),
 		pullRequestFor(ctx, identifier),
 		threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, knownThreads),
 	])
 	// `blockedBy` lists the relation's issues without their status; a blocker is open until closed.
 	const blockers = await Promise.all((issue.relations?.blockedBy ?? []).map(({ id }) => callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id })))
 	const openBlockers = blockers.filter(blocker => !['Done', 'Canceled', 'Duplicate'].includes(blocker.status)).map(blocker => blocker.id)
-	return { snapshot: toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers }), threads }
+	return { snapshot: toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers }), threads, comments }
 }
 
 // Finished role threads are archived so the thread list shows only live work; an archived
-// thread keeps its labels, so a later `find_thread … archived:false` no longer counts it.
-async function archiveThreads(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, threads: readonly LiveThread[]) {
+// thread keeps its labels, so a later `find_thread … archived:false` no longer counts it, and its
+// orb pauses. Each thread's actual routing is recorded first: a failed record keeps the thread
+// for the next evaluation, like a Watchdog cancellation.
+async function archiveThreads(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger' | '$'>, threads: readonly LiveThread[]) {
 	for (const thread of threads) {
+		await recordRouting(ctx, thread)
 		await callJson(ctx.tools, 'update_thread', { thread: thread.id, archived: true })
 		ctx.logger.log(marker, 'archived finished thread', thread.id)
+	}
+}
+
+type ShellContext = Pick<WebhookHandlerContext, 'tools' | 'logger' | '$'>
+
+/** Non-secret connection data (`amp config model-providers list --json`): ID, type, name, active. */
+async function connections(ctx: Pick<WebhookHandlerContext, '$'>): Promise<(Connection & { active?: boolean })[]> {
+	const result = await ctx.$`amp config model-providers list --json`
+	if (result.exitCode !== 0) throw new Error(`amp config model-providers list exited ${result.exitCode}`)
+	return (JSON.parse(result.stdout) as { id: string; type: string; name?: string; active?: boolean }[]).map(({ id, type, name, active }) => ({ id, type, name: name ?? '', active }))
+}
+
+/** The page transport (a Slack DM to the thread owner). True only when Slack confirmed the post; a failure is logged and left for the caller to retry. */
+async function deliver(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, text: string): Promise<boolean> {
+	try {
+		const result = (await ctx.tools.call('slack_write', { text })) as { isError?: boolean } | undefined
+		if (result?.isError) throw new Error('slack_write reported an error')
+		return true
+	} catch (error: unknown) {
+		ctx.logger.log(marker, 'page delivery failed', String(error))
+		return false
+	}
+}
+
+/** One page (pageText) per mismatch; best effort, so a Slack failure never holds an archive. */
+async function pageMismatch(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: string, detail: string) {
+	const text = `${marker} ${pageText(issue, { kind: 'page', reason: 'subscription-mismatch', detail })}`
+	await ctx.tools.call('slack_write', { text }).catch((error: unknown) => ctx.logger.log(marker, 'mismatch page failed', String(error)))
+}
+
+// After a role thread ends (its stage passed, or the Watchdog cancelled it): read the thread's
+// Model Routing from `amp threads usage --details`, post the sanitized record on its issue
+// (models, purposes, connection names; no costs, IDs or links), and page when it was not served
+// by the engine its labels name. Threads without an `odd-engine-*` label predate the pins.
+const routed = new Set<string>()
+async function recordRouting(ctx: ShellContext, thread: LiveThread) {
+	const { role, issue } = parseThreadLabels(thread.labels)
+	const engine = role ? expectedEngine(role, labOf(thread.labels)) : undefined
+	if (!role || !engine) {
+		ctx.logger.log(marker, 'no engine pin to check', thread.id)
+		return
+	}
+	const usage = await ctx.$`amp threads usage ${thread.id} --details`
+	const routes = usage.exitCode === 0 ? parseRouting(usage.stdout, await connections(ctx)) : []
+	const routing: Routing = usage.exitCode === 0 ? checkRouting(engine, routes) : { result: 'missing', problems: [`amp threads usage exited ${usage.exitCode}`] }
+	if (issue) await callJson(ctx.tools, 'linear.save_comment', { issueId: issue, body: routingRecord(thread.id, role, engine, routes, routing) })
+	if (routing.result !== 'match' && !routed.has(thread.id)) {
+		routed.add(thread.id)
+		await pageMismatch(ctx, issue ?? '-', `${role} thread ${thread.id} (${engine.model}): ${routing.problems.join('; ')}`)
 	}
 }
 
@@ -777,7 +1075,7 @@ async function archiveThreads(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger
 // PR by minutes (MET-279 was moved to Deploying off an older merged PR while #180 was open);
 // merged ones were indexed while open, so the quoted search (an unquoted `MET-301` also matches
 // `301`) is a safe prefilter for them.
-const prFields = 'number,headRefName,headRefOid,state,mergeCommit,statusCheckRollup,body'
+const prFields = 'number,headRefName,headRefOid,state,mergeCommit,mergedAt,mergeable,commits,statusCheckRollup,body'
 
 async function pullRequestsFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, identifier: string, state: 'merged' | 'open'): Promise<GitHubPullRequest[]> {
 	const result = state === 'open'
@@ -817,11 +1115,12 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 	return threads.filter(thread => !thread.archived).map(({ archived: _, ...thread }) => thread)
 }
 
-async function currentLoad(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>): Promise<Load> {
+/** Caps from live role threads, and the live role threads per lab that weight reviewer selection. */
+async function currentLoad(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>): Promise<{ load: Load; usage: Partial<Record<Lab, number>>; threads: LiveThread[] }> {
 	const threads = (await Promise.all(roleLabelQueries.map(query => threadsFor(ctx.tools, query)))).flat()
 	const load = loadFrom(threads)
 	ctx.logger.log(marker, 'load', JSON.stringify(load), 'of', JSON.stringify(capacity))
-	return load
+	return { load, usage: engineUsage(threads), threads }
 }
 
 // The Ralph guard's external checks: each is read from Linear or GitHub, never from the agent.

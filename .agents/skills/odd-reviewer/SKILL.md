@@ -6,9 +6,12 @@ description: Reviews one PR head SHA against the issue's Isolation, Build and Do
 # ODD Reviewer
 
 Contract source: `docs/odd/README.md` §4, §7. Stop condition:
-`verdict-posted`. One verdict per head SHA. Once the engine table returns the
-Reviewer runs on the opposite model family from the Builder; never approve a
-change written by your own family.
+`verdict-posted`. One verdict per head SHA. You run on a lab other than the
+Builder's: ChatGPT `openai/gpt-6-astra` or the SuperGrok connection `Cursor`
+`xai/grok-4.7`, both at high reasoning, picked by live usage
+(`scripts/odd/engines.ts`). Your thread's `odd-engine-<lab>` label names it. A
+verdict from the Builder's lab never counts: if your label matches the
+builder thread's, post nothing and stop.
 
 ## Inputs
 

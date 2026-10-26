@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { open, readFile, rename, unlink, lstat } from 'node:fs/promises';
-import { openSync, closeSync } from 'node:fs';
+import { openSync, closeSync, realpathSync } from 'node:fs';
 import { request } from 'node:http';
 import { connect } from 'node:net';
 import { join } from 'node:path';
@@ -233,21 +233,37 @@ export function supportedNode(version: string): boolean {
   return match !== null && Number(match[1]) >= 12;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+/** Side-effect-free candidate check: this tree's collector and parsers against the recorded CLI
+ * fixtures. No CLI, network, lock, snapshot read or write. */
+export async function selfCheck() {
+  const { fixtureRun } = await import('./fixtures.ts');
+  const snapshot = await collect(null, fixtureRun, 1);
+  check(snapshot.tools.length === TOOL_ORDER.length && snapshot.tools.every(tool => tool.status === 'ok'));
+  return { decision: 'self-check', tool: 'usage', root: realpathSync(fileURLToPath(new URL('../..', import.meta.url))) };
+}
+
+// argv[1] is the `current` tools link path; import.meta.url is the version it resolves to.
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   let fd: number | undefined;
   try {
     if (!supportedNode(process.versions.node)) throw new Error(`Use Node 24.x (>= 24.12.0); found ${process.versions.node}`);
     const args = process.argv.slice(2);
-    if (args.length > 1 || (args.length === 1 && args[0] !== '--dry-run')) throw new Error('Invalid arguments');
-    // Same lock from all worktrees once deployed; a fresh worktree uses its own
-    // existing inode before the main checkout contains this collector.
-    const mainLock = '/home/agent/work/factory/scripts/usage/collect.lock';
-    try { fd = openSync(mainLock, 'r'); } catch { fd = openSync(new URL('./collect.lock', import.meta.url), 'r'); }
-    check(spawnSync('flock', ['--exclusive', '--timeout', '60', '3'], { stdio: ['ignore', 'ignore', 'ignore', fd] }).status === 0);
-    const path = process.env.FACTORY_USAGE_SNAPSHOT ?? SNAPSHOT;
-    const snapshot = await collect(await readPrevious(path));
-    if (args[0] === '--dry-run') console.log(JSON.stringify(snapshot, null, 2));
-    else await writeSnapshot(path, snapshot);
+    if (args.length > 1 || (args.length === 1 && !['--dry-run', '--self-check'].includes(args[0]))) throw new Error('Invalid arguments');
+    if (args[0] === '--self-check') console.log(JSON.stringify(await selfCheck()));
+    else {
+      // Same lock inode from all worktrees and tools versions once deployed; only a fresh worktree
+      // uses its own existing inode before the main checkout contains this collector.
+      const mainLock = '/home/agent/work/factory/scripts/usage/collect.lock';
+      try { fd = openSync(mainLock, 'r'); } catch (error) {
+        if (fileURLToPath(import.meta.url).includes('/factory-tools/')) throw error;
+        fd = openSync(new URL('./collect.lock', import.meta.url), 'r');
+      }
+      check(spawnSync('flock', ['--exclusive', '--timeout', '60', '3'], { stdio: ['ignore', 'ignore', 'ignore', fd] }).status === 0);
+      const path = process.env.FACTORY_USAGE_SNAPSHOT ?? SNAPSHOT;
+      const snapshot = await collect(await readPrevious(path));
+      if (args[0] === '--dry-run') console.log(JSON.stringify(snapshot, null, 2));
+      else await writeSnapshot(path, snapshot);
+    }
   } catch (error) {
     const message = error instanceof Error && error.message.startsWith('Use Node 24.x')
       ? error.message

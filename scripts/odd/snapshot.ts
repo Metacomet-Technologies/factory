@@ -1,7 +1,8 @@
 // Outcome driven development: derive an IssueSnapshot from what Linear, GitHub and Amp
 // report (docs/odd/README.md §9). Pure functions; the control-plane plugin does the IO.
 
-import { capacity, contracts, parseCancelled, parseDeployReceipt, parseThreadLabels, parseVerify, roles, type DeployReceipt, type IssueSnapshot, type Load, type RiskClass, type Role, type Status, type Verdict, type Verify } from './lifecycle.ts';
+import { builderEngine, labOf } from './engines.ts';
+import { capacity, contracts, parseCancelled, parseDeployReceipt, parseSteer, parseThreadLabels, parseVerify, roles, type DeployReceipt, type IssueSnapshot, type Load, type RiskClass, type Role, type Status, type Verdict, type Verify } from './lifecycle.ts';
 
 export type WebhookSource = 'linear' | 'github' | 'slack';
 
@@ -40,19 +41,23 @@ export type LinearIssue = {
   status: string;
   labels: readonly string[];
   description?: string | null;
-  /** `list_comments` returns newest first; `createdAt` restores creation order. */
-  comments?: readonly { body: string; createdAt?: string }[];
+  /** `list_comments` returns newest first; `createdAt` restores creation order. `id` lets the control plane update its own record comments in place. */
+  comments?: readonly { id?: string; body: string; createdAt?: string }[];
   /** Present when fetched with `includeRelations: true`. */
   relations?: { blockedBy?: readonly { id: string }[] } | null;
 };
 
-/** `gh pr list --json number,headRefName,headRefOid,state,mergeCommit,statusCheckRollup,body`. */
+/** `gh pr list --json number,headRefName,headRefOid,state,mergeCommit,mergedAt,mergeable,commits,statusCheckRollup,body`. */
 export type GitHubPullRequest = {
   number: number;
   headRefName?: string;
   headRefOid: string;
   state: 'OPEN' | 'MERGED' | 'CLOSED';
   mergeCommit?: { oid: string } | null;
+  mergedAt?: string | null;
+  /** `MERGEABLE`, `CONFLICTING` or `UNKNOWN` while GitHub computes it. */
+  mergeable?: string;
+  commits?: readonly { oid?: string; committedDate?: string }[];
   statusCheckRollup?: readonly { name?: string; conclusion?: string | null; state?: string | null; status?: string | null }[];
   body?: string;
 };
@@ -85,9 +90,16 @@ export function ciState(checks: GitHubPullRequest['statusCheckRollup'] = []): 'p
 /** A reviewer thread's verdict label: state and the 12-character head prefix it judged. */
 export const verdictPattern = /^odd-verdict-(ready|changes)-([a-f0-9]{12})$/;
 
-/** The newest reviewer verdict label, matched to the PR head by its 12-character SHA prefix. */
+/**
+ * The newest reviewer verdict label, matched to the PR head by its 12-character SHA prefix. A
+ * verdict from a thread of the Builder's own lab (`odd-engine-<lab>`) never counts (§6); a builder
+ * thread without that label, or no live builder, falls back to the configured builder lab, as
+ * `selectReviewer` does.
+ */
 export function verdictFor(threads: readonly LiveThread[], headSha: string): Verdict | undefined {
+  const builderLab = labOf(threads.find(thread => parseThreadLabels(thread.labels).role === 'builder')?.labels ?? []) ?? builderEngine.lab;
   for (const thread of threads) {
+    if (labOf(thread.labels) === builderLab) continue;
     for (const label of thread.labels) {
       const match = verdictPattern.exec(label);
       if (match && headSha.startsWith(match[2])) return { state: match[1] as Verdict['state'], sha: headSha };
@@ -141,6 +153,7 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
   let receipt: DeployReceipt | undefined;
   let verify: Verify | undefined;
   let cancelledRounds: Partial<Record<Role, number>> = {};
+  const steers: Record<string, string> = {};
   const oldestFirst = [...issue.comments ?? []].sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''));
   for (const comment of oldestFirst) {
     if (/^odd-merge pr=/m.test(comment.body)) receipt = undefined;
@@ -152,7 +165,10 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     verify = parseVerify(comment.body) ?? verify;
     const cancelled = parseCancelled(comment.body);
     if (cancelled) cancelledRounds[cancelled.role] = Math.max(cancelledRounds[cancelled.role] ?? 0, cancelled.round);
+    const steered = parseSteer(comment.body);
+    if (steered) steers[steered.key] ??= comment.createdAt ?? '';
   }
+  const headAt = pr?.commits?.find(commit => commit.oid === pr.headRefOid)?.committedDate;
   return {
     identifier: issue.id.toUpperCase(),
     status,
@@ -169,11 +185,15 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
       merged: pr.state === 'MERGED',
       mergeSha: pr.mergeCommit?.oid ?? undefined,
       changesRounds: changesRounds(threads),
+      ...(headAt ? { headAt } : {}),
+      ...(pr.mergedAt ? { mergedAt: pr.mergedAt } : {}),
+      ...(pr.mergeable === 'CONFLICTING' ? { conflicting: true } : {}),
     } : undefined,
     deployReceipt: receipt,
     verify,
     openRounds: openRounds(roleThreads, receipt?.sha),
     cancelledRounds,
+    steers,
   };
 }
 

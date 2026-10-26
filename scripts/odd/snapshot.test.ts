@@ -29,6 +29,23 @@ test('a PR owns an issue by branch prefix or closes/contributes line, not by a m
   assert.equal(prOwnsIssue({}, 'MET-301'), false);
 });
 
+test('a ready verdict from the builder\'s lab never merges, whether the builder thread names its lab, lacks the label, or is gone', () => {
+  const issue = { id: 'MET-1', status: 'In Progress', labels: ['odd'] };
+  const pr: GitHubPullRequest = { number: 9, headRefOid: sha, state: 'OPEN', statusCheckRollup: [check('SUCCESS')] };
+  const ready = (lab: string): LiveThread => ({ id: `T-${lab}`, labels: ['odd-issue-met-1', 'odd-role-reviewer', 'odd-round-1', `odd-engine-${lab}`, `odd-verdict-ready-${sha.slice(0, 12)}`], state: 'idle' });
+  const builder = (labels: string[]): LiveThread => ({ id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1', ...labels], state: 'idle' });
+  const idle = { orbs: 0, runnerSlots: 0, buildIssues: 1 };
+  const next = (threads: LiveThread[]) => nextAction(toSnapshot({ issue, pr, threads }), idle);
+  for (const builders of [[builder(['odd-engine-anthropic'])], [builder([])], []]) {
+    assert.equal(next([...builders, ready('anthropic')]).kind, 'spawn', JSON.stringify(builders));
+    // Positive control: the same verdict from another lab merges.
+    assert.deepEqual(next([...builders, ready('openai')]), { kind: 'merge', pr: 9, sha });
+  }
+  // A builder labelled with another lab makes that lab's verdict the refused one.
+  assert.equal(next([builder(['odd-engine-openai']), ready('openai')]).kind, 'spawn');
+  assert.deepEqual(next([builder(['odd-engine-openai']), ready('anthropic')]), { kind: 'merge', pr: 9, sha });
+});
+
 test('CI rollup: any failure beats pending, pending beats success, no checks is pending', () => {
   assert.equal(ciState([check('SUCCESS'), check(null, 'PENDING')]), 'pending');
   assert.equal(ciState([check('SUCCESS'), check('FAILURE'), check(null, 'PENDING')]), 'failure');
@@ -184,4 +201,31 @@ test('a new release starts a fresh verifier budget despite the old receipt\'s ve
   assert.deepEqual(openRounds([old, current], b), { verifier: 2 });
   assert.equal(delivered(old, b), true);
   assert.equal(delivered(current, b), false);
+});
+
+test('P3.1: wait ages come from the head commit, the merge and the steer comment, never from the sweep; a missing source stays unknown', () => {
+  const builder: LiveThread = { id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1'], state: 'idle' };
+  const older = 'f'.repeat(40);
+  const open: GitHubPullRequest = { number: 9, headRefOid: sha, state: 'OPEN', statusCheckRollup: [check(null, 'PENDING')], mergeable: 'MERGEABLE',
+    commits: [{ oid: older, committedDate: '2026-10-26T08:00:00Z' }, { oid: sha, committedDate: '2026-10-26T09:00:00Z' }] };
+  const issue = { id: 'MET-1', status: 'In Progress', labels: ['odd'] };
+  const pending = toSnapshot({ issue, pr: open, threads: [builder] });
+  assert.equal(pending.pr?.headAt, '2026-10-26T09:00:00Z', 'the head commit, not an older one');
+  assert.deepEqual((nextAction(pending, { orbs: 0, runnerSlots: 0, buildIssues: 1 }) as { wait?: object }).wait, { kind: 'ci', key: `ci-${sha.slice(0, 12)}`, since: '2026-10-26T09:00:00Z' });
+  // GitHub did not report the head commit: the age is unknown, not "since this sweep".
+  const undated = toSnapshot({ issue, pr: { ...open, commits: [{ oid: older, committedDate: '2026-10-26T08:00:00Z' }] }, threads: [builder] });
+  assert.equal(undated.pr?.headAt, undefined);
+  // CONFLICTING: CI never runs, so the builder is steered to rebase instead of waiting on pending CI.
+  const conflicting = toSnapshot({ issue, pr: { ...open, mergeable: 'CONFLICTING' }, threads: [builder] });
+  assert.equal((nextAction(conflicting, { orbs: 0, runnerSlots: 0, buildIssues: 1 }) as { key?: string }).key, `conflict-${sha.slice(0, 12)}`);
+  const merged = toSnapshot({ issue: { ...issue, status: 'Deploying' }, pr: { ...open, state: 'MERGED', mergeCommit: { oid: 'e'.repeat(40) }, mergedAt: '2026-10-26T10:00:00Z' } });
+  assert.deepEqual((nextAction(merged, { orbs: 0, runnerSlots: 0, buildIssues: 0 }) as { wait?: object }).wait, { kind: 'receipt', key: `receipt-${'e'.repeat(12)}`, since: '2026-10-26T10:00:00Z' });
+  // The steer record dates the unanswered steer; the first record of a key wins over a later duplicate.
+  const key = `ci-failed-${sha.slice(0, 12)}`;
+  const steered = toSnapshot({ issue: { ...issue, comments: [
+    { body: `odd-steer key=${key} thread=T-b`, createdAt: '2026-10-26T11:05:00Z' },
+    { body: `odd-steer key=${key} thread=T-b`, createdAt: '2026-10-26T11:00:00Z' },
+  ] }, pr: { ...open, statusCheckRollup: [check('FAILURE')] }, threads: [builder] });
+  assert.deepEqual(steered.steers, { [key]: '2026-10-26T11:00:00Z' });
+  assert.deepEqual((nextAction(steered, { orbs: 0, runnerSlots: 0, buildIssues: 1 }) as { wait?: object }).wait, { kind: 'steer', key: `steer-${key}`, since: '2026-10-26T11:00:00Z' });
 });

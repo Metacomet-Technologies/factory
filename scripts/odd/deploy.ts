@@ -8,18 +8,25 @@
 // Deploying issue the release ships gets one `odd-deploy` receipt. The control plane turns the
 // receipt into Done, Todo + Bug, or a page (scripts/odd/lifecycle.ts).
 //
+// The unprivileged runtime (this job, the dispatcher and the usage collector) runs from
+// `~/factory-tools/current`, a link to an immutable `~/factory-tools/<tag>` tree of a release this
+// job verified. It advances only forward, after every tool's side-effect-free self-check passes in
+// the candidate and again through the link (`promoteTools`). The privileged installers stay at the
+// Devon-approved `/home/agent/work/factory` revision (ROOT); this job never moves that checkout.
+//
 // Pure planning (`plan`, `pendingTags`, `issuesFromSubjects`, `parseSnapshot`, `healthySha`,
 // `probeResult`, `restoredResult`, `receiptLine`, `meterPlan`, `resume`) is exported for tests; effects go
 // through `Effects` so the sandbox fixture fakes sudo, curl, git, the release download and Linear.
 
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Refusal } from './lifecycle.ts';
 
+/** The allowlisted installer checkout: sudo, Git history and the release verifier. Never the runtime. */
 export const ROOT = '/home/agent/work/factory';
 export const HOST = 'factory-gpu';
 export const STATE_DIR = join(homedir(), '.local/state/factory-odd');
@@ -27,6 +34,11 @@ export const LEDGER = join(STATE_DIR, 'deploy.json');
 export const PROBES = 3;
 export const PROBE_GAP_MS = 20_000;
 export const LINEAR_KEY_FILE = '/etc/factory-dispatch/linear-api-key';
+/** Versioned runtime trees and the `current` link the deploy, dispatch and usage units execute. */
+export const TOOLS_DIR = join(homedir(), 'factory-tools');
+export const CHECK_TIMEOUT_MS = 60_000;
+/** Each tool's side-effect-free check; a candidate tree must pass all of them. */
+export const toolChecks = [['scripts/odd/deploy.ts', '--self-check'], ['scripts/dispatch/dispatch.ts', 'check'], ['scripts/usage/collect.ts', '--self-check']] as const;
 
 export type Recipe = {
   name: string;
@@ -64,7 +76,11 @@ export type ComponentRecord = { sha: string; tag: string; health: 'pass' | 'fail
 export type InFlight = { tag: string; sha: string; component: string; phase: 'installing' | 'probing'; snapshot?: string; noDbChange?: true };
 /** A release's receipt, saved before delivery so a crashed delivery resumes without redeploying. `delivered` lists issues already handled. */
 export type PendingReceipt = { tag: string; receipt: Receipt; delivered: string[] };
-export type Ledger = { lastTag?: string; components: Record<string, ComponentRecord>; inFlight?: InFlight; receipt?: PendingReceipt; manualBaseline?: ManualBaseline };
+/** A tools tree: release tag/SHA and the installer checkout's HEAD it ran beside. */
+export type ToolsRecord = { tag: string; sha: string; installerSha: string };
+/** `pending` is saved before staging and cleared only by delivery or rejection; `previous` is the link target to restore. */
+export type Tools = { current?: ToolsRecord; pending?: ToolsRecord & { previous: string | null }; rejected?: ToolsRecord & { reason: string } };
+export type Ledger = { lastTag?: string; components: Record<string, ComponentRecord>; inFlight?: InFlight; receipt?: PendingReceipt; manualBaseline?: ManualBaseline; tools?: Tools };
 export type ManualBaseline = {
   tag: string; sha: string; toolsSha: string; manifestSha256: string;
   priorLedger: Omit<Ledger, 'manualBaseline'>;
@@ -179,18 +195,22 @@ export function resume(inFlight: InFlight, probe: 'pass' | 'fail'): 'installed' 
 export type Effects = {
   /** Holds the ledger's release directories (`releases/<tag>`) and inventories. */
   stateDir: string;
+  /** Holds the runtime's `<tag>` trees and `current` link (TOOLS_DIR). */
+  toolsDir: string;
   log: (decision: string, details?: object) => void;
   sleep: (ms: number) => Promise<void>;
   /** Run a command; non-zero exit throws with stdout+stderr in the message. */
-  run: (command: string, args: readonly string[], options?: { cwd?: string }) => { stdout: string; stderr: string };
+  run: (command: string, args: readonly string[], options?: { cwd?: string; timeout?: number }) => { stdout: string; stderr: string };
   /** Exit status 0? For git predicates such as merge-base --is-ancestor. */
   ok: (command: string, args: readonly string[]) => boolean;
   /** `sudo -n /usr/bin/bash <ROOT>/<script> args...`; returns combined output, `ok` false on non-zero exit. */
   sudo: (script: string, args: readonly string[]) => { ok: boolean; output: string };
   /** GET a health endpoint; throws when unreachable. */
   probe: (url: string) => string;
+  /** Throws when unreadable; an absent ledger throws with code ENOENT. */
   readLedger: () => Ledger;
-  writeLedger: (ledger: Ledger) => void;
+  /** Atomic replace; `create` refuses to overwrite an existing ledger. */
+  writeLedger: (ledger: Ledger, options?: { create?: boolean }) => void;
   linear: {
     deploying: (identifier: string) => Promise<boolean>;
     /** Does the issue already carry a comment whose body is exactly `body`? */
@@ -527,17 +547,44 @@ export async function reconcileManual(effects: Effects, tag: string, approval?: 
   return result;
 }
 
-export async function main(effects: Effects): Promise<void> {
-  const tags = publishedTags(effects);
-  const ledger = effects.readLedger();
-  if (!ledger.lastTag) {
-    // First run records where the host already is; the next published release is the first auto-deploy.
-    const latest = pendingTags(tags, undefined).at(-1);
-    if (!latest) { effects.log('no-releases'); return; }
-    effects.writeLedger({ ...ledger, lastTag: latest });
-    effects.log('bootstrap', { lastTag: latest });
-    return;
+const absent = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT';
+
+/** Explicit baseline for an absent ledger only: a published stable tag at an immutable SHA on
+ * main that every enabled component already reports healthy. Records `lastTag` and nothing else:
+ * no install, component health or receipt. Existing ledgers use reconcile-manual. */
+export async function bootstrap(effects: Effects, tag: string): Promise<void> {
+  if (!semver(tag)) throw new Error(`Bootstrap needs a vX.Y.Z release tag, not ${tag}`);
+  // An unreadable or corrupt ledger is existing state too: its read error propagates.
+  let exists = true;
+  try { effects.readLedger(); } catch (error) { if (!absent(error)) throw error; exists = false; }
+  if (exists) throw new Error('A deploy ledger already exists; bootstrap never overwrites it (use reconcile-manual for a stale ledger)');
+  effects.run('git', ['-C', ROOT, 'fetch', '--quiet', '--tags', 'origin']);
+  if (!publishedTags(effects).includes(tag)) throw new Error(`${tag} is not a published stable release`);
+  const sha = effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `refs/tags/${tag}^{commit}`]).stdout.trim();
+  effects.run('git', ['-C', ROOT, 'merge-base', '--is-ancestor', sha, 'origin/main']);
+  const incompatible: string[] = [];
+  for (const recipe of recipes) if ((await probeWindow(effects, recipe, sha, probeResult, 'bootstrap-probe')) === 'fail') incompatible.push(recipe.name);
+  if (incompatible.length) throw new Error(`Refusing bootstrap at ${tag}: ${incompatible.join(', ')} not healthy at ${sha}`);
+  effects.writeLedger({ lastTag: tag, components: {} }, { create: true });
+  effects.log('bootstrap', { lastTag: tag, sha });
+}
+
+/** The job never adopts a missing, unreadable or malformed ledger: it stops before any remote read. */
+function readValidLedger(effects: Effects): Ledger & { lastTag: string } {
+  const stop = (reason: string) => new Error(`Deploy ledger ${LEDGER} ${reason}; not deploying. Investigate (docs/odd/deployer-recovery.md); a genuinely missing ledger needs an explicit reviewed \`deploy.ts --bootstrap TAG\`.`);
+  let ledger: Ledger;
+  try { ledger = effects.readLedger(); } catch (error) {
+    throw stop(absent(error) ? 'is missing' : `is unreadable (${error instanceof Error ? error.message : error})`);
   }
+  const components = (ledger as Partial<Ledger> | null)?.components;
+  if (!ledger || typeof ledger !== 'object' || Array.isArray(ledger) || typeof ledger.lastTag !== 'string' || !semver(ledger.lastTag) ||
+      !components || typeof components !== 'object' || Array.isArray(components)) throw stop('has no valid lastTag and components');
+  return ledger as Ledger & { lastTag: string };
+}
+
+export async function main(effects: Effects): Promise<void> {
+  const ledger = readValidLedger(effects);
+  const tags = publishedTags(effects);
   const cursor = ledger.manualBaseline && compareTags(ledger.manualBaseline.tag, ledger.lastTag) > 0 ? ledger.manualBaseline.tag : ledger.lastTag;
   const pending = pendingTags(tags, cursor);
   effects.log('pending', { lastTag: ledger.lastTag, tags: pending });
@@ -546,12 +593,115 @@ export async function main(effects: Effects): Promise<void> {
     await deployRelease(effects, tag, previous);
     previous = tag;
   }
+  // Only the newest handled release: historical releases deployed above never move the runtime.
+  promoteTools(effects, previous);
+}
+
+/** Side-effect-free check of the tree this module was loaded from (realpath, so a `current`
+ * link resolves to its version): imports, inventory and planning only. No ledger, lock, Git,
+ * network, sudo or write. */
+export function selfCheck() {
+  const root = realpathSync(fileURLToPath(new URL('../..', import.meta.url)));
+  const inventory = JSON.parse(readFileSync(join(root, 'deploy/components.json'), 'utf8')) as { components: { id: string; sources: string[] }[] };
+  const sources = Object.fromEntries(inventory.components.map(component => [component.id, component.sources]));
+  const missing = recipes.filter(recipe => !Array.isArray(sources[recipe.name])).map(recipe => recipe.name);
+  if (missing.length) throw new Error(`deploy/components.json lacks ${missing.join(', ')}`);
+  const planned = plan({ sha: 'f'.repeat(40), sources, baselines: {}, ledger: emptyLedger(), changedSince: () => [], isAncestor: () => true });
+  if (planned.length !== recipes.length || parseSnapshot('Rollback snapshot: /x\n') !== '/x') throw new Error('Deploy planning self-check failed');
+  return { decision: 'self-check', tool: 'deploy', root, installerRoot: ROOT };
+}
+
+/** Run every tool's self-check in `root` (a tree or the `current` link) under a read-only,
+ * no-subprocess Node permission model and a timeout; each must report the expected tree. */
+function checkTools(effects: Effects, root: string, expected: string): void {
+  for (const [script, arg] of toolChecks) {
+    let stdout: string;
+    try { ({ stdout } = effects.run(process.execPath, ['--permission', '--allow-fs-read=*', join(root, script), arg], { cwd: root, timeout: CHECK_TIMEOUT_MS })); } catch (error) {
+      throw new Error(`${script} ${arg} failed in ${root}: ${(error instanceof Error ? error.message : String(error)).split('\n')[0]}`);
+    }
+    let report: { decision?: string; root?: string };
+    try { report = JSON.parse(stdout.trim().split('\n').at(-1) ?? ''); } catch { report = {}; }
+    if (report.decision !== 'self-check' || report.root !== expected) throw new Error(`${script} ${arg} did not report a self-check of ${expected}`);
+  }
+}
+
+const readLink = (path: string) => { try { return readlinkSync(path); } catch (error) { if (absent(error)) return null; throw error; } };
+
+/** Atomically point `link` at `target` (relative), or remove it when there was no link. */
+function setLink(link: string, target: string | null): void {
+  if (target === null) { rmSync(link, { force: true }); return; }
+  const next = `${link}.next-${randomUUID()}`;
+  symlinkSync(target, next);
+  try { renameSync(next, link); } finally { rmSync(next, { force: true }); }
+}
+
+/** An existing version is immutable: reused only when it records the same commit, never replaced. */
+function stageTools(effects: Effects, record: ToolsRecord): string {
+  const dir = join(effects.toolsDir, record.tag);
+  if (existsSync(dir)) {
+    const marker = JSON.parse(readFileSync(join(dir, '.factory-tools.json'), 'utf8')) as Partial<ToolsRecord>;
+    if (marker.sha !== record.sha) throw new Error(`${dir} records ${marker.sha}, not ${record.sha}; refusing to replace a tools version`);
+    return dir;
+  }
+  mkdirSync(effects.toolsDir, { recursive: true });
+  const staging = mkdtempSync(join(effects.toolsDir, `.stage-${record.tag}-`));
+  try {
+    effects.run('git', ['-C', ROOT, 'archive', '--format=tar', '-o', `${staging}.tar`, record.sha]);
+    effects.run('tar', ['--no-same-owner', '-xf', `${staging}.tar`, '-C', staging]);
+    writeFileSync(join(staging, '.factory-tools.json'), `${JSON.stringify({ tag: record.tag, sha: record.sha })}\n`);
+    renameSync(staging, dir);
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+    rmSync(`${staging}.tar`, { force: true });
+  }
+  effects.log('tools-staged', { tag: record.tag, sha: record.sha, dir });
+  return dir;
+}
+
+/**
+ * Advance `<toolsDir>/current` to `tag`, a release this job verified, never backwards. The
+ * pending promotion is saved before staging; a crash retries it, and only a passing check of the
+ * candidate and then of the link (activation) records `current`. A failed check restores the
+ * prior link and rejects that tag; a staging error keeps it pending. Installers stay at ROOT.
+ */
+export function promoteTools(effects: Effects, tag: string): void {
+  const ledger = effects.readLedger();
+  const tools = ledger.tools ?? {};
+  const link = join(effects.toolsDir, 'current');
+  let pending = tools.pending;
+  if (pending) effects.log('tools-resume', pending);
+  else {
+    if (tools.rejected?.tag === tag || (tools.current && compareTags(tag, tools.current.tag) <= 0)) return;
+    const marker = join(effects.stateDir, 'releases', tag, '.verified');
+    if (!existsSync(marker)) { effects.log('tools-waiting', { tag, reason: 'release not verified by this deployer' }); return; }
+    pending = { tag, sha: readFileSync(marker, 'utf8').trim(), installerSha: effects.run('git', ['-C', ROOT, 'rev-parse', 'HEAD']).stdout.trim(), previous: readLink(link) };
+    effects.writeLedger({ ...ledger, tools: { ...tools, pending } });
+  }
+  const { previous, ...record } = pending;
+  const dir = stageTools(effects, record);
+  const expected = realpathSync(dir);
+  try {
+    checkTools(effects, dir, expected);
+    setLink(link, record.tag);
+    if (realpathSync(link) !== expected) throw new Error(`${link} does not resolve to ${expected}`);
+    checkTools(effects, link, expected);
+  } catch (error) {
+    setLink(link, previous);
+    const reason = error instanceof Error ? error.message.split('\n')[0] : String(error);
+    effects.writeLedger({ ...effects.readLedger(), tools: { current: tools.current, rejected: { ...record, reason } } });
+    effects.log('tools-rejected', { ...record, reason, restored: previous });
+    throw new Error(`Tools ${record.tag} rejected; ${link} restored to ${previous ?? 'none'}: ${reason}`);
+  }
+  effects.writeLedger({ ...effects.readLedger(), tools: { current: record, rejected: tools.rejected } });
+  // Installers never advance here: a release that changes them needs Devon's batched move of ROOT.
+  const installers = effects.run('git', ['-C', ROOT, 'diff', '--name-only', record.installerSha, record.sha, '--', 'deploy']).stdout.split('\n').filter(Boolean);
+  effects.log('tools-promoted', { ...record, link, root: expected, installerRoot: ROOT, installerChanges: installers });
 }
 
 export function liveEffects(): Effects {
   const log: Effects['log'] = (decision, details = {}) => console.log(JSON.stringify({ decision, ...details }));
   const run: Effects['run'] = (command, args, options = {}) => {
-    const result = spawnSync(command, args, { cwd: options.cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    const result = spawnSync(command, args, { cwd: options.cwd, timeout: options.timeout, killSignal: 'SIGKILL', encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     if (result.error) throw result.error;
     if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} exited ${result.status}\n${result.stdout}${result.stderr}`);
     return { stdout: result.stdout, stderr: result.stderr };
@@ -571,6 +721,7 @@ export function liveEffects(): Effects {
   type IssueData = { issue: { id: string; state: { name: string }; comments: { nodes: { body: string }[] } } };
   return {
     stateDir: STATE_DIR,
+    toolsDir: TOOLS_DIR,
     log,
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     run,
@@ -580,15 +731,20 @@ export function liveEffects(): Effects {
       return { ok: result.status === 0, output: `${result.stdout}${result.stderr}` };
     },
     probe: url => run('curl', ['-fsS', '--max-time', '10', url]).stdout,
-    readLedger: () => {
-      try { return JSON.parse(readFileSync(LEDGER, 'utf8')) as Ledger; } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyLedger();
-        throw error;
-      }
-    },
-    writeLedger: ledger => {
+    readLedger: () => JSON.parse(readFileSync(LEDGER, 'utf8')) as Ledger,
+    writeLedger: (ledger, options) => {
       mkdirSync(STATE_DIR, { recursive: true });
-      writeFileSync(`${LEDGER}.tmp`, `${JSON.stringify(ledger, null, 2)}\n`);
+      const body = `${JSON.stringify(ledger, null, 2)}\n`;
+      if (options?.create) {
+        // link(2) publishes the complete file atomically and fails with EEXIST instead of replacing.
+        // The staging name is this call's alone: a crash after the link must not leave the ledger
+        // hard-linked to the `.tmp` that ordinary writes truncate.
+        const staging = `${LEDGER}.create-${randomUUID()}`;
+        writeFileSync(staging, body, { flag: 'wx' });
+        try { linkSync(staging, LEDGER); } finally { rmSync(staging, { force: true }); }
+        return;
+      }
+      writeFileSync(`${LEDGER}.tmp`, body);
       renameSync(`${LEDGER}.tmp`, LEDGER);
     },
     linear: {
@@ -602,14 +758,17 @@ export function liveEffects(): Effects {
   };
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const effects = liveEffects();
+// argv[1] is the `current` link path; import.meta.url is the version it resolves to.
+if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(process.argv[1])) {
   const args = process.argv.slice(2);
   const run = async () => {
+    if (args.length === 1 && args[0] === '--self-check') return console.log(JSON.stringify(selfCheck()));
+    const effects = liveEffects();
     if (!args.length) return main(effects);
+    if (args[0] === '--bootstrap' && args.length === 2 && semver(args[1])) return bootstrap(effects, args[1]);
     if (args[0] !== 'reconcile-manual' || !semver(args[1] ?? '') ||
         !(args.length === 2 || (args.length === 4 && args[2] === '--approve' && /^[a-f0-9]{64}$/.test(args[3])))) {
-      throw new Error('Usage: deploy.ts [reconcile-manual TAG [--approve PREVIEW_SHA256]]');
+      throw new Error('Usage: deploy.ts [--bootstrap TAG | reconcile-manual TAG [--approve PREVIEW_SHA256]]');
     }
     await reconcileManual(effects, args[1], args[3]);
   };
