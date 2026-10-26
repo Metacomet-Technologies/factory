@@ -1,0 +1,272 @@
+name: Historical CI recovery
+
+# This run is not push/main CI. Publication additionally requires Devon's
+# separate, exact-run evidence approval in scripts/release/ci-recoveries.json.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_controller:
+        description: Reviewed full main SHA containing this recovery workflow
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: historical-ci-dcc0b84-backup-group-v1
+  cancel-in-progress: false
+
+env:
+  EXPECTED_CONTROLLER: ${{ inputs.expected_controller }}
+  RECOVERY_WORKFLOW_SHA: ${{ github.workflow_sha }}
+
+defaults:
+  run:
+    working-directory: source
+
+# Frozen release-required recipes from dcc0b84's ci.yml. No build caches,
+# source overlays, optional test-file checks, or publication credentials.
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef
+          path: source
+          persist-credentials: false
+      - name: Validate source
+        run: python3 -B ../control/scripts/release/ci_recovery.py check --job rust
+      - name: Rust toolchain
+        run: |
+          cc --version
+          if [[ -f rust-toolchain || -f rust-toolchain.toml ]]; then
+            rustup show active-toolchain
+            rustup component add rustfmt clippy
+          else
+            rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+            rustup default stable
+          fi
+      - name: Rust format
+        run: cargo fmt --check
+      - name: Rust lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Rust tests
+        run: cargo test --workspace --locked
+      - name: Installer dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y sqlite3
+      - name: Installer DB tests
+        run: bash meter/tests/installer-db.sh target/debug/meter
+      - name: Record evidence
+        run: python3 -B ../control/scripts/release/ci_recovery.py record --job rust --output "$RUNNER_TEMP/evidence/receipt.json"
+      - name: Upload evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ci-recovery-${{ github.run_id }}-${{ github.run_attempt }}-rust
+          path: ${{ runner.temp }}/evidence/receipt.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+  kiosk:
+    name: kiosk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef
+          path: source
+          persist-credentials: false
+      - name: Validate source
+        run: python3 -B ../control/scripts/release/ci_recovery.py check --job kiosk
+      - name: Kiosk toolchain
+        run: |
+          python3 -B scripts/env/test_check.py
+          python3 -B scripts/env/test_setup.py
+          scripts/env/setup.sh --ci
+      - name: Kiosk versions
+        working-directory: source/kiosk
+        run: node --version && bun --version && vp --version
+      - name: Kiosk dependencies
+        working-directory: source/kiosk
+        run: |
+          vp install --frozen-lockfile
+          echo "$GITHUB_WORKSPACE/source/kiosk/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Kiosk check
+        working-directory: source/kiosk
+        run: vp check
+        env:
+          OPENAPI_URL: file://${{ github.workspace }}/source/factory-api/openapi.json
+      - name: Kiosk tests
+        working-directory: source/kiosk
+        run: vp test --run
+      - name: Kiosk build
+        working-directory: source/kiosk
+        run: vp build
+      - name: Record evidence
+        run: python3 -B ../control/scripts/release/ci_recovery.py record --job kiosk --output "$RUNNER_TEMP/evidence/receipt.json"
+      - name: Upload evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ci-recovery-${{ github.run_id }}-${{ github.run_attempt }}-kiosk
+          path: ${{ runner.temp }}/evidence/receipt.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+  scripts:
+    name: scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef
+          path: source
+          persist-credentials: false
+      - name: Validate source
+        run: python3 -B ../control/scripts/release/ci_recovery.py check --job scripts
+      - name: Node toolchain
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version-file: source/scripts/dispatch/.node-version
+      - name: Dispatcher tests
+        run: node --test scripts/dispatch scripts/usage scripts/odd
+      - name: Release tests
+        run: python3 scripts/release/test-release.py
+      - name: Script dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y shellcheck sqlite3 zstd rsync
+      - name: Script checks
+        run: |
+          mapfile -d '' scripts < <(find deploy scripts -type f -name '*.sh' -print0)
+          for script in "${scripts[@]}"; do bash -n "$script"; done
+          shellcheck -x "${scripts[@]}"
+      - name: Client lint
+        run: |
+          shellcheck -s bash -x client/factory.zsh
+          shellcheck -s bash -e SC2034 client/factory.env
+      - name: Installer contract
+        run: |
+          bash deploy/lint-installers.sh
+          python3 -B deploy/test-lint-installers.py
+      - name: Ollama tests
+        run: python3 -B deploy/test_set_ollama_host.py
+      - name: Dispatch installer tests
+        run: python3 -B deploy/test-install-dispatch.py
+      - name: Backup tests
+        run: python3 -B deploy/backup/test-backup.py
+      - name: UV toolchain
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          enable-cache: false
+      - name: Offsite group fixture
+        run: |
+          test "$(id -u)" -ne 0
+          if getent group factory-backup; then
+            echo 'Unexpected pre-existing fixture group' >&2
+            exit 1
+          fi
+          sudo groupadd --system factory-backup
+          sudo usermod --append --groups factory-backup "$(id -un)"
+      - name: Offsite tests
+        run: |
+          sudo setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+            --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs \
+            env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" \
+            /usr/bin/python3 -B "$GITHUB_WORKSPACE/control/scripts/release/ci_recovery.py" \
+            offsite --job scripts --output "$RUNNER_TEMP/offsite.json"
+      - name: Reboot tests
+        run: python3 -B deploy/reboot/test-reboot.py
+      - name: Device tests
+        run: |
+          primary_group=$(id -gn)
+          devices_test_group=$(id -Gn | tr ' ' '\n' | grep -vx "$primary_group" | head -n 1)
+          test -n "$devices_test_group"
+          echo "Using supplementary test group: $devices_test_group"
+          DEVICES_TEST_GROUP="$devices_test_group" python3 -B deploy/devices/test-install.py
+          python3 -B deploy/devices-agent/test-install.py
+      - name: Record evidence
+        run: python3 -B ../control/scripts/release/ci_recovery.py record --job scripts --output "$RUNNER_TEMP/evidence/receipt.json"
+      - name: Upload evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ci-recovery-${{ github.run_id }}-${{ github.run_attempt }}-scripts
+          path: ${{ runner.temp }}/evidence/receipt.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+  sandbox:
+    name: sandbox
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: dcc0b84e02c00cfa2d7ef76ce3a74542fdacacef
+          path: source
+          persist-credentials: false
+      - name: Validate source
+        run: python3 -B ../control/scripts/release/ci_recovery.py check --job sandbox
+      - name: Sandbox toolchain
+        run: scripts/env/setup.sh --ci --env sandbox
+      - name: Host configuration tests
+        run: python3 -B deploy/test-agent-host-config.py
+      - name: Sandbox script checks
+        run: |
+          scripts=(scripts/sandbox scripts/sandbox-shims/nvidia-smi scripts/sandbox-shims/tailscale scripts/sandbox-shims/timedatectl scripts/sandbox-shims/ping)
+          for script in "${scripts[@]}"; do bash -n "$script"; done
+          shellcheck -x "${scripts[@]}"
+      - name: Sandbox up
+        run: scripts/sandbox up --rows 1k
+      - name: Sandbox smoke
+        run: python3 scripts/sandbox-shims/smoke.py
+      - name: Sandbox logs
+        if: failure()
+        run: |
+          for service in runtime seed meter factory-api; do scripts/sandbox logs "$service" || true; done
+      - name: Sandbox down
+        if: always()
+        run: scripts/sandbox down
+      - name: Record evidence
+        run: python3 -B ../control/scripts/release/ci_recovery.py record --job sandbox --output "$RUNNER_TEMP/evidence/receipt.json"
+      - name: Upload evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ci-recovery-${{ github.run_id }}-${{ github.run_attempt }}-sandbox
+          path: ${{ runner.temp }}/evidence/receipt.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false

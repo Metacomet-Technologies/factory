@@ -17,6 +17,8 @@ import tempfile
 import time
 import urllib.request
 
+import ci_recovery
+
 REPO = "Metacomet-Technologies/factory"
 SCHEMA = 1
 BATCH_SIZE = 5
@@ -142,6 +144,8 @@ def validate_manifest(manifest, inventory, expected_sha):
             "reservation evidence mismatch")
     require(all(type(evidence[key]) is int and evidence[key] > 0
                 for key in ("pull_request", "ci_run", "ci_attempt")), "invalid merge/CI evidence")
+    if "ci_recovery" in evidence:
+        ci_recovery.provenance_check(evidence["ci_recovery"], expected_sha, evidence["ci_run"], evidence["ci_attempt"])
     artifacts = manifest["artifacts"]
     require(len(artifacts) == len(ASSETS) and {a["name"] for a in artifacts} == ASSETS, "missing/unknown artifact")
     for artifact in artifacts:
@@ -319,6 +323,13 @@ class GitHub:
             self.waiting_for_ci = True
             print(f"waiting for CI on {sha} run {run['id']}", file=sys.stderr)
             return None
+        if run["conclusion"] != "success":
+            recovery = ci_recovery.evidence(self, sha, run)
+            if self.waiting_for_ci:
+                print(f"waiting for approved recovery CI on {sha}", file=sys.stderr)
+                return None
+            if recovery is not None:
+                return {"bump": bump, "pull_request": pr["number"], **recovery}
         require(run["status"] == "completed" and run["conclusion"] == "success",
                 f"{sha}: exact-SHA main CI incomplete or check-failed; "
                 f"Devon must inspect/rerun CI run {run['id']}, then reconcile (never skip this SHA)")
@@ -370,6 +381,9 @@ def planned(api, root, inventory):
                     return
                 require(reservation["bump"] == evidence["bump"]
                         and reservation["pull_request"] == evidence["pull_request"], "reservation intent changed")
+                if "ci_recovery" in reservation or "ci_recovery" in evidence:
+                    require(all(reservation.get(k) == evidence.get(k) for k in ("ci_run", "ci_attempt", "ci_recovery")),
+                            "reserved recovery evidence changed; preserve reservation and investigate")
                 if release is None:
                     require(tag in api.create_reserved_releases or tag in api.resume_release_hints,
                             f"{tag}: reserved tag has no visible release; inspect existing drafts and use explicit recovery")
@@ -485,6 +499,14 @@ def fetch_bundle(api, release, directory):
         (Path(directory) / name).write_bytes(data)
 
 
+def revalidate_recovery(api, plan, inventory):
+    if "ci_recovery" in plan:
+        evidence = api.evidence(plan["source_sha"], inventory)
+        require(evidence is not None and all(plan.get(k) == evidence.get(k) for k in
+                ("bump", "pull_request", "ci_run", "ci_attempt", "ci_recovery")),
+                "recovery evidence changed before write; preserve remote state")
+
+
 def publish_one(api, plan, inventory, directory, builder):
     """Resume at every boundary by inspecting remote state, never replacing content."""
     tag, sha = plan["release_tag"], plan["source_sha"]
@@ -505,6 +527,7 @@ def publish_one(api, plan, inventory, directory, builder):
     # below. This cannot prevent publication if enforcement was disabled.
     if release is not None:
         require(api.tags().get(tag) == {"sha": sha, "reservation": plan}, "draft tag reservation conflict")
+    revalidate_recovery(api, plan, inventory)
     reserve(api, plan)
     builder(plan, directory)
     manifest = verify_bundle(directory, inventory, sha)
@@ -543,6 +566,7 @@ def publish_one(api, plan, inventory, directory, builder):
                 "remote manifest changed")
     # Inspect tag again immediately before the one-way publication boundary.
     require(api.tags().get(tag) == {"sha": sha, "reservation": plan}, "publication tag reservation conflict")
+    revalidate_recovery(api, plan, inventory)
     api.request(f"releases/{release['id']}", "PATCH", {
         "draft": False, "make_latest": "false",
         "body": "factory-release-v1:" + digest((directory / "manifest.json").read_bytes())})
