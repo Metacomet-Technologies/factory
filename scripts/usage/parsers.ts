@@ -52,7 +52,7 @@ export function parseAmp(text: string): Reading {
       check(!individual); individual = true;
       continue;
     }
-    const workspace = line.match(new RegExp(`^(?:Workspace ([a-z0-9][a-z0-9-]{0,62}):|\\*\\*Workspace ([a-z0-9][a-z0-9-]{0,62}):\\*\\*) \\$(${number}) remaining - https://ampcode.com/workspaces/([a-z0-9][a-z0-9-]{0,62})$`));
+    const workspace = line.match(new RegExp(`^(?:Workspace ([a-z0-9][a-z0-9-]{0,62}):|\\*\\*Workspace ([a-z0-9][a-z0-9-]{0,62}):\\*\\*) \\$(${number}) remaining(?: \\(set up auto-reload to avoid running out\\))? - https://ampcode.com/workspaces/([a-z0-9][a-z0-9-]{0,62})$`));
     check(workspace);
     const name = workspace[1] ?? workspace[2];
     check(name === workspace[4] && !workspaces.has(name) && balances.length < 8); workspaces.add(name);

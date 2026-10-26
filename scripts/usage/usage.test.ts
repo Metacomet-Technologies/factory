@@ -101,6 +101,30 @@ test('Amp accepts only the exact optional auto-reload note and validates new-ver
     ampAutoReload.replace('(set up auto-reload to avoid running out)', '(auto-reload on)'),
     ampAutoReload.replace(' - https://ampcode.com/settings', ' (set up auto-reload to avoid running out) - https://ampcode.com/settings'),
   ]) assert.throws(() => parseAmp(text), { message: FORMAT_CHANGED });
+
+  const note = ' (set up auto-reload to avoid running out)';
+  const workspaceSummary = ampNew.replace('$0 remaining', `$12.34 remaining${note}`);
+  const workspaceDetails = detailsNew.replace('$0 remaining', `$12.34 remaining${note}`);
+  for (const text of [workspaceSummary, workspaceSummary.replace('Workspace metacomet:', '**Workspace metacomet:**')]) {
+    const recovered = await collect(previous, async (program, args) => {
+      if (program !== 'amp') return fixtureRun(program, args);
+      if (args[0] === '--version') return versions.ampAutoReload;
+      return args.includes('--details') ? workspaceDetails : text;
+    }, now + STALE_MS + 1);
+    const amp = recovered.tools[0];
+    assert.equal(amp.status, 'ok');
+    assert.equal(amp.reason, null);
+    assert.equal(amp.observed_at_ms, now + STALE_MS + 1);
+    assert.deepEqual(amp.balances[2], {
+      amount: '12.34', remaining: '12.34', total: null, unit: 'usd', label: 'workspace metacomet',
+    });
+    assert.doesNotMatch(JSON.stringify(recovered), /redacted|@|auto-reload/);
+    for (const invalid of [
+      text.replace(note, ' (auto-reload on)'),
+      text.replace(note, note + note),
+      text.replace('/workspaces/metacomet', '/workspaces/other'),
+    ]) assert.throws(() => parseAmp(invalid), { message: FORMAT_CHANGED });
+  }
 });
 
 test('new Claude and Codex versions stay ok unless the version or usage format changes', async () => {
