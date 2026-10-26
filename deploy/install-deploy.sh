@@ -9,7 +9,7 @@ rollback_hint() { printf '%s\n' "Rollback: gpu-ssh 'sudo bash /home/agent/work/f
 fail() { printf 'ERROR: %s\n' "$*" >&2; rollback_hint; exit 1; }
 [[ $EUID -eq 0 ]] || fail 'Run install-deploy.sh as root on factory-gpu.'
 trap 'printf "ERROR: deploy-timer install failed at line %s; snapshot: %s\n" "$LINENO" "${snapshot:-none}" >&2; rollback_hint' ERR
-[[ $# -eq 0 ]] || fail 'Usage: install-deploy.sh'
+[[ $# -eq 0 || ( $# -eq 1 && $1 == --install-only ) ]] || fail 'Usage: install-deploy.sh [--install-only]'
 [[ "$root" == /home/agent/work/factory ]] || fail 'Install only from the merged /home/agent/work/factory checkout.'
 
 # Read-only preflight.
@@ -61,6 +61,8 @@ node_version=$(as_agent "$node" --version)
 [[ $node_version =~ ^v?24\.([0-9]+)\.([0-9]+)$ && ${BASH_REMATCH[1]} -ge 12 ]] || fail "Use Node 24.x (>= 24.12.0); found $node_version"
 as_agent gh auth status >/dev/null 2>&1 || fail 'agent is not logged in to GitHub (gh auth status).'
 as_agent git -C "$root" fetch --quiet --tags origin || fail 'agent cannot fetch tags from origin.'
+status=$(as_agent git -C "$root" status --porcelain) || fail 'Cannot read deployment tools checkout status.'
+[[ -z "$status" ]] || fail 'Require a clean deployment tools checkout.'
 
 # Snapshot units before any deployment mutation.
 install -d -o root -g root -m 0700 /var/backups/factory-deploy
@@ -70,11 +72,26 @@ for unit in factory-deploy.service factory-deploy.timer; do
     systemctl is-enabled "$unit" > "$snapshot/$unit.enabled" 2>/dev/null || true
 done
 printf 'Snapshot: %s\n' "$snapshot"
-if [[ $(systemctl show factory-deploy.timer --property=LoadState --value) != not-found ]]; then systemctl stop factory-deploy.timer; fi
+if [[ $(systemctl show factory-deploy.timer --property=LoadState --value) != not-found ]]; then
+    if [[ ${1:-} == --install-only ]]; then systemctl disable --now factory-deploy.timer
+    else systemctl stop factory-deploy.timer
+    fi
+fi
+case $(systemctl show factory-deploy.service --property=ActiveState --value) in
+    inactive|failed) ;;
+    *) fail 'Wait for the running deploy service to finish before replacing its units.' ;;
+esac
 sed -e "s|@NODE@|$node|g" -e "s|@PATH@|$path|g" "$root/deploy/factory-deploy.service" > "$snapshot/new.service"
 install -o root -g root -m 0644 "$snapshot/new.service" /etc/systemd/system/factory-deploy.service
 install -o root -g root -m 0644 "$root/deploy/factory-deploy.timer" /etc/systemd/system/factory-deploy.timer
 systemctl daemon-reload
+if [[ ${1:-} == --install-only ]]; then
+    systemctl disable --now factory-deploy.timer
+    [[ $(systemctl show factory-deploy.timer --property=UnitFileState --value) == disabled ]] || fail 'Deploy timer is not persistently disabled.'
+    [[ $(systemctl show factory-deploy.timer --property=ActiveState --value) == inactive ]] || fail 'Deploy timer is not inactive.'
+    printf '%s\n' 'Deploy units installed; timer disabled and inactive, ledger unchanged. Reconcile before starting factory-deploy.service and enabling the timer.'
+    exit 0
+fi
 # First run records the latest release in the ledger without deploying (deploy.ts bootstrap);
 # later runs deploy pending releases, bounded by the unit's TimeoutStartSec.
 systemctl start factory-deploy.service

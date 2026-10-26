@@ -454,9 +454,10 @@ prove GitHub token access, native immutability enforcement, or public downloads.
 
 `factory-deploy.timer` on factory-gpu runs `scripts/odd/deploy.ts` as `agent`
 every two minutes (`deploy/factory-deploy.service`, `flock` so runs never
-overlap, 30 minute cap). The job reads `gh release list`, verifies each release
-newer than the ledger's `lastTag` with `release.py verify --anonymous`, detaches
-`/home/agent/work/factory` at the release SHA, and installs each enabled
+overlap, 30 minute cap). The job reads every page of the GitHub releases API,
+excludes drafts/prereleases, and verifies stable tags newer than the ledger's
+`lastTag` oldest first with `release.py verify --anonymous`. It detaches
+`~/.local/state/factory-odd/source` at the release SHA, and installs each enabled
 component whose sources or installer changed since the SHA the host already
 runs: `meter`, `factory-api`, `kiosk`, in that order, through the
 sudoers allowlist (`deploy/sudoers/README.md`). Three health probes 20 s apart
@@ -466,6 +467,28 @@ back and healthy. The result is one `odd-deploy` receipt per issue the release c
 (`docs/odd/README.md` §7). The enabled set lives in `deploy.ts`, not in
 `deploy/components.json`, because `release.py inventory_check` keeps
 `enabled_auto_deploy` empty and eligibility human-only.
+
+`/home/agent/work/factory` stays at the operator-approved tools commit. The job
+never checks out a release there or moves its branch. Its deployer, release
+verifier, installers, helpers and matching rollbacks therefore survive releases
+that predate them. Only the separate source worktree moves; a source checkout
+aliasing the tools' Git directory is refused before checkout or installation.
+The allowlisted installer paths accept a leading `--source-checkout PATH`; default
+manual invocations still use their own checkout. Artifact SHA and clean-tree
+checks apply to that source, and meter/API units come from it. Full-SHA release
+artifacts and short-SHA local builds retain the existing prefix-of-full-HEAD
+check; historical installers are never executed or copied over the tools.
+Inventory still comes from the exact release commit, and anonymous publication,
+immutability, digest, archive and health verification are unchanged.
+
+Tradeoff: deployment machinery upgrades are explicit operator maintenance, not
+part of the release backlog. Pause the timer and wait for the service to finish
+before updating the tools checkout. Keep it clean; never overlay current scripts
+on a historical checkout or exclude them from Git's dirty-tree checks. Stable
+installers may refuse a genuinely incompatible old binary/schema; investigate
+that refusal rather than falling back to historical installers or relaxing checks.
+Rollback arguments and snapshots are unchanged, including an interrupted old
+attempt; do not discard its `inFlight` or `receipt` state.
 
 Not deployed by the job: dispatcher, usage (until it has a rollback that
 restores the previous timer; `rollback-usage.sh` removes the units), pricing,
@@ -493,9 +516,29 @@ gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-deploy.sh'   # remov
 
 A failed component stops the release and exits non-zero; `lastTag` still
 advances and the failed record is not a baseline, so the next release is the
-retry even when it touches only docs. A run killed mid-component resumes that
-component first; a run killed while posting receipts posts the rest without
-redeploying, never twice to the same issue. A failed `gh pr view` keeps the
+retry even when it touches only docs. A target older than or divergent from any
+known live/healthy recorded baseline is refused before installation or a new
+receipt; reverse Git diffs must never authorize a downgrade. A run killed
+mid-component resumes that component after checking the whole plan; a run killed
+while posting receipts posts the rest without redeploying, never twice to the
+same issue. A failed `gh pr view` keeps the
 release pending until the issues can be found. Deleting the ledger makes the next
-run bootstrap again without deploying. A dirty host checkout blocks every
-deploy until it is clean, and the job logs it each tick.
+run bootstrap again without deploying: never delete it as recovery. A dirty tools
+or source checkout blocks deployment until reviewed, and the job logs it each tick.
+
+GPU is now manually recovered to healthy immutable v0.2.49, with the original
+failed-but-handled v0.2.10 ledger and timer paused. Do not replay the older backlog.
+Use the separate [operator reconciliation procedure](odd/deployer-recovery.md).
+`reconcile-manual TAG` freshly verifies the immutable bundle and all live component
+identities/health, then previews a digest-bound adoption. Separate approval adds
+`manualBaseline` without changing `lastTag` or erasing failed records. This explicit
+no-replay floor preserves the old ledger and inventories deferred releases/issues
+as requirements-unverified, with no historical success receipts or Linear writes.
+Ancestry alone does not prove an issue's Done means. Forward deployment, deferred
+issue verification/receipts and timer resumption each need operator approval.
+`install-deploy.sh --install-only` snapshots prior enablement and installs the
+units with the timer persistently disabled and inactive, without running the job
+or changing the ledger. Both states are verified: merely stopping an enabled
+timer would allow its boot trigger to bypass reconciliation approval.
+`rollback-deploy.sh` still removes the units and retains all state, now including
+the source worktree; it does not rewind application deployments or the ledger.

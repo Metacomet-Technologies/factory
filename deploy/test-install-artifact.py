@@ -87,12 +87,14 @@ class ArtifactCheckTest(unittest.TestCase):
             "kiosk": ["install-kiosk.sh", *flag, str(self.dist)],
         }
 
-    def run_all(self, info, status="", check_only=False):
+    def run_all(self, info, status="", check_only=False, source_checkout=None):
         self.env["FAKE_BUILD_INFO"] = json.dumps(info)
         self.env["FAKE_STATUS"] = status
         (self.dist / "version.json").write_text(json.dumps({"build": "0" * 64, **info} if isinstance(info, dict) else info))
         results = {}
         for name, (script, *args) in self.installers(check_only).items():
+            if source_checkout is not None:
+                args = ["--source-checkout", str(source_checkout), *args]
             results[name] = subprocess.run(
                 ["bash", str(here / script), *args],
                 env=self.env,
@@ -112,6 +114,51 @@ class ArtifactCheckTest(unittest.TestCase):
         calls = self.calls.read_text().splitlines()
         self.assertIn(f"sudo -u agent {self.binary} --build-info", calls)
         self.assertTrue(all(call.startswith("sudo -u agent ") for call in calls))
+
+    def test_full_sha_against_historical_source_with_obsolete_installer(self):
+        # Real Git identities and clean-tree checks, only sudo/build-info shimmed.
+        base = pathlib.Path(self.temp.name)
+        (base / "bin/git").unlink()
+        source = base / "historical"
+        source.mkdir()
+
+        def git(*args):
+            return subprocess.check_output(["git", "-C", source, *args], text=True).strip()
+
+        git("init", "-q")
+        git("config", "user.name", "Fixture")
+        git("config", "user.email", "fixture@example.invalid")
+        (source / "deploy").mkdir()
+        # The historical tree has no deployer and an installer using the old equality rule.
+        (source / "deploy/install-meter.sh").write_text(
+            '#!/bin/bash\n[[ $1 == "$(git -C "$2" rev-parse --short=7 HEAD)" ]]\n')
+        git("add", ".")
+        git("commit", "-qm", "historical release")
+        full = git("rev-parse", "HEAD")
+        old = subprocess.run(["bash", source / "deploy/install-meter.sh", full, source], check=False)
+        self.assertEqual(old.returncode, 1, "historical exact short-SHA equality rejects a full SHA")
+
+        for check_only in (False, True):
+            for identity in (full, full[:7]):
+                for name, result in self.run_all({"git_sha": identity, "git_dirty": False},
+                                                 check_only=check_only, source_checkout=source).items():
+                    with self.subTest(installer=name, sha=identity, check_only=check_only):
+                        self.assertIn(f"built at {identity} matches checkout", result.stdout)
+                        self.assertIn("Run as root", result.stderr)
+            # A full SHA sharing the short prefix must still fail, as must dirty artifacts.
+            mismatch = full[:7] + ("0" if full[7] != "0" else "1") + full[8:]
+            for info, message in (({"git_sha": mismatch, "git_dirty": False}, "built at .* but checkout"),
+                                  ({"git_sha": full, "git_dirty": True}, "dirty tree")):
+                for result in self.run_all(info, check_only=check_only, source_checkout=source).values():
+                    self.assertRegex(result.stderr, message)
+                    self.assertNotIn("Run as root", result.stderr)
+            (source / "untracked").write_text("preserve this operator change")
+            for result in self.run_all({"git_sha": full, "git_dirty": False},
+                                       check_only=check_only, source_checkout=source).values():
+                self.assertRegex(result.stderr, "Checkout .* is dirty")
+                self.assertNotIn("Run as root", result.stderr)
+            (source / "untracked").unlink()
+        self.assertEqual(git("status", "--porcelain"), "")
 
     def test_refusals_happen_before_any_change(self):
         for check_only in (False, True):

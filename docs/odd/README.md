@@ -113,7 +113,7 @@ defines Amp-native agents for the roles that need Amp coordination tools.
 | Builder | Issue in `Todo` labelled `odd` with a free build slot. | A PR whose body carries the Evidence section filled with real output; the same thread and branch across review rounds. | Push to its own branch; open and update its PR; comment on its issue. | Amp medium (plugin agent); the engine table returns in a later phase (see §6). | 3 review rounds per PR. | Third `changes` verdict, or Isolation cannot be respected. |
 | Reviewer | PR head SHA with CI green and no verdict for that SHA. | Verdict `ready` or `changes` as a PR comment and the thread label `odd-verdict-<ready\|changes>-<sha12>`, findings bound to the SHA; reruns Evidence commands itself in its own orb. | Request changes; approve. Never pushes to the builder's branch. GitHub refuses a review on a PR the same account opened, so the verdict is a comment, not a review. | Amp high (plugin agent); opposite family returns with the engine table. | 1 per SHA; 2 rounds after a Watchdog cancellation. | Third `changes` verdict on one issue (page: third failed QA round); second spent round (page: budget ceiling). |
 | Shipper | Verdict `ready` on the current head. | Squash merge with `--match-head-commit`; merge receipt `odd-merge pr=<n> head=<sha> merge=<sha>` on the issue; release tag per `docs/release.md` from phase 5. | Merge; tag; close superseded PRs. | Deterministic (`qa.ts check --self-deploying-ok` + `gh pr merge` inside the control plane), no agent. | n/a | `qa.ts check` refuses: the refusal is posted once per head as `odd-merge-refused`; the builder's next push re-enters the loop. |
-| Deployer | GitHub release newer than the host ledger's `lastTag` (`factory-deploy.timer` on factory-gpu, every 2 min). | Verified release unpacked under `~/.local/state/factory-odd/releases/<tag>`, each changed enabled component (`meter`, `factory-api`, `kiosk`) installed and probed at the exact SHA, one deploy receipt per issue the release closes. | `sudo -n /usr/bin/bash <allowlisted script>` on the runner; detaches `/home/agent/work/factory` at the release SHA. | Deterministic job (`scripts/odd/deploy.ts`); on a red receipt the control plane starts one Amp low agent on the factory-gpu runner (`odd-deployer`) that only reads logs and attaches them to the Bug. | 1 deploy + 1 rollback per component per release. | Rollback missing, fails, or leaves the component unhealthy on re-probe (`rollback=none`, page: failed rollback). |
+| Deployer | GitHub release newer than the host ledger's `lastTag` (`factory-deploy.timer` on factory-gpu, every 2 min). | Verified release unpacked under `~/.local/state/factory-odd/releases/<tag>`, each changed enabled component (`meter`, `factory-api`, `kiosk`) installed and probed at the exact SHA, one deploy receipt per issue the release closes. | `sudo -n /usr/bin/bash <allowlisted script>` on the runner; detaches `~/.local/state/factory-odd/source` at the release SHA, leaving tools in `/home/agent/work/factory` unchanged. | Deterministic job (`scripts/odd/deploy.ts`); on a red receipt the control plane starts one Amp low agent on the factory-gpu runner (`odd-deployer`) that only reads logs and attaches them to the Bug. | 1 deploy + 1 rollback per component per release. | Rollback missing, fails, or leaves the component unhealthy on re-probe (`rollback=none`, page: failed rollback). |
 | Verifier | Green deploy receipt (`health=pass`) with no `odd-verify` comment for its SHA. | Issue comment `odd-verify sha=<receipt sha> result=pass\|fail bug=<MET-n\|none>` plus one line per Done-means item; a `Bug` issue in `Triage` on fail. The control plane sets `Done` on `pass`. | Comment on its issue; file Bugs. Never sets status. | Amp low (plugin agent); reruns the Evidence lines against the deployed system. | 1 turn + 2 continuations; 2 rounds. | Never pages; files a bug and lets Intake handle it. Second spent round pages (budget ceiling). |
 | Watchdog | Every 10 minutes (`setInterval` in the plugin). | Stale idle role threads archived with an `odd-watchdog cancelled` comment and the issue restored (builder without PR → `Todo`); caps alert after 60 min over; `control-plane-blind` page after 15 min of failed sweeps; daily digest at 08:00 America/New_York. | Archive threads; comment; restore status; add `escalated`; post alerts and pages. | Deterministic (`scripts/odd/watchdog.ts`), no agent. | n/a | Every sweep failing for 15 minutes; soft caps exceeded for an hour. |
 | Advisor | A role asks a bounded question (`advisor` label or in-thread). | A report-only opinion. | None. | Kimi K3 / Grok advisor tools (existing). | 1 call. | Never. |
@@ -204,7 +204,7 @@ keyed by `issue + stage + SHA`).
 | `check_suite.completed` failure | GitHub webhook | Steer the builder thread with the failing job names; count a round. | — |
 | Reviewer thread ends (`agent.end` with `odd-role-reviewer`) | Plugin | Read verdict label. `ready` → Shipper; `changes` → steer builder, round+1 or page at 3. | Shipper |
 | Merge receipt (`odd-merge`) | Control plane | Status `Deploying`; wait `release not published` until a receipt newer than the merge receipt appears. | — |
-| Release published | `factory-deploy.timer` poll on factory-gpu (no webhook: the runner reads `gh release list`) | Verify, install changed components, probe, roll back on red, post one receipt per issue in `Deploying`. | Deployer (runner job) |
+| Release published | `factory-deploy.timer` poll on factory-gpu (no webhook: the runner paginates the GitHub releases API, oldest pending stable tag first) | Verify, install changed components, probe, roll back on red, post one receipt per issue in `Deploying`. | Deployer (runner job) |
 | Deploy receipt comment | Linear webhook | `health=fail` with a rollback snapshot → `Todo` plus a Bug follow-up in Triage (`Deploy failed: <component> at <sha12>`); `rollback=none` → page. Either red path also starts one log-reading Deployer on factory-gpu (thread label `odd-deploy-<sha12>`). The Bug and the log reader come before `Todo`, so a failure leaves the issue in `Deploying`; a failed evaluation re-checks the issue itself (90 s, doubling, up to 5 times) and a redelivered failed webhook is evaluated again; a page goes out even when its log reader cannot start, and `escalated` is set last. `health=pass` with no `odd-verify` comment for the receipt SHA → spawn Verifier. | Verifier |
 | `odd-verify` comment | Linear webhook | `result=pass` for the current receipt SHA → `Done`; `result=fail` → wait on the Bug it filed (the next release's receipt carries a new SHA and is verified again). A merged PR or a verify line for the receipt SHA satisfies the role's stop. | Intake (for the bug) |
 | Sweep tick (10 min) | `setInterval` in the plugin, started by `arm` | Watchdog: evaluate every issue with a live role thread, every `Triage` issue (never Backlog) and every `odd` issue in `Todo`/`In Progress`/`Deploying`; cancel threads stale for 15 min (`odd-watchdog cancelled` comment, status restored, immediate re-evaluation); caps alert after 60 min over; `control-plane-blind` page after 15 min of failed sweeps; daily digest. Spawns deferred to the dispatcher (no `odd` label) are recorded `ignored`. | Whatever `nextAction` returns |
@@ -287,8 +287,12 @@ Each artifact is machine-checkable before the next role starts.
   Job state: ledger `~/.local/state/factory-odd/deploy.json` (`lastTag`,
   per-component `sha`/`tag`/`health`/`snapshot`, `inFlight` for resume,
   `receipt` with the issues already handled so a crashed delivery resumes
-  without redeploying), log `journalctl -u factory-deploy`. A failed
-  component record is never a baseline, so the next release retries it.
+  without redeploying, optional approved `manualBaseline` preserving the prior
+  ledger and deferred issue inventory), log `journalctl -u factory-deploy`.
+  A failed component record is never a healthy baseline. Older/divergent
+  targets are refused, including when a manual recovery is ahead of `lastTag`.
+  Manual adoption adds a verified no-replay floor, not historical success
+  receipts; deferred issues need their own evidence and approval.
 - Verifier → Done: issue comment whose first line is `odd-verify
   sha=<receipt sha> result=<pass|fail> bug=<MET-n|none>`, then one line per
   Done-means item with its evidence link. The control plane sets `Done` on
@@ -388,6 +392,13 @@ by the previous one).
    factory-api installers run their DB migrations; a rollback restores
    binaries only, so a release with a migration is Devon's call in the spec's
    risk class.
+   Historical-release repair: the job now checks out source in a separate
+   worktree and keeps compatible installers, verifier and timer entry point
+   at the approved tools commit. See [recovery](deployer-recovery.md) for the
+   healthy manual v0.2.49 install with a stale failed-but-handled v0.2.10
+   ledger. Keep the timer paused until explicit baseline reconciliation and
+   forward-deployment approval; never blindly replay older releases or reset
+   the ledger to bootstrap past them. Ancestry does not establish Done means.
 6. Verifier and Watchdog (MET-281): a green receipt spawns an Amp low
    verifier whose `odd-verify` line sets `Done`; the plugin runs a
    deterministic sweep every 10 minutes (`scripts/odd/watchdog.ts`) that

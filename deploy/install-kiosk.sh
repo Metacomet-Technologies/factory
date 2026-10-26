@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 root=$(dirname "$(dirname "$(realpath "$0")")")
+checkout=$root
+if [[ ${1:-} == --source-checkout ]]; then
+    checkout=${2:?Supply a clean source checkout after --source-checkout.}
+    shift 2
+fi
 check_only=0
 if [[ ${1:-} == --check-only ]]; then check_only=1; shift; fi
 source_dir=${1:-/home/agent/work/factory/kiosk/dist}
@@ -27,7 +32,7 @@ verify_artifact() {
 }
 [[ $# -le 1 ]] || fail 'Expected at most one built dist directory.'
 [[ -f "$source_dir/version.json" && ! -L "$source_dir/version.json" ]] || fail "Built kiosk version.json missing: $source_dir; rebuild from $root/kiosk."
-verify_artifact kiosk "$(<"$source_dir/version.json")" "$root"
+verify_artifact kiosk "$(<"$source_dir/version.json")" "$checkout"
 [[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-kiosk.sh [--check-only] [built-dist-directory].'
 trap 'printf "ERROR: kiosk install failed at line %s. Snapshot: %s. Recover with: bash deploy/rollback-kiosk.sh <snapshot>\n" "$LINENO" "${snapshot:-not created (kiosk unchanged)}" >&2' ERR
 trap '[[ -z "$stage" ]] || rm -rf -- "$stage"; [[ -z "$response" ]] || rm -f -- "$response"' EXIT

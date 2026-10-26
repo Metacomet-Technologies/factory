@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Outcome driven development, Deployer (docs/odd/README.md §4, §5.2). factory-deploy.timer runs
 // this as `agent` on factory-gpu every 2 minutes, one run at a time (flock in the unit). No model:
-// every published release newer than the ledger is verified, the main checkout is detached at
-// its SHA, each enabled component whose inputs changed is installed through the sudoers
+// every published release newer than the ledger is verified, a separate source worktree is
+// detached at its SHA, each enabled component whose inputs changed is installed through the sudoers
 // allowlist, probed three times for the exact release SHA, rolled back once when red (and
 // re-probed: the rollback counts only when the previous release is back and healthy), and every
 // Deploying issue the release ships gets one `odd-deploy` receipt. The control plane turns the
@@ -13,7 +13,8 @@
 // through `Effects` so the sandbox fixture fakes sudo, curl, git, the release download and Linear.
 
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -59,7 +60,13 @@ export type ComponentRecord = { sha: string; tag: string; health: 'pass' | 'fail
 export type InFlight = { tag: string; sha: string; component: string; phase: 'installing' | 'probing'; snapshot?: string };
 /** A release's receipt, saved before delivery so a crashed delivery resumes without redeploying. `delivered` lists issues already handled. */
 export type PendingReceipt = { tag: string; receipt: Receipt; delivered: string[] };
-export type Ledger = { lastTag?: string; components: Record<string, ComponentRecord>; inFlight?: InFlight; receipt?: PendingReceipt };
+export type Ledger = { lastTag?: string; components: Record<string, ComponentRecord>; inFlight?: InFlight; receipt?: PendingReceipt; manualBaseline?: ManualBaseline };
+export type ManualBaseline = {
+  tag: string; sha: string; toolsSha: string; manifestSha256: string;
+  priorLedger: Omit<Ledger, 'manualBaseline'>;
+  releases: { tag: string; sha: string; issues: string[]; disposition: 'prior-attempt' | 'not-replayed' | 'manual-install'; requirements: 'unverified' }[];
+  approval: string;
+};
 
 export const semver = (tag: string): [number, number, number] | undefined => {
   const match = /^v(\d+)\.(\d+)\.(\d+)$/.exec(tag);
@@ -96,8 +103,9 @@ export function parseSnapshot(output: string): string | undefined {
 export function healthySha(body: string): string | undefined {
   let json: Record<string, unknown>;
   try { json = JSON.parse(body) as Record<string, unknown>; } catch { return undefined; }
+  if (!json || typeof json !== 'object') return undefined;
   const reported = typeof json.git_sha === 'string' ? json.git_sha : '';
-  if (!/^[0-9a-f]{7,40}$/.test(reported) || json.git_dirty === true) return undefined;
+  if (!/^[0-9a-f]{7,40}$/.test(reported) || json.git_dirty !== false) return undefined;
   return 'status' in json && json.status !== 'ok' ? undefined : reported;
 }
 
@@ -121,8 +129,8 @@ export const receiptLine = (receipt: Receipt) =>
  * Components to install for a release, in recipe order: enabled recipes whose sources or deploy
  * files changed since their baseline, skipping ones the ledger already records healthy at this
  * SHA. `changedSince(baseline)` lists the paths that changed in (baseline, release]; a component
- * with no baseline (never deployed, no health SHA) installs. A killed run's in-flight component
- * is resumed before planning (installRelease).
+ * with no baseline (never deployed, no health SHA) installs. After checking the complete plan,
+ * a killed run's in-flight component is resumed before any other install (installRelease).
  */
 export function plan(input: {
   sha: string;
@@ -130,7 +138,13 @@ export function plan(input: {
   baselines: Record<string, string | undefined>;
   ledger: Ledger;
   changedSince: (baseline: string) => readonly string[];
+  isAncestor: (baseline: string, target: string) => boolean;
 }): Recipe[] {
+  // Check every baseline before filtering: even an unchanged component or a saved pass
+  // cannot make a backwards/divergent deployment (or a historical pass receipt) safe.
+  for (const [name, baseline] of Object.entries(input.baselines)) {
+    if (baseline && !input.isAncestor(baseline, input.sha)) throw new Error(`Refusing older or divergent release for ${name}; reconcile the manual baseline first`);
+  }
   return recipes.filter(recipe => {
     const record = input.ledger.components[recipe.name];
     if (record?.sha === input.sha && record.health === 'pass') return false;
@@ -178,17 +192,24 @@ function newest(effects: Effects, candidates: readonly (string | undefined)[]): 
   for (const candidate of candidates) {
     if (!candidate) continue;
     if (!best || effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', best, candidate])) best = candidate;
+    else if (!effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', candidate, best])) throw new Error('Inconsistent deployment baseline ancestry');
   }
   effects.log('baseline', { candidates: candidates.filter(Boolean), chosen: best });
   return best;
 }
 
-/** The commit a healthy endpoint reports; a degraded, dirty or unreachable one is no baseline. */
-function healthSha(effects: Effects, recipe: Recipe): string | undefined {
-  try {
-    const reported = healthySha(effects.probe(recipe.health));
-    return reported && effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `${reported}^{commit}`]).stdout.trim();
-  } catch { return undefined; }
+/** An unavailable/degraded service can need repair. A reported dirty, unknown,
+ * newer or divergent identity must never be discarded to permit a downgrade. */
+function healthIdentity(effects: Effects, recipe: Recipe, target: string): { sha: string; healthy: boolean } | undefined {
+  let body: string;
+  try { body = effects.probe(recipe.health); } catch { return undefined; }
+  const json = JSON.parse(body);
+  if (!json || typeof json.git_sha !== 'string' || !/^[a-f0-9]{7,40}$/.test(json.git_sha) || json.git_dirty !== false) {
+    throw new Error(`Unverifiable installed identity for ${recipe.name}`);
+  }
+  const sha = effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `${json.git_sha}^{commit}`]).stdout.trim();
+  if (!effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', sha, target])) throw new Error(`Refusing older or divergent release for ${recipe.name}; reconcile the manual baseline first`);
+  return { sha, healthy: !!healthySha(body) };
 }
 
 async function probeWindow(effects: Effects, recipe: Recipe, sha: string, check = probeResult, event = 'probe'): Promise<'pass' | 'fail'> {
@@ -227,7 +248,7 @@ export async function deployComponent(effects: Effects, recipe: Recipe, tag: str
   }
   if (needInstall) {
     effects.writeLedger({ ...ledger, inFlight: { tag, sha, component: recipe.name, phase: 'installing' } });
-    const install = effects.sudo(recipe.installer, [recipe.artifact(releaseDir)]);
+    const install = effects.sudo(recipe.installer, ['--source-checkout', join(effects.stateDir, 'source'), recipe.artifact(releaseDir)]);
     snapshot = parseSnapshot(install.output);
     effects.log('install', { component: recipe.name, ok: install.ok, snapshot });
     if (!install.ok) {
@@ -255,6 +276,7 @@ function finish(effects: Effects, recipe: Recipe, tag: string, sha: string, rece
 }
 
 function prepareRelease(effects: Effects, tag: string): { sha: string; dir: string } {
+  if (effects.run('git', ['-C', ROOT, 'status', '--porcelain']).stdout.trim()) throw new Error(`${ROOT} is dirty; not deploying ${tag}`);
   effects.run('git', ['-C', ROOT, 'fetch', '--quiet', '--tags', 'origin']);
   const sha = effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `refs/tags/${tag}^{commit}`]).stdout.trim();
   effects.run('git', ['-C', ROOT, 'merge-base', '--is-ancestor', sha, 'origin/main']);
@@ -274,39 +296,55 @@ function prepareRelease(effects: Effects, tag: string): { sha: string; dir: stri
     const artifact = recipe.artifact(dir);
     if (statSync(artifact).isFile()) chmodSync(artifact, statSync(artifact).mode | 0o100);
   }
-  if (effects.run('git', ['-C', ROOT, 'status', '--porcelain']).stdout.trim()) throw new Error(`${ROOT} is dirty; not deploying ${tag}`);
-  effects.run('git', ['-C', ROOT, 'checkout', '--quiet', '--detach', sha]);
-  effects.log('checkout', { tag, sha });
+  // Never check out a release over the running job, verifier or allowlisted installers.
+  // Reuse one worktree, but never discard interrupted/operator changes in it.
+  const source = join(effects.stateDir, 'source');
+  if (!existsSync(source)) effects.run('git', ['-C', ROOT, 'worktree', 'add', '--quiet', '--detach', source, sha]);
+  const gitDir = (path: string) => effects.run('git', ['-C', path, 'rev-parse', '--absolute-git-dir']).stdout.trim();
+  if (gitDir(source) === gitDir(ROOT)) throw new Error(`Refusing ${tag}: source checkout aliases the deployer runtime; checkout would replace deployment tools`);
+  if (effects.run('git', ['-C', source, 'status', '--porcelain']).stdout.trim()) throw new Error(`${source} is dirty; not deploying ${tag}`);
+  effects.run('git', ['-C', source, 'checkout', '--quiet', '--detach', sha]);
+  effects.log('checkout', { tag, sha, source });
   return { sha, dir };
-}
-
-/** Put the main checkout back on `main` at the deployed SHA when main is behind or equal; leave it detached otherwise. */
-function restoreMain(effects: Effects): void {
-  if (effects.ok('git', ['-C', ROOT, 'symbolic-ref', '--quiet', 'HEAD'])) return;
-  const head = effects.run('git', ['-C', ROOT, 'rev-parse', 'HEAD']).stdout.trim();
-  if (!effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', 'main', head])) { effects.log('main-left-detached', { head }); return; }
-  effects.run('git', ['-C', ROOT, 'branch', '--force', 'main', head]);
-  effects.run('git', ['-C', ROOT, 'checkout', '--quiet', 'main']);
 }
 
 /** Install the release's changed components; the receipt is saved in the ledger before any delivery. */
 async function installRelease(effects: Effects, tag: string, sha: string, dir: string): Promise<Receipt> {
-  // A killed run's component finishes first: any other install would overwrite its inFlight entry and snapshot.
   const inFlight = effects.readLedger().inFlight;
   const resumed = inFlight?.sha === sha ? recipes.find(recipe => recipe.name === inFlight.component) : undefined;
-  if (resumed) {
-    const result = await deployComponent(effects, resumed, tag, sha, dir);
-    if (result.health === 'fail') return result;
-  }
   const inventory = JSON.parse(effects.run('git', ['-C', ROOT, 'show', `${sha}:deploy/components.json`]).stdout) as { components: { id: string; sources: string[] }[] };
   const sources = Object.fromEntries(inventory.components.map(component => [component.id, component.sources]));
-  const ledger = effects.readLedger();
-  // Only a healthy record is a baseline: a failed target was rolled back, so its inputs are still undeployed.
-  const recorded = (name: string) => ledger.components[name]?.health === 'pass' ? ledger.components[name].sha : undefined;
-  const baselines = Object.fromEntries(recipes.map(recipe => [recipe.name, newest(effects, [recorded(recipe.name), healthSha(effects, recipe)])]));
-  const changed = plan({ sha, sources, baselines, ledger, changedSince: baseline => effects.run('git', ['-C', ROOT, 'diff', '--name-only', `${baseline}..${sha}`]).stdout.split('\n').filter(Boolean) });
+  const select = (recovering = false) => {
+    const ledger = effects.readLedger();
+    // Only a healthy record is a baseline: a failed target was rolled back, so its inputs are still undeployed.
+    const recorded = (name: string) => ledger.components[name]?.health === 'pass' ? ledger.components[name].sha : undefined;
+    const baselines = Object.fromEntries(recipes.map(recipe => {
+      const identity = healthIdentity(effects, recipe, sha);
+      const live = identity?.healthy ? identity.sha : undefined;
+      // API serves /version.json too. Only a transport outage during recorded API recovery
+      // can defer kiosk evidence; any usable identity must still pass all ancestry checks.
+      const dependentOutage = recovering && resumed?.name === 'factory-api' && recipe.name === 'kiosk' && !identity;
+      const floor = ledger.manualBaseline?.sha;
+      if (floor && ((!live && !(recovering && recipe === resumed) && !dependentOutage) ||
+          (identity && !effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', floor, identity.sha])))) {
+        throw new Error(`Manual baseline drift for ${recipe.name}; review before deployment`);
+      }
+      return [recipe.name, newest(effects, [floor, recorded(recipe.name), live])];
+    }));
+    return plan({ sha, sources, baselines, ledger,
+      isAncestor: (baseline, target) => effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', baseline, target]),
+      changedSince: baseline => effects.run('git', ['-C', ROOT, 'diff', '--name-only', `${baseline}..${sha}`]).stdout.split('\n').filter(Boolean) });
+  };
+  let changed = select(true);
   effects.log('plan', { tag, sha, components: changed.map(recipe => recipe.name) });
+  // Guard the entire plan before resuming even one interrupted installer.
+  if (resumed) {
+    const result = await deployComponent(effects, resumed, tag, sha, dir);
+    if (resumed.name === 'factory-api') changed = select();
+    if (result.health === 'fail') return result;
+  }
   for (const recipe of changed) {
+    if (recipe === resumed) continue;
     const result = await deployComponent(effects, recipe, tag, sha, dir);
     if (result.health === 'fail') return result;
   }
@@ -318,19 +356,23 @@ async function installRelease(effects: Effects, tag: string, sha: string, dir: s
   return receipt;
 }
 
+function releaseIssues(effects: Effects, sha: string, previousTag: string, strict = false): string[] {
+  const subjects = effects.run('git', ['-C', ROOT, 'log', '--first-parent', '--format=%s', `${previousTag}..${sha}`]).stdout.split('\n').filter(Boolean);
+  // A lookup failure propagates: the saved receipt keeps the release pending until discovery and delivery succeed.
+  return issuesFromSubjects(subjects, pr => {
+    try { return (JSON.parse(effects.run('gh', ['pr', 'view', String(pr), '--json', 'body'], { cwd: ROOT }).stdout) as { body?: string }).body ?? ''; } catch (error) {
+      if (!strict && /Could not resolve to a PullRequest/.test(String(error))) return '';
+      throw error;
+    }
+  });
+}
+
 async function deployRelease(effects: Effects, tag: string, previousTag: string): Promise<void> {
   const { sha, dir } = prepareRelease(effects, tag);
   const saved = effects.readLedger().receipt;
   const receipt = saved?.tag === tag ? saved.receipt : await installRelease(effects, tag, sha, dir);
   if (saved?.tag === tag) effects.log('receipt-resume', { tag, delivered: saved.delivered });
-  const subjects = effects.run('git', ['-C', ROOT, 'log', '--first-parent', '--format=%s', `${previousTag}..${sha}`]).stdout.split('\n').filter(Boolean);
-  // A lookup failure propagates: the saved receipt keeps the release pending until discovery and delivery succeed.
-  const issues = issuesFromSubjects(subjects, pr => {
-    try { return (JSON.parse(effects.run('gh', ['pr', 'view', String(pr), '--json', 'body'], { cwd: ROOT }).stdout) as { body?: string }).body ?? ''; } catch (error) {
-      if (/Could not resolve to a PullRequest/.test(String(error))) return '';
-      throw error;
-    }
-  });
+  const issues = releaseIssues(effects, sha, previousTag);
   const line = receiptLine(receipt);
   for (const identifier of issues) {
     const pending = effects.readLedger().receipt!;
@@ -347,8 +389,96 @@ async function deployRelease(effects: Effects, tag: string, previousTag: string)
   if (receipt.health === 'fail') throw new Error(`${tag}: ${line}`);
 }
 
+function publishedTags(effects: Effects): string[] {
+  const pages = JSON.parse(effects.run('gh', ['api', '--paginate', '--slurp', 'repos/Metacomet-Technologies/factory/releases?per_page=100'], { cwd: ROOT }).stdout) as { tag_name: string; draft: boolean; prerelease: boolean }[][];
+  return pages.flat().filter(release => !release.draft && !release.prerelease).map(release => release.tag_name);
+}
+
+/** Explicit adoption, never a historical deployment receipt. Preview and approval both
+ * reverify the immutable bundle and three healthy full-SHA observations of every component.
+ * The approval binds the original ledger, tools and complete deferred issue inventory. */
+export async function reconcileManual(effects: Effects, tag: string, approval?: string): Promise<ManualBaseline> {
+  const ledger = effects.readLedger();
+  if (ledger.manualBaseline) {
+    if (approval && ledger.manualBaseline.tag === tag && ledger.manualBaseline.approval === approval) return ledger.manualBaseline;
+    throw new Error('A manual baseline is already recorded; review it rather than replacing historical evidence');
+  }
+  if (!ledger.lastTag || !semver(ledger.lastTag) || !semver(tag) || compareTags(tag, ledger.lastTag) <= 0 || ledger.inFlight || ledger.receipt) {
+    throw new Error('Manual reconciliation requires an existing older lastTag and no in-flight install or pending receipt');
+  }
+  if (effects.run('git', ['-C', ROOT, 'status', '--porcelain']).stdout.trim()) throw new Error('Deployment tools are dirty');
+  const source = join(effects.stateDir, 'source');
+  if (existsSync(source) && effects.run('git', ['-C', source, 'status', '--porcelain']).stdout.trim()) throw new Error('Deployment source is dirty');
+  effects.run('git', ['-C', ROOT, 'fetch', '--quiet', '--tags', 'origin']);
+  const tags = pendingTags(publishedTags(effects), undefined);
+  if (!tags.includes(tag) || !tags.includes(ledger.lastTag)) throw new Error('Baseline and lastTag must be published stable releases');
+  const resolve = (ref: string) => effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `refs/tags/${ref}^{commit}`]).stdout.trim();
+  const sha = resolve(tag);
+  effects.run('git', ['-C', ROOT, 'merge-base', '--is-ancestor', sha, 'origin/main']);
+  for (const [name, record] of Object.entries(ledger.components)) {
+    if (!recipes.some(recipe => recipe.name === name) || !semver(record.tag) || compareTags(record.tag, ledger.lastTag) > 0 ||
+        !['pass', 'fail'].includes(record.health) || resolve(record.tag) !== record.sha) throw new Error(`Inconsistent ledger component: ${name}`);
+  }
+  const toolsSha = effects.run('git', ['-C', ROOT, 'rev-parse', 'HEAD']).stdout.trim();
+  const inventory = join(effects.stateDir, `components-${sha}.json`);
+  writeFileSync(inventory, effects.run('git', ['-C', ROOT, 'show', `${sha}:deploy/components.json`]).stdout);
+  const dir = mkdtempSync(join(effects.stateDir, 'manual-verify-'));
+  let manifest: { build_identity: Record<string, Record<string, unknown>> };
+  let manifestSha256: string;
+  let kioskVersion: { build: string; git_sha: string; git_dirty: boolean };
+  try {
+    // Never trust a cached .verified marker or a handoff alone for adoption.
+    effects.run('python3', [join(ROOT, 'scripts/release/release.py'), 'verify', '--anonymous', '--tag', tag, '--sha', sha, '--inventory', inventory, '--directory', dir]);
+    const raw = readFileSync(join(dir, 'manifest.json'));
+    manifest = JSON.parse(raw.toString());
+    manifestSha256 = createHash('sha256').update(raw).digest('hex');
+    // The verifier has checked every archive entry/digest. Read data only, without extracting
+    // or executing it: the live endpoint exposes this bundle hash, not release-build.json.
+    kioskVersion = JSON.parse(effects.run('tar', ['-xOf', join(dir, 'kiosk.tar.gz'), 'version.json']).stdout);
+    if (!kioskVersion || kioskVersion.git_sha !== sha || kioskVersion.git_dirty !== false ||
+        typeof kioskVersion.build !== 'string' || !/^[a-f0-9]{64}$/.test(kioskVersion.build)) throw new Error('Invalid verified kiosk version identity');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+  for (let attempt = 0; attempt < PROBES; attempt++) {
+    const bodies: Record<string, Record<string, unknown>> = {};
+    for (const recipe of recipes) {
+      const body = JSON.parse(effects.probe(recipe.health));
+      const matches = recipe.name === 'kiosk' ? body?.build === kioskVersion.build :
+        body?.version === tag.slice(1) && body?.status === 'ok' &&
+        ['version', 'git_sha', 'git_dirty', 'built_at_ms', 'inputs_fingerprint'].every(key => body[key] === manifest.build_identity[recipe.name][key]);
+      if (!body || body.git_sha !== sha || body.git_dirty !== false || !matches) throw new Error(`Manual baseline is not uniformly clean and healthy at ${tag}: ${recipe.name}`);
+      bodies[recipe.name] = body;
+    }
+    const contract = bodies.meter.openapi_sha256;
+    if (typeof contract !== 'string' || !/^[a-f0-9]{12}$/.test(contract) || bodies['factory-api'].meter_openapi_expected !== contract ||
+        bodies['factory-api'].meter_openapi_sha256 !== contract) throw new Error('Manual baseline API/meter contracts disagree');
+    if (attempt + 1 < PROBES) await effects.sleep(PROBE_GAP_MS);
+  }
+  const releases: ManualBaseline['releases'] = [];
+  let previous = `${ledger.lastTag}^`;
+  let previousSha: string | undefined;
+  for (const release of tags.filter(candidate => compareTags(candidate, ledger.lastTag!) >= 0 && compareTags(candidate, tag) <= 0)) {
+    const releaseSha = resolve(release);
+    if (!effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', releaseSha, sha]) ||
+        (previousSha && !effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', previousSha, releaseSha]))) throw new Error(`Non-monotonic release ancestry: ${release}`);
+    releases.push({ tag: release, sha: releaseSha, issues: releaseIssues(effects, releaseSha, previous, true),
+      disposition: release === ledger.lastTag ? 'prior-attempt' : release === tag ? 'manual-install' : 'not-replayed', requirements: 'unverified' });
+    previous = release;
+    previousSha = releaseSha;
+  }
+  const report = { tag, sha, toolsSha, manifestSha256, priorLedger: ledger, releases };
+  const digest = createHash('sha256').update(JSON.stringify(report)).digest('hex');
+  if (approval && approval !== digest) throw new Error('Reconciliation plan changed; review the new preview before approving');
+  const result = { ...report, approval: digest };
+  if (approval) {
+    if (JSON.stringify(effects.readLedger()) !== JSON.stringify(ledger)) throw new Error('Ledger changed during reconciliation; review again');
+    effects.writeLedger({ ...ledger, manualBaseline: result });
+  }
+  effects.log(approval ? 'manual-baseline-approved' : 'manual-baseline-preview', result);
+  return result;
+}
+
 export async function main(effects: Effects): Promise<void> {
-  const tags = (JSON.parse(effects.run('gh', ['release', 'list', '--exclude-drafts', '--exclude-pre-releases', '--limit', '50', '--json', 'tagName'], { cwd: ROOT }).stdout) as { tagName: string }[]).map(release => release.tagName);
+  const tags = publishedTags(effects);
   const ledger = effects.readLedger();
   if (!ledger.lastTag) {
     // First run records where the host already is; the next published release is the first auto-deploy.
@@ -358,16 +488,13 @@ export async function main(effects: Effects): Promise<void> {
     effects.log('bootstrap', { lastTag: latest });
     return;
   }
-  const pending = pendingTags(tags, ledger.lastTag);
+  const cursor = ledger.manualBaseline && compareTags(ledger.manualBaseline.tag, ledger.lastTag) > 0 ? ledger.manualBaseline.tag : ledger.lastTag;
+  const pending = pendingTags(tags, cursor);
   effects.log('pending', { lastTag: ledger.lastTag, tags: pending });
-  let previous = ledger.lastTag;
-  try {
-    for (const tag of pending) {
-      await deployRelease(effects, tag, previous);
-      previous = tag;
-    }
-  } finally {
-    if (pending.length) restoreMain(effects);
+  let previous = cursor;
+  for (const tag of pending) {
+    await deployRelease(effects, tag, previous);
+    previous = tag;
   }
 }
 
@@ -404,7 +531,10 @@ export function liveEffects(): Effects {
     },
     probe: url => run('curl', ['-fsS', '--max-time', '10', url]).stdout,
     readLedger: () => {
-      try { return JSON.parse(readFileSync(LEDGER, 'utf8')) as Ledger; } catch { return emptyLedger(); }
+      try { return JSON.parse(readFileSync(LEDGER, 'utf8')) as Ledger; } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyLedger();
+        throw error;
+      }
     },
     writeLedger: ledger => {
       mkdirSync(STATE_DIR, { recursive: true });
@@ -424,5 +554,14 @@ export function liveEffects(): Effects {
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const effects = liveEffects();
-  main(effects).catch(error => { console.error(String(error instanceof Error ? error.message : error)); process.exit(1); });
+  const args = process.argv.slice(2);
+  const run = async () => {
+    if (!args.length) return main(effects);
+    if (args[0] !== 'reconcile-manual' || !semver(args[1] ?? '') ||
+        !(args.length === 2 || (args.length === 4 && args[2] === '--approve' && /^[a-f0-9]{64}$/.test(args[3])))) {
+      throw new Error('Usage: deploy.ts [reconcile-manual TAG [--approve PREVIEW_SHA256]]');
+    }
+    await reconcileManual(effects, args[1], args[3]);
+  };
+  run().catch(error => { console.error(String(error instanceof Error ? error.message : error)); process.exit(1); });
 }
