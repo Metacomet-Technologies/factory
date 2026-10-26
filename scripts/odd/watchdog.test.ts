@@ -1,6 +1,6 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { blindMs, digest, digestDue, localClock, overCaps, restoreStatus, slackMessageMax, slackMessages, staleThreads, sweepMs, staleMs, type DigestInput } from './watchdog.ts';
+import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, slackMessages, staleThreads, sweepMs, staleMs, type DigestInput, type Episode } from './watchdog.ts';
 import { heartbeatLine, parseHeartbeat } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
 import { receiptLabel, type LiveThread } from './snapshot.ts';
@@ -65,6 +65,9 @@ test('the digest lists counts, identifiers and SHAs, and never a diff', () => {
     escalated: [{ identifier: 'MET-304', title: 'clearing escalated' }],
     load: { orbs: 2, runnerSlots: 0, buildIssues: 1 },
     cancelled: ['MET-1 odd-watchdog cancelled role=builder thread=T-1 round=1'],
+    risk: [{ identifier: 'MET-5', reason: 'risk security needs a human decision' }],
+    failedVerification: [{ identifier: 'MET-6', reason: 'verification failed at abcdef123456; bug MET-9' }],
+    unknownAge: [],
   };
   const text = digest(input);
   assert.match(text, /^ODD digest 2026-10-24$/m);
@@ -73,13 +76,17 @@ test('the digest lists counts, identifiers and SHAs, and never a diff', () => {
   assert.match(text, /^Bugs filed \(0\):\n- none$/m);
   assert.match(text, /^Waiting on Devon \(1\):\n- MET-304 /m);
   assert.match(text, /^Load: orbs 2\/4, runner slots 0\/2, build issues 1\/2$/m);
+  // P3.1: human waits are reported here, not paged.
+  assert.match(text, /^Risk decisions waiting \(1\):\n- MET-5 risk security needs a human decision$/m);
+  assert.match(text, /^Failed verifications \(1\):\n- MET-6 verification failed at abcdef123456; bug MET-9$/m);
+  assert.match(text, /^Waits of unknown age \(0\):\n- none$/m);
   assert.match(text, /^Watchdog cancellations \(1\):\n- MET-1 odd-watchdog cancelled role=builder thread=T-1 round=1$/m);
   assert.doesNotMatch(text, /diff --git|ghp_|xox[abp]-|lin_api_/);
 });
 
 test('a digest longer than one Slack message is split on line breaks', () => {
   const merged = Array.from({ length: 46 }, (_, i) => ({ number: 140 + i, title: `ODD phase ${i}: a title about as long as the real ones are`, headSha: 'a'.repeat(40), mergeSha: 'b'.repeat(40) }));
-  const text = digest({ day: '2026-10-24', merged, done: [], bugs: [], escalated: [], load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, cancelled: [] });
+  const text = digest({ day: '2026-10-24', merged, done: [], bugs: [], escalated: [], load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, cancelled: [], risk: [], failedVerification: [], unknownAge: [] });
   assert.ok(text.length > slackMessageMax, 'the fixture must need more than one message');
   const parts = slackMessages(text);
   assert.ok(parts.length > 1);
@@ -320,4 +327,322 @@ test('P3.6: a partially failed arm keeps its error, and arm: true retries it wit
   assert.equal(armed.error, undefined);
   await status({ arm: true });
   assert.deepEqual([...intervals.values()].sort((a, b) => a - b), [5 * 60_000, sweepMs], 'one Slack poll and one sweep interval');
+});
+
+// --- P3.1: wait budgets, failure episodes and plane-blocked incidents ----------------------
+
+const t0 = Date.parse('2026-10-26T12:00:00.000Z');
+const episode = (over: Partial<Episode> = {}): Episode =>
+  ({ issue: 'MET-364', key: 'spawn-reviewer-r1-aaaaaaaaaaaa', stage: 'spawn-reviewer', first: new Date(t0).toISOString(), attempts: 1, state: 'open', alert: 'pending', error: 'Error: Orb custom agents must be registered as an active agent mode', ...over });
+const full = { orbs: 0, runnerSlots: 0, buildIssues: capacity.buildIssues };
+
+test('P3.1: an overdue machine wait pages in the one format at its budget, not before; human waits never page', () => {
+  const ci: Extract<Action, { kind: 'wait' }> = { kind: 'wait', reason: 'ci pending at aaaaaaaaaaaa', wait: { kind: 'ci', key: 'ci-aaaaaaaaaaaa', since: new Date(t0).toISOString() } };
+  assert.equal(overduePage('MET-1', ci, t0 + 60 * 60_000 - 1), undefined);
+  const text = overduePage('MET-1', ci, t0 + 60 * 60_000, { number: 9, headSha: 'a'.repeat(40) });
+  assert.match(text ?? '', /^ODD page: wait-overdue \| issue MET-1 \| PR #9 \| a{40} \| default if silent: the issue keeps waiting; nothing is cancelled or escalated\. ci pending at a{12}: ci wait is 60 min old \(budget 60 min\) since 2026-10-26T12:00:00\.000Z\. episode=ci-a{12}$/);
+  assert.equal(overduePage('MET-1', { ...ci, wait: { kind: 'ci', key: 'ci-x' } }, t0 + 1e9), undefined, 'unknown age is reported in the digest, not paged as overdue');
+  assert.equal(overduePage('MET-1', { kind: 'wait', reason: 'risk security needs a human decision', wait: { kind: 'risk', key: 'risk-security' } }, t0 + 1e9), undefined);
+  assert.deepEqual([...overdueKeys([{ body: overdueLine('ci-x') }, { body: 'other' }])], ['ci-x']);
+});
+
+test('P3.1: a failing action is due at its third attempt or five minutes after its first failure, whichever comes first', () => {
+  assert.deepEqual(failureBudget, { attempts: 3, ms: 5 * 60_000 });
+  assert.equal(failureDue(episode({ attempts: 2 }), t0 + 5 * 60_000 - 1), false);
+  assert.equal(failureDue(episode({ attempts: 3 }), t0 + 1), true);
+  assert.equal(failureDue(episode({ attempts: 1 }), t0 + 5 * 60_000), true);
+  assert.equal(failureDue(episode({ attempts: 1, exhausted: true }), t0), true, 'a spent recheck budget is due at once');
+  const durable = episode({ attempts: 4, alert: 'plane-blocked', commentId: 'c-1' });
+  assert.deepEqual(parseEpisode('MET-364', { id: 'c-1', body: episodeLine(durable) }), durable);
+  assert.equal(sanitizeError('Error: 401 for https://hooks.example/x?token=abc Bearer xyz ghp_abcdef123\nline2'), 'Error: 401 for https://hooks.example/x Bearer [redacted] [redacted] line2');
+});
+
+test('P3.1: one shared blocker is one incident; it is plane-blocked only when every occupied slot fails and ready work waits', () => {
+  const both = [episode(), episode({ issue: 'MET-368', key: 'spawn-reviewer-r1-bbbbbbbbbbbb' })];
+  const plane = { load: full, building: ['MET-364', 'MET-368'], waiting: ['MET-379'] };
+  const [incident, ...rest] = incidents(both, plane, t0);
+  assert.equal(rest.length, 0, 'the same error on two issues is one incident');
+  assert.equal(incident.reason, 'plane-blocked');
+  assert.equal(incident.due, false);
+  assert.equal(incidents(both.map(e => ({ ...e, attempts: 3 })), plane, t0)[0].due, true);
+  // Controls: free capacity, nothing waiting, or one slot progressing is not a deadlock.
+  assert.equal(incidents(both, { ...plane, load: { ...full, buildIssues: 1 } }, t0)[0].reason, 'action-failed');
+  assert.equal(incidents(both, { ...plane, waiting: [] }, t0)[0].reason, 'action-failed');
+  assert.equal(incidents([both[0]], plane, t0)[0].reason, 'action-failed');
+  // A different blocker is a different incident.
+  assert.equal(incidents([...both, episode({ issue: 'MET-9', stage: 'merge', key: 'merge-c', error: 'merge refused' })], plane, t0).length, 2);
+  const text = incidentText({ ...incident, episodes: both.map(e => ({ ...e, attempts: 3 })) }, plane, t0 + 4 * 60_000);
+  assert.match(text, /^ODD page: plane-blocked \| issue MET-364, MET-368 \| - \| - \| default if silent: the build slots stay occupied; nothing is freed, replaced or recovered automatically\. /);
+  assert.match(text, /spawn-reviewer failing since 2026-10-26T12:00:00\.000Z \(4 min, 6 attempts\): Error: Orb custom agents must be registered as an active agent mode\./);
+  assert.match(text, /Occupied build slots 2\/2: MET-364, MET-368\. Ready work waiting for a build slot: MET-379\./);
+  assert.match(text, /Needed: make the reviewer startable .* reload the control orb/);
+  assert.equal(incidentPageDue({ ...incident, due: true, delivered: 'plane-blocked' }), false);
+  assert.equal(incidentPageDue({ ...incident, due: true, delivered: 'action-failed' }), true, 'an action-failed page is raised to plane-blocked once');
+});
+
+type Pr = { number: number; headRefName: string; headRefOid: string; state: 'OPEN' | 'MERGED'; mergeCommit: null; mergeable: string; commits: { oid: string; committedDate: string }[]; statusCheckRollup: { name: string; conclusion: string }[]; body: string };
+const fullSpec = '## Goal\nx\n\n## Isolation\nx\n\n## Build\n- x\n\n## Done means\n- x\n\n## Evidence\n- x\n';
+const head = (n: number) => String(n).repeat(40).slice(0, 40).replace(/[^0-9a-f]/g, 'a');
+
+/**
+ * The factory around one control orb, with fake Linear, GitHub, Slack and thread transports and
+ * a mocked clock. Each `start()` is a fresh plugin load (a reload); earlier loads see the control
+ * labels removed, so their leftover timers only dry-run. Nothing leaves the process.
+ */
+function factory() {
+  const issues = new Map<string, { id: string; status: string; labels: string[]; description: string }>();
+  const comments = new Map<string, { id: string; body: string; createdAt: string }[]>();
+  const prs: Pr[] = [];
+  const threads = new Map<string, { labels: string[]; state: string; archived: boolean; updatedAt: string }>();
+  const dms: string[] = [];
+  const steers: string[] = [];
+  const control = { slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '' };
+  let slackAttempts = 0;
+  let commentIds = 0;
+  let generation = 0;
+  const tools = { call: async (name: string, input: Record<string, unknown>) => {
+    switch (name) {
+      case 'linear.list_issues': return { issues: [...issues.values()].filter(issue => issue.status === input.state && (!input.label || issue.labels.includes(String(input.label)))).map(({ id }) => ({ id })), hasNextPage: false };
+      case 'linear.get_issue':
+        if (input.id === control.unreadable) throw new Error('Linear 503');
+        return { ...issues.get(String(input.id))!, relations: { blockedBy: [] } };
+      case 'linear.list_comments': return { comments: [...(comments.get(String(input.issueId)) ?? [])].reverse() };
+      case 'linear.save_comment': {
+        if (input.id) {
+          for (const list of comments.values()) for (const comment of list) if (comment.id === input.id) comment.body = String(input.body);
+          return { id: input.id };
+        }
+        const list = comments.get(String(input.issueId)) ?? [];
+        const comment = { id: `c-${++commentIds}`, body: String(input.body), createdAt: new Date().toISOString() };
+        comments.set(String(input.issueId), [...list, comment]);
+        return { id: comment.id };
+      }
+      case 'linear.save_issue': return {};
+      case 'find_thread': {
+        const label = /label:(\S+)/.exec(String(input.query))?.[1] ?? '';
+        return { threads: [...threads].filter(([, thread]) => !thread.archived && thread.labels.includes(label)).map(([id, thread]) => ({ id, updatedAt: thread.updatedAt })) };
+      }
+      case 'get_thread_status': { const thread = threads.get(String(input.thread))!; return { metadata: { labels: thread.labels, archived: thread.archived }, agentState: { state: thread.state } }; }
+      case 'update_thread': threads.get(String(input.thread))!.archived = true; return {};
+      case 'slack_write':
+        if (input.channelName) return {};
+        slackAttempts += 1;
+        if (control.slackDown > 0) { control.slackDown -= 1; throw new Error('slack 503'); }
+        dms.push(String(input.text));
+        return { ok: true };
+      case 'slack_read': return { messages: [] };
+      case 'linear.get_status_updates': return { statusUpdates: [], hasNextPage: false };
+      case 'linear.save_status_update': return { id: 'heartbeat' };
+      default: return {};
+    }
+  } };
+  const { $: shell } = fakeShell(command => {
+    if (command.startsWith('gh pr list --state open')) return JSON.stringify(prs.filter(pr => pr.state === 'OPEN'));
+    if (command.startsWith('gh pr list')) return '[]';
+    return undefined;
+  });
+  const $ = async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    if (control.refuse && strings.join('').includes(' check ')) return { exitCode: 1, stdout: '', stderr: control.refuse };
+    return shell(strings, ...values);
+  };
+  let created = 0;
+  const amp = (mine: number) => ({
+    $,
+    createAgent: (config: unknown) => ({ definition: config, createThread: async () => {
+      if (control.spawnFails) throw new Error('Orb custom agents must be registered as an active agent mode');
+      const id = `T-spawned-${++created}`;
+      threads.set(id, { labels: [], state: 'running', archived: false, updatedAt: new Date().toISOString() });
+      return { id, setLabels: async (labels: string[]) => { threads.get(id)!.labels = labels; }, appendUserMessage: async () => {} };
+    } }),
+    registerAgentMode: () => {}, registerTool: () => {},
+    on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { if (name === 'session.start') starts.set(mine, handler); },
+    createWebhook: async () => ({ url: 'https://hooks.example/x' }),
+    system: { executor: { kind: 'remote', keepAlive: async () => {} } },
+    threads: { get: (id: string) => ({ labels: async () => threads.get(id)!.labels, addLabels: async () => [], appendUserMessage: async (message: { content: string }) => {
+      if (control.steerFailures > 0) { control.steerFailures -= 1; throw new Error('thread unavailable'); }
+      steers.push(`${id}: ${message.content}`);
+    } }) },
+  });
+  const starts = new Map<number, (event: unknown, ctx: unknown) => Promise<unknown>>();
+  const builder = (issue: string, state = 'idle') => threads.set(`T-${issue}`, { labels: [`odd-issue-${issue.toLowerCase()}`, 'odd-role-builder', 'odd-round-1', 'odd-engine-anthropic'], state, archived: false, updatedAt: new Date().toISOString() });
+  const openPr = (issue: string, sha: string, over: Partial<Pr> = {}) => {
+    const n = Number(issue.slice(4));
+    prs.push({ number: n, headRefName: `${issue.toLowerCase()}-x`, headRefOid: sha, state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: sha, committedDate: new Date().toISOString() }], statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }], body: `closes ${issue}`, ...over });
+  };
+  return {
+    issues, comments, prs, threads, dms, steers, control, builder, openPr, slackAttempts: () => slackAttempts,
+    issue: (id: string, status: string) => issues.set(id, { id, status, labels: ['odd', 'Bug', 'area:agents'], description: fullSpec }),
+    episodes: (id: string) => (comments.get(id) ?? []).filter(comment => comment.body.startsWith('odd-failure')).map(comment => comment.body.split('\n')[0]),
+    async start() {
+      const mine = ++generation;
+      await (plugin as unknown as (api: unknown) => Promise<void>)(amp(mine));
+      const thread = { id: 'T-control', labels: async () => (mine === generation ? ['odd-control-plane', 'odd-perform'] : []) };
+      await starts.get(mine)!({}, { thread, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools });
+    },
+  };
+}
+
+/** Advances the mocked clock in steps so every timer due on the way fires, letting the plugin settle after each. */
+async function advance(ms: number, step = 30_000) {
+  for (let left = ms; left > 0; left -= step) {
+    mock.timers.tick(Math.min(step, left));
+    await settle();
+  }
+}
+
+/** The MET-379 incident: MET-364 and MET-368 hold both build slots and need a reviewer that cannot spawn; MET-379 is the ready repair. */
+function deadlock(builderState = 'idle') {
+  const plant = factory();
+  for (const id of ['MET-364', 'MET-368']) {
+    plant.issue(id, 'In Progress');
+    plant.builder(id, builderState);
+    plant.openPr(id, id === 'MET-364' ? 'a'.repeat(40) : 'b'.repeat(40));
+  }
+  plant.issue('MET-379', 'Todo');
+  plant.control.spawnFails = true;
+  return plant;
+}
+
+test('P3.1: the MET-379 self-deadlock pages one actionable plane-blocked incident within the failure budget; a failed delivery and a reload keep it pending; recovery resolves it once; a recurrence is a new episode', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = deadlock();
+  plant.control.slackDown = Number.POSITIVE_INFINITY;
+  await plant.start();
+  await settle();
+  assert.deepEqual(plant.episodes('MET-364'), [], 'one failed attempt leaves no comment');
+  // Rechecks at 90 s and 270 s: the third attempt is due, well inside five minutes.
+  await advance(90_000);
+  assert.deepEqual(plant.episodes('MET-364'), ['odd-failure key=spawn-reviewer-r1-aaaaaaaaaaaa stage=spawn-reviewer first=2026-10-26T15:00:00.000Z attempts=2 state=open alert=pending']);
+  await advance(180_000);
+  assert.ok(plant.slackAttempts() >= 1, 'the incident page was attempted');
+  assert.deepEqual(plant.dms, [], 'Slack is down: nothing is delivered');
+  assert.match(plant.episodes('MET-368')[0], /attempts=[34] state=open alert=pending$/, 'still pending, never marked delivered');
+
+  // Reload while Slack is still down, then let Slack recover: the pending page goes out exactly once.
+  await plant.start();
+  await settle();
+  assert.deepEqual(plant.dms, []);
+  plant.control.slackDown = 0;
+  await advance(10 * 60_000);
+  assert.equal(plant.dms.length, 1, 'one page for both issues and every recheck');
+  const [page] = plant.dms;
+  assert.match(page, /^\[odd\] ODD page: plane-blocked \| issue MET-364, MET-368 \| /);
+  assert.match(page, /spawn-reviewer failing since 2026-10-26T15:00:00\.000Z \(\d+ min, \d+ attempts\): Error: Orb custom agents must be registered as an active agent mode\./);
+  assert.match(page, /Occupied build slots 2\/2: MET-364, MET-368\. Ready work waiting for a build slot: MET-379\./);
+  assert.match(page, /Needed: make the reviewer startable/);
+  assert.match(plant.episodes('MET-364')[0], /state=open alert=plane-blocked$/);
+
+  // Another reload and more sweeps: delivered stays delivered.
+  await plant.start();
+  await advance(20 * 60_000);
+  assert.equal(plant.dms.length, 1);
+
+  // Recovery: the reviewer can spawn again. Both issues advance; one resolution closes the incident.
+  plant.control.spawnFails = false;
+  await advance(10 * 60_000);
+  assert.equal(plant.dms.length, 2);
+  assert.match(plant.dms[1], /^\[odd\] ODD resolved: plane-blocked \| issue MET-364, MET-368 \| spawn-reviewer advances again after \d+ min\./);
+  assert.match(plant.episodes('MET-364')[0], /state=resolved alert=closed$/);
+  await advance(20 * 60_000);
+  assert.equal(plant.dms.length, 2, 'no second resolution');
+
+  // Recurrence: the reviewers are gone and spawning breaks again; a new episode pages again.
+  for (const [id, thread] of plant.threads) if (id.startsWith('T-spawned')) thread.archived = true;
+  plant.control.spawnFails = true;
+  await advance(10 * 60_000 + 5 * 60_000);
+  assert.equal(plant.dms.length, 3);
+  assert.match(plant.dms[2], /ODD page: plane-blocked \| issue MET-364, MET-368 /);
+  assert.equal(plant.episodes('MET-364').length, 2, 'the recurrence is a new episode comment');
+});
+
+test('P3.1: an evaluation that keeps failing past its recheck budget still pages, retried until Slack takes it; it is not mistaken for a wait', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  plant.issue('MET-1', 'In Progress');
+  plant.builder('MET-1', 'running');
+  plant.issue('MET-364', 'In Progress');
+  plant.builder('MET-364');
+  // The derivation itself fails: Linear refuses to return the issue.
+  plant.control.unreadable = 'MET-364';
+  plant.control.slackDown = Number.POSITIVE_INFINITY;
+  await plant.start();
+  await settle();
+  // Rechecks back off 90 s, 3, 6, 12 and 24 min; the budget is spent long before Slack recovers.
+  await advance(50 * 60_000);
+  const attempts = plant.slackAttempts();
+  assert.ok(attempts >= 3, 'the incident page was attempted, not only logged');
+  assert.deepEqual(plant.dms, []);
+  plant.control.slackDown = 0;
+  await advance(10 * 60_000);
+  assert.equal(plant.dms.length, 1);
+  assert.match(plant.dms[0], /^\[odd\] ODD page: action-failed \| issue MET-364 \| .*evaluate failing since 2026-10-26T15:00:00\.000Z .*Linear 503.*Needed: restore the Linear, GitHub or thread-search read that fails/);
+});
+
+test('P3.1: full build slots with progressing builders send no incident', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = deadlock('running');
+  await plant.start();
+  await advance(30 * 60_000);
+  assert.deepEqual(plant.dms, []);
+  assert.deepEqual(plant.episodes('MET-364'), []);
+});
+
+test('P3.1: a refused merge counts per head and pages at the third attempt; the refusal is posted once', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  const sha = 'c'.repeat(40);
+  plant.issue('MET-8', 'In Progress');
+  plant.builder('MET-8');
+  plant.threads.set('T-review', { labels: ['odd-issue-met-8', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-ready-${sha.slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+  plant.openPr('MET-8', sha);
+  plant.control.refuse = 'mergeStateStatus BLOCKED';
+  await plant.start();
+  await settle();
+  await advance(120_000);
+  assert.deepEqual(plant.dms, [], 'two refusals do not page');
+  await advance(60_000);
+  assert.equal(plant.dms.length, 1);
+  assert.match(plant.dms[0], /^\[odd\] ODD page: action-failed \| issue MET-8 \| .*merge failing since .*merge refused at c{40}: mergeStateStatus BLOCKED\..*Needed: resolve the merge refusal/);
+  assert.equal((plant.comments.get('MET-8') ?? []).filter(comment => comment.body.startsWith('odd-merge-refused')).length, 1);
+  assert.match(plant.episodes('MET-8')[0], /^odd-failure key=merge-c{12} stage=merge .* attempts=3 state=open alert=action-failed$/);
+  await advance(20 * 60_000);
+  assert.equal(plant.dms.length, 1, 'once per head');
+});
+
+test('P3.1: a failed steer is retried and recorded only after delivery; the record dedupes it across a reload; an unanswered steer pages once after 30 minutes', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  const sha = 'd'.repeat(40);
+  plant.issue('MET-7', 'In Progress');
+  plant.builder('MET-7');
+  plant.openPr('MET-7', sha, { statusCheckRollup: [{ name: 'ci', conclusion: 'FAILURE' }] });
+  plant.control.steerFailures = 1;
+  const records = () => (plant.comments.get('MET-7') ?? []).filter(comment => comment.body.startsWith('odd-steer'));
+  await plant.start();
+  await settle();
+  assert.deepEqual(plant.steers, []);
+  assert.deepEqual(records(), [], 'a failed delivery writes no record');
+  await advance(90_000);
+  assert.deepEqual(plant.steers, [`T-MET-7: [odd] CI failed at ${sha}. Fix the failing jobs and push; do not open a new PR.`]);
+  assert.deepEqual(records().map(comment => comment.body), [`odd-steer key=ci-failed-${sha.slice(0, 12)} thread=T-MET-7`]);
+  assert.equal(records()[0].createdAt, '2026-10-26T15:01:30.000Z');
+
+  await plant.start();
+  await advance(20 * 60_000);
+  assert.equal(plant.steers.length, 1, 'no second steer after a reload');
+  // Sweeps run at :30 (28.5 min unanswered) and :40 (38.5 min).
+  await advance(9 * 60_000 + 30_000);
+  assert.deepEqual(plant.dms, [], 'not before 30 minutes');
+  await advance(10 * 60_000);
+  assert.equal(plant.dms.length, 1);
+  assert.match(plant.dms[0], new RegExp(`^\\[odd\\] ODD page: wait-overdue \\| issue MET-7 \\| PR #7 \\| ${sha} \\| .*steer ci-failed-${sha.slice(0, 12)} unanswered: steer wait is 3\\d min old \\(budget 30 min\\) since 2026-10-26T15:01:30\\.000Z`));
+  await plant.start();
+  await advance(30 * 60_000);
+  assert.equal(plant.dms.length, 1, 'one page per episode, across a reload');
+  assert.equal(plant.steers.length, 1);
 });

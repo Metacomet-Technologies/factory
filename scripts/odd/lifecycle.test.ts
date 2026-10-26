@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { nextAction, specComplete, ralphGuard, parseDeployReceipt, parseVerify, parseCancelled, pageText, verifyLine, cancelledLine, threadLabels, parseThreadLabels, capacity, issueTriaged, controlPlaneSilent, heartbeatLine, parseHeartbeat, silenceMs, type Action, type IssueSnapshot, type PageReason } from './lifecycle.ts';
+import { nextAction, specComplete, ralphGuard, parseDeployReceipt, parseVerify, parseCancelled, pageText, verifyLine, cancelledLine, threadLabels, parseThreadLabels, capacity, issueTriaged, controlPlaneSilent, heartbeatLine, parseHeartbeat, silenceMs, waitAge, waitBudgets, parseSteer, steerLine, type Action, type IssueSnapshot, type PageReason, type Wait } from './lifecycle.ts';
 
 const spec = `## Goal
 Ship it.
@@ -75,7 +75,7 @@ test('changes steer the live builder; the third rejected head pages instead of l
   const pr = { number: 9, headSha: sha, ci: 'success' as const, merged: false, verdict: { state: 'changes' as const, sha }, changesRounds: 2 };
   const owner = { role: 'builder' as const, threadID: 'T-1', round: 1, state: 'idle' as const };
   assert.deepEqual(nextAction(issue({ status: 'In Progress', pr, owner }), idle),
-    { kind: 'steer', role: 'builder', threadID: 'T-1', message: `QA requested changes at ${sha}; see the odd-verdict comment on PR #9. Address every finding, rerun the Evidence commands, push to the same branch.` });
+    { kind: 'steer', role: 'builder', threadID: 'T-1', key: `changes-${sha.slice(0, 12)}`, message: `QA requested changes at ${sha}; see the odd-verdict comment on PR #9. Address every finding, rerun the Evidence commands, push to the same branch.` });
   assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: { ...pr, changesRounds: 3 }, owner }), idle),
     { kind: 'page', reason: 'third-failed-qa-round', detail: 'MET-1: PR #9 rejected 3 times', pr: 9, sha });
   assert.equal(nextAction(issue({ status: 'In Progress', pr, owner: { ...owner, state: 'running' } }), idle).kind, 'wait');
@@ -85,7 +85,7 @@ test('changes steer the live builder; the third rejected head pages instead of l
 });
 
 test('deploy receipts: no receipt waits, healthy is Done, rolled back returns to Todo with a Bug, unhealthy without rollback pages; red ones ask for a log reader', () => {
-  assert.deepEqual(nextAction(issue({ status: 'Deploying' }), idle), { kind: 'wait', reason: 'release not published' });
+  assert.deepEqual(nextAction(issue({ status: 'Deploying' }), idle), { kind: 'wait', reason: 'release not published', wait: { kind: 'receipt', key: 'receipt-unknown' } });
   const receipt = parseDeployReceipt('note\nodd-deploy host=factory-gpu component=meter+kiosk sha=abcdef1234 health=pass rollback=none\n');
   assert.deepEqual(receipt, { host: 'factory-gpu', component: 'meter+kiosk', sha: 'abcdef1234', health: 'pass', rollback: 'none' });
   assert.deepEqual(nextAction(issue({ status: 'Deploying', deployReceipt: receipt }), idle), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify meter+kiosk at abcdef1234', round: 1 });
@@ -130,7 +130,7 @@ test('a green receipt spawns the Verifier; its pass comment sets Done, its fail 
   assert.deepEqual(deploying(), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify kiosk at abcdef1234', round: 1 });
   assert.deepEqual(deploying(parseVerify('odd-verify sha=abcdef1234 result=pass bug=none')), { kind: 'set-status', status: 'Done', reason: 'verified kiosk at abcdef1234' });
   assert.deepEqual(deploying(parseVerify('odd-verify sha=abcdef1234 result=fail bug=met-9\n- pass kiosk shows the scene\n- fail chip pulses')),
-    { kind: 'wait', reason: 'verification failed at abcdef1234; bug MET-9' });
+    { kind: 'wait', reason: 'verification failed at abcdef1234; bug MET-9', wait: { kind: 'verification', key: 'verification-abcdef1234' } });
   // A verdict for an older release does not count for this receipt.
   assert.equal(deploying({ sha: '0123456789', result: 'pass' }).kind, 'spawn');
   assert.equal(parseVerify('odd-verify sha=abcdef1234 result=maybe bug=none'), undefined);
@@ -182,4 +182,56 @@ test('a heartbeat is silent at 20 minutes and not one millisecond before', () =>
   assert.equal(controlPlaneSilent([heartbeatLine(at)], now + silenceMs), true);
   // The newest line wins, so an older stale row does not silence a fresh one.
   assert.equal(controlPlaneSilent([heartbeatLine(new Date(now - silenceMs).toISOString()), heartbeatLine(at)], now), false);
+});
+
+test('P3.1: every machine wait has a budget that is overdue at the boundary, not one millisecond before; human waits and undated waits are never overdue', () => {
+  const at = Date.parse('2026-10-26T12:00:00.000Z');
+  const since = new Date(at).toISOString();
+  const budgets = { ci: 60, receipt: 120, steer: 30, approval: 30 } as const;
+  for (const [kind, minutes] of Object.entries(budgets) as [keyof typeof budgets, number][]) {
+    const ms = minutes * 60_000;
+    assert.deepEqual(waitBudgets[kind], { notify: 'page', ms }, kind);
+    const wait: Wait = { kind, key: `${kind}-x`, since };
+    assert.deepEqual(waitAge(wait, at + ms - 1), { state: 'within', ageMs: ms - 1 }, `${kind} below`);
+    assert.deepEqual(waitAge(wait, at + ms), { state: 'over', ageMs: ms }, `${kind} at`);
+    assert.deepEqual(waitAge(wait, at + ms + 1), { state: 'over', ageMs: ms + 1 }, `${kind} above`);
+    assert.deepEqual(waitAge({ kind, key: `${kind}-x` }, at + 10 * ms), { state: 'unknown' }, `${kind} without a durable start is unknown, not zero`);
+  }
+  for (const kind of ['risk', 'verification'] as const) assert.deepEqual(waitAge({ kind, key: kind, since }, at + 365 * 24 * 60 * 60_000), { state: 'human' });
+});
+
+test('P3.1: waits carry their durable start and an episode key bound to the head, merge or thread behind them', () => {
+  const headAt = '2026-10-26T10:00:00.000Z';
+  const pending = { number: 9, headSha: sha, ci: 'pending' as const, merged: false, headAt };
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: pending }), idle), { kind: 'wait', reason: `ci pending at ${sha.slice(0, 12)}`, wait: { kind: 'ci', key: `ci-${sha.slice(0, 12)}`, since: headAt } });
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: { ...pending, headAt: undefined } }), idle), { kind: 'wait', reason: `ci pending at ${sha.slice(0, 12)}`, wait: { kind: 'ci', key: `ci-${sha.slice(0, 12)}` } });
+  const merged = { ...pending, ci: 'success' as const, merged: true, mergeSha: 'e'.repeat(40), mergedAt: '2026-10-26T11:00:00.000Z' };
+  assert.deepEqual(nextAction(issue({ status: 'Deploying', pr: merged }), idle), { kind: 'wait', reason: 'release not published', wait: { kind: 'receipt', key: `receipt-${'e'.repeat(12)}`, since: merged.mergedAt } });
+  const approval = { role: 'reviewer' as const, threadID: 'T-r', round: 1, state: 'awaiting-approval' as const, idleSince: '2026-10-26T11:30:00.000Z' };
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: pending, owner: approval }), idle), { kind: 'wait', reason: 'reviewer awaiting approval', wait: { kind: 'approval', key: 'approval-T-r', since: approval.idleSince } });
+  const risky = nextAction(issue({ status: 'Triage', description: 'x', labels: ['Bug', 'area:kiosk'], risk: 'security' }), idle);
+  assert.deepEqual(risky, { kind: 'wait', reason: 'risk security needs a human decision', wait: { kind: 'risk', key: 'risk-security' } });
+});
+
+test('P3.1: a CONFLICTING PR steers the builder to rebase instead of waiting on CI that never runs; without a builder it spawns one', () => {
+  const owner = { role: 'builder' as const, threadID: 'T-1', round: 1, state: 'idle' as const };
+  const conflicting = { number: 9, headSha: sha, ci: 'pending' as const, merged: false, conflicting: true };
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: conflicting, owner }), idle), {
+    kind: 'steer', role: 'builder', threadID: 'T-1', key: `conflict-${sha.slice(0, 12)}`,
+    message: `PR #9 conflicts with main at ${sha}. Rebase onto origin/main, resolve the conflicts and push to the same branch; do not open a new PR.`,
+  });
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: conflicting }), idle), { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'PR #9 conflicts with main', round: 1 });
+});
+
+test('P3.1: a delivered steer is not repeated; the issue waits for the answer from the steer comment, and a new head is steered afresh', () => {
+  const owner = { role: 'builder' as const, threadID: 'T-1', round: 1, state: 'idle' as const };
+  const failed = { number: 9, headSha: sha, ci: 'failure' as const, merged: false };
+  const key = `ci-failed-${sha.slice(0, 12)}`;
+  assert.equal(nextAction(issue({ status: 'In Progress', pr: failed, owner }), idle).kind, 'steer');
+  const at = '2026-10-26T12:00:00.000Z';
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: failed, owner, steers: { [key]: at } }), idle), { kind: 'wait', reason: `steer ${key} unanswered`, wait: { kind: 'steer', key: `steer-${key}`, since: at } });
+  const pushed = { ...failed, headSha: 'd'.repeat(40) };
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: pushed, owner, steers: { [key]: at } }), idle).kind, 'steer');
+  assert.deepEqual(parseSteer(`note\n${steerLine(key, 'T-1')}`), { key, threadID: 'T-1' });
+  for (const reason of ['wait-overdue', 'action-failed', 'plane-blocked'] as const) assert.match(pageText('MET-1', { kind: 'page', reason, detail: 'x' }), /default if silent: .*nothing .*automatically|default if silent: the issue keeps waiting/);
 });

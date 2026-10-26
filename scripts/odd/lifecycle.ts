@@ -53,8 +53,12 @@ export type IssueSnapshot = {
    * `idleSince` is the thread's last activity (thread search `updatedAt`); the Watchdog cancels an idle owner past `staleMs`.
    */
   owner?: { role: Role; threadID: string; round: number; state: 'idle' | 'running' | 'awaiting-approval' | 'error'; idleSince?: string };
-  /** `changesRounds` counts the distinct `changes` verdicts on this issue: the builder thread persists across rounds, so rounds live on the reviewer side. */
-  pr?: { number: number; headSha: string; ci: 'pending' | 'success' | 'failure'; verdict?: Verdict; merged: boolean; mergeSha?: string; changesRounds?: number };
+  /**
+   * `changesRounds` counts the distinct `changes` verdicts on this issue: the builder thread persists across rounds, so rounds live on the reviewer side.
+   * `headAt` is the head commit's time and `mergedAt` the merge time (GitHub); either is absent when GitHub did not report it.
+   * `conflicting` is GitHub's `mergeable: CONFLICTING`: CI never runs on such a head, so the builder must rebase.
+   */
+  pr?: { number: number; headSha: string; ci: 'pending' | 'success' | 'failure'; verdict?: Verdict; merged: boolean; mergeSha?: string; changesRounds?: number; headAt?: string; mergedAt?: string; conflicting?: boolean };
   /** Latest `odd-deploy` receipt posted after the latest `odd-merge` receipt (scripts/odd/deploy.ts posts one per release per issue). */
   deployReceipt?: DeployReceipt;
   /** Latest `odd-verify` comment (the Verifier's judgement); it counts only when its SHA is the receipt's. */
@@ -63,6 +67,8 @@ export type IssueSnapshot = {
   openRounds?: Partial<Record<Role, number>>;
   /** Rounds the Watchdog cancelled per role since the latest `odd-escalated` comment (`odd-watchdog cancelled` comments); verifier rounds since the latest receipt. */
   cancelledRounds?: Partial<Record<Role, number>>;
+  /** Steers delivered to the builder (`odd-steer` comments, written only after delivery): steer key -> comment `createdAt` ('' when Linear gave none). */
+  steers?: Readonly<Record<string, string>>;
 };
 
 /** `component` is the `+`-joined set the release installed (`none` when it touched no enabled component), or the component that failed. */
@@ -73,17 +79,50 @@ export type Verify = { sha: string; result: 'pass' | 'fail'; bug?: string };
 
 export type Load = { orbs: number; runnerSlots: number; buildIssues: number };
 
+/**
+ * What a wait is for (audit P3.1). Machine waits page once per episode past their budget; human
+ * waits (a risk decision, a failed verification) go to the daily digest instead. `since` is the
+ * durable start (head commit, merge, steer comment, thread activity), never the last sweep; it is
+ * absent when the source did not report it, and the age is then unknown, not zero. `key` names
+ * the episode: it stays the same until the head, merge, thread or steer behind the wait changes.
+ */
+export type WaitKind = 'ci' | 'receipt' | 'steer' | 'approval' | 'risk' | 'verification';
+export type Wait = { kind: WaitKind; key: string; since?: string };
+
+export const waitBudgets: Readonly<Record<WaitKind, { notify: 'page'; ms: number } | { notify: 'digest' }>> = Object.freeze({
+  ci: { notify: 'page', ms: 60 * 60_000 },
+  receipt: { notify: 'page', ms: 2 * 60 * 60_000 },
+  steer: { notify: 'page', ms: 30 * 60_000 },
+  approval: { notify: 'page', ms: 30 * 60_000 },
+  risk: { notify: 'digest' },
+  verification: { notify: 'digest' },
+});
+
+/** A machine wait is overdue at its budget exactly; one with no durable start has an unknown age. */
+export function waitAge(wait: Wait, now: number): { state: 'human' } | { state: 'unknown' } | { state: 'within' | 'over'; ageMs: number } {
+  const budget = waitBudgets[wait.kind];
+  if (budget.notify === 'digest') return { state: 'human' };
+  const since = wait.since ? Date.parse(wait.since) : Number.NaN;
+  if (Number.isNaN(since)) return { state: 'unknown' };
+  const ageMs = now - since;
+  return { state: ageMs >= budget.ms ? 'over' : 'within', ageMs };
+}
+
+const waiting = (reason: string, kind: WaitKind, key: string, since?: string): Action =>
+  ({ kind: 'wait', reason, wait: { kind, key, ...(since ? { since } : {}) } });
+
 export type Action =
   | { kind: 'spawn'; role: Role; executor: Executor; reason: string; round: number }
-  | { kind: 'steer'; role: Role; threadID: string; message: string }
+  /** `key` names the steer (`<cause>-<head12>`); the control plane writes `odd-steer key=<key>` after delivering it. */
+  | { kind: 'steer'; role: Role; threadID: string; key: string; message: string }
   | { kind: 'merge'; pr: number; sha: string }
   | { kind: 'set-status'; status: Status; reason: string; followUp?: { title: string; body: string }; diagnose?: DeployReceipt }
   | { kind: 'page'; reason: PageReason; detail: string; pr?: number; sha?: string; diagnose?: DeployReceipt }
   /** `stuck` names the idle role whose thread the wait depends on; the Watchdog cancels it once stale. */
-  | { kind: 'wait'; reason: string; stuck?: Role };
+  | { kind: 'wait'; reason: string; stuck?: Role; wait?: Wait };
 
 /** `diagnose` on a red deploy: after acting, the control plane starts one log-reading Deployer on the receipt's host (odd-deployer skill). */
-export type PageReason = 'third-failed-qa-round' | 'failed-rollback' | 'irreversible-action' | 'security-finding' | 'budget-ceiling' | 'control-plane-blind' | 'control-plane-silent' | 'subscription-mismatch';
+export type PageReason = 'third-failed-qa-round' | 'failed-rollback' | 'irreversible-action' | 'security-finding' | 'budget-ceiling' | 'control-plane-blind' | 'control-plane-silent' | 'subscription-mismatch' | 'wait-overdue' | 'action-failed' | 'plane-blocked';
 
 /** What happens when Devon does not answer a page (docs/odd/README.md §8); every page states it. */
 export const pageDefaults: Record<PageReason, string> = Object.freeze({
@@ -95,6 +134,9 @@ export const pageDefaults: Record<PageReason, string> = Object.freeze({
   'control-plane-blind': 'the runner backstop poller runs the lifecycle at 60 s cadence',
   'control-plane-silent': 'the runner backstop poller runs the lifecycle until a fresh heartbeat',
   'subscription-mismatch': 'roles keep their pinned models; nothing is relaunched on another engine',
+  'wait-overdue': 'the issue keeps waiting; nothing is cancelled or escalated',
+  'action-failed': 'every evaluation retries the action; nothing is recovered automatically',
+  'plane-blocked': 'the build slots stay occupied; nothing is freed, replaced or recovered automatically',
 });
 
 /** The one page format (§8): `ODD page: <condition> | issue MET-<n> | <pr or host> | <sha> | default if silent: <action>`. */
@@ -136,6 +178,13 @@ export function parseVerify(text: string): Verify | undefined {
   const match = /^odd-verify sha=([a-f0-9]{7,40}) result=(pass|fail) bug=(\S+)$/m.exec(text);
   if (!match) return undefined;
   return { sha: match[1], result: match[2] as Verify['result'], bug: match[3] === 'none' ? undefined : match[3].toUpperCase() };
+}
+
+export const steerLine = (key: string, threadID: string) => `odd-steer key=${key} thread=${threadID}`;
+
+export function parseSteer(text: string): { key: string; threadID: string } | undefined {
+  const match = /^odd-steer key=(\S+) thread=(\S+)$/m.exec(text);
+  return match ? { key: match[1], threadID: match[2] } : undefined;
 }
 
 export const cancelledLine = (role: Role, threadID: string, round: number) => `odd-watchdog cancelled role=${role} thread=${threadID} round=${round}`;
@@ -213,9 +262,16 @@ function spawn(role: Role, load: Load, reason: string, issue: IssueSnapshot): Ac
   return free(executor, load) ? { kind: 'spawn', role, executor, reason, round: previous + 1 } : { kind: 'wait', reason: `${executor} capacity (${role})` };
 }
 
+/** A steer already delivered (an `odd-steer` comment) is not repeated: the issue waits for the builder's answer from the comment's time. */
+function steer(issue: IssueSnapshot, threadID: string, key: string, message: string): Action {
+  const at = issue.steers?.[key];
+  return at === undefined ? { kind: 'steer', role: 'builder', threadID, key, message } : waiting(`steer ${key} unanswered`, 'steer', `steer-${key}`, at);
+}
+
 /** Derive the single next action for one issue. Idempotent: the same snapshot always yields the same action. */
 export function nextAction(issue: IssueSnapshot, load: Load): Action {
   const { status, owner, pr } = issue;
+  if (owner?.state === 'awaiting-approval') return waiting(`${owner.role} awaiting approval`, 'approval', `approval-${owner.threadID}`, owner.idleSince);
   if (owner && owner.state !== 'idle' && owner.state !== 'error') return { kind: 'wait', reason: `${owner.role} running` };
   if (status === 'Done' || status === 'Canceled' || status === 'Duplicate') return { kind: 'wait', reason: status };
   if (issue.labels.includes(escalatedLabel)) return { kind: 'wait', reason: 'escalated to Devon' };
@@ -226,7 +282,7 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
     const untriaged = issueTriaged(issue);
     if (untriaged.length) return spawn('intake', load, untriaged.join('; '), issue);
     if (specComplete(issue.description)) return { kind: 'set-status', status: 'Todo', reason: 'spec complete' };
-    if (issue.risk && issue.risk !== 'ordinary') return { kind: 'wait', reason: `risk ${issue.risk} needs a human decision` };
+    if (issue.risk && issue.risk !== 'ordinary') return waiting(`risk ${issue.risk} needs a human decision`, 'risk', `risk-${issue.risk}`);
     return spawn('spec', load, 'spec incomplete', issue);
   }
   if (status === 'Todo') {
@@ -246,10 +302,16 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
       return owner?.role === 'builder' ? { kind: 'wait', reason: 'builder has not opened a PR', stuck: 'builder' } : spawn('builder', load, 'no builder thread', issue);
     }
     if (pr.merged) return { kind: 'set-status', status: 'Deploying', reason: `merged ${pr.mergeSha ?? ''}`.trim() };
-    if (pr.ci === 'pending') return { kind: 'wait', reason: `ci pending at ${pr.headSha.slice(0, 12)}` };
+    const head = pr.headSha.slice(0, 12);
+    if (pr.conflicting) {
+      return owner?.role === 'builder'
+        ? steer(issue, owner.threadID, `conflict-${head}`, `PR #${pr.number} conflicts with main at ${pr.headSha}. Rebase onto origin/main, resolve the conflicts and push to the same branch; do not open a new PR.`)
+        : spawn('builder', load, `PR #${pr.number} conflicts with main`, issue);
+    }
+    if (pr.ci === 'pending') return waiting(`ci pending at ${head}`, 'ci', `ci-${head}`, pr.headAt);
     if (pr.ci === 'failure') {
       return owner?.role === 'builder'
-        ? { kind: 'steer', role: 'builder', threadID: owner.threadID, message: `CI failed at ${pr.headSha}. Fix the failing jobs and push; do not open a new PR.` }
+        ? steer(issue, owner.threadID, `ci-failed-${head}`, `CI failed at ${pr.headSha}. Fix the failing jobs and push; do not open a new PR.`)
         : spawn('builder', load, 'ci failed and no builder thread', issue);
     }
     const verdict = pr.verdict?.sha === pr.headSha ? pr.verdict : undefined;
@@ -258,13 +320,13 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
     const round = pr.changesRounds ?? 1;
     if (round >= contracts.builder.rounds) return { kind: 'page', reason: 'third-failed-qa-round', detail: `${issue.identifier}: PR #${pr.number} rejected ${round} times`, pr: pr.number, sha: pr.headSha };
     return owner?.role === 'builder'
-      ? { kind: 'steer', role: 'builder', threadID: owner.threadID, message: `QA requested changes at ${pr.headSha}; see the odd-verdict comment on PR #${pr.number}. Address every finding, rerun the Evidence commands, push to the same branch.` }
+      ? steer(issue, owner.threadID, `changes-${head}`, `QA requested changes at ${pr.headSha}; see the odd-verdict comment on PR #${pr.number}. Address every finding, rerun the Evidence commands, push to the same branch.`)
       : spawn('builder', load, `qa changes, round ${round + 1}`, issue);
   }
   // Deploying: the host Deployer (scripts/odd/deploy.ts) posts the receipt; the control plane never deploys.
   if (status === 'Deploying') {
     const receipt = issue.deployReceipt;
-    if (!receipt) return { kind: 'wait', reason: 'release not published' };
+    if (!receipt) return waiting('release not published', 'receipt', `receipt-${(pr?.mergeSha ?? pr?.headSha ?? 'unknown').slice(0, 12)}`, pr?.mergedAt);
     const line = deployReceiptLine(receipt);
     if (receipt.health === 'fail' && receipt.rollback === 'none') return { kind: 'page', reason: 'failed-rollback', detail: `${receipt.component} on ${receipt.host} unhealthy at ${receipt.sha}: ${line}`, diagnose: receipt };
     if (receipt.health === 'fail') {
@@ -279,7 +341,7 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
     const verify = issue.verify?.sha === receipt.sha ? issue.verify : undefined;
     if (!verify) return spawn('verifier', load, `verify ${receipt.component} at ${receipt.sha.slice(0, 12)}`, issue);
     if (verify.result === 'pass') return { kind: 'set-status', status: 'Done', reason: `verified ${receipt.component} at ${receipt.sha.slice(0, 12)}` };
-    return { kind: 'wait', reason: `verification failed at ${receipt.sha.slice(0, 12)}; bug ${verify.bug ?? 'not filed'}` };
+    return waiting(`verification failed at ${receipt.sha.slice(0, 12)}; bug ${verify.bug ?? 'not filed'}`, 'verification', `verification-${receipt.sha.slice(0, 12)}`);
   }
   return { kind: 'wait', reason: `unknown status ${status}` };
 }

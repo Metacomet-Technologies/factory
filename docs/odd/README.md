@@ -352,7 +352,31 @@ Each artifact is machine-checkable before the next role starts.
 | Control plane blind (every sweep failing for 15 min) | Watchdog sweep | Slack DM (`control-plane-blind`), once per episode | Backstop poller runs the lifecycle at 60 s cadence (phase 7). |
 | Pinned model served off its subscription (arm check), or a role thread's usage routed elsewhere or missing (on archive) | Control plane | Slack DM (`subscription-mismatch`) once per thread; `odd-routing` comment on the issue | Roles keep their pinned models; nothing is relaunched on another engine. |
 | Control plane silent (no heartbeat for 20 min) | Runner poller | Journal line `odd-backstop-resume`, once per episode | The poller runs the lifecycle until a fresh heartbeat. |
+| A machine wait past its budget (audit P3.1): CI 60 min since the head commit, deploy receipt 2 h since the merge, an unanswered steer 30 min since its `odd-steer` comment, a thread awaiting approval 30 min | Control plane | Slack DM (`wait-overdue`) once per episode; `odd-overdue key=<episode>` comment after delivery | The issue keeps waiting; nothing is cancelled or escalated. |
+| A spawn, steer, merge (refusal or failure) or evaluation failing three times, or for 5 min, whichever comes first; rechecks exhausted | Control plane | Slack DM (`action-failed`), one per shared blocker; `plane-blocked` instead when every occupied build slot fails and ready work waits for one | Every evaluation retries the action; nothing frees a slot, spawns a replacement or recovers automatically. |
+| A risk decision or a failed verification waiting on Devon | Watchdog sweep | Daily digest | The issue waits. |
 | Everything else | role | Linear comment | Proceed. |
+
+Waits carry a typed reason, a durable start and an episode key
+(`waitBudgets` in `scripts/odd/lifecycle.ts`). The start comes from GitHub (head
+commit, merge) or a Linear comment's `createdAt`, never from the last sweep; a
+wait without one has an unknown age, which the digest lists instead of paging.
+The episode key changes only with the head, merge, thread or steer behind the
+wait. A CONFLICTING PR steers its builder to rebase, since CI never runs on it.
+A steer is recorded as `odd-steer key=<cause>-<head12> thread=<id>` only after
+delivery, so a failed steer is retried and a delivered one is not repeated
+after a reload.
+
+A failing action is a failure episode (`scripts/odd/watchdog.ts`), keyed by
+issue, stage and head or round. From its second attempt it is an `odd-failure`
+comment updated in place with its first failure, attempt count and the page
+delivered for it, so sweeps and plugin reloads keep them; a one-off failure
+leaves no comment. Episodes with the same stage and error are one incident and
+one page. The page is marked delivered only after Slack accepts it; until then
+every evaluation and sweep retries it. When the failing actions succeed again,
+one `ODD resolved` DM closes the incident, and a later failure opens a new
+episode. Neither the digest nor the heartbeat replaces these pages. Only
+failed derivations count toward `control-plane-blind`.
 
 Every Slack DM uses one format, `pageText` in `scripts/odd/lifecycle.ts`:
 `ODD page: <condition> | issue MET-<n> | <PR #n or host> | <sha> | default if
