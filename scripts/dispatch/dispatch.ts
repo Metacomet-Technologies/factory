@@ -1,4 +1,4 @@
-import { readFileSync, openSync, closeSync, mkdirSync, writeFileSync, renameSync, rmSync, existsSync } from 'node:fs';
+import { readFileSync, openSync, closeSync, mkdirSync, writeFileSync, renameSync, rmSync, existsSync, realpathSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
@@ -332,17 +332,18 @@ async function reconcile(ledger: Ledger) {
   console.log(JSON.stringify({ decision: 'reconcile', dryRun: true, applied: 0, wouldRelease: count }));
 }
 
-async function runPass(command: string, identifier: string | undefined, dryRun: boolean, budget: Budget, ledger: Ledger) {
+/** Environment configuration a poll runs with; throws on invalid values. Reads nothing else. */
+export function config(env: NodeJS.ProcessEnv = process.env) {
   if (!supportedNode(process.versions.node)) throw new Error(`Use Node 24.x (>= 24.12.0); found ${process.versions.node}`);
-  const team = process.env.DISPATCH_TEAM ?? 'MET';
-  const cap = Number(process.env.DISPATCH_MAX_ACTIVE_PER_RUNNER ?? 2);
+  const team = env.DISPATCH_TEAM ?? 'MET';
+  const cap = Number(env.DISPATCH_MAX_ACTIVE_PER_RUNNER ?? 2);
   if (!Number.isSafeInteger(cap) || cap < 1) throw new Error('DISPATCH_MAX_ACTIVE_PER_RUNNER must be a positive integer');
-  const runners = Object.fromEntries((process.env.DISPATCH_RUNNERS ?? 'gpu=factory-gpu,console=factory-console').split(',').map(item => item.split('=')));
+  const runners = Object.fromEntries((env.DISPATCH_RUNNERS ?? 'gpu=factory-gpu,console=factory-console').split(',').map(item => item.split('=')));
   if (Object.keys(runners).length !== 2 || !['gpu', 'console'].every(name => /^[\w-]+$/.test(runners[name] ?? ''))) throw new Error('DISPATCH_RUNNERS must be gpu=<id>,console=<id>');
   const caps: Record<string, number> = { gpu: cap, console: cap };
-  if (process.env.DISPATCH_RUNNER_CAPS !== undefined) {
+  if (env.DISPATCH_RUNNER_CAPS !== undefined) {
     const seen = new Set<string>();
-    for (const item of process.env.DISPATCH_RUNNER_CAPS.split(',')) {
+    for (const item of env.DISPATCH_RUNNER_CAPS.split(',')) {
       const match = item.match(/^(gpu|console)=([0-9]+)$/);
       if (!match || match[0] !== item || seen.has(match[1]) || !Number.isSafeInteger(Number(match[2])) || Number(match[2]) < 1) {
         throw new Error('DISPATCH_RUNNER_CAPS must contain unique gpu=<positive integer> or console=<positive integer> entries separated by commas');
@@ -352,8 +353,23 @@ async function runPass(command: string, identifier: string | undefined, dryRun: 
     }
   }
   // Test-only endpoint override cannot send credentials to another remote host.
-  const endpoint = process.env.DISPATCH_LINEAR_URL ?? 'https://api.linear.app/graphql';
+  const endpoint = env.DISPATCH_LINEAR_URL ?? 'https://api.linear.app/graphql';
   if (endpoint !== 'https://api.linear.app/graphql' && !/^http:\/\/127\.0\.0\.1:\d+\/graphql$/.test(endpoint)) throw new Error('Test endpoint must be loopback /graphql');
+  return { team, caps, runners, endpoint };
+}
+
+/** Side-effect-free candidate check of the tree this module was loaded from: imports (repos,
+ * QA config, engines, lifecycle), environment config and the ledger schema in memory. No Linear
+ * key, lock, ledger file, Amp, Git, SSH or network. */
+export function check() {
+  const { caps, runners } = config();
+  const ledger = openLedger('/nonexistent/factory-dispatch/check.db', true);
+  ledger.get('cursor');
+  return { decision: 'self-check', tool: 'dispatch', root: realpathSync(fileURLToPath(new URL('../..', import.meta.url))), repos: repos.length, caps, runners };
+}
+
+async function runPass(command: string, identifier: string | undefined, dryRun: boolean, budget: Budget, ledger: Ledger) {
+  const { team, caps, runners, endpoint } = config();
   const key = readFileSync(process.env.LINEAR_API_KEY_FILE ?? '/etc/factory-dispatch/linear-api-key', 'utf8').trim();
   if (!key) throw new Error('Linear key file is empty');
   const redact = (text: string) => text.replaceAll(key, '[redacted]');
@@ -987,20 +1003,24 @@ async function runPass(command: string, identifier: string | undefined, dryRun: 
   });
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+// argv[1] is the `current` tools link path; import.meta.url is the version it resolves to.
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   let fd: number | undefined;
   try {
     const args = process.argv.slice(2);
-    const dryRun = args.includes('--dry-run');
-    const reconcileOnly = args.includes('--reconcile');
-    const positional = args.filter(arg => arg !== '--dry-run' && arg !== '--reconcile');
-    if (reconcileOnly ? positional.length !== 0 : !((positional.length === 1 && ['poll', 'import'].includes(positional[0])) || (positional.length === 2 && positional[0] === 'issue' && /^[A-Z][A-Z0-9]*-\d+$/.test(positional[1])))) throw new Error('Usage: dispatch.ts poll|import|issue MET-123 [--dry-run] | dispatch.ts --reconcile');
-    if (reconcileOnly) positional.push('reconcile');
-    // Existing, dedicated inode: even dry-run acquires the lock without writes.
-    fd = openSync(process.env.DISPATCH_LOCK_FILE ?? '/home/agent/work/factory/scripts/dispatch/dispatch.lock', 'r');
-    const lock = spawnSync('flock', ['--exclusive', '3'], { stdio: ['ignore', 'ignore', 'ignore', fd] });
-    if (lock.status !== 0) throw new Error('Could not acquire dispatch lock');
-    await run(positional[0], positional[1], dryRun);
+    if (args.length === 1 && args[0] === 'check') console.log(JSON.stringify(check()));
+    else {
+      const dryRun = args.includes('--dry-run');
+      const reconcileOnly = args.includes('--reconcile');
+      const positional = args.filter(arg => arg !== '--dry-run' && arg !== '--reconcile');
+      if (reconcileOnly ? positional.length !== 0 : !((positional.length === 1 && ['poll', 'import'].includes(positional[0])) || (positional.length === 2 && positional[0] === 'issue' && /^[A-Z][A-Z0-9]*-\d+$/.test(positional[1])))) throw new Error('Usage: dispatch.ts poll|import|issue MET-123 [--dry-run] | dispatch.ts --reconcile | dispatch.ts check');
+      if (reconcileOnly) positional.push('reconcile');
+      // Existing, dedicated inode: even dry-run acquires the lock without writes.
+      fd = openSync(process.env.DISPATCH_LOCK_FILE ?? '/home/agent/work/factory/scripts/dispatch/dispatch.lock', 'r');
+      const lock = spawnSync('flock', ['--exclusive', '3'], { stdio: ['ignore', 'ignore', 'ignore', fd] });
+      if (lock.status !== 0) throw new Error('Could not acquire dispatch lock');
+      await run(positional[0], positional[1], dryRun);
+    }
   } catch (error) {
     // Only our fixed diagnostics; do not echo system errors containing key paths or bodies.
     const message = (error as NodeJS.ErrnoException).code ? 'Dispatcher local configuration failed' : (error as Error).message;

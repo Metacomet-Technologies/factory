@@ -1,11 +1,11 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { ROOT, bootstrap, deployComponent, emptyLedger, issuesFromSubjects, main, parseSnapshot, pendingTags, plan, probeResult, receiptLine, recipes, reconcileManual, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { CHECK_TIMEOUT_MS, ROOT, toolChecks, bootstrap, deployComponent, emptyLedger, issuesFromSubjects, liveEffects, main, parseSnapshot, pendingTags, plan, probeResult, promoteTools, receiptLine, recipes, reconcileManual, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
 import { nextAction, parseDeployReceipt, type Action } from './lifecycle.ts';
 import plugin, { diagnose, page, setStatus } from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
@@ -167,10 +167,13 @@ function world(options: {
   };
   const effects: Effects = {
     stateDir,
+    toolsDir: join(stateDir, 'factory-tools'),
     log: () => {},
     sleep: async () => {},
     run: (command, args) => {
       const out = (stdout: string) => ({ stdout, stderr: '' });
+      // Tools self-checks pass here; the promotion fixtures run the real ones.
+      if (command === process.execPath) return out(JSON.stringify({ decision: 'self-check', root: realpathSync(args.at(-2)!.replace(/\/scripts\/.*$/, '')) }));
       if (command === 'gh' && args[0] === 'api') return out(JSON.stringify([options.tags.map(tag_name => ({ tag_name, draft: false, prerelease: false }))]));
       if (command === 'gh' && args[0] === 'pr') {
         if (failPrView) { failPrView = false; throw new Error(`gh pr view ${args[2]} exited 1\nHTTP 503: Service Unavailable`); }
@@ -601,9 +604,15 @@ test('API recovery does not excuse a usable unsafe kiosk identity or an unrelate
   }
 });
 
-test('install-only persistently disables an enabled-but-stopped timer; normal install and removal preserve ledger; a missing ledger is never initialized and blocks the default install', t => {
+/** install-deploy.sh on a relocated fake host: stub sudo/systemctl/git, real Node self-checks of a promoted tools tree. */
+function installerHost(t: { after: (fn: () => void) => void }) {
   const temp = mkdtempSync(join(tmpdir(), 'odd-units-'));
   t.after(() => rmSync(temp, { recursive: true, force: true }));
+  // The deployer-promoted runtime the units execute: a real tree, so the installer's self-checks run.
+  const toolsVersion = join(temp, 'home/agent/factory-tools/v9.9.9');
+  for (const path of ['scripts/odd', 'scripts/dispatch', 'scripts/usage', 'deploy/components.json']) cpSync(new URL(`../../${path}`, import.meta.url), join(toolsVersion, path), { recursive: true });
+  writeFileSync(join(toolsVersion, '.factory-tools.json'), `${JSON.stringify({ tag: 'v9.9.9', sha: 'f'.repeat(40) })}\n`);
+  symlinkSync('v9.9.9', join(temp, 'home/agent/factory-tools/current'));
   const root = join(temp, 'home/agent/work/factory');
   const bin = join(temp, 'bin');
   const units = join(temp, 'etc/systemd/system');
@@ -629,9 +638,9 @@ test('install-only persistently disables an enabled-but-stopped timer; normal in
   const shims = {
     hostname: 'echo factory-gpu',
     getent: `echo 'agent:x:1000:1000::${temp}/home/agent:/bin/bash'`,
-    node: 'echo v24.22.1',
+    node: `if [[ $1 == --version ]]; then echo v24.22.1; else exec ${process.execPath} "$@"; fi`,
     gh: '[[ $* == "auth status" ]]',
-    git: '[[ $* == *"fetch --quiet --tags origin" || $* == *"status --porcelain" ]]',
+    git: '[[ $* == *"fetch --quiet --tags origin" || $* == *"status --porcelain" ]] || { [[ $* == *"rev-parse HEAD" ]] && echo 1111111111111111111111111111111111111111; }',
     sudo: `if [[ $* == '-n -l' ]]; then
   printf '%s\\n' ${paths.filter(path => /deploy\/(install|rollback)-/.test(path)).map(path => `' /usr/bin/bash ${root}/${path} *'`).join(' ')}
   exit 0
@@ -640,6 +649,24 @@ while [[ $1 == -* ]]; do case $1 in -u|-iu) shift 2 ;; *) shift ;; esac; done
 exec "$@"`,
     install: 'args=(); while (($#)); do case $1 in -o|-g) shift 2 ;; *) args+=("$1"); shift ;; esac; done; exec /usr/bin/install "${args[@]}"',
     systemctl: `state='${temp}'
+echo "$*" >> "$state/systemctl.log"
+# Per-unit state for the tools cutover; the deploy-only tests use the files below.
+if [[ -n \${UNIT_STATE:-} ]]; then
+  case "$1" in
+    show) case "$*" in
+      *DropInPaths*) cat "$UNIT_STATE/$2.dropins" 2>/dev/null || true ;;
+      *ActiveState*) cat "$UNIT_STATE/$2.active" ;;
+      *) exit 98 ;;
+    esac ;;
+    is-enabled) cat "$UNIT_STATE/$2.enabled"; [[ $(cat "$UNIT_STATE/$2.enabled") == enabled ]] ;;
+    is-active) cat "$UNIT_STATE/$2.active"; [[ $(cat "$UNIT_STATE/$2.active") == active ]] ;;
+    stop) echo inactive > "$UNIT_STATE/$2.active" ;;
+    start) echo active > "$UNIT_STATE/$2.active" ;;
+    daemon-reload) ;;
+    *) exit 99 ;;
+  esac
+  exit
+fi
 case "$1" in
   show) case "$*" in
     *DropInPaths*) ;;
@@ -664,6 +691,11 @@ esac`,
   }
   const run = (script: string, args: string[] = [], env = {}) => spawnSync('bash', [join(root, 'deploy', script), ...args],
     { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:/usr/bin:/bin`, ...env } });
+  return { temp, root, units, ledgerPath, ledger, run };
+}
+
+test('install-only persistently disables an enabled-but-stopped timer; normal install and removal preserve ledger; a missing ledger is never initialized and blocks the default install', t => {
+  const { temp, units, ledgerPath, ledger, run } = installerHost(t);
   const installed = run('install-deploy.sh', ['--install-only']);
   assert.equal(installed.status, 0, installed.stdout + installed.stderr);
   const snapshot = /^Snapshot: (.+)$/m.exec(installed.stdout)![1];
@@ -675,6 +707,7 @@ esac`,
   assert.equal(readFileSync(ledgerPath, 'utf8'), ledger);
   const normal = run('install-deploy.sh');
   assert.equal(normal.status, 0, normal.stdout + normal.stderr);
+  assert.match(readFileSync(join(units, 'factory-deploy.service'), 'utf8'), new RegExp(`^ExecStart=.* ${temp}/home/agent/factory-tools/current/scripts/odd/deploy\\.ts$`, 'm'));
   assert.equal(existsSync(join(temp, 'service-started')), true);
   assert.equal(readFileSync(join(temp, 'enabled'), 'utf8'), 'enabled\n');
   assert.equal(readFileSync(join(temp, 'active'), 'utf8'), 'active\n');
@@ -717,6 +750,89 @@ esac`,
   assert.deepEqual(readdirSync(dirname(ledgerPath)), [], 'install-only never initializes the ledger');
 });
 
+test('tools cutover repoints only the three ExecStart paths to one tools link, preserving settings and trigger states; refusals change nothing; revert restores the snapshot', t => {
+  const { temp, units, ledgerPath, ledger, run } = installerHost(t);
+  const state = join(temp, 'unit-state');
+  mkdirSync(state);
+  const work = `${temp}/home/agent/work/factory/scripts/`;
+  const link = `${temp}/home/agent/factory-tools/current/scripts/`;
+  // Installed units as install-deploy/-dispatch/-usage rendered them before the cutover, plus a local setting.
+  const old: Record<string, string> = {};
+  for (const unit of ['factory-deploy.service', 'factory-dispatch.service', 'factory-usage.service']) {
+    old[unit] = readFileSync(new URL(`../../deploy/${unit}`, import.meta.url), 'utf8').replaceAll('/home/agent/', `${temp}/home/agent/`)
+      .replaceAll(link, work).replace('@NODE@', '/opt/node/bin/node').replace('@PATH@', '/opt/node/bin:/usr/bin:/bin')
+      .replace('[Service]\n', '[Service]\nEnvironment="DISPATCH_RUNNER_CAPS=gpu=3"\n');
+    writeFileSync(join(units, unit), old[unit]);
+  }
+  const triggers = { 'factory-deploy.timer': ['enabled', 'active'], 'factory-dispatch.timer': ['enabled', 'active'], 'factory-usage.timer': ['disabled', 'inactive'], 'factory-usage-refresh.path': ['enabled', 'active'] };
+  const setStates = () => {
+    for (const [unit, [enabled, active]] of Object.entries(triggers)) {
+      writeFileSync(join(units, unit), `[Unit]\nDescription=${unit}\n`);
+      writeFileSync(join(state, `${unit}.enabled`), `${enabled}\n`);
+      writeFileSync(join(state, `${unit}.active`), `${active}\n`);
+    }
+    for (const [unit, active] of [['factory-deploy.service', 'inactive'], ['factory-dispatch.service', 'failed'], ['factory-usage.service', 'inactive']]) {
+      writeFileSync(join(state, `${unit}.enabled`), 'static\n');
+      writeFileSync(join(state, `${unit}.active`), `${active}\n`);
+    }
+  };
+  setStates();
+  const env = { UNIT_STATE: state };
+  const unitFiles = () => Object.fromEntries(Object.keys(old).map(unit => [unit, readFileSync(join(units, unit), 'utf8')]));
+  const triggerStates = () => Object.fromEntries(Object.keys(triggers).map(unit => [unit, ['enabled', 'active'].map(kind => readFileSync(join(state, `${unit}.${kind}`), 'utf8').trim())]));
+  const unchanged = (result: ReturnType<typeof run>, error: RegExp) => {
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(result.stderr, error);
+    assert.deepEqual(unitFiles(), old);
+    assert.deepEqual(triggerStates(), triggers);
+  };
+  // A missing link or a tree failing its self-check refuses before any snapshot or unit change.
+  const current = join(temp, 'home/agent/factory-tools/current');
+  rmSync(current);
+  unchanged(run('install-deploy.sh', ['--tools-cutover'], env), /No tools runtime at .*nothing changed/);
+  mkdirSync(join(temp, 'home/agent/factory-tools/v9.9.8/scripts/odd'), { recursive: true });
+  writeFileSync(join(temp, 'home/agent/factory-tools/v9.9.8/scripts/odd/deploy.ts'), "console.log('no self-check here');\n");
+  symlinkSync('v9.9.8', current);
+  unchanged(run('install-deploy.sh', ['--tools-cutover'], env), /Tools self-check failed in .*v9\.9\.8: scripts\/odd\/deploy\.ts --self-check/);
+  rmSync(current);
+  symlinkSync('v9.9.9', current);
+  assert.equal(existsSync(join(temp, 'var/backups/factory-deploy')), false, 'no snapshot before a refusal');
+  // A running service: the snapshot is taken, the stopped triggers are restarted, no unit is replaced.
+  writeFileSync(join(state, 'factory-dispatch.service.active'), 'activating\n');
+  unchanged(run('install-deploy.sh', ['--tools-cutover'], env), /Wait for factory-dispatch\.service to finish/);
+  writeFileSync(join(state, 'factory-dispatch.service.active'), 'failed\n');
+  rmSync(join(temp, 'systemctl.log'), { force: true });
+  const cutover = run('install-deploy.sh', ['--tools-cutover'], env);
+  assert.equal(cutover.status, 0, cutover.stdout + cutover.stderr);
+  assert.match(cutover.stdout, new RegExp(`^Tools: ${temp}/home/agent/factory-tools/v9\\.9\\.9 \\{"tag":"v9\\.9\\.9","sha":"f{40}"\\}$`, 'm'));
+  assert.match(cutover.stdout, new RegExp(`^Installer: ${temp}/home/agent/work/factory 1{40}$`, 'm'));
+  const after = unitFiles();
+  for (const unit of Object.keys(old)) {
+    // Byte-for-byte the old unit with only the script path moved: node, PATH, settings, lock and limits stay.
+    assert.equal(after[unit], old[unit].replace(work, link), unit);
+    assert.equal(after[unit].split('\n').filter(text => text.startsWith('ExecStart=')).length, 1);
+  }
+  assert.deepEqual(Object.values(after).map(text => /^ExecStart=.* (\S+)scripts\//m.exec(text)![1]), Array(3).fill(`${temp}/home/agent/factory-tools/current/`));
+  assert.match(after['factory-deploy.service'], new RegExp(`ExecStart=/usr/bin/flock -n ${temp}/home/agent/\\.local/state/factory-odd/deploy\\.lock /opt/node/bin/node ${link}odd/deploy\\.ts$`, 'm'));
+  assert.deepEqual(triggerStates(), triggers);
+  assert.doesNotMatch(readFileSync(join(temp, 'systemctl.log'), 'utf8'), /^(enable|disable)/m, 'enablement is never changed');
+  assert.equal(readFileSync(ledgerPath, 'utf8'), ledger);
+  const snapshot = /^Snapshot: (.+)$/m.exec(cutover.stdout)![1];
+  for (const unit of Object.keys(old)) assert.equal(readFileSync(join(snapshot, unit), 'utf8'), old[unit]);
+  // A second cutover refuses: the units no longer execute the installer checkout.
+  const again = run('install-deploy.sh', ['--tools-cutover'], env);
+  assert.equal(again.status, 1);
+  assert.match(again.stderr, /does not execute .*work\/factory\/scripts\/odd\/deploy\.ts/);
+  assert.deepEqual(unitFiles(), after);
+  const reverted = run('install-deploy.sh', ['--revert-tools-cutover', snapshot], env);
+  assert.equal(reverted.status, 0, reverted.stdout + reverted.stderr);
+  assert.deepEqual(unitFiles(), old);
+  assert.deepEqual(triggerStates(), triggers);
+  assert.equal(readFileSync(ledgerPath, 'utf8'), ledger);
+  // The repository templates the installers render all execute the same link.
+  for (const unit of Object.keys(old)) assert.match(readFileSync(new URL(`../../deploy/${unit}`, import.meta.url), 'utf8'), /^ExecStart=.*@NODE@ \/home\/agent\/factory-tools\/current\/scripts\/(odd\/deploy|dispatch\/dispatch|usage\/collect)\.ts( poll)?$/m);
+});
+
 test('real Git: releases predating the deployer cannot remove its runtime or tools, including the tick after a failed install', async t => {
   const temp = mkdtempSync(join(tmpdir(), 'odd-history-'));
   t.after(() => rmSync(temp, { recursive: true, force: true }));
@@ -755,9 +871,14 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
   const live = new Map<string, string>();
   const verified: string[] = [];
   const comments: [string, string][] = [];
+  // The runtime the timer executes before these releases; none of them may replace it.
+  const toolsDir = join(temp, 'factory-tools');
+  mkdirSync(join(toolsDir, 'v0.2.8'), { recursive: true });
+  symlinkSync('v0.2.8', join(toolsDir, 'current'));
   const effects: Effects = {
-    stateDir, log: () => {}, sleep: async () => {},
+    stateDir, toolsDir, log: () => {}, sleep: async () => {},
     run: (command, args, options) => {
+      if (command === process.execPath || (command === 'tar' && args[1] === '-xf')) return run(command, args, options);
       if (command === 'git') {
         if (args[2] === 'fetch') return { stdout: '', stderr: '' }; // No network in this fixture.
         return run(command, args.map(arg => arg === ROOT ? runtime : arg), options);
@@ -817,7 +938,11 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
   assert.equal(git('status', '--porcelain'), '');
   // A fresh Node process must still load the timer entry point after the failed tick.
   run(process.execPath, ['--input-type=module', '-e', `await import(${JSON.stringify(entry)})`]);
-  await (await import(`${entry}?next-tick`)).main(effects);
+  // v0.2.11 predates the self-checks: it deploys, but its tools are rejected and the running link stays.
+  await assert.rejects((await import(`${entry}?next-tick`)).main(effects), /Tools v0\.2\.11 rejected; \S+ restored to v0\.2\.8: scripts\/odd\/deploy\.ts --self-check failed in \S+\/v0\.2\.11: /);
+  assert.equal(readlinkSync(join(toolsDir, 'current')), 'v0.2.8');
+  assert.equal(ledger.tools?.current, undefined);
+  assert.deepEqual({ ...ledger.tools?.rejected, reason: undefined }, { tag: 'v0.2.11', sha: second, installerSha: toolsSha, reason: undefined });
   assert.equal(ledger.lastTag, 'v0.2.11');
   assert.deepEqual([...live.values()], [second, second, second]);
   assert.deepEqual(verified, ['v0.2.10', 'v0.2.11']);
@@ -835,6 +960,233 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
     assert.equal(readFileSync(join(checkout, 'operator-note'), 'utf8'), 'preserve me');
     rmSync(join(checkout, 'operator-note'));
   }
+});
+
+// Preloaded before a tool: every network, subprocess, lock, key, file-write or database-file call is reported on stderr and fails.
+const guard = `data:text/javascript,${encodeURIComponent(`
+import fs from 'node:fs';
+import net from 'node:net';
+import childProcess from 'node:child_process';
+import sqlite from 'node:sqlite';
+import { syncBuiltinESMExports } from 'node:module';
+const block = (name, detail = '') => { process.stderr.write('GUARD ' + name + ' ' + detail + '\\n'); throw new Error('blocked ' + name); };
+globalThis.fetch = url => block('fetch', String(url));
+net.Socket.prototype.connect = () => block('connect');
+for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) childProcess[name] = command => block(name, command);
+// Reads stay open (module loading uses openSync); locks, keys and every writable open are blocked.
+const openSync = fs.openSync;
+fs.openSync = (path, flags = 'r', ...rest) => flags !== 'r' || /\\.lock$|linear(-api)?-key/.test(String(path)) ? block('openSync', path) : openSync(path, flags, ...rest);
+for (const name of ['writeFileSync', 'appendFileSync', 'mkdirSync', 'renameSync', 'rmSync', 'unlinkSync', 'chmodSync', 'linkSync', 'symlinkSync', 'mkdtempSync', 'cpSync']) fs[name] = path => block(name, path);
+for (const name of ['open', 'writeFile', 'appendFile', 'mkdir', 'rename', 'rm', 'unlink', 'chmod']) fs.promises[name] = async path => block(name, path);
+const Database = sqlite.DatabaseSync;
+sqlite.DatabaseSync = class extends Database { constructor(path, options) { if (path !== ':memory:') block('DatabaseSync', path); super(path, options); } };
+syncBuiltinESMExports();
+`)}`;
+
+test('self-checks through a tools link: real imports and config, no network, subprocess, lock, ledger, key or file write; the guard catches a real poll', t => {
+  const temp = mkdtempSync(join(tmpdir(), 'odd-checks-'));
+  t.after(() => rmSync(temp, { recursive: true, force: true }));
+  const repo = realpathSync(fileURLToPath(new URL('../..', import.meta.url)));
+  symlinkSync(repo, join(temp, 'current'));
+  mkdirSync(join(temp, 'home'));
+  const env = { PATH: join(temp, 'no-commands'), HOME: join(temp, 'home'), DISPATCH_LEDGER: join(temp, 'state/dispatch.db'),
+    DISPATCH_LOCK_FILE: join(temp, 'dispatch.lock'), LINEAR_API_KEY_FILE: join(temp, 'linear-key'), FACTORY_USAGE_SNAPSHOT: join(temp, 'usage.json') };
+  const run = (script: string, args: string[], extra = {}) => spawnSync(process.execPath, ['--import', guard, join(temp, 'current', script), ...args], { encoding: 'utf8', env: { ...env, ...extra } });
+  for (const [script, arg] of toolChecks) {
+    const result = run(script, [arg]);
+    assert.equal(result.status, 0, `${script}: ${result.stdout}${result.stderr}`);
+    assert.equal(result.stderr, '', `${script} made no guarded call`);
+    const report = JSON.parse(result.stdout.trim());
+    assert.equal(report.decision, 'self-check');
+    assert.equal(report.root, repo, `${script} resolved the link to its tree`);
+  }
+  assert.deepEqual(readdirSync(temp).sort(), ['current', 'home']);
+  assert.deepEqual(readdirSync(join(temp, 'home')), []);
+  // Config is parsed for real: an invalid runner list fails the dispatcher's check.
+  const invalid = run('scripts/dispatch/dispatch.ts', ['check'], { DISPATCH_RUNNERS: 'gpu=factory-gpu' });
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stdout, /DISPATCH_RUNNERS must be gpu=<id>,console=<id>/);
+  // Control: the same guard reports the dispatcher's lock and the collector's lock on a real run.
+  const poll = run('scripts/dispatch/dispatch.ts', ['poll']);
+  assert.equal(poll.status, 1);
+  assert.match(poll.stderr, new RegExp(`^GUARD openSync ${join(temp, 'dispatch.lock')}$`, 'm'));
+  const collect = run('scripts/usage/collect.ts', ['--dry-run']);
+  assert.equal(collect.status, 1);
+  assert.match(collect.stderr, /^GUARD openSync \/home\/agent\/work\/factory\/scripts\/usage\/collect\.lock$/m);
+});
+
+test('tools promotion: a good release once and forward only; missing, failed, timed-out or unactivatable checks and crashes keep the prior link, installer root and no false success', t => {
+  const temp = mkdtempSync(join(tmpdir(), 'odd-tools-'));
+  t.after(() => rmSync(temp, { recursive: true, force: true }));
+  const runtime = join(temp, 'factory');
+  const stateDir = join(temp, 'state');
+  const toolsDir = join(temp, 'factory-tools');
+  const link = join(toolsDir, 'current');
+  const live = liveEffects().run;
+  const git = (...args: string[]) => live('git', ['-C', runtime, ...args]).stdout.trim();
+  mkdirSync(join(runtime, 'deploy'), { recursive: true });
+  for (const path of ['scripts/odd', 'scripts/dispatch', 'scripts/usage', 'deploy/components.json']) cpSync(new URL(`../../${path}`, import.meta.url), join(runtime, path), { recursive: true });
+  writeFileSync(join(runtime, 'deploy/install-meter.sh'), '# installer\n');
+  git('init', '-q');
+  git('config', 'user.name', 'Fixture');
+  git('config', 'user.email', 'fixture@example.invalid');
+  const edit = (path: string, from: string, to: string) => {
+    const text = readFileSync(join(runtime, path), 'utf8');
+    assert.ok(text.includes(from), `${path} lacks ${from}`);
+    writeFileSync(join(runtime, path), text.replace(from, to));
+  };
+  const shas: Record<string, string> = {};
+  const release = (tag: string, change: () => void) => { change(); git('add', '-A'); git('commit', '-qm', tag); shas[tag] = git('rev-parse', 'HEAD'); };
+  const good = () => writeFileSync(join(runtime, 'release.txt'), `${Object.keys(shas).length}\n`);
+  release('v1.0.0', good);
+  release('v1.1.0', good);
+  release('v1.2.0', () => writeFileSync(join(runtime, 'scripts/dispatch/repos.json'), '{"broken'));
+  release('v1.3.0', () => { git('checkout', '-q', shas['v1.1.0'], '--', '.'); edit('scripts/usage/collect.ts', 'export async function selfCheck() {', 'export async function selfCheck() {\n  await new Promise(() => setInterval(() => {}, 1000));'); });
+  // Before this change: the collector has no self-check, and the deployer's main guard compares the link path.
+  release('v1.4.0', () => { git('checkout', '-q', shas['v1.1.0'], '--', '.'); edit('scripts/usage/collect.ts', "['--dry-run', '--self-check']", "['--dry-run']"); });
+  release('v1.5.0', () => { git('checkout', '-q', shas['v1.1.0'], '--', '.'); edit('scripts/odd/deploy.ts', 'fileURLToPath(import.meta.url) === realpathSync(process.argv[1])', 'fileURLToPath(import.meta.url) === process.argv[1]'); });
+  release('v1.6.0', () => { git('checkout', '-q', shas['v1.1.0'], '--', '.'); good(); });
+  release('v1.7.0', good);
+  release('v1.8.0', good);
+  // The approved installer revision ROOT stays at: newer than every release, with its own installer change.
+  writeFileSync(join(runtime, 'deploy/install-meter.sh'), '# reviewed installer change\n');
+  git('add', '-A');
+  git('commit', '-qm', 'installer revision');
+  const installerSha = git('rev-parse', 'HEAD');
+  let ledger: Ledger = { lastTag: 'v1.8.0', components: {} };
+  const logs: [string, Record<string, unknown>][] = [];
+  const checks: { path: string; report?: Record<string, unknown> }[] = [];
+  let crash: ((next: Ledger) => boolean) | undefined;
+  let failArchive = false;
+  const forbidden = () => { throw new Error('promotion must not use sudo, probes or Linear'); };
+  const effects: Effects = {
+    stateDir, toolsDir, log: (decision, details = {}) => logs.push([decision, details as Record<string, unknown>]), sleep: async () => {},
+    run: (command, args, options) => {
+      if (command === process.execPath) {
+        assert.equal(options?.timeout, CHECK_TIMEOUT_MS);
+        assert.deepEqual(args.slice(0, 2), ['--permission', '--allow-fs-read=*'], 'candidate checks cannot write or spawn');
+        checks.push({ path: args[2] });
+        // The real check, with a shorter bound so the hanging candidate costs seconds.
+        const result = live(command, args, { ...options, timeout: 10_000 });
+        try { checks.at(-1)!.report = JSON.parse(result.stdout.trim().split('\n').at(-1)!); } catch { /* Reported by promoteTools. */ }
+        return result;
+      }
+      if (command === 'git' && args[2] === 'archive' && failArchive) { failArchive = false; throw new Error('git archive: interrupted'); }
+      return live(command, args.map(arg => arg === ROOT ? runtime : arg), options);
+    },
+    ok: forbidden, sudo: forbidden, probe: forbidden,
+    readLedger: () => structuredClone(ledger),
+    writeLedger: next => {
+      if (crash?.(next)) { crash = undefined; throw new Error('killed before the ledger write'); }
+      ledger = structuredClone(next);
+    },
+    linear: { deploying: forbidden, posted: forbidden, comment: forbidden },
+  };
+  const verify = (tag: string, sha = shas[tag]) => { mkdirSync(join(stateDir, 'releases', tag), { recursive: true }); writeFileSync(join(stateDir, 'releases', tag, '.verified'), `${sha}\n`); };
+  const decisions = () => logs.map(([decision]) => decision);
+  const record = (tag: string) => ({ tag, sha: shas[tag], installerSha });
+  const linkTarget = () => readlinkSync(link);
+  const versions = () => readdirSync(toolsDir).filter(name => name !== 'current').sort();
+
+  // A release this job never verified is not staged.
+  promoteTools(effects, 'v1.0.0');
+  assert.deepEqual(decisions(), ['tools-waiting']);
+  assert.equal(existsSync(toolsDir), false);
+  for (const tag of Object.keys(shas)) verify(tag);
+
+  // Good: candidate then activation checks, one atomic link, the installer path and SHA recorded beside it.
+  logs.length = 0;
+  promoteTools(effects, 'v1.0.0');
+  const v1 = realpathSync(join(toolsDir, 'v1.0.0'));
+  assert.equal(linkTarget(), 'v1.0.0');
+  assert.deepEqual(ledger.tools, { current: record('v1.0.0'), rejected: undefined });
+  assert.deepEqual(checks.map(check => check.path.replace(toolsDir, '')), [
+    '/v1.0.0/scripts/odd/deploy.ts', '/v1.0.0/scripts/dispatch/dispatch.ts', '/v1.0.0/scripts/usage/collect.ts',
+    '/current/scripts/odd/deploy.ts', '/current/scripts/dispatch/dispatch.ts', '/current/scripts/usage/collect.ts']);
+  assert.deepEqual(checks.map(check => check.report?.root), Array(6).fill(v1), 'every check ran in the resolved version, including through the link');
+  assert.deepEqual(checks.map(check => check.report?.tool), ['deploy', 'dispatch', 'usage', 'deploy', 'dispatch', 'usage']);
+  assert.equal(checks[3].report?.installerRoot, '/home/agent/work/factory');
+  const promoted = logs.find(([decision]) => decision === 'tools-promoted')![1];
+  assert.deepEqual(promoted, { ...record('v1.0.0'), link, root: v1, installerRoot: '/home/agent/work/factory', installerChanges: ['deploy/install-meter.sh'] });
+  assert.deepEqual(JSON.parse(readFileSync(join(v1, '.factory-tools.json'), 'utf8')), { tag: 'v1.0.0', sha: shas['v1.0.0'] });
+  assert.equal(existsSync(join(v1, '.git')), false, 'a release tree, not a checkout that can be moved');
+  // Once: the same tag again stages and checks nothing.
+  checks.length = 0;
+  logs.length = 0;
+  promoteTools(effects, 'v1.0.0');
+  assert.deepEqual([checks.length, logs.length], [0, 0]);
+
+  promoteTools(effects, 'v1.1.0');
+  assert.equal(linkTarget(), 'v1.1.0');
+  assert.deepEqual(ledger.tools?.current, record('v1.1.0'));
+  // Never backwards, and the prior version stays intact for running processes.
+  checks.length = 0;
+  promoteTools(effects, 'v1.0.0');
+  assert.equal(checks.length, 0);
+  assert.equal(linkTarget(), 'v1.1.0');
+  assert.deepEqual(JSON.parse(readFileSync(join(v1, '.factory-tools.json'), 'utf8')), { tag: 'v1.0.0', sha: shas['v1.0.0'] });
+
+  // Failed, timed-out, missing and unactivatable checks: the prior link, no success, the tag not retried.
+  const rejected: [string, RegExp][] = [
+    ['v1.2.0', /scripts\/dispatch\/dispatch\.ts check failed in \S+\/v1\.2\.0: /],
+    ['v1.3.0', /scripts\/usage\/collect\.ts --self-check failed in \S+\/v1\.3\.0: spawnSync \S+ ETIMEDOUT/],
+    ['v1.4.0', /scripts\/usage\/collect\.ts --self-check failed in \S+\/v1\.4\.0: /],
+    // Its candidate checks pass by path; through the link its old main guard runs nothing.
+    ['v1.5.0', /scripts\/odd\/deploy\.ts --self-check did not report a self-check of \S+\/v1\.5\.0$/],
+  ];
+  for (const [tag, reason] of rejected) {
+    logs.length = 0;
+    checks.length = 0;
+    assert.throws(() => promoteTools(effects, tag), new RegExp(`^Error: Tools ${tag.replaceAll('.', '\\.')} rejected; ${link} restored to v1\\.1\\.0: ${reason.source}`));
+    assert.equal(linkTarget(), 'v1.1.0', tag);
+    assert.deepEqual(ledger.tools?.current, record('v1.1.0'), tag);
+    assert.equal(ledger.tools?.pending, undefined, tag);
+    assert.deepEqual({ ...ledger.tools?.rejected, reason: undefined }, { ...record(tag), reason: undefined });
+    assert.match(ledger.tools!.rejected!.reason, reason);
+    assert.ok(!decisions().includes('tools-promoted'), tag);
+    if (tag === 'v1.5.0') assert.deepEqual(checks.map(check => check.report?.root ?? null), [...Array(3).fill(realpathSync(join(toolsDir, tag))), null]);
+    checks.length = 0;
+    promoteTools(effects, tag);
+    assert.equal(checks.length, 0, `${tag} is not retried`);
+  }
+
+  // Killed after the link moved but before delivery: still pending, never recorded as current;
+  // the next tick resumes, rechecks and delivers.
+  crash = next => next.tools?.current?.tag === 'v1.6.0';
+  logs.length = 0;
+  assert.throws(() => promoteTools(effects, 'v1.6.0'), /killed before the ledger write/);
+  assert.equal(linkTarget(), 'v1.6.0');
+  assert.deepEqual(ledger.tools?.pending, { ...record('v1.6.0'), previous: 'v1.1.0' });
+  assert.deepEqual(ledger.tools?.current, record('v1.1.0'));
+  assert.ok(!decisions().includes('tools-promoted'));
+  logs.length = 0;
+  promoteTools(effects, 'v1.8.0');
+  assert.deepEqual(decisions(), ['tools-resume', 'tools-promoted']);
+  assert.deepEqual(ledger.tools?.current, record('v1.6.0'));
+  assert.equal(ledger.tools?.pending, undefined);
+
+  // Interrupted staging: pending kept, link and versions untouched, no partial tree; the retry completes.
+  failArchive = true;
+  assert.throws(() => promoteTools(effects, 'v1.7.0'), /git archive: interrupted/);
+  assert.deepEqual(ledger.tools?.pending, { ...record('v1.7.0'), previous: 'v1.6.0' });
+  assert.equal(linkTarget(), 'v1.6.0');
+  assert.deepEqual(versions(), ['v1.0.0', 'v1.1.0', 'v1.2.0', 'v1.3.0', 'v1.4.0', 'v1.5.0', 'v1.6.0']);
+  promoteTools(effects, 'v1.7.0');
+  assert.equal(linkTarget(), 'v1.7.0');
+  assert.deepEqual(ledger.tools?.current, record('v1.7.0'));
+
+  // An existing version is never replaced, even when its recorded commit differs.
+  mkdirSync(join(toolsDir, 'v1.8.0'));
+  writeFileSync(join(toolsDir, 'v1.8.0/.factory-tools.json'), JSON.stringify({ tag: 'v1.8.0', sha: shas['v1.0.0'] }));
+  assert.throws(() => promoteTools(effects, 'v1.8.0'), /refusing to replace a tools version/);
+  assert.deepEqual(JSON.parse(readFileSync(join(toolsDir, 'v1.8.0/.factory-tools.json'), 'utf8')).sha, shas['v1.0.0']);
+  assert.equal(linkTarget(), 'v1.7.0');
+  assert.deepEqual(ledger.tools?.current, record('v1.7.0'));
+  assert.equal(ledger.tools?.pending?.tag, 'v1.8.0');
+  // The installer checkout never moved; no staging directory or link temporary is left behind.
+  assert.equal(git('rev-parse', 'HEAD'), installerSha);
+  assert.equal(git('status', '--porcelain'), '');
+  assert.deepEqual(readdirSync(toolsDir).filter(name => name.startsWith('.') || name.includes('.next-')), []);
 });
 
 test('sandbox: a kiosk release installs, three green probes report its SHA, Deploying issues get a pass receipt and move to Done', async t => {

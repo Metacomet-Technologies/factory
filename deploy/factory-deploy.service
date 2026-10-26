@@ -12,7 +12,7 @@ WorkingDirectory=/home/agent/work
 Environment=HOME=/home/agent
 Environment="PATH=@PATH@"
 ExecStartPre=/usr/bin/mkdir -p /home/agent/.local/state/factory-odd
-ExecStart=/usr/bin/flock -n /home/agent/.local/state/factory-odd/deploy.lock @NODE@ /home/agent/work/factory/scripts/odd/deploy.ts
+ExecStart=/usr/bin/flock -n /home/agent/.local/state/factory-odd/deploy.lock @NODE@ /home/agent/factory-tools/current/scripts/odd/deploy.ts
 # sudo through the allowlist needs new privileges.
 NoNewPrivileges=false
 Nice=10

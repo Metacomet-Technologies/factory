@@ -10,7 +10,7 @@ SupplementaryGroups=factory-api
 WorkingDirectory=/home/agent/work
 Environment=HOME=/home/agent
 Environment="PATH=@PATH@"
-ExecStart=@NODE@ /home/agent/work/factory/scripts/usage/collect.ts
+ExecStart=@NODE@ /home/agent/factory-tools/current/scripts/usage/collect.ts
 NoNewPrivileges=true
 TimeoutStartSec=5min
 UMask=0027
