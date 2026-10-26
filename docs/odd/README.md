@@ -482,7 +482,46 @@ by the previous one).
    a cancellation before archiving the thread (a failed comment keeps the
    thread, so the round is not lost) and a blind episode ends only when a
    whole sweep, digest and heartbeat included, succeeds; a rejected labels
-   read fails one sweep and never blocks the next (MET-342); the digest is
+   read fails one sweep and never blocks the next (MET-342). Authoritative
+   reads fail closed (MET-344): an MCP `isError` envelope, a missing payload
+   or a malformed issue, comment, thread or PR collection or record (an
+   issue row or issue without a non-blank identifier, status or labels, a
+   comment that is not a record with a string body, a PR row without its
+   ownership fields, a merged PR without its merge commit or a usable merge
+   time, a CI check without the fields the lifecycle reads, a thread without
+   its labels or agent state, a requested blocker list that is absent, a
+   heartbeat or follow-up Bug row without its id, a next page without a
+   cursor) is a failed read, never an empty one, an unblocked or Backlog
+   issue, an idle thread or a missing row; empty lists, empty bodies, null
+   pending conclusions and unrequested relations stay valid; a
+   nonzero `gh` exit throws instead of meaning "no PR", so the Ralph guard,
+   stale-thread cancellation and evaluation neither continue, cancel, archive
+   nor claim a missing PR off it. Open PRs are listed with flat ownership
+   fields only (`number,headRefName,body`, limit 1000; a list that fills the
+   limit fails), because nested `commits` on a 100-PR page exceeds GitHub's
+   500,000-node bound. Only the owning PR is read in full with `gh pr view`,
+   and its head time comes from the head commit itself (`gh api
+   repos/{owner}/{repo}/commits/<sha>`), since gh reads only a PR's first 100
+   commits; an unreadable head time fails the read. Every such read throws a
+   `ReadError`, and an evaluation that fails on one is a failed derivation
+   wherever it happens, also after its action was chosen (a follow-up Bug
+   lookup, the digest, the merge confirmation). Any failed derivation
+   withholds the sweep's heartbeat, even when other issues evaluate, while a
+   failed action (a refused merge, a spawn) stays an incident. A merge whose
+   merge-commit read fails posts no `merge=unknown` receipt: the next
+   evaluation finds the PR merged and posts the receipt once, from the
+   validated merge commit, before the issue moves to Deploying. That
+   recovery runs only for issues ODD owns, and never over the effective
+   deploy receipt (the latest one, the receipt the lifecycle acts on) when
+   its deployed revision contains the merge commit (GitHub's compare reports
+   it identical or ahead; that deployment is the release's evidence).
+   Otherwise the effective receipt is stale, an old release delivered late
+   included, even if an earlier receipt was valid, and the recovered receipt
+   retires it; an unreadable compare is a failed read. A rejected shell read,
+   a draft read that is not `true` or `false`, and a failed log-reader
+   lookup during a failed-rollback page are failed reads too; the page still
+   goes out, and a page write that then fails keeps the read failure; an empty issue enumeration while live
+   role threads hold open issues fails the sweep too; the digest is
    split into Slack messages of at most 2800 characters. Removing the
    `odd-perform` label is the off-switch: the plane keeps evaluating but
    records `dry-run`.

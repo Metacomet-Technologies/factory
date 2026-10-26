@@ -4,8 +4,9 @@ import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, inc
 import { heartbeatLine, parseHeartbeat } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
 import { receiptLabel, type LiveThread } from './snapshot.ts';
-import plugin from '../../.amp/plugins/factory-odd.ts';
+import plugin, { followUp } from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
+import { io } from './launch.ts';
 
 const now = new Date('2026-10-24T15:16:00Z');
 const idleFor = (minutes: number, over: Partial<LiveThread> = {}): LiveThread =>
@@ -141,7 +142,8 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
     const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
     let status: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> } | undefined;
     const amp = {
-      $: fakeShell().$,
+      // `override('$', { command })` may answer a shell command with its stdout.
+      $: fakeShell(command => override('$', { command }) as string | undefined).$,
       createAgent: () => ({ definition: {} }), registerAgentMode: () => {}, registerTool: (tool: typeof status) => { status = tool; },
       on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
       createWebhook: async (options: Record<string, unknown>) => (await override('createWebhook', options)) ?? { url: 'https://hooks.example/x' },
@@ -380,7 +382,45 @@ test('P3.1: one shared blocker is one incident; it is plane-blocked only when ev
   assert.equal(incidentPageDue({ ...incident, due: true, delivered: 'action-failed' }), true, 'an action-failed page is raised to plane-blocked once');
 });
 
-type Pr = { number: number; headRefName: string; headRefOid: string; state: 'OPEN' | 'MERGED'; mergeCommit: null; mergeable: string; commits: { oid: string; committedDate: string }[]; statusCheckRollup: { name: string; conclusion: string }[]; body: string };
+type Pr = { number: number; headRefName: string; headRefOid: string; state: 'OPEN' | 'MERGED'; mergeCommit: { oid: string } | null; mergedAt?: string; mergeable: string; commits: { oid: string; committedDate: string }[]; statusCheckRollup: Record<string, unknown>[]; body: string };
+type Shell = { exitCode: number; stdout: string; stderr: string };
+
+/**
+ * GitHub behind `gh pr list` and `gh pr view <n> --json`: rows carry only the requested fields,
+ * newest first, cut at `--limit`. gh reads at most 100 PRs per GraphQL page and `commits` asks
+ * for 100 commits × 100 authors per PR, so a page over GitHub's 500,000-node bound is refused
+ * with GitHub's own error (the full-field `--limit 100` list asked for 1,000,000). Other
+ * commands are left to the caller.
+ */
+function github(command: string, prs: readonly Pr[], releases: ReadonlyMap<string, readonly string[]> = new Map()): Shell | undefined {
+  // `gh api repos/{owner}/{repo}/compare/<base>...<head>`: `ahead` when the head release contains the base.
+  const compare = /^gh api repos\/\{owner\}\/\{repo\}\/compare\/([0-9a-f]{7,40})\.\.\.([0-9a-f]{7,40}) --jq \.status$/.exec(command);
+  if (compare) return { exitCode: 0, stdout: `${compare[1] === compare[2] ? 'identical' : releases.get(compare[2])?.includes(compare[1]) ? 'ahead' : 'diverged'}\n`, stderr: '' };
+  // `gh api repos/{owner}/{repo}/commits/<sha>`: one commit, from any PR's full history.
+  const commit = /^gh api repos\/\{owner\}\/\{repo\}\/commits\/([0-9a-f]{40}) --jq \.commit\.committer\.date$/.exec(command);
+  if (commit) {
+    const found = prs.flatMap(pr => pr.commits).find(candidate => candidate.oid === commit[1]);
+    return found ? { exitCode: 0, stdout: `${found.committedDate}\n`, stderr: '' } : { exitCode: 1, stdout: '', stderr: 'gh: No commit found for SHA (HTTP 422)' };
+  }
+  // `gh pr view <n> --json isDraft --jq .isDraft`: the fixture's PRs are ready for review.
+  const draft = /^gh pr view (\d+) --json isDraft --jq \.isDraft$/.exec(command);
+  if (draft) return prs.some(pr => pr.number === Number(draft[1])) ? { exitCode: 0, stdout: 'false\n', stderr: '' } : { exitCode: 1, stdout: '', stderr: `GraphQL: Could not resolve to a PullRequest with the number of ${draft[1]}.` };
+  const view = /^gh pr view (\d+) --json ([\w,]+)$/.exec(command);
+  const list = /^gh pr list (?:--search "([^"]+)" )?--state (open|merged) --json ([\w,]+) --limit (\d+)$/.exec(command);
+  if (!view && !list) return undefined;
+  const fields = (view ? view[2] : list![3]).split(',');
+  const nodes = (view ? 1 : Math.min(Number(list![4]), 100)) * (fields.includes('commits') ? 100 * 100 : 1);
+  if (nodes > 500_000) return { exitCode: 1, stdout: '', stderr: `GraphQL: By the time this query traverses to the authors connection, it is requesting up to ${nodes.toLocaleString('en-US')} possible nodes which exceeds the maximum limit of 500,000.` };
+  // gh requests `commits(first: 100)` and does not paginate it.
+  const row = (pr: Pr) => Object.fromEntries(fields.map(field => [field, field === 'commits' ? pr.commits.slice(0, 100) : pr[field as keyof Pr]]));
+  if (view) {
+    const pr = prs.find(candidate => candidate.number === Number(view[1]));
+    return pr ? { exitCode: 0, stdout: JSON.stringify(row(pr)), stderr: '' } : { exitCode: 1, stdout: '', stderr: `GraphQL: Could not resolve to a PullRequest with the number of ${view[1]}.` };
+  }
+  const [, search, state, , limit] = list!;
+  const matches = prs.filter(pr => pr.state === state.toUpperCase() && (!search || `${pr.headRefName} ${pr.body}`.toLowerCase().includes(search.toLowerCase())));
+  return { exitCode: 0, stdout: JSON.stringify(matches.slice(0, Number(limit)).map(row)), stderr: '' };
+}
 const fullSpec = '## Goal\nx\n\n## Isolation\nx\n\n## Build\n- x\n\n## Done means\n- x\n\n## Evidence\n- x\n';
 const head = (n: number) => String(n).repeat(40).slice(0, 40).replace(/[^0-9a-f]/g, 'a');
 
@@ -393,14 +433,24 @@ function factory() {
   const issues = new Map<string, { id: string; status: string; labels: string[]; description: string }>();
   const comments = new Map<string, { id: string; body: string; createdAt: string }[]>();
   const prs: Pr[] = [];
+  /** Deployed revision → the merge commits it contains, for GitHub's compare. */
+  const releases = new Map<string, string[]>();
   const threads = new Map<string, { labels: string[]; state: string; archived: boolean; updatedAt: string }>();
   const dms: string[] = [];
   const steers: string[] = [];
-  const control = { slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '' };
+  const control = { slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '', gh: undefined as ((command: string) => Shell | undefined) | undefined, inject: undefined as ((name: string, input: Record<string, unknown>) => unknown) | undefined };
+  /** Lifecycle mutations: status writes, builder launches and heartbeats (comments, archives, steers and DMs are kept above). */
+  const saves: string[] = [];
+  const launches: string[] = [];
+  let heartbeats = 0;
+  // No fixture starts a live `amp` builder; an attempt is recorded and fails.
+  mock.method(io, 'start', (argv: readonly string[]) => { launches.push(argv.join(' ')); throw new Error('fixture: no live launch'); });
   let slackAttempts = 0;
   let commentIds = 0;
   let generation = 0;
   const tools = { call: async (name: string, input: Record<string, unknown>) => {
+    const injected = control.inject?.(name, input);
+    if (injected !== undefined) return injected;
     switch (name) {
       case 'linear.list_issues': return { issues: [...issues.values()].filter(issue => issue.status === input.state && (!input.label || issue.labels.includes(String(input.label)))).map(({ id }) => ({ id })), hasNextPage: false };
       case 'linear.get_issue':
@@ -417,7 +467,7 @@ function factory() {
         comments.set(String(input.issueId), [...list, comment]);
         return { id: comment.id };
       }
-      case 'linear.save_issue': return {};
+      case 'linear.save_issue': saves.push(`${input.id} ${JSON.stringify(input.state ?? input.addLabels)}`); return {};
       case 'find_thread': {
         const label = /label:(\S+)/.exec(String(input.query))?.[1] ?? '';
         return { threads: [...threads].filter(([, thread]) => !thread.archived && thread.labels.includes(label)).map(([id, thread]) => ({ id, updatedAt: thread.updatedAt })) };
@@ -432,18 +482,15 @@ function factory() {
         return { ok: true };
       case 'slack_read': return { messages: [] };
       case 'linear.get_status_updates': return { statusUpdates: [], hasNextPage: false };
-      case 'linear.save_status_update': return { id: 'heartbeat' };
+      case 'linear.save_status_update': heartbeats += 1; return { id: 'heartbeat' };
       default: return {};
     }
   } };
-  const { $: shell } = fakeShell(command => {
-    if (command.startsWith('gh pr list --state open')) return JSON.stringify(prs.filter(pr => pr.state === 'OPEN'));
-    if (command.startsWith('gh pr list')) return '[]';
-    return undefined;
-  });
+  const { $: shell } = fakeShell();
   const $ = async (strings: TemplateStringsArray, ...values: unknown[]) => {
     if (control.refuse && strings.join('').includes(' check ')) return { exitCode: 1, stdout: '', stderr: control.refuse };
-    return shell(strings, ...values);
+    const command = strings.reduce((text, part, i) => text + part + (i < values.length ? String(values[i]) : ''), '');
+    return control.gh?.(command) ?? github(command, prs, releases) ?? shell(strings, ...values);
   };
   let created = 0;
   const amp = (mine: number) => ({
@@ -454,8 +501,8 @@ function factory() {
       threads.set(id, { labels: [], state: 'running', archived: false, updatedAt: new Date().toISOString() });
       return { id, setLabels: async (labels: string[]) => { threads.get(id)!.labels = labels; }, appendUserMessage: async () => {} };
     } }),
-    registerAgentMode: () => {}, registerTool: () => {},
-    on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { if (name === 'session.start') starts.set(mine, handler); },
+    registerAgentMode: () => {}, registerTool: (tool: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> }) => { statuses.set(mine, tool.execute); },
+    on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { if (name === 'session.start') starts.set(mine, handler); if (name === 'agent.end') ends.set(mine, handler); },
     createWebhook: async () => ({ url: 'https://hooks.example/x' }),
     system: { executor: { kind: 'remote', keepAlive: async () => {} } },
     threads: { get: (id: string) => ({ labels: async () => threads.get(id)!.labels, addLabels: async () => [], appendUserMessage: async (message: { content: string }) => {
@@ -464,13 +511,19 @@ function factory() {
     } }) },
   });
   const starts = new Map<number, (event: unknown, ctx: unknown) => Promise<unknown>>();
-  const builder = (issue: string, state = 'idle') => threads.set(`T-${issue}`, { labels: [`odd-issue-${issue.toLowerCase()}`, 'odd-role-builder', 'odd-round-1', 'odd-engine-anthropic'], state, archived: false, updatedAt: new Date().toISOString() });
+  const ends = new Map<number, (event: unknown, ctx: unknown) => Promise<unknown>>();
+  const statuses = new Map<number, (input: Record<string, unknown>, ctx: unknown) => Promise<string>>();
+  const builder = (issue: string, state = 'idle', updatedAt = new Date().toISOString()) => threads.set(`T-${issue}`, { labels: [`odd-issue-${issue.toLowerCase()}`, 'odd-role-builder', 'odd-round-1', 'odd-engine-anthropic'], state, archived: false, updatedAt });
   const openPr = (issue: string, sha: string, over: Partial<Pr> = {}) => {
     const n = Number(issue.slice(4));
     prs.push({ number: n, headRefName: `${issue.toLowerCase()}-x`, headRefOid: sha, state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: sha, committedDate: new Date().toISOString() }], statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }], body: `closes ${issue}`, ...over });
   };
   return {
-    issues, comments, prs, threads, dms, steers, control, builder, openPr, slackAttempts: () => slackAttempts,
+    issues, comments, prs, releases, threads, dms, steers, control, builder, openPr, saves, launches, heartbeats: () => heartbeats, slackAttempts: () => slackAttempts,
+    /** The latest plugin load's `odd_control_status`: its handled events. */
+    events: async () => (JSON.parse(await statuses.get(generation)!({}, { thread: { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] } })) as { events: { issue: string | null; stage: string; error?: string }[] }).events,
+    /** The Ralph guard as the latest plugin load runs it at the end of a role thread's turn. */
+    guard: (labels: string[]) => ends.get(generation)!({ status: 'done', message: '', thread: { id: 'T-role' } }, { thread: { id: 'T-role', labels: async () => labels }, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools, $ }),
     issue: (id: string, status: string) => issues.set(id, { id, status, labels: ['odd', 'Bug', 'area:agents'], description: fullSpec }),
     episodes: (id: string) => (comments.get(id) ?? []).filter(comment => comment.body.startsWith('odd-failure')).map(comment => comment.body.split('\n')[0]),
     async start() {
@@ -645,4 +698,569 @@ test('P3.1: a failed steer is retried and recorded only after delivery; the reco
   await advance(30 * 60_000);
   assert.equal(plant.dms.length, 1, 'one page per episode, across a reload');
   assert.equal(plant.steers.length, 1);
+});
+
+// --- P3.7: authoritative reads fail closed (MET-344) -----------------------------------------
+
+const otherPr = (n: number): Pr => ({ number: n, headRefName: `met-${n}-other`, headRefOid: 'e'.repeat(40), state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: 'e'.repeat(40), committedDate: '2026-10-26T10:00:00Z' }], statusCheckRollup: [], body: `closes MET-${n}` });
+const builderLabels = ['odd-issue-met-7', 'odd-role-builder', 'odd-round-1', 'odd-engine-anthropic'];
+
+test('P3.7: open-PR discovery stays under GitHub\'s node bound, finds an owned PR past the first 100 with the time of a head past its first 100 commits, and an open PR wins over a merged one', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  const sha = 'f'.repeat(40);
+  plant.issue('MET-7', 'In Progress');
+  plant.builder('MET-7');
+  // A comment with an empty body is a valid row.
+  plant.comments.set('MET-7', [{ id: 'c-0', body: '', createdAt: '2026-10-26T14:00:00.000Z' }]);
+  // An earlier merged PR of MET-7 must not win over its open PR (that would move MET-7 to Deploying).
+  plant.prs.push({ ...otherPr(6), headRefName: 'met-7-first-try', state: 'MERGED', mergeCommit: { oid: '9'.repeat(40) }, mergedAt: '2026-10-25T12:00:00Z', body: 'closes MET-7' });
+  for (let n = 1000; n < 1140; n++) plant.prs.push(otherPr(n));
+  // The owned open PR is the 141st open PR, past gh's first 100-PR page; CI is still running.
+  // Its head is commit 150, past the 100 commits gh reads with a PR.
+  const history = Array.from({ length: 149 }, (_, i) => ({ oid: (i + 1).toString(16).padStart(40, '0'), committedDate: '2026-10-26T13:00:00Z' }));
+  plant.openPr('MET-7', sha, { statusCheckRollup: [{ name: 'ci', conclusion: '', status: 'IN_PROGRESS' }], commits: [...history, { oid: sha, committedDate: '2026-10-26T13:30:00Z' }] });
+  // A merged-only issue still derives Deploying from its merged PR.
+  plant.issue('MET-8', 'In Progress');
+  plant.prs.push({ ...otherPr(8), headRefName: 'met-8-done', state: 'MERGED', mergeCommit: { oid: '8'.repeat(40) }, mergedAt: '2026-10-26T14:00:00Z', body: 'closes MET-8' });
+  await plant.start();
+  await settle();
+  // The CI wait is aged from the head commit (13:30), not an older commit or the sweep: 90 min is past its 60 min budget.
+  assert.equal(plant.dms.length, 1);
+  assert.match(plant.dms[0], new RegExp(`^\\[odd\\] ODD page: wait-overdue \\| issue MET-7 \\| PR #7 \\| ${sha} \\| .*ci pending at f{12}: ci wait is 90 min old \\(budget 60 min\\) since 2026-10-26T13:30:00Z`));
+  assert.ok(!plant.saves.some(save => save.startsWith('MET-7 ')), 'MET-7 keeps its status');
+  assert.ok(plant.saves.includes('MET-8 "Deploying"'));
+  assert.deepEqual(plant.launches, []);
+  assert.equal(plant.heartbeats(), 1);
+  // The Ralph guard reads the same late-page PR: CI is running, not "no open PR".
+  const verdict = await plant.guard(builderLabels) as { userMessage?: string } | undefined;
+  assert.match(verdict?.userMessage ?? '', /CI still running on the PR head/);
+});
+
+test('P3.7: a failed, malformed or truncated read is never missing work: no cancellation, archive, status change, Builder, steer or heartbeat; the failure pages', async t => {
+  const sha = 'c'.repeat(40);
+  const refused = (match: string, stdout = '', stderr = 'HTTP 502: Bad Gateway (https://api.github.com/graphql)', exitCode = 1) =>
+    (command: string): Shell | undefined => command.startsWith(match) ? { exitCode, stdout, stderr } : undefined;
+  const envelope = (json: unknown) => ({ isError: true, content: [{ type: 'text', text: JSON.stringify(json) }] });
+  const cases: { name: string; error: RegExp; guard?: RegExp; setup: (plant: ReturnType<typeof factory>) => void }[] = [
+    { name: 'gh pr list fails', error: /gh pr list --state open failed: HTTP 502/, guard: /gh pr list --state open failed/, setup: plant => { plant.control.gh = refused('gh pr list --state open'); } },
+    { name: 'gh pr list returns no list', error: /gh pr list --state open returned a malformed PR list/, guard: /malformed PR list/, setup: plant => { plant.control.gh = refused('gh pr list --state open', '{"message":"Bad credentials"}', '', 0); } },
+    { name: 'gh pr list fills its limit', error: /filled its 1000 limit/, guard: /filled its 1000 limit/, setup: plant => { plant.prs.unshift(...Array.from({ length: 1000 }, (_, i) => otherPr(2000 + i))); } },
+    { name: 'gh pr view fails', error: /gh pr view 7 failed: HTTP 502/, guard: /gh pr view 7 failed/, setup: plant => { plant.control.gh = refused('gh pr view 7 --json number'); } },
+    { name: 'gh pr view drops the checks', error: /gh pr view 7 returned malformed or changed details/, guard: /malformed or changed details/, setup: plant => { plant.control.gh = refused('gh pr view 7 --json number', JSON.stringify({ number: 7, headRefName: 'met-7-x', headRefOid: sha, state: 'OPEN', body: 'closes MET-7' }), '', 0); } },
+    // Review of aeae4e3: list rows missing their ownership fields hid the owning PR.
+    { name: 'gh pr list rows lack ownership fields', error: /gh pr list --state open returned a malformed PR list/, guard: /malformed PR list/, setup: plant => { plant.control.gh = refused('gh pr list --state open', '[{"number":7}]', '', 0); } },
+    { name: 'the head commit time is unreadable', error: /gh api head commit c{40} failed: HTTP 502/, guard: /gh api head commit c{40} failed/, setup: plant => { plant.control.gh = refused('gh api '); } },
+    { name: 'the head commit time is malformed', error: /gh api head commit c{40} returned no commit time/, guard: /returned no commit time/, setup: plant => { plant.control.gh = refused('gh api ', 'null\n', '', 0); } },
+    // An unknown execution state is not idleness: the Builder may be running.
+    { name: 'thread status without agent state', error: /get_thread_status T-MET-7 returned no labels or agent state/, setup: plant => {
+      // A running Builder with no PR yet and an old search timestamp: only its state keeps it from looking stale.
+      plant.threads.get('T-MET-7')!.state = 'running';
+      plant.prs.length = 0;
+      plant.control.inject = (name, input) => name === 'get_thread_status' && input.thread === 'T-MET-7' ? { metadata: { labels: plant.threads.get('T-MET-7')!.labels, archived: false } } : undefined; } },
+    { name: 'list_comments isError', error: /linear\.list_comments returned an error/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? envelope({ comments: [] }) : undefined; } },
+    { name: 'get_issue isError', error: /linear\.get_issue returned an error/, setup: plant => { plant.control.inject = name => name === 'linear.get_issue' ? envelope({ id: 'MET-7', status: 'Todo', labels: ['odd'], description: fullSpec }) : undefined; } },
+    // Re-review of 91d176c, and the same boundaries' equivalent omissions.
+    { name: 'a comment row without a body', error: /linear\.list_comments returned a malformed comments row at 0/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? { comments: [{}] } : undefined; } },
+    { name: 'a null comment row', error: /linear\.list_comments returned a malformed comments row at 0/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? { comments: [null] } : undefined; } },
+    { name: 'get_issue with an empty id', error: /linear\.get_issue MET-7 returned a malformed issue/, setup: plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, id: '', relations: { blockedBy: [] } } : undefined; } },
+    { name: 'get_issue with an empty status', error: /linear\.get_issue MET-7 returned a malformed issue/, setup: plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, status: '', relations: { blockedBy: [] } } : undefined; } },
+    { name: 'get_issue with a whitespace status', error: /linear\.get_issue MET-7 returned a malformed issue/, setup: plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, status: '  ', relations: { blockedBy: [] } } : undefined; } },
+    { name: 'get_issue without labels', error: /linear\.get_issue MET-7 returned a malformed issue/, setup: plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, labels: undefined, relations: { blockedBy: [] } } : undefined; } },
+    { name: 'a blocker without an id', error: /linear\.get_issue MET-7 returned a malformed issue/, setup: plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, relations: { blockedBy: [{}] } } : undefined; } },
+    { name: 'a thread search row without an id', error: /find_thread returned a malformed threads row at 0/, setup: plant => { plant.control.inject = name => name === 'find_thread' ? { threads: [{ updatedAt: '2026-10-26T14:30:00.000Z' }] } : undefined; } },
+    { name: 'thread labels that are not strings', error: /get_thread_status T-MET-7 returned no labels or agent state/, setup: plant => { plant.control.inject = (name, input) => name === 'get_thread_status' && input.thread === 'T-MET-7' ? { metadata: { labels: [null], archived: false }, agentState: { state: 'idle' } } : undefined; } },
+    { name: 'a merged PR without its merge commit', error: /gh pr view 7 returned malformed or changed details for merged MET-7/, guard: /malformed or changed details for merged/, setup: plant => { plant.prs[0] = { ...plant.prs[0], state: 'MERGED', mergeCommit: null, mergedAt: '2026-10-26T14:00:00Z' }; } },
+    // Re-review of 223e4f5, and the same boundaries' equivalent omissions.
+    ...([['omitted', undefined], ['empty', {}], ['with a null blocker list', { blockedBy: null }]] as const).map(([how, relations]) => ({ name: `get_issue with requested relations ${how}`, error: /linear\.get_issue MET-7 returned a malformed issue/, setup: (plant: ReturnType<typeof factory>) => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, relations } : undefined; } })),
+    { name: 'a check record without its fields', error: /gh pr view 7 returned malformed or changed details for open MET-7/, guard: /malformed or changed details/, setup: plant => { plant.prs[0].statusCheckRollup = [{}]; } },
+    { name: 'a check record with a numeric conclusion', error: /gh pr view 7 returned malformed or changed details for open MET-7/, guard: /malformed or changed details/, setup: plant => { plant.prs[0].statusCheckRollup = [{ name: 'ci', conclusion: 1 }]; } },
+    { name: 'a status context without its state', error: /gh pr view 7 returned malformed or changed details for open MET-7/, guard: /malformed or changed details/, setup: plant => { plant.prs[0].statusCheckRollup = [{ __typename: 'StatusContext', context: 'buildkite' }]; } },
+    { name: 'a merged PR with an unusable merge time', error: /gh pr view 7 returned malformed or changed details for merged MET-7/, guard: /malformed or changed details for merged/, setup: plant => { plant.prs[0] = { ...plant.prs[0], state: 'MERGED', mergeCommit: { oid: '9'.repeat(40) }, mergedAt: 'not-a-date' }; } },
+    { name: 'a thread search page with a malformed cursor', error: /find_thread returned a malformed nextCursor/, setup: plant => { plant.control.inject = name => name === 'find_thread' ? { threads: [], nextCursor: 7 } : undefined; } },
+    { name: 'list_comments without its payload', error: /linear\.list_comments returned no comments list/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? {} : undefined; } },
+  ];
+  for (const { name, error, guard, setup } of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        plant.issue('MET-7', 'In Progress');
+        // The MET-364 shape: an idle Builder past the stale limit whose PR is open and green.
+        plant.builder('MET-7', 'idle', '2026-10-26T14:30:00.000Z');
+        plant.openPr('MET-7', sha);
+        setup(plant);
+        await plant.start();
+        // Rechecks and two more sweeps; the blind episode pages at the sweep 20 minutes in.
+        await advance(21 * 60_000);
+        assert.deepEqual(plant.comments.get('MET-7') ?? [], [], 'no cancellation, steer or launch-failure record');
+        assert.equal(plant.threads.get('T-MET-7')!.archived, false, 'the Builder is not archived');
+        assert.deepEqual([...plant.threads.keys()].filter(id => id.startsWith('T-spawned')), [], 'no role thread spawned');
+        assert.deepEqual(plant.saves, [], 'no status change');
+        assert.deepEqual(plant.launches, [], 'no duplicate Builder');
+        assert.deepEqual(plant.steers, []);
+        assert.equal(plant.heartbeats(), 0, 'a sweep whose only evaluation failed is not healthy');
+        assert.equal(plant.dms.length, 1);
+        const events = await plant.events();
+        assert.ok(events.filter(event => event.issue === 'MET-7').every(event => event.stage === 'failed'), 'no evaluation of MET-7 succeeded');
+        assert.ok(events.some(event => event.stage === 'failed' && error.test(event.error ?? '')), 'the read error is recorded');
+        assert.match(plant.dms[0], /^\[odd\] ODD page: control-plane-blind \| .*every sweep since 2026-10-26T15:00:00\.000Z failed: /);
+        // The Ralph guard neither continues the Builder nor tells it its PR is missing.
+        if (guard) await assert.rejects(plant.guard(builderLabels), guard);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('P3.7: an empty enumeration is healthy only when no live role thread holds an open issue, and a failed enumeration is not an empty one', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const liveBuilder = (status: string) => controlOrb((name, input) => {
+    if (name === 'linear.list_issues') return { issues: [], hasNextPage: false, cursor: '' };
+    if (name === 'find_thread') return /odd-role-builder|odd-issue-met-1 /.test(String(input.query)) ? { threads: [{ id: 'T-1', updatedAt: new Date().toISOString() }] } : { threads: [] };
+    if (name === 'linear.get_issue') return { id: 'MET-1', status, labels: ['odd'], description: '', relations: { blockedBy: [] } };
+    return undefined;
+  });
+  const swept = async (orb: ReturnType<typeof controlOrb>) => {
+    await orb.start();
+    await until(() => orb.calls.includes('linear.list_issues'));
+    await settle();
+    return orb.updates.length;
+  };
+  assert.equal(await swept(controlOrb(emptyWork)), 1, 'a valid empty, idle workspace writes its heartbeat');
+  assert.equal(await swept(liveBuilder('Done')), 1, 'a live thread on a finished issue is resolved work');
+  assert.equal(await swept(liveBuilder('In Progress')), 0, 'Linear listing nothing while a Builder holds an In Progress issue is a failed sweep');
+  const listed = (result: unknown) => controlOrb(name => name === 'linear.list_issues' ? result : emptyWork(name));
+  assert.equal(await swept(listed({ isError: true, content: [{ type: 'text', text: '{"issues":[],"hasNextPage":false}' }] })), 0, 'an isError envelope is a failed read');
+  assert.equal(await swept(listed({})), 0, 'a missing issues payload is a failed read');
+  assert.equal(await swept(listed({ issues: [{}], hasNextPage: false })), 0, 'an issue row without an identifier is a failed read, not an empty workspace');
+  assert.equal(await swept(listed({ issues: [{ id: '' }], hasNextPage: false })), 0);
+  assert.equal(await swept(listed({ issues: [{ id: 'MET-9' }], hasNextPage: true })), 0, 'a next page without a cursor is an incomplete read');
+  assert.equal(await swept(listed({ issues: [] })), 0, 'a page without hasNextPage is an incomplete read');
+});
+
+test('P3.7: any failed derivation withholds the sweep heartbeat even when other issues evaluate; a failed action does not', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = (unreadable: boolean) => {
+    const it = factory();
+    for (const id of ['MET-7', 'MET-8']) {
+      it.issue(id, 'In Progress');
+      it.builder(id, 'running');
+      it.openPr(id, id === 'MET-7' ? 'c'.repeat(40) : 'd'.repeat(40), { statusCheckRollup: [{ name: 'ci', conclusion: '', status: 'IN_PROGRESS' }] });
+    }
+    if (unreadable) it.control.inject = (name, input) => name === 'linear.get_issue' && input.id === 'MET-7' ? { isError: true, content: [{ type: 'text', text: '{"id":"MET-7","status":"Todo"}' }] } : undefined;
+    return it;
+  };
+  const mixed = plant(true);
+  await mixed.start();
+  await advance(21 * 60_000);
+  const events = await mixed.events();
+  assert.ok(events.some(event => event.issue === 'MET-8' && event.stage !== 'failed'), 'MET-8 evaluates normally');
+  assert.equal(mixed.heartbeats(), 0, 'one failed authoritative read keeps every sweep from looking healthy');
+  assert.ok(events.some(event => event.issue === null && event.stage === 'failed' && /1 of 2 evaluations failed/.test(event.error ?? '')));
+  assert.match(mixed.dms.join('\n'), /ODD page: action-failed \| issue MET-7 \| .*linear\.get_issue returned an error/, 'the failing issue pages its own incident');
+  assert.doesNotMatch(mixed.dms.join('\n'), /control-plane-blind/, 'a partly failing sweep is not a blind plane');
+
+  // Control: every read succeeds, and only an action fails (no reviewer can spawn): the sweep stays healthy.
+  const refusing = factory();
+  refusing.issue('MET-8', 'In Progress');
+  refusing.builder('MET-8');
+  refusing.openPr('MET-8', 'd'.repeat(40));
+  refusing.control.spawnFails = true;
+  await refusing.start();
+  await advance(21 * 60_000);
+  assert.ok(refusing.heartbeats() >= 3, 'a failed action keeps the heartbeat');
+  assert.match(refusing.dms.join('\n'), /ODD page: action-failed \| issue MET-8 \| .*spawn-reviewer failing/);
+});
+
+test('P3.7: a malformed comment or issue read on a Todo issue launches no Builder and writes no heartbeat; valid reads launch one', async t => {
+  const payloads: [string, (plant: ReturnType<typeof factory>) => void][] = [
+    ['valid (control)', () => {}],
+    ['comments [{}]', plant => { plant.control.inject = name => name === 'linear.list_comments' ? { comments: [{}] } : undefined; }],
+    ['id ""', plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, id: '', relations: { blockedBy: [] } } : undefined; }],
+    ['status ""', plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, status: '', relations: { blockedBy: [] } } : undefined; }],
+    ['relations omitted', plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))! } : undefined; }],
+    ['relations {}', plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, relations: {} } : undefined; }],
+    ['blockedBy null', plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, relations: { blockedBy: null } } : undefined; }],
+    // Control: an open blocker holds a valid issue back, and the sweep stays healthy.
+    ['valid, blocked by an open issue (control)', plant => {
+      // The blocker is not an ODD issue, so the sweep does not work it.
+      plant.issues.set('MET-8', { id: 'MET-8', status: 'In Progress', labels: [], description: '' });
+      plant.control.inject = (name, input) => name === 'linear.get_issue' && input.id === 'MET-7' ? { ...plant.issues.get('MET-7')!, relations: { blockedBy: [{ id: 'MET-8' }] } } : undefined;
+    }],
+  ];
+  for (const [name, inject] of payloads) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        plant.issue('MET-7', 'Todo');
+        inject(plant);
+        await plant.start();
+        await settle();
+        const valid = name.startsWith('valid');
+        const blocked = name.includes('blocked by');
+        // The fixture's launcher refuses every launch, so the valid control records one attempt.
+        assert.equal(plant.launches.length, valid && !blocked ? 1 : 0, valid && !blocked ? 'a valid Todo issue launches its Builder' : 'no Builder launch');
+        assert.equal(plant.heartbeats(), valid ? 1 : 0);
+        assert.deepEqual(plant.saves, []);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('P3.7: the heartbeat lookup needs every row\'s id and body; a malformed lookup writes no new heartbeat row', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const writes = async (page: unknown) => {
+    const saved: Record<string, unknown>[] = [];
+    const orb = controlOrb((name, input) => {
+      if (name === 'linear.get_status_updates') return page;
+      if (name === 'linear.save_status_update') { saved.push(input); return { id: String(input.id ?? 'update-new') }; }
+      return emptyWork(name);
+    });
+    await orb.start();
+    await until(() => orb.calls.includes('linear.get_status_updates'));
+    await settle();
+    return saved.map(input => input.id ?? 'new');
+  };
+  assert.deepEqual(await writes({ statusUpdates: [], hasNextPage: false }), ['new'], 'no row yet: the first heartbeat row is created');
+  assert.deepEqual(await writes({ statusUpdates: [{ id: 'u-1', body: 'weekly update' }, { id: 'u-2', body: heartbeatLine('2026-10-26T14:00:00.000Z') }], hasNextPage: false }), ['u-2'], 'the existing row is updated in place');
+  assert.deepEqual(await writes({ statusUpdates: [{}], hasNextPage: false }), [], 'a row without id or body');
+  assert.deepEqual(await writes({ statusUpdates: [{ body: heartbeatLine('2026-10-26T14:00:00.000Z') }], hasNextPage: false }), [], 'the heartbeat row without its id');
+  assert.deepEqual(await writes({ statusUpdates: [{ id: 'u-3' }], hasNextPage: false }), [], 'a row without its body');
+  assert.deepEqual(await writes({ statusUpdates: [{ id: 'u-1', body: 'weekly update' }], hasNextPage: true }), [], 'a next page without a cursor');
+});
+
+test('P3.7: genuine pending CheckRuns, status contexts and an empty rollup are valid check reads', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const rollups: [string, Record<string, unknown>[], RegExp | undefined][] = [
+    ['a queued CheckRun with a null conclusion', [{ __typename: 'CheckRun', name: 'ci', conclusion: null, status: 'QUEUED' }], /CI still running/],
+    ['an in-progress CheckRun with an empty conclusion', [{ __typename: 'CheckRun', name: 'ci', conclusion: '', status: 'IN_PROGRESS' }], /CI still running/],
+    ['a failed CheckRun', [{ __typename: 'CheckRun', name: 'ci', conclusion: 'FAILURE', status: 'COMPLETED' }], /CI job ci failed/],
+    ['a pending status context', [{ __typename: 'StatusContext', context: 'buildkite/amp', state: 'PENDING' }], /CI still running/],
+    ['an empty rollup', [], undefined],
+  ];
+  for (const [name, rollup, expected] of rollups) {
+    const plant = factory();
+    plant.issue('MET-7', 'In Progress');
+    plant.builder('MET-7', 'running');
+    plant.openPr('MET-7', 'c'.repeat(40), { statusCheckRollup: rollup });
+    await plant.start();
+    await settle();
+    const verdict = await plant.guard(builderLabels) as { userMessage?: string } | undefined;
+    if (expected) assert.match(verdict?.userMessage ?? '', expected, name);
+    else assert.equal(verdict, undefined, name);
+  }
+});
+
+test('P3.7: the follow-up Bug lookup rejects malformed rows instead of filing a duplicate; valid empty and matching lookups create or reuse', async () => {
+  const title = 'Release 1.2.3 rolled back (abcdef123456)';
+  const run = async (lookup: unknown) => {
+    const saves: Record<string, unknown>[] = [];
+    const tools = { call: async (name: string, input: Record<string, unknown>) => {
+      if (name === 'linear.list_issues') return lookup;
+      if (name === 'linear.save_issue') { saves.push(input); return { id: 'uuid-new', identifier: 'MET-900' }; }
+      return {};
+    } };
+    const issue = { identifier: 'MET-7' } as Parameters<typeof followUp>[1];
+    const result = await followUp({ tools, logger: { log: () => {} } } as Parameters<typeof followUp>[0], issue, { title, body: 'x' }).then(id => ({ id }), (error: unknown) => ({ error: String(error) }));
+    return { result, saves: saves.map(input => (input.title ? 'create' : `relate ${String(input.id)}`)) };
+  };
+  assert.deepEqual(await run({ issues: [] }), { result: { id: 'MET-900' }, saves: ['create'] });
+  assert.deepEqual(await run({ issues: [{ id: 'MET-55', title }] }), { result: { id: 'MET-55' }, saves: ['relate MET-55'] });
+  for (const rows of [[{}], [{ title }], [{ id: '', title }], [{ id: 'MET-55' }]]) {
+    const { result, saves } = await run({ issues: rows });
+    assert.match((result as { error?: string }).error ?? '', /linear\.list_issues returned a malformed issues row at 0/, JSON.stringify(rows));
+    assert.deepEqual(saves, [], `no Bug filed for ${JSON.stringify(rows)}`);
+  }
+});
+
+// --- P3.7 round 4: a failed read is a failed derivation wherever it happens -----------------
+
+const rolledBack = (plant: ReturnType<typeof factory>) => {
+  plant.issue('MET-9', 'Deploying');
+  plant.comments.set('MET-9', [{ id: 'c-r', body: 'odd-deploy host=factory-gpu component=meter sha=' + 'e'.repeat(40) + ' health=fail rollback=' + 'd'.repeat(12), createdAt: '2026-10-26T14:00:00.000Z' }]);
+};
+
+test('P3.7: a read that fails while acting withholds the heartbeat and writes nothing; a valid read acts and heartbeats', async t => {
+  const lookups: [string, unknown, boolean][] = [
+    ['valid empty Bug lookup (control)', undefined, true],
+    ['Bug lookup rows [{}]', { issues: [{}], hasNextPage: false }, false],
+    ['Bug lookup isError', { isError: true, content: [{ type: 'text', text: '{"issues":[],"hasNextPage":false}' }] }, false],
+  ];
+  for (const [name, lookup, healthy] of lookups) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        rolledBack(plant);
+        if (lookup !== undefined) plant.control.inject = (call, input) => call === 'linear.list_issues' && input.query ? lookup : undefined;
+        await plant.start();
+        await settle();
+        const sweep = (await plant.events()).find(event => event.issue === null);
+        assert.equal(plant.heartbeats(), healthy ? 1 : 0);
+        assert.equal(sweep?.stage, healthy ? 'performed' : 'failed');
+        // The rollback's follow-up: a Bug filed and MET-9 returned to Todo, or nothing at all.
+        assert.deepEqual(plant.saves, healthy ? ['undefined "Triage"', 'MET-9 "Todo"'] : []);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('P3.7: malformed digest reads fail the sweep without a heartbeat; a valid empty day posts the digest and heartbeats', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const digestRead = (input: Record<string, unknown>) => Array.isArray(input.fields) && input.fields.includes('title');
+  const run = async (override: (name: string, input: Record<string, unknown>) => unknown) => {
+    const orb = controlOrb((name, input) => override(name, input) ?? emptyWork(name));
+    await orb.start();
+    await until(() => orb.calls.includes('linear.list_issues'));
+    await settle();
+    return { heartbeats: orb.updates.length, digests: orb.alerts.filter(text => text.startsWith('ODD digest')).length };
+  };
+  assert.deepEqual(await run(() => undefined), { heartbeats: 1, digests: 1 }, 'control');
+  for (const [name, override] of [
+    ['digest issues {}', (call: string, input: Record<string, unknown>) => call === 'linear.list_issues' && digestRead(input) ? {} : undefined],
+    ['digest issue rows [{}]', (call: string, input: Record<string, unknown>) => call === 'linear.list_issues' && digestRead(input) ? { issues: [{}], hasNextPage: false } : undefined],
+    ['digest merged PRs [{}]', (call: string, input: Record<string, unknown>) => call === '$' && String(input.command).startsWith('gh pr list --state merged') ? '[{}]' : undefined],
+    ['digest posted-check without messages', (call: string, input: Record<string, unknown>) => call === 'slack_read' && input.channelName === 'factory-alerts' ? {} : undefined],
+  ] as const) {
+    assert.deepEqual(await run(override), { heartbeats: 0, digests: 0 }, name);
+  }
+});
+
+test('P3.7: a merge whose confirmation read fails posts no receipt and no heartbeat; the next evaluation posts the receipt once from the merged PR', async t => {
+  const cases: [string, (mergeSha: string) => Shell][] = [
+    ['valid merge commit (control)', mergeSha => ({ exitCode: 0, stdout: `${mergeSha}\n`, stderr: '' })],
+    ['confirmation fails', () => ({ exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway' })],
+    ['confirmation is null', () => ({ exitCode: 0, stdout: 'null\n', stderr: '' })],
+    ['confirmation read rejects', () => { throw new Error('spawn gh ENOENT'); }],
+  ];
+  for (const [name, confirm] of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        const sha = 'c'.repeat(40);
+        const mergeSha = '7'.repeat(40);
+        plant.issue('MET-8', 'In Progress');
+        plant.builder('MET-8');
+        plant.threads.set('T-review', { labels: ['odd-issue-met-8', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-ready-${sha.slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+        plant.openPr('MET-8', sha);
+        const merges: string[] = [];
+        plant.control.gh = command => {
+          if (command === 'gh pr view 8 --json isDraft --jq .isDraft') return { exitCode: 0, stdout: 'false\n', stderr: '' };
+          if (command.startsWith('gh pr merge 8 ')) {
+            merges.push(command);
+            Object.assign(plant.prs[0], { state: 'MERGED', mergeCommit: { oid: mergeSha }, mergedAt: new Date().toISOString() });
+            return { exitCode: 0, stdout: '', stderr: '' };
+          }
+          if (command === 'gh pr view 8 --json mergeCommit --jq .mergeCommit.oid') return confirm(mergeSha);
+          return undefined;
+        };
+        const receipts = () => (plant.comments.get('MET-8') ?? []).filter(comment => comment.body.startsWith('odd-merge pr=')).map(comment => comment.body);
+        await plant.start();
+        await settle();
+        const valid = name.startsWith('valid');
+        assert.deepEqual(merges.length, 1);
+        assert.deepEqual(receipts(), valid ? [`odd-merge pr=8 head=${sha} merge=${mergeSha} release=none`] : [], 'no merge=unknown or merge=null receipt');
+        assert.equal(plant.heartbeats(), valid ? 1 : 0);
+        // The recheck finds the PR merged: one receipt from its validated merge commit, then Deploying; no second merge.
+        await advance(10 * 60_000);
+        assert.deepEqual(merges.length, 1, 'never merged twice');
+        assert.deepEqual(receipts(), [`odd-merge pr=8 head=${sha} merge=${mergeSha} release=none`]);
+        assert.ok(plant.saves.includes('MET-8 "Deploying"'));
+        assert.ok(plant.heartbeats() >= 1, 'later sweeps are healthy again');
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+// --- P3.7 round 5: diagnosis and shell-transport reads; receipt recovery ownership and chronology ---
+
+const merged8 = (mergedAt: string, mergeSha = '7'.repeat(40)): Pr => ({ number: 8, headRefName: 'met-8-x', headRefOid: 'c'.repeat(40), state: 'MERGED', mergeCommit: { oid: mergeSha }, mergedAt, mergeable: 'UNKNOWN', commits: [{ oid: 'c'.repeat(40), committedDate: '2026-10-26T13:00:00Z' }], statusCheckRollup: [], body: 'closes MET-8' });
+const deployLine = (sha: string, health = 'pass', rollback = 'none') => `odd-deploy host=factory-gpu component=meter sha=${sha} health=${health} rollback=${rollback}`;
+
+test('P3.7: a failed log-reader lookup still pages a failed rollback, but the sweep is not healthy; a valid lookup is', async t => {
+  const lookups: [string, unknown][] = [
+    ['valid lookup (control)', undefined],
+    ['lookup {}', {}],
+    ['lookup rows [{}]', { threads: [{}] }],
+    ['lookup isError', { isError: true, content: [{ type: 'text', text: '{"threads":[]}' }] }],
+  ];
+  for (const [name, lookup] of lookups) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        plant.issue('MET-9', 'Deploying');
+        plant.comments.set('MET-9', [{ id: 'c-r', body: deployLine('e'.repeat(40), 'fail', 'none'), createdAt: '2026-10-26T14:00:00.000Z' }]);
+        if (lookup !== undefined) plant.control.inject = (call, input) => call === 'find_thread' && String(input.query).startsWith('label:odd-deploy-') ? lookup : undefined;
+        await plant.start();
+        await settle();
+        assert.match(plant.dms.join('\n'), /ODD page: failed-rollback \| issue MET-9 /, 'the urgent page goes out');
+        assert.ok(plant.saves.includes('MET-9 ["escalated"]'));
+        assert.equal(plant.heartbeats(), lookup === undefined ? 1 : 0);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+  // A page write failing after the failed lookup is still a failed read; with a valid lookup it stays an action failure.
+  const writes: [string, (call: string, input: Record<string, unknown>) => boolean][] = [
+    ['escalation comment', (call, input) => call === 'linear.save_comment' && String(input.body).startsWith('odd-escalated')],
+    ['Slack page', (call, input) => call === 'slack_write' && !input.channelName],
+    ['escalated label', (call, input) => call === 'linear.save_issue' && Array.isArray(input.addLabels)],
+  ];
+  for (const [write, fails] of writes) {
+    for (const failedLookup of [true, false]) {
+      await t.test(`${failedLookup ? 'lookup isError' : 'valid lookup (control)'}, then the ${write} fails`, async () => {
+        mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+        try {
+          const plant = factory();
+          plant.issue('MET-9', 'Deploying');
+          plant.comments.set('MET-9', [{ id: 'c-r', body: deployLine('e'.repeat(40), 'fail', 'none'), createdAt: '2026-10-26T14:00:00.000Z' }]);
+          plant.control.inject = (call, input) => {
+            if (fails(call, input)) throw new Error(`${write} 503`);
+            return failedLookup && call === 'find_thread' && String(input.query).startsWith('label:odd-deploy-') ? { isError: true, content: [{ type: 'text', text: '{"threads":[]}' }] } : undefined;
+          };
+          await plant.start();
+          await settle();
+          const failed = (await plant.events() as { issue: string | null; stage: string; error?: string; read?: boolean }[]).filter(event => event.issue === 'MET-9' && event.stage === 'failed');
+          assert.ok(failed.length > 0 && failed.every(event => String(event.error).includes(`${write} 503`)), 'the write failure stays observable');
+          assert.deepEqual([...new Set(failed.map(event => event.read === true))], [failedLookup], failedLookup ? 'the read failure is kept' : 'an action failure stays one');
+          if (failedLookup) assert.equal(plant.heartbeats(), 0);
+        } finally {
+          mock.timers.reset();
+        }
+      });
+    }
+  }
+});
+
+test('P3.7: a rejected or malformed draft read before a merge merges nothing and writes no heartbeat; true and false merge', async t => {
+  const reads: [string, string | undefined, boolean][] = [
+    ['rejected', undefined, false],
+    ['null', 'null\n', false],
+    ['empty', '', false],
+    ['not a boolean', '{"isDraft":false}\n', false],
+    ['false (control)', 'false\n', true],
+    ['true (control)', 'true\n', true],
+  ];
+  for (const [name, stdout, merges] of reads) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        const sha = 'c'.repeat(40);
+        plant.issue('MET-8', 'In Progress');
+        plant.builder('MET-8');
+        plant.threads.set('T-review', { labels: ['odd-issue-met-8', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-ready-${sha.slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+        plant.openPr('MET-8', sha);
+        const merged: string[] = [];
+        plant.control.gh = command => {
+          if (command.startsWith('gh pr view 8 --json isDraft')) {
+            if (stdout === undefined) throw new Error('spawn gh ENOENT');
+            return { exitCode: 0, stdout, stderr: '' };
+          }
+          if (command.startsWith('gh pr ready 8')) return { exitCode: 0, stdout: '', stderr: '' };
+          if (command.startsWith('gh pr merge')) { merged.push(command); return { exitCode: 0, stdout: '', stderr: '' }; }
+          if (command.startsWith('gh pr view 8 --json mergeCommit')) return { exitCode: 0, stdout: `${'7'.repeat(40)}\n`, stderr: '' };
+          return undefined;
+        };
+        await plant.start();
+        await settle();
+        assert.equal(merged.length, merges ? 1 : 0);
+        assert.equal(plant.heartbeats(), merges ? 1 : 0);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('P3.7: receipt recovery never writes to an issue ODD does not own', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  plant.issues.set('MET-8', { id: 'MET-8', status: 'In Progress', labels: ['Bug', 'area:agents'], description: fullSpec });
+  plant.builder('MET-8');
+  plant.prs.push(merged8('2026-10-26T14:00:00Z'));
+  await plant.start();
+  await advance(10 * 60_000);
+  assert.deepEqual((plant.comments.get('MET-8') ?? []).map(comment => comment.body), [], 'no odd-merge comment on a dispatcher issue');
+  assert.deepEqual(plant.saves, []);
+});
+
+test('P3.7: a recovered receipt keeps a deployment of a release containing the merge and retires every other', async t => {
+  const mergeSha = '7'.repeat(40);
+  const [d, e] = ['d'.repeat(40), 'e'.repeat(40)];
+  // [name, deploy receipts (sha, posted at), outcome, Linear returns comments oldest first, the compare of this release fails]
+  const cases: [string, [string, string][], 'current' | 'stale' | 'unread', boolean?, string?][] = [
+    ['the merge deployed after it', [[mergeSha, '2026-10-26T14:10:00.000Z']], 'current'],
+    ['the merge deployed at the merge time', [[mergeSha, '2026-10-26T14:00:00.000Z']], 'current'],
+    ['a descendant release deployed after the merge', [[d, '2026-10-26T14:10:00.000Z']], 'current'],
+    ['an old release delivered after the merge (stale)', [[e, '2026-10-26T14:10:00.000Z']], 'stale'],
+    ['deployed before the merge (stale)', [[e, '2026-10-26T13:50:00.000Z']], 'stale'],
+    // Only the effective (latest) receipt counts: an earlier valid one never vouches for a later stale one.
+    ['a valid descendant, then an old release (newest first)', [[d, '2026-10-26T14:10:00.000Z'], [e, '2026-10-26T14:20:00.000Z']], 'stale'],
+    ['a valid descendant, then an old release (oldest first)', [[d, '2026-10-26T14:10:00.000Z'], [e, '2026-10-26T14:20:00.000Z']], 'stale', true],
+    ['a valid descendant, then a release whose compare fails (oldest first)', [[d, '2026-10-26T14:10:00.000Z'], [e, '2026-10-26T14:20:00.000Z']], 'unread', true, e],
+    ['an old release, then a valid descendant (control)', [[e, '2026-10-26T14:10:00.000Z'], [d, '2026-10-26T14:20:00.000Z']], 'current'],
+    ['an old release, then a valid descendant (control, oldest first)', [[e, '2026-10-26T14:10:00.000Z'], [d, '2026-10-26T14:20:00.000Z']], 'current', true],
+  ];
+  for (const [name, deploys, outcome, oldestFirst, unreadable] of cases) {
+    const current = outcome === 'current';
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        plant.issue('MET-8', 'In Progress');
+        plant.builder('MET-8');
+        plant.prs.push(merged8('2026-10-26T14:00:00Z', mergeSha));
+        plant.releases.set('d'.repeat(40), ['e'.repeat(40), mergeSha]);
+        // The old release's own passing verification must not finish the new work.
+        plant.comments.set('MET-8', [
+          { id: 'c-v', body: `odd-verify sha=${'e'.repeat(40)} result=pass bug=none`, createdAt: '2026-10-26T13:40:00.000Z' },
+          ...deploys.map(([sha, createdAt], i) => ({ id: `c-d${i}`, body: deployLine(sha), createdAt })),
+        ]);
+        // Let the issue follow its status writes, so the next evaluation sees Deploying.
+        plant.control.inject = (call, input) => {
+          if (call === 'linear.save_issue' && typeof input.state === 'string') plant.issues.get(String(input.id))!.status = input.state;
+          if (call === 'linear.list_comments' && oldestFirst) return { comments: [...(plant.comments.get(String(input.issueId)) ?? [])] };
+          return undefined;
+        };
+        if (unreadable) plant.control.gh = command => command.startsWith('gh api repos/{owner}/{repo}/compare/') && command.includes(`...${unreadable}`) ? { exitCode: 1, stdout: '', stderr: 'HTTP 502' } : undefined;
+        await plant.start();
+        // The status write, then the next sweep evaluates MET-8 in Deploying.
+        await advance(11 * 60_000);
+        const receipts = (plant.comments.get('MET-8') ?? []).filter(comment => comment.body.startsWith('odd-merge pr=')).map(comment => comment.body);
+        assert.deepEqual(receipts, outcome === 'stale' ? [`odd-merge pr=8 head=${'c'.repeat(40)} merge=${mergeSha} release=none`] : []);
+        if (outcome === 'unread') {
+          assert.equal(plant.issues.get('MET-8')!.status, 'In Progress', 'an unread ancestry moves nothing');
+          assert.equal(plant.heartbeats(), 0);
+          return;
+        }
+        assert.equal(plant.issues.get('MET-8')!.status, 'Deploying');
+        const verifiers = [...plant.threads.values()].filter(thread => thread.labels.includes('odd-role-verifier'));
+        assert.equal(verifiers.length, current ? 1 : 0, current ? 'the post-merge deployment is verified' : 'the stale deployment waits for a new release');
+        await advance(11 * 60_000);
+        assert.equal(plant.issues.get('MET-8')!.status, 'Deploying', 'no earlier verification marks it Done');
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
 });
