@@ -502,9 +502,15 @@ by the previous one).
    500,000-node bound. Only the owning PR is read in full with `gh pr view`,
    and its head time comes from the head commit itself (`gh api
    repos/{owner}/{repo}/commits/<sha>`), since gh reads only a PR's first 100
-   commits; an unreadable head time fails the read. Any failed derivation
+   commits; an unreadable head time fails the read. Every such read throws a
+   `ReadError`, and an evaluation that fails on one is a failed derivation
+   wherever it happens, also after its action was chosen (a follow-up Bug
+   lookup, the digest, the merge confirmation). Any failed derivation
    withholds the sweep's heartbeat, even when other issues evaluate, while a
-   failed action stays an incident; an empty issue enumeration while live
+   failed action (a refused merge, a spawn) stays an incident. A merge whose
+   merge-commit read fails posts no `merge=unknown` receipt: the next
+   evaluation finds the PR merged and posts the receipt once, from the
+   validated merge commit, before the issue moves to Deploying; an empty issue enumeration while live
    role threads hold open issues fails the sweep too; the digest is
    split into Slack messages of at most 2800 characters. Removing the
    `odd-perform` label is the off-switch: the plane keeps evaluating but

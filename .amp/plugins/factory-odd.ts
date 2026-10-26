@@ -143,6 +143,8 @@ export default async function (amp: PluginAPI) {
 		error?: string
 		/** The wait's age against its budget (`ci 12 min`), or `unknown` when no durable start time exists. */
 		wait?: string
+		/** The evaluation failed on an authoritative read (ReadError), even after an action was chosen. */
+		read?: boolean
 	}
 	type ArmState = {
 		armed: boolean
@@ -354,6 +356,8 @@ export default async function (amp: PluginAPI) {
 				entry.stage = 'performed'
 				recheck(ctx, state, identifier, 0)
 			} else {
+				// A merge whose confirmation read failed has no receipt yet; it is posted, once, before Deploying.
+				if (action.kind === 'set-status' && action.status === 'Deploying') await receiptMerge(ctx, issue, comments)
 				entry.stage = (await perform(ctx, state, issue, action, threads, usage, touched)) ? 'performed' : 'ignored'
 			}
 			if (action.kind === 'wait') await alertOverdue(ctx, state, issue, action, comments)
@@ -362,10 +366,12 @@ export default async function (amp: PluginAPI) {
 		} catch (error: unknown) {
 			entry.stage = 'failed'
 			entry.error = String(error)
+			// A failed authoritative read is a failed derivation wherever it happens, so its episode is the evaluation's, not the action's.
+			if (error instanceof ReadError) entry.read = true
 			ctx.logger.log(marker, source, 'evaluation failed', entry.error)
 			const count = (failures.get(identifier) ?? 0) + 1
 			failures.set(identifier, count)
-			const episode = await recordFailure(ctx, state, identifier, failureKey(issue, entry.action), entry.error)
+			const episode = await recordFailure(ctx, state, identifier, failureKey(issue, entry.read ? undefined : entry.action), entry.error)
 			if (count <= failureRechecks) recheck(ctx, state, identifier, recheckMs * 2 ** (count - 1))
 			else {
 				// Rechecks end here, so the episode is due now: the incident page goes out (or is retried by every sweep), never only this log line.
@@ -545,9 +551,10 @@ export default async function (amp: PluginAPI) {
 			let failed = 0
 			const unresolved: string[] = []
 			for (const identifier of identifiers) {
-				// Only a failed derivation is blindness; an action that fails (no reviewer can spawn) is an incident, not a blind plane.
+				// Only a failed derivation is blindness: one before an action was chosen, or a failed authoritative read
+				// while acting (MET-344). An action that fails (no reviewer can spawn) is an incident, not a blind plane.
 				const evaluated = await evaluate(ctx, state, 'watchdog', identifier, at)
-				if (evaluated.stage === 'failed' && !evaluated.action) failed += 1
+				if (evaluated.stage === 'failed' && (!evaluated.action || evaluated.read)) failed += 1
 				if (fromThreads.has(identifier) && (!evaluated.status || ['Triage', 'Todo', 'In Progress', 'Deploying'].includes(evaluated.status))) unresolved.push(identifier)
 			}
 			if (identifiers.size && failed === identifiers.size) throw new Error(`all ${failed} evaluations failed`)
@@ -616,7 +623,7 @@ export default async function (amp: PluginAPI) {
 		if (!state.watchdog.heartbeatId) {
 			let cursor: string | undefined
 			do {
-				const page = await callJson<unknown>(ctx.tools, 'linear.get_status_updates', { type: 'project', project: heartbeatProject, orderBy: 'updatedAt', limit: 50, ...(cursor ? { cursor } : {}) })
+				const page = await readJson<unknown>(ctx.tools, 'linear.get_status_updates', { type: 'project', project: heartbeatProject, orderBy: 'updatedAt', limit: 50, ...(cursor ? { cursor } : {}) })
 				// A failed lookup must not look like no row: it would add a second heartbeat row. Every row has its id and body.
 				state.watchdog.heartbeatId = listOf<{ id: string; body: string }>(page, 'statusUpdates', 'linear.get_status_updates', row => named(row.id) && typeof row.body === 'string').find(update => parseHeartbeat(update.body))?.id
 				cursor = nextPage(page, 'linear.get_status_updates')
@@ -630,9 +637,11 @@ export default async function (amp: PluginAPI) {
 	async function digestPosted(tools: Tools, day: string): Promise<boolean> {
 		let cursor: string | undefined
 		do {
-			const page = await callJson<{ messages?: unknown[]; nextCursor?: string }>(tools, 'slack_read', { operation: 'read_messages', channelName: alertsChannel, lookback: 'P1D', limit: 100, filter: { containsAll: [digestHeading(day)] }, ...(cursor ? { cursor } : {}) })
-			if (page.messages?.length) return true
-			cursor = page.nextCursor
+			const page = await readJson<Row>(tools, 'slack_read', { operation: 'read_messages', channelName: alertsChannel, lookback: 'P1D', limit: 100, filter: { containsAll: [digestHeading(day)] }, ...(cursor ? { cursor } : {}) })
+			// A malformed read is not "no digest yet": that would post the day's digest twice, or count a failed check as healthy.
+			if (listOf(page, 'messages', 'slack_read').length) return true
+			if (!optional(page, 'nextCursor', 'string')) throw new ReadError('slack_read returned a malformed nextCursor')
+			cursor = page.nextCursor as string | undefined
 		} while (cursor)
 		return false
 	}
@@ -642,7 +651,7 @@ export default async function (amp: PluginAPI) {
 		const ids: string[] = []
 		let cursor: string | undefined
 		do {
-			const page = await callJson<unknown>(tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields: ['id'], ...(cursor ? { cursor } : {}) })
+			const page = await readJson<unknown>(tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields: ['id'], ...(cursor ? { cursor } : {}) })
 			for (const issue of listOf<{ id: string }>(page, 'issues', 'linear.list_issues', row => named(row.id))) ids.push(issue.id)
 			cursor = nextPage(page, 'linear.list_issues')
 		} while (cursor)
@@ -653,25 +662,30 @@ export default async function (amp: PluginAPI) {
 	async function digestInput(ctx: EvalContext, day: string, now: Date, load: Load, cancelled: readonly string[], waits: readonly (DigestWait & { list: string })[]): Promise<DigestInput> {
 		const listed = (list: string) => waits.filter(wait => wait.list === list).map(({ identifier, reason }) => ({ identifier, reason }))
 		const since = new Date(now.getTime() - 24 * 60 * 60_000).toISOString()
-		const merged = await ctx.$`gh pr list --state merged --search ${`merged:>=${since.slice(0, 10)}`} --json number,title,headRefOid,mergeCommit,mergedAt --limit 50`
-		if (merged.exitCode !== 0) throw new Error(`gh pr list for the digest failed: ${merged.stderr.trim()}`)
-		type Issue = { id?: string; title?: string; completedAt?: string; createdAt?: string }
+		// Every read and every field the digest uses is validated: a malformed read fails the sweep (no heartbeat), never an empty day.
+		type MergedPr = { number: number; title: string; headRefOid: string; mergeCommit: { oid: string }; mergedAt: string }
+		const prs = ghJson(await ctx.$`gh pr list --state merged --search ${`merged:>=${since.slice(0, 10)}`} --json number,title,headRefOid,mergeCommit,mergedAt --limit 50`, 'gh pr list for the digest')
+		if (!Array.isArray(prs) || !prs.every(pr => isRow(pr) && typeof pr.number === 'number' && typeof pr.title === 'string' && sha40(pr.headRefOid) && isRow(pr.mergeCommit) && sha40(pr.mergeCommit.oid) && timestamp(pr.mergedAt))) {
+			throw new ReadError('gh pr list for the digest returned a malformed PR list')
+		}
+		type Issue = { id: string; title: string; completedAt?: string; createdAt?: string }
 		const issues = async (filter: Record<string, unknown>, fields: string[]) =>
-			(await callJson<{ issues?: Issue[] }>(ctx.tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields })).issues ?? []
-		const named = (list: Issue[]) => list.flatMap(issue => (issue.id ? [{ identifier: issue.id, title: issue.title ?? '' }] : []))
+			listOf<Issue>(await readJson(ctx.tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields }), 'issues', 'linear.list_issues',
+				row => named(row.id) && typeof row.title === 'string' && fields.slice(2).every(field => timestamp(row[field])))
+		const titled = (list: Issue[]) => list.map(issue => ({ identifier: issue.id, title: issue.title }))
 		const [done, bugs, escalated] = await Promise.all([
-			issues({ state: 'Done' }, ['id', 'title', 'completedAt']).then(list => list.filter(issue => (issue.completedAt ?? '') >= since)),
-			issues({ label: 'Bug', createdAt: '-P1D' }, ['id', 'title', 'createdAt']).then(list => list.filter(issue => (issue.createdAt ?? '') >= since)),
+			issues({ state: 'Done' }, ['id', 'title', 'completedAt']).then(list => list.filter(issue => issue.completedAt! >= since)),
+			issues({ label: 'Bug', createdAt: '-P1D' }, ['id', 'title', 'createdAt']).then(list => list.filter(issue => issue.createdAt! >= since)),
 			issues({ label: escalatedLabel }, ['id', 'title']),
 		])
 		return {
 			day,
-			merged: (JSON.parse(merged.stdout) as { number: number; title: string; headRefOid: string; mergeCommit?: { oid?: string }; mergedAt?: string }[])
-				.filter(pr => (pr.mergedAt ?? '') >= since)
-				.map(pr => ({ number: pr.number, title: pr.title, headSha: pr.headRefOid, mergeSha: pr.mergeCommit?.oid ?? 'unknown' })),
-			done: named(done),
-			bugs: named(bugs),
-			escalated: named(escalated),
+			merged: (prs as MergedPr[])
+				.filter(pr => pr.mergedAt >= since)
+				.map(pr => ({ number: pr.number, title: pr.title, headSha: pr.headRefOid, mergeSha: pr.mergeCommit.oid })),
+			done: titled(done),
+			bugs: titled(bugs),
+			escalated: titled(escalated),
 			load,
 			cancelled,
 			risk: listed('risk'),
@@ -871,7 +885,8 @@ export default async function (amp: PluginAPI) {
 	// Every refusal and failed merge at one head counts toward that head's failure episode, which pages at the third attempt.
 	async function merge(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, pr: number, sha: string): Promise<string | undefined> {
 		const draft = await ctx.$`gh pr view ${String(pr)} --json isDraft --jq .isDraft`
-		if (draft.exitCode === 0 && draft.stdout.trim() === 'true') {
+		if (draft.exitCode !== 0) throw new ReadError(`gh pr view ${pr} --json isDraft failed: ${draft.stderr.trim()}`)
+		if (draft.stdout.trim() === 'true') {
 			const ready = await ctx.$`gh pr ready ${String(pr)}`
 			if (ready.exitCode !== 0) throw new Error(`gh pr ready ${pr} failed: ${ready.stderr.trim()}`)
 			ctx.logger.log(marker, 'un-drafted', issue.identifier, pr)
@@ -890,9 +905,12 @@ export default async function (amp: PluginAPI) {
 		}
 		const merged = await ctx.$`gh pr merge ${String(pr)} --squash --match-head-commit ${sha}`
 		if (merged.exitCode !== 0) throw new Error(`gh pr merge ${pr} at ${sha} failed: ${merged.stderr.trim()}`)
+		// The receipt needs the merge commit. The merge has happened, so a failed confirmation is a failed read, not a
+		// receipt with `merge=unknown`: the next evaluation finds the PR merged and posts the receipt once (receiptMerge).
 		const view = await ctx.$`gh pr view ${String(pr)} --json mergeCommit --jq .mergeCommit.oid`
-		const mergeSha = view.exitCode === 0 ? view.stdout.trim() : 'unknown'
-		await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-merge pr=${pr} head=${sha} merge=${mergeSha} release=none` })
+		const mergeSha = view.stdout.trim()
+		if (view.exitCode !== 0 || !sha40(mergeSha)) throw new ReadError(`PR #${pr} merged at ${sha}, but its merge commit was not read (${view.exitCode !== 0 ? view.stderr.trim() : `got ${JSON.stringify(mergeSha.slice(0, 60))}`}); the merge receipt waits for the next evaluation`)
+		await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: mergeReceipt(pr, sha, mergeSha) })
 		ctx.logger.log(marker, 'merged', issue.identifier, pr, sha, mergeSha)
 		return undefined
 	}
@@ -954,7 +972,7 @@ export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 // release (the title carries the SHA; a second issue of the same release reuses it). Returns the Bug.
 export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, followUp: { title: string; body: string }): Promise<string | undefined> {
 	// A malformed row is a failed lookup, never "no Bug yet": that would file a duplicate.
-	const existing = listOf<{ id: string; title: string }>(await callJson(ctx.tools, 'linear.list_issues', { team: 'Metacomet', query: followUp.title, limit: 10 }), 'issues', 'linear.list_issues', row => named(row.id) && typeof row.title === 'string')
+	const existing = listOf<{ id: string; title: string }>(await readJson(ctx.tools, 'linear.list_issues', { team: 'Metacomet', query: followUp.title, limit: 10 }), 'issues', 'linear.list_issues', row => named(row.id) && typeof row.title === 'string')
 	const match = existing.find(candidate => candidate.title === followUp.title)
 	if (match?.id) {
 		await callJson(ctx.tools, 'linear.save_issue', { id: match.id, relatedTo: [issue.identifier] })
@@ -972,7 +990,7 @@ export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logge
 const diagnosed = new Set<string>()
 export async function diagnose(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, receipt: DeployReceipt, bug: string | undefined, spawn: Spawn) {
 	const label = `odd-deploy-${receipt.sha.slice(0, 12)}`
-	const found = listOf(await callJson(ctx.tools, 'find_thread', { query: `label:${label}`, limit: 1 }), 'threads', 'find_thread', row => named(row.id))
+	const found = listOf(await readJson(ctx.tools, 'find_thread', { query: `label:${label}`, limit: 1 }), 'threads', 'find_thread', row => named(row.id))
 	if (diagnosed.has(label) || found.length) {
 		ctx.logger.log(marker, 'deploy log reader exists', issue.identifier, label)
 		return
@@ -1023,11 +1041,39 @@ const optional = (row: Row, key: string, type: 'string' | 'boolean') => row[key]
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(item => typeof item === 'string')
 const timestamp = (value: unknown): value is string => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/.test(value) && Number.isFinite(Date.parse(value))
 
+/** A failed or malformed authoritative read. Wherever it is thrown, the evaluation is a failed derivation (MET-344). */
+class ReadError extends Error {}
+
+/** `callJson` for a read: any failure, an MCP error envelope included, is a ReadError. Writes keep `callJson`. */
+async function readJson<T>(tools: Tools, name: string, input: Record<string, unknown>): Promise<T> {
+	try {
+		return await callJson<T>(tools, name, input)
+	} catch (error: unknown) {
+		throw error instanceof ReadError ? error : new ReadError(error instanceof Error ? error.message : String(error))
+	}
+}
+
+const sha40 = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{40}$/.test(value)
+
+/** The merge receipt (§7): `odd-merge pr=<n> head=<sha> merge=<sha> release=none`. */
+const mergeReceipt = (pr: number, head: string, merge: string) => `odd-merge pr=${pr} head=${head} merge=${merge} release=none`
+
+/**
+ * A merged PR without its receipt (the confirmation read after `gh pr merge` failed) gets it before the issue moves to
+ * Deploying, from the merge commit the PR read has validated. The receipt is what makes older deploy receipts stale.
+ */
+async function receiptMerge(ctx: Pick<WebhookHandlerContext, 'tools'>, issue: IssueSnapshot, comments: readonly { body: string }[]) {
+	const pr = issue.pr
+	if (!pr?.merged || !sha40(pr.mergeSha)) return
+	if (comments.some(comment => comment.body.startsWith(`odd-merge pr=${pr.number} head=${pr.headSha} `))) return
+	await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: mergeReceipt(pr.number, pr.headSha, pr.mergeSha) })
+}
+
 /** The cursor of a Linear page: `hasNextPage` is a boolean, and a next page has a cursor. Ending without one would drop the rest. */
 function nextPage(page: unknown, name: string): string | undefined {
-	if (!isRow(page) || typeof page.hasNextPage !== 'boolean') throw new Error(`${name} returned no hasNextPage`)
+	if (!isRow(page) || typeof page.hasNextPage !== 'boolean') throw new ReadError(`${name} returned no hasNextPage`)
 	if (!page.hasNextPage) return undefined
-	if (!named(page.cursor)) throw new Error(`${name} reported a next page without a cursor`)
+	if (!named(page.cursor)) throw new ReadError(`${name} reported a next page without a cursor`)
 	return page.cursor
 }
 
@@ -1046,15 +1092,15 @@ const checkRecord = (row: unknown): boolean => {
 /** The `key` collection of a read; a missing or malformed one, or one bad row, is a failed read, never an empty list. */
 function listOf<T>(payload: unknown, key: string, name: string, valid: (row: Row) => boolean = () => true): T[] {
 	const list = (payload as Record<string, unknown> | null | undefined)?.[key]
-	if (!Array.isArray(list)) throw new Error(`${name} returned no ${key} list`)
+	if (!Array.isArray(list)) throw new ReadError(`${name} returned no ${key} list`)
 	const bad = list.findIndex(row => !isRow(row) || !valid(row))
-	if (bad >= 0) throw new Error(`${name} returned a malformed ${key} row at ${bad}`)
+	if (bad >= 0) throw new ReadError(`${name} returned a malformed ${key} row at ${bad}`)
 	return list as T[]
 }
 
 /** An issue read without its identifier, status or labels is a failed read, not a Backlog issue. */
 async function getIssue(tools: Tools, input: Record<string, unknown>): Promise<LinearIssue> {
-	const issue = await callJson<unknown>(tools, 'linear.get_issue', input)
+	const issue = await readJson<unknown>(tools, 'linear.get_issue', input)
 	// Requested relations must be present: an absent blocker list would lift the dependency gate.
 	const requested = input.includeRelations === true
 	const relations = isRow(issue) ? issue.relations : undefined
@@ -1063,13 +1109,13 @@ async function getIssue(tools: Tools, input: Record<string, unknown>): Promise<L
 		? !requested
 		: isRow(relations) && (blockedBy === undefined || blockedBy === null ? !requested : Array.isArray(blockedBy) && blockedBy.every(row => isRow(row) && named(row.id)))
 	if (!isRow(issue) || !named(issue.id) || !named(issue.status) || !strings(issue.labels) || !optional(issue, 'description', 'string') || !relationsValid) {
-		throw new Error(`linear.get_issue ${String(input.id)} returned a malformed issue`)
+		throw new ReadError(`linear.get_issue ${String(input.id)} returned a malformed issue`)
 	}
 	return issue as unknown as LinearIssue
 }
 
 const listComments = async (tools: Tools, issueId: string): Promise<Comment[]> =>
-	listOf<Comment>(await callJson(tools, 'linear.list_comments', { issueId, limit: 50 }), 'comments', 'linear.list_comments', row => typeof row.body === 'string' && optional(row, 'id', 'string') && optional(row, 'createdAt', 'string'))
+	listOf<Comment>(await readJson(tools, 'linear.list_comments', { issueId, limit: 50 }), 'comments', 'linear.list_comments', row => typeof row.body === 'string' && optional(row, 'id', 'string') && optional(row, 'createdAt', 'string'))
 
 type Comment = { id?: string; body: string; createdAt?: string }
 
@@ -1161,8 +1207,12 @@ const prListLimit = 1000
 const prFields = 'number,headRefName,headRefOid,state,mergeCommit,mergedAt,mergeable,statusCheckRollup,body'
 
 function ghJson(result: { exitCode: number; stdout: string; stderr: string }, command: string): unknown {
-	if (result.exitCode !== 0) throw new Error(`${command} failed: ${result.stderr.trim()}`)
-	return JSON.parse(result.stdout)
+	if (result.exitCode !== 0) throw new ReadError(`${command} failed: ${result.stderr.trim()}`)
+	try {
+		return JSON.parse(result.stdout)
+	} catch {
+		throw new ReadError(`${command} returned no JSON`)
+	}
 }
 
 async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, state: 'merged' | 'open'): Promise<GitHubPullRequest | undefined> {
@@ -1170,22 +1220,21 @@ async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifie
 	const listed = ghJson(state === 'open'
 		? await ctx.$`gh pr list --state open --json ${prListFields} --limit ${String(prListLimit)}`
 		: await ctx.$`gh pr list --search ${`"${identifier}"`} --state merged --json ${prListFields} --limit ${String(prListLimit)}`, command)
-	if (!Array.isArray(listed) || listed.some(pr => typeof pr?.number !== 'number' || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string')) throw new Error(`${command} returned a malformed PR list`)
-	if (listed.length >= prListLimit) throw new Error(`${command} filled its ${prListLimit} limit; PRs past it are unread`)
+	if (!Array.isArray(listed) || listed.some(pr => typeof pr?.number !== 'number' || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string')) throw new ReadError(`${command} returned a malformed PR list`)
+	if (listed.length >= prListLimit) throw new ReadError(`${command} filled its ${prListLimit} limit; PRs past it are unread`)
 	const owned = (listed as GitHubPullRequest[]).find(pr => prOwnsIssue(pr, identifier))
 	if (!owned) return undefined
 	const pr = ghJson(await ctx.$`gh pr view ${String(owned.number)} --json ${prFields}`, `gh pr view ${owned.number}`) as GitHubPullRequest | null
-	const sha = (value: unknown) => /^[0-9a-f]{40}$/.test(String(value))
 	// A merged PR's merge time is the durable start of its receipt wait, so it must be a usable timestamp.
-	const merged = state === 'merged' ? isRow(pr?.mergeCommit) && sha(pr.mergeCommit.oid) && timestamp(pr.mergedAt) : pr?.mergedAt === null || pr?.mergedAt === undefined || timestamp(pr.mergedAt)
-	if (!isRow(pr) || pr.number !== owned.number || pr.state !== state.toUpperCase() || !sha(pr.headRefOid) || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string' || !optional(pr, 'mergeable', 'string')
+	const merged = state === 'merged' ? isRow(pr?.mergeCommit) && sha40(pr.mergeCommit.oid) && timestamp(pr.mergedAt) : pr?.mergedAt === null || pr?.mergedAt === undefined || timestamp(pr.mergedAt)
+	if (!isRow(pr) || pr.number !== owned.number || pr.state !== state.toUpperCase() || !sha40(pr.headRefOid) || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string' || !optional(pr, 'mergeable', 'string')
 		|| !merged || !Array.isArray(pr.statusCheckRollup) || !pr.statusCheckRollup.every(checkRecord) || !prOwnsIssue(pr, identifier)) {
-		throw new Error(`gh pr view ${owned.number} returned malformed or changed details for ${state} ${identifier}`)
+		throw new ReadError(`gh pr view ${owned.number} returned malformed or changed details for ${state} ${identifier}`)
 	}
 	const head = await ctx.$`gh api ${`repos/{owner}/{repo}/commits/${pr.headRefOid}`} --jq .commit.committer.date`
-	if (head.exitCode !== 0) throw new Error(`gh api head commit ${pr.headRefOid} failed: ${head.stderr.trim()}`)
+	if (head.exitCode !== 0) throw new ReadError(`gh api head commit ${pr.headRefOid} failed: ${head.stderr.trim()}`)
 	const committedDate = head.stdout.trim()
-	if (!timestamp(committedDate)) throw new Error(`gh api head commit ${pr.headRefOid} returned no commit time`)
+	if (!timestamp(committedDate)) throw new ReadError(`gh api head commit ${pr.headRefOid} returned no commit time`)
 	return { ...pr, commits: [{ oid: pr.headRefOid, committedDate }] }
 }
 
@@ -1200,8 +1249,8 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 	const found: { id: string; updatedAt?: string }[] = []
 	let cursor: string | undefined
 	do {
-		const page = await callJson<{ nextCursor?: string }>(tools, 'find_thread', { query, limit: 100, ...(cursor ? { cursor } : {}) })
-		if (!optional(page as Row, 'nextCursor', 'string')) throw new Error('find_thread returned a malformed nextCursor')
+		const page = await readJson<{ nextCursor?: string }>(tools, 'find_thread', { query, limit: 100, ...(cursor ? { cursor } : {}) })
+		if (!optional(page as Row, 'nextCursor', 'string')) throw new ReadError('find_thread returned a malformed nextCursor')
 		const threads = listOf<{ id: string; updatedAt?: string }>(page, 'threads', 'find_thread', row => named(row.id) && optional(row, 'updatedAt', 'string'))
 		found.push(...threads)
 		cursor = threads.length ? page.nextCursor : undefined
@@ -1209,9 +1258,9 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 	const updated = new Map(found.map(({ id, updatedAt }) => [id, updatedAt]))
 	const ids = new Set([...found.map(({ id }) => id), ...known])
 	const threads = await Promise.all([...ids].map(async id => {
-		const status = await callJson<{ metadata: { labels: string[]; archived?: boolean }; agentState?: { state?: string } }>(tools, 'get_thread_status', { thread: id })
+		const status = await readJson<{ metadata: { labels: string[]; archived?: boolean }; agentState?: { state?: string } }>(tools, 'get_thread_status', { thread: id })
 		// An unknown execution state is not idleness: it would let the Watchdog cancel a running thread.
-		if (!strings(status?.metadata?.labels) || !named(status.agentState?.state) || !optional(status.metadata, 'archived', 'boolean')) throw new Error(`get_thread_status ${id} returned no labels or agent state`)
+		if (!strings(status?.metadata?.labels) || !named(status.agentState?.state) || !optional(status.metadata, 'archived', 'boolean')) throw new ReadError(`get_thread_status ${id} returned no labels or agent state`)
 		return { id, labels: status.metadata.labels, state: status.agentState.state, archived: status.metadata.archived === true, updatedAt: updated.get(id) }
 	}))
 	return threads.filter(thread => !thread.archived).map(({ archived: _, ...thread }) => thread)

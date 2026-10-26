@@ -142,7 +142,8 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
     const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
     let status: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> } | undefined;
     const amp = {
-      $: fakeShell().$,
+      // `override('$', { command })` may answer a shell command with its stdout.
+      $: fakeShell(command => override('$', { command }) as string | undefined).$,
       createAgent: () => ({ definition: {} }), registerAgentMode: () => {}, registerTool: (tool: typeof status) => { status = tool; },
       on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
       createWebhook: async (options: Record<string, unknown>) => (await override('createWebhook', options)) ?? { url: 'https://hooks.example/x' },
@@ -971,5 +972,109 @@ test('P3.7: the follow-up Bug lookup rejects malformed rows instead of filing a 
     const { result, saves } = await run({ issues: rows });
     assert.match((result as { error?: string }).error ?? '', /linear\.list_issues returned a malformed issues row at 0/, JSON.stringify(rows));
     assert.deepEqual(saves, [], `no Bug filed for ${JSON.stringify(rows)}`);
+  }
+});
+
+// --- P3.7 round 4: a failed read is a failed derivation wherever it happens -----------------
+
+const rolledBack = (plant: ReturnType<typeof factory>) => {
+  plant.issue('MET-9', 'Deploying');
+  plant.comments.set('MET-9', [{ id: 'c-r', body: 'odd-deploy host=factory-gpu component=meter sha=' + 'e'.repeat(40) + ' health=fail rollback=' + 'd'.repeat(12), createdAt: '2026-10-26T14:00:00.000Z' }]);
+};
+
+test('P3.7: a read that fails while acting withholds the heartbeat and writes nothing; a valid read acts and heartbeats', async t => {
+  const lookups: [string, unknown, boolean][] = [
+    ['valid empty Bug lookup (control)', undefined, true],
+    ['Bug lookup rows [{}]', { issues: [{}], hasNextPage: false }, false],
+    ['Bug lookup isError', { isError: true, content: [{ type: 'text', text: '{"issues":[],"hasNextPage":false}' }] }, false],
+  ];
+  for (const [name, lookup, healthy] of lookups) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        rolledBack(plant);
+        if (lookup !== undefined) plant.control.inject = (call, input) => call === 'linear.list_issues' && input.query ? lookup : undefined;
+        await plant.start();
+        await settle();
+        const sweep = (await plant.events()).find(event => event.issue === null);
+        assert.equal(plant.heartbeats(), healthy ? 1 : 0);
+        assert.equal(sweep?.stage, healthy ? 'performed' : 'failed');
+        // The rollback's follow-up: a Bug filed and MET-9 returned to Todo, or nothing at all.
+        assert.deepEqual(plant.saves, healthy ? ['undefined "Triage"', 'MET-9 "Todo"'] : []);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('P3.7: malformed digest reads fail the sweep without a heartbeat; a valid empty day posts the digest and heartbeats', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const digestRead = (input: Record<string, unknown>) => Array.isArray(input.fields) && input.fields.includes('title');
+  const run = async (override: (name: string, input: Record<string, unknown>) => unknown) => {
+    const orb = controlOrb((name, input) => override(name, input) ?? emptyWork(name));
+    await orb.start();
+    await until(() => orb.calls.includes('linear.list_issues'));
+    await settle();
+    return { heartbeats: orb.updates.length, digests: orb.alerts.filter(text => text.startsWith('ODD digest')).length };
+  };
+  assert.deepEqual(await run(() => undefined), { heartbeats: 1, digests: 1 }, 'control');
+  for (const [name, override] of [
+    ['digest issues {}', (call: string, input: Record<string, unknown>) => call === 'linear.list_issues' && digestRead(input) ? {} : undefined],
+    ['digest issue rows [{}]', (call: string, input: Record<string, unknown>) => call === 'linear.list_issues' && digestRead(input) ? { issues: [{}], hasNextPage: false } : undefined],
+    ['digest merged PRs [{}]', (call: string, input: Record<string, unknown>) => call === '$' && String(input.command).startsWith('gh pr list --state merged') ? '[{}]' : undefined],
+    ['digest posted-check without messages', (call: string, input: Record<string, unknown>) => call === 'slack_read' && input.channelName === 'factory-alerts' ? {} : undefined],
+  ] as const) {
+    assert.deepEqual(await run(override), { heartbeats: 0, digests: 0 }, name);
+  }
+});
+
+test('P3.7: a merge whose confirmation read fails posts no receipt and no heartbeat; the next evaluation posts the receipt once from the merged PR', async t => {
+  const cases: [string, (mergeSha: string) => Shell][] = [
+    ['valid merge commit (control)', mergeSha => ({ exitCode: 0, stdout: `${mergeSha}\n`, stderr: '' })],
+    ['confirmation fails', () => ({ exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway' })],
+    ['confirmation is null', () => ({ exitCode: 0, stdout: 'null\n', stderr: '' })],
+  ];
+  for (const [name, confirm] of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        const sha = 'c'.repeat(40);
+        const mergeSha = '7'.repeat(40);
+        plant.issue('MET-8', 'In Progress');
+        plant.builder('MET-8');
+        plant.threads.set('T-review', { labels: ['odd-issue-met-8', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-ready-${sha.slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+        plant.openPr('MET-8', sha);
+        const merges: string[] = [];
+        plant.control.gh = command => {
+          if (command === 'gh pr view 8 --json isDraft --jq .isDraft') return { exitCode: 0, stdout: 'false\n', stderr: '' };
+          if (command.startsWith('gh pr merge 8 ')) {
+            merges.push(command);
+            Object.assign(plant.prs[0], { state: 'MERGED', mergeCommit: { oid: mergeSha }, mergedAt: new Date().toISOString() });
+            return { exitCode: 0, stdout: '', stderr: '' };
+          }
+          if (command === 'gh pr view 8 --json mergeCommit --jq .mergeCommit.oid') return confirm(mergeSha);
+          return undefined;
+        };
+        const receipts = () => (plant.comments.get('MET-8') ?? []).filter(comment => comment.body.startsWith('odd-merge pr=')).map(comment => comment.body);
+        await plant.start();
+        await settle();
+        const valid = name.startsWith('valid');
+        assert.deepEqual(merges.length, 1);
+        assert.deepEqual(receipts(), valid ? [`odd-merge pr=8 head=${sha} merge=${mergeSha} release=none`] : [], 'no merge=unknown or merge=null receipt');
+        assert.equal(plant.heartbeats(), valid ? 1 : 0);
+        // The recheck finds the PR merged: one receipt from its validated merge commit, then Deploying; no second merge.
+        await advance(10 * 60_000);
+        assert.deepEqual(merges.length, 1, 'never merged twice');
+        assert.deepEqual(receipts(), [`odd-merge pr=8 head=${sha} merge=${mergeSha} release=none`]);
+        assert.ok(plant.saves.includes('MET-8 "Deploying"'));
+        assert.ok(plant.heartbeats() >= 1, 'later sweeps are healthy again');
+      } finally {
+        mock.timers.reset();
+      }
+    });
   }
 });
