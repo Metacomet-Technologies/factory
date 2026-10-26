@@ -9,11 +9,17 @@ FakeRootCheckOnlyTest: the real --check-only path of each installer with real
 artifacts built at HEAD (target/release, kiosk/dist), as uid 0 inside an
 unprivileged Bubblewrap user namespace. Deployment paths are disposable tmpfs
 mounts and system services are shims, so no host state can change.
+
+MeterPlanTest: MET-364, unprivileged. The meter installer relocated into a
+temporary tree with command stubs and temporary DBs; --plan and --no-db-change
+must classify read-only and refuse DB-generation changes before any change.
 """
 
+import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 import unittest
@@ -337,6 +343,172 @@ class FakeRootCheckOnlyTest(unittest.TestCase):
                 self.assertIn(f"Artifact {name} built at {self.head} but checkout {clone} is at {other}",
                               result.stderr)
                 self.assertNotIn("matches checkout", result.stdout)
+
+
+METER_PLAN_SHIMS = {
+    "sudo": """echo "sudo $*" >> "$CALLS"
+if [[ $1 == -u && $2 == agent && ${*: -1} == --build-info ]]; then printf '%s\\n' "$FAKE_BUILD_INFO"; exit 0; fi
+[[ $1 == -u ]] && shift 2
+exec "$@\"""",
+    "git": GIT,
+    "systemctl": """echo "systemctl $*" >> "$CALLS"
+case "$*" in
+  *--property=DropInPaths*) echo ;;
+  *--property=LoadState*) echo loaded ;;
+  "is-enabled "*) echo enabled ;;
+  "is-active --quiet "*) exit 0 ;;
+  "is-active "*) echo active ;;
+  *) exit 0 ;;
+esac""",
+    "flock": 'echo "flock $*" >> "$CALLS"; exit 1',
+    "hostname": "echo factory-gpu",
+    "tailscale": 'echo "{}"',
+    "nvidia-smi": 'echo "GPU 0: fake"',
+    "id": 'if [[ $1 == -u ]]; then echo 999; else echo "uid=999($1) gid=999($1)"; fi',
+    "getent": 'echo "$2:x:999:"',
+    "ss": "true",
+    **{name: f'echo "{name} $*" >> "$CALLS"; exec /usr/bin/{name} "$@"' for name in ("mktemp", "install")},
+    "useradd": 'echo "useradd $*" >> "$CALLS"; exit 99',
+}
+# Relocate the installer's fixed host paths into the fixture tree, as deploy.test.ts does.
+HOST_PATHS = re.compile(r"/srv/factory|/usr/local/|/etc/|/var/backups|/run/systemd/system")
+DB_STATES = {
+    "fresh": ("meter-plan mode=fresh user_version=none db_changing=yes", None),
+    "legacy": ("meter-plan mode=legacy user_version=0 db_changing=yes", 0),
+    "v1": ("meter-plan mode=v1 user_version=1 db_changing=yes", 1),
+    "future": ("meter-plan mode=unknown user_version=3 db_changing=yes", 3),
+    "unreadable": ("meter-plan mode=unknown user_version=none db_changing=yes", "garbage"),
+    "orphan sidecar": ("meter-plan mode=unknown user_version=none db_changing=yes", "orphan"),
+    "symlink": ("meter-plan mode=unknown user_version=none db_changing=yes", "symlink"),
+}
+V2_PLAN = "meter-plan mode=v2 user_version=2 db_changing=no"
+MUTATIONS = re.compile(r"^(mktemp|install|useradd|flock|systemctl (?!show|is-)|meter migrate(?!.*--check-only))", re.M)
+
+
+class MeterPlanTest(unittest.TestCase):
+    """MET-364: --plan and --no-db-change classify the DB generation read-only, unprivileged,
+    against temporary DBs and command stubs, and refuse every DB-changing or unknown state
+    before staging, service changes, backup locks, snapshots or DB writes."""
+
+    def setUp(self):
+        self.assertNotEqual(os.geteuid(), 0, "Run fixture tests unprivileged")
+        self.temp = tempfile.TemporaryDirectory()
+        base = pathlib.Path(self.temp.name)
+        self.tree = base / "host"
+        self.calls = base / "calls"
+        shims = base / "bin"
+        shims.mkdir()
+        for name, body in METER_PLAN_SHIMS.items():
+            (shims / name).write_text(f"#!/bin/bash\n{body}\n")
+            (shims / name).chmod(0o755)
+        self.checkout = self.tree / "repo"
+        (self.checkout / "deploy").mkdir(parents=True)
+        installer = HOST_PATHS.sub(lambda m: f"{self.tree}{m.group(0)}", (here / "install-meter.sh").read_text())
+        self.installer = self.checkout / "deploy/install-meter.sh"
+        self.installer.write_text(installer.replace("[[ $EUID -eq 0 ]]", "true"))
+        (self.checkout / "deploy/meter.service").write_text("[Service]\n")
+        (self.checkout / "deploy/set_ollama_host.py").write_text("")
+        for directory in ("srv/factory/meter", "usr/local/bin", "usr/local/lib/factory-backup", "run/systemd/system",
+                          "var/backups/factory-db", "etc/systemd/system/ollama.service.d", "etc/factory-backup"):
+            (self.tree / directory).mkdir(parents=True, exist_ok=True)
+        for path in ("etc/systemd/system/ollama.service.d/override.conf", "etc/factory-backup/nodes.conf",
+                     "usr/local/lib/factory-backup/factory-backup.sh", "usr/local/lib/factory-backup/restore-check.sh"):
+            (self.tree / path).write_text("")
+        self.db = self.tree / "srv/factory/meter/meter.db"
+        self.binary = base / "prebuilt"
+        self.binary.write_text('#!/bin/bash\necho "meter $*" >> "$CALLS"\n')
+        self.binary.chmod(0o755)
+        self.env = {
+            **os.environ, "PATH": f"{shims}:/usr/sbin:/usr/bin:/sbin:/bin", "CALLS": str(self.calls),
+            "FAKE_HEAD": HEAD, "FAKE_STATUS": "", "FAKE_BUILD_INFO": json.dumps({"git_sha": HEAD, "git_dirty": False}),
+        }
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def make_db(self, state):
+        for path in self.db.parent.glob("meter.db*"):
+            path.unlink()
+        if state is None:
+            return
+        if isinstance(state, int):
+            subprocess.run(["sqlite3", self.db, f"CREATE TABLE requests(id INTEGER); PRAGMA user_version={state};"], check=True)
+        elif state == "garbage":
+            self.db.write_bytes(b"not a sqlite database, " * 64)
+        elif state == "orphan":
+            pathlib.Path(f"{self.db}-wal").write_bytes(b"wal")
+        else:
+            target = self.db.parent / "elsewhere.db"
+            subprocess.run(["sqlite3", target, "PRAGMA user_version=2; CREATE TABLE t(x);"], check=True)
+            self.db.symlink_to(target)
+
+    def state(self):
+        """Every path, type, mode, mtime and content digest: a staged-and-removed directory still moves its parent's mtime."""
+        rows = []
+        for path in sorted(self.tree.rglob("*")):
+            info = path.lstat()
+            digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() and not path.is_symlink() else ""
+            rows.append((str(path), info.st_mode, info.st_mtime_ns, info.st_size, digest))
+        return rows
+
+    def run_installer(self, flag):
+        self.calls.write_text("")
+        result = subprocess.run(["bash", self.installer, "--source-checkout", self.checkout, flag, self.binary],
+                                env=self.env, text=True, capture_output=True, check=False)
+        return result, self.calls.read_text()
+
+    def assert_unchanged(self, flag, expected_rc):
+        before = self.state()
+        result, calls = self.run_installer(flag)
+        self.assertEqual(result.returncode, expected_rc, result.stdout + result.stderr)
+        self.assertEqual(self.state(), before, f"{flag} changed host state")
+        self.assertIsNone(MUTATIONS.search(calls), calls)
+        self.assertNotIn(".meter-stage", calls)
+        return result
+
+    def test_plan_reports_each_generation_read_only_and_fails_closed(self):
+        for case, (line, state) in {**DB_STATES, "v2": (V2_PLAN, 2)}.items():
+            with self.subTest(case=case):
+                self.make_db(state)
+                result = self.assert_unchanged("--plan", 0)
+                self.assertEqual(result.stdout.splitlines()[-1], line)
+                self.assertEqual(len(re.findall("^meter-plan ", result.stdout, re.M)), 1)
+
+    def test_no_db_change_refuses_db_changing_and_unknown_states_before_any_change(self):
+        for case, (line, state) in DB_STATES.items():
+            with self.subTest(case=case):
+                self.make_db(state)
+                result = self.assert_unchanged("--no-db-change", 1)
+                self.assertIn("No deployment changes made; no rollback snapshot exists.", result.stderr)
+                if case == "symlink":
+                    # The existing path-safety preflight refuses it first; --plan above still reports unknown.
+                    self.assertIn("Unsafe file", result.stderr)
+                    continue
+                self.assertIn(line, result.stdout.splitlines())
+                self.assertIn("Refusing automatic meter install", result.stderr)
+
+    def test_v2_stays_eligible_and_a_generation_change_after_plan_is_refused(self):
+        self.make_db(2)
+        self.assertEqual(self.assert_unchanged("--plan", 0).stdout.splitlines()[-1], V2_PLAN)
+        db = self.db.read_bytes()
+        # Control: v2 passes the recheck, stages and read-only checks, then stops at the busy
+        # backup lock (shim) before any snapshot, service change or DB write.
+        result, calls = self.run_installer("--no-db-change")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn("meter-plan", result.stdout)
+        self.assertIn("Backup or deployment is running", result.stderr)
+        self.assertRegex(calls, r"mktemp -d .*/usr/local/bin/\.meter-stage\.")
+        self.assertRegex(calls, r"meter migrate --check-only --db .*/meter\.db")
+        self.assertNotRegex(calls, "systemctl (?!show|is-)")
+        self.assertEqual(self.db.read_bytes(), db)
+        self.assertFalse((self.tree / "var/backups/meter").exists())
+        # Drift between the Deployer's plan and its install: v1 or a vanished DB is refused unchanged.
+        for state, line in ((1, DB_STATES["v1"][0]), (None, DB_STATES["fresh"][0])):
+            with self.subTest(drift=state):
+                self.make_db(state)
+                result = self.assert_unchanged("--no-db-change", 1)
+                self.assertIn(line, result.stdout.splitlines())
+                self.assertIn("Refusing automatic meter install", result.stderr)
 
 
 if __name__ == "__main__":

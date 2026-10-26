@@ -205,7 +205,7 @@ keyed by `issue + stage + SHA`).
 | Reviewer thread ends (`agent.end` with `odd-role-reviewer`) | Plugin | Read verdict label. `ready` → Shipper; `changes` → steer builder, round+1 or page at 3. | Shipper |
 | Merge receipt (`odd-merge`) | Control plane | Status `Deploying`; wait `release not published` until a receipt newer than the merge receipt appears. | — |
 | Release published | `factory-deploy.timer` poll on factory-gpu (no webhook: the runner paginates the GitHub releases API, oldest pending stable tag first) | Verify, install changed components, probe, roll back on red, post one receipt per issue in `Deploying`. | Deployer (runner job) |
-| Deploy receipt comment | Linear webhook | `health=fail` with a rollback snapshot → `Todo` plus a Bug follow-up in Triage (`Deploy failed: <component> at <sha12>`); `rollback=none` → page. Either red path also starts one log-reading Deployer on factory-gpu (thread label `odd-deploy-<sha12>`). The Bug and the log reader come before `Todo`, so a failure leaves the issue in `Deploying`; a failed evaluation re-checks the issue itself (90 s, doubling, up to 5 times) and a redelivered failed webhook is evaluated again; a page goes out even when its log reader cannot start, and `escalated` is set last. `health=pass` with no `odd-verify` comment for the receipt SHA → spawn Verifier. | Verifier |
+| Deploy receipt comment | Linear webhook | `health=fail` with a rollback snapshot → `Todo` plus a Bug follow-up in Triage (`Deploy failed: <component> at <sha12>`); `rollback=none` → page. Either red path also starts one log-reading Deployer on factory-gpu (thread label `odd-deploy-<sha12>`). `health=refused` → page `irreversible-action` only: no Bug, no log reader, no status change. The Bug and the log reader come before `Todo`, so a failure leaves the issue in `Deploying`; a failed evaluation re-checks the issue itself (90 s, doubling, up to 5 times) and a redelivered failed webhook is evaluated again; a page goes out even when its log reader cannot start, and `escalated` is set last. `health=pass` with no `odd-verify` comment for the receipt SHA → spawn Verifier. | Verifier |
 | `odd-verify` comment | Linear webhook | `result=pass` for the current receipt SHA → `Done`; `result=fail` → wait on the Bug it filed (the next release's receipt carries a new SHA and is verified again). A merged PR or a verify line for the receipt SHA satisfies the role's stop. | Intake (for the bug) |
 | Sweep tick (10 min) | `setInterval` in the plugin, started by `arm` | Watchdog: evaluate every issue with a live role thread, every `Triage` issue (never Backlog) and every `odd` issue in `Todo`/`In Progress`/`Deploying`; cancel threads stale for 15 min (`odd-watchdog cancelled` comment, status restored, immediate re-evaluation); caps alert after 60 min over; `control-plane-blind` page after 15 min of failed sweeps; daily digest. Spawns deferred to the dispatcher (no `odd` label) are recorded `ignored`. | Whatever `nextAction` returns |
 | `agent.end` on any `odd-role-*` thread | Plugin | Ralph guard: continue with the role's stop condition unless budget spent or an external check passed. | — |
@@ -281,7 +281,11 @@ Each artifact is machine-checkable before the next role starts.
   issue per release. `component` is `+`-joined install order (`meter+kiosk`),
   `none` when the release changed nothing the host runs, or the failed
   component. `rollback` is the snapshot the rollback restored, and only when
-  a re-probe finds the previous release healthy. Only receipts newer than the
+  a re-probe finds the previous release healthy. A refused release (§10
+  phase 5, meter DB generations) posts `health=refused rollback=none
+  refusal=db-changing-<fresh|legacy|v1|unknown>` for the refused component;
+  older pass/fail receipts parse unchanged, and a malformed refusal does not
+  parse. Only receipts newer than the
   issue's latest `odd-merge` comment (by creation time) count, so a stale
   receipt from an earlier merge cannot close a later one.
   Job state: ledger `~/.local/state/factory-odd/deploy.json` (`lastTag`,
@@ -307,6 +311,7 @@ Each artifact is machine-checkable before the next role starts.
 | Third `changes` verdict on one issue | Control plane | Slack DM, `escalated` label, `odd-escalated` comment, PR back to draft | Issue stays `In Progress` and nothing runs until Devon removes `escalated`. |
 | Health red after rollback | Deployer | Slack DM | Component left on previous release; all deploys of that component paused. |
 | Irreversible production action requested by a spec | Shipper or Deployer | Slack DM, `ui.confirm({ requireHuman: true })` in the control thread | Not executed. |
+| Release would change the meter DB generation (`health=refused` receipt) | Deployer, then control plane | Slack DM (`irreversible-action`), `escalated` label | Not executed: nothing in the release installs and `lastTag` holds until Devon migrates manually and clears the held receipt. |
 | Role round budget spent (builder 3, reviewer 2, verifier 2, intake and spec 1) after a Watchdog cancellation | Control plane | Slack DM (`budget-ceiling`), `escalated` label, `odd-escalated` comment, PR back to draft when one exists | Issue waits with no owner thread until Devon removes `escalated`; the next evaluation starts a fresh round. |
 | Soft caps exceeded for 60 min | Watchdog sweep | `#factory-alerts`, once per episode | Launches already stop at the caps; the alert only reports it. |
 | Control plane blind (every sweep failing for 15 min) | Watchdog sweep | Slack DM (`control-plane-blind`), once per episode | Backstop poller runs the lifecycle at 60 s cadence (phase 7). |
@@ -388,10 +393,25 @@ by the previous one).
    receipt; the control plane sets `Done`, `Todo` + Bug, or pages from the
    receipt. Dispatcher is not auto-deployed (its installer needs the runner
    list on stdin; it retires in phase 7), nor is usage until it has a
-   rollback that restores the previous timer. Known consequence: meter and
-   factory-api installers run their DB migrations; a rollback restores
-   binaries only, so a release with a migration is Devon's call in the spec's
-   risk class.
+   rollback that restores the previous timer. Meter DB generations
+   (MET-364): before any install, rollback or resume the job runs the
+   read-only `install-meter.sh --plan` (one `meter-plan mode=<m>
+   user_version=<n|none> db_changing=<yes|no>` line, no staging, service,
+   lock or snapshot) and installs meter only with `--no-db-change`, which
+   rechecks before its first change. Only a v2 rerun is eligible. A fresh,
+   legacy, v1, unclassifiable or failed plan installs nothing in the release,
+   and a generation change caught by the recheck installs nothing further;
+   both post `health=refused rollback=none refusal=db-changing-<mode>`; the control
+   plane pages `irreversible-action` (not executed), files no Bug, and
+   `lastTag` stays on the previous release. `rollback-meter-v1.sh` is not
+   binaries-only: for a db-changing snapshot it moves the current DB, WAL and
+   SHM aside and restores the older generation, so rows written after the
+   migration are not restored. Migration stays Devon's explicit manual
+   operation with a fresh verified backup; there is no approval flag. After
+   it, Devon clears the held `receipt` from the ledger so the next tick plans
+   again. factory-api is not planned: its installer may migrate and its
+   rollback may restore snapshot DBs, so a release with an API migration is
+   Devon's call in the spec's risk class.
    Historical-release repair: the job now checks out source in a separate
    worktree and keeps compatible installers, verifier and timer entry point
    at the approved tools commit. See [recovery](deployer-recovery.md) for the

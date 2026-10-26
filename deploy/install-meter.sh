@@ -7,9 +7,17 @@ if [[ ${1:-} == --source-checkout ]]; then
     checkout=${2:?Supply a clean source checkout after --source-checkout.}
     shift 2
 fi
-check_only=0
+# --plan prints one machine-readable meter-plan line and exits before staging,
+# service changes, backup locks or snapshots. --no-db-change is the automatic
+# deploy mode: it rechecks that plan before its first change and refuses any
+# DB-generation change. Migration is Devon's explicit manual operation.
+check_only=0 plan=0 no_db_change=0
 binary=${1:-}
-if [[ "$binary" == --check-only ]]; then check_only=1; binary=${2:-}; fi
+case "$binary" in
+    --check-only) check_only=1; binary=${2:-} ;;
+    --plan) plan=1; binary=${2:-} ;;
+    --no-db-change) no_db_change=1; binary=${2:-} ;;
+esac
 destination=/usr/local/bin/meter
 installed_unit=/etc/systemd/system/meter.service
 db=/srv/factory/meter/meter.db
@@ -97,14 +105,37 @@ assert_meter_ready() {
         fi
     done
 }
+# Read-only DB-generation classification shared by --plan, --no-db-change and
+# the install. No DB and no sidecars is fresh; a regular DB is legacy, v1 or v2
+# by user_version; anything else, including an unreadable DB, is unknown and
+# callers fail closed. Only a v2 rerun leaves the DB generation unchanged.
+classify_meter_db() {
+    mode=unknown
+    version=
+    if [[ ! -e "$db" && ! -L "$db" ]]; then
+        if [[ ! -e "$db-wal" && ! -L "$db-wal" && ! -e "$db-shm" && ! -L "$db-shm" ]]; then mode=fresh; fi
+    elif [[ -f "$db" && ! -L "$db" ]] && version=$(meter_sqlite "$db" 'PRAGMA user_version;' 2>/dev/null); then
+        case "$version" in 0) mode=legacy ;; 1) mode=v1 ;; 2) mode=v2 ;; esac
+    fi
+    [[ "$version" =~ ^[0-9]+$ ]] || version=
+    db_changing=yes
+    if [[ "$mode" == v2 ]]; then db_changing=no; fi
+    printf -v meter_plan 'meter-plan mode=%s user_version=%s db_changing=%s' "$mode" "${version:-none}" "$db_changing"
+}
 # Source only the DB helpers for non-root shell regression tests.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
-[[ $# -eq $((1 + check_only)) ]] || fail 'Supply exactly one prebuilt binary path, optionally after --check-only.'
+flags=$((check_only + plan + no_db_change))
+[[ $# -eq $((1 + flags)) ]] || fail 'Supply exactly one prebuilt binary path, optionally after --check-only, --plan or --no-db-change.'
 [[ -f "$binary" && -x "$binary" ]] || fail 'Supply an executable prebuilt meter binary.'
 info=$(sudo -u agent "$binary" --build-info) || fail "meter --build-info failed; rebuild from $root."
 verify_artifact meter "$info" "$checkout"
-[[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-meter.sh [--check-only] <prebuilt-binary>.'
+[[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-meter.sh [--check-only|--plan|--no-db-change] <prebuilt-binary>.'
 trap 'printf "ERROR: meter install failed at line %s.\n" "$LINENO" >&2; rollback_hint' ERR
+if (( plan )); then
+    classify_meter_db
+    printf '%s\n' "$meter_plan"
+    exit 0
+fi
 
 # Read-only preflight: no accounts, DBs or deployment files are created here.
 for command in systemctl curl sudo tailscale nvidia-smi useradd getent id install cp touch date mktemp realpath ss sqlite3 mv flock stat df awk sha256sum zstd python3 cmp chmod chown hostname env cat rm dirname bash sleep; do
@@ -144,6 +175,15 @@ for path in "$destination" /usr/local/bin/meter.new "$installed_unit" "$db" "$db
     done
 done
 [[ ! -L /var/backups/meter && ( ! -e /var/backups/meter || -d /var/backups/meter ) ]] || fail 'Unsafe meter snapshot directory.'
+classify_meter_db
+if (( no_db_change )) && [[ "$db_changing" != no ]]; then
+    printf '%s\n' "$meter_plan"
+    fail "Refusing automatic meter install: mode $mode changes the DB generation; migration is Devon's explicit manual operation."
+fi
+if [[ "$mode" == unknown ]]; then
+    [[ -e "$db" || -L "$db" ]] || fail 'Orphan meter sidecars; recover first.'
+    fail "Unsupported meter user_version: ${version:-unreadable}"
+fi
 # Temporary executable staging lets meter run preflight without traversing the
 # agent's private checkout. No installed binary or service is changed here.
 stage=$(mktemp -d /usr/local/bin/.meter-stage.XXXXXX)
@@ -152,19 +192,11 @@ verification_dir=
 trap 'rm -rf -- "$stage"; if [[ -n "$migration_dir" ]]; then rm -rf -- "$migration_dir"; fi; if [[ -n "$verification_dir" ]]; then rm -rf -- "$verification_dir"; fi' EXIT
 chmod 0755 "$stage"
 install -m 0755 "$binary" "$stage/meter"
-mode=fresh
-if [[ -f "$db" ]]; then
-    version=$(meter_sqlite "$db" 'PRAGMA user_version;')
-    case "$version" in
-        0) mode=legacy; sudo -u meter "$stage/meter" migrate --legacy "$db" --check-only ;;
-        # v1 upgrades in place to v2 (MET-205 rollups); v2 is a rerun.
-        1) mode=v1; sudo -u meter "$stage/meter" migrate --check-only --db "$db" ;;
-        2) mode=v2; sudo -u meter "$stage/meter" migrate --check-only --db "$db" ;;
-        *) fail "Unsupported meter user_version: $version" ;;
-    esac
-else
-    [[ ! -e "$db-wal" && ! -e "$db-shm" ]] || fail 'Orphan meter sidecars; recover first.'
-fi
+case "$mode" in
+    legacy) sudo -u meter "$stage/meter" migrate --legacy "$db" --check-only ;;
+    # v1 upgrades in place to v2 (MET-205 rollups); v2 is a rerun.
+    v1|v2) sudo -u meter "$stage/meter" migrate --check-only --db "$db" ;;
+esac
 if [[ "$mode" == legacy ]]; then
     [[ -f "$destination" && -f "$installed_unit" ]] || fail 'Legacy conversion requires a previous binary and unit.'
     for suffix in '' -wal -shm; do [[ ! -e "$legacy$suffix" ]] || fail "Preserved v0 collision: $legacy$suffix"; done

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { nextAction, specComplete, ralphGuard, parseDeployReceipt, parseVerify, parseCancelled, pageText, verifyLine, cancelledLine, threadLabels, parseThreadLabels, capacity, issueTriaged, controlPlaneSilent, heartbeatLine, parseHeartbeat, silenceMs, type Action, type IssueSnapshot, type PageReason } from './lifecycle.ts';
+import { nextAction, specComplete, ralphGuard, parseDeployReceipt, deployReceiptLine, parseVerify, parseCancelled, pageText, verifyLine, cancelledLine, threadLabels, parseThreadLabels, capacity, issueTriaged, controlPlaneSilent, heartbeatLine, parseHeartbeat, silenceMs, type Action, type IssueSnapshot, type PageReason } from './lifecycle.ts';
 
 const spec = `## Goal
 Ship it.
@@ -105,6 +105,29 @@ test('deploy receipts: no receipt waits, healthy is Done, rolled back returns to
     detail: 'kiosk on factory-gpu unhealthy at abcdef1234: odd-deploy host=factory-gpu component=kiosk sha=abcdef1234 health=fail rollback=none',
   });
   assert.equal(parseDeployReceipt('odd-deploy host=x component=y sha=zz health=pass rollback=none'), undefined);
+});
+
+test('a refused deploy receipt is its own type: it pages irreversible-action, never reads as pass, unchanged or a failed rollback, and malformed refusals do not parse', () => {
+  const refused = 'odd-deploy host=factory-gpu component=meter sha=abcdef1234 health=refused rollback=none refusal=db-changing-v1';
+  const receipt = parseDeployReceipt(`note\n${refused}\n`);
+  assert.deepEqual(receipt, { host: 'factory-gpu', component: 'meter', sha: 'abcdef1234', health: 'refused', rollback: 'none', refusal: 'db-changing-v1' });
+  assert.equal(deployReceiptLine(receipt!), refused);
+  const action = nextAction(issue({ status: 'Deploying', deployReceipt: receipt }), idle);
+  assert.deepEqual(action, { kind: 'page', reason: 'irreversible-action', sha: 'abcdef1234',
+    detail: `meter on factory-gpu not installed at abcdef1234 (db-changing-v1): automatic deploys never change the meter DB generation; migration stays Devon's explicit manual operation. ${refused}` });
+  assert.match(pageText('MET-1', action as Extract<Action, { kind: 'page' }>), /^ODD page: irreversible-action \| issue MET-1 \| - \| abcdef1234 \| default if silent: not executed\./);
+  // Legacy receipts parse exactly as before and carry no refusal.
+  const legacy = 'odd-deploy host=factory-gpu component=meter sha=abcdef1234 health=fail rollback=none';
+  assert.deepEqual(parseDeployReceipt(legacy), { host: 'factory-gpu', component: 'meter', sha: 'abcdef1234', health: 'fail', rollback: 'none' });
+  assert.equal(deployReceiptLine(parseDeployReceipt(legacy)!), legacy);
+  for (const malformed of [
+    refused.replace(' refusal=db-changing-v1', ''),
+    refused.replace('db-changing-v1', 'db-changing-v2'),
+    refused.replace('rollback=none', 'rollback=/var/backups/meter/snap'),
+    refused.replace('health=refused', 'health=pass'),
+    refused.replace('health=refused', 'health=fail'),
+    `${refused} extra=1`,
+  ]) assert.equal(parseDeployReceipt(malformed), undefined, malformed);
 });
 
 test('ralph guard stops on the external condition or the budget, never on the agent claim', () => {
