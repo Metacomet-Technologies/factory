@@ -6,6 +6,7 @@ import { capacity, type Action } from './lifecycle.ts';
 import { receiptLabel, type LiveThread } from './snapshot.ts';
 import plugin from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
+import { io } from './launch.ts';
 
 const now = new Date('2026-10-24T15:16:00Z');
 const idleFor = (minutes: number, over: Partial<LiveThread> = {}): LiveThread =>
@@ -380,7 +381,32 @@ test('P3.1: one shared blocker is one incident; it is plane-blocked only when ev
   assert.equal(incidentPageDue({ ...incident, due: true, delivered: 'action-failed' }), true, 'an action-failed page is raised to plane-blocked once');
 });
 
-type Pr = { number: number; headRefName: string; headRefOid: string; state: 'OPEN' | 'MERGED'; mergeCommit: null; mergeable: string; commits: { oid: string; committedDate: string }[]; statusCheckRollup: { name: string; conclusion: string }[]; body: string };
+type Pr = { number: number; headRefName: string; headRefOid: string; state: 'OPEN' | 'MERGED'; mergeCommit: { oid: string } | null; mergedAt?: string; mergeable: string; commits: { oid: string; committedDate: string }[]; statusCheckRollup: { name: string; conclusion: string }[]; body: string };
+type Shell = { exitCode: number; stdout: string; stderr: string };
+
+/**
+ * GitHub behind `gh pr list` and `gh pr view <n> --json`: rows carry only the requested fields,
+ * newest first, cut at `--limit`. gh reads at most 100 PRs per GraphQL page and `commits` asks
+ * for 100 commits × 100 authors per PR, so a page over GitHub's 500,000-node bound is refused
+ * with GitHub's own error (the full-field `--limit 100` list asked for 1,000,000). Other
+ * commands are left to the caller.
+ */
+function github(command: string, prs: readonly Pr[]): Shell | undefined {
+  const view = /^gh pr view (\d+) --json ([\w,]+)$/.exec(command);
+  const list = /^gh pr list (?:--search "([^"]+)" )?--state (open|merged) --json ([\w,]+) --limit (\d+)$/.exec(command);
+  if (!view && !list) return undefined;
+  const fields = (view ? view[2] : list![3]).split(',');
+  const nodes = (view ? 1 : Math.min(Number(list![4]), 100)) * (fields.includes('commits') ? 100 * 100 : 1);
+  if (nodes > 500_000) return { exitCode: 1, stdout: '', stderr: `GraphQL: By the time this query traverses to the authors connection, it is requesting up to ${nodes.toLocaleString('en-US')} possible nodes which exceeds the maximum limit of 500,000.` };
+  const row = (pr: Pr) => Object.fromEntries(fields.map(field => [field, pr[field as keyof Pr]]));
+  if (view) {
+    const pr = prs.find(candidate => candidate.number === Number(view[1]));
+    return pr ? { exitCode: 0, stdout: JSON.stringify(row(pr)), stderr: '' } : { exitCode: 1, stdout: '', stderr: `GraphQL: Could not resolve to a PullRequest with the number of ${view[1]}.` };
+  }
+  const [, search, state, , limit] = list!;
+  const matches = prs.filter(pr => pr.state === state.toUpperCase() && (!search || `${pr.headRefName} ${pr.body}`.toLowerCase().includes(search.toLowerCase())));
+  return { exitCode: 0, stdout: JSON.stringify(matches.slice(0, Number(limit)).map(row)), stderr: '' };
+}
 const fullSpec = '## Goal\nx\n\n## Isolation\nx\n\n## Build\n- x\n\n## Done means\n- x\n\n## Evidence\n- x\n';
 const head = (n: number) => String(n).repeat(40).slice(0, 40).replace(/[^0-9a-f]/g, 'a');
 
@@ -396,11 +422,19 @@ function factory() {
   const threads = new Map<string, { labels: string[]; state: string; archived: boolean; updatedAt: string }>();
   const dms: string[] = [];
   const steers: string[] = [];
-  const control = { slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '' };
+  const control = { slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '', gh: undefined as ((command: string) => Shell | undefined) | undefined, inject: undefined as ((name: string, input: Record<string, unknown>) => unknown) | undefined };
+  /** Lifecycle mutations: status writes, builder launches and heartbeats (comments, archives, steers and DMs are kept above). */
+  const saves: string[] = [];
+  const launches: string[] = [];
+  let heartbeats = 0;
+  // No fixture starts a live `amp` builder; an attempt is recorded and fails.
+  mock.method(io, 'start', (argv: readonly string[]) => { launches.push(argv.join(' ')); throw new Error('fixture: no live launch'); });
   let slackAttempts = 0;
   let commentIds = 0;
   let generation = 0;
   const tools = { call: async (name: string, input: Record<string, unknown>) => {
+    const injected = control.inject?.(name, input);
+    if (injected !== undefined) return injected;
     switch (name) {
       case 'linear.list_issues': return { issues: [...issues.values()].filter(issue => issue.status === input.state && (!input.label || issue.labels.includes(String(input.label)))).map(({ id }) => ({ id })), hasNextPage: false };
       case 'linear.get_issue':
@@ -417,7 +451,7 @@ function factory() {
         comments.set(String(input.issueId), [...list, comment]);
         return { id: comment.id };
       }
-      case 'linear.save_issue': return {};
+      case 'linear.save_issue': saves.push(`${input.id} ${JSON.stringify(input.state ?? input.addLabels)}`); return {};
       case 'find_thread': {
         const label = /label:(\S+)/.exec(String(input.query))?.[1] ?? '';
         return { threads: [...threads].filter(([, thread]) => !thread.archived && thread.labels.includes(label)).map(([id, thread]) => ({ id, updatedAt: thread.updatedAt })) };
@@ -432,18 +466,15 @@ function factory() {
         return { ok: true };
       case 'slack_read': return { messages: [] };
       case 'linear.get_status_updates': return { statusUpdates: [], hasNextPage: false };
-      case 'linear.save_status_update': return { id: 'heartbeat' };
+      case 'linear.save_status_update': heartbeats += 1; return { id: 'heartbeat' };
       default: return {};
     }
   } };
-  const { $: shell } = fakeShell(command => {
-    if (command.startsWith('gh pr list --state open')) return JSON.stringify(prs.filter(pr => pr.state === 'OPEN'));
-    if (command.startsWith('gh pr list')) return '[]';
-    return undefined;
-  });
+  const { $: shell } = fakeShell();
   const $ = async (strings: TemplateStringsArray, ...values: unknown[]) => {
     if (control.refuse && strings.join('').includes(' check ')) return { exitCode: 1, stdout: '', stderr: control.refuse };
-    return shell(strings, ...values);
+    const command = strings.reduce((text, part, i) => text + part + (i < values.length ? String(values[i]) : ''), '');
+    return control.gh?.(command) ?? github(command, prs) ?? shell(strings, ...values);
   };
   let created = 0;
   const amp = (mine: number) => ({
@@ -454,8 +485,8 @@ function factory() {
       threads.set(id, { labels: [], state: 'running', archived: false, updatedAt: new Date().toISOString() });
       return { id, setLabels: async (labels: string[]) => { threads.get(id)!.labels = labels; }, appendUserMessage: async () => {} };
     } }),
-    registerAgentMode: () => {}, registerTool: () => {},
-    on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { if (name === 'session.start') starts.set(mine, handler); },
+    registerAgentMode: () => {}, registerTool: (tool: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> }) => { statuses.set(mine, tool.execute); },
+    on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { if (name === 'session.start') starts.set(mine, handler); if (name === 'agent.end') ends.set(mine, handler); },
     createWebhook: async () => ({ url: 'https://hooks.example/x' }),
     system: { executor: { kind: 'remote', keepAlive: async () => {} } },
     threads: { get: (id: string) => ({ labels: async () => threads.get(id)!.labels, addLabels: async () => [], appendUserMessage: async (message: { content: string }) => {
@@ -464,13 +495,19 @@ function factory() {
     } }) },
   });
   const starts = new Map<number, (event: unknown, ctx: unknown) => Promise<unknown>>();
-  const builder = (issue: string, state = 'idle') => threads.set(`T-${issue}`, { labels: [`odd-issue-${issue.toLowerCase()}`, 'odd-role-builder', 'odd-round-1', 'odd-engine-anthropic'], state, archived: false, updatedAt: new Date().toISOString() });
+  const ends = new Map<number, (event: unknown, ctx: unknown) => Promise<unknown>>();
+  const statuses = new Map<number, (input: Record<string, unknown>, ctx: unknown) => Promise<string>>();
+  const builder = (issue: string, state = 'idle', updatedAt = new Date().toISOString()) => threads.set(`T-${issue}`, { labels: [`odd-issue-${issue.toLowerCase()}`, 'odd-role-builder', 'odd-round-1', 'odd-engine-anthropic'], state, archived: false, updatedAt });
   const openPr = (issue: string, sha: string, over: Partial<Pr> = {}) => {
     const n = Number(issue.slice(4));
     prs.push({ number: n, headRefName: `${issue.toLowerCase()}-x`, headRefOid: sha, state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: sha, committedDate: new Date().toISOString() }], statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }], body: `closes ${issue}`, ...over });
   };
   return {
-    issues, comments, prs, threads, dms, steers, control, builder, openPr, slackAttempts: () => slackAttempts,
+    issues, comments, prs, threads, dms, steers, control, builder, openPr, saves, launches, heartbeats: () => heartbeats, slackAttempts: () => slackAttempts,
+    /** The latest plugin load's `odd_control_status`: its handled events. */
+    events: async () => (JSON.parse(await statuses.get(generation)!({}, { thread: { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] } })) as { events: { issue: string | null; stage: string; error?: string }[] }).events,
+    /** The Ralph guard as the latest plugin load runs it at the end of a role thread's turn. */
+    guard: (labels: string[]) => ends.get(generation)!({ status: 'done', message: '', thread: { id: 'T-role' } }, { thread: { id: 'T-role', labels: async () => labels }, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools, $ }),
     issue: (id: string, status: string) => issues.set(id, { id, status, labels: ['odd', 'Bug', 'area:agents'], description: fullSpec }),
     episodes: (id: string) => (comments.get(id) ?? []).filter(comment => comment.body.startsWith('odd-failure')).map(comment => comment.body.split('\n')[0]),
     async start() {
@@ -645,4 +682,110 @@ test('P3.1: a failed steer is retried and recorded only after delivery; the reco
   await advance(30 * 60_000);
   assert.equal(plant.dms.length, 1, 'one page per episode, across a reload');
   assert.equal(plant.steers.length, 1);
+});
+
+// --- P3.7: authoritative reads fail closed (MET-344) -----------------------------------------
+
+const otherPr = (n: number): Pr => ({ number: n, headRefName: `met-${n}-other`, headRefOid: 'e'.repeat(40), state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: 'e'.repeat(40), committedDate: '2026-10-26T10:00:00Z' }], statusCheckRollup: [], body: `closes MET-${n}` });
+const builderLabels = ['odd-issue-met-7', 'odd-role-builder', 'odd-round-1', 'odd-engine-anthropic'];
+
+test('P3.7: open-PR discovery stays under GitHub\'s node bound, finds an owned PR past the first 100 with its head time, and an open PR wins over a merged one', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  const sha = 'f'.repeat(40);
+  plant.issue('MET-7', 'In Progress');
+  plant.builder('MET-7');
+  // An earlier merged PR of MET-7 must not win over its open PR (that would move MET-7 to Deploying).
+  plant.prs.push({ ...otherPr(6), headRefName: 'met-7-first-try', state: 'MERGED', mergeCommit: { oid: '9'.repeat(40) }, mergedAt: '2026-10-25T12:00:00Z', body: 'closes MET-7' });
+  for (let n = 1000; n < 1140; n++) plant.prs.push(otherPr(n));
+  // The owned open PR is the 141st open PR, past gh's first 100-PR page; CI is still running.
+  plant.openPr('MET-7', sha, { statusCheckRollup: [{ name: 'ci', conclusion: '' }], commits: [{ oid: 'a'.repeat(40), committedDate: '2026-10-26T13:00:00Z' }, { oid: sha, committedDate: '2026-10-26T13:30:00Z' }] });
+  // A merged-only issue still derives Deploying from its merged PR.
+  plant.issue('MET-8', 'In Progress');
+  plant.prs.push({ ...otherPr(8), headRefName: 'met-8-done', state: 'MERGED', mergeCommit: { oid: '8'.repeat(40) }, mergedAt: '2026-10-26T14:00:00Z', body: 'closes MET-8' });
+  await plant.start();
+  await settle();
+  // The CI wait is aged from the head commit (13:30), not an older commit or the sweep: 90 min is past its 60 min budget.
+  assert.equal(plant.dms.length, 1);
+  assert.match(plant.dms[0], new RegExp(`^\\[odd\\] ODD page: wait-overdue \\| issue MET-7 \\| PR #7 \\| ${sha} \\| .*ci pending at f{12}: ci wait is 90 min old \\(budget 60 min\\) since 2026-10-26T13:30:00Z`));
+  assert.ok(!plant.saves.some(save => save.startsWith('MET-7 ')), 'MET-7 keeps its status');
+  assert.ok(plant.saves.includes('MET-8 "Deploying"'));
+  assert.deepEqual(plant.launches, []);
+  assert.equal(plant.heartbeats(), 1);
+  // The Ralph guard reads the same late-page PR: CI is running, not "no open PR".
+  const verdict = await plant.guard(builderLabels) as { userMessage?: string } | undefined;
+  assert.match(verdict?.userMessage ?? '', /CI still running on the PR head/);
+});
+
+test('P3.7: a failed, malformed or truncated read is never missing work: no cancellation, archive, status change, Builder, steer or heartbeat; the failure pages', async t => {
+  const sha = 'c'.repeat(40);
+  const refused = (match: string, stdout = '', stderr = 'HTTP 502: Bad Gateway (https://api.github.com/graphql)', exitCode = 1) =>
+    (command: string): Shell | undefined => command.startsWith(match) ? { exitCode, stdout, stderr } : undefined;
+  const envelope = (json: unknown) => ({ isError: true, content: [{ type: 'text', text: JSON.stringify(json) }] });
+  const cases: { name: string; error: RegExp; guard?: RegExp; setup: (plant: ReturnType<typeof factory>) => void }[] = [
+    { name: 'gh pr list fails', error: /gh pr list --state open failed: HTTP 502/, guard: /gh pr list --state open failed/, setup: plant => { plant.control.gh = refused('gh pr list --state open'); } },
+    { name: 'gh pr list returns no list', error: /gh pr list --state open returned a malformed PR list/, guard: /malformed PR list/, setup: plant => { plant.control.gh = refused('gh pr list --state open', '{"message":"Bad credentials"}', '', 0); } },
+    { name: 'gh pr list fills its limit', error: /filled its 1000 limit/, guard: /filled its 1000 limit/, setup: plant => { plant.prs.unshift(...Array.from({ length: 1000 }, (_, i) => otherPr(2000 + i))); } },
+    { name: 'gh pr view fails', error: /gh pr view 7 failed: HTTP 502/, guard: /gh pr view 7 failed/, setup: plant => { plant.control.gh = refused('gh pr view 7 --json number'); } },
+    { name: 'gh pr view drops the commits', error: /gh pr view 7 returned malformed or changed details/, guard: /malformed or changed details/, setup: plant => { plant.control.gh = refused('gh pr view 7 --json number', JSON.stringify({ number: 7, headRefName: 'met-7-x', headRefOid: sha, state: 'OPEN', statusCheckRollup: [], body: 'closes MET-7' }), '', 0); } },
+    { name: 'list_comments isError', error: /linear\.list_comments returned an error/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? envelope({ comments: [] }) : undefined; } },
+    { name: 'get_issue isError', error: /linear\.get_issue returned an error/, setup: plant => { plant.control.inject = name => name === 'linear.get_issue' ? envelope({ id: 'MET-7', status: 'Todo', labels: ['odd'], description: fullSpec }) : undefined; } },
+    { name: 'list_comments without its payload', error: /linear\.list_comments returned no comments list/, setup: plant => { plant.control.inject = name => name === 'linear.list_comments' ? {} : undefined; } },
+  ];
+  for (const { name, error, guard, setup } of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        plant.issue('MET-7', 'In Progress');
+        // The MET-364 shape: an idle Builder past the stale limit whose PR is open and green.
+        plant.builder('MET-7', 'idle', '2026-10-26T14:30:00.000Z');
+        plant.openPr('MET-7', sha);
+        setup(plant);
+        await plant.start();
+        // Rechecks and two more sweeps; the blind episode pages at the sweep 20 minutes in.
+        await advance(21 * 60_000);
+        assert.deepEqual(plant.comments.get('MET-7') ?? [], [], 'no cancellation, steer or launch-failure record');
+        assert.equal(plant.threads.get('T-MET-7')!.archived, false, 'the Builder is not archived');
+        assert.deepEqual([...plant.threads.keys()].filter(id => id.startsWith('T-spawned')), [], 'no role thread spawned');
+        assert.deepEqual(plant.saves, [], 'no status change');
+        assert.deepEqual(plant.launches, [], 'no duplicate Builder');
+        assert.deepEqual(plant.steers, []);
+        assert.equal(plant.heartbeats(), 0, 'a sweep whose only evaluation failed is not healthy');
+        assert.equal(plant.dms.length, 1);
+        const failed = (await plant.events()).filter(event => event.issue === 'MET-7');
+        assert.ok(failed.length && failed.every(event => event.stage === 'failed'), 'every evaluation of MET-7 failed');
+        assert.match(failed[0].error ?? '', error);
+        assert.match(plant.dms[0], /^\[odd\] ODD page: control-plane-blind \| .*every sweep since 2026-10-26T15:00:00\.000Z failed: Error: all 1 evaluations failed/);
+        // The Ralph guard neither continues the Builder nor tells it its PR is missing.
+        if (guard) await assert.rejects(plant.guard(builderLabels), guard);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('P3.7: an empty enumeration is healthy only when no live role thread holds an open issue, and a failed enumeration is not an empty one', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const liveBuilder = (status: string) => controlOrb((name, input) => {
+    if (name === 'linear.list_issues') return { issues: [], hasNextPage: false, cursor: '' };
+    if (name === 'find_thread') return /odd-role-builder|odd-issue-met-1 /.test(String(input.query)) ? { threads: [{ id: 'T-1', updatedAt: new Date().toISOString() }] } : { threads: [] };
+    if (name === 'linear.get_issue') return { id: 'MET-1', status, labels: ['odd'], description: '', relations: { blockedBy: [] } };
+    return undefined;
+  });
+  const swept = async (orb: ReturnType<typeof controlOrb>) => {
+    await orb.start();
+    await until(() => orb.calls.includes('linear.list_issues'));
+    await settle();
+    return orb.updates.length;
+  };
+  assert.equal(await swept(controlOrb(emptyWork)), 1, 'a valid empty, idle workspace writes its heartbeat');
+  assert.equal(await swept(liveBuilder('Done')), 1, 'a live thread on a finished issue is resolved work');
+  assert.equal(await swept(liveBuilder('In Progress')), 0, 'Linear listing nothing while a Builder holds an In Progress issue is a failed sweep');
+  const listed = (result: unknown) => controlOrb(name => name === 'linear.list_issues' ? result : emptyWork(name));
+  assert.equal(await swept(listed({ isError: true, content: [{ type: 'text', text: '{"issues":[],"hasNextPage":false}' }] })), 0, 'an isError envelope is a failed read');
+  assert.equal(await swept(listed({})), 0, 'a missing issues payload is a failed read');
 });

@@ -536,17 +536,23 @@ export default async function (amp: PluginAPI) {
 				const { issue } = parseThreadLabels(thread.labels)
 				if (issue) identifiers.add(issue.toUpperCase())
 			}
+			const fromThreads = new Set(identifiers)
 			// Backlog is on demand (Devon moves an idea to Triage), so the sweep never enumerates it.
-			for (const id of await issueIds(ctx.tools, { state: 'Triage' })) identifiers.add(id)
-			for (const status of ['Todo', 'In Progress', 'Deploying']) for (const id of await issueIds(ctx.tools, { state: status, label: oddLabel })) identifiers.add(id)
+			const owned = [...await issueIds(ctx.tools, { state: 'Triage' })]
+			for (const status of ['Todo', 'In Progress', 'Deploying']) owned.push(...await issueIds(ctx.tools, { state: status, label: oddLabel }))
+			for (const id of owned) identifiers.add(id)
 			watchdog.issues = identifiers.size
 			let failed = 0
+			const unresolved: string[] = []
 			for (const identifier of identifiers) {
 				// Only a failed derivation is blindness; an action that fails (no reviewer can spawn) is an incident, not a blind plane.
 				const evaluated = await evaluate(ctx, state, 'watchdog', identifier, at)
 				if (evaluated.stage === 'failed' && !evaluated.action) failed += 1
+				if (fromThreads.has(identifier) && (!evaluated.status || ['Triage', 'Todo', 'In Progress', 'Deploying'].includes(evaluated.status))) unresolved.push(identifier)
 			}
 			if (identifiers.size && failed === identifiers.size) throw new Error(`all ${failed} evaluations failed`)
+			// Live role threads on open issues while Linear lists no ODD-owned issue: the enumeration is not trusted (MET-344).
+			if (!owned.length && unresolved.length) throw new Error(`issue enumeration returned no issues while live role threads hold ${unresolved.join(', ')}`)
 			// Episodes also come due by age alone (five minutes), and a page Slack refused is retried here.
 			if (performing) await raiseIncidents(ctx, state)
 			const load = loadFrom(threads)
@@ -625,8 +631,8 @@ export default async function (amp: PluginAPI) {
 		const ids: string[] = []
 		let cursor: string | undefined
 		do {
-			const page = await callJson<{ issues?: { id?: string }[]; hasNextPage?: boolean; cursor?: string }>(tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields: ['id'], ...(cursor ? { cursor } : {}) })
-			for (const issue of page.issues ?? []) if (issue.id) ids.push(issue.id)
+			const page = await callJson<{ hasNextPage?: boolean; cursor?: string }>(tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields: ['id'], ...(cursor ? { cursor } : {}) })
+			for (const issue of listOf<{ id?: string }>(page, 'issues', 'linear.list_issues')) if (issue.id) ids.push(issue.id)
 			cursor = page.hasNextPage ? page.cursor : undefined
 		} while (cursor)
 		return ids
@@ -936,8 +942,8 @@ export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 // A rolled-back release returns its issues to Todo and files one Bug in Triage per failed
 // release (the title carries the SHA; a second issue of the same release reuses it). Returns the Bug.
 export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, followUp: { title: string; body: string }): Promise<string | undefined> {
-	const existing = await callJson<{ issues?: { id?: string; title?: string }[] }>(ctx.tools, 'linear.list_issues', { team: 'Metacomet', query: followUp.title, limit: 10 })
-	const match = existing.issues?.find(candidate => candidate.title === followUp.title)
+	const existing = listOf<{ id?: string; title?: string }>(await callJson(ctx.tools, 'linear.list_issues', { team: 'Metacomet', query: followUp.title, limit: 10 }), 'issues', 'linear.list_issues')
+	const match = existing.find(candidate => candidate.title === followUp.title)
 	if (match?.id) {
 		await callJson(ctx.tools, 'linear.save_issue', { id: match.id, relatedTo: [issue.identifier] })
 		ctx.logger.log(marker, 'follow-up exists', issue.identifier, match.id)
@@ -954,8 +960,8 @@ export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logge
 const diagnosed = new Set<string>()
 export async function diagnose(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, receipt: DeployReceipt, bug: string | undefined, spawn: Spawn) {
 	const label = `odd-deploy-${receipt.sha.slice(0, 12)}`
-	const found = await callJson<{ threads: { id: string }[] }>(ctx.tools, 'find_thread', { query: `label:${label}`, limit: 1 })
-	if (diagnosed.has(label) || found.threads.length) {
+	const found = listOf(await callJson(ctx.tools, 'find_thread', { query: `label:${label}`, limit: 1 }), 'threads', 'find_thread')
+	if (diagnosed.has(label) || found.length) {
 		ctx.logger.log(marker, 'deploy log reader exists', issue.identifier, label)
 		return
 	}
@@ -984,27 +990,46 @@ type Tools = WebhookHandlerContext['tools']
 // `ctx.tools.call` returns the full CallToolResult for MCP tools: the payload is JSON in the
 // first text block (or `structuredContent` when the server provides it). Built-in tools return
 // their result directly; pass those through unchanged.
+// An `isError` envelope is a failed read even when its text parses as JSON (MET-344).
 async function callJson<T>(tools: Tools, name: string, input: Record<string, unknown>): Promise<T> {
 	const result = (await tools.call(name, input)) as { structuredContent?: unknown; content?: { type: string; text?: string }[] } | T
 	if (typeof result !== 'object' || result === null) return result as T
-	const envelope = result as { structuredContent?: unknown; content?: { type: string; text?: string }[] }
+	const envelope = result as { isError?: boolean; structuredContent?: unknown; content?: { type: string; text?: string }[] }
+	if (envelope.isError === true) throw new Error(`${name} returned an error: ${envelope.content?.find(block => block.type === 'text')?.text?.slice(0, 200) ?? 'no detail'}`)
 	if (envelope.structuredContent !== undefined) return envelope.structuredContent as T
 	const textBlock = envelope.content?.find(block => block.type === 'text' && typeof block.text === 'string')
 	if (!textBlock) return result as T
 	return JSON.parse(textBlock.text as string) as T
 }
 
+/** The `key` collection of a read; a missing or malformed one is a failed read, never an empty list. */
+function listOf<T>(payload: unknown, key: string, name: string): T[] {
+	const list = (payload as Record<string, unknown> | null | undefined)?.[key]
+	if (!Array.isArray(list)) throw new Error(`${name} returned no ${key} list`)
+	return list as T[]
+}
+
+/** An issue read without its identifier and status is a failed read, not a Backlog issue. */
+async function getIssue(tools: Tools, input: Record<string, unknown>): Promise<LinearIssue> {
+	const issue = await callJson<LinearIssue>(tools, 'linear.get_issue', input)
+	if (typeof issue?.id !== 'string' || typeof issue.status !== 'string') throw new Error(`linear.get_issue ${String(input.id)} returned no issue`)
+	return issue
+}
+
+const listComments = async (tools: Tools, issueId: string): Promise<Comment[]> =>
+	listOf<Comment>(await callJson(tools, 'linear.list_comments', { issueId, limit: 50 }), 'comments', 'linear.list_comments')
+
 type Comment = { id?: string; body: string; createdAt?: string }
 
 async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, knownThreads: readonly string[]): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
 	const [issue, comments, pr, threads] = await Promise.all([
-		callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: identifier, includeRelations: true }),
-		callJson<{ comments?: Comment[] }>(ctx.tools, 'linear.list_comments', { issueId: identifier, limit: 50 }).then(result => result.comments ?? []),
+		getIssue(ctx.tools, { id: identifier, includeRelations: true }),
+		listComments(ctx.tools, identifier),
 		pullRequestFor(ctx, identifier),
 		threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, knownThreads),
 	])
 	// `blockedBy` lists the relation's issues without their status; a blocker is open until closed.
-	const blockers = await Promise.all((issue.relations?.blockedBy ?? []).map(({ id }) => callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id })))
+	const blockers = await Promise.all((issue.relations?.blockedBy ?? []).map(({ id }) => getIssue(ctx.tools, { id })))
 	const openBlockers = blockers.filter(blocker => !['Done', 'Canceled', 'Duplicate'].includes(blocker.status)).map(blocker => blocker.id)
 	return { snapshot: toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers }), threads, comments }
 }
@@ -1075,25 +1100,37 @@ async function recordRouting(ctx: ShellContext, thread: LiveThread) {
 // PR by minutes (MET-279 was moved to Deploying off an older merged PR while #180 was open);
 // merged ones were indexed while open, so the quoted search (an unquoted `MET-301` also matches
 // `301`) is a safe prefilter for them.
+// Ownership is listed with flat fields only and the owning PR alone is read in full: nested
+// commits on a 100-PR page ask GitHub for 1,000,000 nodes, over its 500,000 bound (MET-344).
+// A failed or malformed read, or a list that fills its limit, throws: it is never "no PR".
+const prListFields = 'number,headRefName,body'
+const prListLimit = 1000
 const prFields = 'number,headRefName,headRefOid,state,mergeCommit,mergedAt,mergeable,commits,statusCheckRollup,body'
 
-async function pullRequestsFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, identifier: string, state: 'merged' | 'open'): Promise<GitHubPullRequest[]> {
-	const result = state === 'open'
-		? await ctx.$`gh pr list --state open --json ${prFields} --limit 100`
-		: await ctx.$`gh pr list --search ${`"${identifier}"`} --state merged --json ${prFields} --limit 20`
-	if (result.exitCode !== 0) {
-		ctx.logger.log(marker, 'gh pr list failed', result.stderr.trim())
-		return []
-	}
-	return (JSON.parse(result.stdout) as GitHubPullRequest[]).filter(pr => prOwnsIssue(pr, identifier))
+function ghJson(result: { exitCode: number; stdout: string; stderr: string }, command: string): unknown {
+	if (result.exitCode !== 0) throw new Error(`${command} failed: ${result.stderr.trim()}`)
+	return JSON.parse(result.stdout)
 }
 
-async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$' | 'logger'>, identifier: string): Promise<GitHubPullRequest | undefined> {
+async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, state: 'merged' | 'open'): Promise<GitHubPullRequest | undefined> {
+	const command = `gh pr list --state ${state}`
+	const listed = ghJson(state === 'open'
+		? await ctx.$`gh pr list --state open --json ${prListFields} --limit ${String(prListLimit)}`
+		: await ctx.$`gh pr list --search ${`"${identifier}"`} --state merged --json ${prListFields} --limit ${String(prListLimit)}`, command)
+	if (!Array.isArray(listed) || listed.some(pr => typeof pr?.number !== 'number')) throw new Error(`${command} returned a malformed PR list`)
+	if (listed.length >= prListLimit) throw new Error(`${command} filled its ${prListLimit} limit; PRs past it are unread`)
+	const owned = (listed as GitHubPullRequest[]).find(pr => prOwnsIssue(pr, identifier))
+	if (!owned) return undefined
+	const pr = ghJson(await ctx.$`gh pr view ${String(owned.number)} --json ${prFields}`, `gh pr view ${owned.number}`) as GitHubPullRequest | null
+	if (pr?.number !== owned.number || pr.state !== state.toUpperCase() || !/^[0-9a-f]{40}$/.test(String(pr.headRefOid)) || !Array.isArray(pr.commits) || !Array.isArray(pr.statusCheckRollup) || !prOwnsIssue(pr, identifier)) {
+		throw new Error(`gh pr view ${owned.number} returned malformed or changed details for ${state} ${identifier}`)
+	}
+	return pr
+}
+
+async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string): Promise<GitHubPullRequest | undefined> {
 	// Prefer the open PR; otherwise the merged one, so a merged issue derives `Deploying`.
-	const [open] = await pullRequestsFor(ctx, identifier, 'open')
-	if (open) return open
-	const [merged] = await pullRequestsFor(ctx, identifier, 'merged')
-	return merged
+	return (await ownedPullRequest(ctx, identifier, 'open')) ?? (await ownedPullRequest(ctx, identifier, 'merged'))
 }
 
 // `known` are thread IDs this control plane spawned that the search index may not return yet.
@@ -1102,14 +1139,16 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 	const found: { id: string; updatedAt?: string }[] = []
 	let cursor: string | undefined
 	do {
-		const page = await callJson<{ threads: { id: string; updatedAt?: string }[]; nextCursor?: string }>(tools, 'find_thread', { query, limit: 100, ...(cursor ? { cursor } : {}) })
-		found.push(...page.threads)
-		cursor = page.threads.length ? page.nextCursor : undefined
+		const page = await callJson<{ nextCursor?: string }>(tools, 'find_thread', { query, limit: 100, ...(cursor ? { cursor } : {}) })
+		const threads = listOf<{ id: string; updatedAt?: string }>(page, 'threads', 'find_thread')
+		found.push(...threads)
+		cursor = threads.length ? page.nextCursor : undefined
 	} while (cursor)
 	const updated = new Map(found.map(({ id, updatedAt }) => [id, updatedAt]))
 	const ids = new Set([...found.map(({ id }) => id), ...known])
 	const threads = await Promise.all([...ids].map(async id => {
 		const status = await callJson<{ metadata: { labels: string[]; archived?: boolean }; agentState?: { state?: string } }>(tools, 'get_thread_status', { thread: id })
+		if (!Array.isArray(status?.metadata?.labels)) throw new Error(`get_thread_status ${id} returned no labels`)
 		return { id, labels: status.metadata.labels, state: status.agentState?.state ?? 'idle', archived: status.metadata.archived === true, updatedAt: updated.get(id) }
 	}))
 	return threads.filter(thread => !thread.archived).map(({ archived: _, ...thread }) => thread)
@@ -1126,7 +1165,7 @@ async function currentLoad(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>)
 // The Ralph guard's external checks: each is read from Linear or GitHub, never from the agent.
 async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools' | 'logger'>, role: Role, issue: string, labels: readonly string[]): Promise<{ stopMet: boolean; missing: string[] }> {
 	if (role === 'intake' || role === 'spec') {
-		const snapshot = await callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: issue })
+		const snapshot = await getIssue(ctx.tools, { id: issue })
 		const missing = role === 'intake'
 			? issueTriaged(snapshot)
 			: specComplete(snapshot.description ?? '') ? [] : ['Goal, Isolation, Build, Done means and Evidence sections, with one Evidence line per Done-means item']
@@ -1135,8 +1174,8 @@ async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools' | 'lo
 	if (role === 'verifier') {
 		// The verdict is the `odd-verify` comment for the latest receipt's SHA (snapshot.toSnapshot).
 		const [snapshot, comments] = await Promise.all([
-			callJson<LinearIssue>(ctx.tools, 'linear.get_issue', { id: issue }),
-			callJson<{ comments?: { body: string; createdAt?: string }[] }>(ctx.tools, 'linear.list_comments', { issueId: issue, limit: 50 }).then(result => result.comments ?? []),
+			getIssue(ctx.tools, { id: issue }),
+			listComments(ctx.tools, issue),
 		])
 		const { deployReceipt, verify } = toSnapshot({ issue: { ...snapshot, comments } })
 		if (!deployReceipt) return { stopMet: false, missing: [`no odd-deploy receipt on ${issue}`] }
@@ -1145,10 +1184,11 @@ async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools' | 'lo
 			: { stopMet: false, missing: [`comment \`${verifyLine({ sha: deployReceipt.sha, result: 'pass' })}\` (or result=fail bug=<MET-n>) on ${issue}`] }
 	}
 	if (role !== 'builder' && role !== 'reviewer') return { stopMet: true, missing: [] }
-	const [open] = await pullRequestsFor(ctx, issue, 'open')
+	// A failed PR read throws: the guard neither continues the thread nor claims the PR is missing.
+	const open = await ownedPullRequest(ctx, issue, 'open')
 	if (!open) {
 		// A PR merged before the guard ran (MET-279's #179) is delivered work, not a missing PR.
-		const [merged] = await pullRequestsFor(ctx, issue, 'merged')
+		const merged = await ownedPullRequest(ctx, issue, 'merged')
 		return merged ? { stopMet: true, missing: [] } : { stopMet: false, missing: [`no open PR for ${issue}`] }
 	}
 	const { headRefOid, statusCheckRollup = [] } = open

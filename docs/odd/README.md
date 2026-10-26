@@ -482,7 +482,17 @@ by the previous one).
    a cancellation before archiving the thread (a failed comment keeps the
    thread, so the round is not lost) and a blind episode ends only when a
    whole sweep, digest and heartbeat included, succeeds; a rejected labels
-   read fails one sweep and never blocks the next (MET-342); the digest is
+   read fails one sweep and never blocks the next (MET-342). Authoritative
+   reads fail closed (MET-344): an MCP `isError` envelope, a missing payload
+   or a malformed issue, thread or PR collection is a failed read, never an
+   empty one; a nonzero `gh` exit throws instead of meaning "no PR", so the
+   Ralph guard, stale-thread cancellation and evaluation neither continue,
+   cancel, archive nor claim a missing PR off it. Open PRs are listed with
+   flat ownership fields only (`number,headRefName,body`, limit 1000; a list
+   that fills the limit fails) and only the owning PR is read in full with
+   `gh pr view`, because nested `commits` on a 100-PR page exceeds GitHub's
+   500,000-node bound. An empty issue enumeration while live role threads
+   hold open issues fails the sweep and writes no heartbeat; the digest is
    split into Slack messages of at most 2800 characters. Removing the
    `odd-perform` label is the off-switch: the plane keeps evaluating but
    records `dry-run`.
