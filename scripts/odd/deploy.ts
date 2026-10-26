@@ -314,7 +314,6 @@ async function installRelease(effects: Effects, tag: string, sha: string, dir: s
   const resumed = inFlight?.sha === sha ? recipes.find(recipe => recipe.name === inFlight.component) : undefined;
   const inventory = JSON.parse(effects.run('git', ['-C', ROOT, 'show', `${sha}:deploy/components.json`]).stdout) as { components: { id: string; sources: string[] }[] };
   const sources = Object.fromEntries(inventory.components.map(component => [component.id, component.sources]));
-  let deferredKiosk = false;
   const select = (recovering = false) => {
     const ledger = effects.readLedger();
     // Only a healthy record is a baseline: a failed target was rolled back, so its inputs are still undeployed.
@@ -325,7 +324,6 @@ async function installRelease(effects: Effects, tag: string, sha: string, dir: s
       // API serves /version.json too. Only a transport outage during recorded API recovery
       // can defer kiosk evidence; any usable identity must still pass all ancestry checks.
       const dependentOutage = recovering && resumed?.name === 'factory-api' && recipe.name === 'kiosk' && !identity;
-      if (dependentOutage) deferredKiosk = true;
       const floor = ledger.manualBaseline?.sha;
       if (floor && ((!live && !(recovering && recipe === resumed) && !dependentOutage) ||
           (identity && !effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', floor, identity.sha])))) {
@@ -342,7 +340,7 @@ async function installRelease(effects: Effects, tag: string, sha: string, dir: s
   // Guard the entire plan before resuming even one interrupted installer.
   if (resumed) {
     const result = await deployComponent(effects, resumed, tag, sha, dir);
-    if (deferredKiosk) changed = select();
+    if (resumed.name === 'factory-api') changed = select();
     if (result.health === 'fail') return result;
   }
   for (const recipe of changed) {

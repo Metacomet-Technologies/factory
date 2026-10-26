@@ -67,8 +67,9 @@ live drift below it or unavailable/degraded baseline evidence stops deployment
 Because factory-api also serves kiosk, an unreachable kiosk endpoint may be
 deferred only while recovering a recorded in-flight API attempt. Usable identities
 still undergo ancestry/clean checks. After API reinstall or rollback, the job
-rechecks dependent health and replans before any other installation or success
-receipt; a continued outage or unsafe identity stops forward progress.
+always rechecks dependent health and replans before any other installation or
+success receipt, even if kiosk was healthy before recovery; a new or continued
+outage or unsafe identity stops forward progress.
 
 `reconcile-manual v0.2.49` previews an explicit adoption. It fetches tags, verifies
 a fresh immutable release bundle with the current verifier, then checks all

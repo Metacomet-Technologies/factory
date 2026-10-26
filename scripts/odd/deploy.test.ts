@@ -487,6 +487,49 @@ test('recorded API recovery restores its dependent kiosk endpoint before any fur
   }
 });
 
+test('an initially healthy kiosk must remain healthy after recorded API recovery before a success receipt', async t => {
+  const tags: Tag[] = ['v0.2.10', 'v0.2.49'];
+  const host = world({ tags, ledger: { lastTag: 'v0.2.10', components: {} },
+    live: Object.fromEntries(recipes.map(recipe => [recipe.name, shas['v0.2.49']])),
+    changes: { 'v0.2.50': ['factory-api/src/main.rs'] }, issues: { 'v0.2.50': ['MET-350'] } });
+  t.after(host.cleanup);
+  const preview = await reconcileManual(host.effects, 'v0.2.49');
+  await reconcileManual(host.effects, 'v0.2.49', preview.approval);
+  tags.push('v0.2.50');
+  host.effects.writeLedger({ ...host.ledger(), inFlight: {
+    tag: 'v0.2.50', sha: shas['v0.2.50'], component: 'factory-api', phase: 'installing',
+  } });
+  let recovered = false;
+  let kioskUnavailable = true;
+  let dependentChecks = 0;
+  const probe = host.effects.probe;
+  host.effects.probe = url => {
+    if (!recovered && url === recipes[1].health) throw new Error('API unavailable');
+    if (recovered && url === recipes[2].health) {
+      dependentChecks++;
+      if (kioskUnavailable) throw new Error('kiosk unavailable after API reinstall');
+    }
+    return probe(url);
+  };
+  const sudo = host.effects.sudo;
+  host.effects.sudo = (script, args) => {
+    assert.equal(script, 'deploy/install-factory-api.sh');
+    recovered = true;
+    return sudo(script, args);
+  };
+  await assert.rejects(main(host.effects), /Manual baseline drift for kiosk/);
+  assert.ok(dependentChecks > 0);
+  assert.equal(host.ledger().lastTag, 'v0.2.10');
+  assert.equal(host.ledger().receipt, undefined);
+  assert.deepEqual(host.comments, []);
+  kioskUnavailable = false;
+  await main(host.effects);
+  assert.equal(sudoCalls(host.calls).length, 1, 'healthy retry delivers without reinstalling API');
+  assert.equal(host.ledger().lastTag, 'v0.2.50');
+  assert.deepEqual(host.ledger().manualBaseline, preview);
+  assert.deepEqual(host.comments, [['MET-350', line(`component=factory-api sha=${shas['v0.2.50']} health=pass rollback=none`)]]);
+});
+
 test('API recovery does not excuse a usable unsafe kiosk identity or an unrelated outage', async t => {
   for (const control of ['dirty', 'newer', 'degraded', 'unrecorded', 'meter-outage']) {
     const host = manuallyRecovered();
