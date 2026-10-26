@@ -399,8 +399,9 @@ by the previous one).
    user_version=<n|none> db_changing=<yes|no>` line, no staging, service,
    lock or snapshot; the committed version, WAL included, is read from a
    private scratch copy because SQLite creates sidecars even for read-only
-   opens, accepted only when the live main file is unchanged and the live WAL
-   still begins with the copied bytes, else retried twice and then `unknown`;
+   opens, accepted only when the live main file and WAL are byte-identical
+   to the copies both before and after the read (a grown WAL is a newer
+   commit), else retried up to five attempts and then `unknown`;
    an unsafe DB, sidecar or parent path is `unknown`) and installs meter only
    with `--no-db-change`, which rechecks before its path checks and first
    change. Only a v2 rerun is eligible. A fresh, legacy,

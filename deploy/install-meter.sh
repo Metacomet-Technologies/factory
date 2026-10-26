@@ -115,7 +115,7 @@ assert_meter_ready() {
 # committed generation (main file plus any WAL, which may hold a newer
 # user_version) is read from a private scratch copy removed before returning.
 classify_meter_db() {
-    local scratch suffix parent
+    local scratch suffix parent wal
     mode=unknown
     version=
     parent=$(dirname "$db")
@@ -130,24 +130,34 @@ classify_meter_db() {
         if [[ ! -e "$db-wal" && ! -e "$db-shm" && ! -e "$db-journal" ]]; then mode=fresh; fi
     elif [[ ! -e "$db-journal" ]] && scratch=$(mktemp -d); then
         # A checkpoint between the two copies would pair a stale main file with
-        # a consumed WAL. Accept a capture only when the live main file is still
-        # byte-identical and the live WAL still begins with the copied bytes
-        # (later appends are later commits); otherwise retry, then fail closed.
-        for _ in 1 2 3; do
+        # a consumed WAL, and a commit before the read would make the scratch
+        # generation stale. Accept a read only when the live main file and WAL
+        # are byte-identical to the scratch copy both before and after it (a WAL
+        # that grew is a newer commit); otherwise retry, then fail closed.
+        for _ in 1 2 3 4 5; do
             rm -f -- "$scratch/meter.db" "$scratch/meter.db-wal" "$scratch/meter.db-shm"
+            wal=
+            if [[ -e "$db-wal" ]]; then wal=$scratch/wal-copy; fi
             if cp -- "$db" "$scratch/meter.db" \
-                && { [[ ! -e "$db-wal" ]] || cp -- "$db-wal" "$scratch/meter.db-wal"; } \
-                && cmp -s -- "$db" "$scratch/meter.db" \
-                && { [[ ! -e "$scratch/meter.db-wal" ]] \
-                    || cmp -s -n "$(stat -c %s "$scratch/meter.db-wal")" -- "$db-wal" "$scratch/meter.db-wal"; }; then
-                version=$(sqlite3 -readonly "$scratch/meter.db" 'PRAGMA user_version;' 2>/dev/null) || version=
+                && { [[ -z "$wal" ]] || { cp -- "$db-wal" "$wal" && cp -- "$wal" "$scratch/meter.db-wal"; }; } \
+                && capture_current "$scratch" "$wal" \
+                && version=$(sqlite3 -readonly "$scratch/meter.db" 'PRAGMA user_version;' 2>/dev/null) \
+                && capture_current "$scratch" "$wal"; then
                 case "$version" in 0) mode=legacy ;; 1) mode=v1 ;; 2) mode=v2 ;; esac
                 break
             fi
+            version=
+            sleep 0.2
         done
         rm -rf -- "$scratch"
     fi
     classified_plan
+}
+# Are the live main file and WAL still exactly the copies: main file in $1,
+# untouched WAL copy at $2 (empty when none was copied, then no live WAL bytes)?
+capture_current() {
+    cmp -s -- "$db" "$1/meter.db" || return 1
+    if [[ -n "$2" ]]; then cmp -s -- "$db-wal" "$2"; else [[ ! -s "$db-wal" ]]; fi
 }
 classified_plan() {
     [[ "$version" =~ ^[0-9]+$ ]] || version=

@@ -371,19 +371,26 @@ esac""",
     "ss": "true",
     **{name: f'echo "{name} $*" >> "$CALLS"; exec /usr/bin/{name} "$@"' for name in ("mktemp", "install")},
     "useradd": 'echo "useradd $*" >> "$CALLS"; exit 99',
-    # A concurrent writer: CP_HOOK runs right after the classifier copies the main file into scratch.
-    "cp": '/usr/bin/cp "$@" || exit; if [[ -n ${CP_HOOK:-} && ${*: -1} == */meter.db ]]; then python3 "$CP_HOOK" "${@: -2:1}"; fi',
+    # A concurrent writer: WRITER runs right after the classifier copies the main file into scratch
+    # (WRITER_ON=cp), or right after a successful comparison of the live WAL (WRITER_ON=cmp).
+    "cp": '/usr/bin/cp "$@" || exit; if [[ ${WRITER_ON:-} == cp && ${*: -1} == */meter.db ]]; then python3 "$WRITER" "${@: -2:1}"; fi',
+    "cmp": '/usr/bin/cmp "$@" || exit; if [[ ${WRITER_ON:-} == cmp && ${*: -2:1} == */meter.db-wal ]]; then python3 "$WRITER" "${@: -2:1}"; fi',
 }
-# `once`: one real TRUNCATE checkpoint (no version change); `churn`: a commit and a checkpoint on every copy.
-CP_HOOK = """import os, pathlib, sqlite3, sys
-marker = pathlib.Path(os.environ["CP_HOOK_MARK"])
-if os.environ["CP_HOOK_MODE"] == "once" and marker.exists():
+# `once`: one real TRUNCATE checkpoint (no version change); `churn`: a commit and a checkpoint on every
+# copy; `downgrade`: one commit setting user_version=1, left in the WAL.
+WRITER = """import os, pathlib, sqlite3, sys
+marker = pathlib.Path(os.environ["WRITER_MARK"])
+mode = os.environ["WRITER_MODE"]
+if mode != "churn" and marker.exists():
     sys.exit()
 marker.write_text(marker.read_text() + "x" if marker.exists() else "x")
-con = sqlite3.connect(sys.argv[1], isolation_level=None)
-if os.environ["CP_HOOK_MODE"] == "churn":
-    con.execute("INSERT INTO requests VALUES (1)")
-con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+con = sqlite3.connect(sys.argv[1].removesuffix("-wal"), isolation_level=None)
+if mode == "downgrade":
+    con.execute("PRAGMA user_version=1")
+else:
+    if mode == "churn":
+        con.execute("INSERT INTO requests VALUES (1)")
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 con.close()
 """
 # Relocate the installer's fixed host paths into the fixture tree, as deploy.test.ts does.
@@ -575,16 +582,16 @@ class MeterPlanTest(unittest.TestCase):
                 self.assertIn(line, result.stdout.splitlines())
                 self.assertIn("Refusing automatic meter install", result.stderr)
 
-    def run_with_writer(self, flag, mode):
-        hook = self.scratch.parent / "cp-hook.py"
-        hook.write_text(CP_HOOK)
-        marker = self.scratch.parent / "cp-hook-ran"
+    def run_with_writer(self, flag, mode, on="cp"):
+        hook = self.scratch.parent / "writer.py"
+        hook.write_text(WRITER)
+        marker = self.scratch.parent / "writer-ran"
         marker.unlink(missing_ok=True)
-        self.env.update(CP_HOOK=str(hook), CP_HOOK_MODE=mode, CP_HOOK_MARK=str(marker))
+        self.env.update(WRITER=str(hook), WRITER_MODE=mode, WRITER_MARK=str(marker), WRITER_ON=on)
         try:
             result, calls = self.run_installer(flag)
         finally:
-            for name in ("CP_HOOK", "CP_HOOK_MODE", "CP_HOOK_MARK"):
+            for name in ("WRITER", "WRITER_MODE", "WRITER_MARK", "WRITER_ON"):
                 self.env.pop(name)
         self.assertTrue(marker.exists(), "the writer never ran between the copies")
         # No staging, migration, service action or snapshot; scratch removed.
@@ -621,8 +628,21 @@ class MeterPlanTest(unittest.TestCase):
             with self.subTest(flag=flag):
                 self.make_db(("wal", 2))
                 result, runs = self.run_with_writer(flag, "churn")
-                self.assertEqual(runs, "xxx")
+                self.assertEqual(runs, "xxxxx")
                 self.assert_plan(flag, result, "meter-plan mode=unknown user_version=none db_changing=yes")
+
+    def test_a_commit_after_the_comparison_never_reads_a_stale_v2(self):
+        # Committed v2 in a non-empty WAL; right after the classifier's first successful WAL comparison a
+        # writer commits user_version=1 (WAL grows, main file unchanged). The scratch copy still says 2.
+        for flag in ("--plan", "--no-db-change"):
+            with self.subTest(flag=flag):
+                self.make_db(("pending", 1, 2))
+                con = sqlite3.connect(self.db, isolation_level=None)
+                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 2)
+                result, _ = self.run_with_writer(flag, "downgrade", on="cmp")
+                self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 1)
+                con.close()
+                self.assert_plan(flag, result, DB_STATES["v1"][0])
 
 
 if __name__ == "__main__":
