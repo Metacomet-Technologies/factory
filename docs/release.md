@@ -343,6 +343,16 @@ replacing an uploaded asset; OS/compiler system-library changes may require huma
 recovery. The source is never rewritten or bumped. Builds require Linux x86_64
 and working Bubblewrap namespaces.
 
+Cargo output lives in `.amp/in/cargo-target`, a sibling of the deleted checkout,
+and is reused by every plan in a run and across runs through `actions/cache` in
+the read-only build job only. The key is
+`release-target-v2-<os>-<arch>-<hash of rust-toolchain.toml>-<hash of Cargo.lock>`
+and the only restore key is that key through the toolchain segment, so a changed
+`Cargo.lock` restores the same toolchain's output and a toolchain change starts
+cold. v1 hashed both files together, so its fallback could never match. Reuse is
+only a speed path: a cached artifact that changed any byte would still be refused
+by the immutable-asset comparison on retry.
+
 The credential boundary is job-level separation, not environment filtering.
 All dependency installation, builds and sandbox execution run in a job with
 contents:read, actions:read and pull-requests:read. The dependent publication job
@@ -396,6 +406,36 @@ The second command mode builds all real artifacts and uses only FakeGitHub for
 publication, prints complete verification, then rejects tampered and incomplete
 controls. Output stays local. Normal Rust/kiosk/workspace CI runs without the
 override; override tests use an isolated generated Cargo/TypeScript fixture.
+
+Cache byte identity (MET-368), from a committed checkout:
+
+```sh
+python3 -B scripts/release/prove-cache.py --sha "$(git rev-parse HEAD)" --parent "$(git rev-parse HEAD^)"
+python3 -B scripts/release/prove-cache.py --release-run-evidence
+```
+
+The first command clones disposable checkouts at one path and runs build.sh's
+own `RUSTUP_TOOLCHAIN`, `RUSTFLAGS` and `cargo build` lines with one fixed
+`FACTORY_RELEASE_VERSION` (default: the target's `VERSION`; build time is the
+commit time). It builds the target warm (parent first), cold, and seeded by the
+commit before the last `Cargo.lock` change (same toolchain, override with
+`--seed`), then prints each build's elapsed time and the SHA-256 of meter,
+factory-api, pricing and factory-ups-control. It exits nonzero on any byte
+difference, on meter/factory-api `--build-info` that is not the exact SHA, fixed
+version, clean state and commit time, or on a parent/seed SHA embedded in any
+binary. Pricing and UPS control embed no release identity. It needs `ld.lld` on
+PATH. Nothing is published, dispatched or deployed.
+
+The second command uses authenticated `gh` reads only. It finds the first main
+commit whose `release.yml` has the v2 key, then the first completed push or
+`workflow_run` release run from that commit onward whose build job built at least
+two plans. It prints the run URL and ID, every plan's tag, SHA, wall time and cargo
+`Finished` lines from the job log, then runs authenticated `release.py verify` on
+the first plan's bundle. Until such a run occurs naturally it exits nonzero with
+"evidence pending"; never dispatch or rerun one to produce it. MET-331's
+no-cross-run-cache design is superseded: Devon may close it once both commands'
+output (a passing identity proof and a verified multi-plan run) is recorded on
+MET-368. This tooling never changes MET-331.
 
 ## Operator handoff from Mac
 
