@@ -2,6 +2,7 @@
 // @amp-agent-mode {"key":"odd-spec","label":"ODD Spec"}
 // @amp-agent-mode {"key":"odd-builder","label":"ODD Builder"}
 // @amp-agent-mode {"key":"odd-reviewer","label":"ODD Reviewer"}
+// @amp-agent-mode {"key":"odd-reviewer-xai","label":"ODD Reviewer (xai)"}
 // @amp-agent-mode {"key":"odd-verifier","label":"ODD Verifier"}
 // @amp-agent-mode {"key":"odd-deployer","label":"ODD Deployer"}
 // @amp-agent-mode {"key":"odd-control","label":"ODD Control"}
@@ -96,7 +97,9 @@ export default async function (amp: PluginAPI) {
 		display: { label: 'ODD Control', color: '#b45309' },
 	})
 
-	for (const { key, label, agent } of [...modes, { key: 'control', label: 'ODD Control', agent: control }]) {
+	// Orbs run only registered agent definitions, so every other reviewer engine gets its own mode.
+	const reviewerModes = reviewerEngines.slice(1).map(engine => ({ key: `reviewer-${engine.lab}`, label: `ODD Reviewer (${engine.lab})`, agent: reviewerAgents.get(engine.lab)! }))
+	for (const { key, label, agent } of [...modes, ...reviewerModes, { key: 'control', label: 'ODD Control', agent: control }]) {
 		amp.registerAgentMode({
 			key: `odd-${key}`,
 			description: `${label}: the ${key} role of outcome driven development. Use only when the ODD control plane or Devon starts it.`,

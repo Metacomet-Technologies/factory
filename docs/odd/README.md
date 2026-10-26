@@ -268,7 +268,9 @@ SHA x with this output; Done means item 3 has no evidence".
   and refuses the lab on the issue's builder thread label (the configured
   builder lab when there is none), so a changed default never lets one lab
   approve its own change. A verdict label on a thread of the builder's lab
-  never counts.
+  never counts. Orbs run only plugin agents registered as an active agent
+  mode, so each reviewer engine has its own mode: `odd-reviewer` (ChatGPT)
+  and `odd-reviewer-xai` (SuperGrok), with the same instructions and tools.
 - Routing checks: at arm the plane runs `amp config model-providers
   check-access` once per pinned plugin model against the control thread and
   requires an active Claude Subscription connection. `check-access` probes
@@ -364,7 +366,7 @@ carries `escalated`.
 │ .amp/plugins/factory-odd.ts                                                           │
 │  webhooks: /linear /github /slack  ─▶ dedupe ─▶ derive state ─▶ next action           │
 │  dry run unless the thread carries label odd-perform                                  │
-│  agents: odd-intake, odd-spec, odd-reviewer, odd-verifier (pinned models)             │
+│  agents: odd-intake, odd-spec, odd-reviewer[-xai], odd-verifier (pinned models)       │
 │  builder: amp -ox --mode external-agent:claude-code (Claude Subscription)             │
 │  setInterval: 10 min watchdog sweep (scripts/odd/watchdog.ts), 08:00 ET digest       │
 └───────────────┬───────────────────────────────────────────────────────────┬───────────┘

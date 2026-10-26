@@ -1,6 +1,8 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { builderArgs, io, launch, type Launcher } from './launch.ts';
+import { reviewerEngines } from './engines.ts';
 import { fakeConnections, fakeShell, servedBy } from './fixtures.ts';
 import plugin from '../../.amp/plugins/factory-odd.ts';
 
@@ -74,7 +76,7 @@ test('builder args pin Claude Code, the model and effort, the orb project, strea
 const spec = `## Goal\nShip it.\n\n## Isolation\nscripts/odd/\n\n## Build\n- change\n\n## Done means\n- it works\n\n## Evidence\n- node --test scripts/odd`;
 const sha = 'a'.repeat(40);
 
-type FakeThread = { id: string; labels: string[]; state: string; archived: boolean; model?: string; steers: string[] };
+type FakeThread = { id: string; labels: string[]; state: string; archived: boolean; model?: string; mode?: string; steers: string[] };
 type Pr = { number: number; headRefName: string; headRefOid: string; state: 'OPEN' | 'MERGED'; mergeCommit?: { oid: string } | null; statusCheckRollup: { name: string; conclusion: string }[]; body: string };
 
 function controlPlane(options: { status?: string; threads?: Omit<FakeThread, 'archived' | 'steers'>[]; usage?: (id: string) => string; checkAccess?: (model: string) => unknown; launcher?: ReturnType<typeof fakeLauncher> } = {}) {
@@ -124,17 +126,21 @@ function controlPlane(options: { status?: string; threads?: Omit<FakeThread, 'ar
   });
   const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
   const webhooks = new Map<string, (event: unknown, ctx: unknown) => Promise<void>>();
+  // Orbs only run plugin agents whose definition is registered as an active agent mode.
+  const modes = new Map<string, unknown>();
   const amp = {
     $,
     createAgent: (config: { model?: string; reasoningEffort?: string }) => {
       agentModels.push({ model: config.model, reasoningEffort: config.reasoningEffort });
-      return { definition: config, createThread: async () => {
+      return { definition: config, createThread: async (opts: { executor?: string }) => {
+        const mode = [...modes].find(([, agent]) => agent === config)?.[0];
+        if (opts.executor === 'orb' && !mode) throw new Error('Orb custom agents must be registered as an active agent mode');
         const id = `T-22222222-2222-4222-8222-${String(++created).padStart(12, '0')}`;
-        threads.set(id, { id, labels: [], state: 'running', archived: false, model: config.model, steers: [] });
+        threads.set(id, { id, labels: [], state: 'running', archived: false, model: config.model, mode, steers: [] });
         return { id, setLabels: async (labels: string[]) => { threads.get(id)!.labels = labels; return labels; }, appendUserMessage: async () => {} };
       } };
     },
-    registerAgentMode: () => {}, registerTool: () => {},
+    registerAgentMode: ({ key, agent }: { key: string; agent: unknown }) => { modes.set(key, agent); }, registerTool: () => {},
     on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
     createWebhook: async ({ key, handler }: { key: string; handler: (event: unknown, ctx: unknown) => Promise<void> }) => { webhooks.set(key, handler); return { url: `https://hooks.example/${key}` }; },
     system: { executor: { kind: 'remote', keepAlive: async () => {} } },
@@ -144,7 +150,7 @@ function controlPlane(options: { status?: string; threads?: Omit<FakeThread, 'ar
   const ctx = { thread: control, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools, $ };
   let events = 0;
   return {
-    issue, threads, comments, dms, commands, agentModels,
+    issue, threads, comments, dms, commands, agentModels, modes,
     setPr: (next: Pr | undefined) => { pr = next; },
     async start() {
       if (options.launcher) mock.method(io, 'start', options.launcher.start);
@@ -234,20 +240,43 @@ test('control plane: a launch that yields no child is a visible failure on the i
 
 const builder = (lab: string) => ({ id: child, labels: ['odd-issue-met-7', 'odd-role-builder', 'odd-round-1', `odd-engine-${lab}`], state: 'idle' });
 
-for (const [builderLab, reviewerLab, model] of [['anthropic', 'openai', 'openai/gpt-6-astra'], ['openai', 'xai', 'xai/grok-4.7']] as const) {
-  test(`control plane: a ${builderLab} builder gets a ${reviewerLab} reviewer pinned to ${model}`, async t => {
+// A live reviewer on another issue: one unit of load on its lab's subscription.
+const busy = (lab: string, n: number) => ({ id: `T-44444444-4444-4444-8444-${String(n).padStart(12, '0')}`, labels: [`odd-issue-met-${8 + n}`, 'odd-role-reviewer', 'odd-round-1', `odd-engine-${lab}`], state: 'running' });
+const reviewerCases = [
+  { builderLab: 'anthropic', busyLabs: [], reviewerLab: 'openai', model: 'openai/gpt-6-astra', mode: 'odd-reviewer' },
+  { builderLab: 'anthropic', busyLabs: ['openai'], reviewerLab: 'xai', model: 'xai/grok-4.7', mode: 'odd-reviewer-xai' },
+  { builderLab: 'anthropic', busyLabs: ['xai'], reviewerLab: 'openai', model: 'openai/gpt-6-astra', mode: 'odd-reviewer' },
+  // Same-lab refusal outweighs usage: the busier lab still reviews an OpenAI builder.
+  { builderLab: 'openai', busyLabs: [], reviewerLab: 'xai', model: 'xai/grok-4.7', mode: 'odd-reviewer-xai' },
+  { builderLab: 'openai', busyLabs: ['xai'], reviewerLab: 'xai', model: 'xai/grok-4.7', mode: 'odd-reviewer-xai' },
+] as const;
+
+for (const { builderLab, busyLabs, reviewerLab, model, mode } of reviewerCases) {
+  test(`control plane: a ${builderLab} builder with busy [${busyLabs.join(', ')}] gets a ${reviewerLab} reviewer pinned to ${model} through registered mode ${mode}`, async t => {
     mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
     t.after(() => mock.timers.reset());
-    const plane = controlPlane({ status: 'In Progress', threads: [builder(builderLab)] });
+    const plane = controlPlane({ status: 'In Progress', threads: [builder(builderLab), ...busyLabs.map(busy)] });
     plane.setPr(prWith('OPEN', 'SUCCESS'));
     await plane.start();
     await plane.deliver();
-    const reviewers = live(plane).filter(thread => thread.labels.includes('odd-role-reviewer'));
+    const reviewers = live(plane).filter(thread => thread.labels.includes('odd-role-reviewer') && thread.labels.includes('odd-issue-met-7'));
     assert.equal(reviewers.length, 1);
     assert.equal(reviewers[0].model, model);
-    assert.ok(reviewers[0].labels.includes(`odd-engine-${reviewerLab}`));
+    assert.equal(reviewers[0].mode, mode);
+    assert.deepEqual([...reviewers[0].labels].sort(), [`odd-engine-${reviewerLab}`, 'odd-issue-met-7', 'odd-role-reviewer', 'odd-round-1']);
   });
 }
+
+test('control plane: every registered mode is discoverable from the plugin header, and each reviewer engine has its own mode', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  t.after(() => mock.timers.reset());
+  const plane = controlPlane();
+  await plane.start();
+  const header = [...readFileSync(new URL('../../.amp/plugins/factory-odd.ts', import.meta.url), 'utf8').matchAll(/^\/\/ @amp-agent-mode (.+)$/gm)].map(m => (JSON.parse(m[1]) as { key: string }).key);
+  assert.deepEqual([...plane.modes.keys()].sort(), [...header].sort());
+  const reviewerModels = [...plane.modes].filter(([key]) => key.startsWith('odd-reviewer')).map(([, agent]) => (agent as { model: string }).model).sort();
+  assert.deepEqual(reviewerModels, reviewerEngines.map(engine => engine.model).sort());
+});
 
 test('control plane: a ready verdict from the builder\'s own lab never merges; a reviewer from another lab is started instead', async t => {
   mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
