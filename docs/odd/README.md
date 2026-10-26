@@ -510,7 +510,11 @@ by the previous one).
    failed action (a refused merge, a spawn) stays an incident. A merge whose
    merge-commit read fails posts no `merge=unknown` receipt: the next
    evaluation finds the PR merged and posts the receipt once, from the
-   validated merge commit, before the issue moves to Deploying; an empty issue enumeration while live
+   validated merge commit, before the issue moves to Deploying. That
+   recovery runs only for issues ODD owns, and never over a deploy receipt
+   posted at or after the merge time (that deployment is the release's
+   evidence); a rejected shell read and a failed log-reader lookup during a
+   failed-rollback page are failed reads too, and the page still goes out; an empty issue enumeration while live
    role threads hold open issues fails the sweep too; the digest is
    split into Slack messages of at most 2800 characters. Removing the
    `odd-perform` label is the off-switch: the plane keeps evaluating but

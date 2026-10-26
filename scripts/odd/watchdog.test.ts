@@ -1036,6 +1036,7 @@ test('P3.7: a merge whose confirmation read fails posts no receipt and no heartb
     ['valid merge commit (control)', mergeSha => ({ exitCode: 0, stdout: `${mergeSha}\n`, stderr: '' })],
     ['confirmation fails', () => ({ exitCode: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway' })],
     ['confirmation is null', () => ({ exitCode: 0, stdout: 'null\n', stderr: '' })],
+    ['confirmation read rejects', () => { throw new Error('spawn gh ENOENT'); }],
   ];
   for (const [name, confirm] of cases) {
     await t.test(name, async () => {
@@ -1072,6 +1073,107 @@ test('P3.7: a merge whose confirmation read fails posts no receipt and no heartb
         assert.deepEqual(receipts(), [`odd-merge pr=8 head=${sha} merge=${mergeSha} release=none`]);
         assert.ok(plant.saves.includes('MET-8 "Deploying"'));
         assert.ok(plant.heartbeats() >= 1, 'later sweeps are healthy again');
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+// --- P3.7 round 5: diagnosis and shell-transport reads; receipt recovery ownership and chronology ---
+
+const merged8 = (mergedAt: string, mergeSha = '7'.repeat(40)): Pr => ({ number: 8, headRefName: 'met-8-x', headRefOid: 'c'.repeat(40), state: 'MERGED', mergeCommit: { oid: mergeSha }, mergedAt, mergeable: 'UNKNOWN', commits: [{ oid: 'c'.repeat(40), committedDate: '2026-10-26T13:00:00Z' }], statusCheckRollup: [], body: 'closes MET-8' });
+const deployLine = (sha: string, health = 'pass', rollback = 'none') => `odd-deploy host=factory-gpu component=meter sha=${sha} health=${health} rollback=${rollback}`;
+
+test('P3.7: a failed log-reader lookup still pages a failed rollback, but the sweep is not healthy; a valid lookup is', async t => {
+  const lookups: [string, unknown][] = [
+    ['valid lookup (control)', undefined],
+    ['lookup {}', {}],
+    ['lookup rows [{}]', { threads: [{}] }],
+    ['lookup isError', { isError: true, content: [{ type: 'text', text: '{"threads":[]}' }] }],
+  ];
+  for (const [name, lookup] of lookups) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        plant.issue('MET-9', 'Deploying');
+        plant.comments.set('MET-9', [{ id: 'c-r', body: deployLine('e'.repeat(40), 'fail', 'none'), createdAt: '2026-10-26T14:00:00.000Z' }]);
+        if (lookup !== undefined) plant.control.inject = (call, input) => call === 'find_thread' && String(input.query).startsWith('label:odd-deploy-') ? lookup : undefined;
+        await plant.start();
+        await settle();
+        assert.match(plant.dms.join('\n'), /ODD page: failed-rollback \| issue MET-9 /, 'the urgent page goes out');
+        assert.ok(plant.saves.includes('MET-9 ["escalated"]'));
+        assert.equal(plant.heartbeats(), lookup === undefined ? 1 : 0);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('P3.7: a rejected draft read before a merge merges nothing and writes no heartbeat', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  const sha = 'c'.repeat(40);
+  plant.issue('MET-8', 'In Progress');
+  plant.builder('MET-8');
+  plant.threads.set('T-review', { labels: ['odd-issue-met-8', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-ready-${sha.slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+  plant.openPr('MET-8', sha);
+  const merges: string[] = [];
+  plant.control.gh = command => {
+    if (command.startsWith('gh pr view 8 --json isDraft')) throw new Error('spawn gh ENOENT');
+    if (command.startsWith('gh pr merge')) merges.push(command);
+    return undefined;
+  };
+  await plant.start();
+  await settle();
+  assert.deepEqual(merges, []);
+  assert.equal(plant.heartbeats(), 0);
+});
+
+test('P3.7: receipt recovery never writes to an issue ODD does not own', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  plant.issues.set('MET-8', { id: 'MET-8', status: 'In Progress', labels: ['Bug', 'area:agents'], description: fullSpec });
+  plant.builder('MET-8');
+  plant.prs.push(merged8('2026-10-26T14:00:00Z'));
+  await plant.start();
+  await advance(10 * 60_000);
+  assert.deepEqual((plant.comments.get('MET-8') ?? []).map(comment => comment.body), [], 'no odd-merge comment on a dispatcher issue');
+  assert.deepEqual(plant.saves, []);
+});
+
+test('P3.7: a recovered receipt keeps a deployment made after the merge and retires one made before it', async t => {
+  const cases: [string, string, boolean][] = [
+    ['deployed after the merge', '2026-10-26T14:10:00.000Z', true],
+    ['deployed before the merge (stale)', '2026-10-26T13:50:00.000Z', false],
+  ];
+  for (const [name, deployedAt, current] of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        const mergeSha = '7'.repeat(40);
+        plant.issue('MET-8', 'In Progress');
+        plant.builder('MET-8');
+        plant.prs.push(merged8('2026-10-26T14:00:00Z', mergeSha));
+        plant.comments.set('MET-8', [{ id: 'c-d', body: deployLine(current ? mergeSha : 'e'.repeat(40)), createdAt: deployedAt }]);
+        // Let the issue follow its status writes, so the next evaluation sees Deploying.
+        plant.control.inject = (call, input) => {
+          if (call === 'linear.save_issue' && typeof input.state === 'string') plant.issues.get(String(input.id))!.status = input.state;
+          return undefined;
+        };
+        await plant.start();
+        // The status write, then the next sweep evaluates MET-8 in Deploying.
+        await advance(11 * 60_000);
+        const receipts = (plant.comments.get('MET-8') ?? []).filter(comment => comment.body.startsWith('odd-merge pr=')).map(comment => comment.body);
+        assert.deepEqual(receipts, current ? [] : [`odd-merge pr=8 head=${'c'.repeat(40)} merge=${mergeSha} release=none`]);
+        assert.equal(plant.issues.get('MET-8')!.status, 'Deploying');
+        const verifiers = [...plant.threads.values()].filter(thread => thread.labels.includes('odd-role-verifier'));
+        assert.equal(verifiers.length, current ? 1 : 0, current ? 'the post-merge deployment is verified' : 'the stale deployment waits for a new release');
       } finally {
         mock.timers.reset();
       }
