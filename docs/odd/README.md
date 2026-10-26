@@ -452,9 +452,11 @@ by the previous one).
    issue without type + area gets one Intake round, then Spec. The sweep posts
    a cancellation before archiving the thread (a failed comment keeps the
    thread, so the round is not lost) and a blind episode ends only when a
-   whole sweep, digest included, succeeds; the digest is split into Slack
-   messages of at most 2800 characters. Removing the `odd-perform` label is
-   the off-switch: the plane keeps evaluating but records `dry-run`.
+   whole sweep, digest and heartbeat included, succeeds; a rejected labels
+   read fails one sweep and never blocks the next (MET-342); the digest is
+   split into Slack messages of at most 2800 characters. Removing the
+   `odd-perform` label is the off-switch: the plane keeps evaluating but
+   records `dry-run`.
 7. Retire the poller as primary (MET-282). It stays as the backstop: one
    `odd-heartbeat` project status update per successful sweep, and the poller
    runs the lifecycle only when that heartbeat is missing or 20 minutes old.
@@ -493,7 +495,9 @@ Three threads exist, with different jobs:
 Devon's inputs are: move an idea from Backlog to Triage, file a bug, answer a
 page in Slack, decide a non-ordinary risk sitting in Triage, and say "merge"
 for a plugin PR (the one path still merged by hand during the rollout).
-Status on demand comes from the control orb's `odd_control_status`.
+Status on demand comes from the control orb's `odd_control_status`. A failed
+arm keeps its error there and turn boundaries do not retry it;
+`odd_control_status arm:true` retries it in place.
 
 Off-switch: remove the `odd-perform` label from the control thread; it keeps
 evaluating and records `dry-run`. Re-add the label to resume. Never rotate or
