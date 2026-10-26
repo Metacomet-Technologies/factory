@@ -232,10 +232,11 @@ class GitHub:
     def request(self, path, method="GET", data=None, binary=False, upload=None,
                 api_version=API_VERSION):
         endpoint = f"repos/{REPO}/{path}"
+        accept = "application/octet-stream" if binary and not path.startswith("actions/artifacts/") else "application/vnd.github+json"
         if self.anonymous:
             require(method == "GET" and data is None and upload is None, "anonymous mode is read-only")
             request = urllib.request.Request("https://api.github.com/" + endpoint, headers={
-                "Accept": "application/octet-stream" if binary else "application/vnd.github+json",
+                "Accept": accept,
                 "User-Agent": "factory-release-verifier", "X-GitHub-Api-Version": api_version})
             with urllib.request.urlopen(request, timeout=120) as response:
                 result = response.read(512 * 1024 * 1024 + 1)
@@ -244,9 +245,7 @@ class GitHub:
         if upload is not None:
             endpoint = "https://uploads.github.com/" + endpoint
         args = ["gh", "api", endpoint, "--method", method,
-                "-H", f"X-GitHub-Api-Version: {api_version}"]
-        if binary:
-            args += ["-H", "Accept: application/octet-stream"]
+                "-H", f"X-GitHub-Api-Version: {api_version}", "-H", f"Accept: {accept}"]
         payload = None
         if upload is not None:
             args += ["-H", "Content-Type: application/octet-stream", "--input", str(upload)]
