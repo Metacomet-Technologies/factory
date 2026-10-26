@@ -456,7 +456,11 @@ prove GitHub token access, native immutability enforcement, or public downloads.
 every two minutes (`deploy/factory-deploy.service`, `flock` so runs never
 overlap, 30 minute cap). The job reads every page of the GitHub releases API,
 excludes drafts/prereleases, and verifies stable tags newer than the ledger's
-`lastTag` oldest first with `release.py verify --anonymous`. It detaches
+`lastTag` oldest first with `release.py verify`, using the existing authenticated
+`gh api` transport. Manual reconciliation uses the same transport; neither path
+falls back to anonymous access on failure. This avoids exhausting GitHub's
+60-request/hour anonymous quota as annotated release tags accumulate, without
+new credentials or privileges. It detaches
 `~/.local/state/factory-odd/source` at the release SHA, and installs each enabled
 component whose sources or installer changed since the SHA the host already
 runs: `meter`, `factory-api`, `kiosk`, in that order, through the
@@ -478,7 +482,7 @@ manual invocations still use their own checkout. Artifact SHA and clean-tree
 checks apply to that source, and meter/API units come from it. Full-SHA release
 artifacts and short-SHA local builds retain the existing prefix-of-full-HEAD
 check; historical installers are never executed or copied over the tools.
-Inventory still comes from the exact release commit, and anonymous publication,
+Inventory still comes from the exact release commit, and publication,
 immutability, digest, archive and health verification are unchanged.
 
 Tradeoff: deployment machinery upgrades are explicit operator maintenance, not
