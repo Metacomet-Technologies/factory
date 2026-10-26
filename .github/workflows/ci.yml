@@ -56,9 +56,16 @@ jobs:
             cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain*') }}-
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
-        with:
-          tool: nextest@0.9.149
+      - name: Install cargo-nextest
+        run: |
+          version=0.9.149
+          archive="cargo-nextest-${version}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${version}/${archive}"
+          echo "32d1d8c0567b7a80bee2bad8bb09125c846da96bc009b2de11ec08557290c770  $archive" | sha256sum -c
+          mkdir -p "$HOME/.cargo/bin"
+          tar -xzf "$archive" -C "$HOME/.cargo/bin" cargo-nextest
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo-nextest" --version
       - run: cargo nextest run --workspace --locked
       - run: cargo test --doc --workspace --locked
       - name: Install installer test dependencies
