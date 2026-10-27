@@ -292,15 +292,22 @@ export function admittedLoad(threads: readonly LiveThread[], reservations: reado
 /** The label the control plane gives a verifier thread: the receipt SHA (12-character prefix) it verifies. */
 export const receiptLabel = (sha: string) => `odd-receipt-${sha.slice(0, 12)}`;
 
+/** The label the control plane gives a red release's log reader (Deployer): the release SHA (12-character prefix) it reads. */
+export const readerLabel = (sha: string) => `odd-deploy-${sha.slice(0, 12)}`;
+/** The label a log reader adds to its own thread once its diagnosis for that release is posted. */
+export const diagnosedLabel = (sha: string) => `odd-diagnosed-${sha.slice(0, 12)}`;
+
 /**
- * A role thread that has finished its round: a reviewer carrying a verdict label, or a verifier
- * spawned for another receipt than the current one (`receiptSha`). Delivered threads hold no
- * round of the budget and are never stale.
+ * A role thread that has finished its round: a reviewer carrying a verdict label, a verifier
+ * spawned for another receipt than the current one (`receiptSha`), or a log reader carrying the
+ * diagnosed label for the release it was spawned for. Delivered threads hold no round of the
+ * budget and are never stale.
  */
 export function delivered(thread: LiveThread, receiptSha?: string): boolean {
   const { role } = parseThreadLabels(thread.labels);
   if (role === 'reviewer') return thread.labels.some(label => verdictPattern.test(label));
   if (role === 'verifier') return receiptSha === undefined || !thread.labels.includes(receiptLabel(receiptSha));
+  if (role === 'deployer') return thread.labels.some(label => label.startsWith('odd-deploy-') && thread.labels.includes(label.replace('odd-deploy-', 'odd-diagnosed-')));
   return false;
 }
 
@@ -345,12 +352,18 @@ const roleStages: Partial<Record<keyof typeof contracts, readonly Status[]>> = {
   verifier: ['Deploying'],
 };
 
-/** Idle role threads whose stage the issue has left: finished work to archive (§7 handoff). */
+/**
+ * Idle role threads whose stage the issue has left: finished work to archive (§7 handoff). A log
+ * reader has no stage (a failed rollback leaves the issue in Deploying, a rolled-back one moves on
+ * while the reader still runs): it is finished once it is idle and `delivered`.
+ */
 export function finishedThreads(status: Status, threads: readonly LiveThread[]): LiveThread[] {
   return threads.filter(thread => {
     const { role } = parseThreadLabels(thread.labels);
+    if (ownerState(thread.state) !== 'idle') return false;
+    if (role === 'deployer') return delivered(thread);
     const stages = role ? roleStages[role] : undefined;
-    return stages !== undefined && !stages.includes(status) && ownerState(thread.state) === 'idle';
+    return stages !== undefined && !stages.includes(status);
   });
 }
 

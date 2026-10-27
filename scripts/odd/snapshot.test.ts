@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { admittedLoad, changesRounds, ciState, delivered, finishedThreads, issueFromEvent, loadFrom, openRounds, prOwnsIssue, receiptLabel, reconciles, riskFrom, spawnRecords, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { admittedLoad, changesRounds, ciState, delivered, diagnosedLabel, finishedThreads, issueFromEvent, loadFrom, openRounds, prOwnsIssue, readerLabel, receiptLabel, reconciles, riskFrom, spawnRecords, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
 import { contractOf, nextAction, parseSpawn, spawnKey, spawnLine } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
@@ -346,4 +346,26 @@ test('MET-348: a legacy steered history at its third rejected head still pages; 
   const budgeted = toSnapshot({ issue: { id: 'MET-1', status: 'In Progress', labels: ['odd'], description, comments: [steered, { body: grant, createdAt: '2026-10-27T02:59:00.500Z' }] }, pr, threads });
   assert.equal(nextAction(budgeted, { orbs: 0, runnerSlots: 0, buildIssues: 1 }, Date.parse('2026-10-27T03:30:00Z')).kind, 'steer');
   assert.equal((nextAction(budgeted, { orbs: 0, runnerSlots: 0, buildIssues: 1 }, Date.parse('2026-10-27T04:59:00Z')) as { reason?: string }).reason, 'budget-ceiling');
+});
+
+test('P4.6-deployer-archive: a log reader is finished by its diagnosed label for its own release, in every status, never by the issue leaving Deploying', () => {
+  const red = 'e'.repeat(40);
+  const reader = (id: string, state: string, extra: string[]): LiveThread => ({ id, labels: ['odd-issue-met-9', 'odd-role-deployer', 'odd-round-1', readerLabel(red), ...extra], state });
+  const threads: LiveThread[] = [
+    reader('diagnosed-idle', 'idle', [diagnosedLabel(red)]),
+    reader('diagnosed-running', 'tool-running', [diagnosedLabel(red)]),
+    reader('diagnosed-error', 'error', [diagnosedLabel(red)]),
+    reader('undiagnosed-idle', 'idle', []),
+    // A diagnosed label for another release is not this reader's handoff.
+    reader('other-release-idle', 'idle', [diagnosedLabel('f'.repeat(40))]),
+  ];
+  // A failed rollback leaves the issue in Deploying; a rolled-back one has moved to Todo while the reader may still run.
+  for (const status of ['Deploying', 'Todo', 'In Progress', 'Done'] as const) {
+    assert.deepEqual(finishedThreads(status, threads).map(t => t.id), ['diagnosed-idle'], status);
+  }
+  assert.equal(delivered(threads[0]), true);
+  assert.equal(delivered(threads[3]), false);
+  assert.equal(delivered(threads[4]), false);
+  assert.deepEqual(openRounds(threads), { deployer: 1 }, 'an undiagnosed reader still holds its round');
+  assert.deepEqual(openRounds([threads[0]]), {});
 });

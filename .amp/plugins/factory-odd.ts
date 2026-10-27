@@ -45,7 +45,7 @@ import {
 	type SpawnRecord,
 } from '../../scripts/odd/lifecycle.ts'
 import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { admittedLoad, finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, receiptLabel, reconciles, roleLabelQueries, spawnRecords, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
+import { admittedLoad, diagnosedLabel, finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
 import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
 import { builderArgs, launch } from '../../scripts/odd/launch.ts'
 import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, digestHeading, episodeLine, incidentPageDue, incidentText, incidents, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, resolutionText, restoreStatus, sanitizeError, slackMessages, staleThreads, sweepMs, unknownAge, type DigestInput, type DigestWait, type Episode, type Plane } from '../../scripts/odd/watchdog.ts'
@@ -444,7 +444,11 @@ export default async function (amp: PluginAPI) {
 			if (performing) await reconcileSpawns(ctx, issue, threads)
 			holdSpawns(issue, threads)
 			const finished = finishedThreads(issue.status, threads)
-			if (finished.length && performing) await archiveThreads(ctx, finished)
+			if (finished.length && performing) {
+				await archiveThreads(ctx, finished)
+				// An archived log reader leaves thread search before admission may have seen it indexed; its slot is free now.
+				for (const [slot, held] of ledger) if (finished.some(thread => thread.id === held.thread)) ledger.delete(slot)
+			}
 			const { usage, threads: live } = await currentLoad(ctx)
 			// The issue's own reservations are left out: a pending one must reach perform's fail-closed check and page, not wait on its own slot.
 			const { load } = admittedLoad(live, [...ledger.values()].filter(held => held.issue !== issue!.identifier))
@@ -1251,7 +1255,7 @@ export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logge
 // journal excerpts to the Bug, or to the issue when the rollback failed and no Bug exists.
 const diagnosed = new Set<string>()
 export async function diagnose(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, receipt: DeployReceipt, bug: string | undefined, spawn: Spawn) {
-	const label = `odd-deploy-${receipt.sha.slice(0, 12)}`
+	const label = readerLabel(receipt.sha)
 	const found = listOf(await readJson(ctx.tools, 'find_thread', { query: `label:${label}`, limit: 1 }), 'threads', 'find_thread', row => named(row.id))
 	if (diagnosed.has(label) || found.length) {
 		ctx.logger.log(marker, 'deploy log reader exists', issue.identifier, label)
@@ -1265,6 +1269,7 @@ export async function diagnose(ctx: Pick<WebhookHandlerContext, 'tools' | 'logge
 			`${marker} Outcome ${issue.identifier}. Role: deployer. Reason: red deploy.`,
 			`Receipt: \`${deployReceiptLine(receipt)}\`.`,
 			`Attach the installer and journal excerpts (\`journalctl -u factory-deploy\`, the ledger) for this release to ${target}${bug ? ` (Bug follow-up of ${issue.identifier})` : ' (the rollback failed; Devon is paged)'}.`,
+			`Once that comment is posted, add the label \`${diagnosedLabel(receipt.sha)}\` to this thread with \`update_thread\` (\`labels.add\`); the control plane archives the thread on that label.`,
 			`Load the \`${contracts.deployer.skill}\` skill and start.`,
 		].join(' '))
 	} catch (error: unknown) {
