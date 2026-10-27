@@ -137,8 +137,11 @@ export const supersededMerge = (pr: Pick<GitHubPullRequest, 'mergedAt'>, failedA
 export const prEligible = (pr: Pick<GitHubPullRequest, 'headRefName' | 'body' | 'mergedAt'>, identifier: string, failedAt: string | undefined): boolean =>
   prOwnsIssue(pr, identifier) && !supersededMerge(pr, failedAt);
 
-/** `updatedAt` is the thread's last activity as reported by thread search; absent for a thread the index has not returned yet. */
-export type LiveThread = { id: string; labels: readonly string[]; state: string; updatedAt?: string };
+/**
+ * `updatedAt` is the thread's last activity as reported by thread search; absent for a thread the index has not returned yet.
+ * `activeAt` is the agent state's last update (`get_thread_status` `agentState.updatedAt`): a running thread's activity (P3.10), absent when not reported.
+ */
+export type LiveThread = { id: string; labels: readonly string[]; state: string; updatedAt?: string; activeAt?: string };
 
 const statuses: readonly Status[] = ['Backlog', 'Triage', 'Todo', 'In Progress', 'In Review', 'Deploying', 'Done', 'Canceled', 'Duplicate'];
 
@@ -187,14 +190,29 @@ export function riskFrom(description: string): RiskClass | undefined {
   return match ? match[1].toLowerCase() as RiskClass : undefined;
 }
 
-const ownerState = (state: string): NonNullable<IssueSnapshot['owner']>['state'] => {
-  if (state === 'idle' || state === 'error' || state === 'awaiting-approval') return state;
-  return 'running';
-};
+type ThreadState = NonNullable<IssueSnapshot['owner']>['state'];
+
+/**
+ * P3.10: the Amp agent states `get_thread_status` reports. `streaming` and `tool-running` are
+ * running; `external-agent` is a retired terminal thread, finished like an idle one. Any other
+ * state is unknown: undefined here and a failed read in the control plane, never running or idle.
+ */
+const threadStates: Readonly<Record<string, ThreadState>> = Object.freeze({
+  idle: 'idle', 'external-agent': 'idle', error: 'error', 'awaiting-approval': 'awaiting-approval',
+  running: 'running', streaming: 'running', 'tool-running': 'running',
+});
+export const threadState = (state: string): ThreadState | undefined => Object.hasOwn(threadStates, state) ? threadStates[state] : undefined;
+
+/** threadState for a thread already read; an unknown state throws instead of guessing. */
+export function ownerState(state: string): ThreadState {
+  const known = threadState(state);
+  if (!known) throw new Error(`unknown thread state ${JSON.stringify(state)}`);
+  return known;
+}
 
 /**
  * Combine the three sources. `threads` are the live Amp threads labelled for this issue. The
- * owner is a running role thread if any (the issue waits for it), else the builder thread
+ * owner is a running or approval-blocked role thread if any (the issue waits for it), else the builder thread
  * (steer targets it even while a reviewer thread is idle beside it), else the first role thread.
  * Open blockers come from Linear relations; the caller resolves which are still open.
  */
@@ -206,12 +224,16 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
   // Any other name is Unknown, never Backlog: Backlog is parked and silent, an unknown status pages (lifecycle.ts).
   const status = statuses.find(name => name === issue.status) ?? 'Unknown';
   const roleThreads = threads.filter(thread => parseThreadLabels(thread.labels).role);
-  const owned = roleThreads.find(thread => ownerState(thread.state) === 'running')
+  // Every role thread's state is judged, not only up to the first match: an unknown one fails the snapshot.
+  for (const thread of roleThreads) ownerState(thread.state);
+  const owned = roleThreads.find(thread => ['running', 'awaiting-approval'].includes(ownerState(thread.state)))
     ?? roleThreads.find(thread => parseThreadLabels(thread.labels).role === 'builder')
     ?? roleThreads[0];
   const owner = owned ? (() => {
     const { role, round } = parseThreadLabels(owned.labels);
-    return role ? { role, threadID: owned.id, round, state: ownerState(owned.state), ...(owned.updatedAt ? { idleSince: owned.updatedAt } : {}) } : undefined;
+    const state = ownerState(owned.state);
+    const since = state === 'running' ? owned.activeAt : owned.updatedAt;
+    return role ? { role, threadID: owned.id, round, state, ...(since ? { idleSince: since } : {}) } : undefined;
   })() : undefined;
   // Only receipts after the latest merge count: an issue re-opened after a rollback and merged again starts clean.
   let receipt: DeployReceipt | undefined;

@@ -409,7 +409,7 @@ test('P3.11: a bound reviewer for the green head enters In Review; changes retur
   assert.deepEqual(at('In Progress', green(sha), [reviewed(sha, 'T-r1')]), { kind: 'set-status', status: 'In Review', reason: `reviewer recorded at ${sha.slice(0, 12)}` });
   // In Review without a verdict keeps the reviewer (an idle one without a verdict is retried in the next round).
   assert.deepEqual(at('In Review', green(sha), [reviewed(sha, 'T-r1')], { openRounds: { reviewer: 1 } }), { kind: 'spawn', role: 'reviewer', executor: 'orb', reason: `no verdict at ${sha.slice(0, 12)}`, round: 2 });
-  assert.deepEqual(at('In Review', green(sha), [reviewed(sha, 'T-r1')], { owner: { ...builder, role: 'reviewer', threadID: 'T-r1', state: 'running' } }), { kind: 'wait', reason: 'reviewer running' });
+  assert.deepEqual(at('In Review', green(sha), [reviewed(sha, 'T-r1')], { owner: { ...builder, role: 'reviewer', threadID: 'T-r1', state: 'running' } }), { kind: 'wait', reason: 'reviewer running', stuck: 'reviewer', wait: { kind: 'activity', key: 'activity-T-r1' } });
   // Changes: back to In Progress, where the epoch's budget is admitted and the same builder steered.
   assert.deepEqual(at('In Review', green(sha, 'changes'), [reviewed(sha, 'T-r1')]), { kind: 'set-status', status: 'In Progress', reason: `changes requested at ${sha.slice(0, 12)}` });
   assert.equal(at('In Progress', green(sha, 'changes'), [reviewed(sha, 'T-r1')]).kind, 'admit');
@@ -440,4 +440,30 @@ test('P3.11: an unknown status pages once, even beside a running owner, and is n
   const latched = { ...unknown, labels: ['odd', 'escalated'], escalation: { id: 'c-1', reason: 'unknown-status' as const, done: ['label', 'page', 'archive'] as const, detail: '' } };
   assert.deepEqual(nextAction(latched, idle), { kind: 'wait', reason: 'escalated to Devon' });
   assert.deepEqual(nextAction(toSnapshot({ issue: { id: 'MET-2', status: 'Backlog', labels: ['odd'], description: spec } }), idle), { kind: 'wait', reason: 'backlog: triage on demand' });
+});
+
+// --- P3.10: approval, unknown and inactive-running thread states ---------------------------------
+
+test('P3.10: a running owner waits on its activity with a 15-minute cancel budget; approval stays the 30-minute human wait; error is never running', () => {
+  const pending = { number: 9, headSha: sha, ci: 'pending' as const, merged: false, headAt: '2026-10-26T10:00:00.000Z' };
+  const since = '2026-10-26T11:30:00.000Z';
+  const running = { role: 'builder' as const, threadID: 'T-b', round: 1, state: 'running' as const, idleSince: since };
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: pending, owner: running }), idle),
+    { kind: 'wait', reason: 'builder running', stuck: 'builder', wait: { kind: 'activity', key: 'activity-T-b', since } });
+  // Missing activity is an unknown age, never "now" and never immortal-by-omission.
+  const undated = nextAction(issue({ status: 'In Progress', pr: pending, owner: { ...running, idleSince: undefined } }), idle);
+  assert.deepEqual(undated, { kind: 'wait', reason: 'builder running', stuck: 'builder', wait: { kind: 'activity', key: 'activity-T-b' } });
+  assert.deepEqual(waitAge((undated as Extract<Action, { kind: 'wait' }>).wait!, Date.parse(since) + 24 * 60 * 60_000), { state: 'unknown' });
+  assert.deepEqual(waitBudgets.activity, { notify: 'cancel', ms: 15 * 60_000 });
+  const at = Date.parse(since);
+  assert.deepEqual(waitAge({ kind: 'activity', key: 'a', since }, at + 15 * 60_000 - 1), { state: 'within', ageMs: 15 * 60_000 - 1 });
+  assert.deepEqual(waitAge({ kind: 'activity', key: 'a', since }, at + 15 * 60_000), { state: 'over', ageMs: 15 * 60_000 });
+  // Awaiting approval is a wait on Devon (approval, 30 min), not running: nothing marks it for cancellation.
+  const approval = nextAction(issue({ status: 'In Progress', pr: pending, owner: { ...running, state: 'awaiting-approval' } }), idle);
+  assert.deepEqual(approval, { kind: 'wait', reason: 'builder awaiting approval', wait: { kind: 'approval', key: 'approval-T-b', since } });
+  assert.deepEqual(waitBudgets.approval, { notify: 'page', ms: 30 * 60_000 });
+  // An errored owner is a failure the lifecycle acts on, not a running wait.
+  const errored = nextAction(issue({ status: 'In Progress', owner: { ...running, state: 'error', round: 3 } }), idle);
+  assert.equal(errored.kind, 'page');
+  assert.equal(nextAction(issue({ status: 'In Progress', owner: { ...running, state: 'error', round: 1 } }), idle).kind, 'spawn');
 });

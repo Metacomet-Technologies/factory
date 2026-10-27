@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { admittedLoad, changesRounds, ciState, delivered, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, openRounds, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, riskFrom, spawnRecords, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { admittedLoad, changesRounds, ciState, delivered, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, openRounds, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, riskFrom, spawnRecords, threadState, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
 import { contractOf, nextAction, parseSpawn, spawnKey, spawnLine } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
@@ -451,4 +451,32 @@ test('P4.3: the latest red receipt by creation time bounds which merges deliver 
   assert.equal(toSnapshot({ issue, pr: pr('2026-10-26T13:00:00Z') }).pr, undefined);
   assert.equal(toSnapshot({ issue, pr: pr('2026-10-26T13:00:01Z') }).pr?.merged, true);
   assert.equal(toSnapshot({ issue: { ...issue, comments: comments.slice(0, 2) }, pr: pr('2026-10-26T11:00:00Z') }).pr?.merged, true);
+});
+
+test('P3.10: every reported Amp state maps to idle, running, approval or error; any other state fails the snapshot instead of reading as running or idle', () => {
+  for (const [state, known] of [['idle', 'idle'], ['external-agent', 'idle'], ['error', 'error'], ['awaiting-approval', 'awaiting-approval'], ['running', 'running'], ['streaming', 'running'], ['tool-running', 'running']] as const) assert.equal(threadState(state), known, state);
+  for (const state of ['', 'paused', 'Idle', 'constructor', 'toString', 'unknown']) assert.equal(threadState(state), undefined, state);
+  const issue = { id: 'MET-1', status: 'In Progress', labels: [] };
+  const builder: LiveThread = { id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1'], state: 'streaming' };
+  const odd: LiveThread = { id: 'T-r', labels: ['odd-issue-met-1', 'odd-role-reviewer', 'odd-round-1'], state: 'paused' };
+  // Even after a running owner is found, a later unknown state is judged.
+  assert.throws(() => toSnapshot({ issue, threads: [builder, odd] }), /unknown thread state "paused"/);
+  assert.throws(() => loadFrom([odd]), /unknown thread state/);
+  assert.throws(() => finishedThreads('Done', [odd]), /unknown thread state/);
+  // A thread without a role label is not ours to judge.
+  assert.equal(toSnapshot({ issue, threads: [builder, { ...odd, labels: ['odd-issue-met-1'] }] }).owner?.threadID, 'T-b');
+});
+
+test('P3.10: an approval-blocked thread owns the issue beside an idle builder; a running owner is dated by its agent activity, not by thread search', () => {
+  const issue = { id: 'MET-1', status: 'In Progress', labels: [] };
+  const builder: LiveThread = { id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1'], state: 'idle', updatedAt: '2026-10-26T09:00:00.000Z' };
+  const reviewer: LiveThread = { id: 'T-r', labels: ['odd-issue-met-1', 'odd-role-reviewer', 'odd-round-1'], state: 'awaiting-approval', updatedAt: '2026-10-26T10:00:00.000Z' };
+  const pr: GitHubPullRequest = { number: 9, headRefOid: sha, state: 'OPEN', statusCheckRollup: [check('SUCCESS')] };
+  const approval = toSnapshot({ issue, pr, threads: [builder, reviewer] });
+  assert.deepEqual(approval.owner, { role: 'reviewer', threadID: 'T-r', round: 1, state: 'awaiting-approval', idleSince: '2026-10-26T10:00:00.000Z' });
+  assert.deepEqual(nextAction(approval, { orbs: 0, runnerSlots: 0, buildIssues: 1 }), { kind: 'wait', reason: 'reviewer awaiting approval', wait: { kind: 'approval', key: 'approval-T-r', since: '2026-10-26T10:00:00.000Z' } });
+  const running = { ...builder, state: 'tool-running', updatedAt: '2026-10-26T12:00:00.000Z', activeAt: '2026-10-26T11:40:00.000Z' };
+  assert.equal(toSnapshot({ issue, threads: [running] }).owner?.idleSince, '2026-10-26T11:40:00.000Z');
+  assert.equal(toSnapshot({ issue, threads: [{ ...running, activeAt: undefined }] }).owner?.idleSince, undefined, 'a search date is not agent activity');
+  assert.equal(toSnapshot({ issue, threads: [builder] }).owner?.idleSince, '2026-10-26T09:00:00.000Z');
 });
