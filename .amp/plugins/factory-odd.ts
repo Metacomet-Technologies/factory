@@ -48,7 +48,7 @@ import {
 	type Verify,
 } from '../../scripts/odd/lifecycle.ts'
 import { contextNamesSource, intakeChannel, intakeLookback, intakeEmoji, intakePrompt, outcomeIssue, pendingIntake, slackSourceLabel, slackSourceTs, sourceLine, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { admittedLoad, bindingCandidate, buildEpoch, currentBinding, diagnosedLabel, draftedLine, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, prBindingLine, prOwnsIssue, readerLabel, receiptLabel, reconciles, releasedDraft, roleLabelQueries, spawnRecords, threadState, toSnapshot, verdictPattern, verifiedFor, verifiedLabels, type GitHubPullRequest, type LinearIssue, type LiveThread, type PrBinding, type Reservation, undraftedLine } from '../../scripts/odd/snapshot.ts'
+import { admittedLoad, bindingCandidate, buildEpoch, currentBinding, diagnosedLabel, draftedLine, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, prBindingLine, prOwnsIssue, parseIdentity, readerLabel, receiptLabel, reconciles, releasedDraft, roleLabelQueries, spawnRecords, threadState, toSnapshot, trustedComments, verdictPattern, verifiedFor, verifiedLabels, type AuthoredComment, type GitHubPullRequest, type Identity, type LinearIssue, type LiveThread, type PrBinding, type Reservation, undraftedLine } from '../../scripts/odd/snapshot.ts'
 import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
 import { builderArgs, launch } from '../../scripts/odd/launch.ts'
 import { alertsChannel, blindMs, capsAlertMs, digest, digestDelivered, digestDue, digestHeading, digestLate, digestParts, digestSends, episodeLine, firstParentSince, postedText, incidentPageDue, incidentText, incidents, newestRelease, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, postedLate, publisherPage, publisherPagedLine, publisherSnapshot, resolutionText, restoreStatus, sanitizeError, staleReason, staleThreads, stalledWork, sweepMs, type DigestInput, type DigestList, type DigestWait, type Episode, type MainCommit, type Plane, type Publisher, type Run } from '../../scripts/odd/watchdog.ts'
@@ -117,12 +117,15 @@ const roleTools: Partial<Record<Role, string>> = { reviewer: 'odd_verdict', veri
  * tool lists are not an OS sandbox. Intake alone writes Slack (it replies in the message's
  * thread) and keeps `update_thread`, the only way its Slack contract (scripts/odd/intake.ts,
  * odd-intake skill) names its outcome issue on its own thread.
+ * MET-339: the Linear connection is the plane's marker-writer identity, so no role writes or deletes
+ * comments through it; a role comments as the Amp app (`comment_on_linear_issue`), whose markers
+ * the plane never accepts once the identity is activated (trustedComments).
  */
 function roleGrant(role: Role): { add: string[]; exclude: string[] } {
 	const own = roleTools[role]
-	const add = ['mcp__linear__*', 'slack_read', ...(role === 'intake' ? ['slack_write', 'update_thread'] : []), ...(own ? [own] : [])]
+	const add = ['mcp__linear__*', 'comment_on_linear_issue', 'slack_read', ...(role === 'intake' ? ['slack_write', 'update_thread'] : []), ...(own ? [own] : [])]
 	const readOnly = role === 'reviewer' || role === 'verifier' || role === 'deployer'
-	const exclude = ['create_thread', 'update_thread', 'send_thread_message', ...Object.values(roleTools), ...(readOnly ? ['apply_patch', 'edit_file', 'create_file', 'Task'] : [])]
+	const exclude = ['create_thread', 'update_thread', 'send_thread_message', 'mcp__linear__save_comment', 'mcp__linear__delete_comment', ...Object.values(roleTools), ...(readOnly ? ['apply_patch', 'edit_file', 'create_file', 'Task'] : [])]
 	return { add, exclude: exclude.filter(tool => !add.includes(tool)) }
 }
 
@@ -138,6 +141,7 @@ export default async function (amp: PluginAPI) {
 				`Load the project skill \`${contracts[role].skill}\` first and follow it as your contract.`,
 				`Your external stop condition is "${contracts[role].stop}". Never claim it; produce the artifact that makes it true.`,
 				'Never write artifacts another role is supposed to check. Never edit Done means. Follow AGENTS.md.',
+				'Comment on Linear issues only with comment_on_linear_issue (you post as the Amp app); the Linear connection\'s comment tools are the control plane\'s.',
 				extra,
 			].join(' '),
 			tools: roleGrant(role),
@@ -821,7 +825,7 @@ export default async function (amp: PluginAPI) {
 			} else {
 				watchdog.overSince ??= at
 				if (performing && !watchdog.alerted && now.getTime() - Date.parse(watchdog.overSince) >= capsAlertMs) {
-					await ctx.tools.call('slack_write', { channelName: alertsChannel, text: `${marker} soft caps exceeded since ${watchdog.overSince}: orbs ${load.orbs}/${capacity.orbs}, runner slots ${load.runnerSlots}/${capacity.runnerSlots}, build issues ${load.buildIssues}/${capacity.buildIssues}.` })
+					await ctx.tools.call('slack_write', { ...slackAs(), channelName: alertsChannel, text: `${marker} soft caps exceeded since ${watchdog.overSince}: orbs ${load.orbs}/${capacity.orbs}, runner slots ${load.runnerSlots}/${capacity.runnerSlots}, build issues ${load.buildIssues}/${capacity.buildIssues}.` })
 					watchdog.alerted = true
 				}
 			}
@@ -852,7 +856,7 @@ export default async function (amp: PluginAPI) {
 			watchdog.blindSince ??= at
 			if (performing && !watchdog.paged && now.getTime() - Date.parse(watchdog.blindSince) >= blindMs) {
 				const text = pageText('-', { kind: 'page', reason: 'control-plane-blind', detail: `every sweep since ${watchdog.blindSince} failed: ${watchdog.error}` })
-				await ctx.tools.call('slack_write', { text: `${marker} ${text}` }).then(() => { watchdog.paged = true }, (slackError: unknown) => ctx.logger.log(marker, 'blind page failed', String(slackError)))
+				await ctx.tools.call('slack_write', { ...slackAs(), text: `${marker} ${text}` }).then(() => { watchdog.paged = true }, (slackError: unknown) => ctx.logger.log(marker, 'blind page failed', String(slackError)))
 			}
 		} finally {
 			// The publisher snapshot, its page and the digest run after the heartbeat and apart from it
@@ -896,7 +900,7 @@ export default async function (amp: PluginAPI) {
 					watchdog.digestPending = pending
 				}
 				for (const text of digestSends(day, [...posted, ...pending.sent], pending.parts)) {
-					const result = (await ctx.tools.call('slack_write', { channelName: alertsChannel, text })) as { isError?: boolean } | undefined
+					const result = (await ctx.tools.call('slack_write', { ...slackAs(), channelName: alertsChannel, text })) as { isError?: boolean } | undefined
 					if (result?.isError) throw new Error(`slack_write reported an error for ${text.split('\n')[0]}`)
 					pending.sent.push(text)
 				}
@@ -927,7 +931,7 @@ export default async function (amp: PluginAPI) {
 			}
 			if (!(await deliver(ctx, `${marker} ${text}`))) return
 			watchdog.publisherPaged = sha
-			await ctx.tools.call('slack_write', { channelName: alertsChannel, text: `${record}\n${marker} ${text}` })
+			await ctx.tools.call('slack_write', { ...slackAs(), channelName: alertsChannel, text: `${record}\n${marker} ${text}` })
 		} catch (error: unknown) {
 			ctx.logger.log(marker, 'publisher page check or record failed', String(error))
 		}
@@ -1140,7 +1144,7 @@ export default async function (amp: PluginAPI) {
 			ctx.logger.log(marker, 'slack poll failed', slack.failures, slack.error)
 			if (slack.failures >= slackAlertAfter && !slack.alerted && (perform ?? (await ctx.thread.labels().catch(() => [])).includes(performLabel))) {
 				const text = `${marker} Slack intake poll failed ${slack.failures} times in a row since ${slack.failingSince}: ${sanitizeError(slack.error)}`
-				slack.alerted = await ctx.tools.call('slack_write', { channelName: alertsChannel, text }).then(result => !(result as { isError?: boolean } | undefined)?.isError, (alertError: unknown) => {
+				slack.alerted = await ctx.tools.call('slack_write', { ...slackAs(), channelName: alertsChannel, text }).then(result => !(result as { isError?: boolean } | undefined)?.isError, (alertError: unknown) => {
 					ctx.logger.log(marker, 'slack poll alert failed', String(alertError))
 					return false
 				})
@@ -1464,7 +1468,7 @@ export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 	}
 	await step('page', async () => {
 		if (id && delivered.has(id)) return
-		const sent = (await ctx.tools.call('slack_write', { text: `${marker} ${pageText(issue.identifier, { ...action, detail })} Remove the \`${escalatedLabel}\` label to resume.` })) as { isError?: boolean } | undefined
+		const sent = (await ctx.tools.call('slack_write', { ...slackAs(), text: `${marker} ${pageText(issue.identifier, { ...action, detail })} Remove the \`${escalatedLabel}\` label to resume.` })) as { isError?: boolean } | undefined
 		if (sent?.isError) throw new Error(`slack_write reported an error for the ${action.reason} page`)
 		if (id) delivered.add(id)
 	})
@@ -1697,15 +1701,32 @@ function slackMessagesFor(tools: Tools, input: Record<string, unknown>, valid: (
 	}, message => (named(message.ts) ? message.ts : undefined))
 }
 
+/**
+ * MET-339: the activated identity (ODD_IDENTITY, docs/odd/README.md §9), undefined until Devon
+ * activates it. A malformed value is a failed read, so every derivation fails closed and pages blind.
+ */
+function identity(): Identity | undefined {
+	try {
+		return parseIdentity(process.env.ODD_IDENTITY)
+	} catch (error: unknown) {
+		throw new ReadError(error instanceof Error ? error.message : String(error))
+	}
+}
+
+/** Slack pages and alerts post as the Amp bot once the identity is activated; before that, as before. */
+const slackAs = (): { postAs?: 'bot' } => (process.env.ODD_IDENTITY?.trim() ? { postAs: 'bot' } : {})
+
 // Every comment, so a receipt or marker older than the newest 100 still counts; toSnapshot orders them by createdAt.
 // Like every Linear read, each page must say whether another follows (nextPage): a page without `hasNextPage` is malformed.
-const listComments = (tools: Tools, issueId: string): Promise<Comment[]> => allPages<Comment>(`linear.list_comments ${issueId}`, async cursor => {
+// Only the markers their authors may write count (trustedComments): the author's immutable ID, never its name.
+const listComments = async (tools: Tools, issueId: string): Promise<Comment[]> => trustedComments(await allPages<Comment>(`linear.list_comments ${issueId}`, async cursor => {
 	const page = await readJson<unknown>(tools, 'linear.list_comments', { issueId, limit: 100, ...(cursor ? { cursor } : {}) })
-	const rows = listOf<Comment>(page, 'comments', 'linear.list_comments', row => typeof row.body === 'string' && optional(row, 'id', 'string') && optional(row, 'createdAt', 'string'))
+	const rows = listOf<Comment>(page, 'comments', 'linear.list_comments', row => typeof row.body === 'string' && optional(row, 'id', 'string') && optional(row, 'createdAt', 'string')
+		&& (row.author === undefined || row.author === null || (isRow(row.author) && optional(row.author, 'id', 'string'))))
 	return { rows, next: nextPage(page, 'linear.list_comments') }
-}, comment => comment.id)
+}, comment => comment.id), identity())
 
-type Comment = { id?: string; body: string; createdAt?: string }
+type Comment = AuthoredComment
 
 /** failedReceiptAt over a comment read: a failed receipt without a creation time is a failed read. */
 function failedAt(comments: readonly Comment[]): string | undefined {
@@ -1773,7 +1794,7 @@ async function connections(ctx: Pick<WebhookHandlerContext, '$'>): Promise<(Conn
 /** The page transport (a Slack DM to the thread owner). True only when Slack confirmed the post; a failure is logged and left for the caller to retry. */
 async function deliver(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, text: string): Promise<boolean> {
 	try {
-		const result = (await ctx.tools.call('slack_write', { text })) as { isError?: boolean } | undefined
+		const result = (await ctx.tools.call('slack_write', { ...slackAs(), text })) as { isError?: boolean } | undefined
 		if (result?.isError) throw new Error('slack_write reported an error')
 		return true
 	} catch (error: unknown) {
@@ -1785,7 +1806,7 @@ async function deliver(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, tex
 /** One page (pageText) per mismatch; best effort, so a Slack failure never holds an archive. */
 async function pageMismatch(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: string, detail: string) {
 	const text = `${marker} ${pageText(issue, { kind: 'page', reason: 'subscription-mismatch', detail })}`
-	await ctx.tools.call('slack_write', { text }).catch((error: unknown) => ctx.logger.log(marker, 'mismatch page failed', String(error)))
+	await ctx.tools.call('slack_write', { ...slackAs(), text }).catch((error: unknown) => ctx.logger.log(marker, 'mismatch page failed', String(error)))
 }
 
 // After a role thread ends (its stage passed, or the Watchdog cancelled it): read the thread's

@@ -556,6 +556,17 @@ that refusal rather than falling back to historical installers or relaxing check
 Rollback arguments and snapshots are unchanged, including an interrupted old
 attempt; do not discard its `inFlight` or `receipt` state.
 
+Linear credential (MET-339). With `/etc/factory-dispatch/odd-deployer-oauth.json`
+installed, the job reads and writes Linear as the ODD Deployer app: each run
+requests a fresh client-credentials token (scope `read,write`) and never
+stores it. Without that file it uses the shared `linear-api-key`, until the
+identity is activated in `/etc/factory-dispatch/odd-identity`. From then on the
+job refuses the shared key, refuses a credential whose `viewer` is not the
+configured deployer, and counts only receipts the deployer wrote, plus
+plane-authored receipts from before activation, when it decides whether an
+issue already has its receipt. Provisioning and activation order:
+`docs/odd/README.md` §9.
+
 Not deployed by the job: dispatcher, usage (until it has a rollback that
 restores the previous timer; `rollback-usage.sh` removes the units), pricing,
 ups-control, alerts, backup, reboot, nut, devices-agent. Those stay with Devon.

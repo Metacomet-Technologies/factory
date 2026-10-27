@@ -1,7 +1,7 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { blindMs, digest, digestDue, postedText, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, staleReason, staleThreads, sweepMs, staleMs, type DigestInput, type Episode, digestParts, digestSends, digestCompleteLine, digestDelivered, digestLate, stalledWork, firstParentSince, newestRelease, publisherSnapshot, publisherPage, publisherLine, publisherStallMs, type DigestList, type MainCommit, type Publisher, type Run } from './watchdog.ts';
-import { controlPlaneSilent, deployReceiptLine, heartbeatLine, parseHeartbeat, silenceMs, verifyLine } from './lifecycle.ts';
+import { controlPlaneSilent, deployReceiptLine, heartbeatLine, parseHeartbeat, silenceMs, spawnLine, verifyLine } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
 import { diagnosedLabel, loadFrom, readerLabel, receiptLabel, toSnapshot, verifiedLabels, type LiveThread } from './snapshot.ts';
 import plugin, { followUp } from '../../.amp/plugins/factory-odd.ts';
@@ -13,6 +13,13 @@ import { slackSourceLabel, sourceLine } from './intake.ts';
 // No test arms with the host's injected webhook secrets: each plugin load sees only the synthetic environment it is given.
 const secretNames = ['ODD_GITHUB_WEBHOOK_SECRET', 'ODD_LINEAR_WEBHOOK_SECRET'] as const;
 for (const name of secretNames) delete process.env[name];
+// MET-339: nor with an activated identity; the identity fixtures set and remove their own.
+delete process.env.ODD_IDENTITY;
+/** Synthetic principals: the plane's Linear connection (which `linear.save_comment` writes as), the ODD Deployer app user, the Amp app roles comment as, another human. */
+const planeID = '00000000-0000-4000-8000-0000000000aa';
+const deployerID = '00000000-0000-4000-8000-0000000000bb';
+const roleID = '00000000-0000-4000-8000-0000000000cc';
+const humanID = '00000000-0000-4000-8000-0000000000dd';
 
 const now = new Date('2026-10-24T15:16:00Z');
 const idleFor = (minutes: number, over: Partial<LiveThread> = {}): LiveThread =>
@@ -973,7 +980,7 @@ const head = (n: number) => String(n).repeat(40).slice(0, 40).replace(/[^0-9a-f]
  */
 function factory() {
   const issues = new Map<string, { id: string; status: string; labels: string[]; description: string }>();
-  const comments = new Map<string, { id: string; body: string; createdAt: string }[]>();
+  const comments = new Map<string, { id: string; body: string; createdAt: string; author?: { id: string; name: string } }[]>();
   const prs: Pr[] = [];
   /** Deployed revision → the merge commits it contains, for GitHub's compare. */
   const releases = new Map<string, string[]>();
@@ -1030,7 +1037,7 @@ function factory() {
           return { id: input.id };
         }
         const list = comments.get(String(input.issueId)) ?? [];
-        const comment = { id: `c-${++commentIds}`, body: String(input.body), createdAt: new Date().toISOString() };
+        const comment = { id: `c-${++commentIds}`, body: String(input.body), createdAt: new Date().toISOString(), author: { id: planeID, name: 'Devon Garbalosa' } };
         comments.set(String(input.issueId), [...list, comment]);
         return { id: comment.id };
       }
@@ -1116,7 +1123,7 @@ function factory() {
     /** The Ralph guard as the latest plugin load runs it at the end of a role thread's turn. */
     guard: (labels: string[]) => ends.get(generation)!({ status: 'done', message: '', thread: { id: 'T-role' } }, { thread: { id: 'T-role', labels: async () => labels }, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools, $ }),
     /** A comment one second after the previous planted one, so creation order is unambiguous. */
-    say: (issue: string, body: string) => comments.set(issue, [...(comments.get(issue) ?? []), { id: `said-${++said}`, body, createdAt: new Date(Date.parse('2026-10-26T12:00:00Z') + said * 1000).toISOString() }]),
+    say: (issue: string, body: string, author?: { id: string; name: string }) => comments.set(issue, [...(comments.get(issue) ?? []), { id: `said-${++said}`, body, createdAt: new Date(Date.parse('2026-10-26T12:00:00Z') + said * 1000).toISOString(), ...(author ? { author } : {}) }]),
     issue: (id: string, status: string) => issues.set(id, { id, status, labels: ['odd', 'Bug', 'area:agents'], description: fullSpec }),
     episodes: (id: string) => (comments.get(id) ?? []).filter(comment => comment.body.startsWith('odd-failure')).map(comment => comment.body.split('\n')[0]),
     /** `load` is the plugin's default export; pass a freshly imported module to model a control-orb restart that drops module state. */
@@ -3941,6 +3948,9 @@ test('MET-338: role agents get only their own role tool; none creates, messages 
       for (const tool of editing) assert.ok(['reviewer', 'verifier', 'deployer'].includes(role) ? denied(tool) : !exclude.includes(tool), `${role} ${tool}`);
       assert.ok(!exclude.includes('shell_command'), `${role} keeps the shell for Evidence`);
       assert.ok(role === 'intake' ? granted('slack_write') : !add.includes('slack_write'), `${role} slack_write`);
+      // MET-339: the Linear connection is the plane's marker writer; a role comments as the Amp app.
+      for (const tool of ['mcp__linear__save_comment', 'mcp__linear__delete_comment']) assert.ok(denied(tool), `${role} excludes ${tool}`);
+      assert.ok(granted('comment_on_linear_issue'), `${role} comments as the Amp app`);
     }
   }
 
@@ -3951,4 +3961,66 @@ test('MET-338: role agents get only their own role tool; none creates, messages 
   plant.issue('MET-9', 'Deploying');
   await plant.guard(labels);
   assert.deepEqual(plant.threads.get('T-role')!.labels, [...labels, diagnosedLabel(red)]);
+});
+
+// --- MET-339: authenticated lifecycle markers ----------------------------------------------------
+
+const identityLine = `plane=${planeID} deployer=${deployerID} since=2026-10-26T00:00:00.000Z`;
+const as = (id: string, name: string) => ({ id, name });
+
+for (const activated of [true, false]) {
+  test(`MET-339 control plane, identity ${activated ? 'active' : 'not activated (control)'}: forged role, human and unauthored markers ${activated ? 'are ignored whatever their names; the deployer\'s receipt is verified' : 'still count, as before MET-339'}`, async t => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+    if (activated) process.env.ODD_IDENTITY = identityLine;
+    t.after(() => { mock.timers.reset(); delete process.env.ODD_IDENTITY; });
+    const plant = factory();
+    plant.control.statuses = true;
+    const [A, B, C] = ['a', 'b', 'c'].map(x => `0${x}`.repeat(20));
+    // MET-70: the deployer's receipt, then a role forges its passing verification under Devon's name.
+    plant.issue('MET-70', 'Deploying');
+    plant.say('MET-70', deployLine(A), as(deployerID, 'Devon Garbalosa'));
+    plant.say('MET-70', verifyLine({ sha: A, result: 'pass' }), as(roleID, 'Devon Garbalosa'));
+    // MET-71: only a human-authored receipt.
+    plant.issue('MET-71', 'Deploying');
+    plant.say('MET-71', deployLine(B), as(humanID, 'ODD Deployer'));
+    // MET-72: the deployer's receipt, then an unauthored spawn record claiming its verifier round.
+    plant.issue('MET-72', 'Deploying');
+    plant.say('MET-72', deployLine(C), as(deployerID, 'ODD Deployer'));
+    plant.say('MET-72', spawnLine({ role: 'verifier', round: 1, key: `verifier-${C.slice(0, 12)}` }));
+    await plant.start();
+    await settle();
+    if (activated) {
+      assert.equal(plant.issues.get('MET-70')!.status, 'Deploying', 'a forged verification never sets Done');
+      assert.ok(roleThread(plant, 'MET-70', 'verifier')[1].labels.includes(receiptLabel(A)), 'the deployer\'s receipt gets its verifier');
+      assert.equal(rolesOf(plant, 'MET-71', 'verifier').length, 0, 'a human receipt starts no verifier');
+      assert.ok(roleThread(plant, 'MET-72', 'verifier')[1].labels.includes(receiptLabel(C)), 'an unauthored spawn record holds no round');
+      assert.deepEqual(plant.spawnLines('MET-72').slice(1).map(line => line.replace(/thread=\S+/, 'thread=x')), [`odd-spawn role=verifier round=1 key=verifier-${C.slice(0, 12)} thread=x`, `odd-spawn role=verifier round=1 key=verifier-${C.slice(0, 12)} thread=x`]);
+    } else {
+      assert.equal(plant.issues.get('MET-70')!.status, 'Done', 'the forged verification set Done');
+      assert.ok(roleThread(plant, 'MET-71', 'verifier')[1].labels.includes(receiptLabel(B)), 'the human receipt started a verifier');
+      assert.equal(rolesOf(plant, 'MET-72', 'verifier').length, 0, 'the unauthored record left the round pending, so no verifier started');
+    }
+  });
+}
+
+test('MET-339 control plane: a malformed or half-configured ODD_IDENTITY fails every derivation closed and pages control-plane-blind as the Amp bot', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  process.env.ODD_IDENTITY = `plane=${planeID} since=2026-10-26T00:00:00.000Z`;
+  t.after(() => { mock.timers.reset(); delete process.env.ODD_IDENTITY; });
+  const plant = factory();
+  plant.control.statuses = true;
+  const slack: Record<string, unknown>[] = [];
+  plant.control.inject = (name, input) => { if (name === 'slack_write') slack.push(input); return undefined; };
+  plant.issue('MET-73', 'Deploying');
+  plant.say('MET-73', deployLine('0d'.repeat(20)), as(deployerID, 'ODD Deployer'));
+  plant.say('MET-73', verifyLine({ sha: '0d'.repeat(20), result: 'pass' }), as(planeID, 'Devon Garbalosa'));
+  await plant.start();
+  await settle();
+  assert.equal(plant.issues.get('MET-73')!.status, 'Deploying', 'nothing is derived from an unauthenticated read');
+  assert.match((await plant.events()).find(event => event.issue === 'MET-73')?.error ?? '', /ODD identity configuration is malformed/);
+  await advance(blindMs + 2 * sweepMs);
+  await until(() => plant.dms.length > 0);
+  assert.match(plant.dms[0], /control-plane-blind/);
+  assert.ok(slack.length > 0 && slack.every(input => input.postAs === 'bot'), 'every Slack write posts as the Amp bot');
+  assert.ok(!JSON.stringify(slack).includes(planeID), 'the configuration is not echoed to Slack');
 });

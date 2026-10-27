@@ -707,6 +707,77 @@ its own: every delivery's handler fails, so nothing is evaluated and Amp
 retries the event for up to an hour, while the other provider and the sweep
 keep running. Setting secrets never re-registers or shows the webhook URLs.
 
+Service identities and authenticated markers (MET-339). Each writer has its
+own principal, named by its immutable Linear user ID, never a display name.
+Per Devon's decision of 2026-10-27, existing credentials are reused wherever
+the separation holds:
+
+| Writer | Principal | Writes |
+| --- | --- | --- |
+| Plane (control orb plugin) | Devon's Linear connection (`linear.save_comment`, `linear.save_issue`); user `3017c6e0-5bc4-4cf6-9a39-1a8d5ca74fc0` | Every lifecycle marker except receipts: `odd-spawn`, `odd-merge`, `odd-verify`, `odd-escalated`, `odd-resume`, `odd-watchdog`, `odd-budget`, `odd-steer`, `odd-pr`, `odd-drafted`, episodes |
+| Role agents (plugin modes) | The Amp Linear app, through `comment_on_linear_issue`. Role grants exclude `mcp__linear__save_comment` and `mcp__linear__delete_comment` | Evidence and diagnoses; never a marker the plane accepts |
+| Host deployer (`scripts/odd/deploy.ts`) | Linear OAuth app "ODD Deployer" (client credentials, actor=app); app user `9b96bc7d-30b6-433f-8dab-5c62b82ee92a` | `odd-deploy` receipts only |
+| GitHub merges | Devon's existing `gh` auth (accepted exception, `mergedBy` DGarbs51) | Merges |
+| Slack pages and alerts | The Amp bot (`slack_write` with `postAs: "bot"`) once the identity is activated | Pages, alerts, digest |
+
+The activated identity is one line, `plane=<uuid> deployer=<uuid>
+since=<ISO-8601 with ms>Z`, in the `metacomet/factory` project environment
+variable `ODD_IDENTITY` (nonsecret) for the plugin and in
+`/etc/factory-dispatch/odd-identity` for the deployer. Absent or blank means
+not activated: every author counts, as before. Present, it must parse exactly
+with two distinct IDs, or every read fails closed: each derivation fails,
+and the sweep pages `control-plane-blind`; the deployer exits nonzero.
+
+Once activated, `trustedComments` (`scripts/odd/snapshot.ts`) runs on every
+comment read, in the plugin and in the deployer. A deployer comment
+contributes only its `odd-deploy` lines. A plane comment contributes every
+other line, plus `odd-deploy` lines created before `since`. Any other author
+contributes nothing: the Amp app, another human, a missing author, or a
+display name that copies a principal's. History is reconciled by that one
+rule: until activation the deployer wrote receipts with Devon's key, so those
+plane-authored receipts stay valid, and no other author's history does. A
+receipt an issue loses this way (a hand or forged one) is reposted by the
+deployer's reconcile on its next tick, when the proven release contains the
+merge (`docs/release.md`).
+
+Activation checklist. Devon or the coordinator runs these steps in order;
+a Builder never does.
+
+1. Done 2026-10-27: Devon created the ODD Deployer app and recorded its app
+   user ID on MET-339.
+2. Merge MET-339 and let the deploy tools advance to its release. Nothing
+   changes yet.
+3. Devon installs `/etc/factory-dispatch/odd-deployer-oauth.json`
+   (`{"client_id":"...","client_secret":"..."}`, root-owned, readable by
+   `agent` only) on factory-gpu. From the next tick the deployer requests a
+   fresh client-credentials token each run (scope `read,write`, never
+   persisted) and writes receipts as ODD Deployer. Check that the next
+   receipt's `list_comments` author ID is the deployer's.
+4. Invite the Amp bot to `#factory-alerts`. An explicit `postAs` never falls
+   back to Devon's user token.
+5. Pick `since`: the current time, after step 3's first deployer receipt.
+   Write the line to `/etc/factory-dispatch/odd-identity` on the host and to
+   `ODD_IDENTITY` on the project, then run `amp orb restart-processes` on
+   the control orb (a plugin reload alone does not read new environment).
+   Both writers already use their final principals, so the order does not
+   matter and in-flight issues keep their markers.
+6. Acceptance (MET-339 Done means 2): Devon records the principal IDs and
+   the observed authors of normal writes (an `odd-spawn`, an `odd-deploy`, a
+   merge's `mergedBy`, a Slack page) on MET-339. No log shows a secret.
+
+To deactivate, remove both values; every author counts again. To change the
+deployer principal, install the new credential and update both identity
+lines together: receipts lost in the change are reposted by reconcile. To
+change the plane principal, drain every `odd` issue out of In Progress, In
+Review and Deploying first, because markers from the old ID stop counting.
+
+Residual risks, accepted by Devon or tracked: any comment written as Devon
+(coordinator or hand comments) counts as a plane marker. Claude Code
+builders run through the CLI with the owner's MCP connections, so plugin
+role grants do not reach them (MET-407). The legacy dispatcher keeps
+Devon's key on the host and writes no ODD lifecycle markers. Tool grants are
+not an OS sandbox.
+
 What stays in `scripts/dispatch/`: the launcher (`amp -x` construction,
 worktrees, caps), `qa.ts check` and merge, the ledger as the backstop's cache,
 and the stage-policy evaluator. What leaves it: polling as the primary

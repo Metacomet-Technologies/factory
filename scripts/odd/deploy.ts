@@ -31,7 +31,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deployReceiptLine, oddLabel, parseDeployReceipt, type ComponentIdentity, type Refusal } from './lifecycle.ts';
-import { prOwnsIssue, toSnapshot, type GitHubPullRequest } from './snapshot.ts';
+import { parseIdentity, prOwnsIssue, toSnapshot, trustedComments, type AuthoredComment, type GitHubPullRequest, type Identity } from './snapshot.ts';
 
 /** Git history and the release verifier. Never the runtime, and never run as root. */
 export const ROOT = '/home/agent/work/factory';
@@ -44,6 +44,10 @@ export const LEDGER = join(STATE_DIR, 'deploy.json');
 export const PROBES = 3;
 export const PROBE_GAP_MS = 20_000;
 export const LINEAR_KEY_FILE = '/etc/factory-dispatch/linear-api-key';
+/** MET-339: the activated identity (`plane=<uuid> deployer=<uuid> since=<ISO-8601>`, docs/odd/README.md §9); absent until Devon activates it. */
+export const IDENTITY_FILE = '/etc/factory-dispatch/odd-identity';
+/** MET-339: the ODD Deployer Linear app's client credentials, `{"client_id":"...","client_secret":"..."}`; Devon installs it, root-owned, agent-readable. */
+export const DEPLOYER_OAUTH_FILE = '/etc/factory-dispatch/odd-deployer-oauth.json';
 /** Versioned runtime trees and the `current` link the deploy, dispatch and usage units execute. */
 export const TOOLS_DIR = join(homedir(), 'factory-tools');
 export const CHECK_TIMEOUT_MS = 60_000;
@@ -182,7 +186,7 @@ function tagged(line: string, tag: string): string {
 /** The issue already has this receipt, exactly or as the tagless line an earlier deployer posted: never post it twice. */
 async function posted(effects: Effects, identifier: string, line: string): Promise<boolean> {
   const equivalent = [line, deployReceiptLine({ ...parseDeployReceipt(line)!, tag: undefined })];
-  return (await effects.linear.comments(identifier)).some(comment => equivalent.includes(comment.body.trim()));
+  return (await issueComments(effects, identifier)).some(comment => equivalent.includes(comment.body.trim()));
 }
 
 /** A DB-guarded installer's verdict: `eligible` for exactly one v2 no-DB-change `meter-plan` line,
@@ -265,10 +269,15 @@ export type Effects = {
     comment: (identifier: string, body: string) => Promise<void>;
     /** Every issue labelled `odd` in Deploying, all pages. */
     deployingIssues: () => Promise<string[]>;
-    /** Every comment on the issue, all pages. */
-    comments: (identifier: string) => Promise<{ body: string; createdAt: string }[]>;
+    /** Every comment on the issue, all pages, with its author's user ID. */
+    comments: (identifier: string) => Promise<(AuthoredComment & { createdAt: string })[]>;
   };
+  /** MET-339: the activated identity; undefined before activation, when every author counts. */
+  identity?: Identity;
 };
+
+/** The issue's comments whose markers count (trustedComments): receipts only from the deployer, other markers only from the plane. */
+const issueComments = async (effects: Effects, identifier: string) => trustedComments(await effects.linear.comments(identifier), effects.identity);
 
 export const emptyLedger = (): Ledger => ({ components: {} });
 
@@ -669,7 +678,7 @@ async function reconcile(effects: Effects): Promise<void> {
   for (const identifier of await effects.linear.deployingIssues()) {
     // A pending delivery is this issue's receipt; posting another first would reorder them.
     if (deliveries.some(delivery => delivery.issue === identifier)) continue;
-    const comments = await effects.linear.comments(identifier);
+    const comments = await issueComments(effects, identifier);
     const { deployReceipt: receipt, verify } = toSnapshot({ issue: { id: identifier, status: 'Deploying', labels: [oddLabel], comments } });
     const failed = receipt?.health === 'pass' && verify?.sha === receipt.sha && verify.result === 'fail';
     if (receipt && !failed) continue;
@@ -930,6 +939,46 @@ export function promoteTools(effects: Effects, tag: string): void {
   effects.log('tools-promoted', { ...record, link, root: expected, installerRoot: ROOT, installerChanges: installers });
 }
 
+/** A host file's contents, or undefined when it does not exist; any other read failure throws. */
+function readOptional(path: string): string | undefined {
+  try { return readFileSync(path, 'utf8'); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+/**
+ * MET-339: the Authorization the deployer reads and writes Linear with. With the ODD Deployer
+ * credential installed: a fresh client-credentials token for this run (Linear's guidance for
+ * scheduled automation; never persisted), whose principal must be the activated deployer. Without
+ * it: the legacy shared key, which an activated identity refuses, since receipts written as the
+ * plane principal would be ignored and strand the issue. Errors name files and user IDs, never values.
+ */
+export async function deployerAuthorization(identity: Identity | undefined, io: {
+  read: (path: string) => string | undefined;
+  token: (clientId: string, clientSecret: string) => Promise<string>;
+  viewer: (authorization: string) => Promise<string>;
+}): Promise<string> {
+  const oauth = io.read(DEPLOYER_OAUTH_FILE);
+  if (oauth === undefined) {
+    if (identity) throw new Error(`Identity enforcement is active but ${DEPLOYER_OAUTH_FILE} is absent; refusing to write receipts with the shared Linear key`);
+    const key = io.read(LINEAR_KEY_FILE)?.trim();
+    if (!key) throw new Error(`${LINEAR_KEY_FILE} is absent or empty`);
+    return key;
+  }
+  let parsed: { client_id?: unknown; client_secret?: unknown } | null = null;
+  try { parsed = JSON.parse(oauth) as typeof parsed; } catch { /* reported below without the contents */ }
+  const clientId = parsed?.client_id;
+  const clientSecret = parsed?.client_secret;
+  if (typeof clientId !== 'string' || !clientId || typeof clientSecret !== 'string' || !clientSecret) throw new Error(`${DEPLOYER_OAUTH_FILE} is not {"client_id":"...","client_secret":"..."}`);
+  const authorization = `Bearer ${await io.token(clientId, clientSecret)}`;
+  if (identity) {
+    const viewer = await io.viewer(authorization);
+    if (viewer !== identity.deployer) throw new Error(`${DEPLOYER_OAUTH_FILE} authenticates Linear user ${viewer}, not the configured deployer ${identity.deployer}`);
+  }
+  return authorization;
+}
+
 export function liveEffects(): Effects {
   const log: Effects['log'] = (decision, details = {}) => console.log(JSON.stringify({ decision, ...details }));
   const run: Effects['run'] = (command, args, options = {}) => {
@@ -938,9 +987,8 @@ export function liveEffects(): Effects {
     if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} exited ${result.status}\n${result.stdout}${result.stderr}`);
     return { stdout: result.stdout, stderr: result.stderr };
   };
-  let key: string | undefined;
-  async function graphql<T>(query: string, variables: object): Promise<T> {
-    const authorization = key ??= readFileSync(LINEAR_KEY_FILE, 'utf8').trim();
+  const identity = parseIdentity(readOptional(IDENTITY_FILE));
+  async function request<T>(authorization: string, query: string, variables: object): Promise<T> {
     const response = await fetch('https://api.linear.app/graphql', {
       method: 'POST', headers: { Authorization: authorization, 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, variables }), signal: AbortSignal.timeout(30_000),
@@ -948,6 +996,23 @@ export function liveEffects(): Effects {
     const payload = await response.json() as { data?: T; errors?: { message: string }[] };
     if (!response.ok || payload.errors?.length || !payload.data) throw new Error(`Linear ${response.status}: ${payload.errors?.map(error => error.message).join('; ') ?? 'no data'}`);
     return payload.data;
+  }
+  let authorization: Promise<string> | undefined;
+  async function graphql<T>(query: string, variables: object): Promise<T> {
+    authorization ??= deployerAuthorization(identity, {
+      read: readOptional,
+      token: async (clientId, clientSecret) => {
+        const response = await fetch('https://api.linear.app/oauth/token', {
+          method: 'POST', headers: { Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ grant_type: 'client_credentials', scope: 'read,write' }), signal: AbortSignal.timeout(30_000),
+        });
+        const payload = await response.json() as { access_token?: unknown; error?: unknown };
+        if (!response.ok || typeof payload.access_token !== 'string' || !payload.access_token) throw new Error(`Linear token ${response.status}: ${typeof payload.error === 'string' ? payload.error : 'no access token'}`);
+        return payload.access_token;
+      },
+      viewer: async header => (await request<{ viewer: { id: string } }>(header, 'query { viewer { id } }', {})).viewer.id,
+    });
+    return request<T>(await authorization, query, variables);
   }
   const issueQuery = 'query Issue($id: String!) { issue(id: $id) { id state { name } } }';
   type IssueData = { issue: { id: string; state: { name: string } } };
@@ -963,9 +1028,9 @@ export function liveEffects(): Effects {
       after = page.pageInfo.endCursor;
     }
   }
-  const comments = (identifier: string) => all(async after => (await graphql<{ issue: { comments: Page<{ body: string; createdAt: string }> } }>(
-    'query Comments($id: String!, $after: String) { issue(id: $id) { comments(first: 250, after: $after) { nodes { body createdAt } pageInfo { hasNextPage endCursor } } } }',
-    { id: identifier, after })).issue.comments);
+  const comments = async (identifier: string) => (await all(async after => (await graphql<{ issue: { comments: Page<{ body: string; createdAt: string; user: { id: string } | null }> } }>(
+    'query Comments($id: String!, $after: String) { issue(id: $id) { comments(first: 250, after: $after) { nodes { body createdAt user { id } } pageInfo { hasNextPage endCursor } } } }',
+    { id: identifier, after })).issue.comments)).map(({ user, ...comment }) => ({ ...comment, author: user }));
   return {
     stateDir: STATE_DIR,
     toolsDir: TOOLS_DIR,
@@ -996,6 +1061,7 @@ export function liveEffects(): Effects {
       writeFileSync(`${LEDGER}.tmp`, body);
       renameSync(`${LEDGER}.tmp`, LEDGER);
     },
+    ...(identity ? { identity } : {}),
     linear: {
       deploying: async identifier => (await graphql<IssueData>(issueQuery, { id: identifier })).issue.state.name === 'Deploying',
       comment: async (identifier, body) => {
