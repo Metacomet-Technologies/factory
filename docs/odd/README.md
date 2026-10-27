@@ -432,14 +432,35 @@ bare hex, and the signed `webhookTimestamp` must be within 60 s of Amp's
 `receivedAt` (so Amp's own retries stay valid). The same signed Linear bytes
 under another event ID inside that window are a replay. A missing, malformed,
 invalid, stale or replayed delivery is recorded `rejected` and read no
-further. Slack has no webhook; `#factory-intake` is polled. The two signing
-secrets live only in the control orb's memory, entered by Devon through
-owner-only `ui.input({ secret: true })` dialogs at arm or with
-`odd_control_status set_secrets:true`. Status shows only `signing: set |
-missing`. After a reload they are gone: until set again, every delivery's
-handler fails, so nothing is evaluated and Amp retries the event for up to an
-hour; the sweep keeps running. Setting them never re-registers or shows the
-webhook URLs.
+further. Slack has no webhook; `#factory-intake` is polled.
+
+Signing secrets (MET-382): the project environment takes precedence over
+private input, per provider.
+
+1. Persistent project configuration: the `metacomet/factory` project secrets
+   `ODD_GITHUB_WEBHOOK_SECRET` and `ODD_LINEAR_WEBHOOK_SECRET`, which Amp
+   injects into the orb's process environment. The plugin reads them at every
+   arm, so a plugin reload re-arms both providers with no dialog. An empty or
+   whitespace-only value counts as missing.
+2. Runtime refresh: Amp injects environment values when it starts the orb's
+   processes. A secret created or changed after that reaches the plugin only
+   after `amp orb restart-processes` (or a new orb); a plugin reload alone
+   does not pick it up. A removed or changed value on a fresh runtime
+   replaces the old one; nothing earlier is reused.
+3. Transient private input: for a provider the environment does not
+   configure, arming asks Devon once through an owner-only
+   `ui.input({ secret: true })` dialog, and `odd_control_status
+   set_secrets:true` asks again. That value lives only in the plugin's memory
+   until the next reload. An environment-configured provider is never asked,
+   and private input never replaces its value; change the project secret
+   instead.
+
+Status shows only `signing: set | missing` per provider and `signingSource:
+environment | private` for each set one; values are never returned, logged,
+written or included in errors. A provider without a secret fails closed on
+its own: every delivery's handler fails, so nothing is evaluated and Amp
+retries the event for up to an hour, while the other provider and the sweep
+keep running. Setting secrets never re-registers or shows the webhook URLs.
 
 What stays in `scripts/dispatch/`: the launcher (`amp -x` construction,
 worktrees, caps), `qa.ts check` and merge, the ledger as the backstop's cache,
