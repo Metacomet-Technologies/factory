@@ -3969,6 +3969,51 @@ test('MET-338: role agents get only their own role tool; none creates, messages 
   assert.deepEqual(plant.threads.get('T-role')!.labels, [...labels, diagnosedLabel(red)]);
 });
 
+// --- MET-406: resuming a spent verifier budget on an unchanged receipt -------------------------
+
+test('MET-406: removing escalated from the MET-337 shape (two cancelled verifier rounds on one receipt) spawns epoch 2\'s first verifier as round 3, whose odd_verify is accepted and sets Done; nothing re-pages', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-27T17:55:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  plant.control.statuses = true;
+  const receipt = '2de923db368fc9ee5b76b6c8bae32e09405d56ff';
+  const key = `verifier-${receipt.slice(0, 12)}`;
+  plant.issue('MET-337', 'Deploying');
+  plant.say('MET-337', deployLine(receipt));
+  for (const n of [1, 2]) {
+    plant.say('MET-337', `odd-spawn role=verifier round=${n} key=${key} thread=pending`);
+    plant.say('MET-337', `odd-spawn role=verifier round=${n} key=${key} thread=T-v${n}`);
+    plant.say('MET-337', `odd-watchdog cancelled role=verifier thread=T-v${n} round=${n}`);
+    plant.threads.set(`T-v${n}`, { labels: ['odd-issue-met-337', 'odd-role-verifier', `odd-round-${n}`, receiptLabel(receipt)], state: 'idle', archived: true, updatedAt: new Date().toISOString() });
+  }
+  plant.say('MET-337', `odd-escalated reason=budget-ceiling pr=213 sha=${'b9bf30a49701287b80ab65377d3b346a0370a278'} done=label,draft,page,archive\n\nMET-337: verifier spent 2/2 rounds (verify none at ${receipt.slice(0, 12)})`);
+  plant.issues.get('MET-337')!.labels.push('escalated');
+  const lines = (prefix: string) => (plant.comments.get('MET-337') ?? []).filter(comment => comment.body.startsWith(prefix)).map(comment => comment.body);
+  await plant.start();
+  await settle();
+  assert.deepEqual([lines('odd-resume').length, lines('odd-spawn').length, plant.dms.length], [0, 4, 0], 'held while labelled');
+
+  plant.issues.get('MET-337')!.labels = plant.issues.get('MET-337')!.labels.filter(label => label !== 'escalated');
+  await advance(2 * sweepMs);
+  assert.deepEqual(lines('odd-resume'), [`odd-resume escalation=${(plant.comments.get('MET-337') ?? []).find(comment => comment.body.startsWith('odd-escalated'))!.id} epoch=2`]);
+  assert.equal(lines('odd-escalated').length, 1, 'no second escalation');
+  assert.deepEqual(plant.dms, [], 'no page');
+  const live = [...plant.threads].filter(([, candidate]) => !candidate.archived && candidate.labels.includes('odd-role-verifier'));
+  assert.equal(live.length, 1, 'one verifier for epoch 2');
+  const [[verifier, thread]] = live;
+  assert.deepEqual(lines('odd-spawn').slice(4), [`odd-spawn role=verifier round=3 key=${key} thread=pending`, `odd-spawn role=verifier round=3 key=${key} thread=${verifier}`]);
+  assert.ok(thread.labels.includes('odd-round-3') && thread.labels.includes(receiptLabel(receipt)), thread.labels.join(' '));
+
+  // The new round's own spawn record assigns it the receipt, so its report is accepted and the plane closes the issue.
+  assert.match(await outcome(plant.tool('odd_verify', verifier, { result: 'pass' })), /^accepted: Recorded odd-verify-pass-2de923db368f/);
+  thread.state = 'idle';
+  await advance(2 * sweepMs);
+  assert.deepEqual(lines('odd-verify '), [verifyLine({ sha: receipt, result: 'pass' })]);
+  assert.equal(plant.issues.get('MET-337')!.status, 'Done');
+  // Archiving the finished verifier records its routing, which the fixture cannot serve (an unchanged, separate page).
+  assert.deepEqual(plant.dms.filter(dm => !dm.includes('subscription-mismatch')), []);
+});
+
 // --- MET-339: authenticated lifecycle markers ----------------------------------------------------
 
 const identityLine = `plane=${planeID} deployer=${deployerID} since=2026-10-26T00:00:00.000Z`;

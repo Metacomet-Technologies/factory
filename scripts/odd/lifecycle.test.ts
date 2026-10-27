@@ -551,3 +551,84 @@ test('P3.10: a running owner waits on its activity with a 15-minute cancel budge
   assert.equal(errored.kind, 'page');
   assert.equal(nextAction(issue({ status: 'In Progress', owner: { ...running, state: 'error', round: 1 } }), idle).kind, 'spawn');
 });
+
+// --- MET-406: a resume grants the verifier a fresh budget on the same receipt -------------------
+
+const met337 = (() => {
+  const receipt = '2de923db368fc9ee5b76b6c8bae32e09405d56ff';
+  const head = 'b9bf30a49701287b80ab65377d3b346a0370a278';
+  const key = `verifier-${receipt.slice(0, 12)}`;
+  let minute = 0;
+  const c = (body: string, id?: string) => ({ ...(id ? { id } : {}), body, createdAt: new Date(Date.parse('2026-10-27T11:00:00.000Z') + 60_000 * minute++).toISOString() });
+  const round = (n: number) => [
+    c(`odd-spawn role=verifier round=${n} key=${key} thread=pending`),
+    c(`odd-spawn role=verifier round=${n} key=${key} thread=T-v${n}`),
+    c(`odd-watchdog cancelled role=verifier thread=T-v${n} round=${n}`),
+  ];
+  const latch = (id: string, spent: string) => c(`odd-escalated reason=budget-ceiling pr=213 sha=${head} done=label,draft,page,archive\n\nMET-337: verifier spent ${spent} rounds (verify none at ${receipt.slice(0, 12)})`, id);
+  const deploy = (sha: string) => c(`odd-deploy host=factory-gpu component=none sha=${sha} health=pass rollback=none`);
+  const snap = (comments: ReturnType<typeof c>[], labels: string[] = ['odd']) =>
+    toSnapshot({ issue: { id: 'MET-337', status: 'Deploying', labels, description: spec, comments: [...comments].reverse() } });
+  const epoch1 = [c(`odd-merge pr=213 head=${head} merge=${'8'.repeat(40)} release=none`), deploy(receipt), ...round(1), ...round(2)];
+  return { receipt, round, latch, deploy, snap, epoch1, c };
+})();
+const verifyNone = `verify none at ${met337.receipt.slice(0, 12)}`;
+
+test('MET-406 Done-means 1: after escalated is removed from a spent verifier budget on the MET-337 receipt, the next evaluation spawns round 1 of epoch 2 instead of re-paging', () => {
+  const { latch, snap, epoch1, c } = met337;
+  const spent = snap(epoch1);
+  assert.deepEqual(nextAction(spent, idle), { kind: 'page', reason: 'budget-ceiling', detail: `MET-337: verifier spent 2/2 rounds (${verifyNone})`, pr: undefined, sha: undefined });
+  const escalated = [...epoch1, latch('e1', '2/2')];
+  assert.deepEqual(nextAction(snap(escalated, ['odd', 'escalated']), idle), { kind: 'wait', reason: 'escalated to Devon' });
+  assert.deepEqual(nextAction(snap(escalated), idle), { kind: 'resume', escalation: 'e1', epoch: 2 });
+  const resumed = snap([...escalated, c('odd-resume escalation=e1 epoch=2')]);
+  assert.equal(resumed.correction?.epoch, 2);
+  // Round 1 of the new epoch is numbered 3: epoch 1's `odd-spawn … round=1|2 key=verifier-<receipt>` records stay unique.
+  assert.deepEqual(nextAction(resumed, idle), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: `verify none at ${met337.receipt.slice(0, 12)}`, round: 3 });
+  // Capacity still gates it like any spawn.
+  assert.deepEqual(nextAction(resumed, { ...idle, orbs: capacity.orbs }), { kind: 'wait', reason: 'orb capacity (verifier)' });
+});
+
+test('MET-406 Done-means 2: a second spent verifier budget in the same epoch pages budget-ceiling once, and the next resume grants one more', () => {
+  const { round, latch, snap, epoch1, c } = met337;
+  const epoch2 = [...epoch1, latch('e1', '2/2'), c('odd-resume escalation=e1 epoch=2')];
+  // One epoch-2 round spent: the second is granted.
+  assert.deepEqual(nextAction(snap([...epoch2, ...round(3)]), idle), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: verifyNone, round: 4 });
+  // A live, undelivered epoch-2 round 4 next to a cancelled round 3: spent, so it waits on the live thread.
+  const live = toSnapshot({ issue: { id: 'MET-337', status: 'Deploying', labels: ['odd'], comments: [...epoch2, ...round(3)].reverse() },
+    threads: [{ id: 'T-v4', labels: ['odd-issue-met-337', 'odd-role-verifier', 'odd-round-4', `odd-receipt-${met337.receipt.slice(0, 12)}`], state: 'idle' }] });
+  assert.deepEqual(nextAction(live, idle), { kind: 'wait', reason: 'verifier round budget spent (2/2)', stuck: 'verifier' });
+  // Both epoch-2 rounds spent: one page, as in epoch 1.
+  const spent = [...epoch2, ...round(3), ...round(4)];
+  assert.deepEqual(nextAction(snap(spent), idle), { kind: 'page', reason: 'budget-ceiling', detail: `MET-337: verifier spent 2/2 rounds (${verifyNone})`, pr: undefined, sha: undefined });
+  // Once latched it holds: no second page while labelled.
+  const escalated = [...spent, latch('e2', '2/2')];
+  assert.deepEqual(nextAction(snap(escalated, ['odd', 'escalated']), idle), { kind: 'wait', reason: 'escalated to Devon' });
+  // A third epoch numbers on from round 5.
+  assert.deepEqual(nextAction(snap([...escalated, c('odd-resume escalation=e2 epoch=3')]), idle), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: verifyNone, round: 5 });
+});
+
+test('MET-406 Done-means 3 and 4: without a resume the per-receipt budget is unchanged, and a new receipt starts a fresh budget in any epoch', () => {
+  const { round, latch, deploy, snap, epoch1, c } = met337;
+  const fresh = 'f'.repeat(40);
+  // Never escalated: one cancelled round leaves one; two page (Done-means 3).
+  assert.deepEqual(nextAction(snap(epoch1.slice(0, -3)), idle), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: verifyNone, round: 2 });
+  assert.equal(snap(epoch1).epochBase, undefined);
+  // An escalation comment alone (label still on, or never resumed) grants nothing.
+  assert.equal((nextAction(snap([...epoch1, latch('e1', '2/2')], ['odd', 'escalated']), idle)).kind, 'wait');
+  // A new receipt, before or after a resume, starts at round 1 with a full budget (Done-means 4).
+  const verify = `verify none at ${fresh.slice(0, 12)}`;
+  assert.deepEqual(nextAction(snap([...epoch1, deploy(fresh)]), idle), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: verify, round: 1 });
+  const epoch2 = [...epoch1, latch('e1', '2/2'), c('odd-resume escalation=e1 epoch=2'), ...round(3)];
+  const next = snap([...epoch2, deploy(fresh)]);
+  assert.equal(next.epochBase, undefined);
+  assert.deepEqual(nextAction(next, idle), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: verify, round: 1 });
+  // That receipt's own two rounds still page in the same epoch.
+  const key = `verifier-${fresh.slice(0, 12)}`;
+  const freshEpoch = [...epoch2, deploy(fresh), ...[1, 2].map(n => c(`odd-watchdog cancelled role=verifier thread=T-f${n} round=${n}\n\n${key}`))];
+  assert.deepEqual(nextAction(snap(freshEpoch), idle), { kind: 'page', reason: 'budget-ceiling', detail: `MET-337: verifier spent 2/2 rounds (${verify})`, pr: undefined, sha: undefined });
+  // Other roles are untouched: a resume still restarts their cancelled rounds from 1.
+  const builder = snap([...epoch1, c('odd-watchdog cancelled role=builder thread=T-b round=3'), latch('e1', '2/2'), c('odd-resume escalation=e1 epoch=2')]);
+  assert.deepEqual(builder.cancelledRounds, { verifier: 2 });
+  assert.deepEqual(builder.epochBase, { verifier: 2 });
+});
