@@ -702,13 +702,12 @@ export async function main(effects: Effects): Promise<void> {
   effects.log('pending', { lastTag: ledger.lastTag, tags: pending, deliveries: ledger.deliveries?.length ?? 0 });
   // Before any release, so a held or failing release never strands an earlier one's recipients.
   await deliverDelayed(effects);
-  let previous = cursor;
-  for (const tag of pending) {
-    await deployRelease(effects, tag, previous);
-    previous = tag;
-  }
-  // Only the newest handled release: historical releases deployed above never move the runtime.
-  promoteTools(effects, previous);
+  // At most the oldest pending release per tick: the timer drains the rest one invocation at a time.
+  // A saved receipt or in-flight install always belongs to this release, since its cursor has not moved.
+  const [tag] = pending;
+  if (tag) await deployRelease(effects, tag, cursor);
+  // Only the release this tick handled: older ones never move the runtime.
+  promoteTools(effects, tag ?? cursor);
   await reconcile(effects);
 }
 

@@ -2038,6 +2038,97 @@ test('pending releases are immutable v-tags newer than the ledger, oldest first;
   assert.equal(resume({ tag: 'v', sha, component: 'kiosk', phase: 'installing' }, 'fail'), 'reinstall');
 });
 
+// --- Drain policy (MET-366): one oldest pending release per tick; the two-minute timer drains the rest.
+
+/** One `main` tick on a persistent host: what it prepared and installed, and where the cursors stand after it. */
+async function tick(host: ReturnType<typeof world>) {
+  host.calls.length = 0;
+  let error: unknown;
+  try { await main(host.effects); } catch (caught) { error = caught; }
+  const ledger = host.ledger();
+  return { ok: !error, prepared: host.calls.filter(call => call.startsWith('verify ')), installs: sudoCalls(host.calls), lastTag: ledger.lastTag, tools: ledger.tools?.current?.tag };
+}
+
+test('drain: three pending releases take three ticks, oldest first, each preparing, installing and recording only its own release; a fourth installs nothing', async t => {
+  // Listed newest first: the order comes from the immutable tags, not the listing.
+  const host = world({ tags: ['v0.3.1', 'v0.3.0', 'v0.2.50', 'v0.2.9'],
+    changes: { 'v0.2.50': ['kiosk/src/App.tsx'], 'v0.3.0': ['kiosk/src/App.tsx'], 'v0.3.1': ['kiosk/src/App.tsx'] },
+    issues: { 'v0.2.50': ['MET-350'], 'v0.3.0': ['MET-300'], 'v0.3.1': ['MET-301'] }, ledger: baseline() });
+  t.after(host.cleanup);
+  const kioskAt = (tag: Tag) => `sudo deploy/install-kiosk.sh ${host.stateDir}/releases/${tag}/kiosk`;
+  const receipt = (issue: string, tag: Tag) => [issue, line(`component=kiosk sha=${shas[tag]} health=pass rollback=none`)];
+  for (const [tag, issue] of [['v0.2.50', 'MET-350'], ['v0.3.0', 'MET-300'], ['v0.3.1', 'MET-301']] as const) {
+    const before = host.comments.length;
+    assert.deepEqual(await tick(host), { ok: true, prepared: [`verify ${tag}`], installs: [kioskAt(tag)], lastTag: tag, tools: tag }, tag);
+    assert.equal(host.live.kiosk, shas[tag], `${tag} is live, no newer release`);
+    assert.deepEqual(host.comments.slice(before), [receipt(issue, tag)], `${tag} receipts only its own issue`);
+    assert.deepEqual(host.ledger().deployed?.tag, tag);
+  }
+  assert.deepEqual(await tick(host), { ok: true, prepared: [], installs: [], lastTag: 'v0.3.1', tools: 'v0.3.1' });
+  assert.equal(host.comments.length, 3);
+});
+
+test('drain: a failed preparation, killed install, failed delivery or failed install neither skips the release nor reinstalls; delayed delivery and reconcile run with or without a new release', async t => {
+  const notDeploying = ['MET-300'];
+  const host = world({ tags: ['v0.2.9', 'v0.2.50', 'v0.3.0', 'v0.3.1'],
+    changes: { 'v0.2.50': ['meter/src/main.rs', 'kiosk/src/App.tsx'], 'v0.3.0': ['kiosk/src/App.tsx'], 'v0.3.1': ['kiosk/src/App.tsx'] },
+    issues: { 'v0.2.50': ['MET-350', 'MET-351'], 'v0.3.0': ['MET-300'], 'v0.3.1': ['MET-301'] },
+    failComment: 'MET-351', notDeploying, ledger: baseline() });
+  t.after(host.cleanup);
+  const dir = (tag: Tag) => `${host.stateDir}/releases/${tag}`;
+  const { run, sudo, writeLedger, linear } = host.effects;
+  let failVerify = true;
+  host.effects.run = (command, args, options) => {
+    if (command === 'python3' && failVerify) { failVerify = false; throw new Error('release.py verify exited 1\nHTTP 502'); }
+    return run(command, args, options);
+  };
+  // Killed after kiosk's install and probes, before its result was recorded: inFlight still says probing.
+  let crash = (next: Ledger) => next.components.kiosk?.tag === 'v0.2.50';
+  host.effects.writeLedger = (next, options) => {
+    if (crash(next)) { crash = () => false; throw new Error('killed before the ledger write'); }
+    writeLedger(next, options);
+  };
+  // v0.3.0's kiosk installer refuses before changing anything.
+  host.effects.sudo = (script, args) => script === 'deploy/install-kiosk.sh' && args.at(-1) === `${dir('v0.3.0')}/kiosk`
+    ? (host.calls.push(`sudo ${script} ${args.slice(2).join(' ')}`), { ok: false, output: 'ERROR: preflight failed\nNo deployment changes made; no rollback snapshot exists.\n' })
+    : sudo(script, args);
+  let reconciled = 0;
+  host.effects.linear = { ...linear, deployingIssues: async () => { reconciled++; return linear.deployingIssues!(); } };
+  const pass = (tag: Tag, component: string) => line(`component=${component} sha=${shas[tag]} health=pass rollback=none`);
+
+  // 1. Preparation fails: nothing installed, the cursor stays, no later release is prepared.
+  assert.deepEqual(await tick(host), { ok: false, prepared: [], installs: [], lastTag: 'v0.2.9', tools: undefined });
+  assert.equal(host.ledger().inFlight, undefined);
+  // 2. The same release again: meter installs, kiosk installs, then the kill.
+  assert.deepEqual(await tick(host), { ok: false, prepared: ['verify v0.2.50'], installs: [
+    `sudo deploy/install-meter.sh --no-db-change ${dir('v0.2.50')}/meter-linux-x86_64`, `sudo deploy/install-kiosk.sh ${dir('v0.2.50')}/kiosk`], lastTag: 'v0.2.9', tools: undefined });
+  assert.deepEqual(host.ledger().inFlight, { tag: 'v0.2.50', sha: shas['v0.2.50'], component: 'kiosk', phase: 'probing', snapshot: '/var/backups/kiosk/snap' });
+  assert.equal(host.ledger().components.meter.health, 'pass');
+  // 3. Recovery reinstalls neither finished component; MET-351's comment fails, so the receipt is saved and the cursor holds.
+  assert.deepEqual(await tick(host), { ok: false, prepared: [], installs: [], lastTag: 'v0.2.9', tools: undefined });
+  assert.deepEqual(host.ledger().receipt, { tag: 'v0.2.50', receipt: { component: 'meter+kiosk', sha: shas['v0.2.50'], health: 'pass', rollback: 'none' }, delivered: ['MET-350'] });
+  // 4. The saved receipt delivers MET-351 alone, with no install, before the cursor moves.
+  assert.deepEqual(await tick(host), { ok: true, prepared: [], installs: [], lastTag: 'v0.2.50', tools: 'v0.2.50' });
+  assert.deepEqual(host.comments, [['MET-350', pass('v0.2.50', 'meter+kiosk')], ['MET-351', pass('v0.2.50', 'meter+kiosk')]]);
+  // 5. v0.3.0 fails without a change: its fail receipt waits for MET-300 and v0.3.1 is not prepared.
+  const failed = line(`component=kiosk sha=${shas['v0.3.0']} health=fail rollback=unchanged`);
+  assert.deepEqual(await tick(host), { ok: false, prepared: ['verify v0.3.0'], installs: [`sudo deploy/install-kiosk.sh ${dir('v0.3.0')}/kiosk`], lastTag: 'v0.3.0', tools: 'v0.2.50' });
+  assert.equal(host.live.kiosk, shas['v0.2.50']);
+  assert.deepEqual(host.ledger().deliveries?.map(delivery => [delivery.issue, delivery.line]), [['MET-300', failed]]);
+  // 6. A new release exists and MET-300 is Deploying: the delayed receipt is posted, and v0.3.1 reinstalls the failed kiosk.
+  notDeploying.splice(0, 1, 'MET-301');
+  assert.deepEqual(await tick(host), { ok: true, prepared: ['verify v0.3.1'], installs: [`sudo deploy/install-kiosk.sh ${dir('v0.3.1')}/kiosk`], lastTag: 'v0.3.1', tools: 'v0.3.1' });
+  assert.deepEqual(host.comments.slice(2), [['MET-300', failed]]);
+  assert.deepEqual(host.ledger().deliveries?.map(delivery => delivery.issue), ['MET-301']);
+  // 7. No new release: MET-301's delayed receipt is still delivered and reconcile still runs; nothing is prepared or installed.
+  notDeploying.length = 0;
+  const reconciledBefore = reconciled;
+  assert.deepEqual(await tick(host), { ok: true, prepared: [], installs: [], lastTag: 'v0.3.1', tools: 'v0.3.1' });
+  assert.deepEqual(host.comments.slice(3), [['MET-301', pass('v0.3.1', 'kiosk')]]);
+  assert.deepEqual(host.ledger().deliveries, []);
+  assert.equal(reconciled, reconciledBefore + 1);
+});
+
 // --- Explicit bootstrap (MET-362): an absent ledger is adopted only on request, never by the job.
 
 test('bootstrap: an absent ledger adopts one healthy published release without installing or historical receipts, then deploys forward only', async t => {
