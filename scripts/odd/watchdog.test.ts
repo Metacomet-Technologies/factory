@@ -2474,3 +2474,82 @@ test('P4.6-deployer-archive: a diagnosed reader thread search has never returned
     mock.timers.reset();
   }
 });
+
+// --- P4.3: a merge at or before the latest failed receipt is history after a rollback -------
+
+const mergedPr = (issue: string, n: number, mergedAt: string, over: Partial<Pr> = {}): Pr => {
+  const sha = head(n);
+  return { number: n, headRefName: `${issue.toLowerCase()}-x`, headRefOid: sha, state: 'MERGED', mergeCommit: { oid: '7'.repeat(40) }, mergedAt, mergeable: 'UNKNOWN', commits: [{ oid: sha, committedDate: '2026-10-26T10:00:00Z' }], statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }], body: `closes ${issue}`, ...over };
+};
+/** MET-41's first release: PR #41 merged at 11:00, its merge receipt, then a red receipt at 12:00:02 that rolled it back. */
+const rolledBack41 = (plant: ReturnType<typeof factory>, status: string) => {
+  plant.issue('MET-41', status);
+  plant.prs.push(mergedPr('MET-41', 41, '2026-10-26T11:00:00Z'));
+  plant.say('MET-41', `odd-merge pr=41 head=${head(41)} merge=${'7'.repeat(40)} release=none`);
+  plant.say('MET-41', deployLine('7'.repeat(40), 'fail', 'd'.repeat(12)));
+};
+const builder41 = ['odd-issue-met-41', 'odd-role-builder', 'odd-round-1', 'odd-engine-anthropic'];
+const guardMessage = async (plant: ReturnType<typeof factory>) => ((await plant.guard(builder41)) as { userMessage?: string } | undefined)?.userMessage;
+
+test('P4.3: rollback -> Todo -> a new builder with no new PR never returns to Deploying, and the old merge does not meet its stop', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  plant.control.launch = true;
+  rolledBack41(plant, 'Deploying');
+  await plant.start();
+  await settle();
+  assert.ok(plant.saves.includes('MET-41 "Todo"'), 'the red receipt returns the issue to Todo');
+
+  // Its log reader posted the diagnosis and idled.
+  for (const reader of rolesOf(plant, 'MET-41', 'deployer')) Object.assign(reader, { state: 'idle', labels: [...reader.labels, diagnosedLabel('7'.repeat(40))] });
+  plant.issues.get('MET-41')!.status = 'Todo';
+  await plant.sweep();
+  await settle();
+  const builders = rolesOf(plant, 'MET-41', 'builder');
+  assert.equal(builders.length, 1, 'Todo starts a fresh builder although the old PR is merged');
+
+  // The builder ran and idled without opening a PR.
+  plant.issues.get('MET-41')!.status = 'In Progress';
+  builders[0].state = 'idle';
+  const before = plant.saves.length;
+  await plant.sweep();
+  await settle();
+  await advance(30 * 60_000);
+  assert.ok(!plant.saves.includes('MET-41 "Deploying"'), `never Deploying off the rolled-back merge: ${plant.saves.slice(before).join('; ')}`);
+  assert.equal((plant.comments.get('MET-41') ?? []).filter(comment => comment.body.startsWith('odd-merge')).length, 1, 'no merge receipt is recovered for the old PR');
+  assert.match(await guardMessage(plant) ?? '', /no open PR for MET-41/, 'the Ralph guard continues the builder');
+});
+
+test('P4.3: after a rollback a new owned open or later-merged PR advances; mentions and equal or older merges stay excluded', async t => {
+  // Each row adds PRs to the rolled-back issue. The old #41 is listed first (as newest), so a later merge must not hide behind it.
+  const cases: { name: string; add: (plant: ReturnType<typeof factory>) => void; deploying: boolean; reviewer: boolean; stop: boolean }[] = [
+    { name: 'no new PR (control)', add: () => {}, deploying: false, reviewer: false, stop: false },
+    // The red receipt is 12:00:02.000Z in Linear's format; GitHub reports the same instant without milliseconds.
+    { name: 'owned merge at the failure instant', add: plant => plant.prs.push(mergedPr('MET-41', 42, '2026-10-26T12:00:02Z')), deploying: false, reviewer: false, stop: false },
+    { name: 'owned merge before the failure', add: plant => plant.prs.push(mergedPr('MET-41', 43, '2026-10-26T12:00:01Z')), deploying: false, reviewer: false, stop: false },
+    { name: 'later merge that only mentions MET-41', add: plant => plant.prs.push(mergedPr('MET-41', 44, '2026-10-26T13:00:00Z', { headRefName: 'met-279-x', body: 'contributes MET-279\n\nMET-41 was rolled back.' })), deploying: false, reviewer: false, stop: false },
+    { name: 'owned merge one second after the failure', add: plant => plant.prs.push(mergedPr('MET-41', 45, '2026-10-26T12:00:03Z')), deploying: true, reviewer: false, stop: true },
+    { name: 'new owned open PR', add: plant => plant.openPr('MET-41', head(46), { number: 46 }), deploying: false, reviewer: true, stop: true },
+  ];
+  for (const { name, add, deploying, reviewer, stop } of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        rolledBack41(plant, 'In Progress');
+        plant.builder('MET-41');
+        add(plant);
+        await plant.start();
+        await settle();
+        assert.equal(plant.saves.includes('MET-41 "Deploying"'), deploying, plant.saves.join('; '));
+        assert.equal(rolesOf(plant, 'MET-41', 'reviewer').length, reviewer ? 1 : 0);
+        const message = await guardMessage(plant);
+        assert.equal(message === undefined, stop, message);
+        if (!stop) assert.match(message ?? '', /no open PR for MET-41/);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});

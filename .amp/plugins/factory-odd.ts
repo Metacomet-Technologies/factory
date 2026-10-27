@@ -45,7 +45,7 @@ import {
 	type SpawnRecord,
 } from '../../scripts/odd/lifecycle.ts'
 import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { admittedLoad, diagnosedLabel, finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
+import { admittedLoad, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, loadFrom, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
 import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
 import { builderArgs, launch } from '../../scripts/odd/launch.ts'
 import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, digestHeading, episodeLine, incidentPageDue, incidentText, incidents, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, resolutionText, restoreStatus, sanitizeError, slackMessages, staleThreads, sweepMs, unknownAge, type DigestInput, type DigestWait, type Episode, type Plane } from '../../scripts/odd/watchdog.ts'
@@ -1449,15 +1449,24 @@ const listComments = (tools: Tools, issueId: string): Promise<Comment[]> => allP
 
 type Comment = { id?: string; body: string; createdAt?: string }
 
+/** failedReceiptAt over a comment read: a failed receipt without a creation time is a failed read. */
+function failedAt(comments: readonly Comment[]): string | undefined {
+	try {
+		return failedReceiptAt(comments)
+	} catch (error: unknown) {
+		throw new ReadError(error instanceof Error ? error.message : String(error))
+	}
+}
+
 // A thread an `odd-spawn` record binds is read by its ID, so search lag (or a plugin reload) never
 // hides it; one whose labels did not land carries its record's role labels. `known` are other
 // threads of the issue to read by ID (the log readers this process spawned).
 async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, merged?: number, known: readonly string[] = []): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
-	const [issue, comments, pr] = await Promise.all([
+	const [issue, comments] = await Promise.all([
 		getIssue(ctx.tools, { id: identifier, includeRelations: true }),
 		listComments(ctx.tools, identifier),
-		pullRequestFor(ctx, identifier, merged),
 	])
+	const pr = await pullRequestFor(ctx, identifier, failedAt(comments), merged)
 	const bound = new Map(spawnRecords(comments).flatMap(record => (record.thread ? [[record.thread, record] as const] : [])))
 	const threads = (await threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, [...bound.keys(), ...known])).map(thread => {
 		const record = bound.get(thread.id)
@@ -1539,7 +1548,7 @@ async function recordRouting(ctx: ShellContext, thread: LiveThread) {
 // commits on a 100-PR page ask GitHub for 1,000,000 nodes, over its 500,000 bound (MET-344).
 // A failed or malformed read, or a list that fills its limit, throws: it is never "no PR".
 // gh reads only a PR's first 100 commits, so the head time is read from the head commit itself.
-const prListFields = 'number,headRefName,body'
+const prListFields = 'number,headRefName,body,mergedAt'
 const prListLimit = 1000
 const prFields = 'number,headRefName,headRefOid,state,mergeCommit,mergedAt,mergeable,statusCheckRollup,body'
 
@@ -1564,14 +1573,18 @@ async function ghJson(run: PromiseLike<ShellResult>, command: string): Promise<u
 	}
 }
 
-async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, state: 'merged' | 'open', merged?: number): Promise<GitHubPullRequest | undefined> {
+// P4.3: `failed` is the latest failed receipt's time (failedReceiptAt); a PR merged at or before it is skipped (prEligible),
+// so an older merge never hides a later one and never stands in for a missing PR after a rollback.
+async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, state: 'merged' | 'open', failed: string | undefined, merged?: number): Promise<GitHubPullRequest | undefined> {
 	const command = `gh pr list --state ${state}`
 	const listed = await ghJson(state === 'open'
 		? ctx.$`gh pr list --state open --json ${prListFields} --limit ${String(prListLimit)}`
 		: ctx.$`gh pr list --search ${`"${identifier}"`} --state merged --json ${prListFields} --limit ${String(prListLimit)}`, command)
-	if (!Array.isArray(listed) || listed.some(pr => typeof pr?.number !== 'number' || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string')) throw new ReadError(`${command} returned a malformed PR list`)
+	if (!Array.isArray(listed) || listed.some(pr => typeof pr?.number !== 'number' || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string' )) throw new ReadError(`${command} returned a malformed PR list`)
 	if (listed.length >= prListLimit) throw new ReadError(`${command} filled its ${prListLimit} limit; PRs past it are unread`)
-	const owned = (listed as GitHubPullRequest[]).find(pr => prOwnsIssue(pr, identifier))
+	// After a failed receipt every merged row is ordered against it, so each needs a usable merge time.
+	if (failed && state === 'merged' && listed.some(pr => !timestamp(pr.mergedAt))) throw new ReadError(`${command} returned a merged PR without a usable merge time to order against the failed receipt at ${failed}`)
+	const owned = (listed as GitHubPullRequest[]).find(pr => prEligible(pr, identifier, failed))
 	return owned && viewPullRequest(ctx, identifier, owned.number, owned.number === merged ? 'merged' : state)
 }
 
@@ -1594,9 +1607,9 @@ async function viewPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier
 // `merged` is the PR this process just merged (P4.6-recheck). GitHub's lists trail the merge: a stale open-list row
 // for it is read as merged, never as open, and while the merged search has not indexed it, it is read by number,
 // so the re-check right after a merge derives neither "no PR" nor an open PR. A view still open is a failed read.
-async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, merged?: number): Promise<GitHubPullRequest | undefined> {
+async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, failed: string | undefined, merged?: number): Promise<GitHubPullRequest | undefined> {
 	// Prefer the open PR; otherwise the merged one, so a merged issue derives `Deploying`.
-	return (await ownedPullRequest(ctx, identifier, 'open', merged)) ?? (await ownedPullRequest(ctx, identifier, 'merged'))
+	return (await ownedPullRequest(ctx, identifier, 'open', failed, merged)) ?? (await ownedPullRequest(ctx, identifier, 'merged', failed))
 		?? (merged === undefined ? undefined : await viewPullRequest(ctx, identifier, merged, 'merged'))
 }
 
@@ -1668,10 +1681,12 @@ async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools' | 'lo
 	}
 	if (role !== 'builder' && role !== 'reviewer') return { stopMet: true, missing: [] }
 	// A failed PR read throws: the guard neither continues the thread nor claims the PR is missing.
-	const open = await ownedPullRequest(ctx, issue, 'open')
+	// The snapshot's eligibility rule (P4.3): a merge at or before the latest failed receipt is not this round's PR.
+	const failed = failedAt(await listComments(ctx.tools, issue))
+	const open = await ownedPullRequest(ctx, issue, 'open', failed)
 	if (!open) {
 		// A PR merged before the guard ran (MET-279's #179) is delivered work, not a missing PR.
-		const merged = await ownedPullRequest(ctx, issue, 'merged')
+		const merged = await ownedPullRequest(ctx, issue, 'merged', failed)
 		return merged ? { stopMet: true, missing: [] } : { stopMet: false, missing: [`no open PR for ${issue}`] }
 	}
 	const { headRefOid, statusCheckRollup = [] } = open

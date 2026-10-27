@@ -637,7 +637,13 @@ by the previous one).
    retries one round and pages `budget-ceiling` after that; caps and blind
    alerts once per episode; daily digest at 08:00 America/New_York; one page
    format; `merge()` un-drafts the PR and rechecks after a refusal; a merged
-   PR satisfies the builder and reviewer stops. A delivered thread (reviewer
+   PR satisfies the builder and reviewer stops. After a red receipt
+   (`health=fail`, P4.3), a PR merged at or before the latest one shipped the
+   failed release: PR selection, the snapshot and those stops all skip it
+   (`snapshot.prEligible`, ownership unchanged), so the issue's new builder
+   is never moved to Deploying or stopped off the old merge, while a new open
+   PR or one merged strictly later counts; merged rows then need a usable
+   merge time. A delivered thread (reviewer
    with a verdict, verifier labelled `odd-receipt-<sha12>` for an older
    receipt) holds no round; verifier rounds count per receipt. The sweep
    reads every page of issues and threads, and the digest is not reposted
