@@ -128,8 +128,11 @@ test('snapshot combines Linear, GitHub and thread state, and feeds nextAction', 
   assert.equal(deploying([receipt('pass', '2026-10-24T13:40:00Z'), merge(2, '2026-10-24T13:30:00Z'), receipt('fail', '2026-10-24T13:20:00Z'), merge(1, '2026-10-24T13:10:00Z')])?.health, 'pass');
   assert.equal(snapshot.risk, 'ordinary');
   assert.deepEqual(nextAction(snapshot, { orbs: 0, runnerSlots: 0, buildIssues: 1 }), { kind: 'spawn', role: 'reviewer', executor: 'orb', reason: `no verdict at ${sha.slice(0, 12)}`, round: 1 });
+  // P3.11: a status the lifecycle does not know is Unknown with its name, never parked as Backlog.
   const unknown = toSnapshot({ issue: { id: 'MET-1', status: 'Nonsense', labels: [] } });
-  assert.equal(unknown.status, 'Backlog');
+  assert.equal(unknown.status, 'Unknown');
+  assert.equal(unknown.unknownStatus, 'Nonsense');
+  assert.equal(toSnapshot({ issue: { id: 'MET-1', status: 'Backlog', labels: [] } }).unknownStatus, undefined);
   assert.equal(unknown.pr, undefined);
 });
 
@@ -160,6 +163,9 @@ test('finished threads: idle role threads whose stage the issue has left; runnin
   assert.deepEqual(finishedThreads('Triage', threads).map(t => t.id), ['builder-idle', 'reviewer-idle', 'verifier-idle']);
   assert.deepEqual(finishedThreads('Todo', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'reviewer-idle', 'verifier-idle']);
   assert.deepEqual(finishedThreads('In Progress', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'verifier-idle']);
+  // P3.11: review keeps the builder (and its build slot) and the reviewer; an unknown status archives nothing.
+  assert.deepEqual(finishedThreads('In Review', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'verifier-idle']);
+  assert.deepEqual(finishedThreads('Unknown', threads), []);
   assert.deepEqual(finishedThreads('Deploying', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'builder-idle', 'reviewer-idle']);
   assert.deepEqual(finishedThreads('Duplicate', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'builder-idle', 'reviewer-idle', 'verifier-idle']);
 });

@@ -724,7 +724,7 @@ export default async function (amp: PluginAPI) {
 			const fromThreads = new Set(identifiers)
 			// Backlog is on demand (Devon moves an idea to Triage), so the sweep never enumerates it.
 			const owned = [...await issueIds(ctx.tools, { state: 'Triage' })]
-			for (const status of ['Todo', 'In Progress', 'Deploying']) owned.push(...await issueIds(ctx.tools, { state: status, label: oddLabel }))
+			for (const status of ['Todo', 'In Progress', 'In Review', 'Deploying']) owned.push(...await issueIds(ctx.tools, { state: status, label: oddLabel }))
 			for (const id of owned) identifiers.add(id)
 			watchdog.issues = identifiers.size
 			let failed = 0
@@ -734,7 +734,7 @@ export default async function (amp: PluginAPI) {
 				// while acting (MET-344). An action that fails (no reviewer can spawn) is an incident, not a blind plane.
 				const evaluated = await evaluate(ctx, state, 'watchdog', identifier, at)
 				if (evaluated.stage === 'failed' && (!evaluated.action || evaluated.read)) failed += 1
-				if (fromThreads.has(identifier) && (!evaluated.status || ['Triage', 'Todo', 'In Progress', 'Deploying'].includes(evaluated.status))) unresolved.push(identifier)
+				if (fromThreads.has(identifier) && (!evaluated.status || ['Triage', 'Todo', 'In Progress', 'In Review', 'Deploying'].includes(evaluated.status))) unresolved.push(identifier)
 			}
 			if (identifiers.size && failed === identifiers.size) throw new Error(`all ${failed} evaluations failed`)
 			// Live role threads on open issues while Linear lists no ODD-owned issue: the enumeration is not trusted (MET-344).
@@ -1195,6 +1195,8 @@ export default async function (amp: PluginAPI) {
 				}
 				// Todo -> In Progress is the builder's claim; the status change is the handoff artifact (§7).
 				if (action.role === 'builder' && issue.status === 'Todo') await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: 'In Progress' })
+				// In Progress -> In Review once the green head's reviewer is recorded and created; the lifecycle converges if this write is lost.
+				if (action.role === 'reviewer' && issue.status === 'In Progress') await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: 'In Review' })
 				return true
 			}
 			case 'set-status':

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, staleThreads, sweepMs, staleMs, type DigestInput, type Episode, digestParts, digestSends, digestCompleteLine, digestDelivered, digestLate, stalledWork, firstParentSince, newestRelease, publisherSnapshot, publisherPage, publisherLine, publisherStallMs, type DigestList, type MainCommit, type Publisher, type Run } from './watchdog.ts';
 import { controlPlaneSilent, deployReceiptLine, heartbeatLine, parseHeartbeat, silenceMs, verifyLine } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
-import { diagnosedLabel, readerLabel, receiptLabel, type LiveThread } from './snapshot.ts';
+import { diagnosedLabel, loadFrom, readerLabel, receiptLabel, type LiveThread } from './snapshot.ts';
 import plugin, { followUp } from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
 import { io } from './launch.ts';
@@ -888,8 +888,9 @@ function factory() {
   const threads = new Map<string, { labels: string[]; state: string; archived: boolean; updatedAt: string }>();
   const dms: string[] = [];
   const steers: string[] = [];
+  // `statuses` applies status writes to the issue, as Linear does.
   // P4.1: `launch` lets a builder launch succeed; `indexLag` hides new threads from thread search until `index()`; `ambiguous` creates the thread, unlabelled, and then fails the call; `bindFailures` fails that many `odd-spawn` bindings.
-  const control = { slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '', indexLag: false, ambiguous: false, bindFailures: 0, launch: false, gh: undefined as ((command: string) => Shell | undefined) | undefined, inject: undefined as ((name: string, input: Record<string, unknown>) => unknown) | undefined };
+  const control = { statuses: false, slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '', indexLag: false, ambiguous: false, bindFailures: 0, launch: false, gh: undefined as ((command: string) => Shell | undefined) | undefined, inject: undefined as ((name: string, input: Record<string, unknown>) => unknown) | undefined };
   /** Threads thread search does not return yet, and every create call the plane made (plugin agents and builder launches). */
   const hidden = new Set<string>();
   const creates: string[] = [];
@@ -940,7 +941,12 @@ function factory() {
         comments.set(String(input.issueId), [...list, comment]);
         return { id: comment.id };
       }
-      case 'linear.save_issue': saves.push(`${input.id} ${JSON.stringify(input.state ?? input.addLabels)}`); return {};
+      case 'linear.save_issue': {
+        saves.push(`${input.id} ${JSON.stringify(input.state ?? input.addLabels)}`);
+        const saved = issues.get(String(input.id));
+        if (control.statuses && saved && typeof input.state === 'string') saved.status = input.state;
+        return {};
+      }
       case 'find_thread': {
         // Like Amp's thread search, archived threads are left out only when the query says `archived:false`.
         const label = /label:(\S+)/.exec(String(input.query))?.[1] ?? '';
@@ -1041,6 +1047,7 @@ function deadlock(builderState = 'idle') {
   }
   plant.issue('MET-379', 'Todo');
   plant.control.spawnFails = true;
+  plant.control.statuses = true;
   return plant;
 }
 
@@ -3193,4 +3200,103 @@ test('P3.2+P6.2+P4.6-digest: a failed middle part and a reload complete every pa
   const next = orb.alerts.filter(text => text.startsWith('ODD digest 2026-10-25 part 1/'));
   assert.equal(next.length, 1);
   assert.match(next[0], /\nLate catch-up: due at 08:00 America\/New_York and not delivered then; posted by a later sweep\.\n/);
+});
+
+// --- P3.11: In Review and unknown statuses -----------------------------------------------
+
+test('P3.11: In Progress -> In Review -> In Progress -> In Review -> Deploying keeps one builder thread and one build slot; changes steer it; a reviewer without a verdict is retried', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-27T03:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  plant.control.statuses = true;
+  plant.issue('MET-60', 'In Progress');
+  plant.builder('MET-60');
+  plant.openPr('MET-60', head(1));
+  plant.control.gh = command => {
+    if (!command.startsWith('gh pr merge 60 ')) return undefined;
+    Object.assign(plant.prs[0], { state: 'MERGED', mergeCommit: { oid: '7'.repeat(40) }, mergedAt: new Date().toISOString() });
+    return { exitCode: 0, stdout: '', stderr: '' };
+  };
+  const statuses = () => plant.saves.filter(save => save.startsWith('MET-60 "')).map(save => JSON.parse(save.slice('MET-60 '.length)) as string);
+  const builderLive = () => !plant.threads.get('T-MET-60')!.archived;
+  const buildIssues = () => loadFrom([...plant.threads].filter(([, thread]) => !thread.archived).map(([id, thread]) => ({ id, ...thread }))).buildIssues;
+  const reviewers = () => [...plant.threads].filter(([, thread]) => thread.labels.includes('odd-issue-met-60') && thread.labels.includes('odd-role-reviewer'));
+  const verdict = (id: string, state: 'ready' | 'changes' | undefined, sha: string) => {
+    const thread = plant.threads.get(id)!;
+    if (state) thread.labels.push(`odd-verdict-${state}-${sha.slice(0, 12)}`);
+    thread.state = 'idle';
+    thread.updatedAt = new Date().toISOString();
+  };
+
+  // Green head 1: one reviewer, then In Review; the builder stays live and holds the issue's one slot.
+  await plant.start();
+  await settle();
+  assert.equal(reviewers().length, 1);
+  assert.deepEqual(statuses(), ['In Review']);
+  assert.ok(builderLive());
+  assert.equal(buildIssues(), 1);
+
+  // Changes at head 1: back to In Progress, the budget is admitted and the same builder is steered.
+  verdict(reviewers()[0][0], 'changes', head(1));
+  await advance(12 * 60_000);
+  assert.deepEqual(statuses(), ['In Review', 'In Progress']);
+  assert.equal(plant.steers.length, 1);
+  assert.match(plant.steers[0], /^T-MET-60: \[odd\] QA requested changes at /);
+  assert.ok(builderLive());
+  assert.equal(buildIssues(), 1);
+
+  // The builder pushes head 2: a fresh reviewer for it, In Review again.
+  plant.prs[0].headRefOid = head(2);
+  plant.prs[0].commits = [{ oid: head(2), committedDate: new Date().toISOString() }];
+  await advance(11 * 60_000);
+  assert.equal(reviewers().length, 2);
+  assert.deepEqual(statuses(), ['In Review', 'In Progress', 'In Review']);
+  // That reviewer ends without a verdict: the next round is spawned in place, without leaving review.
+  verdict(reviewers()[1][0], undefined, head(2));
+  await advance(11 * 60_000);
+  assert.equal(reviewers().length, 3);
+  assert.deepEqual(statuses(), ['In Review', 'In Progress', 'In Review']);
+  assert.ok(plant.spawnLines('MET-60').some(line => line.startsWith(`odd-spawn role=reviewer round=2 key=reviewer-${head(2).slice(0, 12)} thread=T-`)));
+  assert.ok(builderLive());
+  assert.equal(buildIssues(), 1);
+
+  // Ready at head 2: merged from In Review, then Deploying.
+  verdict(reviewers()[2][0], 'ready', head(2));
+  await advance(11 * 60_000);
+  assert.deepEqual(statuses(), ['In Review', 'In Progress', 'In Review', 'Deploying']);
+  assert.equal((plant.comments.get('MET-60') ?? []).filter(comment => comment.body.startsWith(`odd-merge pr=60 head=${head(2)} `)).length, 1);
+  assert.equal(plant.steers.length, 1);
+  assert.deepEqual(plant.launches, [], 'no second builder');
+  assert.deepEqual(plant.dms.filter(dm => !dm.includes('subscription-mismatch')), []);
+});
+
+test('P3.11: an unknown status pages once across sweeps and a reload and archives nothing; Backlog stays untouched', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-27T03:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  plant.control.statuses = true;
+  plant.control.inject = (call, input) => {
+    if (call === 'linear.save_issue' && Array.isArray(input.addLabels)) plant.issues.get(String(input.id))!.labels.push(...input.addLabels as string[]);
+    return undefined;
+  };
+  plant.issue('MET-70', 'QA');
+  plant.builder('MET-70');
+  plant.openPr('MET-70', head(3));
+  plant.issue('MET-71', 'Backlog');
+  plant.builder('MET-71');
+  await plant.start();
+  await settle();
+  await advance(25 * 60_000);
+  await plant.start();
+  await advance(25 * 60_000);
+  // Archiving Backlog's idle builder records its routing, which the fixture cannot serve (an unchanged, separate page).
+  const pages = plant.dms.filter(dm => !dm.includes('subscription-mismatch'));
+  assert.equal(pages.length, 1);
+  assert.match(pages[0], /^\[odd\] ODD page: unknown-status \| issue MET-70 \| - \| - \| default if silent: .*Linear status "QA" is not one ODD knows/);
+  assert.equal((plant.comments.get('MET-70') ?? []).filter(comment => comment.body.startsWith('odd-escalated reason=unknown-status ')).length, 1);
+  assert.equal(plant.threads.get('T-MET-70')!.archived, false, 'an unknown status archives nothing');
+  assert.equal(plant.issues.get('MET-70')!.status, 'QA', 'never moved, and never to Backlog');
+  assert.equal(plant.issues.get('MET-71')!.status, 'Backlog');
+  assert.deepEqual(plant.saves.filter(save => save.startsWith('MET-71 ')), [], 'Backlog: no status write and no label');
+  assert.deepEqual((plant.comments.get('MET-71') ?? []).filter(comment => /^odd-(escalated|spawn|budget|steer) /.test(comment.body)), [], 'Backlog: no page, spawn or steer');
 });

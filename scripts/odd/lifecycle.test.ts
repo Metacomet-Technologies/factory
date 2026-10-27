@@ -395,3 +395,49 @@ test('P4.3: rollback -> Todo -> a new builder without a new PR waits for its PR 
   const builder = { id: 'T-2', labels: threadLabels('MET-1', 'builder', 1), state: 'idle' };
   assert.deepEqual(at('In Progress', [builder]), { kind: 'wait', reason: 'builder has not opened a PR', stuck: 'builder' });
 });
+
+test('P3.11: a bound reviewer for the green head enters In Review; changes return In Progress to steer the same builder; the next head reviews again and merges', () => {
+  const head2 = 'd'.repeat(40);
+  const reviewed = (head: string, thread?: string) => ({ role: 'reviewer' as const, round: 1, key: `reviewer-${head.slice(0, 12)}`, ...(thread ? { thread } : {}) });
+  const green = (head: string, verdict?: 'ready' | 'changes') => ({ number: 9, headSha: head, ci: 'success' as const, merged: false, ...(verdict ? { verdict: { state: verdict, sha: head } } : {}) });
+  const at = (status: IssueSnapshot['status'], pr: IssueSnapshot['pr'], spawns: IssueSnapshot['spawns'], over: Partial<IssueSnapshot> = {}) =>
+    nextAction(issue({ status, pr, spawns, owner: builder, ...over }), idle, t0);
+  // In Progress, green, nothing recorded: spawn the reviewer. A pending record (create unconfirmed) does not enter review.
+  assert.equal((at('In Progress', green(sha), []) as { role?: string }).role, 'reviewer');
+  assert.equal((at('In Progress', green(sha), [reviewed(sha)]) as { role?: string }).role, 'reviewer');
+  // Bound record for this head: In Review (the plugin writes it after the create; this converges a lost write).
+  assert.deepEqual(at('In Progress', green(sha), [reviewed(sha, 'T-r1')]), { kind: 'set-status', status: 'In Review', reason: `reviewer recorded at ${sha.slice(0, 12)}` });
+  // In Review without a verdict keeps the reviewer (an idle one without a verdict is retried in the next round).
+  assert.deepEqual(at('In Review', green(sha), [reviewed(sha, 'T-r1')], { openRounds: { reviewer: 1 } }), { kind: 'spawn', role: 'reviewer', executor: 'orb', reason: `no verdict at ${sha.slice(0, 12)}`, round: 2 });
+  assert.deepEqual(at('In Review', green(sha), [reviewed(sha, 'T-r1')], { owner: { ...builder, role: 'reviewer', threadID: 'T-r1', state: 'running' } }), { kind: 'wait', reason: 'reviewer running' });
+  // Changes: back to In Progress, where the epoch's budget is admitted and the same builder steered.
+  assert.deepEqual(at('In Review', green(sha, 'changes'), [reviewed(sha, 'T-r1')]), { kind: 'set-status', status: 'In Progress', reason: `changes requested at ${sha.slice(0, 12)}` });
+  assert.equal(at('In Progress', green(sha, 'changes'), [reviewed(sha, 'T-r1')]).kind, 'admit');
+  const steered = at('In Progress', green(sha, 'changes'), [reviewed(sha, 'T-r1')], { correction: { epoch: 1, corrected: false, budget: grant() } });
+  assert.equal(steered.kind === 'steer' && steered.threadID, 'T-1');
+  // The builder pushed: the old head's record does not hold the new head in review, in either status.
+  assert.equal((at('In Progress', green(head2), [reviewed(sha, 'T-r1')]) as { role?: string }).role, 'reviewer');
+  assert.deepEqual(at('In Review', green(head2), [reviewed(sha, 'T-r1')]), { kind: 'set-status', status: 'In Progress', reason: `head ${head2.slice(0, 12)} is not under review` });
+  assert.deepEqual(at('In Review', { ...green(head2), ci: 'pending' }, [reviewed(head2, 'T-r2')]).kind, 'set-status');
+  assert.deepEqual(at('In Review', { ...green(head2), conflicting: true }, [reviewed(head2, 'T-r2')]).kind, 'set-status');
+  // Ready at the reviewed head merges from In Review; the merge enters Deploying.
+  assert.deepEqual(at('In Review', green(head2, 'ready'), [reviewed(sha, 'T-r1'), reviewed(head2, 'T-r2')]), { kind: 'merge', pr: 9, sha: head2 });
+  assert.equal((at('In Review', { ...green(head2, 'ready'), merged: true, mergeSha: 'e'.repeat(40) }, [reviewed(head2, 'T-r2')]) as { status?: string }).status, 'Deploying');
+  // The correction deadline holds In Review too: nothing merges past it.
+  const late = nextAction(issue({ status: 'In Review', pr: green(head2, 'ready'), spawns: [reviewed(head2, 'T-r2')], owner: builder, correction: { epoch: 1, corrected: true, budget: grant() } }), idle, t0 + correctionWindowMs);
+  assert.equal(late.kind === 'page' && late.reason, 'budget-ceiling');
+  assert.equal(nextAction(issue({ status: 'In Review', pr: green(head2, 'ready'), spawns: [reviewed(head2, 'T-r2')], owner: builder, correction: { epoch: 1, corrected: true, budget: grant() } }), idle, t0 + correctionWindowMs - 1).kind, 'merge');
+});
+
+test('P3.11: an unknown status pages once, even beside a running owner, and is never read as Backlog; Backlog stays a silent wait', () => {
+  const unknown = toSnapshot({ issue: { id: 'MET-1', status: 'QA', labels: ['odd'], description: spec } });
+  assert.equal(unknown.status, 'Unknown');
+  const paged = nextAction(unknown, idle);
+  assert.deepEqual(paged, { kind: 'page', reason: 'unknown-status', detail: 'MET-1: Linear status "QA" is not one ODD knows; the issue is held, not parked as Backlog.' });
+  assert.match(pageText('MET-1', paged as Extract<Action, { kind: 'page' }>), /^ODD page: unknown-status \| issue MET-1 \| - \| - \| default if silent: nothing is started/);
+  assert.deepEqual(nextAction({ ...unknown, owner: { role: 'builder', threadID: 'T-1', round: 1, state: 'running' } }, idle).kind, 'page');
+  // Once the latch is written and delivered, the issue holds: no second page.
+  const latched = { ...unknown, labels: ['odd', 'escalated'], escalation: { id: 'c-1', reason: 'unknown-status' as const, done: ['label', 'page', 'archive'] as const, detail: '' } };
+  assert.deepEqual(nextAction(latched, idle), { kind: 'wait', reason: 'escalated to Devon' });
+  assert.deepEqual(nextAction(toSnapshot({ issue: { id: 'MET-2', status: 'Backlog', labels: ['odd'], description: spec } }), idle), { kind: 'wait', reason: 'backlog: triage on demand' });
+});

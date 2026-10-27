@@ -39,13 +39,16 @@ export const oddLabel = 'odd';
 /** Linear label the control plane sets when a round budget is spent; it waits while the label is present. */
 export const escalatedLabel = 'escalated';
 
-export type Status = 'Backlog' | 'Triage' | 'Todo' | 'In Progress' | 'Deploying' | 'Done' | 'Canceled' | 'Duplicate';
+/** `Unknown` is any Linear status not listed here (snapshot.ts keeps its name in `unknownStatus`); it pages, never parks as Backlog. */
+export type Status = 'Backlog' | 'Triage' | 'Todo' | 'In Progress' | 'In Review' | 'Deploying' | 'Done' | 'Canceled' | 'Duplicate' | 'Unknown';
 export type RiskClass = 'ordinary' | 'security' | 'authority' | 'irreversible';
 export type Verdict = { state: 'ready' | 'changes'; sha: string };
 
 export type IssueSnapshot = {
   identifier: string;
   status: Status;
+  /** The Linear status name when `status` is `Unknown`. */
+  unknownStatus?: string;
   labels: readonly string[];
   description: string;
   openBlockers: readonly string[];
@@ -168,7 +171,7 @@ export type Action =
   | { kind: 'wait'; reason: string; stuck?: Role; wait?: Wait };
 
 /** `diagnose` on a red deploy: after acting, the control plane starts one log-reading Deployer on the receipt's host (odd-deployer skill). */
-export type PageReason = 'third-failed-qa-round' | 'failed-rollback' | 'irreversible-action' | 'security-finding' | 'budget-ceiling' | 'control-plane-blind' | 'control-plane-silent' | 'subscription-mismatch' | 'wait-overdue' | 'action-failed' | 'plane-blocked';
+export type PageReason = 'third-failed-qa-round' | 'failed-rollback' | 'irreversible-action' | 'security-finding' | 'budget-ceiling' | 'control-plane-blind' | 'control-plane-silent' | 'subscription-mismatch' | 'wait-overdue' | 'action-failed' | 'plane-blocked' | 'unknown-status';
 
 /** What happens when Devon does not answer a page (docs/odd/README.md §8); every page states it. */
 export const pageDefaults: Record<PageReason, string> = Object.freeze({
@@ -183,6 +186,7 @@ export const pageDefaults: Record<PageReason, string> = Object.freeze({
   'wait-overdue': 'the issue keeps waiting; nothing is cancelled or escalated',
   'action-failed': 'every evaluation retries the action; nothing is recovered automatically',
   'plane-blocked': 'the build slots stay occupied; nothing is freed, replaced or recovered automatically',
+  'unknown-status': 'nothing is started, steered, merged, archived or moved for the issue until the `escalated` label is removed',
 });
 
 /** The one page format (§8): `ODD page: <condition> | issue MET-<n> | <pr or host> | <sha> | default if silent: <action>`. */
@@ -429,7 +433,7 @@ function held(issue: IssueSnapshot, load: Load, now: number): Action | undefined
   }
   if (labelled) return { kind: 'wait', reason: 'escalated to Devon' };
   const { pr, correction } = issue;
-  if (issue.status !== 'In Progress' || !pr || pr.merged) return undefined;
+  if ((issue.status !== 'In Progress' && issue.status !== 'In Review') || !pr || pr.merged) return undefined;
   const ceiling = (why: string): Action => ({ kind: 'page', reason: 'budget-ceiling', pr: pr.number, sha: pr.headSha,
     detail: `${issue.identifier}: ${why}. Head ${pr.headSha}; last blocker: ${blocker(proceed(issue, load, now))}.` });
   if (correction?.invalid) return ceiling(`correction budget state cannot be trusted (${correction.invalid}); no time is granted`);
@@ -442,6 +446,8 @@ function held(issue: IssueSnapshot, load: Load, now: number): Action | undefined
 
 function proceed(issue: IssueSnapshot, load: Load, now: number): Action {
   const { status, owner, pr } = issue;
+  // A status the lifecycle does not know is never read as another one: it pages once (the latch holds it after).
+  if (status === 'Unknown') return { kind: 'page', reason: 'unknown-status', detail: `${issue.identifier}: Linear status ${JSON.stringify((issue.unknownStatus ?? '').slice(0, 60))} is not one ODD knows; the issue is held, not parked as Backlog.` };
   if (owner?.state === 'awaiting-approval') return waiting(`${owner.role} awaiting approval`, 'approval', `approval-${owner.threadID}`, owner.idleSince);
   if (owner && owner.state !== 'idle' && owner.state !== 'error') return { kind: 'wait', reason: `${owner.role} running` };
   if (status === 'Done' || status === 'Canceled' || status === 'Duplicate') return { kind: 'wait', reason: status };
@@ -462,7 +468,14 @@ function proceed(issue: IssueSnapshot, load: Load, now: number): Action {
     if (!specComplete(issue.description)) return { kind: 'set-status', status: 'Triage', reason: 'spec regressed' };
     return spawn('builder', load, 'ready to build', issue);
   }
-  if (status === 'In Progress') {
+  if (status === 'In Progress' || status === 'In Review') {
+    // In Review means a reviewer thread is bound to a spawn record for the current green head and has not asked for changes.
+    // A pending record (create unconfirmed) stays In Progress, where the spawn path pages it.
+    const verdict = pr?.verdict?.sha === pr?.headSha ? pr?.verdict : undefined;
+    const review = pr !== undefined && !pr.merged && !pr.conflicting && pr.ci === 'success' && verdict?.state !== 'changes'
+      && (issue.spawns ?? []).some(record => record.role === 'reviewer' && record.thread !== undefined && record.key === spawnKey(issue, 'reviewer'));
+    if (status === 'In Review' && !review && !pr?.merged) return { kind: 'set-status', status: 'In Progress', reason: verdict?.state === 'changes' ? `changes requested at ${verdict.sha.slice(0, 12)}` : `head ${pr?.headSha.slice(0, 12) ?? '(no PR)'} is not under review` };
+    if (status === 'In Progress' && review) return { kind: 'set-status', status: 'In Review', reason: `reviewer recorded at ${pr!.headSha.slice(0, 12)}` };
     if (!pr) {
       if (owner?.role === 'builder' && owner.state === 'error') {
         return owner.round >= contracts.builder.rounds
@@ -484,7 +497,6 @@ function proceed(issue: IssueSnapshot, load: Load, now: number): Action {
         ? steer(issue, owner.threadID, `ci-failed-${head}`, `CI failed at ${pr.headSha}. Fix the failing jobs and push; do not open a new PR.`)
         : spawn('builder', load, 'ci failed and no builder thread', issue);
     }
-    const verdict = pr.verdict?.sha === pr.headSha ? pr.verdict : undefined;
     if (!verdict) return spawn('reviewer', load, `no verdict at ${pr.headSha.slice(0, 12)}`, issue);
     if (verdict.state === 'ready') return { kind: 'merge', pr: pr.number, sha: pr.headSha };
     const round = pr.changesRounds ?? 1;
