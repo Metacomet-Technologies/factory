@@ -75,6 +75,10 @@ export const recipes: readonly Recipe[] = [
     health: 'http://127.0.0.1:8080/version.json' },
 ];
 
+/** Inputs scripts/release/release.py fingerprints for every component: a change to any one
+ * intentionally selects every enabled recipe. */
+export const releaseInputs = ['VERSION', 'Cargo.toml', 'Cargo.lock', 'deploy/components.json'] as const;
+
 export type ComponentRecord = { sha: string; tag: string; health: 'pass' | 'fail'; snapshot?: string };
 /** `noDbChange`: the install ran with `--no-db-change`, so its snapshot never restores a DB generation (no `db-changing` marker). */
 export type InFlight = { tag: string; sha: string; component: string; phase: 'installing' | 'probing'; snapshot?: string; noDbChange?: true };
@@ -166,11 +170,12 @@ export function meterPlan(output: string): 'eligible' | Refusal | undefined {
 }
 
 /**
- * Components to install for a release, in recipe order: enabled recipes whose sources or deploy
- * files changed since their baseline, skipping ones the ledger already records healthy at this
- * SHA. `changedSince(baseline)` lists the paths that changed in (baseline, release]; a component
- * with no baseline (never deployed, no health SHA) installs. After checking the complete plan,
- * a killed run's in-flight component is resumed before any other install (installRelease).
+ * Components to install for a release, in recipe order: enabled recipes whose sources, deploy
+ * files or shared release inputs changed since their baseline, skipping ones the ledger already
+ * records healthy at this SHA. `changedSince(baseline)` lists the paths that changed in
+ * (baseline, release]; a component with no baseline (never deployed, no health SHA) installs.
+ * After checking the complete plan, a killed run's in-flight component is resumed before any
+ * other install (installRelease).
  */
 export function plan(input: {
   sha: string;
@@ -190,7 +195,7 @@ export function plan(input: {
     if (record?.sha === input.sha && record.health === 'pass') return false;
     const baseline = input.baselines[recipe.name];
     if (!baseline) return true;
-    const inputs = [...(input.sources[recipe.name] ?? []), ...recipe.deployFiles];
+    const inputs = [...(input.sources[recipe.name] ?? []), ...recipe.deployFiles, ...releaseInputs];
     return input.changedSince(baseline).some(path => inputs.some(prefix => path === prefix || path.startsWith(`${prefix}/`)));
   });
 }
