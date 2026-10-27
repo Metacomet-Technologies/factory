@@ -1821,6 +1821,42 @@ test('MET-382: project-environment secrets survive plugin reload without dialogs
   }
 });
 
+test('P3.13: an unresolved issue-scoped Linear delivery logs one sanitized diagnostic and is neither read nor acted on; a documented Comment payload resolves from its URL with no diagnostic', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse(received) });
+  t.after(() => mock.timers.reset());
+  const issueId = '731161c3-191b-46df-8500-c493d2eba9e1';
+  const commentUrl = (identifier: string) => `https://linear.app/metacomet/issue/${identifier}/p313-fixture#comment-c0ffee`;
+  const comment = (url: string, body = 'p313 private comment text') =>
+    JSON.stringify({ action: 'create', type: 'Comment', data: { id: 'c-p313', body, issueId }, url, webhookTimestamp: sent });
+  const cases = [
+    { name: 'foreign team in the URL', body: comment(commentUrl('ENG-8')), reads: [] as string[], diagnostic: true },
+    { name: 'URL not on linear.app', body: comment('https://linear.app.example/metacomet/issue/MET-8/x'), reads: [], diagnostic: true },
+    { name: 'documented Comment payload', body: comment(commentUrl('MET-8')), reads: ['MET-8'], diagnostic: false },
+    { name: 'not issue-scoped', body: JSON.stringify({ action: 'update', type: 'Project', data: { id: 'p' }, url: commentUrl('MET-8'), webhookTimestamp: sent }), reads: [], diagnostic: false },
+  ];
+  for (const [index, row] of cases.entries()) {
+    await t.test(row.name, async () => {
+      const orb = signedOrb();
+      await orb.start(linearSecret, githubSecret);
+      const [logged, commands] = [orb.output.length, orb.commands.length];
+      await orb.deliver('linear', `p313-${index}`, row.body, { 'linear-signature': hmac(linearSecret, row.body) });
+      const lines = orb.output.slice(logged).filter(line => line.includes('linear-unresolved'));
+      assert.deepEqual(lines, row.diagnostic ? ['[odd] linear-unresolved type=Comment'] : [], 'one sanitized diagnostic, or none');
+      assert.deepEqual(orb.reads, row.reads, 'snapshot reads');
+      if (row.reads.length === 0) {
+        assert.deepEqual(orb.effects, [], 'no mutation');
+        assert.deepEqual(orb.commands.slice(commands), [], 'no gh read');
+      } else assert.deepEqual(orb.effects, ['linear.save_issue'], 'the resolved issue is decided');
+      const { events } = await orb.status() as { events: { source: string; issue: string | null; stage: string }[] };
+      const last = events.findLast(event => event.source === 'linear')!;
+      assert.deepEqual([last.issue, last.stage], row.reads.length ? ['MET-8', 'performed'] : [null, 'ignored']);
+      for (const secret of ['p313 private comment text', 'linear.app', issueId, 'c0ffee', linearSecret, hmac(linearSecret, row.body)]) {
+        assert.ok(!orb.output.some(line => line.includes(secret)), `the payload, URL or signature leaked: ${secret}`);
+      }
+    });
+  }
+});
+
 // --- P4.5: every authoritative lifecycle read follows its pages --------------------------
 
 const unrelatedPr = (n: number, state: Pr['state'] = 'OPEN'): Pr =>

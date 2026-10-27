@@ -6,19 +6,38 @@ import { budgetSkewMs, capacity, contracts, parseBudget, parseCancelled, parseDe
 
 export type WebhookSource = 'linear' | 'github' | 'slack';
 
-const identifierPattern = /\bMET-\d+\b/i;
+const identifierPattern = /^MET-[1-9]\d*$/i;
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const record = (value: unknown) => (typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined);
+
+/**
+ * P3.13: Linear's documented Comment payload carries `data.issueId` (a UUID) and the comment's
+ * `url` (`https://linear.app/<workspace>/issue/MET-<n>/<slug>#comment-<id>`), not always the
+ * issue identifier. Only that exact host and path shape resolves; anything else is undefined.
+ */
+function identifierFromCommentUrl(event: Record<string, unknown>, data: Record<string, unknown>): string | undefined {
+  if (event.type !== 'Comment' || typeof data.issueId !== 'string' || !uuidPattern.test(data.issueId) || typeof event.url !== 'string') return undefined;
+  let url: URL;
+  try { url = new URL(event.url); } catch { return undefined; }
+  if (url.protocol !== 'https:' || url.hostname !== 'linear.app' || url.username || url.password || url.port) return undefined;
+  const segment = /^\/[^/]+\/issue\/([^/]+)(?:\/[^/]*)?$/.exec(url.pathname)?.[1];
+  return segment && identifierPattern.test(segment) ? segment.toUpperCase() : undefined;
+}
 
 /** The issue a webhook delivery is about, or undefined when the event is not issue-scoped. */
 export function issueFromEvent(source: WebhookSource, body: string): string | undefined {
   let payload: unknown;
   try { payload = JSON.parse(body); } catch { return undefined; }
-  if (typeof payload !== 'object' || payload === null) return undefined;
-  const event = payload as Record<string, unknown>;
+  const event = record(payload);
+  if (!event) return undefined;
   if (source === 'linear') {
-    const data = event.data as Record<string, unknown> | undefined;
-    const issue = (data?.issue as Record<string, unknown> | undefined) ?? data;
-    const identifier = issue?.identifier;
-    return typeof identifier === 'string' && identifierPattern.test(identifier) ? identifier.toUpperCase() : undefined;
+    const data = record(event.data);
+    if (!data) return undefined;
+    // An explicit identifier wins; a present but malformed one never falls back to the URL.
+    const identifier = (record(data.issue) ?? data).identifier ?? data.identifier;
+    if (identifier !== undefined) return typeof identifier === 'string' && identifierPattern.test(identifier) ? identifier.toUpperCase() : undefined;
+    return identifierFromCommentUrl(event, data);
   }
   if (source === 'github') {
     const pr = event.pull_request as Record<string, unknown> | undefined;
@@ -33,6 +52,22 @@ export function issueFromEvent(source: WebhookSource, body: string): string | un
     return link ? link[1].toUpperCase() : undefined;
   }
   return undefined;
+}
+
+/**
+ * P3.13: the sanitized diagnostic for a Linear delivery that is about an issue (an Issue or
+ * Comment, or any payload carrying `data.issueId`) but names no issue `issueFromEvent` accepts;
+ * undefined when the delivery resolves or is not issue-scoped. Only the event type is kept, and
+ * only when it is a plain word: never the payload, URL or anything signed.
+ */
+export function linearUnresolved(body: string): string | undefined {
+  if (issueFromEvent('linear', body)) return undefined;
+  let payload: unknown;
+  try { payload = JSON.parse(body); } catch { return undefined; }
+  const event = record(payload);
+  const type = event?.type;
+  if (type !== 'Issue' && type !== 'Comment' && record(event?.data)?.issueId === undefined) return undefined;
+  return `linear-unresolved type=${typeof type === 'string' && /^[A-Za-z]{1,32}$/.test(type) ? type : 'unknown'}`;
 }
 
 /** Subset of the Linear MCP `get_issue` result the lifecycle needs. */
