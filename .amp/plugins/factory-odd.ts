@@ -48,7 +48,7 @@ import {
 	type Verify,
 } from '../../scripts/odd/lifecycle.ts'
 import { contextNamesSource, intakeChannel, intakeLookback, intakeEmoji, intakePrompt, outcomeIssue, pendingIntake, slackSourceLabel, slackSourceTs, sourceLine, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { admittedLoad, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, threadState, toSnapshot, verdictPattern, verifiedFor, verifiedLabels, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
+import { admittedLoad, bindingCandidate, buildEpoch, currentBinding, diagnosedLabel, draftedLine, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, prBindingLine, prOwnsIssue, readerLabel, receiptLabel, reconciles, releasedDraft, roleLabelQueries, spawnRecords, threadState, toSnapshot, verdictPattern, verifiedFor, verifiedLabels, type GitHubPullRequest, type LinearIssue, type LiveThread, type PrBinding, type Reservation, undraftedLine } from '../../scripts/odd/snapshot.ts'
 import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
 import { builderArgs, launch } from '../../scripts/odd/launch.ts'
 import { alertsChannel, blindMs, capsAlertMs, digest, digestDelivered, digestDue, digestHeading, digestLate, digestParts, digestSends, episodeLine, firstParentSince, incidentPageDue, incidentText, incidents, newestRelease, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, postedLate, publisherPage, publisherPagedLine, publisherSnapshot, resolutionText, restoreStatus, sanitizeError, staleReason, staleThreads, stalledWork, sweepMs, type DigestInput, type DigestList, type DigestWait, type Episode, type MainCommit, type Plane, type Publisher, type Run } from '../../scripts/odd/watchdog.ts'
@@ -306,10 +306,11 @@ export default async function (amp: PluginAPI) {
 		async execute(input, ctx) {
 			const state = input.state
 			if (state !== 'ready' && state !== 'changes') throw new Error('state must be ready or changes')
-			const { issue, sha12, labels } = await assignment(ctx, 'reviewer')
+			const { issue, sha12, labels, comments } = await assignment(ctx, 'reviewer')
 			const prior = labels.find(label => verdictPattern.test(label))
 			if (prior) throw new Error(`this thread already carries its verdict ${prior}; one verdict per head`)
-			const pr = await ownedPullRequest({ $: amp.$ }, issue, 'open', undefined)
+			const { pr: selected } = await pullRequestFor({ $: amp.$ }, issue, comments)
+			const pr = selected?.state === 'OPEN' ? selected : undefined
 			if (!pr || !pr.headRefOid.startsWith(sha12)) throw new Error(`stale assignment: this thread reviews head ${sha12}, but ${issue}'s open PR is ${pr ? `#${pr.number} at ${pr.headRefOid}` : 'gone'}. Nothing was recorded; the control plane reviews the new head in a new thread.`)
 			const label = `odd-verdict-${state}-${sha12}`
 			await amp.threads.get(ctx.thread.id).addLabels([label])
@@ -529,6 +530,8 @@ export default async function (amp: PluginAPI) {
 			issue = derived.snapshot
 			loadEpisodes(state, issue.identifier, comments)
 			performing = (await ctx.thread.labels()).includes(performLabel)
+			// P4.4: the epoch's first PR is bound before anything acts on it, so every later read selects the same PR; only on an issue ODD owns.
+			if (performing && derived.bind && issue.labels.includes(oddLabel)) await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: prBindingLine(derived.bind) })
 			if (performing) await reconcileSpawns(ctx, issue, threads)
 			holdSpawns(issue, threads)
 			const finished = finishedThreads(issue.status, threads)
@@ -1328,7 +1331,10 @@ export default async function (amp: PluginAPI) {
 	// The Shipper (§4) is this function: the dispatcher's merge gate at the exact head, then a
 	// head-pinned squash merge. Self-deploying paths pass because ODD merges them too (§1). A
 	// page puts the PR back to draft, and the gate refuses drafts, so a ready verdict un-drafts it
-	// first. A refusal is posted once per head so the builder sees it; GitHub's merge state lags
+	// first, but only a draft the plane made whose escalation was resumed (P4.4, releasedDraft):
+	// its `odd-undrafted` record is written before `gh pr ready`, so it is released at most once.
+	// Any other draft (a human's) stays a draft and is refused like a failed gate. A refusal is
+	// posted once per head so the builder sees it; GitHub's merge state lags
 	// CI by a minute or so (MET-280's PR #182), so the issue is re-checked instead of waiting for
 	// a webhook that nothing will send.
 	const refused = new Set<string>()
@@ -1339,19 +1345,22 @@ export default async function (amp: PluginAPI) {
 	// Once the receipt is written the issue is re-evaluated at once, so it moves to Deploying without a webhook or the sweep.
 	async function merge(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, pr: number, sha: string, comments: readonly Comment[]): Promise<string | undefined> {
 		if (comments.some(comment => comment.body.startsWith(`odd-merge pr=${pr} head=${sha} `))) throw new ReadError(`PR #${pr} has a merge receipt at ${sha} but still reads open; waiting for GitHub to catch up`)
-		const draft = await shellRead(ctx.$`gh pr view ${String(pr)} --json isDraft --jq .isDraft`, `gh pr view ${pr} --json isDraft`)
-		if (draft.exitCode !== 0) throw new ReadError(`gh pr view ${pr} --json isDraft failed: ${draft.stderr.trim()}`)
-		const isDraft = draft.stdout.trim()
-		if (isDraft !== 'true' && isDraft !== 'false') throw new ReadError(`gh pr view ${pr} --json isDraft returned ${JSON.stringify(isDraft.slice(0, 60))}, not true or false`)
-		if (isDraft === 'true') {
-			const ready = await ctx.$`gh pr ready ${String(pr)}`
-			if (ready.exitCode !== 0) throw new Error(`gh pr ready ${pr} failed: ${ready.stderr.trim()}`)
-			ctx.logger.log(marker, 'un-drafted', issue.identifier, pr)
+		let cause: string | undefined
+		if (await isDraft(ctx, pr)) {
+			const escalation = releasedDraft(comments, pr)
+			if (escalation) {
+				await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: undraftedLine(pr, escalation) })
+				const ready = await ctx.$`gh pr ready ${String(pr)}`
+				if (ready.exitCode !== 0) throw new Error(`gh pr ready ${pr} failed: ${ready.stderr.trim()}`)
+				ctx.logger.log(marker, 'un-drafted', issue.identifier, pr)
+			} else cause = `PR #${pr} is a draft the control plane did not make or already released; ODD merges it only after its author marks it ready`
 		}
-		const root = (await ctx.$`git rev-parse --show-toplevel`).stdout.trim()
-		const check = await ctx.$`node ${`${root}/scripts/dispatch/qa.ts`} check ${String(pr)} ${sha} --self-deploying-ok`
-		if (check.exitCode !== 0) {
-			const cause = check.stderr.trim() || check.stdout.trim()
+		if (!cause) {
+			const root = (await ctx.$`git rev-parse --show-toplevel`).stdout.trim()
+			const check = await ctx.$`node ${`${root}/scripts/dispatch/qa.ts`} check ${String(pr)} ${sha} --self-deploying-ok`
+			if (check.exitCode !== 0) cause = check.stderr.trim() || check.stdout.trim()
+		}
+		if (cause) {
 			ctx.logger.log(marker, 'merge refused', issue.identifier, pr, sha, cause)
 			if (!refused.has(sha)) {
 				refused.add(sha)
@@ -1429,9 +1438,13 @@ export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 		if (!issue.labels.includes(escalatedLabel)) await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, addLabels: [escalatedLabel] })
 	})
 	if (action.pr !== undefined) {
+		// P4.4: a PR that is already a draft is not the plane's to release later; only a draft the plane made is recorded
+		// (`odd-drafted`, after it succeeded). A lost record leaves the PR a draft for its author: it fails closed.
 		await step('draft', async () => {
+			if (await isDraft(ctx, action.pr!)) return
 			const draft = await ctx.$`gh pr ready ${String(action.pr)} --undo`
 			if (draft.exitCode !== 0) throw new Error(`gh pr ready ${action.pr} --undo failed: ${draft.stderr.trim()}`)
+			await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: draftedLine(action.pr!, id ?? '-') })
 		})
 	}
 	let detail = action.detail
@@ -1702,12 +1715,12 @@ function failedAt(comments: readonly Comment[]): string | undefined {
 // A thread an `odd-spawn` record binds is read by its ID, so search lag (or a plugin reload) never
 // hides it; one whose labels did not land carries its record's role labels. `known` are other
 // threads of the issue to read by ID (the log readers this process spawned).
-async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, merged?: number, known: readonly string[] = []): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
+async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, merged?: number, known: readonly string[] = []): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[]; bind?: PrBinding }> {
 	const [issue, comments] = await Promise.all([
 		getIssue(ctx.tools, { id: identifier, includeRelations: true }),
 		listComments(ctx.tools, identifier),
 	])
-	const pr = await pullRequestFor(ctx, identifier, failedAt(comments), merged)
+	const { pr, bind } = await pullRequestFor(ctx, identifier, comments, merged)
 	const bound = new Map(spawnRecords(comments).flatMap(record => (record.thread ? [[record.thread, record] as const] : [])))
 	const threads = (await threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, [...bound.keys(), ...known])).map(thread => {
 		const record = bound.get(thread.id)
@@ -1716,7 +1729,7 @@ async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 	// `blockedBy` lists the relation's issues without their status; a blocker is open until closed.
 	const blockers = await Promise.all((issue.relations?.blockedBy ?? []).map(({ id }) => getIssue(ctx.tools, { id })))
 	const openBlockers = blockers.filter(blocker => !['Done', 'Canceled', 'Duplicate'].includes(blocker.status)).map(blocker => blocker.id)
-	return { snapshot: toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers }), threads, comments }
+	return { snapshot: toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers }), threads, comments, ...(bind ? { bind } : {}) }
 }
 
 // A cancellation's comment is written before the thread is archived: an archived thread leaves
@@ -1802,11 +1815,20 @@ async function recordRouting(ctx: ShellContext, thread: LiveThread) {
 // commits on a 100-PR page ask GitHub for 1,000,000 nodes, over its 500,000 bound (MET-344).
 // A failed or malformed read, or a list that fills its limit, throws: it is never "no PR".
 // gh reads only a PR's first 100 commits, so the head time is read from the head commit itself.
-const prListFields = 'number,headRefName,body,mergedAt'
+const prListFields = 'number,headRefName,body,mergedAt,createdAt'
 const prListLimit = 1000
 const prFields = 'number,headRefName,headRefOid,state,mergeCommit,mergedAt,mergeable,statusCheckRollup,body'
 
 type ShellResult = { exitCode: number; stdout: string; stderr: string }
+
+/** GitHub's draft state of a PR; a failed or malformed read is a failed read, never "not a draft". */
+async function isDraft(ctx: Pick<WebhookHandlerContext, '$'>, pr: number): Promise<boolean> {
+	const draft = await shellRead(ctx.$`gh pr view ${String(pr)} --json isDraft --jq .isDraft`, `gh pr view ${pr} --json isDraft`)
+	if (draft.exitCode !== 0) throw new ReadError(`gh pr view ${pr} --json isDraft failed: ${draft.stderr.trim()}`)
+	const value = draft.stdout.trim()
+	if (value !== 'true' && value !== 'false') throw new ReadError(`gh pr view ${pr} --json isDraft returned ${JSON.stringify(value.slice(0, 60))}, not true or false`)
+	return value === 'true'
+}
 
 /** A shell read: a rejected run (the shell or gh never answered) is a failed read, like a nonzero exit. */
 async function shellRead(run: PromiseLike<ShellResult>, command: string): Promise<ShellResult> {
@@ -1829,7 +1851,8 @@ async function ghJson(run: PromiseLike<ShellResult>, command: string): Promise<u
 
 // P4.3: `failed` is the latest failed receipt's time (failedReceiptAt); a PR merged at or before it is skipped (prEligible),
 // so an older merge never hides a later one and never stands in for a missing PR after a rollback.
-async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, state: 'merged' | 'open', failed: string | undefined, merged?: number): Promise<GitHubPullRequest | undefined> {
+// P4.4: this is the one PR the epoch may bind (bindingCandidate); several are a failed read, never the first in list order.
+async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, state: 'merged' | 'open', failed: string | undefined, merged?: number, excluded?: number): Promise<GitHubPullRequest | undefined> {
 	const command = `gh pr list --state ${state}`
 	const listed = await ghJson(state === 'open'
 		? ctx.$`gh pr list --state open --json ${prListFields} --limit ${String(prListLimit)}`
@@ -1838,19 +1861,32 @@ async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifie
 	if (listed.length >= prListLimit) throw new ReadError(`${command} filled its ${prListLimit} limit; PRs past it are unread`)
 	// After a failed receipt every merged row is ordered against it, so each needs a usable merge time.
 	if (failed && state === 'merged' && listed.some(pr => !timestamp(pr.mergedAt))) throw new ReadError(`${command} returned a merged PR without a usable merge time to order against the failed receipt at ${failed}`)
-	const owned = (listed as GitHubPullRequest[]).find(pr => prEligible(pr, identifier, failed))
+	// And every owned open row needs its creation time, so a PR opened before the rollback is never bound after it.
+	if (failed && state === 'open' && listed.some(pr => prOwnsIssue(pr, identifier) && !timestamp(pr.createdAt))) throw new ReadError(`${command} returned an owned PR without a usable creation time to order against the failed receipt at ${failed}`)
+	let owned: GitHubPullRequest | undefined
+	try {
+		owned = bindingCandidate(listed as GitHubPullRequest[], identifier, failed, excluded)
+	} catch (error: unknown) {
+		throw new ReadError(error instanceof Error ? error.message : String(error))
+	}
 	return owned && viewPullRequest(ctx, identifier, owned.number, owned.number === merged ? 'merged' : state)
 }
 
-/** One owned PR read in full by number, validated to be in `state`; anything else is a failed read. */
-async function viewPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, number: number, state: 'merged' | 'open'): Promise<GitHubPullRequest> {
+/**
+ * One owned PR read in full by number, validated to be in `state` (any of open, merged or closed
+ * when omitted, for a bound PR); anything else is a failed read. A closed PR is returned without its head time.
+ */
+async function viewPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, number: number, state?: 'merged' | 'open'): Promise<GitHubPullRequest> {
 	const pr = await ghJson(ctx.$`gh pr view ${String(number)} --json ${prFields}`, `gh pr view ${number}`) as GitHubPullRequest | null
+	const actual = pr?.state
+	const known = state ? actual === state.toUpperCase() : actual === 'OPEN' || actual === 'MERGED' || actual === 'CLOSED'
 	// A merged PR's merge time is the durable start of its receipt wait, so it must be a usable timestamp.
-	const merged = state === 'merged' ? isRow(pr?.mergeCommit) && sha40(pr.mergeCommit.oid) && timestamp(pr.mergedAt) : pr?.mergedAt === null || pr?.mergedAt === undefined || timestamp(pr.mergedAt)
-	if (!isRow(pr) || pr.number !== number || pr.state !== state.toUpperCase() || !sha40(pr.headRefOid) || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string' || !optional(pr, 'mergeable', 'string')
+	const merged = actual === 'MERGED' ? isRow(pr?.mergeCommit) && sha40(pr.mergeCommit.oid) && timestamp(pr.mergedAt) : pr?.mergedAt === null || pr?.mergedAt === undefined || timestamp(pr.mergedAt)
+	if (!isRow(pr) || pr.number !== number || !known || !sha40(pr.headRefOid) || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string' || !optional(pr, 'mergeable', 'string')
 		|| !merged || !Array.isArray(pr.statusCheckRollup) || !pr.statusCheckRollup.every(checkRecord) || !prOwnsIssue(pr, identifier)) {
-		throw new ReadError(`gh pr view ${number} returned malformed or changed details for ${state} ${identifier}`)
+		throw new ReadError(`gh pr view ${number} returned malformed or changed details for ${state ?? 'bound'} ${identifier}`)
 	}
+	if (actual === 'CLOSED') return pr
 	const head = await shellRead(ctx.$`gh api ${`repos/{owner}/{repo}/commits/${pr.headRefOid}`} --jq .commit.committer.date`, `gh api head commit ${pr.headRefOid}`)
 	if (head.exitCode !== 0) throw new ReadError(`gh api head commit ${pr.headRefOid} failed: ${head.stderr.trim()}`)
 	const committedDate = head.stdout.trim()
@@ -1858,13 +1894,23 @@ async function viewPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier
 	return { ...pr, commits: [{ oid: pr.headRefOid, committedDate }] }
 }
 
+// P4.4: the epoch's bound PR (`odd-pr`, currentBinding) is read by number, whatever GitHub's lists return or in
+// which order, across reloads; a closed one binds nothing more. Unbound, the one candidate (open first, then
+// merged) is returned with the binding the performing plane records before it acts (`bind`).
 // `merged` is the PR this process just merged (P4.6-recheck). GitHub's lists trail the merge: a stale open-list row
 // for it is read as merged, never as open, and while the merged search has not indexed it, it is read by number,
 // so the re-check right after a merge derives neither "no PR" nor an open PR. A view still open is a failed read.
-async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, failed: string | undefined, merged?: number): Promise<GitHubPullRequest | undefined> {
+async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, comments: readonly Comment[], merged?: number): Promise<{ pr?: GitHubPullRequest; bind?: PrBinding }> {
+	const failed = failedAt(comments)
+	const binding = currentBinding(comments)
+	if (binding) {
+		const pr = await viewPullRequest(ctx, identifier, binding.pr, binding.pr === merged ? 'merged' : undefined)
+		if (pr.state !== 'CLOSED') return { pr }
+	}
 	// Prefer the open PR; otherwise the merged one, so a merged issue derives `Deploying`.
-	return (await ownedPullRequest(ctx, identifier, 'open', failed, merged)) ?? (await ownedPullRequest(ctx, identifier, 'merged', failed))
+	const pr = (await ownedPullRequest(ctx, identifier, 'open', failed, merged, binding?.pr)) ?? (await ownedPullRequest(ctx, identifier, 'merged', failed, undefined, binding?.pr))
 		?? (merged === undefined ? undefined : await viewPullRequest(ctx, identifier, merged, 'merged'))
+	return pr ? { pr, bind: { pr: pr.number, branch: pr.headRefName ?? '', ...buildEpoch(comments) } } : {}
 }
 
 const statusReads = 3
@@ -1950,15 +1996,12 @@ async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools' | 'lo
 	}
 	if (role !== 'builder' && role !== 'reviewer') return { stopMet: true, missing: [] }
 	// A failed PR read throws: the guard neither continues the thread nor claims the PR is missing.
-	// The snapshot's eligibility rule (P4.3): a merge at or before the latest failed receipt is not this round's PR.
-	const failed = failedAt(await listComments(ctx.tools, issue))
-	const open = await ownedPullRequest(ctx, issue, 'open', failed)
-	if (!open) {
-		// A PR merged before the guard ran (MET-279's #179) is delivered work, not a missing PR.
-		const merged = await ownedPullRequest(ctx, issue, 'merged', failed)
-		return merged ? { stopMet: true, missing: [] } : { stopMet: false, missing: [`no open PR for ${issue}`] }
-	}
-	const { headRefOid, statusCheckRollup = [] } = open
+	// The snapshot's selection: the epoch's bound PR (P4.4), and a merge at or before the latest failed receipt is not this round's PR (P4.3).
+	const { pr } = await pullRequestFor(ctx, issue, await listComments(ctx.tools, issue))
+	// A PR merged before the guard ran (MET-279's #179) is delivered work, not a missing PR.
+	if (pr?.state === 'MERGED') return { stopMet: true, missing: [] }
+	if (pr?.state !== 'OPEN') return { stopMet: false, missing: [`no open PR for ${issue}`] }
+	const { headRefOid, statusCheckRollup = [] } = pr
 	if (role === 'reviewer') {
 		// The verdict is the reviewer thread's own label for the current head (snapshot.verdictFor).
 		const head = headRefOid.slice(0, 12)

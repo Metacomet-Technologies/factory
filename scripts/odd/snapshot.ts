@@ -95,6 +95,7 @@ export type GitHubPullRequest = {
   commits?: readonly { oid?: string; committedDate?: string }[];
   statusCheckRollup?: readonly { name?: string; conclusion?: string | null; state?: string | null; status?: string | null }[];
   body?: string;
+  createdAt?: string;
 };
 
 /**
@@ -136,6 +137,64 @@ export const supersededMerge = (pr: Pick<GitHubPullRequest, 'mergedAt'>, failedA
 /** A PR that can deliver the issue: it owns it (prOwnsIssue) and its merge, if any, is not superseded. */
 export const prEligible = (pr: Pick<GitHubPullRequest, 'headRefName' | 'body' | 'mergedAt'>, identifier: string, failedAt: string | undefined): boolean =>
   prOwnsIssue(pr, identifier) && !supersededMerge(pr, failedAt);
+
+/**
+ * P4.4: the durable binding of a build round to its PR. `round` is the issue's build round (its
+ * highest builder `odd-spawn` round, 0 before any) and `rollback` its rollback epoch (red deploy
+ * receipts so far); together they are the epoch (buildEpoch) the binding holds for.
+ */
+export type PrBinding = { pr: number; branch: string; round: number; rollback: number };
+
+export const prBindingLine = (binding: PrBinding) => `odd-pr pr=${binding.pr} branch=${binding.branch} round=${binding.round} rollback=${binding.rollback}`;
+
+export function parsePrBinding(text: string): PrBinding | undefined {
+  const match = /^odd-pr pr=([1-9]\d*) branch=(\S+) round=(\d+) rollback=(\d+)$/m.exec(text);
+  return match ? { pr: Number(match[1]), branch: match[2], round: Number(match[3]), rollback: Number(match[4]) } : undefined;
+}
+
+export function buildEpoch(comments: readonly { body: string }[]): { round: number; rollback: number } {
+  const round = Math.max(0, ...spawnRecords(comments).filter(record => record.role === 'builder').map(record => record.round));
+  return { round, rollback: comments.filter(comment => parseDeployReceipt(comment.body)?.health === 'fail').length };
+}
+
+/** The latest `odd-pr` binding (by creation time) for the current epoch; one from an older round or rollback epoch binds nothing. */
+export function currentBinding(comments: readonly { body: string; createdAt?: string }[]): PrBinding | undefined {
+  const { round, rollback } = buildEpoch(comments);
+  return [...comments].sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''))
+    .map(comment => parsePrBinding(comment.body))
+    .filter(binding => binding?.round === round && binding.rollback === rollback)
+    .at(-1);
+}
+
+/**
+ * P4.4: the one PR an unbound epoch may bind, from one listed state: eligible (prEligible, so a
+ * merge after a red receipt counts by its merge time), not `excluded` (a bound PR that was closed)
+ * and, if still unmerged after a red receipt, opened strictly after it, so a stale pre-rollback PR
+ * is never bound. More than one candidate throws: the binding is never chosen by list order.
+ */
+export function bindingCandidate<T extends Pick<GitHubPullRequest, 'number' | 'headRefName' | 'body' | 'mergedAt' | 'createdAt'>>(rows: readonly T[], identifier: string, failedAt: string | undefined, excluded?: number): T | undefined {
+  const candidates = rows.filter(pr => pr.number !== excluded && prEligible(pr, identifier, failedAt) && (failedAt === undefined || pr.mergedAt != null || Date.parse(pr.createdAt ?? '') > Date.parse(failedAt)));
+  if (candidates.length > 1) throw new Error(`${identifier} has ${candidates.length} candidate PRs (${candidates.map(pr => `#${pr.number}`).sort().join(', ')}) and no odd-pr binding for its current epoch; none is chosen by list order`);
+  return candidates[0];
+}
+
+/** P4.4: the plane's own record that it drafted `pr` for escalation `escalation`, written only after the draft succeeded. */
+export const draftedLine = (pr: number, escalation: string) => `odd-drafted pr=${pr} escalation=${escalation}`;
+/** Written before the plane marks that PR ready again, so one draft is released at most once. */
+export const undraftedLine = (pr: number, escalation: string) => `odd-undrafted pr=${pr} escalation=${escalation}`;
+
+/**
+ * P4.4: the escalation whose plane draft of `pr` an `odd-resume` for that escalation released and
+ * no `odd-undrafted` has consumed, or undefined: a draft the plane did not make (a human's) or
+ * already released stays a draft.
+ */
+export function releasedDraft(comments: readonly { body: string }[], pr: number): string | undefined {
+  const lines = (pattern: RegExp) => new Set(comments.flatMap(comment => [...comment.body.matchAll(pattern)].flatMap(match => (Number(match[1]) === pr ? [match[2]] : []))));
+  const drafted = lines(/^odd-drafted pr=(\d+) escalation=(\S+)$/gm);
+  const undrafted = lines(/^odd-undrafted pr=(\d+) escalation=(\S+)$/gm);
+  const resumed = new Set(comments.flatMap(comment => { const resume = parseResume(comment.body); return resume && resume !== 'malformed' ? [resume.escalation] : []; }));
+  return [...drafted].find(escalation => resumed.has(escalation) && !undrafted.has(escalation));
+}
 
 /**
  * `updatedAt` is the thread's last activity as reported by thread search; absent for a thread the index has not returned yet.

@@ -832,7 +832,7 @@ test('P3.1: one shared blocker is one incident; it is plane-blocked only when ev
   assert.equal(incidentPageDue({ ...incident, due: true, delivered: 'action-failed' }), true, 'an action-failed page is raised to plane-blocked once');
 });
 
-type Pr = { number: number; headRefName: string; headRefOid: string; state: 'OPEN' | 'MERGED'; mergeCommit: { oid: string } | null; mergedAt?: string; mergeable: string; commits: { oid: string; committedDate: string }[]; statusCheckRollup: Record<string, unknown>[]; body: string };
+type Pr = { number: number; headRefName: string; headRefOid: string; state: 'OPEN' | 'MERGED' | 'CLOSED'; mergeCommit: { oid: string } | null; mergedAt?: string; mergeable: string; commits: { oid: string; committedDate: string }[]; statusCheckRollup: Record<string, unknown>[]; body: string; createdAt?: string; isDraft?: boolean };
 type Shell = { exitCode: number; stdout: string; stderr: string };
 
 /**
@@ -852,9 +852,11 @@ function github(command: string, prs: readonly Pr[], releases: ReadonlyMap<strin
     const found = prs.flatMap(pr => pr.commits).find(candidate => candidate.oid === commit[1]);
     return found ? { exitCode: 0, stdout: `${found.committedDate}\n`, stderr: '' } : { exitCode: 1, stdout: '', stderr: 'gh: No commit found for SHA (HTTP 422)' };
   }
-  // `gh pr view <n> --json isDraft --jq .isDraft`: the fixture's PRs are ready for review.
+  // `gh pr view <n> --json isDraft --jq .isDraft`: ready for review unless `isDraft`; `gh pr ready <n> [--undo]` sets it.
   const draft = /^gh pr view (\d+) --json isDraft --jq \.isDraft$/.exec(command);
-  if (draft) return prs.some(pr => pr.number === Number(draft[1])) ? { exitCode: 0, stdout: 'false\n', stderr: '' } : { exitCode: 1, stdout: '', stderr: `GraphQL: Could not resolve to a PullRequest with the number of ${draft[1]}.` };
+  if (draft) { const pr = prs.find(candidate => candidate.number === Number(draft[1])); return pr ? { exitCode: 0, stdout: `${pr.isDraft === true}\n`, stderr: '' } : { exitCode: 1, stdout: '', stderr: `GraphQL: Could not resolve to a PullRequest with the number of ${draft[1]}.` }; }
+  const ready = /^gh pr ready (\d+)( --undo)?$/.exec(command);
+  if (ready) { const pr = prs.find(candidate => candidate.number === Number(ready[1])); if (pr) pr.isDraft = ready[2] !== undefined; return pr ? { exitCode: 0, stdout: '', stderr: '' } : { exitCode: 1, stdout: '', stderr: 'no PR' }; }
   const view = /^gh pr view (\d+) --json ([\w,]+)$/.exec(command);
   const list = /^gh pr list (?:--search "([^"]+)" )?--state (open|merged) --json ([\w,]+) --limit (\d+)$/.exec(command);
   if (!view && !list) return undefined;
@@ -1005,7 +1007,7 @@ function factory() {
   let said = 0;
   const openPr = (issue: string, sha: string, over: Partial<Pr> = {}) => {
     const n = Number(issue.slice(4));
-    prs.push({ number: n, headRefName: `${issue.toLowerCase()}-x`, headRefOid: sha, state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: sha, committedDate: new Date().toISOString() }], statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }], body: `closes ${issue}`, ...over });
+    prs.push({ number: n, headRefName: `${issue.toLowerCase()}-x`, headRefOid: sha, state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: sha, committedDate: new Date().toISOString() }], statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }], body: `closes ${issue}`, createdAt: new Date().toISOString(), ...over });
   };
   return {
     issues, comments, prs, releases, threads, dms, steers, control, builder, openPr, saves, launches, hidden, creates, outcomes, heartbeats: () => heartbeats, slackAttempts: () => slackAttempts,
@@ -1676,14 +1678,13 @@ test('P3.7: a failed log-reader lookup still pages a failed rollback, but the sw
   }
 });
 
-test('P3.7: a rejected or malformed draft read before a merge merges nothing and writes no heartbeat; true and false merge', async t => {
+test('P3.7: a rejected or malformed draft read before a merge merges nothing and writes no heartbeat; a ready PR merges', async t => {
   const reads: [string, string | undefined, boolean][] = [
     ['rejected', undefined, false],
     ['null', 'null\n', false],
     ['empty', '', false],
     ['not a boolean', '{"isDraft":false}\n', false],
     ['false (control)', 'false\n', true],
-    ['true (control)', 'true\n', true],
   ];
   for (const [name, stdout, merges] of reads) {
     await t.test(name, async () => {
@@ -2860,6 +2861,198 @@ test('P4.3: after a rollback a new owned open or later-merged PR advances; menti
         const message = await guardMessage(plant);
         assert.equal(message === undefined, stop, message);
         if (!stop) assert.match(message ?? '', /no open PR for MET-41/);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+// --- P4.4: each build round is bound to its PR; only the plane's own drafts are released ----------
+
+/** MET-7 with a builder and, per PR number, an owned open PR whose head has a ready verdict. `gh pr merge` merges it. */
+function boundPlant(numbers: readonly number[], over: Partial<Pr> = {}) {
+  const plant = factory();
+  plant.issue('MET-7', 'In Progress');
+  plant.builder('MET-7');
+  for (const n of numbers) {
+    plant.openPr('MET-7', head(n), { number: n, headRefName: `met-7-try-${n}`, ...over });
+    plant.threads.set(`T-review-${n}`, { labels: ['odd-issue-met-7', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-ready-${head(n).slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+  }
+  const merges: string[] = [];
+  const readies: string[] = [];
+  plant.control.gh = command => {
+    if (/^gh pr ready \d+$/.test(command)) readies.push(command);
+    const merge = /^gh pr merge (\d+) /.exec(command);
+    if (merge) {
+      merges.push(merge[1]);
+      Object.assign(plant.prs.find(pr => pr.number === Number(merge[1]))!, { state: 'MERGED', mergeCommit: { oid: '7'.repeat(40) }, mergedAt: new Date().toISOString() });
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
+    if (/^gh pr view \d+ --json mergeCommit/.test(command)) return { exitCode: 0, stdout: `${'7'.repeat(40)}\n`, stderr: '' };
+    return undefined;
+  };
+  const lines = (prefix: string) => (plant.comments.get('MET-7') ?? []).filter(comment => comment.body.startsWith(prefix)).map(comment => comment.body.split('\n')[0]);
+  return { plant, merges, readies, lines };
+}
+
+test('P4.4: the first owned PR is bound once; a second PR, reordered lists and reloads still select and merge only the bound PR', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const { plant, merges, lines } = boundPlant([7]);
+  plant.control.statuses = true;
+  // The verdict is not in yet: the first evaluation binds #7 and starts its reviewer.
+  plant.threads.delete('T-review-7');
+  await plant.start();
+  await settle();
+  assert.deepEqual(lines('odd-pr '), ['odd-pr pr=7 branch=met-7-try-7 round=0 rollback=0']);
+  const reviewer = plant.threads.get('T-spawned-1')!;
+  assert.ok(reviewer.labels.includes('odd-issue-met-7'), 'the reviewer is started for the bound PR');
+  // A second owned PR opens, listed first (newest) and then last, with ready verdicts on both heads; the plane reloads between reads.
+  plant.openPr('MET-7', head(70), { number: 70, headRefName: 'met-7-try-70' });
+  plant.prs.reverse();
+  plant.threads.set('T-review-70', { labels: ['odd-issue-met-7', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-ready-${head(70).slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+  await plant.start();
+  await settle();
+  assert.deepEqual(merges, [], 'no verdict on the bound head yet: the other PR is never merged');
+  plant.prs.reverse();
+  // The bound PR's reviewer delivers its ready verdict.
+  Object.assign(reviewer, { state: 'idle', labels: [...reviewer.labels, `odd-verdict-ready-${head(7).slice(0, 12)}`] });
+  await plant.start();
+  await advance(10 * 60_000);
+  assert.deepEqual(merges, ['7']);
+  assert.deepEqual(lines('odd-merge pr='), [`odd-merge pr=7 head=${head(7)} merge=${'7'.repeat(40)} release=none`]);
+  assert.deepEqual(lines('odd-pr '), ['odd-pr pr=7 branch=met-7-try-7 round=0 rollback=0'], 'bound once across reloads');
+});
+
+test('P4.4: an ambiguous first binding binds and merges nothing in either list order and pages as a failed read; one candidate binds and merges', async t => {
+  const cases: [string, number[], boolean][] = [['two owned open PRs', [7, 70], false], ['the same PRs listed the other way', [70, 7], false], ['one owned open PR (control)', [7], true]];
+  for (const [name, numbers, merges] of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const { plant, merges: merged, lines } = boundPlant(numbers);
+        await plant.start();
+        await settle();
+        assert.deepEqual(merged, merges ? ['7'] : []);
+        assert.deepEqual(lines('odd-pr '), merges ? ['odd-pr pr=7 branch=met-7-try-7 round=0 rollback=0'] : []);
+        assert.equal(plant.heartbeats(), merges ? 1 : 0, 'an ambiguous read is never healthy');
+        const events = await plant.events();
+        if (!merges) assert.ok(events.some(event => /MET-7 has 2 candidate PRs \(#7, #70\)/.test(event.error ?? '')), JSON.stringify(events));
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('P4.4: after a rollback the old epoch binding and a PR opened before the red receipt never merge; a PR opened after it is bound in the new epoch', async t => {
+  const cases: [string, boolean][] = [['stale pre-rollback PR only', false], ['stale and new PR', true]];
+  for (const [name, fresh] of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        rolledBack41(plant, 'In Progress');
+        plant.builder('MET-41');
+        // The rolled-back PR #41 was bound in epoch 0; #47 was opened at 11:30, before the red receipt at 12:00:02.
+        plant.say('MET-41', 'odd-pr pr=41 branch=met-41-x round=0 rollback=0');
+        plant.openPr('MET-41', head(47), { number: 47, headRefName: 'met-41-stale', createdAt: '2026-10-26T11:30:00Z' });
+        if (fresh) plant.openPr('MET-41', head(48), { number: 48, headRefName: 'met-41-retry' });
+        for (const n of [47, 48]) plant.threads.set(`T-review-${n}`, { labels: ['odd-issue-met-41', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-ready-${head(n).slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+        const merges: string[] = [];
+        plant.control.gh = command => {
+          const merge = /^gh pr merge (\d+) /.exec(command);
+          if (merge) { merges.push(merge[1]); return { exitCode: 0, stdout: '', stderr: '' }; }
+          if (/^gh pr view \d+ --json mergeCommit/.test(command)) return { exitCode: 0, stdout: `${'8'.repeat(40)}\n`, stderr: '' };
+          return undefined;
+        };
+        await plant.start();
+        await settle();
+        assert.deepEqual(merges, fresh ? ['48'] : [], 'the stale PR is never merged');
+        assert.deepEqual((plant.comments.get('MET-41') ?? []).filter(comment => comment.body.startsWith('odd-pr ')).map(comment => comment.body), ['odd-pr pr=41 branch=met-41-x round=0 rollback=0', ...(fresh ? ['odd-pr pr=48 branch=met-41-retry round=0 rollback=1'] : [])]);
+        assert.ok(!plant.saves.includes('MET-41 "Deploying"'));
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('P4.4: a human draft stays a draft and is refused once; a plane draft is released only after its own resume, and only once', async t => {
+  const escalation = `odd-escalated reason=budget-ceiling pr=7 sha=${head(7)} done=label,draft,page,archive`;
+  const cases: { name: string; records: (latch: string) => string[]; merges: boolean }[] = [
+    { name: 'human draft, no plane record', records: () => [], merges: false },
+    { name: 'plane draft, escalation not resumed', records: latch => [`odd-drafted pr=7 escalation=${latch}`], merges: false },
+    { name: 'plane draft of another PR, resumed', records: latch => [`odd-drafted pr=70 escalation=${latch}`, `odd-resume escalation=${latch} epoch=2`], merges: false },
+    { name: 'plane draft already released, drafted again by a human', records: latch => [`odd-drafted pr=7 escalation=${latch}`, `odd-resume escalation=${latch} epoch=2`, `odd-undrafted pr=7 escalation=${latch}`], merges: false },
+    { name: 'plane draft, resumed (control)', records: latch => [`odd-drafted pr=7 escalation=${latch}`, `odd-resume escalation=${latch} epoch=2`], merges: true },
+  ];
+  for (const { name, records, merges } of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const { plant, merges: merged, readies, lines } = boundPlant([7], { isDraft: true });
+        plant.say('MET-7', 'odd-pr pr=7 branch=met-7-try-7 round=0 rollback=0');
+        const lists = records('said-2');
+        // A released latch (with its resume) or none: the plane-draft-not-resumed case keeps the issue escalated.
+        if (lists.length) { plant.say('MET-7', escalation); for (const line of lists) plant.say('MET-7', line); }
+        if (lists.length && !lists.some(line => line.startsWith('odd-resume'))) plant.issues.get('MET-7')!.labels.push('escalated');
+        await plant.start();
+        await settle();
+        await advance(10 * 60_000);
+        assert.deepEqual(merged, merges ? ['7'] : []);
+        assert.deepEqual(readies, merges ? ['gh pr ready 7'] : [], 'only a released plane draft is marked ready');
+        assert.equal(plant.prs[0].isDraft, !merges);
+        assert.deepEqual(lines('odd-undrafted'), [...lists.filter(line => line.startsWith('odd-undrafted')), ...(merges ? ['odd-undrafted pr=7 escalation=said-2'] : [])]);
+        const escalated = lists.length > 0 && !lists.some(line => line.startsWith('odd-resume'));
+        assert.deepEqual(lines('odd-merge-refused'), merges || escalated ? [] : [`odd-merge-refused pr=7 head=${head(7)}`], 'a held draft is refused once per head');
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('P4.4: an escalation drafts a ready PR and records it, leaves a human draft unrecorded; after the resume only the plane draft is marked ready and merged', async t => {
+  for (const human of [false, true]) {
+    await t.test(human ? 'PR already a draft at the escalation' : 'PR ready at the escalation', async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-27T03:00:00Z') });
+      try {
+        // A legacy history at its third rejected head pages third-failed-qa-round at once (MET-348).
+        const { plant, reject, lines } = correcting();
+        plant.prs[0].isDraft = human;
+        plant.say('MET-7', `odd-steer key=changes-${head(1).slice(0, 12)} thread=T-MET-7`);
+        plant.say('MET-7', `odd-steer key=changes-${head(2).slice(0, 12)} thread=T-MET-7`);
+        reject(1, head(1));
+        reject(2, head(2));
+        reject(3, head(3));
+        const readies: string[] = [];
+        const merges: string[] = [];
+        plant.control.gh = command => {
+          if (/^gh pr ready 7$/.test(command)) readies.push(command);
+          if (/^gh pr merge 7 /.test(command)) { merges.push(command); return { exitCode: 0, stdout: '', stderr: '' }; }
+          if (/^gh pr view 7 --json mergeCommit/.test(command)) return { exitCode: 0, stdout: `${'7'.repeat(40)}\n`, stderr: '' };
+          return undefined;
+        };
+        await plant.start();
+        await settle();
+        const latch = lines('odd-escalated')[0];
+        assert.match(latch.body, /^odd-escalated reason=third-failed-qa-round pr=7 sha=\w{40} done=label,draft,page,archive\n/);
+        assert.equal(plant.prs[0].isDraft, true, 'the PR is a draft either way');
+        assert.deepEqual(lines('odd-drafted').map(comment => comment.body), human ? [] : [`odd-drafted pr=7 escalation=${latch.id}`]);
+        // Devon removes the label; the head-3 reviewer is gone and head 4 gets a ready verdict.
+        plant.issues.get('MET-7')!.labels = plant.issues.get('MET-7')!.labels.filter(label => label !== 'escalated');
+        await advance(10 * 60_000);
+        assert.deepEqual(lines('odd-resume').map(comment => comment.body), [`odd-resume escalation=${latch.id} epoch=2`]);
+        const pr = plant.prs[0];
+        Object.assign(pr, { headRefOid: head(4), commits: [{ oid: head(4), committedDate: new Date().toISOString() }] });
+        plant.threads.set('T-r4', { labels: ['odd-issue-met-7', 'odd-role-reviewer', 'odd-round-4', 'odd-engine-openai', `odd-verdict-ready-${head(4).slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+        await plant.start();
+        await advance(10 * 60_000);
+        assert.deepEqual(readies, human ? [] : ['gh pr ready 7']);
+        assert.equal(merges.length, human ? 0 : 1);
+        assert.equal(pr.isDraft, human, 'a human draft is still a draft');
       } finally {
         mock.timers.reset();
       }

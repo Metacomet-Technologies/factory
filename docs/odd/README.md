@@ -520,7 +520,14 @@ already `escalated` stay held.
 Escalation is a latch. `odd-escalated reason=<r> pr=<n|-> sha=<sha|-> done=<steps>`
 is written before any side effect; the label, the draft, the DM and the
 archive are each recorded in `done=` once they succeed, and a failed step is
-retried alone by the next evaluation while the issue holds. The escalation
+retried alone by the next evaluation while the issue holds. The draft step
+drafts only a PR that is ready for review and then records
+`odd-drafted pr=<n> escalation=<comment id>` (P4.4); a PR that is already a
+draft is left as it is and unrecorded. `merge()` marks a draft ready only
+when such a record has an `odd-resume` for the same escalation and no
+`odd-undrafted` line, which it writes before `gh pr ready`; any other draft,
+a human's included, stays a draft and the merge is refused once per head.
+A lost record fails closed: the PR stays a draft for its author. The escalation
 comment never resets a budget or a round count. When Devon removes
 `escalated` from a latch whose label step was recorded, the control plane
 writes `odd-resume escalation=<comment id> epoch=<n+1>` once; that record
@@ -737,14 +744,27 @@ by the previous one).
    cancels idle role threads stale for 15 minutes, restores the issue,
    retries one round and pages `budget-ceiling` after that; caps and blind
    alerts once per episode; daily digest at 08:00 America/New_York; one page
-   format; `merge()` un-drafts the PR and rechecks after a refusal; a merged
+   format; `merge()` un-drafts only a PR the plane drafted for a resumed
+   escalation (P4.4) and rechecks after a refusal; a merged
    PR satisfies the builder and reviewer stops. After a red receipt
    (`health=fail`, P4.3), a PR merged at or before the latest one shipped the
    failed release: PR selection, the snapshot and those stops all skip it
    (`snapshot.prEligible`, ownership unchanged), so the issue's new builder
    is never moved to Deploying or stopped off the old merge, while a new open
    PR or one merged strictly later counts; merged rows then need a usable
-   merge time. A delivered thread (reviewer
+   merge time. Each build round is bound to its PR (P4.4): the first time an
+   issue ODD owns has exactly one candidate PR in its epoch (its build round,
+   the highest builder `odd-spawn` round, and its rollback epoch, the red
+   receipts so far), the performing plane writes `odd-pr pr=<n>
+   branch=<branch> round=<r> rollback=<k>` before it acts. From then on the
+   snapshot, the Ralph guard and `odd_verdict` read that PR by number,
+   whatever order GitHub lists PRs in and across reloads; a bound PR that was
+   closed binds nothing more. Unbound, two or more candidates are a failed
+   read naming them, never the first in list order, so nothing merges until
+   one is closed. A binding from an older round or rollback epoch binds
+   nothing, and after a red receipt an open PR opened at or before it is
+   never a candidate (open rows then need a usable creation time). A
+   delivered thread (reviewer
    with a verdict, verifier labelled `odd-receipt-<sha12>` for an older
    receipt) holds no round; verifier rounds count per receipt. The sweep
    reads every page of issues and threads, and the digest is not reposted

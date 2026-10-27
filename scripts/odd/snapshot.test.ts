@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { admittedLoad, changesRounds, ciState, delivered, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, openRounds, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, riskFrom, spawnRecords, threadState, toSnapshot, verdictFor, verifiedFor, verifiedLabels, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { admittedLoad, bindingCandidate, buildEpoch, changesRounds, ciState, currentBinding, delivered, diagnosedLabel, draftedLine, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, openRounds, parsePrBinding, prBindingLine, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, releasedDraft, riskFrom, spawnRecords, threadState, toSnapshot, verdictFor, undraftedLine, verifiedFor, verifiedLabels, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
 import { contractOf, nextAction, parseSpawn, spawnKey, spawnLine } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
@@ -510,4 +510,64 @@ test('P3.10: an approval-blocked thread owns the issue beside an idle builder; a
   assert.equal(toSnapshot({ issue, threads: [running] }).owner?.idleSince, '2026-10-26T11:40:00.000Z');
   assert.equal(toSnapshot({ issue, threads: [{ ...running, activeAt: undefined }] }).owner?.idleSince, undefined, 'a search date is not agent activity');
   assert.equal(toSnapshot({ issue, threads: [builder] }).owner?.idleSince, '2026-10-26T09:00:00.000Z');
+});
+
+test('P4.4: the binding holds for its build round and rollback epoch only, latest by creation time in any comment order', () => {
+  const at = (s: number) => new Date(Date.parse('2026-10-26T12:00:00Z') + s * 1000).toISOString();
+  const red = `odd-deploy host=h component=c sha=${'9'.repeat(40)} health=fail rollback=dddddddddddd`;
+  const binding = { pr: 7, branch: 'met-7-x', round: 1, rollback: 0 };
+  assert.equal(prBindingLine(binding), 'odd-pr pr=7 branch=met-7-x round=1 rollback=0');
+  assert.deepEqual(parsePrBinding(`${prBindingLine(binding)}\n\nwhy`), binding);
+  assert.equal(parsePrBinding('odd-pr pr=7 branch=met-7-x round=1'), undefined, 'a partial line binds nothing');
+  const comments = [
+    { body: spawnLine({ role: 'builder', round: 1, key: 'builder', thread: 'T-b1' }), createdAt: at(1) },
+    { body: prBindingLine(binding), createdAt: at(2) },
+    { body: spawnLine({ role: 'reviewer', round: 3, key: `reviewer-${'a'.repeat(12)}` }), createdAt: at(3) },
+  ];
+  assert.deepEqual(buildEpoch(comments), { round: 1, rollback: 0 }, 'only builder spawns set the round');
+  assert.deepEqual(currentBinding(comments), binding);
+  assert.deepEqual(currentBinding([...comments].reverse()), binding, 'newest-first reads bind the same PR');
+  // A closed bound PR is rebound later in the same epoch: the latest binding wins, in either order.
+  const rebound = [...comments, { body: prBindingLine({ ...binding, pr: 70, branch: 'met-7-y' }), createdAt: at(4) }];
+  assert.equal(currentBinding(rebound)?.pr, 70);
+  assert.equal(currentBinding([...rebound].reverse())?.pr, 70);
+  // A new builder round or a red receipt starts an epoch the old binding does not hold for.
+  assert.equal(currentBinding([...comments, { body: spawnLine({ role: 'builder', round: 2, key: 'builder' }), createdAt: at(5) }]), undefined);
+  const rolledBack = [...comments, { body: red, createdAt: at(5) }];
+  assert.deepEqual(buildEpoch(rolledBack), { round: 1, rollback: 1 });
+  assert.equal(currentBinding(rolledBack), undefined);
+  assert.equal(currentBinding([...rolledBack, { body: prBindingLine({ ...binding, pr: 48, rollback: 1 }), createdAt: at(6) }])?.pr, 48);
+});
+
+test('P4.4: an unbound epoch binds its one eligible candidate; several throw in any order; a pre-rollback open PR and a closed bound PR never bind', () => {
+  const row = (number: number, over: Partial<GitHubPullRequest> = {}) => ({ number, headRefName: `met-7-${number}`, body: '', mergedAt: null, createdAt: '2026-10-26T13:00:00Z', ...over });
+  assert.equal(bindingCandidate([row(7)], 'MET-7', undefined)?.number, 7);
+  assert.equal(bindingCandidate([], 'MET-7', undefined), undefined);
+  for (const rows of [[row(7), row(70)], [row(70), row(7)]]) assert.throws(() => bindingCandidate(rows, 'MET-7', undefined), /MET-7 has 2 candidate PRs \(#7, #70\)/);
+  assert.equal(bindingCandidate([row(7), row(70), { ...row(9), headRefName: 'met-9-x', body: 'see MET-7' }], 'MET-7', undefined, 7)?.number, 70, 'the closed bound PR and a mention are not candidates');
+  const failed = '2026-10-26T12:00:02.000Z';
+  assert.equal(bindingCandidate([row(47, { createdAt: '2026-10-26T12:00:02Z' })], 'MET-7', failed), undefined, 'opened at the red receipt: stale');
+  assert.equal(bindingCandidate([row(47, { createdAt: '2026-10-26T11:30:00Z' }), row(48, { createdAt: '2026-10-26T12:00:03Z' })], 'MET-7', failed)?.number, 48);
+  assert.equal(bindingCandidate([row(47, { createdAt: undefined })], 'MET-7', failed), undefined, 'no creation time never binds after a rollback');
+  // A merge counts by its merge time (P4.3), whenever the PR was opened.
+  assert.equal(bindingCandidate([row(45, { createdAt: '2026-10-26T10:00:00Z', mergedAt: '2026-10-26T12:00:03Z' })], 'MET-7', failed)?.number, 45);
+  assert.equal(bindingCandidate([row(41, { createdAt: '2026-10-26T10:00:00Z', mergedAt: '2026-10-26T12:00:02Z' })], 'MET-7', failed), undefined);
+});
+
+test('P4.4: only a plane draft whose own escalation was resumed is released, once; a human draft never is', () => {
+  const resume = (escalation: string) => ({ body: `odd-resume escalation=${escalation} epoch=2` });
+  const cases: [string, { body: string }[], string | undefined][] = [
+    ['no plane record (a human draft)', [resume('c-1')], undefined],
+    ['plane draft not resumed', [{ body: draftedLine(7, 'c-1') }], undefined],
+    ['resume of another escalation', [{ body: draftedLine(7, 'c-1') }, resume('c-9')], undefined],
+    ['plane draft of another PR', [{ body: draftedLine(70, 'c-1') }, resume('c-1')], undefined],
+    ['already released', [{ body: draftedLine(7, 'c-1') }, resume('c-1'), { body: undraftedLine(7, 'c-1') }], undefined],
+    ['malformed resume', [{ body: draftedLine(7, 'c-1') }, { body: 'odd-resume escalation=c-1' }], undefined],
+    ['plane draft resumed', [{ body: draftedLine(7, 'c-1') }, resume('c-1')], 'c-1'],
+    ['a second escalation after the first was released', [{ body: draftedLine(7, 'c-1') }, resume('c-1'), { body: undraftedLine(7, 'c-1') }, { body: draftedLine(7, 'c-5') }, resume('c-5')], 'c-5'],
+  ];
+  for (const [name, comments, expected] of cases) {
+    assert.equal(releasedDraft(comments, 7), expected, name);
+    assert.equal(releasedDraft([...comments].reverse(), 7), expected, `${name}, reordered`);
+  }
 });
