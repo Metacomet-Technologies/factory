@@ -288,13 +288,22 @@ async function rollback(effects: Effects, recipe: Recipe, sha: string, snapshot:
   return (await probeWindow(effects, recipe, sha, restoredResult, 'rollback-probe')) === 'pass' ? snapshot : 'none';
 }
 
+/** An installer that failed before its snapshot ran no rollback: `unchanged` only when three probes
+ * find the exact healthy identity captured before the install, else `none` (unproven recovery). */
+async function unchanged(effects: Effects, recipe: Recipe, before: string | undefined): Promise<string> {
+  if (!before) { effects.log('unchanged-unproven', { component: recipe.name, reason: 'no healthy identity before the install' }); return 'none'; }
+  const same = (expected: string, body: string) => healthySha(body) === expected ? 'pass' : 'fail';
+  return (await probeWindow(effects, recipe, before, same, 'unchanged-probe')) === 'pass' ? 'unchanged' : 'none';
+}
+
 /** Install, probe, roll back once on red. Returns the receipt for this component. */
 export async function deployComponent(effects: Effects, recipe: Recipe, tag: string, sha: string, releaseDir: string): Promise<Receipt> {
   const ledger = effects.readLedger();
   let snapshot: string | undefined;
   let needInstall = true;
   const inFlight = ledger.inFlight;
-  if (inFlight && inFlight.sha === sha && inFlight.component === recipe.name) {
+  const resuming = inFlight && inFlight.sha === sha && inFlight.component === recipe.name;
+  if (resuming) {
     const action = resume(inFlight, await probeWindow(effects, recipe, sha));
     effects.log('resume', { component: recipe.name, phase: inFlight.phase, action });
     snapshot = inFlight.snapshot;
@@ -308,6 +317,9 @@ export async function deployComponent(effects: Effects, recipe: Recipe, tag: str
   }
   if (needInstall) {
     const guarded = recipe.dbGuard ? { noDbChange: true as const } : {};
+    // The exact healthy identity before this install; an interrupted install's prior state is unproven.
+    let before: string | undefined;
+    if (!resuming) try { before = healthySha(effects.probe(recipe.health)); } catch { /* unavailable: unproven */ }
     effects.writeLedger({ ...ledger, inFlight: { tag, sha, component: recipe.name, phase: 'installing', ...guarded } });
     const install = effects.sudo(recipe.installer, ['--source-checkout', join(effects.stateDir, 'source'), ...(recipe.dbGuard ? ['--no-db-change'] : []), recipe.artifact(releaseDir)]);
     snapshot = parseSnapshot(install.output);
@@ -317,8 +329,8 @@ export async function deployComponent(effects: Effects, recipe: Recipe, tag: str
       // The installer's own recheck saw the DB generation change after the preflight: nothing changed.
       const verdict = recipe.dbGuard && !snapshot ? meterPlan(install.output) : undefined;
       if (verdict && verdict !== 'eligible') return refuse(effects, tag, { component: recipe.name, sha, health: 'refused', rollback: 'none', refusal: verdict });
-      // The installer's own ERR path already restored or never changed anything; a snapshot means it changed something.
-      return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: snapshot ? await rollback(effects, recipe, sha, snapshot) : 'none' }, snapshot);
+      // A snapshot means it changed something; without one it refused before any change, proven only by the captured identity.
+      return finish(effects, recipe, tag, sha, { component: recipe.name, sha, health: 'fail', rollback: snapshot ? await rollback(effects, recipe, sha, snapshot) : await unchanged(effects, recipe, before) }, snapshot);
     }
     effects.writeLedger({ ...effects.readLedger(), inFlight: { tag, sha, component: recipe.name, phase: 'probing', snapshot, ...guarded } });
     if ((await probeWindow(effects, recipe, sha)) === 'fail') {
