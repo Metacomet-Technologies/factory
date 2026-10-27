@@ -1,6 +1,6 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, slackMessages, staleThreads, sweepMs, staleMs, type DigestInput, type Episode } from './watchdog.ts';
+import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, staleThreads, sweepMs, staleMs, type DigestInput, type Episode, digestParts, digestSends, digestCompleteLine, digestDelivered, digestLate, stalledWork, firstParentSince, newestRelease, publisherSnapshot, publisherPage, publisherLine, publisherStallMs, type DigestList, type MainCommit, type Publisher, type Run } from './watchdog.ts';
 import { controlPlaneSilent, deployReceiptLine, heartbeatLine, parseHeartbeat, silenceMs, verifyLine } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
 import { diagnosedLabel, readerLabel, receiptLabel, type LiveThread } from './snapshot.ts';
@@ -55,13 +55,16 @@ test('caps are over only past the soft limits', () => {
 
 test('the digest is due once per New York day after 08:00', () => {
   // 2026-10-24 is EDT (UTC-4): 11:59Z is 07:59 local, 12:00Z is 08:00 local.
-  assert.deepEqual(localClock(new Date('2026-10-24T12:00:00Z')), { day: '2026-10-24', hour: 8 });
+  assert.deepEqual(localClock(new Date('2026-10-24T12:00:00Z')), { day: '2026-10-24', hour: 8, minute: 0 });
   assert.equal(digestDue(undefined, new Date('2026-10-24T11:59:00Z')), undefined);
   assert.equal(digestDue(undefined, new Date('2026-10-24T12:00:00Z')), '2026-10-24');
   assert.equal(digestDue('2026-10-24', new Date('2026-10-24T20:00:00Z')), undefined);
   assert.equal(digestDue('2026-10-24', new Date('2026-10-25T03:59:00Z')), undefined, 'still 23:59 on the 24th in New York');
   assert.equal(digestDue('2026-10-24', new Date('2026-10-25T12:00:00Z')), '2026-10-25');
 });
+
+const released: Publisher = { release: { tag: 'v0.2.50', sha: 'c'.repeat(40) } };
+const noWaits = { risk: [], failedVerification: [], unknownAge: [], overBudget: [], missingReceipt: [], unownedTodo: [] };
 
 test('the digest lists counts, identifiers and SHAs, and never a diff', () => {
   const input: DigestInput = {
@@ -72,12 +75,15 @@ test('the digest lists counts, identifiers and SHAs, and never a diff', () => {
     escalated: [{ identifier: 'MET-304', title: 'clearing escalated' }],
     load: { orbs: 2, runnerSlots: 0, buildIssues: 1 },
     cancelled: ['MET-1 odd-watchdog cancelled role=builder thread=T-1 round=1'],
+    publisher: released,
+    ...noWaits,
     risk: [{ identifier: 'MET-5', reason: 'risk security needs a human decision' }],
     failedVerification: [{ identifier: 'MET-6', reason: 'verification failed at abcdef123456; bug MET-9' }],
-    unknownAge: [],
   };
   const text = digest(input);
   assert.match(text, /^ODD digest 2026-10-24$/m);
+  assert.doesNotMatch(text, /Late catch-up/, 'an on-time digest does not claim to be late');
+  assert.match(text, /^Publisher: main published through newest release v0\.2\.50 at cccccccccccc$/m);
   assert.match(text, /^Merged PRs \(1\):\n- #182 ODD phase 5 head 00769a51786e merge ea4a339a0ce1$/m);
   assert.match(text, /^Issues Done \(1\):\n- MET-280 /m);
   assert.match(text, /^Bugs filed \(0\):\n- none$/m);
@@ -91,18 +97,165 @@ test('the digest lists counts, identifiers and SHAs, and never a diff', () => {
   assert.doesNotMatch(text, /diff --git|ghp_|xox[abp]-|lin_api_/);
 });
 
-test('a digest longer than one Slack message is split on line breaks', () => {
+const partBody = (part: string) => part.slice(part.indexOf('\n') + 1);
+
+test('a digest longer than one Slack message is split on line breaks, each part carrying its day/part identity', () => {
   const merged = Array.from({ length: 46 }, (_, i) => ({ number: 140 + i, title: `ODD phase ${i}: a title about as long as the real ones are`, headSha: 'a'.repeat(40), mergeSha: 'b'.repeat(40) }));
-  const text = digest({ day: '2026-10-24', merged, done: [], bugs: [], escalated: [], load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, cancelled: [], risk: [], failedVerification: [], unknownAge: [] });
+  const text = digest({ day: '2026-10-24', merged, done: [], bugs: [], escalated: [], load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, cancelled: [], publisher: released, ...noWaits });
   assert.ok(text.length > slackMessageMax, 'the fixture must need more than one message');
-  const parts = slackMessages(text);
+  const parts = digestParts(text, '2026-10-24');
   assert.ok(parts.length > 1);
   assert.ok(parts.every(part => part.length <= slackMessageMax));
-  assert.match(parts[0], /^ODD digest 2026-10-24\n/);
-  assert.match(parts[1], new RegExp(`^\\(2/${parts.length}\\)\\n- #`));
-  assert.equal(parts.map(part => part.replace(/^\(\d+\/\d+\)\n/, '')).join('\n'), text, 'nothing is lost or cut mid-line');
-  assert.deepEqual(slackMessages('short'), ['short']);
+  const id = /id=([0-9a-f]{8})$/.exec(parts[0].split('\n')[0])![1];
+  parts.forEach((part, i) => assert.equal(part.split('\n')[0], `ODD digest 2026-10-24 part ${i + 1}/${parts.length} id=${id}`));
+  assert.equal(['ODD digest 2026-10-24', ...parts.map(partBody)].join('\n'), text, 'nothing is lost or cut mid-line');
+  assert.deepEqual(digestParts(text, '2026-10-24'), parts, 'the same facts render the same delivery');
 });
+
+// --- P3.2+P6.2+P4.6-digest: stalled work, the publisher snapshot and reliable delivery -----
+
+const ciWait = (since: string): Action => ({ kind: 'wait', reason: 'ci pending at abcdef123456', wait: { kind: 'ci', key: 'ci-abcdef123456', since } });
+
+test('P3.2+P6.2+P4.6-digest: every stalled-work class reaches its digest list; work within budget or owned does not', () => {
+  const at = Date.parse('2026-10-24T15:00:00Z');
+  const ago = (minutes: number) => new Date(at - minutes * 60_000).toISOString();
+  const cases: [string, ReturnType<typeof stalledWork>][] = [
+    ['over budget', stalledWork('MET-11', 'In Progress', true, ciWait(ago(61)), at)],
+    ['within budget', stalledWork('MET-12', 'In Progress', true, ciWait(ago(59)), at)],
+    ['missing receipt, young', stalledWork('MET-13', 'Deploying', false, { kind: 'wait', reason: 'release not published', wait: { kind: 'receipt', key: 'receipt-eeeeeeeeeeee', since: ago(5) } }, at)],
+    ['unowned Todo', stalledWork('MET-14', 'Todo', false, { kind: 'wait', reason: 'blocked by MET-2' }, at)],
+    ['owned Todo', stalledWork('MET-15', 'Todo', true, { kind: 'wait', reason: 'builder running' }, at)],
+    ['In Progress without a wait record', stalledWork('MET-16', 'In Progress', false, { kind: 'wait', reason: 'builder running' }, at)],
+    ['risk', stalledWork('MET-17', 'In Progress', true, { kind: 'wait', reason: 'risk security needs a human decision', wait: { kind: 'risk', key: 'risk-1' } }, at)],
+    ['failed verify', stalledWork('MET-18', 'Deploying', false, { kind: 'wait', reason: 'verification failed at abcdef123456', wait: { kind: 'verification', key: 'verify-1' } }, at)],
+    ['unknown age', stalledWork('MET-19', 'In Progress', true, { kind: 'wait', reason: 'ci pending at 123456abcdef', wait: { kind: 'ci', key: 'ci-123456abcdef' } }, at)],
+    ['spawn', stalledWork('MET-20', 'Todo', false, { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'x', round: 1 }, at)],
+  ];
+  assert.deepEqual(cases.map(([name, item]) => [name, item?.list]), [
+    ['over budget', 'overBudget'], ['within budget', undefined], ['missing receipt, young', 'missingReceipt'], ['unowned Todo', 'unownedTodo'],
+    ['owned Todo', undefined], ['In Progress without a wait record', undefined], ['risk', 'risk'], ['failed verify', 'failedVerification'], ['unknown age', 'unknownAge'], ['spawn', undefined],
+  ]);
+  const lists: Record<DigestList, { identifier: string; reason: string }[]> = { risk: [], failedVerification: [], unknownAge: [], overBudget: [], missingReceipt: [], unownedTodo: [] };
+  for (const [, item] of cases) if (item) lists[item.list] = [...lists[item.list], { identifier: item.identifier, reason: item.reason }];
+  const stalled: Publisher = { release: released.release, stalled: { sha: 'd'.repeat(40), since: ago(90), unreleased: 2, state: 'failed', run: 'https://github.com/o/r/actions/runs/7' } };
+  const text = digest({ day: '2026-10-24', late: true, merged: [], done: [], bugs: [], escalated: [], load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, cancelled: [], publisher: stalled, ...lists });
+  assert.match(text, /^ODD digest 2026-10-24\nLate catch-up: due at 08:00 America\/New_York and not delivered then; posted by a later sweep\.$/m);
+  assert.match(text, /^Publisher failed: 2 unreleased first-parent commits on main; oldest d{40} landed 2026-10-24T13:30:00\.000Z; run https:\/\/github\.com\/o\/r\/actions\/runs\/7; newest release v0\.2\.50 at c{12}$/m);
+  assert.match(text, /^Waits over budget \(1\):\n- MET-11 ci pending at abcdef123456 \(ci wait, 61 min old, budget 60 min, episode ci-abcdef123456\)$/m);
+  assert.match(text, /^Missing deploy receipts \(1\):\n- MET-13 release not published \(receipt wait, 5 min old, budget 120 min, episode receipt-eeeeeeeeeeee\)$/m);
+  assert.match(text, /^Todo with no owner \(1\):\n- MET-14 blocked by MET-2$/m);
+  assert.match(text, /^Risk decisions waiting \(1\):\n- MET-17 /m);
+  assert.match(text, /^Failed verifications \(1\):\n- MET-18 /m);
+  assert.match(text, /^Waits of unknown age \(1\):\n- MET-19 /m);
+  for (const absent of ['MET-12', 'MET-15', 'MET-16', 'MET-20']) assert.doesNotMatch(text, new RegExp(`${absent}\\b`));
+});
+
+const commit = (sha: string, parents: string[], date = '2026-10-24T12:00:00Z'): MainCommit => ({ sha, parents, date });
+const run = (status: string, conclusion: string, url: string, createdAt = '2026-10-24T13:00:00Z'): Run => ({ status, conclusion, url, createdAt });
+
+test('P3.2+P6.2+P4.6-digest: the publisher snapshot names the oldest stalled first-parent SHA and tells pending from failed and recovery runs', () => {
+  const [r, a, b, side, m] = ['1', '2', '3', '4', '5'].map(c => c.repeat(40));
+  // r (release) <- a <- m (merge of side) ; side branches off r. Only a and m are first-parent; side is not main's history.
+  const commits = [commit(m, [a, side], '2026-10-24T13:00:00Z'), commit(side, [r]), commit(a, [r], '2026-10-24T12:10:00Z')];
+  assert.deepEqual(firstParentSince(r, commits).map(c => c.sha), [a, m]);
+  assert.deepEqual(firstParentSince(r, []), []);
+  assert.throws(() => firstParentSince(r, [commit(m, [a, side]), commit(side, [r])]), /does not reach release/, 'a truncated compare is never an empty stall');
+  assert.throws(() => firstParentSince(r, [commit(a, [r]), commit(b, [r])]), /2 heads/);
+  assert.equal(newestRelease([{ tag: 'v0.2.9', draft: false, prerelease: false }, { tag: 'v0.2.10', draft: false, prerelease: false }, { tag: 'v0.3.0', draft: true, prerelease: false }, { tag: 'v0.2.11-rc', draft: false, prerelease: false }, { tag: 'v0.2.12', draft: false, prerelease: true }]), 'v0.2.10');
+  const release = { tag: 'v0.2.10', sha: r };
+  const chain = firstParentSince(r, commits);
+  assert.deepEqual(publisherSnapshot(release, [], [run('completed', 'failure', 'pub')], []), { release }, 'nothing unreleased is no stall, whatever the runs');
+  const state = (pub: Run[], ci: Run[]) => { const s = publisherSnapshot(release, chain, pub, ci).stalled!; return [s.sha, s.state, s.run ?? null, s.since, s.unreleased]; };
+  assert.deepEqual(state([run('completed', 'success', 'pub-ok')], [run('in_progress', '', 'ci-running')]), [a, 'pending', 'ci-running', '2026-10-24T12:10:00Z', 2], 'CI still running: pending, its run named');
+  assert.deepEqual(state([run('queued', '', 'pub-queued')], [run('completed', 'success', 'ci-ok')]), [a, 'pending', 'pub-queued', '2026-10-24T12:10:00Z', 2], 'publisher queued: pending');
+  assert.deepEqual(state([], []), [a, 'pending', null, '2026-10-24T12:10:00Z', 2], 'no run yet: pending with no run');
+  assert.deepEqual(state([run('completed', 'success', 'pub-old', '2026-10-24T11:00:00Z'), run('completed', 'failure', 'pub-new')], [run('completed', 'success', 'ci-ok')]), [a, 'failed', 'pub-new', '2026-10-24T12:10:00Z', 2], 'the newest publisher run failed');
+  assert.deepEqual(state([run('completed', 'failure', 'pub-new')], [run('completed', 'failure', 'ci-red')]), [a, 'recovery', 'ci-red', '2026-10-24T12:10:00Z', 2], 'the stalled SHA\'s own CI failed: recovery wins, naming the CI run');
+  assert.deepEqual(state([run('completed', 'failure', 'pub-old', '2026-10-24T11:00:00Z'), run('completed', 'success', 'pub-new')], [run('completed', 'success', 'ci-ok')])[1], 'pending', 'a newer success clears an older failure');
+});
+
+test('P3.2+P6.2+P4.6-digest: the publisher pages past 60 minutes, not at 59 or at 60, with the exact SHA and run', () => {
+  const since = '2026-10-24T12:00:00.000Z';
+  const stalled: Publisher = { release: { tag: 'v0.2.10', sha: '1'.repeat(40) }, stalled: { sha: '2'.repeat(40), since, unreleased: 1, state: 'recovery', run: 'https://github.com/o/r/actions/runs/42' } };
+  const at = (minutes: number) => Date.parse(since) + minutes * 60_000;
+  assert.equal(publisherStallMs, 60 * 60_000);
+  assert.equal(publisherPage(stalled, at(59)), undefined);
+  assert.equal(publisherPage(stalled, at(60)), undefined);
+  const page = publisherPage(stalled, at(61))!;
+  assert.match(page, /^ODD page: wait-overdue \| issue - \| - \| 2{40} \| default if silent: /);
+  assert.match(page, /publisher recovery: 1 unreleased first-parent commit on main; oldest 2{40} landed 2026-10-24T12:00:00\.000Z \(61 min\); run https:\/\/github\.com\/o\/r\/actions\/runs\/42; budget 60 min; newest release v0\.2\.10\. episode=publisher-222222222222$/);
+  assert.equal(publisherPage({ release: stalled.release }, at(600)), undefined, 'a published main never pages');
+  assert.equal(publisherLine({ release: stalled.release }), 'Publisher: main published through newest release v0.2.10 at 111111111111');
+});
+
+test('P3.2+P6.2+P4.6-digest: oversized lines are hard-split with the part prefix counted; every message fits and nothing is lost', () => {
+  const day = '2026-11-01';
+  const strip = (text: string) => text.replace(/\n/g, '');
+  for (const [name, body, max] of [
+    ['one line far over the limit', `- ${'x'.repeat(9000)}`, slackMessageMax],
+    ['a line exactly at the room left after the prefix', 'y'.repeat(slackMessageMax - 'ODD digest 2026-11-01 part 9/9 id=00000000'.length - 1), slackMessageMax],
+    ['a line one over that room', 'z'.repeat(slackMessageMax - 'ODD digest 2026-11-01 part 9/9 id=00000000'.length), slackMessageMax],
+    ['surrogate pairs at the cut', '😀'.repeat(3000), slackMessageMax],
+    ['two-digit part numbers', Array.from({ length: 400 }, (_, i) => `- line ${i} ${'w'.repeat(40)}`).join('\n'), 400],
+    ['three-digit part numbers', Array.from({ length: 300 }, (_, i) => `- ${i} ${'v'.repeat(80)}`).join('\n'), 120],
+  ] as const) {
+    const text = `ODD digest ${day}\n${body}`;
+    const parts = digestParts(text, day, max);
+    assert.ok(parts.every(part => part.length <= max), `${name}: longest ${Math.max(...parts.map(part => part.length))} > ${max}`);
+    assert.equal(strip(parts.map(partBody).join('')), strip(body), `${name}: every character, in order`);
+    assert.ok(parts.every(part => !/[\uD800-\uDBFF]$|^[\uDC00-\uDFFF]/m.test(partBody(part))), `${name}: no surrogate pair is split`);
+    parts.forEach((part, i) => assert.match(part.split('\n')[0], new RegExp(`^ODD digest ${day} part ${i + 1}/${parts.length} id=[0-9a-f]{8}$`), name));
+    if (name === 'a line exactly at the room left after the prefix') assert.equal(parts.length, 1, 'a line that fits is never split');
+    if (name === 'a line one over that room') assert.equal(parts.length, 2);
+    if (name.startsWith('two-digit')) assert.ok(parts.length >= 10 && parts.length < 100, `${parts.length} parts`);
+    if (name.startsWith('three-digit')) assert.ok(parts.length >= 100, `${parts.length} parts`);
+  }
+});
+
+test('P3.2+P6.2+P4.6-digest: delivery posts only missing parts, completes once, and a superseded or legacy day is handled', () => {
+  const day = '2026-10-24';
+  const parts = digestParts(`ODD digest ${day}\n${Array.from({ length: 200 }, (_, i) => `- row ${i}`).join('\n')}`, day, 300);
+  const id = /id=(\w+)$/.exec(parts[0].split('\n')[0])![1];
+  const done = digestCompleteLine(day, id, parts.length);
+  assert.deepEqual(digestSends(day, [], parts), [...parts, done], 'nothing posted: every part, then completion');
+  assert.deepEqual(digestSends(day, parts.slice(0, 2), parts), [...parts.slice(2), done], 'a failed tail: only the tail, then completion');
+  assert.deepEqual(digestSends(day, [parts[0], parts[2]], parts), [parts[1], ...parts.slice(3), done], 'a hole in the middle is filled');
+  assert.deepEqual(digestSends(day, [...parts].reverse(), parts), [done], 'all parts present in any order: only completion');
+  assert.deepEqual(digestSends(day, [...parts, done], parts), [], 'a completed day is never posted again');
+  assert.deepEqual(digestSends(day, ['ODD digest 2026-10-24\nMerged PRs (0):'], parts), [], 'a digest from before part identities counts as delivered');
+  assert.deepEqual(digestSends(day, ['ODD digest 2026-10-23 complete id=00000000 parts=1'], parts), [...parts, done], 'yesterday\'s completion is not today\'s');
+  // Another rendering's incomplete delivery is superseded in full; its complete earlier rendering only needs its completion line.
+  const other = digestParts(`ODD digest ${day}\n${Array.from({ length: 200 }, (_, i) => `- other ${i}`).join('\n')}`, day, 300);
+  const otherId = /id=(\w+)$/.exec(other[0].split('\n')[0])![1];
+  assert.deepEqual(digestSends(day, other.slice(0, 1), parts), [...parts, done]);
+  assert.deepEqual(digestSends(day, other, parts), [digestCompleteLine(day, otherId, other.length)]);
+  assert.ok(digestDelivered(day, [done]) && !digestDelivered(day, parts));
+});
+
+test('P3.2+P6.2+P4.6-digest: one digest per New York calendar day across DST; late only from 08:30', () => {
+  // 2026-11-01: EDT ends at 06:00Z (02:00 EDT -> 01:00 EST). 08:00 EST is 13:00Z; the day before, 08:00 EDT is 12:00Z.
+  assert.equal(digestDue('2026-10-31', new Date('2026-11-01T12:30:00Z')), undefined, '07:30 EST: not yet');
+  assert.equal(digestDue('2026-10-31', new Date('2026-11-01T13:00:00Z')), '2026-11-01');
+  assert.equal(digestDue('2026-11-01', new Date('2026-11-02T04:59:00Z')), undefined, '23:59 EST on the 1st');
+  assert.equal(digestDue('2026-11-01', new Date('2026-11-02T05:00:00Z')), undefined, '00:00 on the 2nd is before 08:00');
+  // 2027-03-14: EST -> EDT at 07:00Z. 08:00 EDT is 12:00Z.
+  assert.equal(digestDue('2027-03-13', new Date('2027-03-14T11:59:00Z')), undefined);
+  assert.equal(digestDue('2027-03-13', new Date('2027-03-14T12:00:00Z')), '2027-03-14');
+  assert.equal(digestLate(new Date('2026-11-01T13:29:00Z')), false, '08:29 EST is on time');
+  assert.equal(digestLate(new Date('2026-11-01T13:30:00Z')), true, '08:30 EST is a catch-up');
+  assert.equal(digestLate(new Date('2026-11-02T04:59:00Z')), true, '23:59 is a catch-up');
+  assert.equal(digestLate(new Date('2026-10-24T12:00:00Z')), false, '08:00 EDT');
+});
+
+/** The publisher reads (P6.2) of a main published through v0.2.50: one release, an identical compare. */
+const publishedRelease = { tag_name: 'v0.2.50', draft: false, prerelease: false };
+function publishedMain(command: string): string | undefined {
+  if (command === 'gh api --paginate --slurp repos/{owner}/{repo}/releases?per_page=100') return JSON.stringify([[publishedRelease]]);
+  if (command.startsWith('gh api --paginate --slurp repos/{owner}/{repo}/compare/')) return JSON.stringify([{ status: 'identical', ahead_by: 0, behind_by: 0, base_commit: { sha: 'c'.repeat(40) }, commits: [] }]);
+  return undefined;
+}
+/** Counts digest deliveries: messages that are a digest's first part, or a pre-identity digest. */
+const digestsIn = (alerts: readonly string[]) => alerts.filter(text => /^ODD digest \S+(\n| part 1\/)/.test(text)).length;
 
 /** Linear, thread search and #factory-alerts shared by every plugin instance; each `start()` is a fresh plugin load arming the control thread and returns its `odd_control_status` tool. `override` also sees `thread.labels` and `createWebhook`. */
 function controlOrb(override: (name: string, input: Record<string, unknown>) => unknown = () => undefined) {
@@ -145,19 +298,22 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
       default: return {};
     }
   } };
+  let loads = 0;
   const start = async () => {
     const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
     let status: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> } | undefined;
     const amp = {
       // `override('$', { command })` may answer a shell command with its stdout.
-      $: fakeShell(command => override('$', { command }) as string | undefined).$,
+      $: fakeShell(command => (override('$', { command }) as string | undefined) ?? publishedMain(command)).$,
       createAgent: () => ({ definition: {}, createThread: async () => ({ id: `T-spawned-${spawned.length + 1}`, setLabels: async () => {}, appendUserMessage: async (message: { content: string }) => { spawned.push(message.content); } }) }), registerAgentMode: () => {}, registerTool: (tool: typeof status) => { status = tool; },
       on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
       createWebhook: async (options: Record<string, unknown>) => (await override('createWebhook', options)) ?? { url: 'https://hooks.example/x' },
       system: { executor: { kind: 'remote', keepAlive: async () => {} } },
     };
     await (plugin as unknown as (api: unknown) => Promise<void>)(amp);
-    const thread = { id: 'T-control', labels: async () => (await override('thread.labels', {})) ?? ['odd-control-plane', 'odd-perform'] };
+    // Like a reload, a newer load replaces this one: its leftover timers see the control labels removed and only dry-run.
+    const mine = ++loads;
+    const thread = { id: 'T-control', labels: async () => (mine === loads ? (await override('thread.labels', {})) ?? ['odd-control-plane', 'odd-perform'] : []) };
     const ctx = { thread, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools };
     await handlers.get('session.start')!({}, ctx);
     return async (input: Record<string, unknown>) => JSON.parse(await status!.execute(input, ctx)) as { armed: boolean; error?: string; slack: { error?: string } };
@@ -175,15 +331,15 @@ test('the sweep reads every page of issues and threads, and a plugin reload does
   t.after(() => mock.timers.reset());
   const orb = controlOrb();
   await orb.start();
-  await until(() => orb.alerts.length > 0);
+  await until(() => orb.alerts.some(text => / complete id=/.test(text)));
   assert.ok(orb.evaluated.includes('MET-101'), 'issue on the second Triage page');
   assert.ok(orb.evaluated.includes('MET-200'), 'thread on the second search page');
-  assert.equal(orb.alerts.filter(text => text.startsWith('ODD digest 2026-10-24')).length, 1);
+  assert.equal(digestsIn(orb.alerts), 1);
   // Reload: a fresh plugin instance arms the same control thread and sweeps at once.
   await orb.start();
   await until(() => orb.reads() === 2);
   for (let i = 0; i < 200; i++) await new Promise(resolve => setImmediate(resolve));
-  assert.equal(orb.alerts.length, 1);
+  assert.equal(orb.alerts.length, 2, 'one part and its completion line, posted once');
 });
 
 test('the sweep records a cancellation on the issue before it archives the stale thread', async t => {
@@ -289,16 +445,17 @@ test('P3.8: a digest that Slack keeps rejecting is retried every sweep with its 
   // Slack accepts the digest: the next sweep posts it once and clears only the digest error.
   rejecting = false;
   mock.timers.tick(sweepMs);
-  await until(() => orb.alerts.length === 1);
+  await until(() => orb.alerts.length === 2);
   await settle();
-  assert.match(orb.alerts[0], /^ODD digest 2026-10-24/);
+  assert.match(orb.alerts[0], /^ODD digest 2026-10-24 part 1\/1 id=/);
+  assert.match(orb.alerts[1], /^ODD digest 2026-10-24 complete id=/);
   state = await watchdog();
   assert.equal(state.digestDay, '2026-10-24');
   assert.equal(state.digestError, undefined);
   mock.timers.tick(sweepMs);
   await until(() => parseHeartbeat(orb.updates[0].body) === '2026-10-24T15:50:00.000Z');
   await settle();
-  assert.equal(orb.alerts.length, 1, 'a posted digest is not posted again');
+  assert.equal(orb.alerts.length, 2, 'a posted digest is not posted again');
 });
 
 test('P3.8: a heartbeat write that keeps failing pages control-plane-blind exactly once and a digest success neither ends the episode nor suppresses the page; only a heartbeat success recovers', async t => {
@@ -315,7 +472,7 @@ test('P3.8: a heartbeat write that keeps failing pages control-plane-blind exact
   await until(() => heartbeats === 1);
   await settle();
   // The digest goes out while the heartbeat fails, and the episode stays open.
-  assert.equal(orb.alerts.filter(text => text.startsWith('ODD digest 2026-10-24')).length, 1);
+  assert.equal(digestsIn(orb.alerts), 1);
   let state = await watchdog();
   assert.equal(state.blindSince, '2026-10-24T15:00:00.000Z');
   assert.equal(state.digestDay, '2026-10-24');
@@ -1368,7 +1525,7 @@ test('P3.7, P3.8: malformed digest reads post no digest and keep the heartbeat; 
     await orb.start();
     await until(() => orb.calls.includes('linear.list_issues'));
     await settle();
-    return { heartbeats: orb.updates.length, digests: orb.alerts.filter(text => text.startsWith('ODD digest')).length };
+    return { heartbeats: orb.updates.length, digests: digestsIn(orb.alerts) };
   };
   assert.deepEqual(await run(() => undefined), { heartbeats: 1, digests: 1 }, 'control');
   for (const [name, override] of [
@@ -2104,7 +2261,7 @@ for (const shape of shapes) {
     const orb = controlOrb((name, input) => name === 'linear.list_issues' && input.state === 'Done' ? done.read(input) : emptyWork(name));
     await orb.start();
     await settle();
-    const outcome = () => ({ digests: orb.alerts.filter(text => text.startsWith('ODD digest')).length, sentinel: orb.alerts.filter(text => /^- MET-101 late Done sentinel$/m.test(text)).length, heartbeats: orb.updates.length });
+    const outcome = () => ({ digests: digestsIn(orb.alerts), sentinel: orb.alerts.filter(text => /^- MET-101 late Done sentinel$/m.test(text)).length, heartbeats: orb.updates.length });
     assert.deepEqual(outcome(), shape === 'empty' ? { digests: 1, sentinel: 0, heartbeats: 1 } : failing(shape) ? { digests: 0, sentinel: 0, heartbeats: 1 } : { digests: 1, sentinel: 1, heartbeats: 1 });
     done.state.broken = false;
     await advance(sweepMs);
@@ -2128,7 +2285,7 @@ for (const shape of slackShapes) {
     });
     await orb.start();
     await settle();
-    const outcome = () => ({ reposted: orb.alerts.filter(text => text.startsWith('ODD digest')).length, heartbeats: orb.updates.length });
+    const outcome = () => ({ reposted: digestsIn(orb.alerts), heartbeats: orb.updates.length });
     // An empty channel is a true "not posted yet": the digest goes out.
     assert.deepEqual(outcome(), shape === 'empty' ? { reposted: 1, heartbeats: 1 } : failing(shape) ? { reposted: 0, heartbeats: 1 } : { reposted: 0, heartbeats: 1 });
     alerts.state.broken = false;
@@ -2876,4 +3033,161 @@ test('P3.12: a Slack-only Intake is continued until an issue whose Context recor
   assert.equal(await guard(), undefined, 'the outcome exists: stop');
   await advance(5 * 60_000);
   assert.equal(plant.threads.get('T-slack')!.archived, true);
+});
+
+// --- P3.2+P6.2+P4.6-digest through the plugin: fake GitHub, Slack and clock -----------------
+
+/** The publisher's GitHub as the control orb reads it: the newest release, main's first-parent commits after it, and runs. */
+function publisherGitHub() {
+  const release = 'c'.repeat(40);
+  const gh = { tag: 'v0.2.50', base: release, main: [] as MainCommit[], releaseRuns: [] as Run[], ci: new Map<string, Run[]>(), down: false, reads: 0 };
+  const answer = (command: string): string | undefined => {
+    if (command === 'gh api --paginate --slurp repos/{owner}/{repo}/releases?per_page=100') {
+      gh.reads += 1;
+      return JSON.stringify([[{ tag_name: gh.tag, draft: false, prerelease: false }, { tag_name: 'v0.2.49', draft: false, prerelease: false }]]);
+    }
+    if (command === `gh api --paginate --slurp repos/{owner}/{repo}/compare/${gh.tag}...main?per_page=100`) {
+      if (gh.down) return '{"message":"Bad Gateway"}';
+      return JSON.stringify([{ status: gh.main.length ? 'ahead' : 'identical', ahead_by: gh.main.length, behind_by: 0, base_commit: { sha: gh.base }, commits: gh.main.map(c => ({ sha: c.sha, parents: c.parents.map(sha => ({ sha })), commit: { committer: { date: c.date } } })) }]);
+    }
+    if (command === 'gh run list --workflow release.yml --branch main --limit 20 --json status,conclusion,url,createdAt') return JSON.stringify(gh.releaseRuns);
+    const ci = /^gh run list --workflow ci\.yml --commit ([0-9a-f]{40}) --event push --limit 20 --json status,conclusion,url,createdAt$/.exec(command);
+    if (ci) return JSON.stringify(gh.ci.get(ci[1]) ?? []);
+    return undefined;
+  };
+  /** Main gains `sha` (first parent: the previous tip, or the release) landing at `date`. */
+  const land = (sha: string, date: string) => gh.main.push({ sha, parents: [gh.main.at(-1)?.sha ?? release], date });
+  return { gh, answer, land, release };
+}
+
+const publisherPages = (dms: readonly string[]) => dms.filter(text => /ODD page: wait-overdue \| issue - \|/.test(text));
+
+test('P3.2+P6.2+P4.6-digest: unreleased main pages once past 60 minutes with the exact SHA and failing run, survives a reload without a repeat, and resets on recovery', async t => {
+  // 13:00Z is 09:00 EDT: the day's digest is due too, and shares the publisher snapshot.
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T13:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const { gh, answer, land } = publisherGitHub();
+  const stalled = 'd'.repeat(40);
+  land(stalled, '2026-10-24T12:01:00.000Z'); // 59 minutes before the first sweep
+  land('e'.repeat(40), '2026-10-24T12:30:00.000Z');
+  gh.ci.set(stalled, [run('completed', 'failure', 'https://github.com/Metacomet-Technologies/factory/actions/runs/901', '2026-10-24T12:02:00Z')]);
+  gh.releaseRuns = [run('completed', 'failure', 'https://github.com/Metacomet-Technologies/factory/actions/runs/902', '2026-10-24T12:40:00Z')];
+  const orb = controlOrb((name, input) => (name === '$' ? answer(String(input.command)) : emptyWork(name)));
+  await orb.start();
+  await settle();
+  assert.deepEqual(publisherPages(orb.dms), [], '59 minutes: no page');
+  assert.equal(digestsIn(orb.alerts), 1, 'the digest went out from the same snapshot');
+  assert.match(orb.alerts.join('\n'), new RegExp(`^Publisher recovery: 2 unreleased first-parent commits on main; oldest ${stalled} landed 2026-10-24T12:01:00\\.000Z; run https://github\\.com/Metacomet-Technologies/factory/actions/runs/901; newest release v0\\.2\\.50 at c{12}$`, 'm'));
+  const reads = gh.reads;
+  await advance(sweepMs);
+  assert.equal(gh.reads, reads + 1, 'one publisher snapshot per sweep serves the page and the digest');
+  const pages = publisherPages(orb.dms);
+  assert.equal(pages.length, 1, '69 minutes: one page');
+  assert.match(pages[0], new RegExp(`\\| ${stalled} \\| .*oldest ${stalled} landed 2026-10-24T12:01:00\\.000Z \\(69 min\\); run https://github\\.com/Metacomet-Technologies/factory/actions/runs/901;`));
+  assert.ok(orb.alerts.some(text => text.startsWith(`odd-publisher-paged sha=${stalled}\n`)), 'the delivered page is recorded');
+  await advance(2 * sweepMs);
+  assert.equal(publisherPages(orb.dms).length, 1, 'later sweeps do not repeat it');
+  await orb.start();
+  await settle();
+  assert.equal(publisherPages(orb.dms).length, 1, 'a reload finds the record and does not repeat it');
+  // Recovery: the stalled SHA and its successor are released; nothing pages, and the episode is closed.
+  gh.tag = 'v0.2.51';
+  const tip = gh.main.at(-1)!.sha;
+  gh.base = tip;
+  gh.main = [];
+  await advance(sweepMs);
+  assert.equal(publisherPages(orb.dms).length, 1);
+  // A new stall on a new SHA is a new episode: it pages once past its own 60 minutes.
+  const next = 'f'.repeat(40);
+  gh.main = [{ sha: next, parents: [tip], date: new Date(Date.now()).toISOString() }];
+  gh.ci.set(next, [run('in_progress', '', 'https://github.com/Metacomet-Technologies/factory/actions/runs/950', new Date(Date.now()).toISOString())]);
+  gh.releaseRuns = [];
+  await advance(6 * sweepMs);
+  assert.equal(publisherPages(orb.dms).length, 1, 'exactly 60 minutes: still no page');
+  await advance(sweepMs);
+  const second = publisherPages(orb.dms).slice(1);
+  assert.equal(second.length, 1);
+  assert.match(second[0], new RegExp(`publisher pending: 1 unreleased first-parent commit on main; oldest ${next} .*run https://github\\.com/Metacomet-Technologies/factory/actions/runs/950;`));
+});
+
+test('P3.2+P6.2+P4.6-digest: a failed page is retried; an unreadable snapshot pages nothing and holds the digest without touching the heartbeat', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T14:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const { gh, answer, land } = publisherGitHub();
+  land('d'.repeat(40), '2026-10-24T12:00:00.000Z');
+  gh.down = true;
+  let pagesRefused = 1;
+  const orb = controlOrb((name, input) => {
+    if (name === '$') return answer(String(input.command));
+    if (name === 'slack_write' && !input.channelName && pagesRefused > 0) { pagesRefused -= 1; throw new Error('slack 503'); }
+    return emptyWork(name);
+  });
+  const status = await orb.start();
+  await settle();
+  const state = async () => ((await status({})) as unknown as { watchdog: DigestWatchdog & { publisherError?: string } }).watchdog;
+  assert.deepEqual([publisherPages(orb.dms).length, digestsIn(orb.alerts), orb.updates.length], [0, 0, 1], 'malformed compare: no page, no digest, heartbeat kept');
+  assert.match((await state()).publisherError ?? '', /malformed comparison/);
+  assert.match((await state()).digestError ?? '', /needs the publisher snapshot/);
+  gh.down = false;
+  await advance(sweepMs);
+  assert.equal(publisherPages(orb.dms).length, 0, 'Slack refused the first page');
+  assert.equal(digestsIn(orb.alerts), 1);
+  assert.ok(!orb.alerts.some(text => text.startsWith('odd-publisher-paged')), 'no record without delivery');
+  await advance(sweepMs);
+  assert.equal(publisherPages(orb.dms).length, 1, 'the next sweep delivers it');
+  await advance(sweepMs);
+  assert.equal(publisherPages(orb.dms).length, 1);
+  assert.equal((await state()).publisherError, undefined);
+});
+
+test('P3.2+P6.2+P4.6-digest: a failed middle part and a reload complete every part exactly once; no message exceeds 2800 characters; the day is never reposted', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T12:05:00Z') });
+  t.after(() => mock.timers.reset());
+  const { answer } = publisherGitHub();
+  // A merged PR list three Slack messages long, one title far longer than a message.
+  const prs = Array.from({ length: 40 }, (_, i) => ({ number: 300 + i, title: i === 7 ? `huge ${'t'.repeat(4000)}` : `merged change ${i}`, headRefOid: 'a'.repeat(40), mergeCommit: { oid: 'b'.repeat(40) }, mergedAt: '2026-10-24T03:00:00Z' }));
+  const writes: string[] = [];
+  let failPart: number | undefined = 2;
+  const orb = controlOrb((name, input) => {
+    if (name === '$') return String(input.command).startsWith('gh pr list --state merged') ? JSON.stringify(prs) : answer(String(input.command));
+    if (name === 'slack_write' && input.channelName === 'factory-alerts') {
+      const text = String(input.text);
+      writes.push(text);
+      if (text.length > slackMessageMax) throw new Error('invalid_blocks');
+      if (failPart && new RegExp(`^ODD digest 2026-10-24 part ${failPart}/`).test(text)) throw new Error('slack 503');
+    }
+    return emptyWork(name);
+  });
+  await orb.start();
+  await settle();
+  const parts = (alerts: readonly string[]) => alerts.filter(text => / part \d+\/\d+ id=/.test(text.split('\n')[0]));
+  const posted = parts(orb.alerts);
+  const total = Number(/part 1\/(\d+)/.exec(posted[0])![1]);
+  assert.ok(total >= 3, `${total} parts`);
+  assert.equal(posted.length, 1, 'part 2 failed: the delivery stops there');
+  assert.ok(!orb.alerts.some(text => text.includes(' complete id=')), 'no completion line before every part');
+  assert.doesNotMatch(posted[0], /Late catch-up/, 'rendered at 08:05');
+  // Part 2 keeps failing for 30 minutes; then a reload, and a fresh process re-renders the same facts at 08:35 and posts only the missing parts.
+  await advance(30 * 60_000);
+  assert.equal(parts(orb.alerts).length, 1, 'retries in this process resend only part 2');
+  failPart = undefined;
+  await orb.start();
+  await settle();
+  const all = parts(orb.alerts);
+  assert.deepEqual(all.map(text => text.split('\n')[0]), Array.from({ length: total }, (_, i) => `${posted[0].split('\n')[0].replace(/part 1\//, `part ${i + 1}/`)}`), 'every part once, one id, in order');
+  assert.doesNotMatch(all.join('\n'), /Late catch-up/, 'the retry keeps the delivery\'s on-time label');
+  assert.equal(orb.alerts.filter(text => text.includes(' complete id=')).length, 1);
+  assert.ok(writes.every(text => text.length <= slackMessageMax), `longest write ${Math.max(...writes.map(text => text.length))}`);
+  assert.ok(all.map(partBody).join('').replace(/\n/g, '').includes(`- #307 huge ${'t'.repeat(4000)} head aaaaaaaaaaaa merge bbbbbbbbbbbb`), 'the oversized line is delivered whole across parts');
+  // Another reload and later sweeps the same day post nothing.
+  const count = orb.alerts.length;
+  await orb.start();
+  await advance(2 * sweepMs);
+  assert.equal(orb.alerts.length, count, 'a completed day is not reposted');
+  // The next day gets its own digest; nothing posted by 08:00 then is a labelled late catch-up.
+  mock.timers.setTime(Date.parse('2026-10-25T15:00:00Z'));
+  await advance(sweepMs);
+  const next = orb.alerts.filter(text => text.startsWith('ODD digest 2026-10-25 part 1/'));
+  assert.equal(next.length, 1);
+  assert.match(next[0], /\nLate catch-up: due at 08:00 America\/New_York and not delivered then; posted by a later sweep\.\n/);
 });

@@ -115,7 +115,7 @@ defines Amp-native agents for the roles that need Amp coordination tools.
 | Shipper | Verdict `ready` on the current head. | Squash merge with `--match-head-commit`; merge receipt `odd-merge pr=<n> head=<sha> merge=<sha>` on the issue; release tag per `docs/release.md` from phase 5. | Merge; tag; close superseded PRs. | Deterministic (`qa.ts check --self-deploying-ok` + `gh pr merge` inside the control plane), no agent. | n/a | `qa.ts check` refuses: the refusal is posted once per head as `odd-merge-refused`; the builder's next push re-enters the loop. |
 | Deployer | GitHub release newer than the host ledger's `lastTag` (`factory-deploy.timer` on factory-gpu, every 2 min). | Verified release unpacked under `~/.local/state/factory-odd/releases/<tag>`, each changed enabled component (`meter`, `factory-api`, `kiosk`) installed and probed at the exact SHA, one deploy receipt per issue the release closes. | `sudo -n /usr/bin/bash <allowlisted script>` on the runner; detaches `~/.local/state/factory-odd/source` at the release SHA, leaving the installers in `/home/agent/work/factory` unchanged; then advances the deploy, dispatch and usage runtime link `~/factory-tools/current` to the newest handled release only after each tool's self-check passes in the candidate and through the link, restoring the prior link otherwise ([cutover](deployer-recovery.md#tools-runtime-cutover-met-346-p28)). | Deterministic job (`scripts/odd/deploy.ts`); on a red receipt the control plane starts one plugin agent (`odd-deployer`, `openai/gpt-6-astra` low) on the factory-gpu runner that only reads logs and attaches them to the Bug. | 1 deploy + 1 rollback per component per release. | Rollback missing, fails, or leaves the component unhealthy on re-probe, or a pre-snapshot failure without the prior healthy identity re-proven (`rollback=none`, page: failed rollback). |
 | Verifier | Green deploy receipt (`health=pass`) with no `odd-verify` comment for its SHA. | Issue comment `odd-verify sha=<receipt sha> result=pass\|fail bug=<MET-n\|none>` plus one line per Done-means item; a `Bug` issue in `Triage` on fail. The control plane sets `Done` on `pass`. | Comment on its issue; file Bugs. Never sets status. | Plugin agent pinned to `openai/gpt-6-astra` low (ChatGPT); reruns the Evidence lines against the deployed system. | 1 turn + 2 continuations; 2 rounds. | Never pages; files a bug and lets Intake handle it. Second spent round pages (budget ceiling). |
-| Watchdog | Every 10 minutes (`setInterval` in the plugin). | Stale idle role threads archived with an `odd-watchdog cancelled` comment and the issue restored (builder without PR → `Todo`); caps alert after 60 min over; `control-plane-blind` page after 15 min of failed sweeps; daily digest at 08:00 America/New_York. | Archive threads; comment; restore status; add `escalated`; post alerts and pages. | Deterministic (`scripts/odd/watchdog.ts`), no agent. | n/a | Every sweep failing for 15 minutes; soft caps exceeded for an hour. |
+| Watchdog | Every 10 minutes (`setInterval` in the plugin). | Stale idle role threads archived with an `odd-watchdog cancelled` comment and the issue restored (builder without PR → `Todo`); caps alert after 60 min over; `control-plane-blind` page after 15 min of failed sweeps; daily digest at 08:00 America/New_York. | Archive threads; comment; restore status; add `escalated`; post alerts and pages; read releases, compare and runs with `gh`. | Deterministic (`scripts/odd/watchdog.ts`), no agent. | n/a | Every sweep failing for 15 minutes; soft caps exceeded for an hour. |
 | Advisor | A role asks a bounded question (`advisor` label or in-thread). | A report-only opinion. | None. | Kimi K3 / Grok advisor tools (existing). | 1 call. | Never. |
 
 Role boundaries that keep this from being "one man":
@@ -427,7 +427,8 @@ Each artifact is machine-checkable before the next role starts.
 | Control plane silent (no heartbeat for 20 min) | Runner poller | Journal line `odd-backstop-resume`, once per episode | The poller runs the lifecycle until a fresh heartbeat. |
 | A machine wait past its budget (audit P3.1): CI 60 min since the head commit, deploy receipt 2 h since the merge, an unanswered steer 30 min since its `odd-steer` comment, a thread awaiting approval 30 min | Control plane | Slack DM (`wait-overdue`) once per episode; `odd-overdue key=<episode>` comment after delivery | The issue keeps waiting; nothing is cancelled or escalated. |
 | A spawn, steer, merge (refusal or failure) or evaluation failing three times, or for 5 min, whichever comes first; rechecks exhausted | Control plane | Slack DM (`action-failed`), one per shared blocker; `plane-blocked` instead when every occupied build slot fails and ready work waits for one | Every evaluation retries the action; nothing frees a slot, spawns a replacement or recovers automatically. |
-| A risk decision or a failed verification waiting on Devon | Watchdog sweep | Daily digest | The issue waits. |
+| Main unreleased (P6.2): the oldest first-parent commit no published stable release contains landed more than 60 min ago | Watchdog sweep | Slack DM (`wait-overdue`, issue `-`, the stalled SHA, its CI or `release.yml` run URL) once per stalled SHA; an `odd-publisher-paged sha=<sha>` record in `#factory-alerts` after delivery | Nothing is published or rerun; the page names `pending` (CI or the publisher still queued or running), `failed` (the newest `release.yml` run on main failed) or `recovery` (the SHA's own push CI failed: rerun it or approve a historical recovery, `docs/release.md`). Released, the episode ends; the next stalled SHA is a new one. |
+| A risk decision, a failed verification, a machine wait past its budget, a missing deploy receipt, an unowned `Todo` issue, a wait of unknown age, or main unreleased | Watchdog sweep | Daily digest, one list per class plus a publisher line | The issue waits. |
 | Everything else | role | Linear comment | Proceed. |
 
 Waits carry a typed reason, a durable start and an episode key
@@ -760,7 +761,27 @@ by the previous one).
    lookup during a failed-rollback page are failed reads too; the page still
    goes out, and a page write that then fails keeps the read failure; an empty issue enumeration while live
    role threads hold open issues fails the sweep too; the digest is
-   split into Slack messages of at most 2800 characters. Removing the
+   split into Slack messages of at most 2800 characters (MET-354,
+   P3.2+P6.2+P4.6-digest). Every message starts with
+   `ODD digest <day> part <n>/<total> id=<content hash>`; a line longer than a
+   message is hard-split at code points with that prefix, at its widest part
+   number, counted. `ODD digest <day> complete id=<id> parts=<total>` is posted
+   only after every part: a failed part, a retry or a reload posts only the
+   parts the channel lacks, a day with its completion line (or a pre-MET-354
+   digest) is never posted again, and if the facts changed before a reload
+   re-rendered them, the new rendering is posted and completed in full rather
+   than leaving a tail missing. One digest per New York calendar day after
+   08:00 (DST included); one first rendered from 08:30 opens with a
+   `Late catch-up` line, which a retry of a partial delivery keeps as posted.
+   The digest lists risk decisions, failed verifications, machine waits over
+   budget, missing deploy receipts, `Todo` issues no role thread holds and
+   waits of unknown age, and a publisher line from the same snapshot the
+   unreleased-main page uses: authenticated `gh` reads of the newest stable
+   release, its full compare with main walked by first parent, and, while
+   main is unreleased, the newest `release.yml` runs and the oldest stalled
+   SHA's push CI. A malformed, truncated or diverged read pages nothing and
+   holds the digest (`publisherError`, `digestError`), never reporting an
+   unknown stall as none, and never touches the heartbeat. Removing the
    `odd-perform` label is the off-switch: the plane keeps evaluating but
    records `dry-run`.
 7. Retire the poller as primary (MET-282). It stays as the backstop: one

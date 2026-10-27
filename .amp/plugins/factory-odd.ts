@@ -48,7 +48,7 @@ import { contextNamesSource, intakeChannel, intakeLookback, intakeEmoji, intakeP
 import { admittedLoad, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
 import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
 import { builderArgs, launch } from '../../scripts/odd/launch.ts'
-import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, digestHeading, episodeLine, incidentPageDue, incidentText, incidents, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, resolutionText, restoreStatus, sanitizeError, slackMessages, staleThreads, sweepMs, unknownAge, type DigestInput, type DigestWait, type Episode, type Plane } from '../../scripts/odd/watchdog.ts'
+import { alertsChannel, blindMs, capsAlertMs, digest, digestDelivered, digestDue, digestHeading, digestLate, digestParts, digestSends, episodeLine, firstParentSince, incidentPageDue, incidentText, incidents, newestRelease, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, postedLate, publisherPage, publisherPagedLine, publisherSnapshot, resolutionText, restoreStatus, sanitizeError, staleThreads, stalledWork, sweepMs, type DigestInput, type DigestList, type DigestWait, type Episode, type MainCommit, type Plane, type Publisher, type Run } from '../../scripts/odd/watchdog.ts'
 
 export const description =
 	'Factory ODD control plane: Linear, GitHub and Slack webhooks drive a deterministic outcome lifecycle; role agents run in orbs; Ralph loops are bounded by external checks. See docs/odd/README.md.'
@@ -207,8 +207,8 @@ export default async function (amp: PluginAPI) {
 		events: HandledEvent[]
 		/** Slack intake poll: last run, last error, the message timestamps handed to Intake (not completed), consecutive failed polls since `failingSince`, whether that episode's alert went out, and the oldest message not yet handed. */
 		slack: { polledAt?: string; error?: string; spawned: string[]; failures: number; failingSince?: string; alerted?: boolean; pending?: string }
-		/** Watchdog sweep (scripts/odd/watchdog.ts): last run, issues swept, episodes in progress, digest day, cancellations today. */
-		watchdog: { sweptAt?: string; error?: string; issues?: number; overSince?: string; alerted?: boolean; blindSince?: string; paged?: boolean; digestDay?: string; digestError?: string; heartbeatId?: string; cancelled: string[]; waits: Record<string, DigestWait & { list: 'risk' | 'failedVerification' | 'unknownAge' }>; overdue: string[] }
+		/** Watchdog sweep (scripts/odd/watchdog.ts): last run, issues swept, episodes in progress, digest day and the delivery in progress, publisher read error and the stalled SHA paged, cancellations today. */
+		watchdog: { sweptAt?: string; error?: string; issues?: number; overSince?: string; alerted?: boolean; blindSince?: string; paged?: boolean; digestDay?: string; digestError?: string; digestPending?: { day: string; parts: string[]; sent: string[] }; publisherError?: string; publisherPaged?: string; heartbeatId?: string; cancelled: string[]; waits: Record<string, DigestWait & { list: DigestList }>; overdue: string[] }
 		/** Failing actions by `<issue> <episode key>` (scripts/odd/watchdog.ts Episode), and the build slots the incidents are judged against. */
 		episodes: Record<string, Episode>
 		plane: Plane
@@ -468,7 +468,7 @@ export default async function (amp: PluginAPI) {
 			ctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
 			entry.status = issue.status
 			entry.action = action
-			noteWait(ctx, state, entry, issue.identifier, action)
+			noteWait(ctx, state, entry, issue, threads, action)
 			const ownerBusy = action.kind === 'spawn' || (action.kind === 'wait' && action.reason.endsWith('running'))
 			if (ownerBusy) recheck(ctx, state, identifier, recheckMs)
 			if (!performing) {
@@ -560,19 +560,18 @@ export default async function (amp: PluginAPI) {
 		}
 	}
 
-	// Human waits and waits of unknown age go to the digest; the entry shows every wait's age.
-	function noteWait(ctx: EvalContext, state: ArmState, entry: HandledEvent, identifier: string, action: Action) {
+	// Stalled work goes to the digest (watchdog.stalledWork); the entry shows every wait's age.
+	function noteWait(ctx: EvalContext, state: ArmState, entry: HandledEvent, issue: IssueSnapshot, threads: readonly LiveThread[], action: Action) {
+		const identifier = issue.identifier
 		const atCapacity = action.kind === 'wait' && action.reason.startsWith('build capacity')
 		state.plane.waiting = [...state.plane.waiting.filter(id => id !== identifier), ...(atCapacity ? [identifier] : [])].sort()
 		delete state.watchdog.waits[identifier]
+		const stalled = stalledWork(identifier, issue.status, threads.some(thread => parseThreadLabels(thread.labels).role), action, Date.now())
+		if (stalled) state.watchdog.waits[identifier] = stalled
 		if (action.kind !== 'wait' || !action.wait) return
 		const age = waitAge(action.wait, Date.now())
 		entry.wait = age.state === 'within' || age.state === 'over' ? `${action.wait.kind} ${Math.floor(age.ageMs / 60_000)} min` : `${action.wait.kind} ${age.state}`
-		if (age.state === 'human') state.watchdog.waits[identifier] = { list: action.wait.kind === 'risk' ? 'risk' : 'failedVerification', identifier, reason: action.reason }
-		if (age.state === 'unknown') {
-			state.watchdog.waits[identifier] = { list: 'unknownAge', ...unknownAge(identifier, action.reason, action.wait) }
-			ctx.logger.log(marker, 'wait age unknown', identifier, action.wait.key)
-		}
+		if (age.state === 'unknown') ctx.logger.log(marker, 'wait age unknown', identifier, action.wait.key)
 	}
 
 	// A machine wait past its budget pages once per episode. The `odd-overdue` comment is the
@@ -781,28 +780,81 @@ export default async function (amp: PluginAPI) {
 				await ctx.tools.call('slack_write', { text: `${marker} ${text}` }).then(() => { watchdog.paged = true }, (slackError: unknown) => ctx.logger.log(marker, 'blind page failed', String(slackError)))
 			}
 		} finally {
-			// The digest runs after the heartbeat and apart from it (P3.8): its failure is `digestError`
-			// only, retried by the next sweep, and never withholds a heartbeat or ends a blind episode.
-			if (digestLoad && performing) await deliverDigest(ctx, watchdog, now, digestLoad)
+			// The publisher snapshot, its page and the digest run after the heartbeat and apart from it
+			// (P3.8): their failures are `publisherError` and `digestError` only, retried by the next
+			// sweep, and never withhold a heartbeat or end a blind episode. One snapshot serves both.
+			if (performing) {
+				const publisher = await readPublisher(ctx).then(
+					snapshot => {
+						delete watchdog.publisherError
+						return snapshot
+					},
+					(error: unknown) => {
+						watchdog.publisherError = String(error)
+						ctx.logger.log(marker, 'publisher read failed; retried next sweep', watchdog.publisherError)
+						return undefined
+					},
+				)
+				if (publisher) await pagePublisher(ctx, watchdog, publisher, now)
+				if (digestLoad) await deliverDigest(ctx, watchdog, now, digestLoad, publisher)
+			}
 			sweeping.delete(state)
 		}
 	}
 
 	// `digestDay` is in memory and a plugin reload forgets it, so the channel itself is the
-	// durable record: a digest already posted for the day is not posted again.
-	async function deliverDigest(ctx: EvalContext, watchdog: ArmState['watchdog'], now: Date, load: Load) {
+	// durable record. Every part carries its day/part identity and the completion line goes out
+	// only after every part has: a failed part, or a reload mid-delivery, is retried by posting
+	// only the parts the channel lacks, and a completed day is never posted again. The rendered
+	// parts are kept for the day, so a retry in this process posts the same delivery.
+	async function deliverDigest(ctx: EvalContext, watchdog: ArmState['watchdog'], now: Date, load: Load, publisher: Publisher | undefined) {
 		const day = digestDue(watchdog.digestDay, now)
 		if (!day) return
 		try {
-			if (!(await digestPosted(ctx.tools, day))) {
-				for (const text of slackMessages(digest(await digestInput(ctx, day, now, load, watchdog.cancelled, Object.values(watchdog.waits))))) await ctx.tools.call('slack_write', { channelName: alertsChannel, text })
+			const posted = await digestMessages(ctx.tools, day)
+			if (!digestDelivered(day, posted)) {
+				let pending = watchdog.digestPending?.day === day ? watchdog.digestPending : undefined
+				if (!pending) {
+					if (!publisher) throw new ReadError(`the digest needs the publisher snapshot: ${watchdog.publisherError ?? 'not read'}`)
+					const input = await digestInput(ctx, day, now, load, watchdog.cancelled, Object.values(watchdog.waits), publisher, postedLate(day, posted) ?? digestLate(now))
+					pending = { day, parts: digestParts(digest(input), day), sent: [] }
+					watchdog.digestPending = pending
+				}
+				for (const text of digestSends(day, [...posted, ...pending.sent], pending.parts)) {
+					const result = (await ctx.tools.call('slack_write', { channelName: alertsChannel, text })) as { isError?: boolean } | undefined
+					if (result?.isError) throw new Error(`slack_write reported an error for ${text.split('\n')[0]}`)
+					pending.sent.push(text)
+				}
 			}
 			watchdog.digestDay = day
+			delete watchdog.digestPending
 			watchdog.cancelled = []
 			delete watchdog.digestError
 		} catch (error: unknown) {
 			watchdog.digestError = String(error)
 			ctx.logger.log(marker, 'digest failed; retried next sweep', watchdog.digestError)
+		}
+	}
+
+	// Main left unreleased past `publisherStallMs` pages once per stalled SHA (P6.2). Memory holds the
+	// SHA paged; after a reload the `#factory-alerts` record (written once Slack takes the page) does.
+	// The episode is the SHA, so recovery (no stall) or a newer oldest SHA ends it.
+	async function pagePublisher(ctx: EvalContext, watchdog: ArmState['watchdog'], publisher: Publisher, now: Date) {
+		const sha = publisher.stalled?.sha
+		const text = publisherPage(publisher, now.getTime())
+		if (!text || !sha || watchdog.publisherPaged === sha) return
+		try {
+			const record = publisherPagedLine(sha)
+			const recorded = (await slackMessagesFor(ctx.tools, { operation: 'read_messages', channelName: alertsChannel, lookback: 'P7D', limit: 100, filter: { containsAll: [record] } }, row => typeof row.text === 'string')).some(message => message.text.split('\n').includes(record))
+			if (recorded) {
+				watchdog.publisherPaged = sha
+				return
+			}
+			if (!(await deliver(ctx, `${marker} ${text}`))) return
+			watchdog.publisherPaged = sha
+			await ctx.tools.call('slack_write', { channelName: alertsChannel, text: `${record}\n${marker} ${text}` })
+		} catch (error: unknown) {
+			ctx.logger.log(marker, 'publisher page check or record failed', String(error))
 		}
 	}
 
@@ -824,10 +876,10 @@ export default async function (amp: PluginAPI) {
 		if (saved.id) state.watchdog.heartbeatId = saved.id
 	}
 
-	// Slack filters each page after the limit, so every page of the last day is read.
-	async function digestPosted(tools: Tools, day: string): Promise<boolean> {
+	// The day's digest messages in #factory-alerts. Slack filters each page after the limit, so every page of the last day is read.
+	async function digestMessages(tools: Tools, day: string): Promise<string[]> {
 		// A malformed read is not "no digest yet": that would post the day's digest twice, or count a failed check as healthy.
-		return (await slackMessagesFor(tools, { operation: 'read_messages', channelName: alertsChannel, lookback: 'P1D', limit: 100, filter: { containsAll: [digestHeading(day)] } })).length > 0
+		return (await slackMessagesFor(tools, { operation: 'read_messages', channelName: alertsChannel, lookback: 'P1D', limit: 100, filter: { containsAll: [digestHeading(day)] } }, row => typeof row.text === 'string')).map(message => message.text)
 	}
 
 	// Every page: the sweep must see every issue in the status, not the first 100.
@@ -843,8 +895,8 @@ export default async function (amp: PluginAPI) {
 	}
 
 	// Yesterday's facts for the digest: identifiers, titles and SHAs only (digest() formats them).
-	async function digestInput(ctx: EvalContext, day: string, now: Date, load: Load, cancelled: readonly string[], waits: readonly (DigestWait & { list: string })[]): Promise<DigestInput> {
-		const listed = (list: string) => waits.filter(wait => wait.list === list).map(({ identifier, reason }) => ({ identifier, reason }))
+	async function digestInput(ctx: EvalContext, day: string, now: Date, load: Load, cancelled: readonly string[], waits: readonly (DigestWait & { list: DigestList })[], publisher: Publisher, late: boolean): Promise<DigestInput> {
+		const listed = (list: DigestList) => waits.filter(wait => wait.list === list).map(({ identifier, reason }) => ({ identifier, reason }))
 		const since = new Date(now.getTime() - 24 * 60 * 60_000).toISOString()
 		// Every read and every field the digest uses is validated: a malformed read fails the digest (retried next sweep), never an empty day.
 		type MergedPr = { number: number; title: string; headRefOid: string; mergeCommit: { oid: string }; mergedAt: string }
@@ -878,7 +930,52 @@ export default async function (amp: PluginAPI) {
 			risk: listed('risk'),
 			failedVerification: listed('failedVerification'),
 			unknownAge: listed('unknownAge'),
+			overBudget: listed('overBudget'),
+			missingReceipt: listed('missingReceipt'),
+			unownedTodo: listed('unownedTodo'),
+			publisher,
+			late,
 		}
+	}
+
+	// The publisher snapshot (P6.2), all authenticated gh reads: the newest stable published release, the full
+	// compare of it with main (first-parent walk), and, only while main is unreleased, the newest release.yml
+	// runs on main and the oldest stalled SHA's push CI runs. Every read and field is validated; a malformed,
+	// truncated or diverged read throws, so neither the page nor the digest ever reports an unknown stall as none.
+	async function readPublisher(ctx: EvalContext): Promise<Publisher> {
+		const releasePages = await ghJson(ctx.$`gh api --paginate --slurp ${'repos/{owner}/{repo}/releases?per_page=100'}`, 'gh api releases')
+		const releaseRow = (row: unknown) => isRow(row) && typeof row.tag_name === 'string' && typeof row.draft === 'boolean' && typeof row.prerelease === 'boolean'
+		if (!Array.isArray(releasePages) || !releasePages.every(page => Array.isArray(page) && page.every(releaseRow))) throw new ReadError('gh api releases returned a malformed release list')
+		const tag = newestRelease((releasePages as Row[][]).flat().map(row => ({ tag: String(row.tag_name), draft: row.draft === true, prerelease: row.prerelease === true })))
+		if (!tag) throw new ReadError('gh api releases lists no published stable release')
+		const comparePages = await ghJson(ctx.$`gh api --paginate --slurp ${`repos/{owner}/{repo}/compare/${tag}...main?per_page=100`}`, `gh api compare ${tag}...main`)
+		const commitRow = (row: unknown) => isRow(row) && sha40(row.sha) && Array.isArray(row.parents) && row.parents.every(parent => isRow(parent) && sha40(parent.sha)) && isRow(row.commit) && isRow(row.commit.committer) && timestamp(row.commit.committer.date)
+		const pageRow = (page: unknown) => isRow(page) && typeof page.status === 'string' && Number.isInteger(page.ahead_by) && Number.isInteger(page.behind_by) && isRow(page.base_commit) && sha40(page.base_commit.sha) && Array.isArray(page.commits) && page.commits.every(commitRow)
+		if (!Array.isArray(comparePages) || !comparePages.length || !comparePages.every(pageRow)) throw new ReadError(`gh api compare ${tag}...main returned a malformed comparison`)
+		const pages = comparePages as Row[]
+		const first = pages[0] as Row & { status: string; ahead_by: number; behind_by: number; base_commit: { sha: string } }
+		if (pages.some(page => (page.base_commit as Row).sha !== first.base_commit.sha || page.ahead_by !== first.ahead_by)) throw new ReadError(`gh api compare ${tag}...main pages disagree`)
+		if (first.behind_by !== 0 || !['identical', 'ahead'].includes(first.status)) throw new ReadError(`release ${tag} is not on main (compare ${first.status}, behind by ${first.behind_by})`)
+		const commits: MainCommit[] = pages.flatMap(page => (page.commits as Row[]).map(row => ({ sha: String(row.sha), parents: (row.parents as Row[]).map(parent => String(parent.sha)), date: String(((row.commit as Row).committer as Row).date) })))
+		if (new Set(commits.map(commit => commit.sha)).size !== first.ahead_by) throw new ReadError(`gh api compare ${tag}...main listed ${commits.length} of ${first.ahead_by} commits`)
+		let chain: MainCommit[]
+		try {
+			chain = firstParentSince(first.base_commit.sha, commits)
+		} catch (error: unknown) {
+			throw new ReadError(error instanceof Error ? error.message : String(error))
+		}
+		const release = { tag, sha: first.base_commit.sha }
+		if (!chain.length) return publisherSnapshot(release, chain, [], [])
+		const runs = async (run: PromiseLike<ShellResult>, name: string): Promise<Run[]> => {
+			const rows = await ghJson(run, name)
+			if (!Array.isArray(rows) || !rows.every(row => isRow(row) && typeof row.status === 'string' && typeof row.conclusion === 'string' && typeof row.url === 'string' && timestamp(row.createdAt))) throw new ReadError(`${name} returned a malformed run list`)
+			return rows as Run[]
+		}
+		const [publisherRuns, ciRuns] = await Promise.all([
+			runs(ctx.$`gh run list --workflow release.yml --branch main --limit 20 --json status,conclusion,url,createdAt`, 'gh run list release.yml'),
+			runs(ctx.$`gh run list --workflow ci.yml --commit ${chain[0].sha} --event push --limit 20 --json status,conclusion,url,createdAt`, `gh run list ci.yml ${chain[0].sha.slice(0, 12)}`),
+		])
+		return publisherSnapshot(release, chain, publisherRuns, ciRuns)
 	}
 
 	// Every fresh top-level message from an allowed author in #factory-intake (P3.12) gets its own

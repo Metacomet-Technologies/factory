@@ -39,11 +39,11 @@ export function restoreStatus(role: Role, status: Status, hasPr: boolean): Statu
 
 export const overCaps = (load: Load) => load.orbs > capacity.orbs || load.runnerSlots > capacity.runnerSlots || load.buildIssues > capacity.buildIssues;
 
-/** Calendar day (YYYY-MM-DD) and hour in the digest zone. */
-export function localClock(now: Date, timeZone = digestTimeZone): { day: string; hour: number } {
-  const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' }).formatToParts(now);
+/** Calendar day (YYYY-MM-DD), hour and minute in the digest zone. */
+export function localClock(now: Date, timeZone = digestTimeZone): { day: string; hour: number; minute: number } {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(now);
   const get = (type: string) => parts.find(part => part.type === type)?.value ?? '';
-  return { day: `${get('year')}-${get('month')}-${get('day')}`, hour: Number(get('hour')) };
+  return { day: `${get('year')}-${get('month')}-${get('day')}`, hour: Number(get('hour')), minute: Number(get('minute')) };
 }
 
 /** One digest per local day, once the clock has passed `digestHour`. */
@@ -52,23 +52,32 @@ export function digestDue(lastDigestDay: string | undefined, now: Date, timeZone
   return hour >= digestHour && day !== lastDigestDay ? day : undefined;
 }
 
-/** A human wait (a risk decision, a failed verification) or a machine wait whose age is unknown; the digest lists both. */
+/** A digest first rendered this long after `digestHour` (three sweeps) is a late catch-up and says so. */
+export const digestLateMs = 30 * 60_000;
+export function digestLate(now: Date, timeZone = digestTimeZone): boolean {
+  const { hour, minute } = localClock(now, timeZone);
+  return (hour - digestHour) * 60 + minute >= digestLateMs / 60_000;
+}
+
+/** One stalled-work line: an issue and why it waits. */
 export type DigestWait = { identifier: string; reason: string };
+/** The digest's stalled-work lists, one per class; each issue sits in at most one (the sweep's latest evaluation). */
+export type DigestList = 'risk' | 'failedVerification' | 'unknownAge' | 'overBudget' | 'missingReceipt' | 'unownedTodo';
 
 export type DigestInput = {
   day: string;
+  /** Rendered after the scheduled window (digestLate): the digest says it is a catch-up. */
+  late?: boolean;
   merged: readonly { number: number; title: string; headSha: string; mergeSha: string }[];
   done: readonly { identifier: string; title: string }[];
   bugs: readonly { identifier: string; title: string }[];
   escalated: readonly { identifier: string; title: string }[];
   load: Load;
   cancelled: readonly string[];
-  risk: readonly DigestWait[];
-  failedVerification: readonly DigestWait[];
-  unknownAge: readonly DigestWait[];
-};
+  publisher: Publisher;
+} & Record<DigestList, readonly DigestWait[]>;
 
-/** The digest's first line; the sweep searches `#factory-alerts` for it so a plugin reload does not post the day twice. */
+/** Every digest message starts with this; the sweep searches `#factory-alerts` for it. */
 export const digestHeading = (day: string) => `ODD digest ${day}`;
 
 const short = (sha: string) => sha.slice(0, 12);
@@ -77,27 +86,106 @@ const list = <T>(items: readonly T[], line: (item: T) => string) => (items.lengt
 /** Slack rejects a message whose block text exceeds 3000 characters (`invalid_blocks`); a day with 46 merged PRs is longer. */
 export const slackMessageMax = 2800;
 
-/** Splits `text` on line breaks into messages of at most `max` characters; every part after the first starts with `(n/total)`. */
-export function slackMessages(text: string, max = slackMessageMax): string[] {
-  const parts: string[] = [];
-  let current = '';
-  for (const line of text.split('\n')) {
-    const next = current ? `${current}\n${line}` : line;
-    if (next.length <= max || !current) {
-      current = next;
-    } else {
-      parts.push(current);
-      current = line;
-    }
-  }
-  parts.push(current);
-  return parts.length === 1 ? parts : parts.map((part, i) => (i === 0 ? part : `(${i + 1}/${parts.length})\n${part}`));
+function fnv(text: string): string {
+  let hash = 0x811c9dc5;
+  for (const char of text) hash = Math.imul(hash ^ char.charCodeAt(0), 0x01000193) >>> 0;
+  return hash.toString(16).padStart(8, '0');
 }
+
+const partHeader = (day: string, part: number, parts: number, id: string) => `${digestHeading(day)} part ${part}/${parts} id=${id}`;
+/** Written only after every part of delivery `id` is in the channel; a day with it is never posted again. */
+export const digestCompleteLine = (day: string, id: string, parts: number) => `${digestHeading(day)} complete id=${id} parts=${parts}`;
+
+/**
+ * The digest as Slack messages of at most `max` characters. Every message starts with its durable
+ * identity, `ODD digest <day> part <n>/<total> id=<content hash>`, so a retry after a failed
+ * part or a reload posts only the parts the channel lacks. Lines are packed whole; a line longer
+ * than a message body is hard-split at code points, with the header (at the widest part number)
+ * counted against the limit.
+ */
+export function digestParts(text: string, day: string, max = slackMessageMax): string[] {
+  const id = fnv(text);
+  const body = text.split('\n');
+  if (body[0] === digestHeading(day)) body.shift();
+  for (let digits = 1; ; digits++) {
+    const widest = 10 ** digits - 1;
+    const room = max - partHeader(day, widest, widest, id).length - 1;
+    const lines = body.flatMap(line => {
+      const chunks: string[] = [];
+      let chunk = '';
+      for (const char of line) {
+        if (chunk.length + char.length > room) {
+          chunks.push(chunk);
+          chunk = '';
+        }
+        chunk += char;
+      }
+      return [...chunks, chunk];
+    });
+    const bodies: string[] = [];
+    let current: string | undefined;
+    for (const line of lines) {
+      if (current !== undefined && current.length + 1 + line.length <= room) current += `\n${line}`;
+      else {
+        if (current !== undefined) bodies.push(current);
+        current = line;
+      }
+    }
+    bodies.push(current ?? '');
+    if (bodies.length <= widest) return bodies.map((part, i) => `${partHeader(day, i + 1, bodies.length, id)}\n${part}`);
+  }
+}
+
+/** True when the channel holds the day's completion line, or a digest from before part identities (its first line is the bare heading). */
+export function digestDelivered(day: string, posted: readonly string[]): boolean {
+  const heading = digestHeading(day);
+  return posted.some(text => {
+    const first = text.split('\n')[0];
+    return first === heading || first.startsWith(`${heading} complete id=`);
+  });
+}
+
+/** Whether an earlier, incomplete delivery of `day` in the channel was a late catch-up (its part 1 says so); undefined when none was posted. */
+export function postedLate(day: string, posted: readonly string[]): boolean | undefined {
+  const first = posted.find(text => new RegExp(`^${digestHeading(day)} part 1/\\d+ id=`).test(text));
+  return first === undefined ? undefined : first.includes('\nLate catch-up:');
+}
+
+/**
+ * What to post next for `day`, given what the channel (and this process) already holds: the
+ * parts of `parts` not yet posted, oldest first, then the completion line. A delivery the
+ * channel already holds in full (an older rendering whose completion line failed) only gets its
+ * completion line. An incomplete delivery of another rendering (the facts changed before a
+ * reload re-rendered them) is superseded: the new rendering is posted in full under its own id
+ * and completed, so no tail is ever left missing. Nothing once the day is delivered.
+ */
+export function digestSends(day: string, posted: readonly string[], parts: readonly string[]): string[] {
+  if (digestDelivered(day, posted)) return [];
+  const pattern = new RegExp(`^${digestHeading(day)} part (\\d+)/(\\d+) id=([0-9a-f]{8})$`);
+  const seen = new Map<string, { total: number; parts: Set<number> }>();
+  for (const text of posted) {
+    const match = pattern.exec(text.split('\n')[0]);
+    if (!match) continue;
+    const key = `${match[3]} ${match[2]}`;
+    const entry = seen.get(key) ?? { total: Number(match[2]), parts: new Set<number>() };
+    entry.parts.add(Number(match[1]));
+    seen.set(key, entry);
+  }
+  for (const [key, entry] of seen) if (entry.parts.size === entry.total) return [digestCompleteLine(day, key.split(' ')[0], entry.total)];
+  const header = pattern.exec(parts[0]?.split('\n')[0] ?? '');
+  if (!header) throw new Error(`digest parts for ${day} have no part identity`);
+  const done = seen.get(`${header[3]} ${header[2]}`)?.parts ?? new Set<number>();
+  return [...parts.filter((_, i) => !done.has(i + 1)), digestCompleteLine(day, header[3], parts.length)];
+}
+
+const waits = (title: string, items: readonly DigestWait[]) => [`${title} (${items.length}):`, list(items, wait => `${wait.identifier} ${wait.reason}`)];
 
 /** The daily digest for `#factory-alerts`: counts, identifiers and SHAs only; never diffs or secrets. */
 export function digest(input: DigestInput): string {
   return [
     digestHeading(input.day),
+    ...(input.late ? [`Late catch-up: due at ${String(digestHour).padStart(2, '0')}:00 ${digestTimeZone} and not delivered then; posted by a later sweep.`] : []),
+    publisherLine(input.publisher),
     `Merged PRs (${input.merged.length}):`,
     list(input.merged, pr => `#${pr.number} ${pr.title} head ${short(pr.headSha)} merge ${short(pr.mergeSha)}`),
     `Issues Done (${input.done.length}):`,
@@ -106,17 +194,131 @@ export function digest(input: DigestInput): string {
     list(input.bugs, issue => `${issue.identifier} ${issue.title}`),
     `Waiting on Devon (${input.escalated.length}):`,
     list(input.escalated, issue => `${issue.identifier} ${issue.title}`),
-    `Risk decisions waiting (${input.risk.length}):`,
-    list(input.risk, wait => `${wait.identifier} ${wait.reason}`),
-    `Failed verifications (${input.failedVerification.length}):`,
-    list(input.failedVerification, wait => `${wait.identifier} ${wait.reason}`),
-    `Waits of unknown age (${input.unknownAge.length}):`,
-    list(input.unknownAge, wait => `${wait.identifier} ${wait.reason}`),
+    ...waits('Risk decisions waiting', input.risk),
+    ...waits('Failed verifications', input.failedVerification),
+    ...waits('Waits over budget', input.overBudget),
+    ...waits('Missing deploy receipts', input.missingReceipt),
+    ...waits('Todo with no owner', input.unownedTodo),
+    ...waits('Waits of unknown age', input.unknownAge),
     `Load: orbs ${input.load.orbs}/${capacity.orbs}, runner slots ${input.load.runnerSlots}/${capacity.runnerSlots}, build issues ${input.load.buildIssues}/${capacity.buildIssues}`,
     `Watchdog cancellations (${input.cancelled.length}):`,
     list(input.cancelled, line => line),
   ].join('\n');
 }
+
+/**
+ * The digest list for an evaluated issue's wait, if it is stalled work: a deploy receipt still
+ * missing (any age), a machine wait past its budget, a human wait, a wait of unknown age, or a
+ * Todo issue that waits with no role thread holding it.
+ */
+export function stalledWork(identifier: string, status: Status, owned: boolean, action: Action, now: number): (DigestWait & { list: DigestList }) | undefined {
+  if (action.kind !== 'wait') return undefined;
+  if (!action.wait) return status === 'Todo' && !owned ? { list: 'unownedTodo', identifier, reason: action.reason } : undefined;
+  const age = waitAge(action.wait, now);
+  const budget = waitBudgets[action.wait.kind];
+  const aged = age.state === 'within' || age.state === 'over' ? `${minutes(age.ageMs)} old${budget.notify === 'page' ? `, budget ${minutes(budget.ms)}` : ''}` : 'no durable start time';
+  const reason = `${action.reason} (${action.wait.kind} wait, ${aged}, episode ${action.wait.key})`;
+  if (action.wait.kind === 'receipt') return { list: 'missingReceipt', identifier, reason };
+  if (age.state === 'human') return { list: action.wait.kind === 'risk' ? 'risk' : 'failedVerification', identifier, reason: action.reason };
+  if (age.state === 'unknown') return { list: 'unknownAge', ...unknownAge(identifier, action.reason, action.wait) };
+  if (age.state === 'over') return { list: 'overBudget', identifier, reason };
+  return status === 'Todo' && !owned ? { list: 'unownedTodo', identifier, reason: action.reason } : undefined;
+}
+
+// --- Publisher (P6.2): one authenticated GitHub snapshot of first-parent main against the newest
+// published release, shared by the digest and the unreleased-main page.
+
+/** First-parent main unreleased for longer than this pages once per stalled SHA. */
+export const publisherStallMs = 60 * 60_000;
+
+/** A commit as GitHub's compare lists it, reduced to what the walk needs; `date` is when it landed (committer date). */
+export type MainCommit = { sha: string; parents: readonly string[]; date: string };
+/** A workflow run as `gh run list` reports it; `conclusion` is empty until the run completes. */
+export type Run = { status: string; conclusion: string; url: string; createdAt: string };
+
+/**
+ * `pending`: nothing has failed yet (CI or the publisher is queued or running, or waits for its
+ * next wakeup). `failed`: the newest `release.yml` run on main failed. `recovery`: the stalled
+ * SHA's own push CI failed, so the publisher cannot pass it until that CI is rerun or a
+ * historical recovery is approved (docs/release.md); it wins over `failed`, whose cause it is.
+ */
+export type PublisherState = 'pending' | 'failed' | 'recovery';
+export type Publisher = {
+  release: { tag: string; sha: string };
+  /** The oldest first-parent commit no published release contains, when it landed, how many are unreleased, and the run that explains it. */
+  stalled?: { sha: string; since: string; unreleased: number; state: PublisherState; run?: string };
+};
+
+/** The newest stable published release: the highest vMAJOR.MINOR.PATCH tag that is neither a draft nor a prerelease. */
+export function newestRelease(releases: readonly { tag: string; draft: boolean; prerelease: boolean }[]): string | undefined {
+  const version = (tag: string) => /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(tag)?.slice(1).map(Number);
+  let best: { tag: string; v: number[] } | undefined;
+  for (const release of releases) {
+    const v = version(release.tag);
+    if (!v || release.draft || release.prerelease) continue;
+    if (!best || (v[0] - best.v[0] || v[1] - best.v[1] || v[2] - best.v[2]) > 0) best = { tag: release.tag, v };
+  }
+  return best?.tag;
+}
+
+/**
+ * The first-parent commits of main after `releaseSha`, oldest first, from the full compare of
+ * the release with main. Main's head is the one commit no other listed commit has as a parent;
+ * the walk follows first parents to `releaseSha`. A walk that leaves the list (a truncated
+ * compare, or a release reached only through a second parent) throws: an unknown stall is never
+ * reported as none.
+ */
+export function firstParentSince(releaseSha: string, commits: readonly MainCommit[]): MainCommit[] {
+  if (!commits.length) return [];
+  const bySha = new Map(commits.map(commit => [commit.sha, commit]));
+  const parents = new Set(commits.flatMap(commit => commit.parents));
+  const heads = commits.filter(commit => !parents.has(commit.sha));
+  if (heads.length !== 1) throw new Error(`compare lists ${heads.length} heads of main, not one`);
+  const chain: MainCommit[] = [];
+  for (let commit: MainCommit | undefined = heads[0]; commit; ) {
+    chain.push(commit);
+    const parent: string | undefined = commit.parents[0];
+    if (parent === releaseSha) return chain.reverse();
+    commit = parent === undefined ? undefined : bySha.get(parent);
+    if (chain.length > commits.length) break;
+  }
+  throw new Error(`the first-parent walk from main does not reach release ${short(releaseSha)} within the compare`);
+}
+
+const newest = (runs: readonly Run[]) => [...runs].sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+const unsuccessful = (run: Run | undefined) => run?.status === 'completed' && !['success', 'skipped', 'neutral'].includes(run.conclusion);
+
+/** The snapshot from the release, its first-parent chain on main, the newest `release.yml` runs on main and the oldest stalled SHA's push CI runs. */
+export function publisherSnapshot(release: { tag: string; sha: string }, chain: readonly MainCommit[], publisherRuns: readonly Run[], ciRuns: readonly Run[]): Publisher {
+  const oldest = chain[0];
+  if (!oldest) return { release };
+  const ci = newest(ciRuns);
+  const publisher = newest(publisherRuns);
+  const state: PublisherState = ci?.status === 'completed' && ci.conclusion !== 'success' ? 'recovery' : unsuccessful(publisher) ? 'failed' : 'pending';
+  const run = state === 'recovery' ? ci : state === 'failed' ? publisher : ci && ci.status !== 'completed' ? ci : publisher;
+  return { release, stalled: { sha: oldest.sha, since: oldest.date, unreleased: chain.length, state, ...(run ? { run: run.url } : {}) } };
+}
+
+// The age is in the page only: the digest is rendered from facts alone, so a reload that re-renders an unchanged day keeps its delivery id.
+const stallText = (stalled: NonNullable<Publisher['stalled']>, now?: number) =>
+  `${stalled.unreleased} unreleased first-parent commit${stalled.unreleased === 1 ? '' : 's'} on main; oldest ${stalled.sha} landed ${stalled.since}${now === undefined ? '' : ` (${minutes(now - Date.parse(stalled.since))})`}; run ${stalled.run ?? 'none'}`;
+
+export function publisherLine(publisher: Publisher): string {
+  const release = `newest release ${publisher.release.tag} at ${short(publisher.release.sha)}`;
+  return publisher.stalled ? `Publisher ${publisher.stalled.state}: ${stallText(publisher.stalled)}; ${release}` : `Publisher: main published through ${release}`;
+}
+
+/** The page for main left unreleased past `publisherStallMs`; nothing at or below it. One page per stalled SHA (the caller dedupes). */
+export function publisherPage(publisher: Publisher, now: number): string | undefined {
+  const { stalled } = publisher;
+  if (!stalled || now - Date.parse(stalled.since) <= publisherStallMs) return undefined;
+  const detail = `publisher ${stalled.state}: ${stallText(stalled, now)}; budget ${minutes(publisherStallMs)}; newest release ${publisher.release.tag}. episode=${publisherEpisode(stalled.sha)}`;
+  return pageText('-', { kind: 'page', reason: 'wait-overdue', sha: stalled.sha, detail });
+}
+
+/** The durable record of a delivered publisher page, posted to `#factory-alerts` after Slack takes the page. */
+export const publisherEpisode = (sha: string) => `publisher-${short(sha)}`;
+export const publisherPagedLine = (sha: string) => `odd-publisher-paged sha=${sha}`;
 
 // --- Overdue waits (audit P3.1): one page per durable episode, recorded on the issue after delivery.
 
