@@ -69,6 +69,8 @@ export type IssueSnapshot = {
   cancelledRounds?: Partial<Record<Role, number>>;
   /** Steers delivered to the builder (`odd-steer` comments, written only after delivery): steer key -> comment `createdAt` ('' when Linear gave none). */
   steers?: Readonly<Record<string, string>>;
+  /** Spawn records (`odd-spawn` comments), one per role, round and key; `thread` is absent while the create is unconfirmed. */
+  spawns?: SpawnRecord[];
 };
 
 /** `component` is the `+`-joined set the release installed (`none` when it touched no enabled component), or the component that failed or was refused. */
@@ -199,6 +201,29 @@ export function parseCancelled(text: string): { role: Role; threadID: string; ro
   return { role: match[1] as Role, threadID: match[2], round: Number(match[3]) };
 }
 
+/**
+ * A spawn record (P4.1): the plane writes `thread=pending` before it creates a role thread and
+ * the same line with the returned thread ID before it sends the outcome. Records are append-only:
+ * a role, round and key stays pending until a bound line for it exists. `key` names the stage the
+ * spawn serves: the role, plus the PR head for a reviewer and the receipt for a verifier.
+ */
+export type SpawnRecord = { role: Role; round: number; key: string; thread?: string };
+
+export const spawnLine = (record: SpawnRecord) => `odd-spawn role=${record.role} round=${record.round} key=${record.key} thread=${record.thread ?? 'pending'}`;
+
+export function parseSpawn(text: string): SpawnRecord | undefined {
+  const match = /^odd-spawn role=(\S+) round=(\d+) key=(\S+) thread=(pending|T-\S+)$/m.exec(text);
+  if (!match || !roles.includes(match[1] as Role)) return undefined;
+  return { role: match[1] as Role, round: Number(match[2]), key: match[3], ...(match[4] === 'pending' ? {} : { thread: match[4] }) };
+}
+
+/** The stage key of a spawn of `role` on `issue`: the reviewer's head and the verifier's receipt (12-character prefixes). */
+export function spawnKey(issue: Pick<IssueSnapshot, 'pr' | 'deployReceipt'>, role: Role): string {
+  if (role === 'reviewer' && issue.pr) return `reviewer-${issue.pr.headSha.slice(0, 12)}`;
+  if (role === 'verifier' && issue.deployReceipt) return `verifier-${issue.deployReceipt.sha.slice(0, 12)}`;
+  return role;
+}
+
 const sections = ['## Goal', '## Isolation', '## Build', '## Done means', '## Evidence'] as const;
 
 function section(description: string, heading: string): string {
@@ -242,8 +267,13 @@ export function parseDeployReceipt(text: string): DeployReceipt | undefined {
   return { host: match[1], component: match[2], sha: match[3], health: match[4] as DeployReceipt['health'], rollback: match[5], ...(refused ? { refusal: match[6] as Refusal } : {}) };
 }
 
-const free = (executor: Executor, load: Load) =>
-  executor === 'none' || (executor === 'orb' ? load.orbs < capacity.orbs : load.runnerSlots < capacity.runnerSlots);
+/** Why a spawn of `role` must wait at `load`, or undefined when it fits its executor's cap; `newBuild` is a builder for an issue without one. */
+export function capacityWait(role: Role, load: Load, newBuild: boolean): string | undefined {
+  const { executor } = contracts[role];
+  if (role === 'builder' && newBuild && load.buildIssues >= capacity.buildIssues) return `build capacity (${load.buildIssues}/${capacity.buildIssues} issues)`;
+  const free = executor === 'none' || (executor === 'orb' ? load.orbs < capacity.orbs : load.runnerSlots < capacity.runnerSlots);
+  return free ? undefined : `${executor} capacity (${role})`;
+}
 
 /**
  * Spawn a fresh round of `role`, or wait: on capacity, or while an idle thread of the role is
@@ -265,8 +295,8 @@ function spawn(role: Role, load: Load, reason: string, issue: IssueSnapshot): Ac
       : { kind: 'page', reason: 'budget-ceiling', detail: `${issue.identifier}: ${role} spent ${previous}/${rounds} rounds (${reason})`, pr: issue.pr?.number, sha: issue.pr?.headSha };
   }
   // An issue that already has a builder thread is inside the build count; only a new issue needs a free build slot.
-  if (role === 'builder' && live === 0 && load.buildIssues >= capacity.buildIssues) return { kind: 'wait', reason: `build capacity (${load.buildIssues}/${capacity.buildIssues} issues)` };
-  return free(executor, load) ? { kind: 'spawn', role, executor, reason, round: previous + 1 } : { kind: 'wait', reason: `${executor} capacity (${role})` };
+  const full = capacityWait(role, load, live === 0);
+  return full ? { kind: 'wait', reason: full } : { kind: 'spawn', role, executor, reason, round: previous + 1 };
 }
 
 /** A steer already delivered (an `odd-steer` comment) is not repeated: the issue waits for the builder's answer from the comment's time. */

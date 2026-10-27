@@ -248,8 +248,10 @@ test('control plane: a launch that yields no child is a visible failure on the i
   assert.deepEqual(launcher.events, ['start', 'kill']);
   assert.equal(plane.issue.status, 'Todo');
   assert.equal(plane.threads.size, 0, 'no plugin agent stands in for the builder');
-  assert.equal(plane.comments.length, 1);
-  assert.match(plane.comments[0], /^odd-launch-failed role=builder engine=anthropic model=anthropic\/claude-opus-5-5\n\n.*No project matches/);
+  // P4.1: the durable reservation precedes the launch; it stays pending because no child was confirmed.
+  assert.deepEqual(plane.comments.slice(0, 1), ['odd-spawn role=builder round=1 key=builder thread=pending']);
+  assert.equal(plane.comments.length, 2);
+  assert.match(plane.comments[1], /^odd-launch-failed role=builder engine=anthropic model=anthropic\/claude-opus-5-5\n\n.*No project matches/);
 });
 
 const builder = (lab: string) => ({ id: child, labels: ['odd-issue-met-7', 'odd-role-builder', 'odd-round-1', `odd-engine-${lab}`], state: 'idle' });

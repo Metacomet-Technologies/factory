@@ -258,9 +258,10 @@ SHA x with this output; Done means item 3 has no evidence".
   running in its own orb (`scripts/odd/launch.ts`). Steering, caps, crash
   reconciliation (the labels exist from creation) and stage-based archiving
   work on it like on any role thread. A launch that yields no child posts
-  `odd-launch-failed` on the issue and fails the evaluation (retried with
-  backoff); no plugin agent or other engine stands in, and the plane never
-  falls back to a runner. Runner Claude builds stay the dispatcher's
+  `odd-launch-failed` on the issue and fails the evaluation; its `odd-spawn`
+  record stays pending, so it is not relaunched (spawn records below). No
+  plugin agent or other engine stands in, and the plane never falls back to
+  a runner. Runner Claude builds stay the dispatcher's
   `engine/claude` path within its runner slots.
 - Reviewer: a plugin agent on ChatGPT `openai/gpt-6-astra` or the SuperGrok
   connection `Cursor` `xai/grok-4.7`, both at high reasoning. The plane picks
@@ -287,9 +288,37 @@ SHA x with this output; Done means item 3 has no evidence".
 - Executor: orb by default for Builder, Reviewer, Spec, Intake, Verifier
   (judgement part). Runner only for Deployer, hardware checks, and anything
   whose Isolation names a device, a production DB or Tailscale. Caps: 4 orbs,
-  2 runner slots, 2 issues in build or review at once, counted from live
-  thread labels, not from a ledger. An issue holds its build slot from the
-  builder's spawn until the merge, including while it waits for review.
+  2 runner slots, 2 issues in build or review at once. An issue holds its
+  build slot from the builder's spawn until the merge, including while it
+  waits for review.
+- Admission (P4.1, MET-343): every spawn path (issue roles, Slack intake,
+  the red-deploy log reader) takes its cap check and reservation in one
+  global queue in the control plugin. Load is the live role threads thread
+  search returns plus every reservation search has not returned yet, each
+  counted as a running thread of its executor and, for a builder, as its
+  issue's build slot. Search lag therefore never admits past the caps.
+- Spawn records (P4.1): before an issue role's create the plane comments
+  `odd-spawn role=<role> round=<n> key=<role|reviewer-<head12>|verifier-<receipt12>>
+  thread=pending`, and after it the same line with `thread=<T-…>`, written
+  after the labels and before the outcome message (the builder's CLI launch
+  carries labels and prompt at creation; its line is written once the
+  `session_id` is read). Every evaluation reads bound threads by ID with
+  `get_thread_status`, so a reload or search lag never spawns a second
+  thread for the same stage. A bound thread whose labels did not land
+  carries its record's role labels. Create calls have no idempotency key,
+  so a create that did not confirm a thread (an error, a lost response, no
+  `session_id`, or a lost binding write) is never retried: its pending
+  record holds the role on that issue and a slot against the caps, and
+  every evaluation fails into the `spawn-<role>` failure episode, which
+  pages through the incident path (§8). Each evaluation also tries to bind a
+  pending record to the one live thread with its role and round labels that
+  no other record owns (a reviewer without a verdict, a verifier with the
+  record's receipt label). If none exists, Devon checks for the thread and
+  removes the pending comment, or adds the bound line, to release the stage.
+  Slack intake and the log reader have no issue record: an unconfirmed
+  create keeps its reservation and is not retried until the control orb
+  reloads (Slack also pages it). The log reader's own search-then-spawn
+  dedupe (`odd-deploy-<sha12>`) is unchanged.
 - The reviewer reruns the Evidence in its own orb, on a lab other than the
   builder's, so no change is approved by the model family that wrote it.
 

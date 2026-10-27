@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { changesRounds, ciState, delivered, finishedThreads, issueFromEvent, loadFrom, openRounds, prOwnsIssue, receiptLabel, riskFrom, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
-import { nextAction } from './lifecycle.ts';
+import { admittedLoad, changesRounds, ciState, delivered, finishedThreads, issueFromEvent, loadFrom, openRounds, prOwnsIssue, receiptLabel, reconciles, riskFrom, spawnRecords, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { nextAction, parseSpawn, spawnKey, spawnLine } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
 const check = (conclusion: string | null, state?: string) => ({ name: 'ci', conclusion, state: state ?? null });
@@ -228,4 +228,51 @@ test('P3.1: wait ages come from the head commit, the merge and the steer comment
   ] }, pr: { ...open, statusCheckRollup: [check('FAILURE')] }, threads: [builder] });
   assert.deepEqual(steered.steers, { [key]: '2026-10-26T11:00:00Z' });
   assert.deepEqual((nextAction(steered, { orbs: 0, runnerSlots: 0, buildIssues: 1 }) as { wait?: object }).wait, { kind: 'steer', key: `steer-${key}`, since: '2026-10-26T11:00:00Z' });
+});
+
+test('P4.1: spawn records round-trip, a bound line wins over its pending line in any order, and keys name the head or receipt', () => {
+  const pending = { role: 'reviewer' as const, round: 2, key: `reviewer-${sha.slice(0, 12)}` };
+  assert.equal(spawnLine(pending), `odd-spawn role=reviewer round=2 key=reviewer-${sha.slice(0, 12)} thread=pending`);
+  assert.deepEqual(parseSpawn(spawnLine(pending)), pending);
+  assert.deepEqual(parseSpawn(spawnLine({ ...pending, thread: 'T-1' })), { ...pending, thread: 'T-1' });
+  assert.equal(parseSpawn('odd-spawn role=shipper-x round=1 key=x thread=pending'), undefined, 'unknown role');
+  assert.equal(parseSpawn('odd-spawn role=builder round=1 key=builder thread=none'), undefined, 'neither pending nor a thread');
+  const builder = { role: 'builder' as const, round: 1, key: 'builder' };
+  const lines = (...records: object[]) => records.map(record => ({ body: spawnLine(record as typeof builder) }));
+  // Newest-first and oldest-first comment orders give the same records.
+  assert.deepEqual(spawnRecords(lines({ ...builder, thread: 'T-b' }, builder)), [{ ...builder, thread: 'T-b' }]);
+  assert.deepEqual(spawnRecords(lines(builder, { ...builder, thread: 'T-b' }, builder)), [{ ...builder, thread: 'T-b' }]);
+  assert.deepEqual(spawnRecords(lines(builder, pending)), [builder, pending], 'one record per role, round and key');
+  const snapshot = toSnapshot({ issue: { id: 'MET-1', status: 'Todo', labels: [], comments: lines(builder) } });
+  assert.deepEqual(snapshot.spawns, [builder]);
+  const issue = { pr: { number: 1, headSha: sha, ci: 'success' as const, merged: false }, deployReceipt: { host: 'h', component: 'c', sha: 'e'.repeat(40), health: 'pass' as const, rollback: 'none' } };
+  assert.deepEqual(['builder', 'reviewer', 'verifier', 'spec'].map(role => spawnKey(issue, role as 'builder')), ['builder', `reviewer-${sha.slice(0, 12)}`, `verifier-${'e'.repeat(12)}`, 'spec']);
+});
+
+test('P4.1: a pending record reconciles only to an unowned live thread of its role and round still owed its artifact', () => {
+  const thread = (id: string, labels: string[]): LiveThread => ({ id, labels: ['odd-issue-met-1', ...labels], state: 'running' });
+  const reviewer = { role: 'reviewer' as const, round: 1, key: `reviewer-${sha.slice(0, 12)}` };
+  assert.equal(reconciles(reviewer, thread('T-r', ['odd-role-reviewer', 'odd-round-1']), new Set()), true);
+  assert.equal(reconciles(reviewer, thread('T-r', ['odd-role-reviewer', 'odd-round-1']), new Set(['T-r'])), false, 'owned by another record');
+  assert.equal(reconciles(reviewer, thread('T-r', ['odd-role-reviewer', 'odd-round-2']), new Set()), false, 'another round');
+  assert.equal(reconciles(reviewer, thread('T-r', ['odd-role-builder', 'odd-round-1']), new Set()), false, 'another role');
+  assert.equal(reconciles(reviewer, thread('T-r', ['odd-role-reviewer', 'odd-round-1', `odd-verdict-changes-${'0'.repeat(12)}`]), new Set()), false, 'an older head\'s delivered reviewer');
+  const verifier = { role: 'verifier' as const, round: 1, key: `verifier-${'e'.repeat(12)}` };
+  assert.equal(reconciles(verifier, thread('T-v', ['odd-role-verifier', 'odd-round-1', receiptLabel('e'.repeat(40))]), new Set()), true);
+  assert.equal(reconciles(verifier, thread('T-v', ['odd-role-verifier', 'odd-round-1', receiptLabel('d'.repeat(40))]), new Set()), false, 'another release');
+});
+
+test('P4.1: admitted load counts every reservation thread search has not returned, once, by executor and build issue', () => {
+  const live = (id: string, role: string, issue: string, state = 'running'): LiveThread => ({ id, labels: [`odd-issue-${issue}`, `odd-role-${role}`, 'odd-round-1'], state });
+  const threads = [live('T-b1', 'builder', 'met-1', 'idle'), live('T-r1', 'reviewer', 'met-1')];
+  assert.deepEqual(admittedLoad(threads, []).load, { orbs: 1, runnerSlots: 0, buildIssues: 1 });
+  const { load, building } = admittedLoad(threads, [
+    { role: 'reviewer', issue: 'MET-1', thread: 'T-r1' }, // indexed: already counted
+    { role: 'builder', issue: 'MET-2' }, // pending create
+    { role: 'builder', issue: 'MET-1', thread: 'T-b2' }, // a second builder thread of a building issue
+    { role: 'intake', thread: 'T-slack' },
+    { role: 'deployer' },
+  ]);
+  assert.deepEqual(load, { orbs: 4, runnerSlots: 1, buildIssues: 2 });
+  assert.deepEqual([...building].sort(), ['MET-1', 'MET-2']);
 });
