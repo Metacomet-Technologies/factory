@@ -2,7 +2,7 @@
 // report (docs/odd/README.md §9). Pure functions; the control-plane plugin does the IO.
 
 import { builderEngine, labOf } from './engines.ts';
-import { capacity, contracts, parseCancelled, parseDeployReceipt, parseSpawn, parseSteer, parseThreadLabels, parseVerify, roles, type DeployReceipt, type IssueSnapshot, type Load, type RiskClass, type Role, type SpawnRecord, type Status, type Verdict, type Verify } from './lifecycle.ts';
+import { budgetSkewMs, capacity, contracts, parseBudget, parseCancelled, parseDeployReceipt, parseEscalation, parseResume, parseSpawn, parseSteer, parseThreadLabels, parseVerify, roles, type Correction, type DeployReceipt, type Escalation, type IssueSnapshot, type Load, type RiskClass, type Role, type SpawnRecord, type Status, type Verdict, type Verify } from './lifecycle.ts';
 
 export type WebhookSource = 'linear' | 'github' | 'slack';
 
@@ -149,15 +149,55 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     return role ? { role, threadID: owned.id, round, state: ownerState(owned.state), ...(owned.updatedAt ? { idleSince: owned.updatedAt } : {}) } : undefined;
   })() : undefined;
   // Only receipts after the latest merge count: an issue re-opened after a rollback and merged again starts clean.
-  // Cancelled rounds restart at the latest escalation: Devon clearing `escalated` grants a fresh budget.
   let receipt: DeployReceipt | undefined;
   let verify: Verify | undefined;
   let cancelledRounds: Partial<Record<Role, number>> = {};
   const steers: Record<string, string> = {};
+  // Correction epochs (MET-348). A new epoch starts at an `odd-resume` for the open latch, written
+  // only after Devon removed `escalated` from it, or at a legacy `odd-escalated` comment from before
+  // latches (prior semantics; honoured only until the issue's first latch, budget or resume record).
+  // It restarts the cancelled rounds (not the verifier's, which belong to a release) and the budget.
+  let correction: Correction = { epoch: 1, corrected: false };
+  let escalation: Escalation | undefined;
+  let recorded = false;
+  const resumed = new Set<string>();
+  const nextEpoch = () => {
+    correction = { epoch: correction.epoch + 1, corrected: false };
+    cancelledRounds = cancelledRounds.verifier ? { verifier: cancelledRounds.verifier } : {};
+  };
   const oldestFirst = [...issue.comments ?? []].sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''));
   for (const comment of oldestFirst) {
     if (/^odd-merge pr=/m.test(comment.body)) receipt = undefined;
-    if (/^odd-escalated reason=/m.test(comment.body)) cancelledRounds = {};
+    const latch = parseEscalation(comment.body);
+    if (latch === 'legacy' && !recorded) nextEpoch();
+    else if (latch === 'legacy' || latch === 'malformed') correction.invalid ??= `${latch} odd-escalated comment ${comment.id ?? 'without id'}`;
+    else if (latch) {
+      recorded = true;
+      escalation = { ...latch, ...(comment.id ? { id: comment.id } : {}) };
+    }
+    const resume = parseResume(comment.body);
+    if (resume) recorded = true;
+    if (resume === 'malformed') correction.invalid ??= 'malformed odd-resume comment';
+    else if (resume && !resumed.has(resume.escalation)) {
+      // A resume releases only the open latch whose label was set; anything else grants nothing.
+      if (!escalation?.id || resume.escalation !== escalation.id || !escalation.done.includes('label') || resume.epoch !== correction.epoch + 1) correction.invalid ??= `odd-resume for ${resume.escalation} does not release the open escalation`;
+      else {
+        resumed.add(resume.escalation);
+        escalation = undefined;
+        nextEpoch();
+      }
+    }
+    const budget = parseBudget(comment.body);
+    if (budget) recorded = true;
+    if (budget === 'malformed') correction.invalid ??= 'malformed odd-budget comment';
+    else if (budget) {
+      const skew = Math.abs(Date.parse(comment.createdAt ?? '') - Date.parse(budget.start));
+      if (!(skew <= budgetSkewMs)) correction.invalid ??= `odd-budget start ${budget.start} is not its comment time ${comment.createdAt ?? '(none)'}`;
+      else if (budget.epoch !== correction.epoch) correction.invalid ??= `odd-budget for epoch ${budget.epoch} recorded in epoch ${correction.epoch}`;
+      else if (correction.budget && correction.budget.contract !== budget.contract) correction.invalid ??= `conflicting odd-budget contracts in epoch ${budget.epoch}`;
+      // A duplicate (a write whose response was lost, then retried) never extends the window: the earliest start holds.
+      else if (!correction.budget || budget.start < correction.budget.start) correction.budget = budget;
+    }
     // Verifier rounds belong to one release: a receipt for a new SHA is a fresh verification budget.
     const next = parseDeployReceipt(comment.body);
     if (next && next.sha !== receipt?.sha) delete cancelledRounds.verifier;
@@ -167,6 +207,7 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     if (cancelled) cancelledRounds[cancelled.role] = Math.max(cancelledRounds[cancelled.role] ?? 0, cancelled.round);
     const steered = parseSteer(comment.body);
     if (steered) steers[steered.key] ??= comment.createdAt ?? '';
+    if (steered?.key.startsWith('changes-')) correction.corrected = true;
   }
   const headAt = pr?.commits?.find(commit => commit.oid === pr.headRefOid)?.committedDate;
   return {
@@ -195,6 +236,8 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     cancelledRounds,
     steers,
     spawns: spawnRecords(issue.comments ?? []),
+    ...(escalation ? { escalation } : {}),
+    correction,
   };
 }
 

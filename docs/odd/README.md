@@ -110,8 +110,8 @@ defines Amp-native agents for the roles that need Amp coordination tools.
 | --- | --- | --- | --- | --- | --- | --- |
 | Intake | Slack message in `#factory-intake`; Linear issue in `Triage` without a type or area label (Backlog is never triaged). | A Linear issue in the template, or a comment on the existing issue, with `area:*`, type and a duplicate check. | Create and edit *its own* issue; link duplicates. | Plugin agent pinned to `openai/gpt-6-astra` low (ChatGPT). | 1 turn + 2 continuations. | Never. Ambiguity becomes a question inside the spec. |
 | Spec | Issue reaches `Triage` with a type and area. | `## Isolation`, `## Build`, `## Done means`, `## Evidence`, size estimate, risk class. Status moves to `Todo`. | Edit its own issue; split into children; mark blocked-by. | Plugin agent pinned to `openai/gpt-6-astra` medium (ChatGPT). | 1 turn + 3 continuations. | Risk class is `irreversible` or `security` and no existing pattern covers it. |
-| Builder | Issue in `Todo` labelled `odd` with a free build slot. | A PR whose body carries the Evidence section filled with real output; the same thread and branch across review rounds. | Push to its own branch; open and update its PR; comment on its issue. | Claude Code (`claude-opus-5-5`, effort high) on an orb, launched through the CLI and served by the Claude Subscription (§6). | 3 review rounds per PR. | Third `changes` verdict, or Isolation cannot be respected. |
-| Reviewer | PR head SHA with CI green and no verdict for that SHA. | Verdict `ready` or `changes` as a PR comment and the thread label `odd-verdict-<ready\|changes>-<sha12>`, findings bound to the SHA; reruns Evidence commands itself in its own orb. | Request changes; approve. Never pushes to the builder's branch. GitHub refuses a review on a PR the same account opened, so the verdict is a comment, not a review. | Plugin agent pinned to ChatGPT `openai/gpt-6-astra` or SuperGrok (`Cursor`) `xai/grok-4.7`, high reasoning, never the Builder's lab (§6). | 1 per SHA; 2 rounds after a Watchdog cancellation. | Third `changes` verdict on one issue (page: third failed QA round); second spent round (page: budget ceiling). |
+| Builder | Issue in `Todo` labelled `odd` with a free build slot. | A PR whose body carries the Evidence section filled with real output; the same thread and branch across review rounds. | Push to its own branch; open and update its PR; comment on its issue. | Claude Code (`claude-opus-5-5`, effort high) on an orb, launched through the CLI and served by the Claude Subscription (§6). | A fixed 120-minute correction budget per epoch (§8); 3 review rounds for a history without one. | Budget deadline (`budget-ceiling`), a changed contract, a safety condition, or Isolation cannot be respected. |
+| Reviewer | PR head SHA with CI green and no verdict for that SHA. | Verdict `ready` or `changes` as a PR comment and the thread label `odd-verdict-<ready\|changes>-<sha12>`, findings bound to the SHA; reruns Evidence commands itself in its own orb. | Request changes; approve. Never pushes to the builder's branch. GitHub refuses a review on a PR the same account opened, so the verdict is a comment, not a review. | Plugin agent pinned to ChatGPT `openai/gpt-6-astra` or SuperGrok (`Cursor`) `xai/grok-4.7`, high reasoning, never the Builder's lab (§6). | 1 per SHA; 2 rounds after a Watchdog cancellation. | Second spent round (page: budget ceiling). Re-reviews focus on the delta and the affected proof, still rerun every Evidence line and the mandatory checks, and label any reused investigation historical. |
 | Shipper | Verdict `ready` on the current head. | Squash merge with `--match-head-commit`; merge receipt `odd-merge pr=<n> head=<sha> merge=<sha>` on the issue; release tag per `docs/release.md` from phase 5. | Merge; tag; close superseded PRs. | Deterministic (`qa.ts check --self-deploying-ok` + `gh pr merge` inside the control plane), no agent. | n/a | `qa.ts check` refuses: the refusal is posted once per head as `odd-merge-refused`; the builder's next push re-enters the loop. |
 | Deployer | GitHub release newer than the host ledger's `lastTag` (`factory-deploy.timer` on factory-gpu, every 2 min). | Verified release unpacked under `~/.local/state/factory-odd/releases/<tag>`, each changed enabled component (`meter`, `factory-api`, `kiosk`) installed and probed at the exact SHA, one deploy receipt per issue the release closes. | `sudo -n /usr/bin/bash <allowlisted script>` on the runner; detaches `~/.local/state/factory-odd/source` at the release SHA, leaving the installers in `/home/agent/work/factory` unchanged; then advances the deploy, dispatch and usage runtime link `~/factory-tools/current` to the newest handled release only after each tool's self-check passes in the candidate and through the link, restoring the prior link otherwise ([cutover](deployer-recovery.md#tools-runtime-cutover-met-346-p28)). | Deterministic job (`scripts/odd/deploy.ts`); on a red receipt the control plane starts one plugin agent (`odd-deployer`, `openai/gpt-6-astra` low) on the factory-gpu runner that only reads logs and attaches them to the Bug. | 1 deploy + 1 rollback per component per release. | Rollback missing, fails, or leaves the component unhealthy on re-probe (`rollback=none`, page: failed rollback). |
 | Verifier | Green deploy receipt (`health=pass`) with no `odd-verify` comment for its SHA. | Issue comment `odd-verify sha=<receipt sha> result=pass\|fail bug=<MET-n\|none>` plus one line per Done-means item; a `Bug` issue in `Triage` on fail. The control plane sets `Done` on `pass`. | Comment on its issue; file Bugs. Never sets status. | Plugin agent pinned to `openai/gpt-6-astra` low (ChatGPT); reruns the Evidence lines against the deployed system. | 1 turn + 2 continuations; 2 rounds. | Never pages; files a bug and lets Intake handle it. Second spent round pages (budget ceiling). |
@@ -338,7 +338,12 @@ Each artifact is machine-checkable before the next role starts.
   label `odd-verdict-ready-<sha12>` or `odd-verdict-changes-<sha12>`. The
   control plane reads the label; `changes` steers the same builder thread
   once per head SHA. Rounds are counted as distinct heads with a `changes`
-  verdict.
+  verdict. Before the epoch's first `changes` steer the control plane records
+  `odd-budget epoch=<n> start=<t> deadline=<t+120m> contract=<hash>`; from
+  the second rejected head on, the steer asks the builder to open its next
+  handoff with a design reassessment (invariant, competing hypotheses,
+  discriminating probes, smallest shared fix). Builder and Spec skills
+  require a reusable end-to-end proof matrix built from existing fixtures.
 - Shipper → Deployer: merge receipt comment `odd-merge pr=<n> head=<sha>
   merge=<sha> release=<tag|none>`; from phase 5 a GitHub release whose notes
   list components and issues (`docs/release.md`).
@@ -377,7 +382,7 @@ Each artifact is machine-checkable before the next role starts.
 | Condition | Who notices | Channel | Default if Devon is silent |
 | --- | --- | --- | --- |
 | Spec risk `irreversible` or `security` with no precedent | Spec | Linear mention + `#factory-alerts` | Issue stays in `Triage`; nothing builds. |
-| Third `changes` verdict on one issue | Control plane | Slack DM, `escalated` label, `odd-escalated` comment, PR back to draft | Issue stays `In Progress` and nothing runs until Devon removes `escalated`. |
+| Correction budget deadline reached, a changed contract, or untrusted budget state (MET-348); third `changes` verdict on a history with no recorded budget | Control plane | Slack DM (`budget-ceiling`, or `third-failed-qa-round` for the legacy cap), `escalated` label, `odd-escalated` latch, PR back to draft | Nothing more is started, steered or merged; running work and its results are kept until Devon removes `escalated`. |
 | Health red after rollback | Deployer | Slack DM | Component left on previous release; all deploys of that component paused. |
 | Irreversible production action requested by a spec | Shipper or Deployer | Slack DM, `ui.confirm({ requireHuman: true })` in the control thread | Not executed. |
 | Release would change the meter DB generation (`health=refused` receipt) | Deployer, then control plane | Slack DM (`irreversible-action`), `escalated` label | Not executed: nothing in the release installs and `lastTag` holds until Devon migrates manually and clears the held receipt. |
@@ -412,10 +417,39 @@ one `ODD resolved` DM closes the incident, and a later failure opens a new
 episode. Neither the digest nor the heartbeat replaces these pages. Only
 failed derivations count toward `control-plane-blind`.
 
+Correction budget (MET-348). A `changes` verdict no longer pages on its
+round count. Before the first correction of an epoch is steered or spawned,
+the control plane records `odd-budget`: a fixed 120-minute wall-clock window
+from that moment, bound to a hash of the issue's Goal, Isolation, Build,
+Done means, Evidence and risk. New heads, retries, duplicate events,
+replacement workers, archive or index drift and reloads keep the original
+deadline (a duplicate record keeps the earliest start); CI and review waits
+count; nothing renews or pauses it. At the deadline exactly, and for any
+changed contract or malformed, conflicting, unwitnessed or out-of-epoch
+budget state, the issue pages `budget-ceiling` with the deadline, the head
+and the last blocker, whatever it is doing; a running worker is not
+cancelled. A ready verdict at the current head with CI green inside the
+window merges through the normal gates. Security findings, a failed
+rollback, irreversible actions and risk decisions still page or wait at
+once. Histories steered before budgets existed have an unknown age: they
+keep the three-round cap until a resume starts a budgeted epoch; issues
+already `escalated` stay held.
+
+Escalation is a latch. `odd-escalated reason=<r> pr=<n|-> sha=<sha|-> done=<steps>`
+is written before any side effect; the label, the draft, the DM and the
+archive are each recorded in `done=` once they succeed, and a failed step is
+retried alone by the next evaluation while the issue holds. The escalation
+comment never resets a budget or a round count. When Devon removes
+`escalated` from a latch whose label step was recorded, the control plane
+writes `odd-resume escalation=<comment id> epoch=<n+1>` once; that record
+alone starts the next epoch (fresh budget and Watchdog round counts, not the
+verifier's). A resume that names another latch or epoch, or a malformed
+record, grants nothing and holds the issue.
+
 Every Slack DM uses one format, `pageText` in `scripts/odd/lifecycle.ts`:
 `ODD page: <condition> | issue MET-<n> | <PR #n or host> | <sha> | default if
-silent: <action>. <detail>`. A page is a no-op while the issue already
-carries `escalated`.
+silent: <action>. <detail>`. A latched page goes out at most once; a page
+step is recorded on the latch only after Slack accepts it.
 
 ## 9. Control-plane topology
 

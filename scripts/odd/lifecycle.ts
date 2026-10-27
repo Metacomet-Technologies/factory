@@ -2,6 +2,8 @@
 // Pure functions only. The control-plane plugin (.amp/plugins/factory-odd.ts) and
 // the runner backstop both derive state from Linear and GitHub and call nextAction.
 
+import { createHash } from 'node:crypto';
+
 export const roles = ['intake', 'spec', 'builder', 'reviewer', 'shipper', 'deployer', 'verifier', 'watchdog'] as const;
 export type Role = typeof roles[number];
 export type Executor = 'orb' | 'runner' | 'none';
@@ -65,13 +67,45 @@ export type IssueSnapshot = {
   verify?: Verify;
   /** Highest `odd-round-<n>` per role among live threads that have not produced their artifact (snapshot.ts `delivered`). */
   openRounds?: Partial<Record<Role, number>>;
-  /** Rounds the Watchdog cancelled per role since the latest `odd-escalated` comment (`odd-watchdog cancelled` comments); verifier rounds since the latest receipt. */
+  /** Rounds the Watchdog cancelled per role since the current correction epoch began (`odd-watchdog cancelled` comments); verifier rounds since the latest receipt. */
   cancelledRounds?: Partial<Record<Role, number>>;
   /** Steers delivered to the builder (`odd-steer` comments, written only after delivery): steer key -> comment `createdAt` ('' when Linear gave none). */
   steers?: Readonly<Record<string, string>>;
   /** Spawn records (`odd-spawn` comments), one per role, round and key; `thread` is absent while the create is unconfirmed. */
   spawns?: SpawnRecord[];
+  /** The escalation latch (`odd-escalated … done=`) no `odd-resume` has released; absent for legacy escalations, whose label alone holds. */
+  escalation?: Escalation;
+  /** The correction epoch and its budget (snapshot.toSnapshot). Absent only in hand-built snapshots, read as a fresh epoch 1. */
+  correction?: Correction;
 };
+
+/**
+ * Escalation (§8) is a latch: the `odd-escalated` comment is written before any side effect and
+ * records each step once it succeeded, so a partial failure is retried step by step while the
+ * issue holds. `id` is the comment's; a latch without one can never be released.
+ */
+export const escalationSteps = ['label', 'draft', 'page', 'archive'] as const;
+export type EscalationStep = typeof escalationSteps[number];
+export type Escalation = { id?: string; reason: PageReason; pr?: number; sha?: string; done: readonly EscalationStep[]; detail: string };
+
+/**
+ * The outcome correction budget (MET-348): a fixed wall-clock window granted per epoch and bound
+ * to the issue's accepted contract, never to a head or a worker. Epoch 1 starts with the issue;
+ * each `odd-resume` (or a legacy `odd-escalated` comment) starts the next. `corrected` says a
+ * `changes` steer was delivered in this epoch without a budget (a legacy history); `invalid`
+ * names budget state that cannot be trusted, which holds the issue instead of granting time.
+ */
+export type Budget = { epoch: number; start: string; deadline: string; contract: string };
+export type Correction = { epoch: number; corrected: boolean; budget?: Budget; invalid?: string };
+export const correctionWindowMs = 120 * 60_000;
+/** How far a budget's recorded start may sit from its comment's `createdAt`: a start Linear did not witness grants nothing. */
+export const budgetSkewMs = 5 * 60_000;
+
+/** What the budget binds to: Goal, Isolation, Build, Done means, Evidence and risk. Other sections and PR edits are cosmetic. */
+export function contractOf(description: string, risk: RiskClass | undefined): string {
+  const text = [...sections.map(heading => `${heading}\n${section(description, heading).split('\n').map(line => line.trimEnd()).join('\n')}`), `risk: ${risk ?? 'none'}`].join('\n');
+  return createHash('sha256').update(text).digest('hex').slice(0, 12);
+}
 
 /** `component` is the `+`-joined set the release installed (`none` when it touched no enabled component), or the component that failed or was refused. */
 export type DeployReceipt = { host: string; component: string; sha: string; health: 'pass' | 'fail' | 'refused'; rollback: 'none' | string; refusal?: Refusal };
@@ -123,7 +157,12 @@ export type Action =
   | { kind: 'steer'; role: Role; threadID: string; key: string; message: string }
   | { kind: 'merge'; pr: number; sha: string }
   | { kind: 'set-status'; status: Status; reason: string; followUp?: { title: string; body: string }; diagnose?: DeployReceipt }
-  | { kind: 'page'; reason: PageReason; detail: string; pr?: number; sha?: string; diagnose?: DeployReceipt }
+  /** `latch` is an escalation already recorded; the control plane finishes its missing steps instead of starting another. */
+  | { kind: 'page'; reason: PageReason; detail: string; pr?: number; sha?: string; diagnose?: DeployReceipt; latch?: { id: string; done: readonly EscalationStep[] } }
+  /** Record the epoch's correction budget (`odd-budget`) before the first correction of the epoch is steered or spawned. */
+  | { kind: 'admit'; budget: Budget }
+  /** Devon removed `escalated` from a latched issue: record `odd-resume`, which starts the next epoch once. */
+  | { kind: 'resume'; escalation: string; epoch: number }
   /** `stuck` names the idle role whose thread the wait depends on; the Watchdog cancels it once stale. */
   | { kind: 'wait'; reason: string; stuck?: Role; wait?: Wait };
 
@@ -136,7 +175,7 @@ export const pageDefaults: Record<PageReason, string> = Object.freeze({
   'failed-rollback': 'component stays on the previous release; deploys of that component pause',
   'irreversible-action': 'not executed',
   'security-finding': 'issue stays In Progress; nothing merges',
-  'budget-ceiling': 'issue waits with no owner thread until the `escalated` label is removed',
+  'budget-ceiling': 'nothing more is started, steered or merged for the issue; running work and its results are kept until the `escalated` label is removed',
   'control-plane-blind': 'the runner backstop poller runs the lifecycle at 60 s cadence',
   'control-plane-silent': 'the runner backstop poller runs the lifecycle until a fresh heartbeat',
   'subscription-mismatch': 'roles keep their pinned models; nothing is relaunched on another engine',
@@ -191,6 +230,38 @@ export const steerLine = (key: string, threadID: string) => `odd-steer key=${key
 export function parseSteer(text: string): { key: string; threadID: string } | undefined {
   const match = /^odd-steer key=(\S+) thread=(\S+)$/m.exec(text);
   return match ? { key: match[1], threadID: match[2] } : undefined;
+}
+
+/** The latch's first line; the page detail follows after a blank line. Legacy latches carry only `reason=`. */
+export const escalationLine = (latch: Omit<Escalation, 'id' | 'detail'>) =>
+  `odd-escalated reason=${latch.reason} pr=${latch.pr ?? '-'} sha=${latch.sha ?? '-'} done=${latch.done.length ? escalationSteps.filter(step => latch.done.includes(step)).join(',') : '-'}`;
+
+/** A latch; `legacy` for a pre-latch escalation comment (`odd-escalated reason=<r>` alone on its line); `malformed` for any other `odd-escalated` line. */
+export function parseEscalation(text: string): Omit<Escalation, 'id'> | 'legacy' | 'malformed' | undefined {
+  if (!/^odd-escalated\b/m.test(text)) return undefined;
+  if (/^odd-escalated reason=[a-z-]+$/m.test(text)) return 'legacy';
+  const match = /^odd-escalated reason=([a-z-]+) pr=(\d+|-) sha=([a-f0-9]{7,40}|-) done=((?:label|draft|page|archive)(?:,(?:label|draft|page|archive))*|-)$/m.exec(text);
+  if (!match || !(match[1] in pageDefaults)) return 'malformed';
+  const detail = text.slice(text.indexOf(match[0]) + match[0].length).trim();
+  return { reason: match[1] as PageReason, ...(match[2] !== '-' ? { pr: Number(match[2]) } : {}), ...(match[3] !== '-' ? { sha: match[3] } : {}), done: match[4] === '-' ? [] : match[4].split(',') as EscalationStep[], detail };
+}
+
+export const budgetLine = (budget: Budget) => `odd-budget epoch=${budget.epoch} start=${budget.start} deadline=${budget.deadline} contract=${budget.contract}`;
+
+/** A budget record, `malformed` for an `odd-budget` line that does not parse or whose deadline is not its start plus the window. */
+export function parseBudget(text: string): Budget | 'malformed' | undefined {
+  if (!/^odd-budget\b/m.test(text)) return undefined;
+  const match = /^odd-budget epoch=([1-9]\d*) start=(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z) deadline=(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z) contract=([a-f0-9]{12})$/m.exec(text);
+  if (!match || Date.parse(match[3]) - Date.parse(match[2]) !== correctionWindowMs) return 'malformed';
+  return { epoch: Number(match[1]), start: match[2], deadline: match[3], contract: match[4] };
+}
+
+export const resumeLine = (escalation: string, epoch: number) => `odd-resume escalation=${escalation} epoch=${epoch}`;
+
+export function parseResume(text: string): { escalation: string; epoch: number } | 'malformed' | undefined {
+  if (!/^odd-resume\b/m.test(text)) return undefined;
+  const match = /^odd-resume escalation=(\S+) epoch=([1-9]\d*)$/m.exec(text);
+  return match ? { escalation: match[1], epoch: Number(match[2]) } : 'malformed';
 }
 
 export const cancelledLine = (role: Role, threadID: string, round: number) => `odd-watchdog cancelled role=${role} thread=${threadID} round=${round}`;
@@ -280,8 +351,8 @@ export function capacityWait(role: Role, load: Load, newBuild: boolean): string 
  * live and the rounds are spent (a role that ends without reaching its stop condition must not
  * be respawned forever; the Watchdog cancels it once it is stale, see scripts/odd/watchdog.ts).
  * Cancelled rounds count too; once the budget is spent and no thread of the role is live, the
- * issue pages instead of waiting silently. Both counts restart at the latest `odd-escalated`
- * comment, so a cleared escalation is a fresh budget. Only `openRounds` counts live rounds: an
+ * issue pages instead of waiting silently. Cancelled rounds restart with each correction epoch
+ * (an `odd-resume` after Devon clears `escalated`), never at the escalation comment itself. Only `openRounds` counts live rounds: an
  * owner that delivered its artifact (a reviewer with a verdict for an older head, a verifier of an
  * older receipt) has finished its round and must not block the next one.
  */
@@ -305,13 +376,68 @@ function steer(issue: IssueSnapshot, threadID: string, key: string, message: str
   return at === undefined ? { kind: 'steer', role: 'builder', threadID, key, message } : waiting(`steer ${key} unanswered`, 'steer', `steer-${key}`, at);
 }
 
-/** Derive the single next action for one issue. Idempotent: the same snapshot always yields the same action. */
-export function nextAction(issue: IssueSnapshot, load: Load): Action {
+/** What the steer or spawn after the second rejected head adds (§7): the next handoff opens with a design reassessment. */
+export const reassessment = 'Two or more heads were rejected: open your next handoff with a short design reassessment (the invariant, competing root-cause hypotheses, the probes that tell them apart, and the smallest shared fix) before patching findings.';
+
+/** One line for a page: what the issue was doing or waiting on. */
+const blocker = (action: Action): string => {
+  switch (action.kind) {
+    case 'wait': return action.reason;
+    case 'page': return `${action.reason}: ${action.detail}`;
+    case 'steer': return `steer ${action.key}`;
+    case 'spawn': return `spawn ${action.role} (${action.reason})`;
+    case 'merge': return `merge PR #${action.pr} at ${action.sha}`;
+    case 'set-status': return `set ${action.status} (${action.reason})`;
+    case 'admit': return `admit epoch ${action.budget.epoch}`;
+    case 'resume': return `resume epoch ${action.epoch}`;
+  }
+};
+
+/**
+ * Derive the single next action for one issue. Idempotent: the same snapshot and clock always
+ * yield the same action. An escalation latch and the correction budget are judged first, so a
+ * running worker never delays a page and nothing merges past the deadline.
+ */
+export function nextAction(issue: IssueSnapshot, load: Load, now = Date.now()): Action {
+  const terminal = issue.status === 'Done' || issue.status === 'Canceled' || issue.status === 'Duplicate';
+  return (terminal ? undefined : held(issue, load, now)) ?? proceed(issue, load, now);
+}
+
+/**
+ * The escalation latch (§8): finish its missing steps; once Devon removes `escalated` from a
+ * labelled latch, resume (the only path to a new epoch). Then the budget: untrusted state, a
+ * changed contract or the deadline itself page `budget-ceiling` for an unmerged PR, whatever
+ * else the issue is doing. The page holds subsequent actions; it cancels nothing.
+ */
+function held(issue: IssueSnapshot, load: Load, now: number): Action | undefined {
+  const labelled = issue.labels.includes(escalatedLabel);
+  const latch = issue.escalation;
+  if (latch) {
+    if (!latch.id) return { kind: 'wait', reason: 'escalated to Devon; the escalation comment has no id' };
+    if (latch.done.includes('label') && !labelled) return { kind: 'resume', escalation: latch.id, epoch: (issue.correction?.epoch ?? 1) + 1 };
+    const pending = escalationSteps.some(step => (step !== 'draft' || latch.pr !== undefined) && !latch.done.includes(step));
+    if (!pending) return { kind: 'wait', reason: 'escalated to Devon' };
+    const diagnose = latch.reason === 'failed-rollback' ? issue.deployReceipt : undefined;
+    return { kind: 'page', reason: latch.reason, detail: latch.detail, pr: latch.pr, sha: latch.sha, ...(diagnose ? { diagnose } : {}), latch: { id: latch.id, done: latch.done } };
+  }
+  if (labelled) return { kind: 'wait', reason: 'escalated to Devon' };
+  const { pr, correction } = issue;
+  if (issue.status !== 'In Progress' || !pr || pr.merged) return undefined;
+  const ceiling = (why: string): Action => ({ kind: 'page', reason: 'budget-ceiling', pr: pr.number, sha: pr.headSha,
+    detail: `${issue.identifier}: ${why}. Head ${pr.headSha}; last blocker: ${blocker(proceed(issue, load, now))}.` });
+  if (correction?.invalid) return ceiling(`correction budget state cannot be trusted (${correction.invalid}); no time is granted`);
+  const budget = correction?.budget;
+  if (!budget) return undefined;
+  if (budget.contract !== contractOf(issue.description, issue.risk)) return ceiling(`the accepted contract changed after epoch ${budget.epoch}'s budget was granted and needs a human reassessment`);
+  if (now >= Date.parse(budget.deadline)) return ceiling(`epoch ${budget.epoch} correction budget ended at ${budget.deadline} (granted ${budget.start}, ${correctionWindowMs / 60_000} min)`);
+  return undefined;
+}
+
+function proceed(issue: IssueSnapshot, load: Load, now: number): Action {
   const { status, owner, pr } = issue;
   if (owner?.state === 'awaiting-approval') return waiting(`${owner.role} awaiting approval`, 'approval', `approval-${owner.threadID}`, owner.idleSince);
   if (owner && owner.state !== 'idle' && owner.state !== 'error') return { kind: 'wait', reason: `${owner.role} running` };
   if (status === 'Done' || status === 'Canceled' || status === 'Duplicate') return { kind: 'wait', reason: status };
-  if (issue.labels.includes(escalatedLabel)) return { kind: 'wait', reason: 'escalated to Devon' };
 
   // Backlog is triaged on demand: Devon moves an idea to Triage when it should enter the factory.
   if (status === 'Backlog') return { kind: 'wait', reason: 'backlog: triage on demand' };
@@ -355,10 +481,19 @@ export function nextAction(issue: IssueSnapshot, load: Load): Action {
     if (!verdict) return spawn('reviewer', load, `no verdict at ${pr.headSha.slice(0, 12)}`, issue);
     if (verdict.state === 'ready') return { kind: 'merge', pr: pr.number, sha: pr.headSha };
     const round = pr.changesRounds ?? 1;
-    if (round >= contracts.builder.rounds) return { kind: 'page', reason: 'third-failed-qa-round', detail: `${issue.identifier}: PR #${pr.number} rejected ${round} times`, pr: pr.number, sha: pr.headSha };
+    const correction = issue.correction ?? { epoch: 1, corrected: false };
+    if (!correction.budget) {
+      // The epoch's first correction records its budget first. A legacy history (corrected without
+      // a budget, or several rejected heads already) has an unknown age, so it keeps the round cap.
+      if (!correction.corrected && round <= 1) {
+        return { kind: 'admit', budget: { epoch: correction.epoch, start: new Date(now).toISOString(), deadline: new Date(now + correctionWindowMs).toISOString(), contract: contractOf(issue.description, issue.risk) } };
+      }
+      if (round >= contracts.builder.rounds) return { kind: 'page', reason: 'third-failed-qa-round', detail: `${issue.identifier}: PR #${pr.number} rejected ${round} times`, pr: pr.number, sha: pr.headSha };
+    }
+    const reassess = round >= 2 ? ` ${reassessment}` : '';
     return owner?.role === 'builder'
-      ? steer(issue, owner.threadID, `changes-${head}`, `QA requested changes at ${pr.headSha}; see the odd-verdict comment on PR #${pr.number}. Address every finding, rerun the Evidence commands, push to the same branch.`)
-      : spawn('builder', load, `qa changes, round ${round + 1}`, issue);
+      ? steer(issue, owner.threadID, `changes-${head}`, `QA requested changes at ${pr.headSha}; see the odd-verdict comment on PR #${pr.number}. Address every finding, rerun the Evidence commands, push to the same branch.${reassess}`)
+      : spawn('builder', load, `qa changes, round ${round + 1}${round >= 2 ? '; design reassessment required' : ''}`, issue);
   }
   // Deploying: the host Deployer (scripts/odd/deploy.ts) posts the receipt; the control plane never deploys.
   if (status === 'Deploying') {

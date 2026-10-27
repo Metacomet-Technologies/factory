@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { admittedLoad, changesRounds, ciState, delivered, finishedThreads, issueFromEvent, loadFrom, openRounds, prOwnsIssue, receiptLabel, reconciles, riskFrom, spawnRecords, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
-import { nextAction, parseSpawn, spawnKey, spawnLine } from './lifecycle.ts';
+import { contractOf, nextAction, parseSpawn, spawnKey, spawnLine } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
 const check = (conclusion: string | null, state?: string) => ({ name: 'ci', conclusion, state: state ?? null });
@@ -163,9 +163,10 @@ test('after a third changes verdict and a cleared escalation, the spent reviewer
   // page() archives the reviewer threads whose changes verdict is for another head.
   const resumed = toSnapshot({ issue, pr, threads: [builder, changes(3, sha.slice(0, 12))] });
   assert.equal(resumed.pr?.changesRounds, 1);
-  assert.equal(nextAction(resumed, { orbs: 0, runnerSlots: 0, buildIssues: 1 }).kind, 'steer');
-  assert.deepEqual(nextAction(toSnapshot({ issue, pr, threads: [changes(3, sha.slice(0, 12))] }), { orbs: 0, runnerSlots: 0, buildIssues: 0 }),
-    { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'qa changes, round 2', round: 1 });
+  // MET-348: the legacy escalation started epoch 2, whose first correction records its budget before the steer.
+  assert.equal(resumed.correction?.epoch, 2);
+  assert.equal(nextAction(resumed, { orbs: 0, runnerSlots: 0, buildIssues: 1 }).kind, 'admit');
+  assert.equal(nextAction(toSnapshot({ issue, pr, threads: [changes(3, sha.slice(0, 12))] }), { orbs: 0, runnerSlots: 0, buildIssues: 0 }).kind, 'admit');
 });
 
 test('a reviewer that delivered changes for an older head does not hold a round: the new head is reviewed', () => {
@@ -275,4 +276,74 @@ test('P4.1: admitted load counts every reservation thread search has not returne
   ]);
   assert.deepEqual(load, { orbs: 4, runnerSlots: 1, buildIssues: 2 });
   assert.deepEqual([...building].sort(), ['MET-1', 'MET-2']);
+});
+
+// --- MET-348: escalation latch and correction epochs from issue comments -----------------------
+
+test('MET-348: epochs, budgets and the latch derive from comments; duplicates never extend, conflicts and forgeries grant nothing', () => {
+  const contract = 'abcdefabcdef';
+  const budget = (epoch: number, start: string) => `odd-budget epoch=${epoch} start=${start} deadline=${new Date(Date.parse(start) + 120 * 60_000).toISOString()} contract=${contract}`;
+  const snap = (comments: { id?: string; body: string; createdAt?: string }[], labels: string[] = []) =>
+    toSnapshot({ issue: { id: 'MET-1', status: 'In Progress', labels, comments: [...comments].reverse() } });
+  const c = (id: string, body: string, createdAt: string) => ({ id, body, createdAt });
+  const b1 = c('b1', budget(1, '2026-10-27T03:00:00.000Z'), '2026-10-27T03:00:01.000Z');
+  // One budget, then a lost-response retry an hour later: the earliest start holds.
+  const retried = snap([b1, c('b1b', budget(1, '2026-10-27T04:00:00.000Z'), '2026-10-27T04:00:00.500Z')]);
+  assert.equal(retried.correction?.budget?.deadline, '2026-10-27T05:00:00.000Z');
+  assert.equal(retried.correction?.invalid, undefined);
+  // A start Linear did not witness (backdated or forward-dated by more than 5 min) grants nothing.
+  assert.match(String(snap([c('bx', budget(1, '2026-10-27T03:00:00.000Z'), '2026-10-27T03:30:00.000Z')]).correction?.invalid), /is not its comment time/);
+  // Two contracts in one epoch, a budget for another epoch, and a malformed line are all untrusted.
+  assert.match(String(snap([b1, c('b2', budget(1, '2026-10-27T03:10:00.000Z').replace(contract, '123456123456'), '2026-10-27T03:10:00.000Z')]).correction?.invalid), /conflicting/);
+  assert.match(String(snap([c('b3', budget(2, '2026-10-27T03:00:00.000Z'), '2026-10-27T03:00:00.000Z')]).correction?.invalid), /epoch 2 recorded in epoch 1/);
+  assert.match(String(snap([c('b4', 'odd-budget epoch=1 forever', '2026-10-27T03:00:00.000Z')]).correction?.invalid), /malformed/);
+
+  const latch = c('e1', `odd-escalated reason=budget-ceiling pr=9 sha=${'c'.repeat(40)} done=label,draft,page,archive\n\ndetail`, '2026-10-27T05:00:01.000Z');
+  const held = snap([b1, latch], ['escalated']);
+  assert.equal(held.escalation?.id, 'e1');
+  assert.equal(held.correction?.epoch, 1, 'an escalation comment does not reset the budget');
+  assert.equal(held.correction?.budget?.start, '2026-10-27T03:00:00.000Z');
+  // An observed resume for the open latch starts epoch 2 once, with fresh cancellations and no budget.
+  const cancel = c('x1', 'odd-watchdog cancelled role=builder thread=T-1 round=2', '2026-10-27T04:00:00.000Z');
+  const resume = c('r1', 'odd-resume escalation=e1 epoch=2', '2026-10-27T06:00:00.000Z');
+  const after = snap([b1, cancel, latch, resume]);
+  assert.deepEqual(after.correction, { epoch: 2, corrected: false });
+  assert.equal(after.escalation, undefined);
+  assert.deepEqual(after.cancelledRounds, {});
+  // A retried resume (duplicate record) does not grant a third epoch.
+  assert.deepEqual(snap([b1, latch, resume, c('r2', 'odd-resume escalation=e1 epoch=2', '2026-10-27T06:00:05.000Z')]).correction, { epoch: 2, corrected: false });
+  // A resume naming another latch, a latch whose label was never set, or a wrong epoch is untrusted and releases nothing.
+  for (const forged of ['odd-resume escalation=e9 epoch=2', 'odd-resume escalation=e1 epoch=7']) {
+    const bad = snap([b1, latch, c('rf', forged, '2026-10-27T06:00:00.000Z')]);
+    assert.equal(bad.correction?.epoch, 1);
+    assert.equal(bad.escalation?.id, 'e1');
+    assert.match(String(bad.correction?.invalid), /does not release/);
+  }
+  const unlabelled = c('e2', `odd-escalated reason=budget-ceiling pr=9 sha=- done=-\n\nd`, '2026-10-27T05:00:01.000Z');
+  assert.equal(snap([b1, unlabelled, c('r3', 'odd-resume escalation=e2 epoch=2', '2026-10-27T06:00:00.000Z')]).correction?.epoch, 1);
+
+  // Legacy: an old escalation comment starts a new epoch (prior semantics) only before any new-style record.
+  const legacy = c('l1', 'odd-escalated reason=third-failed-qa-round\n\nMET-1: PR #9 rejected 3 times', '2026-10-26T01:00:00.000Z');
+  assert.equal(snap([legacy]).correction?.epoch, 2);
+  const late = snap([b1, c('l2', 'odd-escalated reason=third-failed-qa-round', '2026-10-27T04:00:00.000Z')]);
+  assert.equal(late.correction?.epoch, 1);
+  assert.match(String(late.correction?.invalid), /legacy odd-escalated/);
+  // A legacy history that was steered without a budget is `corrected`: it keeps the round cap.
+  assert.equal(snap([c('s1', `odd-steer key=changes-${'a'.repeat(12)} thread=T-1`, '2026-10-26T02:00:00.000Z')]).correction?.corrected, true);
+  assert.equal(snap([c('s2', `odd-steer key=ci-failed-${'a'.repeat(12)} thread=T-1`, '2026-10-26T02:00:00.000Z')]).correction?.corrected, false);
+});
+
+test('MET-348: a legacy steered history at its third rejected head still pages; a budgeted one is steered', () => {
+  const changes = (n: number, head: string): LiveThread => ({ id: `T-r${n}`, labels: ['odd-issue-met-1', 'odd-role-reviewer', `odd-round-${n}`, `odd-verdict-changes-${head}`], state: 'idle' });
+  const builder: LiveThread = { id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1'], state: 'idle' };
+  const pr: GitHubPullRequest = { number: 9, headRefOid: sha, state: 'OPEN', statusCheckRollup: [check('SUCCESS')] };
+  const threads = [builder, changes(1, 'a'.repeat(12)), changes(2, 'b'.repeat(12)), changes(3, sha.slice(0, 12))];
+  const steered = { body: `odd-steer key=changes-${'a'.repeat(12)} thread=T-b`, createdAt: '2026-10-27T03:00:00.000Z' };
+  const legacy = toSnapshot({ issue: { id: 'MET-1', status: 'In Progress', labels: ['odd'], comments: [steered] }, pr, threads });
+  assert.equal((nextAction(legacy, { orbs: 0, runnerSlots: 0, buildIssues: 1 }, Date.parse('2026-10-27T03:30:00Z')) as { reason?: string }).reason, 'third-failed-qa-round');
+  const description = '## Goal\nx';
+  const grant = `odd-budget epoch=1 start=2026-10-27T02:59:00.000Z deadline=2026-10-27T04:59:00.000Z contract=${contractOf(description, undefined)}`;
+  const budgeted = toSnapshot({ issue: { id: 'MET-1', status: 'In Progress', labels: ['odd'], description, comments: [steered, { body: grant, createdAt: '2026-10-27T02:59:00.500Z' }] }, pr, threads });
+  assert.equal(nextAction(budgeted, { orbs: 0, runnerSlots: 0, buildIssues: 1 }, Date.parse('2026-10-27T03:30:00Z')).kind, 'steer');
+  assert.equal((nextAction(budgeted, { orbs: 0, runnerSlots: 0, buildIssues: 1 }, Date.parse('2026-10-27T04:59:00Z')) as { reason?: string }).reason, 'budget-ceiling');
 });

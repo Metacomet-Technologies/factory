@@ -1182,6 +1182,14 @@ test('P3.7: a failed log-reader lookup still pages a failed rollback, but the sw
           await settle();
           const failed = (await plant.events() as { issue: string | null; stage: string; error?: string; read?: boolean }[]).filter(event => event.issue === 'MET-9' && event.stage === 'failed');
           assert.ok(failed.length > 0 && failed.every(event => String(event.error).includes(`${write} 503`)), 'the write failure stays observable');
+          if (write === 'escalation comment') {
+            // MET-348: the latch is written before any side effect, so its failure leaves no label, DM or log reader, and no lookup ran to fail.
+            assert.deepEqual(plant.saves, []);
+            assert.deepEqual(plant.dms, []);
+            assert.deepEqual([...plant.threads.values()].filter(thread => thread.labels.includes('odd-role-deployer')), []);
+            assert.deepEqual([...new Set(failed.map(event => event.read === true))], [false]);
+            return;
+          }
           assert.deepEqual([...new Set(failed.map(event => event.read === true))], [failedLookup], failedLookup ? 'the read failure is kept' : 'an action failure stays one');
           if (failedLookup) assert.equal(plant.heartbeats(), 0);
         } finally {
@@ -1921,4 +1929,119 @@ test('P4.1: concurrent issue, Slack and log-reader admissions stay at 4 orbs, 2 
   plant.index();
   await advance(20 * 60_000);
   assert.deepEqual(running(), { orbs: capacity.orbs, runnerSlots: capacity.runnerSlots, buildIssues: capacity.buildIssues });
+});
+
+// --- MET-348: outcome correction budget through the plugin -------------------------------------
+
+/** MET-7 In Progress with an idle builder and a green PR; `reject(n, head)` moves the PR to `head` and has a reviewer reject it. Linear labels follow writes. */
+function correcting() {
+  const plant = factory();
+  plant.issue('MET-7', 'In Progress');
+  plant.builder('MET-7');
+  plant.openPr('MET-7', head(1));
+  plant.control.inject = (call, input) => {
+    if (call === 'linear.save_issue' && Array.isArray(input.addLabels)) plant.issues.get(String(input.id))!.labels.push(...input.addLabels as string[]);
+    return undefined;
+  };
+  const reject = (n: number, sha: string) => {
+    const pr = plant.prs[0];
+    pr.headRefOid = sha;
+    pr.commits = [{ oid: sha, committedDate: new Date().toISOString() }];
+    plant.threads.set(`T-r${n}`, { labels: ['odd-issue-met-7', 'odd-role-reviewer', `odd-round-${n}`, 'odd-engine-openai', `odd-verdict-changes-${sha.slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+  };
+  /** Escalation DMs; archiving a reviewer records its routing, which the fixture cannot serve (an unchanged, separate page). */
+  const pages = () => plant.dms.filter(dm => !dm.includes('subscription-mismatch'));
+  const lines = (prefix: string) => (plant.comments.get('MET-7') ?? []).filter(comment => comment.body.startsWith(prefix));
+  return { plant, reject, lines, pages };
+}
+
+test('MET-348 matrix: third and fourth heads are corrected inside one fixed 120-minute epoch; at the deadline correction holds and pages once; reloads, duplicates and replacement workers never extend it', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-27T03:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const { plant, reject, lines, pages } = correcting();
+  reject(1, head(1));
+  await plant.start();
+  await settle();
+  // The admission rechecks at once (a 0 ms timer), which delivers the steer.
+  mock.timers.tick(0);
+  await settle();
+  // The budget is recorded before the first correction steer.
+  assert.deepEqual(lines('odd-budget').map(comment => comment.body.split(' contract=')[0]), ['odd-budget epoch=1 start=2026-10-27T03:00:00.000Z deadline=2026-10-27T05:00:00.000Z']);
+  assert.equal(plant.steers.length, 1);
+  const order = (plant.comments.get('MET-7') ?? []).map(comment => comment.body.split(' ')[0]);
+  assert.ok(order.indexOf('odd-budget') < order.indexOf('odd-steer'), 'budget before steer');
+  // Heads 2, 3 and 4 are rejected inside the window, across a reload and a replacement builder thread.
+  for (const [n, minutes] of [[2, 20], [3, 40], [4, 60]] as const) {
+    void minutes;
+    await advance(20 * 60_000);
+    if (n === 3) await plant.start();
+    if (n === 4) {
+      plant.threads.get('T-MET-7')!.archived = true;
+      plant.threads.set('T-MET-7b', { labels: ['odd-issue-met-7', 'odd-role-builder', 'odd-round-2', 'odd-engine-anthropic'], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+    }
+    reject(n, head(n));
+    await advance(11 * 60_000);
+  }
+  assert.equal(plant.steers.length, 4, 'every head inside the budget is corrected');
+  assert.ok(plant.steers.slice(2).every(steer => steer.includes('design reassessment')), 'from the second rejected head the handoff asks for a reassessment');
+  assert.deepEqual(pages(), [], 'no round-count-only page');
+  assert.equal(lines('odd-budget').length, 1, 'reloads, new heads and a replacement worker do not record another budget');
+  assert.deepEqual(plant.launches, [], 'no live role launched');
+  // The builder is working on head 4 when the deadline arrives: it is paged, not cancelled.
+  plant.threads.get('T-MET-7b')!.state = 'running';
+  await advance(Date.parse('2026-10-27T05:00:00Z') - Date.now() - 1);
+  assert.deepEqual(pages(), [], 'not one millisecond before the deadline');
+  await advance(10 * 60_000);
+  assert.equal(pages().length, 1);
+  assert.match(pages()[0], new RegExp(`^\\[odd\\] ODD page: budget-ceiling \\| issue MET-7 \\| PR #7 \\| ${head(4)} \\| default if silent: nothing more is started, steered or merged.*epoch 1 correction budget ended at 2026-10-27T05:00:00\\.000Z.*last blocker: builder running`));
+  assert.ok(plant.issues.get('MET-7')!.labels.includes('escalated'));
+  assert.equal(plant.threads.get('T-MET-7b')!.archived, false, 'running work is kept');
+  assert.match(lines('odd-escalated')[0].body, /^odd-escalated reason=budget-ceiling pr=7 sha=\w{40} done=label,draft,page,archive\n/);
+  // A ready verdict after the deadline does not merge; reloads and sweeps send nothing more.
+  plant.threads.set('T-r5', { labels: ['odd-issue-met-7', 'odd-role-reviewer', 'odd-round-5', 'odd-engine-openai', `odd-verdict-ready-${head(4).slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+  plant.threads.get('T-MET-7b')!.state = 'idle';
+  await plant.start();
+  await advance(30 * 60_000);
+  assert.equal(pages().length, 1);
+  assert.equal(plant.steers.length, 4);
+  assert.equal(lines('odd-merge').length, 0);
+  assert.equal(lines('odd-escalated').length, 1);
+  // Devon removes the label: one odd-resume, across a reload; then epoch 2 records its own budget at its first correction.
+  plant.issues.get('MET-7')!.labels = plant.issues.get('MET-7')!.labels.filter(label => label !== 'escalated');
+  plant.threads.delete('T-r5');
+  await advance(10 * 60_000);
+  await plant.start();
+  await advance(20 * 60_000);
+  assert.deepEqual(lines('odd-resume').map(comment => comment.body), [`odd-resume escalation=${lines('odd-escalated')[0].id} epoch=2`]);
+});
+
+test('MET-348 matrix: an interrupted escalation retries only its missing steps, never resets on the escalation comment, and keeps legacy histories at the round cap', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-27T03:00:00Z') });
+  t.after(() => mock.timers.reset());
+  // Legacy: steered without a budget (prior history of unknown age), now at its third rejected head.
+  const { plant, reject, lines, pages } = correcting();
+  plant.say('MET-7', `odd-steer key=changes-${head(1).slice(0, 12)} thread=T-MET-7`);
+  plant.say('MET-7', `odd-steer key=changes-${head(2).slice(0, 12)} thread=T-MET-7`);
+  reject(1, head(1));
+  reject(2, head(2));
+  reject(3, head(3));
+  plant.control.slackDown = 1;
+  await plant.start();
+  await settle();
+  // The latch exists before any side effect; the label landed, Slack refused, no DM went out.
+  assert.equal(lines('odd-escalated').length, 1);
+  assert.match(lines('odd-escalated')[0].body, /^odd-escalated reason=third-failed-qa-round pr=7 sha=\w{40} done=label,draft,archive\n/);
+  assert.deepEqual(pages(), []);
+  assert.equal(lines('odd-budget').length, 0, 'a legacy history mints no budget');
+  // The retry finishes the page once; the escalation comment granted no new epoch, so nothing is steered.
+  await advance(90_000);
+  assert.equal(pages().length, 1);
+  assert.match(pages()[0], /ODD page: third-failed-qa-round \| issue MET-7 \| PR #7/);
+  assert.match(lines('odd-escalated')[0].body, /done=label,draft,page,archive\n/);
+  await plant.start();
+  await advance(30 * 60_000);
+  assert.equal(pages().length, 1);
+  assert.equal(plant.steers.length, 0);
+  assert.equal(plant.saves.filter(save => save.includes('escalated')).length, 1, 'the label is set once');
+  assert.equal(lines('odd-resume').length, 0, 'no resume while the label is present');
 });
