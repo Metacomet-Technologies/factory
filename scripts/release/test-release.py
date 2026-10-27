@@ -1622,6 +1622,113 @@ class RunnerProvisioning(unittest.TestCase):
             self.assertNotEqual(resolved, str(candidate))
 
 
+class ReleaseRunEvidence(unittest.TestCase):
+    """--release-run-evidence over fake authenticated reads; synthetic runs, never natural evidence."""
+    CHANGE, FIRST, SECOND = "c" * 40, "627cfe5" + "1" * 33, "dcc0b84" + "2" * 33
+
+    def setUp(self):
+        workflow = {"old" + "0" * 37: "key: release-target-v1-", self.CHANGE: "key: release-target-v2-",
+                    "d" * 40: "key: release-target-v2-"}
+        self.files = {f".github/workflows/release.yml?ref={sha}": text for sha, text in workflow.items()}
+        self.files[f"deploy/components.json?ref={self.FIRST}"] = "{}"
+        # Newest first, as GitHub lists commits.
+        self.commits = [{"sha": sha, "commit": {"committer": {"date": "2026-10-26T14:13:55Z"}}}
+                        for sha in reversed(workflow)]
+        self.runs, self.jobs, self.logs, self.failing, self.verified = [], {}, {}, set(), []
+        self.verify_code = 0
+
+    def add_run(self, number, event="push", plans=2, build="success", conclusion="success"):
+        self.runs.append({"id": number, "run_attempt": 1, "event": event, "head_branch": "main",
+                          "head_sha": self.SECOND, "status": "completed", "conclusion": conclusion,
+                          "html_url": f"https://github.com/{r.REPO}/actions/runs/{number}"})
+        self.jobs[number] = [{"id": number * 10, "name": "build", "conclusion": build},
+                             {"id": number * 10 + 1, "name": "publish", "conclusion": conclusion}]
+        heads = [("02:07:51", "627cfe5", "02:10:07", "1m 58s"), ("02:11:54", "dcc0b84", "02:12:30", "30s")][:plans]
+        log = []
+        for start, head, end, took in heads:
+            log += [f"build\tS\t2026-10-26T{start}.36Z Cloning into '/w/f/.amp/in/release'...",
+                    f"build\tS\t2026-10-26T{start}.55Z HEAD is now at {head} Plan",
+                    f"build\tS\t2026-10-26T{end}.18Z     Finished `release` profile [optimized] target(s) in {took}"]
+        log.append("build\tS\t2026-10-26T02:13:00.00Z ##[group]Run actions/upload-artifact@cf43")
+        self.logs[number * 10] = "\n".join(log)
+        self.logs[number * 10 + 1] = (f"publish\tS\t2026-10-26T02:20:00Z v0.2.1 {self.FIRST} complete\n"
+                                      f"publish\tS\t2026-10-26T02:21:00Z v0.2.2 {self.SECOND} complete")
+
+    def evidence(self):
+        test = self
+
+        class Api(r.GitHub):
+            def request(self, path, method="GET", **_):
+                test.assertEqual(method, "GET")
+                url = urlsplit(path)
+                r.require(url.path.split("/")[0] not in test.failing, f"GitHub GET {path} failed")
+                if url.path == "commits":
+                    return test.commits
+                if url.path.startswith("contents/"):
+                    text = test.files[url.path.removeprefix("contents/") + "?ref=" + parse_qs(url.query)["ref"][0]]
+                    return {"content": base64.b64encode(text.encode()).decode()}
+                if url.path == "actions/workflows/release.yml/runs":
+                    return {"workflow_runs": test.runs}
+                if url.path.startswith("compare/"):
+                    return {"status": "ahead"}
+                if url.path.startswith("actions/runs/"):
+                    return {"jobs": test.jobs[int(url.path.split("/")[2])]}
+                raise AssertionError(path)
+
+        def verify(argv, **_):
+            test.assertIn("verify", argv)
+            test.verified.append(argv[argv.index("--tag") + 1:argv.index("--tag") + 4:2])
+            return subprocess.CompletedProcess(argv, test.verify_code, "bundle ok" if not test.verify_code else "",
+                                               "" if not test.verify_code else "asset digest mismatch")
+
+        out = io.StringIO()
+        with patch.object(r, "GitHub", Api), patch.object(prove_cache, "job_log", lambda job: self.logs[job]), \
+                patch.object(prove_cache.subprocess, "run", verify), redirect_stdout(out):
+            try:
+                prove_cache.release_run_evidence()
+            except ValueError as error:
+                return out.getvalue(), str(error)
+        return out.getvalue(), None
+
+    def test_no_eligible_natural_run_is_pending(self):
+        self.add_run(1, event="workflow_dispatch")  # two plans, but an operator run
+        self.add_run(2, plans=1)
+        self.add_run(3, build="failure")
+        out, error = self.evidence()
+        self.assertIn(f"change on main: {self.CHANGE}", out)
+        self.assertTrue(error.startswith("evidence pending: no completed naturally triggered"), error)
+        self.assertEqual(self.verified, [])
+
+    def test_eligible_multi_plan_run_is_read_back_and_verified(self):
+        self.add_run(1, event="workflow_dispatch")
+        self.add_run(2, plans=1)
+        self.add_run(3)
+        out, error = self.evidence()
+        self.assertIsNone(error)
+        self.assertIn(f"runs/3 id 3 attempt 1 event push head {self.SECOND}", out)
+        self.assertIn(f"plan v0.2.1 {self.FIRST} 243s cargo: `release` profile [optimized] target(s) in 1m 58s", out)
+        self.assertIn(f"plan v0.2.2 {self.SECOND} 66s cargo: `release` profile [optimized] target(s) in 30s", out)
+        self.assertIn(f"verified v0.2.1 {self.FIRST}: bundle ok", out)
+        self.assertEqual(self.verified, [["v0.2.1", self.FIRST]])
+
+    def test_verification_and_read_errors_are_failures_not_pending(self):
+        self.add_run(3)
+        self.verify_code = 1
+        _, error = self.evidence()
+        self.assertEqual(error, "release.py verify v0.2.1 failed: asset digest mismatch")
+        self.setUp()
+        self.add_run(3, conclusion="failure")
+        _, error = self.evidence()
+        self.assertEqual(error, "first multi-plan run 3 did not publish successfully")
+        for endpoint in ("commits", "actions", "compare"):
+            self.setUp()
+            self.add_run(3)
+            self.failing = {endpoint}
+            _, error = self.evidence()
+            self.assertRegex(error, rf"^GitHub GET {endpoint}\S* failed$")
+            self.assertEqual(self.verified, [])
+
+
 class BuildMetadata(unittest.TestCase):
     def test_normal_invalid_changed_unset_and_source_consistency(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1638,6 +1745,8 @@ class BuildMetadata(unittest.TestCase):
             (root / "kiosk/package.json").write_text('{"type":"module","version":"0.2.0"}')
             (root / "scripts/build-fingerprint.sh").write_text("printf '123456abcdef\\n'\n")
             (root / ".gitignore").write_text("target/\n")
+            # Outside the repository, cargo needs the repository pin, not a user-global default.
+            shutil.copyfile(ROOT / "rust-toolchain.toml", root / "rust-toolchain.toml")
             run(root, "cargo", "generate-lockfile")
             run(root, "git", "init", "-q")
             commit(root, "fixture metadata source")

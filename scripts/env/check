@@ -50,6 +50,8 @@ SYSTEM = [
     ("zstd", "zstd"),
     ("rsync", "rsync"),
     ("xz-utils", "xz"),
+    # scripts/release/build.sh links with -fuse-ld=lld.
+    ("lld", "ld.lld"),
 ]
 
 EXEMPT = {

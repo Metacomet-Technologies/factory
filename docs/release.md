@@ -423,8 +423,15 @@ commit before the last `Cargo.lock` change (same toolchain, override with
 factory-api, pricing and factory-ups-control. It exits nonzero on any byte
 difference, on meter/factory-api `--build-info` that is not the exact SHA, fixed
 version, clean state and commit time, or on a parent/seed SHA embedded in any
-binary. Pricing and UPS control embed no release identity. It needs `ld.lld` on
-PATH. Nothing is published, dispatched or deployed.
+binary. Pricing and UPS control embed no release identity. Nothing is
+published, dispatched or deployed.
+
+Prerequisites: the pinned Rust toolchain from `rust-toolchain.toml` (no
+user-global rustup default or `RUSTUP_TOOLCHAIN` is needed) and `ld.lld` on
+PATH, which build.sh links with. lld is a system-package item of the toolchain
+contract, so `scripts/env/check --env <name>` fails without it and
+`scripts/env/setup.sh` (`.agents/setup` on orbs) installs it when missing; that
+install needs root. The command checks both first and stops before building.
 
 The second command uses authenticated `gh` reads only. It finds the first main
 commit whose `release.yml` has the v2 key, then the first completed push or
@@ -432,7 +439,12 @@ commit whose `release.yml` has the v2 key, then the first completed push or
 two plans. It prints the run URL and ID, every plan's tag, SHA, wall time and cargo
 `Finished` lines from the job log, then runs authenticated `release.py verify` on
 the first plan's bundle. Until such a run occurs naturally it exits nonzero with
-"evidence pending"; never dispatch or rerun one to produce it. MET-331's
+"evidence pending"; never dispatch or rerun one to produce it. Record its raw
+output and exit status. Only "evidence pending" means no natural evidence yet;
+any other nonzero result (authentication or read failure, unparseable log,
+unpublished plan, failed bundle verification) is an error, never pending or
+success. The fixture tests cover pending, eligible readback and rejected-bundle
+results with synthetic runs, which never count as a natural release. MET-331's
 no-cross-run-cache design is superseded: Devon may close it once both commands'
 output (a passing identity proof and a verified multi-plan run) is recorded on
 MET-368. This tooling never changes MET-331.
