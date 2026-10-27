@@ -410,6 +410,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "shared",
  "tempfile",
  "tokio",
 ]
@@ -1094,6 +1095,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "shared",
  "tempfile",
  "toml",
 ]

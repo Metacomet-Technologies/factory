@@ -1622,6 +1622,146 @@ class RunnerProvisioning(unittest.TestCase):
             self.assertNotEqual(resolved, str(candidate))
 
 
+class CacheProofIdentity(unittest.TestCase):
+    """prove_cache.inspect against a disposable checkout of fake binaries printing chosen --build-info."""
+    VERSION = "0.2.66"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.checkout = Path(self.tmp.name) / "release"
+        (self.checkout / "scripts").mkdir(parents=True)
+        (self.checkout / "target/release").mkdir(parents=True)
+        (self.checkout / "scripts/build-fingerprint.sh").write_text('printf "fp-%s\\n" "$1"\n')
+        (self.checkout / ".gitignore").write_text("target/\n")
+        run(self.checkout, "git", "init", "-q")
+        commit(self.checkout, "identity fixture")
+        self.sha = r.git(self.checkout, "rev-parse", "HEAD")
+        self.ms = int(r.git(self.checkout, "show", "-s", "--format=%ct", "HEAD")) * 1000
+        for name in prove_cache.BINARIES:
+            self.emit(name, self.valid(name))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def valid(self, name, **change):
+        fingerprint = f"fp-{name}" if name in ("meter", "factory-api") else ""
+        identity = {"version": self.VERSION, "git_sha": self.sha, "git_dirty": False, "built_at_ms": self.ms,
+                    "inputs_fingerprint": fingerprint, **change}
+        return json.dumps({k: v for k, v in identity.items() if v is not ...}) + "\n"
+
+    def emit(self, name, stdout, code=0, body=b"fixture binary "):
+        binary = self.checkout / "target/release" / name
+        (self.checkout / f"{name}.out").write_text(stdout)
+        binary.write_bytes(b"#!/bin/sh\n# " + body + b"\n" + f'cat "{self.checkout}/{name}.out"\nexit {code}\n'.encode())
+        binary.chmod(0o755)
+
+    def inspect(self, version=None, foreign=()):
+        return prove_cache.inspect(self.checkout, dict(os.environ), self.sha, version or self.VERSION, set(foreign))
+
+    def refuse(self, name, stdout, code=0, pattern=None):
+        self.emit(name, stdout, code)
+        with self.assertRaisesRegex(ValueError, pattern or re.escape(name)):
+            self.inspect()
+        self.emit(name, self.valid(name))
+
+    def test_all_four_identities_required_and_reported(self):
+        result = self.inspect()
+        self.assertEqual(set(result), set(prove_cache.BINARIES))
+        for name, row in result.items():
+            self.assertEqual(row["identity"], json.loads(self.valid(name)))
+            self.assertEqual(len(row["sha256"]), 64)
+        self.assertEqual(result["pricing"]["identity"]["inputs_fingerprint"], "")
+        self.assertEqual(result["factory-ups-control"]["identity"]["inputs_fingerprint"], "")
+        self.assertEqual(result["meter"]["identity"]["inputs_fingerprint"], "fp-meter")
+        self.assertEqual(self.inspect(), result)  # repeated valid runs agree
+
+    def test_each_binary_independently_rejects_absent_malformed_or_failed_identity(self):
+        for name in prove_cache.BINARIES:
+            good = self.valid(name)
+            for label, stdout, code in (("absent", "", 0), ("blank", "\n", 0), ("null", "null\n", 0),
+                                        ("array", "[]\n", 0), ("malformed", "{version: 1}\n", 0),
+                                        ("truncated", good[:len(good) // 2] + "\n", 0),
+                                        ("no newline", good[:-1], 0), ("two lines", good + good, 0),
+                                        ("nonzero exit", good, 1), ("unknown flag", "", 2),
+                                        ("duplicate key", good[:-2] + ', "git_dirty": false}\n', 0)):
+                with self.subTest(name=name, case=label):
+                    self.refuse(name, stdout, code)
+        self.inspect()
+
+    def test_missing_extra_and_wrongly_typed_fields(self):
+        for name in prove_cache.BINARIES:
+            for label, change in (("missing version", {"version": ...}), ("missing fingerprint", {"inputs_fingerprint": ...}),
+                                  ("missing time", {"built_at_ms": ...}), ("extra status", {"status": "ok"}),
+                                  ("dirty as zero", {"git_dirty": 0}), ("dirty as string", {"git_dirty": "false"}),
+                                  ("time as string", {"built_at_ms": str(self.ms)}),
+                                  ("time as float", {"built_at_ms": float(self.ms)}),
+                                  ("fingerprint null", {"inputs_fingerprint": None})):
+                with self.subTest(name=name, case=label):
+                    self.refuse(name, self.valid(name, **change))
+
+    def test_wrong_release_values_and_asymmetric_controls(self):
+        for name in prove_cache.BINARIES:
+            for label, change in (("short sha", {"git_sha": self.sha[:7]}), ("other sha", {"git_sha": "b" * 40}),
+                                  ("dirty", {"git_dirty": True}), ("seconds", {"built_at_ms": self.ms // 1000}),
+                                  ("wall clock", {"built_at_ms": self.ms + 1}), ("source version", {"version": "0.2.0"}),
+                                  ("other fingerprint", {"inputs_fingerprint": "fp-other"})):
+                with self.subTest(name=name, case=label):
+                    self.refuse(name, self.valid(name, **change))
+        # Controls: the full SHA, milliseconds and false pass; versions match only the fixed override.
+        self.inspect()
+        for name in prove_cache.BINARIES:
+            self.emit(name, self.valid(name, version="0.2.0"))
+        self.assertEqual(self.inspect(version="0.2.0")["pricing"]["identity"]["version"], "0.2.0")
+        with self.assertRaisesRegex(ValueError, "meter"):
+            self.inspect()
+
+    def test_fingerprint_semantics(self):
+        # pricing/UPS must not fabricate one; meter/API keep their computed contract.
+        self.refuse("pricing", self.valid("pricing", inputs_fingerprint="fp-pricing"))
+        self.refuse("factory-ups-control", self.valid("factory-ups-control", inputs_fingerprint="fp-meter"))
+        self.refuse("factory-api", self.valid("factory-api", inputs_fingerprint=""))
+        (self.checkout / "scripts/build-fingerprint.sh").write_text("printf '\\n'\n")
+        with self.assertRaisesRegex(ValueError, "meter build fingerprint is empty"):
+            self.inspect()
+
+    def test_reordered_keys_pass_and_retry_after_failure_is_fresh(self):
+        for name in prove_cache.BINARIES:
+            reordered = dict(reversed(list(json.loads(self.valid(name)).items())))
+            self.emit(name, json.dumps(reordered, indent=None, separators=(",", ":")) + "\n")
+        first = self.inspect()
+        self.emit("factory-ups-control", "")
+        with self.assertRaisesRegex(ValueError, "factory-ups-control"):
+            self.inspect()
+        self.emit("factory-ups-control", self.valid("factory-ups-control"))
+        self.assertEqual(self.inspect()["factory-ups-control"]["identity"], first["factory-ups-control"]["identity"])
+
+    def test_foreign_sha_scan_and_scenario_comparison(self):
+        foreign = "c" * 40
+        self.emit("pricing", self.valid("pricing"), body=foreign.encode())
+        with self.assertRaisesRegex(ValueError, f"pricing embeds foreign SHA {foreign}"):
+            self.inspect(foreign=[foreign])
+        self.emit("pricing", self.valid("pricing"))
+        builds = {scenario: self.inspect(foreign=[foreign]) for scenario in ("warm", "cold", "seeded")}
+        prove_cache.compare(builds)
+        # One binary's identity alone differs: refused even with identical bytes.
+        one = copy.deepcopy(builds)
+        one["seeded"]["factory-ups-control"]["identity"]["built_at_ms"] += 1
+        with self.assertRaisesRegex(ValueError, "factory-ups-control") as raised:
+            prove_cache.compare(one)
+        self.assertNotIn("pricing", str(raised.exception))
+        # Combined bad identity and byte mismatch: inspect refuses, and both differences are reported.
+        self.emit("meter", self.valid("meter", git_dirty=True), body=b"different bytes")
+        with self.assertRaisesRegex(ValueError, "meter embedded identity"):
+            self.inspect()
+        both = copy.deepcopy(builds)
+        both["cold"]["meter"]["sha256"] = "f" * 64
+        both["cold"]["pricing"]["identity"] = None
+        with self.assertRaises(ValueError) as raised:
+            prove_cache.compare(both)
+        self.assertIn("meter:", str(raised.exception))
+        self.assertIn("pricing:", str(raised.exception))
+
+
 class ReleaseRunEvidence(unittest.TestCase):
     """--release-run-evidence over fake authenticated reads; synthetic runs, never natural evidence."""
     CHANGE, FIRST, SECOND = "c" * 40, "627cfe5" + "1" * 33, "dcc0b84" + "2" * 33

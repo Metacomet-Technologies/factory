@@ -58,6 +58,8 @@ fn timestamp(text: &str) -> Result<i64> {
 }
 
 fn main() -> Result<()> {
+    // No component fingerprint contract: the release identity alone.
+    shared::exit_if_build_info("");
     let cli = Cli::parse();
     eprintln!(
         "pricing feeds: openrouter={} litellm={}",
