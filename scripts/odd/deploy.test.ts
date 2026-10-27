@@ -1331,23 +1331,53 @@ test('sandbox: a red probe runs the rollback once, the restored release is re-pr
 });
 
 /** Fake plugin context: records every tool call; `fail` makes that tool's next call fail once. */
-function pluginContext(found: { id: string }[] = [], fail?: string) {
+function pluginContext(found: { id: string }[] = [], fail?: string, linear = fakeLinear()) {
   const tools: [string, Record<string, unknown>][] = [];
-  const bugs: string[] = [];
   const ctx = {
     tools: { call: async (name: string, input: Record<string, unknown>) => {
       tools.push([name, input]);
-      if (name === fail) { fail = undefined; throw new Error(`${name}: HTTP 503`); }
+      if (name === fail || (fail === 'Bug lookup' && name === 'linear.get_issue')) { fail = undefined; throw new Error(`${name}: HTTP 503`); }
       if (name === 'find_thread') return { threads: found };
-      if (name === 'linear.list_issues') return { issues: bugs.map(title => ({ id: 'MET-900', title })) };
-      if (name === 'linear.save_issue' && typeof input.title === 'string') bugs.push(input.title);
       if (name === 'linear.save_comment') return { id: input.id ?? 'c-latch' };
-      return name === 'linear.save_issue' && input.title ? { identifier: 'MET-900' } : {};
+      return linear.call(name, input) ?? {};
     } },
     $: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
     logger: { log: () => {} },
   };
-  return { ctx: ctx as unknown as Parameters<typeof page>[0], tools };
+  return { ctx: ctx as unknown as Parameters<typeof page>[0], tools, linear };
+}
+
+/** Fake Linear issues with related-issue links, as get_issue returns them; a created issue is MET-900, MET-901, … */
+function fakeLinear() {
+  const issues = new Map<string, { id: string; title: string; description: string; labels: string[]; status: string; related: Set<string> }>();
+  const add = (id: string, fields: { title?: string; description?: string; labels?: string[]; status?: string; related?: string[] } = {}) => {
+    issues.set(id, { id, title: fields.title ?? id, description: fields.description ?? '', labels: fields.labels ?? ['odd'], status: fields.status ?? 'Deploying', related: new Set() });
+    for (const other of fields.related ?? []) link(id, other);
+  };
+  const link = (a: string, b: string) => {
+    if (!issues.has(b)) add(b);
+    issues.get(a)!.related.add(b);
+    issues.get(b)!.related.add(a);
+  };
+  const call = (name: string, input: Record<string, unknown>): unknown => {
+    if (name === 'linear.get_issue') {
+      const id = String(input.id);
+      if (!issues.has(id)) add(id);
+      const { title, description, labels, status, related } = issues.get(id)!;
+      return { id, title, description, labels, status, relations: { blockedBy: [], relatedTo: [...related].map(other => ({ id: other, title: issues.get(other)!.title })) } };
+    }
+    if (name === 'linear.save_issue' && typeof input.title === 'string' && input.id === undefined) {
+      const id = `MET-${900 + [...issues.keys()].filter(key => /^MET-9\d\d$/.test(key)).length}`;
+      add(id, { title: input.title, description: String(input.description), labels: input.labels as string[], status: String(input.state) });
+      for (const other of (input.relatedTo as string[] | undefined) ?? []) link(id, other);
+      return { identifier: id };
+    }
+    if (name === 'linear.save_issue' && typeof input.id === 'string' && typeof input.title === 'string') issues.get(input.id)!.title = input.title;
+    // Linear's search matches title or description text; only a title lookup could rely on it.
+    if (name === 'linear.list_issues' && typeof input.query === 'string') return { issues: [...issues.values()].filter(issue => `${issue.title}\n${issue.description}`.includes(String(input.query))).map(({ id, title }) => ({ id, title })) };
+    return undefined;
+  };
+  return { issues, add, link, call, created: () => [...issues.values()].filter(issue => issue.labels.includes('Bug')) };
 }
 
 for (const [name, options] of [['exits non-zero', { rollbackOk: false }], ['exits 0 but the release stays red', { rollbackRestores: false }]] as const) {
@@ -1390,7 +1420,7 @@ const flakySpawn = (fails: boolean) => {
   return { spawn, spawned };
 };
 
-for (const [what, receiptSha, failTool, spawnFails] of [['Bug lookup', 'c'.repeat(40), 'linear.list_issues', false], ['log-reader spawn', 'd'.repeat(40), undefined, true]] as const) {
+for (const [what, receiptSha, failTool, spawnFails] of [['Bug lookup', 'c'.repeat(40), 'Bug lookup', false], ['log-reader spawn', 'd'.repeat(40), undefined, true]] as const) {
   test(`control plane: when the ${what} fails, the issue stays in Deploying; re-evaluating it files one Bug, starts one log reader and only then moves it to Todo`, async () => {
     const issue = redIssue(receiptSha, '/var/backups/kiosk/snap');
     const { ctx, tools } = pluginContext([], failTool);
@@ -1410,12 +1440,72 @@ for (const [what, receiptSha, failTool, spawnFails] of [['Bug lookup', 'c'.repea
   });
 }
 
+// P4.6-rollback-bugs: a rollback Bug is labelled by its receipt component and found again by relation and key, never by title.
+const rollbackOf = (identifier: string, component: string, receiptSha: string) => ({ identifier, status: 'Deploying' as const, labels: ['odd'], description: '', openBlockers: [],
+  deployReceipt: parseDeployReceipt(line(`component=${component} sha=${receiptSha} health=fail rollback=/var/backups/${component}/snap`)) });
+const evaluate = async (linear: ReturnType<typeof fakeLinear>, issue: ReturnType<typeof rollbackOf>) => {
+  const { ctx } = pluginContext([{ id: 'T-reader' }], undefined, linear);
+  await setStatus(ctx, issue, nextAction(issue, idle) as Extract<Action, { kind: 'set-status' }>, async () => 'T-deployer');
+};
+
+test('P4.6-rollback-bugs: every deploy component files its Bug in Triage with exactly Bug and its own area; tooling components fall back to ops, never agents', async () => {
+  const components = JSON.parse(readFileSync(new URL('../../deploy/components.json', import.meta.url), 'utf8')).components.map((component: { id: string }) => component.id) as string[];
+  const expected: Record<string, string> = { meter: 'area:meter', 'factory-api': 'area:api', kiosk: 'area:kiosk' };
+  assert.ok(['meter', 'factory-api', 'kiosk', 'dispatcher', 'usage'].every(name => components.includes(name)), components.join(' '));
+  for (const component of components) {
+    const linear = fakeLinear();
+    await evaluate(linear, rollbackOf('MET-311', component, 'c'.repeat(40)));
+    const bugs = linear.created();
+    assert.equal(bugs.length, 1, component);
+    assert.deepEqual([bugs[0].labels, bugs[0].status], [['Bug', expected[component] ?? 'area:ops'], 'Triage'], component);
+    assert.ok(bugs[0].related.has('MET-311'), component);
+  }
+});
+
+test('P4.6-rollback-bugs: repeated evaluations and an edited title reuse the related Bug; same-title, unkeyed or other-identity issues are never reused', async () => {
+  const sha = 'c'.repeat(40);
+  const title = `Deploy failed: meter at ${sha.slice(0, 12)}`;
+  const linear = fakeLinear();
+  // An unrelated Bug with the identical title and even the key line, not linked to MET-311.
+  linear.add('MET-500', { title, labels: ['Bug', 'area:agents'], status: 'Triage', description: `odd-rollback-bug source=MET-311 component=meter sha=${sha}` });
+  // A related issue with the identical title but no key line (filed by hand).
+  linear.add('MET-501', { title, labels: ['Bug', 'area:meter'], status: 'Triage', description: 'seen it too', related: ['MET-311'] });
+  // A related Bug for another source issue of the same release.
+  linear.add('MET-502', { title, labels: ['Bug', 'area:meter'], status: 'Triage', description: `odd-rollback-bug source=MET-312 component=meter sha=${sha}`, related: ['MET-311', 'MET-312'] });
+  const issue = rollbackOf('MET-311', 'meter', sha);
+  await evaluate(linear, issue);
+  const filed = linear.created().filter(bug => bug.id >= 'MET-900');
+  assert.deepEqual(filed.map(bug => bug.id), ['MET-900'], 'none of MET-500..502 is reused');
+  await evaluate(linear, issue);
+  linear.call('linear.save_issue', { id: 'MET-900', title: 'meter rollback: probe 503 after install' });
+  await evaluate(linear, issue);
+  assert.deepEqual(linear.created().filter(bug => bug.id >= 'MET-900').map(bug => bug.id), ['MET-900'], 'reused after a repeat and a title edit');
+  // Each part of the identity is a different Bug: another release, another component, another source issue.
+  await evaluate(linear, rollbackOf('MET-311', 'meter', 'd'.repeat(40)));
+  await evaluate(linear, rollbackOf('MET-311', 'kiosk', sha));
+  await evaluate(linear, rollbackOf('MET-313', 'meter', sha));
+  assert.deepEqual(linear.created().filter(bug => bug.id >= 'MET-900').map(bug => [bug.id, bug.labels[1], [...bug.related].sort().join(' ')]),
+    [['MET-900', 'area:meter', 'MET-311'], ['MET-901', 'area:meter', 'MET-311'], ['MET-902', 'area:kiosk', 'MET-311'], ['MET-903', 'area:meter', 'MET-313']]);
+});
+
+test('P4.6-rollback-bugs: a source issue read without its related list, or with a malformed one, files no Bug and keeps the issue in Deploying', async () => {
+  for (const relations of [undefined, {}, { relatedTo: null }, { relatedTo: [{}] }, { relatedTo: [{ id: '' }] }]) {
+    const linear = fakeLinear();
+    const base = linear.call;
+    const issue = rollbackOf('MET-311', 'meter', 'c'.repeat(40));
+    const { ctx, tools } = pluginContext([], undefined, { ...linear, call: (name: string, input: Record<string, unknown>) =>
+      name === 'linear.get_issue' && input.id === 'MET-311' ? { id: 'MET-311', status: 'Deploying', labels: ['odd'], relations } : base(name, input) });
+    await assert.rejects(setStatus(ctx, issue, nextAction(issue, idle) as Extract<Action, { kind: 'set-status' }>, async () => 'T-deployer'), /relatedTo|malformed/, JSON.stringify(relations));
+    assert.deepEqual(tools.filter(([tool]) => tool === 'linear.save_issue'), [], JSON.stringify(relations));
+  }
+});
+
 /** The registered plugin armed in a control thread, with fake Amp, Linear, GitHub and Slack. */
 async function controlPlane(options: { issue: string; receipt: string; failOnce: string }) {
   const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
   const webhooks = new Map<string, (event: unknown, ctx: unknown) => Promise<void>>();
   const calls: string[] = [];
-  const bugs: string[] = [];
+  const linear = fakeLinear();
   let status = 'Deploying';
   let failOnce: string | undefined = options.failOnce;
   const alerts: string[] = [];
@@ -1423,13 +1513,18 @@ async function controlPlane(options: { issue: string; receipt: string; failOnce:
     // The Watchdog sweep enumerates issues by status and posts to #factory-alerts; neither is the handoff under test.
     if (name === 'linear.list_issues' && (input.state !== undefined || input.label !== undefined)) return { issues: [] };
     if (name === 'slack_write' && input.channelName !== undefined) { alerts.push(String(input.text)); return {}; }
-    if (name === failOnce) { failOnce = undefined; calls.push(`${name} failed`); throw new Error(`${name}: HTTP 503`); }
+    const lookup = name === 'linear.get_issue' && Array.isArray(input.fields) && input.fields.includes('relations');
+    if (lookup) calls.push('Bug lookup');
+    if (failOnce === 'Bug lookup' && lookup) { failOnce = undefined; calls[calls.length - 1] = 'Bug lookup failed'; throw new Error(`${name}: HTTP 503`); }
     switch (name) {
-      case 'linear.get_issue': return { id: options.issue, status, labels: ['odd'], description: '', relations: { blockedBy: [] } };
+      case 'linear.get_issue': {
+        if (input.id !== options.issue) return linear.call(name, input);
+        const { relations } = linear.call(name, input) as { relations: unknown };
+        return { id: options.issue, status, labels: ['odd'], description: '', relations };
+      }
       case 'linear.list_comments': return { comments: [{ body: options.receipt, createdAt: '2026-10-24T15:00:00Z' }, { body: 'odd-merge pr=1 head=a merge=b release=none', createdAt: '2026-10-24T14:00:00Z' }], hasNextPage: false };
-      case 'linear.list_issues': calls.push('Bug lookup'); return { issues: bugs.map(title => ({ id: 'MET-900', title })) };
       case 'linear.save_issue':
-        if (typeof input.title === 'string') { bugs.push(input.title); calls.push('Bug created'); return { identifier: 'MET-900' }; }
+        if (typeof input.title === 'string') { calls.push('Bug created'); return linear.call(name, input); }
         if (typeof input.state === 'string') { status = input.state; calls.push(`status ${status}`); }
         return {};
       case 'find_thread': return { threads: [] };
@@ -1474,9 +1569,9 @@ test('control plane, through the registered webhook: a transient Bug-lookup fail
   mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   t.after(() => mock.timers.reset());
   const receipt = line(`component=kiosk sha=${'f'.repeat(40)} health=fail rollback=/var/backups/kiosk/snap`);
-  const host = await controlPlane({ issue: 'MET-312', receipt, failOnce: 'linear.list_issues' });
+  const host = await controlPlane({ issue: 'MET-312', receipt, failOnce: 'Bug lookup' });
   await assert.rejects(host.deliver('evt-1'), /HTTP 503/);
-  assert.deepEqual(host.calls, ['linear.list_issues failed']);
+  assert.deepEqual(host.calls, ['Bug lookup failed']);
   assert.equal(host.status(), 'Deploying');
   // No new event arrives: the failure's own re-check (90 s) finishes the handoff.
   mock.timers.tick(90_000);
@@ -1485,7 +1580,7 @@ test('control plane, through the registered webhook: a transient Bug-lookup fail
   assert.equal(host.status(), 'Todo');
 
   // A redelivery of a failed event is evaluated again rather than dropped as seen.
-  const again = await controlPlane({ issue: 'MET-313', receipt: receipt.replace('f'.repeat(40), '9'.repeat(40)), failOnce: 'linear.list_issues' });
+  const again = await controlPlane({ issue: 'MET-313', receipt: receipt.replace('f'.repeat(40), '9'.repeat(40)), failOnce: 'Bug lookup' });
   await assert.rejects(again.deliver('evt-2'), /HTTP 503/);
   await again.deliver('evt-2');
   assert.equal(again.status(), 'Todo');

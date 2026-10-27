@@ -194,7 +194,7 @@ test('the sweep records a cancellation on the issue before it archives the stale
     switch (name) {
       case 'linear.list_issues': return { issues: [], hasNextPage: false, cursor: '' };
       case 'find_thread': return /odd-role-builder|odd-issue-met-1 /.test(String(input.query)) ? { threads: [{ id: 'T-1', updatedAt: new Date(Date.now() - staleMs - 60_000).toISOString() }] } : { threads: [] };
-      case 'linear.get_issue': return { id: 'MET-1', status: 'In Progress', labels: ['odd'], description: '', relations: { blockedBy: [] } };
+      case 'linear.get_issue': return { id: 'MET-1', status: 'In Progress', labels: ['odd'], description: '', relations: { blockedBy: [], relatedTo: [] } };
       case 'linear.save_comment':
         if (commentFailures-- > 0) throw new Error('503 Service Unavailable');
         return {};
@@ -764,7 +764,7 @@ function factory() {
       case 'linear.list_issues': return { issues: [...issues.values()].filter(issue => issue.status === input.state && (!input.label || issue.labels.includes(String(input.label)))).map(({ id }) => ({ id })), hasNextPage: false };
       case 'linear.get_issue':
         if (input.id === control.unreadable) throw new Error('Linear 503');
-        return { ...issues.get(String(input.id))!, relations: { blockedBy: [] } };
+        return { ...issues.get(String(input.id))!, relations: { blockedBy: [], relatedTo: [] } };
       case 'linear.list_comments': {
         // Newest first, `limit` per page; each page repeats the previous page's last comment, as overlapping pages can.
         const all = [...(comments.get(String(input.issueId)) ?? [])].reverse();
@@ -1305,22 +1305,25 @@ test('P3.7: genuine pending CheckRuns, status contexts and an empty rollup are v
 
 test('P3.7: the follow-up Bug lookup rejects malformed rows instead of filing a duplicate; valid empty and matching lookups create or reuse', async () => {
   const title = 'Release 1.2.3 rolled back (abcdef123456)';
-  const run = async (lookup: unknown) => {
+  const receipt = { host: 'factory-gpu', component: 'meter', sha: 'abcdef123456', health: 'fail', rollback: '/snap' } as const;
+  const key = 'odd-rollback-bug source=MET-7 component=meter sha=abcdef123456';
+  const run = async (related: unknown) => {
     const saves: Record<string, unknown>[] = [];
     const tools = { call: async (name: string, input: Record<string, unknown>) => {
-      if (name === 'linear.list_issues') return lookup;
+      if (name === 'linear.get_issue' && input.id === 'MET-7') return { id: 'MET-7', status: 'Deploying', labels: ['odd'], relations: { blockedBy: [], relatedTo: related } };
+      if (name === 'linear.get_issue') return { id: input.id, status: 'Triage', labels: ['Bug'], description: `x\n\n${key}` };
       if (name === 'linear.save_issue') { saves.push(input); return { id: 'uuid-new', identifier: 'MET-900' }; }
       return {};
     } };
     const issue = { identifier: 'MET-7' } as Parameters<typeof followUp>[1];
-    const result = await followUp({ tools, logger: { log: () => {} } } as Parameters<typeof followUp>[0], issue, { title, body: 'x' }).then(id => ({ id }), (error: unknown) => ({ error: String(error) }));
+    const result = await followUp({ tools, logger: { log: () => {} } } as Parameters<typeof followUp>[0], issue, { title, body: 'x' }, receipt).then(id => ({ id }), (error: unknown) => ({ error: String(error) }));
     return { result, saves: saves.map(input => (input.title ? 'create' : `relate ${String(input.id)}`)) };
   };
-  assert.deepEqual(await run({ issues: [] }), { result: { id: 'MET-900' }, saves: ['create'] });
-  assert.deepEqual(await run({ issues: [{ id: 'MET-55', title }] }), { result: { id: 'MET-55' }, saves: ['relate MET-55'] });
-  for (const rows of [[{}], [{ title }], [{ id: '', title }], [{ id: 'MET-55' }]]) {
-    const { result, saves } = await run({ issues: rows });
-    assert.match((result as { error?: string }).error ?? '', /linear\.list_issues returned a malformed issues row at 0/, JSON.stringify(rows));
+  assert.deepEqual(await run([]), { result: { id: 'MET-900' }, saves: ['create'] });
+  assert.deepEqual(await run([{ id: 'MET-55', title }]), { result: { id: 'MET-55' }, saves: [] });
+  for (const rows of [[{}], [{ title }], [{ id: '', title }], undefined, null, 'MET-55']) {
+    const { result, saves } = await run(rows);
+    assert.match((result as { error?: string }).error ?? '', /linear\.get_issue MET-7 relations returned (a malformed relatedTo row at 0|no relatedTo list)/, JSON.stringify(rows));
     assert.deepEqual(saves, [], `no Bug filed for ${JSON.stringify(rows)}`);
   }
 });
@@ -1335,8 +1338,8 @@ const rolledBack = (plant: ReturnType<typeof factory>) => {
 test('P3.7: a read that fails while acting withholds the heartbeat and writes nothing; a valid read acts and heartbeats', async t => {
   const lookups: [string, unknown, boolean][] = [
     ['valid empty Bug lookup (control)', undefined, true],
-    ['Bug lookup rows [{}]', { issues: [{}], hasNextPage: false }, false],
-    ['Bug lookup isError', { isError: true, content: [{ type: 'text', text: '{"issues":[],"hasNextPage":false}' }] }, false],
+    ['Bug lookup rows [{}]', { id: 'MET-9', status: 'Deploying', labels: ['odd'], relations: { relatedTo: [{}] } }, false],
+    ['Bug lookup isError', { isError: true, content: [{ type: 'text', text: '{"id":"MET-9","status":"Deploying","labels":["odd"],"relations":{"relatedTo":[]}}' }] }, false],
   ];
   for (const [name, lookup, healthy] of lookups) {
     await t.test(name, async () => {
@@ -1344,7 +1347,7 @@ test('P3.7: a read that fails while acting withholds the heartbeat and writes no
       try {
         const plant = factory();
         rolledBack(plant);
-        if (lookup !== undefined) plant.control.inject = (call, input) => call === 'linear.list_issues' && input.query ? lookup : undefined;
+        if (lookup !== undefined) plant.control.inject = (call, input) => call === 'linear.get_issue' && Array.isArray(input.fields) && input.fields.includes('relations') ? lookup : undefined;
         await plant.start();
         await settle();
         const sweep = (await plant.events()).find(event => event.issue === null);

@@ -327,6 +327,12 @@ export function issueTriaged(issue: { status: string; labels: readonly string[] 
   return missing;
 }
 
+/** A rollback Bug's area label, from its receipt component; components without their own area (the tooling ones) are ops. */
+export const rollbackArea = (component: string) => ({ meter: 'area:meter', 'factory-api': 'area:api', kiosk: 'area:kiosk' } as Record<string, string>)[component] ?? 'area:ops';
+
+/** A rollback Bug's identity, a line of its description: source issue, component and failed release. Its title may be edited; this line identifies it. */
+export const rollbackBugKey = (source: string, receipt: DeployReceipt) => `odd-rollback-bug source=${source} component=${receipt.component} sha=${receipt.sha}`;
+
 export const deployReceiptLine = (receipt: DeployReceipt) =>
   `odd-deploy host=${receipt.host} component=${receipt.component} sha=${receipt.sha} health=${receipt.health} rollback=${receipt.rollback}${receipt.refusal ? ` refusal=${receipt.refusal}` : ''}`;
 

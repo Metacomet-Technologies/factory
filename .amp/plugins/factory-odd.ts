@@ -29,6 +29,8 @@ import {
 	parseThreadLabels,
 	ralphGuard,
 	resumeLine,
+	rollbackArea,
+	rollbackBugKey,
 	spawnKey,
 	spawnLine,
 	specComplete,
@@ -1218,7 +1220,7 @@ type Spawn = (labels: string[], content: string) => Promise<string>
 // log reader are both deduplicated, and a failure in either leaves the issue in Deploying for the
 // next evaluation to retry. Moving it to Todo first would hand it to a builder with neither.
 export async function setStatus(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, action: Extract<Action, { kind: 'set-status' }>, spawn: Spawn) {
-	const bug = action.followUp ? await followUp(ctx, issue, action.followUp) : undefined
+	const bug = action.followUp && action.diagnose ? await followUp(ctx, issue, action.followUp, action.diagnose) : undefined
 	if (action.diagnose) await diagnose(ctx, issue, action.diagnose, bug, spawn)
 	await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: action.status })
 }
@@ -1292,18 +1294,22 @@ export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 	if (unread) throw unread
 }
 
-// A rolled-back release returns its issues to Todo and files one Bug in Triage per failed
-// release (the title carries the SHA; a second issue of the same release reuses it). Returns the Bug.
-export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, followUp: { title: string; body: string }): Promise<string | undefined> {
-	// A malformed row is a failed lookup, never "no Bug yet": that would file a duplicate.
-	const existing = listOf<{ id: string; title: string }>(await readJson(ctx.tools, 'linear.list_issues', { team: 'Metacomet', query: followUp.title, limit: 10 }), 'issues', 'linear.list_issues', row => named(row.id) && typeof row.title === 'string')
-	const match = existing.find(candidate => candidate.title === followUp.title)
-	if (match?.id) {
-		await callJson(ctx.tools, 'linear.save_issue', { id: match.id, relatedTo: [issue.identifier] })
-		ctx.logger.log(marker, 'follow-up exists', issue.identifier, match.id)
-		return match.id
+// A rolled-back release returns its issues to Todo and files one Bug in Triage per source issue,
+// component and failed release, labelled with the component's area. The Bug is found again through
+// the source issue's related issues and the key line in its description, never by title: an
+// edited title still matches, an unrelated issue with the same title never does. Returns the Bug.
+export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, followUp: { title: string; body: string }, receipt: DeployReceipt): Promise<string | undefined> {
+	const key = rollbackBugKey(issue.identifier, receipt)
+	// A missing or malformed related list is a failed lookup, never "no Bug yet": that would file a duplicate.
+	const source = await getIssue(ctx.tools, { id: issue.identifier, fields: ['id', 'status', 'labels', 'relations'] })
+	const related = listOf<{ id: string }>(source.relations, 'relatedTo', `linear.get_issue ${issue.identifier} relations`, row => named(row.id))
+	for (const { id } of related) {
+		const candidate = await getIssue(ctx.tools, { id, fields: ['id', 'status', 'labels', 'description'] })
+		if (!(candidate.description ?? '').split('\n').some(line => line.trim() === key)) continue
+		ctx.logger.log(marker, 'follow-up exists', issue.identifier, id)
+		return id
 	}
-	const created = await callJson<{ id?: string; identifier?: string }>(ctx.tools, 'linear.save_issue', { team: 'Metacomet', title: followUp.title, description: followUp.body, labels: ['Bug', 'area:agents'], state: 'Triage', relatedTo: [issue.identifier] })
+	const created = await callJson<{ id?: string; identifier?: string }>(ctx.tools, 'linear.save_issue', { team: 'Metacomet', title: followUp.title, description: `${followUp.body}\n\n${key}`, labels: ['Bug', rollbackArea(receipt.component)], state: 'Triage', relatedTo: [issue.identifier] })
 	ctx.logger.log(marker, 'follow-up filed', issue.identifier, created.identifier ?? created.id ?? '')
 	return created.identifier ?? created.id
 }
