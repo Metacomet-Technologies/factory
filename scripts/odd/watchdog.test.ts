@@ -3353,7 +3353,7 @@ test('P3.10: a running owner never pages; one without activity reaches the diges
   assert.equal(overduePage('MET-1', { ...approval, wait: { ...approval.wait!, since: ago(29) } }, now.getTime()), undefined);
 });
 
-test('P3.10: the sweep cancels an inactive running builder with its exact reason before archiving it; fresh, undated, approval-blocked and delivered threads stay; an unknown state is a failed read that touches nothing', async t => {
+test('P3.10: the sweep cancels an inactive running builder with its exact reason before archiving it; fresh, undated, approval-blocked and delivered threads stay; an unknown state fails only its own issue, which nothing touches', async t => {
   mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
   t.after(() => mock.timers.reset());
   const plant = factory();
@@ -3366,6 +3366,8 @@ test('P3.10: the sweep cancels an inactive running builder with its exact reason
   plant.threads.set('T-MET-10-builder-2', { labels: ['odd-issue-met-10', 'odd-role-builder', 'odd-round-2'], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
   const active = ago(1);
   thread('MET-2', 'builder', 'tool-running', active); // active
+  plant.issue('MET-7', 'In Progress');
+  thread('MET-7', 'builder', 'working', active); // MET-394: Amp's `working` is running, and active
   thread('MET-3', 'builder', 'running'); // activity never reported
   thread('MET-4', 'builder', 'awaiting-approval', ago(60)); // waits on Devon
   plant.openPr('MET-5', 'a'.repeat(40));
@@ -3387,20 +3389,39 @@ test('P3.10: the sweep cancels an inactive running builder with its exact reason
   assert.ok(!plant.saves.some(save => /^MET-[2-5] /.test(save)), 'no other status changes');
   const met3 = (await plant.events()).find(event => event.issue === 'MET-3') as { wait?: string } | undefined;
   assert.equal(met3?.wait, 'activity unknown', 'missing activity is surfaced');
+  assert.deepEqual(cancelled('MET-7'), []);
+  assert.equal(((await plant.events()).find(event => event.issue === 'MET-7') as { wait?: string } | undefined)?.wait, 'activity 1 min', 'a working owner waits on its activity');
+  // The sweep that read the `working` thread completed and persisted the heartbeat (MET-394).
+  assert.ok(plant.heartbeats() >= 1, 'a sweep with a working thread writes the heartbeat');
+  const watchdog = async () => (({ error, blindSince }) => ({ error, blindSince }))((JSON.parse(await plant.sweep()) as { watchdog: { error?: string; blindSince?: string } }).watchdog);
+  assert.deepEqual(await watchdog(), { error: undefined, blindSince: undefined }, 'nor is it blind');
   // Fifteen minutes later the active builder has gone quiet too; the undated one still is never guessed stale.
   await advance(16 * 60_000);
   assert.equal(cancelled('MET-2').length, 1);
   assert.deepEqual(cancelled('MET-2'), [`odd-watchdog cancelled role=builder thread=T-MET-2-builder round=1\n\nrunning thread inactive for 16 min since ${active} (budget 15 min)`]);
+  assert.deepEqual(cancelled('MET-7'), [`odd-watchdog cancelled role=builder thread=T-MET-7-builder round=1\n\nrunning thread inactive for 16 min since ${active} (budget 15 min)`]);
   assert.deepEqual(cancelled('MET-3'), []);
   assert.deepEqual(cancelled('MET-4'), []);
   // An unknown state is a failed read, never running or idle: the long-quiet thread in it is neither cancelled nor archived, and nothing else acts.
   plant.issue('MET-6', 'In Progress');
   thread('MET-6', 'builder', 'paused', ago(600));
-  const writes = [plant.saves.length, [...plant.comments.values()].flat().filter(comment => comment.body.startsWith('odd-watchdog')).length];
+  const writes = plant.saves.length;
+  const beats = plant.heartbeats();
+  const before = new Date().toISOString();
   await advance(sweepMs);
-  assert.ok((await plant.events()).some(event => event.stage === 'failed' && /unknown agent state "paused"/.test(event.error ?? '')));
+  const fresh = ((await plant.events()) as { issue: string | null; stage: string; error?: string; at: string }[]).filter(event => event.at > before);
+  assert.ok(fresh.some(event => event.issue === 'MET-6' && event.stage === 'failed' && /unknown thread state "paused"/.test(event.error ?? '')), 'the unknown state fails its own issue');
+  // That issue only (MET-394): the sweep still evaluates the others and is not blind, but the failed derivation withholds the heartbeat (MET-344).
+  assert.ok(fresh.some(event => event.issue === 'MET-4' && event.stage !== 'failed'), 'other issues are still evaluated');
+  assert.ok(!fresh.some(event => event.issue !== 'MET-6' && event.issue !== null && event.stage === 'failed'), 'no other issue fails');
+  assert.equal(plant.heartbeats(), beats);
+  assert.equal((await watchdog()).blindSince, undefined, 'one unknown thread does not blind the plane');
   assert.equal(plant.threads.get('T-MET-6-builder')!.archived, false);
-  assert.deepEqual([plant.saves.length, [...plant.comments.values()].flat().filter(comment => comment.body.startsWith('odd-watchdog')).length], writes);
+  // Nothing acts on MET-6; the other issues keep acting (MET-10's idle second builder is now stale too).
+  assert.deepEqual(plant.saves.filter(save => save.startsWith('MET-6 ')), []);
+  // Its only record is the issue's own failure episode, naming the state (an incident, not an action).
+  assert.deepEqual(comments('MET-6').map(body => /^odd-failure key=evaluate .*\n\nError: unknown thread state "paused"$/.test(body)), [true]);
+  assert.deepEqual(plant.saves.slice(writes), ['MET-10 "Todo"']);
 });
 
 test('P3.10: an errored builder at its spent budget is archived once with its round recorded, frees only its build slot, and stays spent across a restart', async t => {

@@ -1899,8 +1899,8 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 		}
 		// An unknown execution state is not idleness: it would let the Watchdog cancel a running thread.
 		if (!strings(status?.metadata?.labels) || !named(status.agentState?.state) || !optional(status.agentState as Row, 'updatedAt', 'string') || !optional(status.metadata, 'archived', 'boolean')) throw new ReadError(`get_thread_status ${id} returned no labels or agent state`)
-		// Nor is it running (P3.10): a state outside the known ones fails the read instead of being guessed.
-		if (!threadState(status.agentState.state)) throw new ReadError(`get_thread_status ${id} returned unknown agent state ${JSON.stringify(status.agentState.state.slice(0, 40))}`)
+		// Nor is it running (P3.10). A state outside the known ones (threadState) is kept as read, so it fails only its own
+		// issue's snapshot (toSnapshot), never the whole sweep (MET-394), and no action is taken on that issue.
 		const { state, updatedAt: activeAt } = status.agentState
 		return { id, labels: status.metadata.labels, state, archived: status.metadata.archived === true, updatedAt: updated.get(id), ...(activeAt ? { activeAt } : {}) }
 	}))

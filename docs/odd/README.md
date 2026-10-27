@@ -247,10 +247,14 @@ one rule for every role thread:
    round left starts a fresh thread of the same role; rounds spent
    (`contracts[role].rounds`) pages `budget-ceiling` and sets `escalated`.
 
-Thread states (P3.10). `get_thread_status` reports `idle` (and
-`external-agent`, a retired terminal thread), `running`, `streaming` and
-`tool-running` (running), `awaiting-approval` and `error`; any other state
-fails the read, so nothing is cancelled, archived or spawned on a guess. A
+Thread states (P3.10). `get_thread_status` and `find_thread` report `idle`
+(and `external-agent`, a retired terminal thread); `running`, `working`,
+`streaming`, `tool-running`, `tool_use`, `running_tools` and `compacting`
+(running); `awaiting-approval` or `awaiting_approval`; and `error`. Any other
+state fails the derivation of its own issue only (MET-394): nothing is
+cancelled, archived, steered, merged or spawned for that issue on a guess, the
+thread keeps its capacity slot, and the rest of the sweep still runs; the
+failed derivation withholds the heartbeat like any other (§9). A
 running owner waits on its activity (`activity` wait, the agent state's own
 `updatedAt`, never thread search's): after 15 minutes without it the
 Watchdog cancels the thread like an idle one, since a dead orb can keep
