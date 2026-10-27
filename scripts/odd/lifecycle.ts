@@ -113,8 +113,11 @@ export function contractOf(description: string, risk: RiskClass | undefined): st
 }
 
 /** `component` is the `+`-joined set the release installed (`none` when it touched no enabled component), or the component that failed or was refused.
- * `rollback` is the restored snapshot, `unchanged` (fail only: refused before any change, prior healthy release re-proven), or `none`. */
-export type DeployReceipt = { host: string; component: string; sha: string; health: 'pass' | 'fail' | 'refused'; rollback: 'none' | string; refusal?: Refusal };
+ * `rollback` is the restored snapshot, `unchanged` (fail only: refused before any change, prior healthy release re-proven), or `none`.
+ * A complete receipt set (MET-386, pass only) adds `round`, the tag of the proven release `sha` that published it, and `set`, each
+ * component the issue requires at its own healthy SHA and tag; `component` then joins exactly the set's components. */
+export type DeployReceipt = { host: string; component: string; sha: string; health: 'pass' | 'fail' | 'refused'; rollback: 'none' | string; refusal?: Refusal; round?: string; set?: readonly ComponentIdentity[] };
+export type ComponentIdentity = { component: string; sha: string; tag: string };
 
 /** Why the Deployer installed nothing: the meter plan would change the DB generation (fresh, legacy or v1 migration) or could not be
  * classified, or an interrupted install's rollback snapshot is not proven free of a DB-generation restore (`snapshot`). */
@@ -344,15 +347,26 @@ export const rollbackArea = (component: string) => ({ meter: 'area:meter', 'fact
 export const rollbackBugKey = (source: string, receipt: DeployReceipt) => `odd-rollback-bug source=${source} component=${receipt.component} sha=${receipt.sha}`;
 
 export const deployReceiptLine = (receipt: DeployReceipt) =>
-  `odd-deploy host=${receipt.host} component=${receipt.component} sha=${receipt.sha} health=${receipt.health} rollback=${receipt.rollback}${receipt.refusal ? ` refusal=${receipt.refusal}` : ''}`;
+  `odd-deploy host=${receipt.host} component=${receipt.component} sha=${receipt.sha} health=${receipt.health} rollback=${receipt.rollback}${receipt.refusal ? ` refusal=${receipt.refusal}` : ''}` +
+  (receipt.set ? ` round=${receipt.round} set=${receipt.set.map(entry => `${entry.component}:${entry.sha}@${entry.tag}`).join(',')}` : '');
 
-/** Legacy pass/fail receipts parse unchanged. `health=refused` needs `rollback=none` and a known `refusal=`, which no other receipt may carry. */
+/**
+ * Legacy pass/fail receipts parse unchanged. `health=refused` needs `rollback=none` and a known `refusal=`, which no other receipt may carry.
+ * A receipt set (`round=<tag> set=<component>:<sha40>@<tag>,...`) is pass with `rollback=none` only, names each component once, and its
+ * `component=` joins exactly those names: a set that disagrees with itself does not parse.
+ */
 export function parseDeployReceipt(text: string): DeployReceipt | undefined {
-  const match = /^odd-deploy host=(\S+) component=(\S+) sha=([a-f0-9]{7,40}) health=(pass|fail|refused) rollback=(\S+)(?: refusal=(db-changing-(?:fresh|legacy|v1|unknown|snapshot)))?$/m.exec(text);
+  const match = /^odd-deploy host=(\S+) component=(\S+) sha=([a-f0-9]{7,40}) health=(pass|fail|refused) rollback=(\S+)(?: refusal=(db-changing-(?:fresh|legacy|v1|unknown|snapshot)))?(?: round=(v\d+\.\d+\.\d+) set=(\S+))?$/m.exec(text);
   if (!match) return undefined;
   const refused = match[4] === 'refused';
   if (refused !== (match[6] !== undefined) || (refused && match[5] !== 'none') || (match[5] === 'unchanged' && match[4] !== 'fail')) return undefined;
-  return { host: match[1], component: match[2], sha: match[3], health: match[4] as DeployReceipt['health'], rollback: match[5], ...(refused ? { refusal: match[6] as Refusal } : {}) };
+  const receipt: DeployReceipt = { host: match[1], component: match[2], sha: match[3], health: match[4] as DeployReceipt['health'], rollback: match[5], ...(refused ? { refusal: match[6] as Refusal } : {}) };
+  if (match[7] === undefined) return receipt;
+  const set = match[8].split(',').map(entry => /^([a-z][a-z0-9-]*):([a-f0-9]{40})@(v\d+\.\d+\.\d+)$/.exec(entry));
+  if (receipt.health !== 'pass' || receipt.rollback !== 'none' || set.some(entry => !entry)) return undefined;
+  const names = set.map(entry => entry![1]);
+  if (new Set(names).size !== names.length || names.join('+') !== receipt.component) return undefined;
+  return { ...receipt, round: match[7], set: set.map(entry => ({ component: entry![1], sha: entry![2], tag: entry![3] })) };
 }
 
 /** Why a spawn of `role` must wait at `load`, or undefined when it fits its executor's cap; `newBuild` is a builder for an issue without one. */

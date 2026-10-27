@@ -318,7 +318,11 @@ function world(options: {
         return out(options.releaseFile?.(sha, file) ?? stagedFile(file));
       }
       if (git[0] === 'show') return out(JSON.stringify({ components: Object.entries(sources).map(([id, paths]) => ({ id, sources: paths })) }));
-      if (git[0] === 'diff') { const [from, to] = git[2].split('..'); return out(changedBetween(from, to).join('\n')); }
+      if (git[0] === 'diff') {
+        const [from, to] = git[2].split('..');
+        // `<merge>^..<merge>`: what that release alone changed.
+        return out(changedBetween(from.endsWith('^') ? order[index(from.slice(0, -1)) - 1] : from, to).join('\n'));
+      }
       if (git[0] === 'log') {
         const [from, to] = git.at(-1)!.split('..');
         const before = from.endsWith('^') ? index(shas[from.slice(0, -1) as Tag]) - 1 : index(shas[from as Tag] ?? from);
@@ -1029,7 +1033,7 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
         [{ tag_name: 'v0.2.11', draft: false, prerelease: false },
           ...Array.from({ length: 99 }, (_, i) => ({ tag_name: `v9.0.${i}`, draft: i % 2 === 0, prerelease: i % 2 !== 0 }))],
         ...(args.includes('--paginate') ? [['v0.2.10', 'v0.2.9'].map(tag_name => ({ tag_name, draft: false, prerelease: false }))] : []),
-      ] : { body: `closes MET-${args[2]}` }), stderr: '' };
+      ] : args[1] === 'list' ? [] : { body: `closes MET-${args[2]}` }), stderr: '' };
       if (command === 'python3') {
         assert.equal(readFileSync(args[0].replace(ROOT, runtime), 'utf8'), readFileSync(new URL('../release/release.py', import.meta.url), 'utf8'));
         verified.push(args[args.indexOf('--tag') + 1]);
@@ -1339,7 +1343,7 @@ test('sandbox: a kiosk release installs, three green probes report its SHA, Depl
   t.after(host.cleanup);
   await main(host.effects);
   const dir = join(host.stateDir, 'releases/v0.3.0');
-  assert.deepEqual(host.calls, ['verify v0.3.0', 'checkout 1111111', 'probe', 'probe', 'probe', 'probe', `sudo deploy/install-kiosk.sh ${dir}/kiosk`, 'probe', 'probe', 'probe']);
+  assert.deepEqual(host.calls.filter(call => !call.startsWith('gh pr list')), ['verify v0.3.0', 'checkout 1111111', 'probe', 'probe', 'probe', 'probe', `sudo deploy/install-kiosk.sh ${dir}/kiosk`, 'probe', 'probe', 'probe']);
   assert.equal(host.live.kiosk, shas['v0.3.0']);
   const pass = line(`component=kiosk sha=${shas['v0.3.0']} health=pass rollback=none`);
   assert.deepEqual(host.comments, [['MET-301', pass]]);
@@ -2127,6 +2131,60 @@ test('sandbox: a no-new-release tick routes branch-, body- and edited-subject-ow
   const count = host.comments.length;
   await main(host.effects);
   assert.equal(host.comments.length, count, 'idempotent from the issues\' own comments');
+});
+
+test('MET-386 sandbox: a mixed-SHA receipt set keeps meter at its release and kiosk at its own; a partial set waits, and only verification of the complete set reaches Done', async t => {
+  const [A, B, C] = [shas['v0.2.50'], shas['v0.3.0'], shas['v0.3.1']];
+  const tags: Tag[] = ['v0.2.9', 'v0.2.50'];
+  // MET-500 owns two PRs: #501 changes meter (v0.2.50), #502 kiosk (v0.3.0). MET-501 is meter-only; MET-502 ships factory-api in v0.3.1.
+  const host = world({ tags, ledger: baseline(), deploying: ['MET-500', 'MET-501'],
+    changes: { 'v0.2.50': ['meter/src/lib.rs'], 'v0.3.0': ['kiosk/src/App.tsx'], 'v0.3.1': ['factory-api/src/main.rs'] },
+    issues: { 'v0.2.50': ['MET-500', 'MET-501'], 'v0.3.0': ['MET-500'], 'v0.3.1': ['MET-502'] },
+    prs: [merged(501, A, { title: 'MET-500: meter', headRefName: 'met-500-meter', body: 'contributes MET-500' }),
+      merged(502, B, { title: 'MET-500: kiosk', headRefName: 'met-500-kiosk', body: 'contributes MET-500' }),
+      merged(511, A, { title: 'MET-501: meter', headRefName: 'met-501-meter', body: 'closes MET-501' })] });
+  t.after(host.cleanup);
+  let meterDegraded = false;
+  const probe = host.effects.probe;
+  host.effects.probe = url => {
+    const body = probe(url);
+    return meterDegraded && url.includes(':11434') ? JSON.stringify({ ...JSON.parse(body), status: 'degraded' }) : body;
+  };
+  const meterAtA = line(`component=meter sha=${A} health=pass rollback=none`);
+  // v0.2.50: every component each issue needs is at the release SHA, so the uniform receipt stays as it was.
+  await main(host.effects);
+  assert.deepEqual(issueComments(host, 'MET-500'), [meterAtA]);
+  assert.deepEqual(issueComments(host, 'MET-501'), [meterAtA]);
+  // #502 merges; a late pass for the meter-only receipt is stale and cannot close the issue.
+  host.comments.push(['MET-500', mergeLine(502, B)], ['MET-500', `odd-verify sha=${A} result=pass bug=none`]);
+  // v0.3.0 installs kiosk only; meter, still at v0.2.50, is degraded: the set is partial and nothing is published.
+  meterDegraded = true;
+  tags.push('v0.3.0');
+  await main(host.effects);
+  assert.equal(host.live.meter, A, 'meter was not reinstalled');
+  assert.equal(host.ledger().deployed?.sha, B);
+  assert.deepEqual(issueComments(host, 'MET-500').filter(body => body.startsWith('odd-deploy')), [meterAtA], 'neither kiosk alone nor meter+kiosk at one SHA');
+  assert.deepEqual(decisions(host, 'receipt-partial'), [{ issue: 'MET-500', tag: 'v0.3.0', missing: `meter is not reported healthy at ${A}` }]);
+  assert.deepEqual(decisions(host, 'reconcile-refused'), [{ issue: 'MET-500', tag: 'v0.3.0', reason: `receipt set incomplete: meter is not reported healthy at ${A}` }]);
+  assert.deepEqual(await lifecycleOf(host, 'MET-500'), { kind: 'wait', reason: 'release not published', wait: { kind: 'receipt', key: 'receipt-unknown' } });
+  // A tick with no new release, meter healthy again: the complete set is published at round v0.3.0, each component at its own SHA.
+  meterDegraded = false;
+  await main(host.effects);
+  const set = line(`component=meter+kiosk sha=${B} health=pass rollback=none round=v0.3.0 set=meter:${A}@v0.2.50,kiosk:${B}@v0.3.0`);
+  assert.deepEqual(issueComments(host, 'MET-500').at(-1), set);
+  assert.deepEqual(parseDeployReceipt(set)?.set, [{ component: 'meter', sha: A, tag: 'v0.2.50' }, { component: 'kiosk', sha: B, tag: 'v0.3.0' }]);
+  assert.deepEqual(await lifecycleOf(host, 'MET-500'), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: `verify meter+kiosk at ${B.slice(0, 12)}`, round: 1 });
+  // The set fails verification. v0.3.1 ships only factory-api: the refresh keeps meter and kiosk at their own SHAs under round v0.3.1.
+  host.comments.push(['MET-500', `odd-verify sha=${B} result=fail bug=MET-900`]);
+  tags.push('v0.3.1');
+  await main(host.effects);
+  const refreshed = line(`component=meter+kiosk sha=${C} health=pass rollback=none round=v0.3.1 set=meter:${A}@v0.2.50,kiosk:${B}@v0.3.0`);
+  assert.deepEqual(issueComments(host, 'MET-500').filter(body => body.startsWith('odd-deploy')), [meterAtA, set, refreshed], 'never factory-api at v0.3.1 for this issue');
+  assert.deepEqual(await lifecycleOf(host, 'MET-500'), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: `verify meter+kiosk at ${C.slice(0, 12)}`, round: 1 });
+  host.comments.push(['MET-500', `odd-verify sha=${C} result=pass bug=none`]);
+  assert.deepEqual(await lifecycleOf(host, 'MET-500'), { kind: 'set-status', status: 'Done', reason: `verified meter+kiosk at ${C.slice(0, 12)}` });
+  assert.deepEqual(sudoCalls(host.calls).map(call => call.split(' ')[1]), ['deploy/install-meter.sh', 'deploy/install-kiosk.sh', 'deploy/install-factory-api.sh'], 'one install per release, no replay for a receipt');
+  assert.deepEqual(issueComments(host, 'MET-501'), [meterAtA], 'the meter-only issue keeps its one receipt');
 });
 
 test('pending releases are immutable v-tags newer than the ledger, oldest first; a missing or cursorless ledger is never silently adopted', async t => {

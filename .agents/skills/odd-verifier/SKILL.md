@@ -17,6 +17,14 @@ An issue in `Deploying` with a deploy receipt `odd-deploy ... health=pass`,
 or merged with a merge receipt when nothing deploys. The prompt names the
 receipt line and the SHA to verify; use that SHA, not the branch head.
 
+A receipt set (`... round=<tag> set=<component>:<sha>@<tag>,...`, MET-386)
+covers components deployed at different SHAs. Its `sha` is the round, the
+release that published the set: `odd_verify` reports for it. Check each
+listed component against its own `set` SHA and tag, never the round SHA,
+and treat a component that reports any other identity as a `fail`. Every
+component the issue needs is in the set; the Deployer never publishes a
+partial one.
+
 ## Steps
 
 1. Read `Done means` and `Evidence`. Pair them line by line.

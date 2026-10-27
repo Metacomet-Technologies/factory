@@ -2,7 +2,7 @@
 // report (docs/odd/README.md §9). Pure functions; the control-plane plugin does the IO.
 
 import { builderEngine, labOf } from './engines.ts';
-import { budgetSkewMs, capacity, contracts, parseBudget, parseCancelled, parseDeployReceipt, parseEscalation, parseResume, parseSpawn, parseSteer, parseThreadLabels, parseVerify, roles, type Correction, type DeployReceipt, type Escalation, type IssueSnapshot, type Load, type RiskClass, type Role, type SpawnRecord, type Status, type Verdict, type Verify } from './lifecycle.ts';
+import { budgetSkewMs, capacity, contracts, deployReceiptLine, parseBudget, parseCancelled, parseDeployReceipt, parseEscalation, parseResume, parseSpawn, parseSteer, parseThreadLabels, parseVerify, roles, type Correction, type DeployReceipt, type Escalation, type IssueSnapshot, type Load, type RiskClass, type Role, type SpawnRecord, type Status, type Verdict, type Verify } from './lifecycle.ts';
 
 export type WebhookSource = 'linear' | 'github' | 'slack';
 
@@ -349,6 +349,9 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     // Verifier rounds belong to one release: a receipt for a new SHA is a fresh verification budget.
     const next = parseDeployReceipt(comment.body);
     if (next && next.sha !== receipt?.sha) delete cancelledRounds.verifier;
+    // MET-386: a receipt that replaces a different one, even at the same round SHA (a receipt set after a
+    // partial uniform receipt), needs its own verification; a repost of the same line keeps it.
+    if (next && receipt && deployReceiptLine(next) !== deployReceiptLine(receipt)) verify = undefined;
     receipt = next ?? receipt;
     verify = parseVerify(comment.body) ?? verify;
     const cancelled = parseCancelled(comment.body);
