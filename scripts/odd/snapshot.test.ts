@@ -477,14 +477,22 @@ test('P4.3: the latest red receipt by creation time bounds which merges deliver 
 });
 
 test('P3.10: every reported Amp state maps to idle, running, approval or error; any other state fails the snapshot instead of reading as running or idle', () => {
-  for (const [state, known] of [['idle', 'idle'], ['external-agent', 'idle'], ['error', 'error'], ['awaiting-approval', 'awaiting-approval'], ['running', 'running'], ['streaming', 'running'], ['tool-running', 'running']] as const) assert.equal(threadState(state), known, state);
-  for (const state of ['', 'paused', 'Idle', 'constructor', 'toString', 'unknown']) assert.equal(threadState(state), undefined, state);
+  for (const [state, known] of [['idle', 'idle'], ['external-agent', 'idle'], ['error', 'error'], ['awaiting-approval', 'awaiting-approval'], ['awaiting_approval', 'awaiting-approval'], ['running', 'running'], ['working', 'running'], ['streaming', 'running'], ['tool-running', 'running'], ['tool_use', 'running'], ['running_tools', 'running'], ['compacting', 'running']] as const) assert.equal(threadState(state), known, state);
+  for (const state of ['', 'paused', 'Idle', 'Working', 'work', 'tool-use', 'constructor', 'toString', 'unknown']) assert.equal(threadState(state), undefined, state);
   const issue = { id: 'MET-1', status: 'In Progress', labels: [] };
   const builder: LiveThread = { id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1'], state: 'streaming' };
   const odd: LiveThread = { id: 'T-r', labels: ['odd-issue-met-1', 'odd-role-reviewer', 'odd-round-1'], state: 'paused' };
   // Even after a running owner is found, a later unknown state is judged.
   assert.throws(() => toSnapshot({ issue, threads: [builder, odd] }), /unknown thread state "paused"/);
-  assert.throws(() => loadFrom([odd]), /unknown thread state/);
+  // MET-394: a `working` owner is running, dated by its agent activity, and holds its slot like any running thread.
+  const working: LiveThread = { ...builder, state: 'working', updatedAt: '2026-10-26T12:00:00.000Z', activeAt: '2026-10-26T11:40:00.000Z' };
+  assert.deepEqual(toSnapshot({ issue, threads: [working] }).owner, { role: 'builder', threadID: 'T-b', round: 1, state: 'running', idleSince: '2026-10-26T11:40:00.000Z' });
+  assert.deepEqual(finishedThreads('Done', [working]), [], 'a working thread is never finished work to archive');
+  const running = loadFrom([{ ...builder, state: 'running' }]);
+  assert.deepEqual(loadFrom([working]), running);
+  // An unknown thread fails only its own issue's snapshot: the shared load stays readable and keeps its slot, never freed as idle.
+  assert.deepEqual(loadFrom([{ ...builder, state: 'paused' }]), running);
+  assert.notDeepEqual(loadFrom([{ ...builder, state: 'idle' }]), running);
   assert.throws(() => finishedThreads('Done', [odd]), /unknown thread state/);
   // A thread without a role label is not ours to judge.
   assert.equal(toSnapshot({ issue, threads: [builder, { ...odd, labels: ['odd-issue-met-1'] }] }).owner?.threadID, 'T-b');

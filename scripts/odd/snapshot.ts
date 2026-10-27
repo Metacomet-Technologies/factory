@@ -193,20 +193,22 @@ export function riskFrom(description: string): RiskClass | undefined {
 type ThreadState = NonNullable<IssueSnapshot['owner']>['state'];
 
 /**
- * P3.10: the Amp agent states `get_thread_status` reports. `streaming` and `tool-running` are
- * running; `external-agent` is a retired terminal thread, finished like an idle one. Any other
- * state is unknown: undefined here and a failed read in the control plane, never running or idle.
+ * P3.10: the Amp agent states `get_thread_status` and `find_thread` report (MET-394: their tool
+ * descriptions name `working`, `streaming`, `tool_use`, `running_tools` and `compacting` as working
+ * now, and `awaiting_approval`). Every active state is running; `external-agent` is a retired
+ * terminal thread, finished like an idle one. Any other state is unknown: undefined here, never
+ * running or idle, and it fails the derivation of its own issue only.
  */
 const threadStates: Readonly<Record<string, ThreadState>> = Object.freeze({
-  idle: 'idle', 'external-agent': 'idle', error: 'error', 'awaiting-approval': 'awaiting-approval',
-  running: 'running', streaming: 'running', 'tool-running': 'running',
+  idle: 'idle', 'external-agent': 'idle', error: 'error', 'awaiting-approval': 'awaiting-approval', awaiting_approval: 'awaiting-approval',
+  running: 'running', working: 'running', streaming: 'running', 'tool-running': 'running', tool_use: 'running', running_tools: 'running', compacting: 'running',
 });
 export const threadState = (state: string): ThreadState | undefined => Object.hasOwn(threadStates, state) ? threadStates[state] : undefined;
 
 /** threadState for a thread already read; an unknown state throws instead of guessing. */
 export function ownerState(state: string): ThreadState {
   const known = threadState(state);
-  if (!known) throw new Error(`unknown thread state ${JSON.stringify(state)}`);
+  if (!known) throw new Error(`unknown thread state ${JSON.stringify(state.slice(0, 40))}`);
   return known;
 }
 
@@ -436,7 +438,8 @@ export function openRounds(threads: readonly LiveThread[], receiptSha?: string):
 /**
  * Live load (§6): orbs and runner slots count running role threads by executor; buildIssues
  * counts issues with a live builder thread in any state, since a builder waiting for review
- * still holds its build slot.
+ * still holds its build slot. A thread in an unknown state keeps its executor slot: caps never
+ * under-count on a guess, and its own issue fails derivation (toSnapshot) rather than every issue.
  */
 export function loadFrom(threads: readonly LiveThread[]): Load {
   const load: Load = { orbs: 0, runnerSlots: 0, buildIssues: 0 };
@@ -445,7 +448,7 @@ export function loadFrom(threads: readonly LiveThread[]): Load {
     const { role, issue } = parseThreadLabels(thread.labels);
     if (!role) continue;
     if (role === 'builder' && issue) building.add(issue);
-    if (ownerState(thread.state) !== 'running') continue;
+    if ((threadState(thread.state) ?? 'running') !== 'running') continue;
     const executor = contracts[role].executor;
     if (executor === 'orb') load.orbs += 1;
     else if (executor === 'runner') load.runnerSlots += 1;
