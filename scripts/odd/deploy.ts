@@ -14,8 +14,10 @@
 // The unprivileged runtime (this job, the dispatcher and the usage collector) runs from
 // `~/factory-tools/current`, a link to an immutable `~/factory-tools/<tag>` tree of a release this
 // job verified. It advances only forward, after every tool's side-effect-free self-check passes in
-// the candidate and again through the link (`promoteTools`). The privileged installers stay at the
-// Devon-approved `/home/agent/work/factory` revision (ROOT); this job never moves that checkout.
+// the candidate and again through the link (`promoteTools`). sudo runs the privileged installers
+// only from TRUSTED, the root-owned tree Devon staged from a verified release; before any privileged
+// call, a release whose staged assets are missing, changed or not its own is held (`requireStaged`).
+// Git history and the release verifier stay in the `/home/agent/work/factory` checkout (ROOT).
 //
 // Pure planning (`plan`, `pendingTags`, `issuesFromSubjects`, `parseSnapshot`, `healthySha`,
 // `probeResult`, `restoredResult`, `receiptLine`, `meterPlan`, `resume`) is exported for tests; effects go
@@ -23,15 +25,18 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { oddLabel, type Refusal } from './lifecycle.ts';
 import { prOwnsIssue, toSnapshot, type GitHubPullRequest } from './snapshot.ts';
 
-/** The allowlisted installer checkout: sudo, Git history and the release verifier. Never the runtime. */
+/** Git history and the release verifier. Never the runtime, and never run as root. */
 export const ROOT = '/home/agent/work/factory';
+/** MET-375: the root-owned installer tree Devon stages from a verified release (deploy/sudoers/stage-trusted.sh);
+ * the sudoers allowlist names only scripts in it. */
+export const TRUSTED = '/usr/local/lib/factory-deploy';
 export const HOST = 'factory-gpu';
 export const STATE_DIR = join(homedir(), '.local/state/factory-odd');
 export const LEDGER = join(STATE_DIR, 'deploy.json');
@@ -51,8 +56,11 @@ export type Recipe = {
   /** Installer argument from the verified release directory. */
   artifact: (releaseDir: string) => string;
   installer: string;
-  /** Restores the installer's snapshot. */
+  /** Restores the installer's snapshot: `sudo rollback ...rollbackArgs SNAPSHOT`. */
   rollback: string;
+  rollbackArgs?: readonly string[];
+  /** Every file the installer and rollback run or read as root from TRUSTED (deploy/sudoers/trusted-assets.sh callers). */
+  staged: readonly string[];
   /** Health endpoint reporting `git_sha`. */
   health: string;
   /** The installer classifies DB-generation changes: preflighted with `--plan`, installed with `--no-db-change`. */
@@ -66,12 +74,16 @@ export type Recipe = {
 export const recipes: readonly Recipe[] = [
   { name: 'meter', deployFiles: ['deploy/install-meter.sh', 'deploy/meter.service'], artifact: dir => join(dir, 'meter-linux-x86_64'),
     installer: 'deploy/install-meter.sh', rollback: 'deploy/rollback-meter-v1.sh',
+    staged: ['deploy/install-meter.sh', 'deploy/meter.service', 'deploy/set_ollama_host.py', 'deploy/rollback-meter-v1.sh'],
     health: 'http://127.0.0.1:11434/meter/health', dbGuard: true },
   { name: 'factory-api', deployFiles: ['deploy/install-factory-api.sh', 'deploy/factory-api.service'], artifact: dir => join(dir, 'factory-api-linux-x86_64'),
     installer: 'deploy/install-factory-api.sh', rollback: 'deploy/rollback-factory-api.sh',
+    staged: ['deploy/install-factory-api.sh', 'deploy/factory-api.service', 'deploy/alerts/factory-api-alerts.conf', 'deploy/device-tokens.sh', 'deploy/rollback-factory-api.sh'],
     health: 'http://127.0.0.1:8080/v1/health' },
   { name: 'kiosk', deployFiles: ['deploy/install-kiosk.sh'], artifact: dir => join(dir, 'kiosk'),
-    installer: 'deploy/install-kiosk.sh', rollback: 'deploy/rollback-kiosk.sh',
+    // rollback-kiosk.sh is not allowlisted: the installer validates the snapshot, then runs it (MET-375).
+    installer: 'deploy/install-kiosk.sh', rollback: 'deploy/install-kiosk.sh', rollbackArgs: ['--rollback'],
+    staged: ['deploy/install-kiosk.sh', 'deploy/rollback-kiosk.sh'],
     health: 'http://127.0.0.1:8080/version.json' },
 ];
 
@@ -211,6 +223,8 @@ export type Effects = {
   stateDir: string;
   /** Holds the runtime's `<tag>` trees and `current` link (TOOLS_DIR). */
   toolsDir: string;
+  /** The staged installer tree sudo runs from (TRUSTED). */
+  trustedDir: string;
   log: (decision: string, details?: object) => void;
   sleep: (ms: number) => Promise<void>;
   /** Epoch milliseconds: a delayed delivery's first-seen time and expiry. */
@@ -219,7 +233,7 @@ export type Effects = {
   run: (command: string, args: readonly string[], options?: { cwd?: string; timeout?: number }) => { stdout: string; stderr: string };
   /** Exit status 0? For git predicates such as merge-base --is-ancestor. */
   ok: (command: string, args: readonly string[]) => boolean;
-  /** `sudo -n /usr/bin/bash <ROOT>/<script> args...`; returns combined output, `ok` false on non-zero exit. */
+  /** `sudo -n /usr/bin/bash <TRUSTED>/<script> args...`; returns combined output, `ok` false on non-zero exit. */
   sudo: (script: string, args: readonly string[]) => { ok: boolean; output: string };
   /** GET a health endpoint; throws when unreachable. */
   probe: (url: string) => string;
@@ -282,7 +296,7 @@ async function probeWindow(effects: Effects, recipe: Recipe, sha: string, check 
 /** Run the rollback once, then re-probe: the snapshot when the previous release is back and healthy, else `none`. */
 async function rollback(effects: Effects, recipe: Recipe, sha: string, snapshot: string | undefined): Promise<string> {
   if (!snapshot) { effects.log('rollback-missing-snapshot', { component: recipe.name }); return 'none'; }
-  const result = effects.sudo(recipe.rollback, [snapshot]);
+  const result = effects.sudo(recipe.rollback, [...recipe.rollbackArgs ?? [], snapshot]);
   effects.log('rollback', { component: recipe.name, ok: result.ok, snapshot });
   if (!result.ok) return 'none';
   return (await probeWindow(effects, recipe, sha, restoredResult, 'rollback-probe')) === 'pass' ? snapshot : 'none';
@@ -391,6 +405,41 @@ function prepareRelease(effects: Effects, tag: string): { sha: string; dir: stri
   return { sha, dir };
 }
 
+/** MET-375: before any privileged call, every file any recipe runs or reads as root must be
+ * staged in TRUSTED as a regular, non-symlinked file that is not group- or other-writable, still have
+ * the digest stage-trusted.sh recorded, and be byte-identical to this release. Otherwise the release
+ * is held: no sudo, receipt or ledger change, retried each tick until Devon restages. The installers
+ * enforce root ownership themselves. Never falls back to the agent-writable checkout's scripts. */
+function requireStaged(effects: Effects, tag: string, sha: string): void {
+  const dir = effects.trustedDir;
+  const problems: string[] = [];
+  const sums = new Map<string, string>();
+  try {
+    for (const line of readFileSync(join(dir, 'SHA256SUMS'), 'utf8').split('\n').filter(Boolean)) {
+      const match = /^([a-f0-9]{64}) {2}(\S+)$/.exec(line);
+      if (!match || sums.has(match[2])) throw new Error(`malformed or duplicate line: ${line}`);
+      sums.set(match[2], match[1]);
+    }
+  } catch (error) { problems.push(`SHA256SUMS: ${(error instanceof Error ? error.message : String(error)).split('\n')[0]}`); }
+  for (const file of new Set(['deploy/sudoers/trusted-assets.sh', ...recipes.flatMap(recipe => recipe.staged)])) {
+    const path = join(dir, file);
+    let staged: Buffer;
+    try {
+      const info = lstatSync(path);
+      if (!info.isFile() || realpathSync(path) !== path) { problems.push(`${file}: symlinked or not a regular file`); continue; }
+      if (info.mode & 0o022) { problems.push(`${file}: group- or other-writable`); continue; }
+      staged = readFileSync(path);
+    } catch { problems.push(`${file}: missing`); continue; }
+    if (createHash('sha256').update(staged).digest('hex') !== sums.get(file)) { problems.push(`${file}: changed since staging`); continue; }
+    let release: string | undefined;
+    try { release = effects.run('git', ['-C', ROOT, 'show', `${sha}:${file}`]).stdout; } catch { /* absent from the release */ }
+    if (release !== staged.toString()) problems.push(`${file}: ${release === undefined ? 'absent from' : 'differs from'} ${tag}`);
+  }
+  if (!problems.length) return;
+  effects.log('staged-assets-held', { tag, sha, trustedDir: dir, problems });
+  throw new Error(`${tag}: staged installers in ${dir} cannot install this release (${problems.join('; ')}); nothing installed. Devon restages (deploy/sudoers/README.md)`);
+}
+
 /** Install the release's changed components; the receipt is saved in the ledger before any delivery. */
 async function installRelease(effects: Effects, tag: string, sha: string, dir: string): Promise<Receipt> {
   const inFlight = effects.readLedger().inFlight;
@@ -433,6 +482,8 @@ async function installRelease(effects: Effects, tag: string, sha: string, dir: s
   };
   let changed = select(true);
   effects.log('plan', { tag, sha, components: changed.map(recipe => recipe.name) });
+  // Every recipe's assets, so a later re-selection or rollback can never reach an unchecked file.
+  if (resumed || changed.length) requireStaged(effects, tag, sha);
   // Guard the entire plan before resuming even one interrupted installer.
   const refused = preflight(resumed ? [resumed, ...changed] : changed);
   if (refused) return refused;
@@ -776,7 +827,7 @@ function stageTools(effects: Effects, record: ToolsRecord): string {
  * Advance `<toolsDir>/current` to `tag`, a release this job verified, never backwards. The
  * pending promotion is saved before staging; a crash retries it, and only a passing check of the
  * candidate and then of the link (activation) records `current`. A failed check restores the
- * prior link and rejects that tag; a staging error keeps it pending. Installers stay at ROOT.
+ * prior link and rejects that tag; a staging error keeps it pending. Installers stay in TRUSTED.
  */
 export function promoteTools(effects: Effects, tag: string): void {
   const ledger = effects.readLedger();
@@ -807,7 +858,7 @@ export function promoteTools(effects: Effects, tag: string): void {
     throw new Error(`Tools ${record.tag} rejected; ${link} restored to ${previous ?? 'none'}: ${reason}`);
   }
   effects.writeLedger({ ...effects.readLedger(), tools: { current: record, rejected: tools.rejected } });
-  // Installers never advance here: a release that changes them needs Devon's batched move of ROOT.
+  // Installers never advance here: a release that changes them waits for Devon to restage TRUSTED.
   const installers = effects.run('git', ['-C', ROOT, 'diff', '--name-only', record.installerSha, record.sha, '--', 'deploy']).stdout.split('\n').filter(Boolean);
   effects.log('tools-promoted', { ...record, link, root: expected, installerRoot: ROOT, installerChanges: installers });
 }
@@ -851,13 +902,14 @@ export function liveEffects(): Effects {
   return {
     stateDir: STATE_DIR,
     toolsDir: TOOLS_DIR,
+    trustedDir: TRUSTED,
     log,
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     now: () => Date.now(),
     run,
     ok: (command, args) => spawnSync(command, args, { stdio: 'ignore' }).status === 0,
     sudo: (script, args) => {
-      const result = spawnSync('sudo', ['-n', '/usr/bin/bash', join(ROOT, script), ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+      const result = spawnSync('sudo', ['-n', '/usr/bin/bash', join(TRUSTED, script), ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
       return { ok: result.status === 0, output: `${result.stdout}${result.stderr}` };
     },
     probe: url => run('curl', ['-fsS', '--max-time', '10', url]).stdout,

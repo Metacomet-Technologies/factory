@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 root=$(dirname "$(dirname "$(realpath "$0")")")
+# --source-checkout only names the clean checkout the artifact's build identity must match (MET-239);
+# units and helpers always come from this script's own tree, never from the caller (MET-375).
 checkout=$root
 if [[ ${1:-} == --source-checkout ]]; then
     checkout=${2:?Supply a clean source checkout after --source-checkout.}
@@ -14,6 +16,24 @@ snapshot=
 stage=
 response=
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+# MET-375: from the staged root-owned tree, read only its verified assets (deploy/sudoers/README.md).
+if [[ $0 == /usr/local/lib/factory-deploy/* || $root == /usr/local/lib/factory-deploy ]]; then
+    # shellcheck source=SCRIPTDIR/sudoers/trusted-assets.sh
+    source /usr/local/lib/factory-deploy/deploy/sudoers/trusted-assets.sh
+    trusted_assets deploy/sudoers/trusted-assets.sh deploy/install-kiosk.sh deploy/rollback-kiosk.sh
+fi
+# MET-375: the allowlisted kiosk rollback (rollback-kiosk.sh itself is not allowlisted). As root it copies
+# the snapshot over the served kiosk, so accept only an installer snapshot: a root-owned directory
+# directly inside root-owned /var/backups/factory-kiosk, never a caller-chosen tree.
+if [[ ${1:-} == --rollback ]]; then
+    [[ $# -eq 2 ]] || fail 'Usage: install-kiosk.sh --rollback SNAPSHOT'
+    [[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/install-kiosk.sh --rollback SNAPSHOT.'
+    snapshot=$(realpath -e -- "$2") || fail "No snapshot directory: $2"
+    [[ -d $snapshot && $(dirname "$snapshot") == /var/backups/factory-kiosk && $(stat -c %u "$snapshot") == 0 &&
+        $(stat -c %u /var/backups/factory-kiosk) == 0 && $(( 8#$(stat -c %a /var/backups/factory-kiosk) & 8#022 )) == 0 ]] ||
+        fail "Not an installer snapshot in /var/backups/factory-kiosk: $2"
+    exec bash "$root/deploy/rollback-kiosk.sh" "$snapshot"
+fi
 # MET-239: refuse an artifact not built from this clean checkout. No override;
 # a mismatch means rebuild. Runs before the root check and any change.
 verify_artifact() {

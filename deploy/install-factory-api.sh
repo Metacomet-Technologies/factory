@@ -2,25 +2,7 @@
 set -Eeuo pipefail
 umask 0077
 root=$(dirname "$(dirname "$(realpath "$0")")")
-# MET-219: add one remote device credential hash; the token is read from stdin only.
-if [[ ${1:-} == --enroll-device ]]; then
-    shift
-    exec bash "$root/deploy/device-tokens.sh" enroll "$@"
-fi
-checkout=$root
-if [[ ${1:-} == --source-checkout ]]; then
-    checkout=${2:?Supply a clean source checkout after --source-checkout.}
-    shift 2
-fi
-binary=${1:-}
-unit=$checkout/deploy/factory-api.service
-destination=/usr/local/bin/factory-api
-installed_unit=/etc/systemd/system/factory-api.service
-pricing_db=/var/lib/factory-api/pricing.db
-legacy_db=/var/lib/factory-api/pricing.v0.db
-requests_db=/var/lib/factory-api/requests.db
 snapshot=
-
 rollback_hint() {
     if [[ -n "$snapshot" ]]; then
         printf 'Recover with: sudo bash %q %q\n' "$root/deploy/rollback-factory-api.sh" "$snapshot" >&2
@@ -29,6 +11,33 @@ rollback_hint() {
     fi
 }
 fail() { printf 'ERROR: %s\n' "$*" >&2; rollback_hint; exit 1; }
+# MET-375: from the staged root-owned tree, read only its verified assets (deploy/sudoers/README.md).
+if [[ $0 == /usr/local/lib/factory-deploy/* || $root == /usr/local/lib/factory-deploy ]]; then
+    # shellcheck source=SCRIPTDIR/sudoers/trusted-assets.sh
+    source /usr/local/lib/factory-deploy/deploy/sudoers/trusted-assets.sh
+    trusted_assets deploy/sudoers/trusted-assets.sh deploy/install-factory-api.sh deploy/factory-api.service \
+        deploy/alerts/factory-api-alerts.conf deploy/device-tokens.sh deploy/rollback-factory-api.sh
+fi
+# MET-219: add one remote device credential hash; the token is read from stdin only.
+if [[ ${1:-} == --enroll-device ]]; then
+    shift
+    exec bash "$root/deploy/device-tokens.sh" enroll "$@"
+fi
+# --source-checkout only names the clean checkout the artifact's build identity must match (MET-239);
+# the unit and helpers always come from this script's own tree, never from the caller (MET-375).
+checkout=$root
+if [[ ${1:-} == --source-checkout ]]; then
+    checkout=${2:?Supply a clean source checkout after --source-checkout.}
+    shift 2
+fi
+binary=${1:-}
+unit=$root/deploy/factory-api.service
+destination=/usr/local/bin/factory-api
+installed_unit=/etc/systemd/system/factory-api.service
+pricing_db=/var/lib/factory-api/pricing.db
+legacy_db=/var/lib/factory-api/pricing.v0.db
+requests_db=/var/lib/factory-api/requests.db
+
 # MET-239: refuse an artifact not built from this clean checkout. No override;
 # a mismatch means rebuild. Runs before the root check and any change.
 verify_artifact() {

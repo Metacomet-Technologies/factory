@@ -2,15 +2,26 @@
 set -Eeuo pipefail
 umask 0077
 repo=$(dirname "$(dirname "$(realpath "$0")")")
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+# MET-375: from the staged root-owned tree, read only its verified assets (deploy/sudoers/README.md).
+if [[ $0 == /usr/local/lib/factory-deploy/* || $repo == /usr/local/lib/factory-deploy ]]; then
+    # shellcheck source=SCRIPTDIR/sudoers/trusted-assets.sh
+    source /usr/local/lib/factory-deploy/deploy/sudoers/trusted-assets.sh
+    trusted_assets deploy/sudoers/trusted-assets.sh deploy/rollback-factory-api.sh deploy/alerts/factory-api-alerts.conf deploy/device-tokens.sh
+fi
 # MET-219: remove only the credential line one enrollment added.
 if [[ ${1:-} == --unenroll-device ]]; then
     shift
     exec bash "$repo/deploy/device-tokens.sh" unenroll "$@"
 fi
-fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/rollback-factory-api.sh <snapshot-directory>.'
 [[ $# -eq 1 ]] || fail 'Supply the exact snapshot directory printed by the installer.'
-snapshot=$1
+# MET-375: the snapshot's binary and unit are installed as root, so accept only an installer snapshot:
+# a root-owned directory directly inside root-owned /var/backups/factory-api, never a caller-chosen path.
+snapshot=$(realpath -e -- "$1") || fail "No snapshot directory: $1"
+[[ -d $snapshot && $(dirname "$snapshot") == /var/backups/factory-api && $(stat -c %u "$snapshot") == 0 &&
+    $(stat -c %u /var/backups/factory-api) == 0 && $(( 8#$(stat -c %a /var/backups/factory-api) & 8#022 )) == 0 ]] ||
+    fail "Not an installer snapshot in /var/backups/factory-api: $1"
 trap 'printf "ERROR: rollback failed at line %s; snapshot retained at %s.\n" "$LINENO" "$snapshot" >&2' ERR
 for command in systemctl cp rm cat mv mktemp date sudo curl touch sqlite3 jq flock sha256sum cmp find realpath install; do
     command -v "$command" >/dev/null || fail "Required command missing: $command"

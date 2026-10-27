@@ -2,6 +2,12 @@
 set -Eeuo pipefail
 root=$(dirname "$(dirname "$(realpath "$0")")")
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+# MET-375: from the staged root-owned tree, read only its verified assets (deploy/sudoers/README.md).
+if [[ $0 == /usr/local/lib/factory-deploy/* || $root == /usr/local/lib/factory-deploy ]]; then
+    # shellcheck source=SCRIPTDIR/sudoers/trusted-assets.sh
+    source /usr/local/lib/factory-deploy/deploy/sudoers/trusted-assets.sh
+    trusted_assets deploy/sudoers/trusted-assets.sh deploy/rollback-meter.sh deploy/set_ollama_host.py
+fi
 [[ $EUID -eq 0 ]] || fail 'Run as root: sudo bash deploy/rollback-meter.sh.'
 trap 'printf "ERROR: rollback failed at line %s. Pre-install snapshots for manual recovery: /etc/systemd/system/ollama.service.d/override.conf.bak.<timestamp>\n" "$LINENO" >&2' ERR
 
