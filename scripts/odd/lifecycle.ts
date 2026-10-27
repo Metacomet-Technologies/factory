@@ -55,7 +55,7 @@ export type IssueSnapshot = {
   risk?: RiskClass;
   /**
    * Live thread owning the issue, derived from Amp thread labels odd-issue-<id>, odd-role-<role>, odd-round-<n>.
-   * `idleSince` is the thread's last activity (thread search `updatedAt`); the Watchdog cancels an idle owner past `staleMs`.
+   * `idleSince` is the thread's last activity: thread search `updatedAt`, or for a running owner its agent state's `updatedAt` (P3.10). The Watchdog cancels an idle or running owner after `staleMs` without activity.
    */
   owner?: { role: Role; threadID: string; round: number; state: 'idle' | 'running' | 'awaiting-approval' | 'error'; idleSince?: string };
   /**
@@ -130,14 +130,16 @@ export type Load = { orbs: number; runnerSlots: number; buildIssues: number };
  * absent when the source did not report it, and the age is then unknown, not zero. `key` names
  * the episode: it stays the same until the head, merge, thread or steer behind the wait changes.
  */
-export type WaitKind = 'ci' | 'receipt' | 'steer' | 'approval' | 'risk' | 'verification';
+export type WaitKind = 'ci' | 'receipt' | 'steer' | 'approval' | 'activity' | 'risk' | 'verification';
 export type Wait = { kind: WaitKind; key: string; since?: string };
 
-export const waitBudgets: Readonly<Record<WaitKind, { notify: 'page'; ms: number } | { notify: 'digest' }>> = Object.freeze({
+/** `activity` (P3.10) is a running owner's last activity: past its budget the Watchdog cancels the thread instead of paging. */
+export const waitBudgets: Readonly<Record<WaitKind, { notify: 'page' | 'cancel'; ms: number } | { notify: 'digest' }>> = Object.freeze({
   ci: { notify: 'page', ms: 60 * 60_000 },
   receipt: { notify: 'page', ms: 2 * 60 * 60_000 },
   steer: { notify: 'page', ms: 30 * 60_000 },
   approval: { notify: 'page', ms: 30 * 60_000 },
+  activity: { notify: 'cancel', ms: 15 * 60_000 },
   risk: { notify: 'digest' },
   verification: { notify: 'digest' },
 });
@@ -152,7 +154,7 @@ export function waitAge(wait: Wait, now: number): { state: 'human' } | { state: 
   return { state: ageMs >= budget.ms ? 'over' : 'within', ageMs };
 }
 
-const waiting = (reason: string, kind: WaitKind, key: string, since?: string): Action =>
+const waiting = (reason: string, kind: WaitKind, key: string, since?: string): Extract<Action, { kind: 'wait' }> =>
   ({ kind: 'wait', reason, wait: { kind, key, ...(since ? { since } : {}) } });
 
 export type Action =
@@ -449,7 +451,8 @@ function proceed(issue: IssueSnapshot, load: Load, now: number): Action {
   // A status the lifecycle does not know is never read as another one: it pages once (the latch holds it after).
   if (status === 'Unknown') return { kind: 'page', reason: 'unknown-status', detail: `${issue.identifier}: Linear status ${JSON.stringify((issue.unknownStatus ?? '').slice(0, 60))} is not one ODD knows; the issue is held, not parked as Backlog.` };
   if (owner?.state === 'awaiting-approval') return waiting(`${owner.role} awaiting approval`, 'approval', `approval-${owner.threadID}`, owner.idleSince);
-  if (owner && owner.state !== 'idle' && owner.state !== 'error') return { kind: 'wait', reason: `${owner.role} running` };
+  // P3.10: a running owner is aged by its last activity; the Watchdog cancels it once inactive past the budget.
+  if (owner?.state === 'running') return { ...waiting(`${owner.role} running`, 'activity', `activity-${owner.threadID}`, owner.idleSince), stuck: owner.role };
   if (status === 'Done' || status === 'Canceled' || status === 'Duplicate') return { kind: 'wait', reason: status };
 
   // Backlog is triaged on demand: Devon moves an idea to Triage when it should enter the factory.

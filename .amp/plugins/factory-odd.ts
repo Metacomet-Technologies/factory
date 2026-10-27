@@ -47,10 +47,10 @@ import {
 	type SpawnRecord,
 } from '../../scripts/odd/lifecycle.ts'
 import { contextNamesSource, intakeChannel, intakeLookback, intakeEmoji, intakePrompt, outcomeIssue, pendingIntake, slackSourceLabel, slackSourceTs, sourceLine, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { admittedLoad, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
+import { admittedLoad, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, threadState, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
 import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
 import { builderArgs, launch } from '../../scripts/odd/launch.ts'
-import { alertsChannel, blindMs, capsAlertMs, digest, digestDelivered, digestDue, digestHeading, digestLate, digestParts, digestSends, episodeLine, firstParentSince, incidentPageDue, incidentText, incidents, newestRelease, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, postedLate, publisherPage, publisherPagedLine, publisherSnapshot, resolutionText, restoreStatus, sanitizeError, staleThreads, stalledWork, sweepMs, type DigestInput, type DigestList, type DigestWait, type Episode, type MainCommit, type Plane, type Publisher, type Run } from '../../scripts/odd/watchdog.ts'
+import { alertsChannel, blindMs, capsAlertMs, digest, digestDelivered, digestDue, digestHeading, digestLate, digestParts, digestSends, episodeLine, firstParentSince, incidentPageDue, incidentText, incidents, newestRelease, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, postedLate, publisherPage, publisherPagedLine, publisherSnapshot, resolutionText, restoreStatus, sanitizeError, staleReason, staleThreads, stalledWork, sweepMs, type DigestInput, type DigestList, type DigestWait, type Episode, type MainCommit, type Plane, type Publisher, type Run } from '../../scripts/odd/watchdog.ts'
 
 export const description =
 	'Factory ODD control plane: Linear, GitHub and Slack webhooks drive a deterministic outcome lifecycle; role agents run in orbs; Ralph loops are bounded by external checks. See docs/odd/README.md.'
@@ -480,7 +480,7 @@ export default async function (amp: PluginAPI) {
 			}
 			const stale = action.kind === 'wait' && action.stuck ? staleThreads(action, threads, new Date(), issue.deployReceipt?.sha) : []
 			if (action.kind === 'wait' && action.stuck && stale.length) {
-				await cancelStale(ctx, state, issue, action.stuck, stale)
+				await cancelStale(ctx, state, issue, action.stuck, stale, threads)
 				entry.stage = 'performed'
 				recheck(ctx, state, identifier, 0)
 			} else {
@@ -678,20 +678,15 @@ export default async function (amp: PluginAPI) {
 		return alerting
 	}
 
-	// The Watchdog's cancel (§8): an idle thread the lifecycle waits on past `staleMs` is archived
-	// and the cancellation is recorded on the issue, so `spawn()` counts the next round from it. A
-	// builder that never opened a PR hands the issue back to Todo for a fresh builder.
-	// The comment is written before the thread is archived: an archived thread leaves the
-	// snapshot, so a cancellation that failed to record would hand the role a fresh budget.
-	async function cancelStale(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, role: Role, stale: readonly LiveThread[]) {
-		for (const thread of stale) {
-			const line = cancelledLine(role, thread.id, parseThreadLabels(thread.labels).round)
-			await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: line })
-			state.watchdog.cancelled.push(`${issue.identifier} ${line}`)
-			ctx.logger.log(marker, 'watchdog cancelled', issue.identifier, thread.id)
-		}
-		await archiveThreads(ctx, stale)
-		const status = restoreStatus(role, issue.status, issue.pr !== undefined)
+	// The Watchdog's cancel (§8): an idle or running thread the lifecycle waits on past `staleMs`
+	// without activity, or an errored one at its spent budget, is archived and the cancellation is
+	// recorded on the issue with its exact reason, so `spawn()` counts the next round from it. A
+	// builder that never opened a PR hands the issue back to Todo for a fresh builder, unless
+	// another builder thread of the issue is still live.
+	async function cancelStale(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, role: Role, stale: readonly LiveThread[], threads: readonly LiveThread[]) {
+		await cancelThreads(ctx, issue.identifier, role, stale, thread => staleReason(thread, new Date()), state.watchdog.cancelled)
+		const left = threads.some(thread => !stale.includes(thread) && parseThreadLabels(thread.labels).role === role)
+		const status = left ? undefined : restoreStatus(role, issue.status, issue.pr !== undefined)
 		if (status) await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: status })
 	}
 
@@ -1382,6 +1377,12 @@ export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 			const match = verdictPattern.exec(label)
 			return match?.[1] === 'changes' && match[2] !== head
 		})))
+		// P3.10: a spent budget's errored role threads are archived once, each round recorded first, so their slots free and the rounds stay spent.
+		if (action.reason !== 'budget-ceiling' && action.reason !== 'third-failed-qa-round') return
+		for (const thread of threads) {
+			const { role } = parseThreadLabels(thread.labels)
+			if (role && threadState(thread.state) === 'error') await cancelThreads(ctx, issue.identifier, role, [thread], () => `errored thread archived at the ${action.reason} page: Amp does not resume it`)
+		}
 	})
 	if (failures.length) {
 		const error = failures[0]
@@ -1638,6 +1639,19 @@ async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 	return { snapshot: toSnapshot({ issue: { ...issue, comments }, pr, threads, openBlockers }), threads, comments }
 }
 
+// A cancellation's comment is written before the thread is archived: an archived thread leaves
+// the snapshot, so a cancellation that failed to record would hand the role a fresh budget, and
+// the recorded round survives a reload.
+async function cancelThreads(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger' | '$'>, issue: string, role: Role, threads: readonly LiveThread[], reason: (thread: LiveThread) => string, cancelled?: string[]) {
+	for (const thread of threads) {
+		const line = cancelledLine(role, thread.id, parseThreadLabels(thread.labels).round)
+		await callJson(ctx.tools, 'linear.save_comment', { issueId: issue, body: `${line}\n\n${reason(thread)}` })
+		cancelled?.push(`${issue} ${line} (${reason(thread)})`)
+		ctx.logger.log(marker, 'watchdog cancelled', issue, thread.id)
+	}
+	await archiveThreads(ctx, threads)
+}
+
 // Finished role threads are archived so the thread list shows only live work; an archived
 // thread keeps its labels, so a later `find_thread … archived:false` no longer counts it, and its
 // orb pauses. Each thread's actual routing is recorded first: a failed record keeps the thread
@@ -1794,7 +1808,7 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 		// every live thread once per evaluation, so one transient rejection would otherwise fail the whole sweep. The read
 		// has no side effect: a rejection is retried up to `statusReads` attempts, the last one still fails the derivation,
 		// and a resolved status is validated below and never retried.
-		let status: { metadata: { labels: string[]; archived?: boolean }; agentState?: { state?: string } }
+		let status: { metadata: { labels: string[]; archived?: boolean }; agentState?: { state?: string; updatedAt?: string } }
 		for (let attempt = 1; ; attempt++) {
 			try {
 				status = await readJson(tools, 'get_thread_status', { thread: id })
@@ -1804,8 +1818,11 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 			}
 		}
 		// An unknown execution state is not idleness: it would let the Watchdog cancel a running thread.
-		if (!strings(status?.metadata?.labels) || !named(status.agentState?.state) || !optional(status.metadata, 'archived', 'boolean')) throw new ReadError(`get_thread_status ${id} returned no labels or agent state`)
-		return { id, labels: status.metadata.labels, state: status.agentState.state, archived: status.metadata.archived === true, updatedAt: updated.get(id) }
+		if (!strings(status?.metadata?.labels) || !named(status.agentState?.state) || !optional(status.agentState as Row, 'updatedAt', 'string') || !optional(status.metadata, 'archived', 'boolean')) throw new ReadError(`get_thread_status ${id} returned no labels or agent state`)
+		// Nor is it running (P3.10): a state outside the known ones fails the read instead of being guessed.
+		if (!threadState(status.agentState.state)) throw new ReadError(`get_thread_status ${id} returned unknown agent state ${JSON.stringify(status.agentState.state.slice(0, 40))}`)
+		const { state, updatedAt: activeAt } = status.agentState
+		return { id, labels: status.metadata.labels, state, archived: status.metadata.archived === true, updatedAt: updated.get(id), ...(activeAt ? { activeAt } : {}) }
 	}))
 	return threads.filter(thread => !thread.archived).map(({ archived: _, ...thread }) => thread)
 }

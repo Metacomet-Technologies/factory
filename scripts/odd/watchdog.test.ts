@@ -1,9 +1,9 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, staleThreads, sweepMs, staleMs, type DigestInput, type Episode, digestParts, digestSends, digestCompleteLine, digestDelivered, digestLate, stalledWork, firstParentSince, newestRelease, publisherSnapshot, publisherPage, publisherLine, publisherStallMs, type DigestList, type MainCommit, type Publisher, type Run } from './watchdog.ts';
+import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, staleReason, staleThreads, sweepMs, staleMs, type DigestInput, type Episode, digestParts, digestSends, digestCompleteLine, digestDelivered, digestLate, stalledWork, firstParentSince, newestRelease, publisherSnapshot, publisherPage, publisherLine, publisherStallMs, type DigestList, type MainCommit, type Publisher, type Run } from './watchdog.ts';
 import { controlPlaneSilent, deployReceiptLine, heartbeatLine, parseHeartbeat, silenceMs, verifyLine } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
-import { diagnosedLabel, loadFrom, readerLabel, receiptLabel, type LiveThread } from './snapshot.ts';
+import { diagnosedLabel, loadFrom, readerLabel, receiptLabel, toSnapshot, type LiveThread } from './snapshot.ts';
 import plugin, { followUp } from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
 import { io } from './launch.ts';
@@ -885,7 +885,8 @@ function factory() {
   const prs: Pr[] = [];
   /** Deployed revision → the merge commits it contains, for GitHub's compare. */
   const releases = new Map<string, string[]>();
-  const threads = new Map<string, { labels: string[]; state: string; archived: boolean; updatedAt: string }>();
+  /** `activeAt` is the agent state's own `updatedAt` (P3.10); thread search reports `updatedAt`. */
+  const threads = new Map<string, { labels: string[]; state: string; archived: boolean; updatedAt: string; activeAt?: string }>();
   const dms: string[] = [];
   const steers: string[] = [];
   // `statuses` applies status writes to the issue, as Linear does.
@@ -953,7 +954,7 @@ function factory() {
         const live = String(input.query).includes('archived:false');
         return { threads: [...threads].filter(([id, thread]) => !hidden.has(id) && !(live && thread.archived) && thread.labels.includes(label)).map(([id, thread]) => ({ id, updatedAt: thread.updatedAt })) };
       }
-      case 'get_thread_status': { const thread = threads.get(String(input.thread))!; return { metadata: { labels: thread.labels, archived: thread.archived }, agentState: { state: thread.state } }; }
+      case 'get_thread_status': { const thread = threads.get(String(input.thread))!; return { metadata: { labels: thread.labels, archived: thread.archived }, agentState: { state: thread.state, ...(thread.activeAt ? { updatedAt: thread.activeAt } : {}) } }; }
       case 'update_thread': threads.get(String(input.thread))!.archived = true; return {};
       case 'slack_write':
         if (input.channelName) return {};
@@ -3299,4 +3300,138 @@ test('P3.11: an unknown status pages once across sweeps and a reload and archive
   assert.equal(plant.issues.get('MET-71')!.status, 'Backlog');
   assert.deepEqual(plant.saves.filter(save => save.startsWith('MET-71 ')), [], 'Backlog: no status write and no label');
   assert.deepEqual((plant.comments.get('MET-71') ?? []).filter(comment => /^odd-(escalated|spawn|budget|steer) /.test(comment.body)), [], 'Backlog: no page, spawn or steer');
+});
+
+// --- P3.10: approval, unknown and inactive-running thread states ---------------------------------
+
+test('P3.10: a running owner is cancelled after 15 minutes without agent activity, not at 15; approval, undated, delivered and idle siblings never are; an errored thread only at a spent budget', () => {
+  const ago = (minutes: number) => new Date(now.getTime() - minutes * 60_000).toISOString();
+  const runningWait = (since?: string): Action => ({ kind: 'wait', reason: 'builder running', stuck: 'builder', wait: { kind: 'activity', key: 'activity-T-run', ...(since ? { since } : {}) } });
+  // Thread search's date is fresh on purpose: only the agent's own activity ages a running thread.
+  const run = (minutes: number | undefined, over: Partial<LiveThread> = {}): LiveThread => idleFor(0, { id: 'T-run', state: 'streaming', ...(minutes === undefined ? {} : { activeAt: ago(minutes) }), ...over });
+  const ids = (threads: LiveThread[]) => threads.map(thread => thread.id);
+  assert.deepEqual(ids(staleThreads(runningWait(ago(16)), [run(16)], now)), ['T-run']);
+  assert.deepEqual(ids(staleThreads(runningWait(ago(16)), [run(16, { state: 'tool-running' })], now)), ['T-run']);
+  assert.deepEqual(staleThreads(runningWait(ago(15)), [run(15)], now), [], 'at the budget exactly it is still alive');
+  assert.deepEqual(staleThreads(runningWait(ago(1)), [run(1)], now), []);
+  assert.deepEqual(staleThreads(runningWait(), [run(undefined, { updatedAt: ago(600) })], now), [], 'missing activity is unknown, not stale');
+  assert.deepEqual(staleThreads(runningWait(ago(60)), [run(60, { state: 'awaiting-approval' })], now), [], 'a human wait is never cancelled');
+  // On a running wait an idle or errored sibling of the role is left alone: only the inactive running thread goes.
+  assert.deepEqual(ids(staleThreads(runningWait(ago(60)), [run(60), idleFor(60), idleFor(60, { id: 'T-err', state: 'error' })], now)), ['T-run']);
+  const reviewerWait: Action = { kind: 'wait', reason: 'reviewer running', stuck: 'reviewer', wait: { kind: 'activity', key: 'activity-T-run' } };
+  const reviewer = (extra: string[]) => run(60, { labels: ['odd-issue-met-1', 'odd-role-reviewer', 'odd-round-1', ...extra] });
+  assert.equal(staleThreads(reviewerWait, [reviewer([])], now).length, 1);
+  assert.deepEqual(staleThreads(reviewerWait, [reviewer(['odd-verdict-ready-abcdefabcdef'])], now), [], 'a delivered thread is never cancelled');
+  // A spent budget waits on its live thread: an errored one is cancelled at once (Amp never resumes it); approval-blocked never.
+  const spent: Action = { kind: 'wait', reason: 'reviewer round budget spent (2/2)', stuck: 'reviewer' };
+  const second = (state: string) => idleFor(1, { id: `T-${state}`, state, labels: ['odd-issue-met-1', 'odd-role-reviewer', 'odd-round-2'] });
+  assert.deepEqual(ids(staleThreads(spent, [second('error'), second('awaiting-approval'), second('idle'), second('streaming')], now)), ['T-error']);
+  assert.throws(() => staleThreads(spent, [second('paused')], now), /unknown thread state/);
+  // The exact reason recorded with each cancellation.
+  assert.equal(staleReason(run(16), now), `running thread inactive for 16 min since ${ago(16)} (budget 15 min)`);
+  assert.equal(staleReason(idleFor(20), now), `idle thread inactive for 20 min since ${ago(20)} (budget 15 min)`);
+  assert.equal(staleReason(second('error'), now), 'errored thread: Amp does not resume it');
+});
+
+test('P3.10: a running owner never pages; one without activity reaches the digest as unknown age, one past its budget as over budget; approval pages at 30 minutes', () => {
+  const ago = (minutes: number) => new Date(now.getTime() - minutes * 60_000).toISOString();
+  const running = (since?: string): Extract<Action, { kind: 'wait' }> => ({ kind: 'wait', reason: 'builder running', stuck: 'builder', wait: { kind: 'activity', key: 'activity-T-1', ...(since ? { since } : {}) } });
+  assert.equal(overduePage('MET-1', running(ago(600)), now.getTime()), undefined, 'cancellation, not a page');
+  assert.deepEqual(stalledWork('MET-1', 'In Progress', true, running(), now.getTime()), { list: 'unknownAge', identifier: 'MET-1', reason: 'builder running (activity wait, episode activity-T-1: no durable start time)' });
+  assert.deepEqual(stalledWork('MET-1', 'In Progress', true, running(ago(20)), now.getTime()), { list: 'overBudget', identifier: 'MET-1', reason: 'builder running (activity wait, 20 min old, budget 15 min, episode activity-T-1)' });
+  assert.equal(stalledWork('MET-1', 'In Progress', true, running(ago(5)), now.getTime()), undefined);
+  const approval: Extract<Action, { kind: 'wait' }> = { kind: 'wait', reason: 'builder awaiting approval', wait: { kind: 'approval', key: 'approval-T-1', since: ago(30) } };
+  assert.match(overduePage('MET-1', approval, now.getTime()) ?? '', /^ODD page: wait-overdue \| issue MET-1 .*approval wait is 30 min old \(budget 30 min\)/);
+  assert.equal(overduePage('MET-1', { ...approval, wait: { ...approval.wait!, since: ago(29) } }, now.getTime()), undefined);
+});
+
+test('P3.10: the sweep cancels an inactive running builder with its exact reason before archiving it; fresh, undated, approval-blocked and delivered threads stay; an unknown state is a failed read that touches nothing', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+  const thread = (issue: string, role: string, state: string, activeAt?: string, extra: string[] = []) =>
+    plant.threads.set(`T-${issue}-${role}`, { labels: [`odd-issue-${issue.toLowerCase()}`, `odd-role-${role}`, 'odd-round-1', ...extra], state, archived: false, updatedAt: new Date().toISOString(), ...(activeAt ? { activeAt } : {}) });
+  for (const id of ['MET-1', 'MET-2', 'MET-3', 'MET-4', 'MET-5', 'MET-10']) plant.issue(id, 'In Progress');
+  thread('MET-1', 'builder', 'streaming', ago(16)); // dead orb: still "streaming", no activity
+  thread('MET-10', 'builder', 'streaming', ago(16));
+  plant.threads.set('T-MET-10-builder-2', { labels: ['odd-issue-met-10', 'odd-role-builder', 'odd-round-2'], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+  const active = ago(1);
+  thread('MET-2', 'builder', 'tool-running', active); // active
+  thread('MET-3', 'builder', 'running'); // activity never reported
+  thread('MET-4', 'builder', 'awaiting-approval', ago(60)); // waits on Devon
+  plant.openPr('MET-5', 'a'.repeat(40));
+  thread('MET-5', 'builder', 'idle');
+  thread('MET-5', 'reviewer', 'streaming', ago(60), ['odd-engine-openai', `odd-verdict-ready-${'a'.repeat(12)}`]); // delivered
+  await plant.start();
+  await settle();
+  const comments = (id: string) => (plant.comments.get(id) ?? []).map(comment => comment.body);
+  const cancelled = (id: string) => comments(id).filter(body => body.startsWith('odd-watchdog cancelled'));
+  assert.deepEqual(cancelled('MET-1'), [`odd-watchdog cancelled role=builder thread=T-MET-1-builder round=1\n\nrunning thread inactive for 16 min since ${ago(16)} (budget 15 min)`]);
+  assert.equal(plant.threads.get('T-MET-1-builder')!.archived, true);
+  assert.ok(plant.saves.includes('MET-1 "Todo"'), 'a builder without a PR hands the issue back');
+  // Beside another live builder the issue keeps its status: only the dead thread goes.
+  assert.equal(cancelled('MET-10').length, 1);
+  assert.equal(plant.threads.get('T-MET-10-builder-2')!.archived, false);
+  assert.ok(!plant.saves.some(save => save.startsWith('MET-10 ')));
+  for (const id of ['MET-2', 'MET-3', 'MET-4', 'MET-5']) assert.deepEqual(cancelled(id), [], id);
+  for (const key of ['T-MET-2-builder', 'T-MET-3-builder', 'T-MET-4-builder', 'T-MET-5-builder', 'T-MET-5-reviewer']) assert.equal(plant.threads.get(key)!.archived, false, key);
+  assert.ok(!plant.saves.some(save => /^MET-[2-5] /.test(save)), 'no other status changes');
+  const met3 = (await plant.events()).find(event => event.issue === 'MET-3') as { wait?: string } | undefined;
+  assert.equal(met3?.wait, 'activity unknown', 'missing activity is surfaced');
+  // Fifteen minutes later the active builder has gone quiet too; the undated one still is never guessed stale.
+  await advance(16 * 60_000);
+  assert.equal(cancelled('MET-2').length, 1);
+  assert.deepEqual(cancelled('MET-2'), [`odd-watchdog cancelled role=builder thread=T-MET-2-builder round=1\n\nrunning thread inactive for 16 min since ${active} (budget 15 min)`]);
+  assert.deepEqual(cancelled('MET-3'), []);
+  assert.deepEqual(cancelled('MET-4'), []);
+  // An unknown state is a failed read, never running or idle: the long-quiet thread in it is neither cancelled nor archived, and nothing else acts.
+  plant.issue('MET-6', 'In Progress');
+  thread('MET-6', 'builder', 'paused', ago(600));
+  const writes = [plant.saves.length, [...plant.comments.values()].flat().filter(comment => comment.body.startsWith('odd-watchdog')).length];
+  await advance(sweepMs);
+  assert.ok((await plant.events()).some(event => event.stage === 'failed' && /unknown agent state "paused"/.test(event.error ?? '')));
+  assert.equal(plant.threads.get('T-MET-6-builder')!.archived, false);
+  assert.deepEqual([plant.saves.length, [...plant.comments.values()].flat().filter(comment => comment.body.startsWith('odd-watchdog')).length], writes);
+});
+
+test('P3.10: an errored builder at its spent budget is archived once with its round recorded, frees only its build slot, and stays spent across a restart', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  const archives: string[] = [];
+  plant.control.inject = (name, input) => {
+    if (name === 'linear.save_issue' && Array.isArray(input.addLabels)) plant.issues.get(String(input.id))!.labels.push(...input.addLabels as string[]);
+    if (name === 'update_thread') archives.push(String(input.thread));
+    return undefined;
+  };
+  // MET-7's third builder round errored without a PR; MET-9's builder works (no activity reported, so never guessed stale).
+  plant.issue('MET-7', 'In Progress');
+  plant.threads.set('T-MET-7', { labels: ['odd-issue-met-7', 'odd-role-builder', 'odd-round-3', 'odd-engine-anthropic'], state: 'error', archived: false, updatedAt: new Date().toISOString() });
+  plant.issue('MET-9', 'In Progress');
+  plant.builder('MET-9', 'running');
+  // MET-8 is ready and waits for one of the two build slots.
+  plant.issue('MET-8', 'Todo');
+  await plant.start();
+  await settle();
+  const bodies = (id: string) => (plant.comments.get(id) ?? []).map(comment => comment.body);
+  assert.equal(plant.dms.filter(dm => /ODD page: third-failed-qa-round \| issue MET-7/.test(dm)).length, 1);
+  assert.deepEqual(bodies('MET-7').filter(body => body.startsWith('odd-watchdog cancelled')), ['odd-watchdog cancelled role=builder thread=T-MET-7 round=3\n\nerrored thread archived at the third-failed-qa-round page: Amp does not resume it']);
+  assert.deepEqual(archives, ['T-MET-7'], 'only the errored owner is archived');
+  assert.match(bodies('MET-7').find(body => body.startsWith('odd-escalated')) ?? '', /done=label,page,archive\n/);
+  // Its build slot is free: MET-8 gets a builder (the fixture's launch fails, but it was admitted); MET-9 keeps its own.
+  await advance(5 * 60_000);
+  assert.ok(plant.launches.some(argv => argv.includes('odd-issue-met-8')), 'the freed slot admits the waiting issue');
+  assert.equal(plant.threads.get('T-MET-9')!.archived, false);
+  // A restarted control orb (fresh module state) reads the spent round from the issue: nothing is archived, paged or launched again for MET-7.
+  const launched = plant.launches.length;
+  await plant.start((await import('../../.amp/plugins/factory-odd.ts?restart=p3-10-errored')).default);
+  await advance(30 * 60_000);
+  assert.deepEqual(archives, ['T-MET-7']);
+  assert.equal(plant.dms.filter(dm => /ODD page: third-failed-qa-round \| issue MET-7/.test(dm)).length, 1, 'paged once');
+  assert.equal(bodies('MET-7').filter(body => body.startsWith('odd-watchdog cancelled')).length, 1);
+  assert.ok(!plant.launches.slice(launched).some(argv => argv.includes('odd-issue-met-7')));
+  const snapshot = toSnapshot({ issue: { id: 'MET-7', status: 'In Progress', labels: plant.issues.get('MET-7')!.labels, comments: plant.comments.get('MET-7') } });
+  assert.deepEqual(snapshot.cancelledRounds, { builder: 3 });
+  assert.equal(snapshot.owner, undefined);
 });

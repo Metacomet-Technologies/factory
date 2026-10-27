@@ -2,12 +2,12 @@
 // The control-plane plugin runs the sweep on a timer and does the IO; nothing here calls out.
 
 import { capacity, pageText, parseThreadLabels, waitAge, waitBudgets, type Action, type Load, type Role, type Status, type Wait } from './lifecycle.ts';
-import { delivered, type LiveThread } from './snapshot.ts';
+import { delivered, ownerState, type LiveThread } from './snapshot.ts';
 
 /** Sweep cadence: every issue with live work or in an ODD-owned status is re-evaluated this often. */
 export const sweepMs = 10 * 60_000;
-/** An idle role thread the lifecycle is waiting on is cancelled after this long without activity. */
-export const staleMs = 15 * 60_000;
+/** An idle or running role thread the lifecycle is waiting on is cancelled after this long without activity. */
+export const staleMs = (waitBudgets.activity as { ms: number }).ms;
 /** Soft caps exceeded for this long raise one `#factory-alerts` post per episode. */
 export const capsAlertMs = 60 * 60_000;
 /** Every sweep call failing for this long pages `control-plane-blind` once per episode. */
@@ -18,18 +18,35 @@ export const digestTimeZone = 'America/New_York';
 export const alertsChannel = 'factory-alerts';
 
 /**
- * Threads to cancel: the action waits on an idle thread of `action.stuck`'s role, and that
- * thread has been idle longer than `staleMs`. A thread the search index has not dated yet
- * (`updatedAt` missing) is never stale, and neither is one that delivered (a reviewer with a
- * verdict, a verifier of another receipt than `receiptSha`).
+ * Threads to cancel: the action waits on a thread of `action.stuck`'s role. On a running owner
+ * (an `activity` wait, P3.10) that is a running thread without activity for longer than
+ * `staleMs`; otherwise an idle thread inactive that long, or an errored one, which Amp never
+ * resumes (archiving it frees only that thread's slot). Activity is `activeAt` for a running
+ * thread and `updatedAt` for an idle one; a thread without it is never stale (a running owner's
+ * activity wait then has an unknown age, which the digest lists). A thread awaiting approval, or
+ * one that delivered (a reviewer with a verdict, a verifier of another receipt than
+ * `receiptSha`), is never cancelled.
  */
 export function staleThreads(action: Action, threads: readonly LiveThread[], now: Date, receiptSha?: string): LiveThread[] {
   if (action.kind !== 'wait' || !action.stuck) return [];
+  const running = action.wait?.kind === 'activity';
   return threads.filter(thread => {
     const { role } = parseThreadLabels(thread.labels);
-    if (role !== action.stuck || thread.state !== 'idle' || !thread.updatedAt || delivered(thread, receiptSha)) return false;
-    return now.getTime() - Date.parse(thread.updatedAt) > staleMs;
+    if (role !== action.stuck || delivered(thread, receiptSha)) return false;
+    const state = ownerState(thread.state);
+    if (state === 'error') return !running;
+    const active = running ? thread.activeAt : thread.updatedAt;
+    if (state !== (running ? 'running' : 'idle') || !active) return false;
+    return now.getTime() - Date.parse(active) > staleMs;
   });
+}
+
+/** The exact reason a cancellation records beside its `odd-watchdog cancelled` line. */
+export function staleReason(thread: LiveThread, now: Date): string {
+  const state = ownerState(thread.state);
+  if (state === 'error') return 'errored thread: Amp does not resume it';
+  const active = state === 'running' ? thread.activeAt : thread.updatedAt;
+  return `${state} thread inactive for ${minutes(now.getTime() - Date.parse(active ?? ''))} since ${active} (budget ${minutes(staleMs)})`;
 }
 
 /** The status a cancelled role's issue returns to; undefined keeps the current status. */
@@ -216,7 +233,7 @@ export function stalledWork(identifier: string, status: Status, owned: boolean, 
   if (!action.wait) return status === 'Todo' && !owned ? { list: 'unownedTodo', identifier, reason: action.reason } : undefined;
   const age = waitAge(action.wait, now);
   const budget = waitBudgets[action.wait.kind];
-  const aged = age.state === 'within' || age.state === 'over' ? `${minutes(age.ageMs)} old${budget.notify === 'page' ? `, budget ${minutes(budget.ms)}` : ''}` : 'no durable start time';
+  const aged = age.state === 'within' || age.state === 'over' ? `${minutes(age.ageMs)} old${'ms' in budget ? `, budget ${minutes(budget.ms)}` : ''}` : 'no durable start time';
   const reason = `${action.reason} (${action.wait.kind} wait, ${aged}, episode ${action.wait.key})`;
   if (action.wait.kind === 'receipt') return { list: 'missingReceipt', identifier, reason };
   if (age.state === 'human') return { list: action.wait.kind === 'risk' ? 'risk' : 'failedVerification', identifier, reason: action.reason };
