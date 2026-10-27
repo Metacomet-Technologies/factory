@@ -208,7 +208,7 @@ export default async function (amp: PluginAPI) {
 		/** Slack intake poll: last run, last error, the message timestamps handed to Intake (not completed), consecutive failed polls since `failingSince`, whether that episode's alert went out, and the oldest message not yet handed. */
 		slack: { polledAt?: string; error?: string; spawned: string[]; failures: number; failingSince?: string; alerted?: boolean; pending?: string }
 		/** Watchdog sweep (scripts/odd/watchdog.ts): last run, issues swept, episodes in progress, digest day, cancellations today. */
-		watchdog: { sweptAt?: string; error?: string; issues?: number; overSince?: string; alerted?: boolean; blindSince?: string; paged?: boolean; digestDay?: string; heartbeatId?: string; cancelled: string[]; waits: Record<string, DigestWait & { list: 'risk' | 'failedVerification' | 'unknownAge' }>; overdue: string[] }
+		watchdog: { sweptAt?: string; error?: string; issues?: number; overSince?: string; alerted?: boolean; blindSince?: string; paged?: boolean; digestDay?: string; digestError?: string; heartbeatId?: string; cancelled: string[]; waits: Record<string, DigestWait & { list: 'risk' | 'failedVerification' | 'unknownAge' }>; overdue: string[] }
 		/** Failing actions by `<issue> <episode key>` (scripts/odd/watchdog.ts Episode), and the build slots the incidents are judged against. */
 		episodes: Record<string, Episode>
 		plane: Plane
@@ -710,6 +710,7 @@ export default async function (amp: PluginAPI) {
 		watchdog.sweptAt = at
 		// The labels read is inside the try: a rejection fails this sweep and still releases `sweeping`.
 		let performing = false
+		let digestLoad: Load | undefined
 		try {
 			performing = (await ctx.thread.labels()).includes(performLabel)
 			if (performing) entry.stage = 'performed'
@@ -750,16 +751,7 @@ export default async function (amp: PluginAPI) {
 					watchdog.alerted = true
 				}
 			}
-			// `digestDay` is in memory and a plugin reload forgets it, so the channel itself is the
-			// durable record: a digest already posted for the day is not posted again.
-			const day = digestDue(watchdog.digestDay, now)
-			if (day && performing) {
-				if (!(await digestPosted(ctx.tools, day))) {
-					for (const text of slackMessages(digest(await digestInput(ctx, day, now, load, watchdog.cancelled, Object.values(watchdog.waits))))) await ctx.tools.call('slack_write', { channelName: alertsChannel, text })
-				}
-				watchdog.digestDay = day
-				watchdog.cancelled = []
-			}
+			digestLoad = load
 			// The heartbeat is the poller's only view of this sweep (docs/odd/README.md §9). A failed
 			// sweep writes nothing, so the row aging past 20 minutes is the silence signal. Dry-run
 			// writes nothing either: a plane that is not performing must not look alive.
@@ -771,13 +763,13 @@ export default async function (amp: PluginAPI) {
 				entry.stage = 'failed'
 				entry.error = watchdog.error
 				ctx.logger.log(marker, 'sweep degraded; no heartbeat', watchdog.error)
-				return
+			} else {
+				if (performing) await writeHeartbeat(ctx, state, at)
+				// A blind episode ends only when the evaluations and the heartbeat succeed; the digest has no part in it (P3.8).
+				delete watchdog.error
+				delete watchdog.blindSince
+				watchdog.paged = false
 			}
-			if (performing) await writeHeartbeat(ctx, state, at)
-			// A blind episode ends only when a whole sweep, digest and heartbeat included, succeeds.
-			delete watchdog.error
-			delete watchdog.blindSince
-			watchdog.paged = false
 		} catch (error: unknown) {
 			watchdog.error = String(error)
 			entry.stage = 'failed'
@@ -789,7 +781,28 @@ export default async function (amp: PluginAPI) {
 				await ctx.tools.call('slack_write', { text: `${marker} ${text}` }).then(() => { watchdog.paged = true }, (slackError: unknown) => ctx.logger.log(marker, 'blind page failed', String(slackError)))
 			}
 		} finally {
+			// The digest runs after the heartbeat and apart from it (P3.8): its failure is `digestError`
+			// only, retried by the next sweep, and never withholds a heartbeat or ends a blind episode.
+			if (digestLoad && performing) await deliverDigest(ctx, watchdog, now, digestLoad)
 			sweeping.delete(state)
+		}
+	}
+
+	// `digestDay` is in memory and a plugin reload forgets it, so the channel itself is the
+	// durable record: a digest already posted for the day is not posted again.
+	async function deliverDigest(ctx: EvalContext, watchdog: ArmState['watchdog'], now: Date, load: Load) {
+		const day = digestDue(watchdog.digestDay, now)
+		if (!day) return
+		try {
+			if (!(await digestPosted(ctx.tools, day))) {
+				for (const text of slackMessages(digest(await digestInput(ctx, day, now, load, watchdog.cancelled, Object.values(watchdog.waits))))) await ctx.tools.call('slack_write', { channelName: alertsChannel, text })
+			}
+			watchdog.digestDay = day
+			watchdog.cancelled = []
+			delete watchdog.digestError
+		} catch (error: unknown) {
+			watchdog.digestError = String(error)
+			ctx.logger.log(marker, 'digest failed; retried next sweep', watchdog.digestError)
 		}
 	}
 
@@ -806,7 +819,8 @@ export default async function (amp: PluginAPI) {
 				cursor = nextPage(page, 'linear.get_status_updates')
 			} while (!state.watchdog.heartbeatId && cursor)
 		}
-		const saved = await callJson<{ id?: string }>(ctx.tools, 'linear.save_status_update', { type: 'project', project: heartbeatProject, health: 'onTrack', body, ...(state.watchdog.heartbeatId ? { id: state.watchdog.heartbeatId } : {}) })
+		// No `health`: liveness is the `at` timestamp, and the project's health stays Devon's call (P3.8).
+		const saved = await callJson<{ id?: string }>(ctx.tools, 'linear.save_status_update', { type: 'project', project: heartbeatProject, body, ...(state.watchdog.heartbeatId ? { id: state.watchdog.heartbeatId } : {}) })
 		if (saved.id) state.watchdog.heartbeatId = saved.id
 	}
 
@@ -832,7 +846,7 @@ export default async function (amp: PluginAPI) {
 	async function digestInput(ctx: EvalContext, day: string, now: Date, load: Load, cancelled: readonly string[], waits: readonly (DigestWait & { list: string })[]): Promise<DigestInput> {
 		const listed = (list: string) => waits.filter(wait => wait.list === list).map(({ identifier, reason }) => ({ identifier, reason }))
 		const since = new Date(now.getTime() - 24 * 60 * 60_000).toISOString()
-		// Every read and every field the digest uses is validated: a malformed read fails the sweep (no heartbeat), never an empty day.
+		// Every read and every field the digest uses is validated: a malformed read fails the digest (retried next sweep), never an empty day.
 		type MergedPr = { number: number; title: string; headRefOid: string; mergeCommit: { oid: string }; mergedAt: string }
 		const prs = await ghJson(ctx.$`gh pr list --state merged --search ${`merged:>=${since.slice(0, 10)}`} --json number,title,headRefOid,mergeCommit,mergedAt --limit ${String(prListLimit)}`, 'gh pr list for the digest')
 		if (!Array.isArray(prs) || !prs.every(pr => isRow(pr) && typeof pr.number === 'number' && typeof pr.title === 'string' && sha40(pr.headRefOid) && isRow(pr.mergeCommit) && sha40(pr.mergeCommit.oid) && timestamp(pr.mergedAt))) {
