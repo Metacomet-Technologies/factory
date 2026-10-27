@@ -377,12 +377,25 @@ Each artifact is machine-checkable before the next role starts.
   only its `odd_verdict` tool sets, for its assigned head. The control plane
   reads the label; `changes` steers the same builder thread
   once per head SHA. Rounds are counted as distinct heads with a `changes`
-  verdict. Before the epoch's first `changes` steer the control plane records
+  verdict, from live reviewer labels and the delivered `odd-steer
+  key=changes-<head12>` comments, so archiving a stale-head reviewer never
+  lowers the count. Before the epoch's first `changes` steer the control plane records
   `odd-budget epoch=<n> start=<t> deadline=<t+120m> contract=<hash>`; from
   the second rejected head on, the steer asks the builder to open its next
   handoff with a design reassessment (invariant, competing hypotheses,
   discriminating probes, smallest shared fix). Builder and Spec skills
   require a reusable end-to-end proof matrix built from existing fixtures.
+- Finished role threads (`finishedThreads`, MET-404): each evaluation
+  archives idle role threads whose work is done, recording routing first
+  (`archiveThreads`). A thread is done when the issue has left its role's
+  stage, and also inside the stage for two roles. A verifier is done when its
+  `odd-receipt-<sha12>` is not the current receipt, or when it carries an
+  `odd-verify-<result>-<sha12>` label and the plane has recorded the
+  `odd-verify` line for the current receipt; until then the label is the only
+  copy of that result. A reviewer is done when its verdict label is for a head
+  that is no longer the PR's. The builder is kept through review. A
+  running or approval-blocked thread is never archived, and an Unknown status
+  archives nothing.
 - Shipper → Deployer: merge receipt comment `odd-merge pr=<n> head=<sha>
   merge=<sha> release=<tag|none>`. The publisher (`docs/release.md`), not
   the Shipper, publishes each immutable release with a marker-only body; it

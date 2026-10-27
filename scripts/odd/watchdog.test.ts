@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, staleReason, staleThreads, sweepMs, staleMs, type DigestInput, type Episode, digestParts, digestSends, digestCompleteLine, digestDelivered, digestLate, stalledWork, firstParentSince, newestRelease, publisherSnapshot, publisherPage, publisherLine, publisherStallMs, type DigestList, type MainCommit, type Publisher, type Run } from './watchdog.ts';
 import { controlPlaneSilent, deployReceiptLine, heartbeatLine, parseHeartbeat, silenceMs, verifyLine } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
-import { diagnosedLabel, loadFrom, readerLabel, receiptLabel, toSnapshot, type LiveThread } from './snapshot.ts';
+import { diagnosedLabel, loadFrom, readerLabel, receiptLabel, toSnapshot, verifiedLabels, type LiveThread } from './snapshot.ts';
 import plugin, { followUp } from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
 import { io } from './launch.ts';
@@ -2167,6 +2167,39 @@ test('P4.5: a receipt beyond comment 50 starts the verifier, and the verifier\'s
   assert.match(unmet?.userMessage ?? '', new RegExp(`odd-verify sha=${sha}`), 'the guard found the receipt and waits for its verdict');
   plant.say('MET-20', verifyLine({ sha, result: 'pass' }));
   assert.equal(await plant.guard(labels) as Promise<{ userMessage: string } | undefined>, undefined, 'verdict on page 1, receipt on page 2: stop met');
+});
+
+test('MET-404: the control plane archives finished verifiers and stale-head reviewers inside their stage, after recording a verifier\'s result; current work and the builder stay', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-27T20:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  const [old, current] = ['1'.repeat(40), '2'.repeat(40)];
+  const live = (id: string, labels: string[]) => plant.threads.set(id, { labels, state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+  plant.issue('MET-50', 'Deploying');
+  plant.say('MET-50', deployReceiptLine({ host: 'gpu', component: 'api', sha: old, health: 'pass', rollback: 'none' }));
+  plant.say('MET-50', verifyLine({ sha: old, result: 'fail', bug: 'MET-51' }));
+  plant.say('MET-50', deployReceiptLine({ host: 'gpu', component: 'api', sha: current, health: 'pass', rollback: 'none' }));
+  live('T-v-old', ['odd-issue-met-50', 'odd-role-verifier', 'odd-round-1', receiptLabel(old), ...verifiedLabels({ sha: old, result: 'fail', bug: 'MET-51' })]);
+  // The current verifier has reported through odd_verify, but the plane has not written its `odd-verify` line yet.
+  live('T-v-current', ['odd-issue-met-50', 'odd-role-verifier', 'odd-round-1', receiptLabel(current), ...verifiedLabels({ sha: current, result: 'fail', bug: 'MET-52' })]);
+  const [h1, h2] = ['a'.repeat(40), 'b'.repeat(40)];
+  plant.issue('MET-60', 'In Review');
+  plant.builder('MET-60');
+  plant.openPr('MET-60', h2);
+  plant.say('MET-60', `odd-steer key=changes-${h1.slice(0, 12)} thread=T-MET-60`);
+  live('T-r-stale', ['odd-issue-met-60', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-changes-${h1.slice(0, 12)}`]);
+  live('T-r-current', ['odd-issue-met-60', 'odd-role-reviewer', 'odd-round-2', 'odd-engine-openai']);
+  await plant.start();
+  await settle();
+  const archived = () => [...plant.threads].filter(([, thread]) => thread.archived).map(([id]) => id).sort();
+  assert.deepEqual(archived(), ['T-r-stale', 'T-v-old'], 'the superseded verifier and the stale-head reviewer go; the unrecorded result stays');
+  assert.deepEqual((plant.comments.get('MET-50') ?? []).filter(comment => comment.body.startsWith(`odd-verify sha=${current}`)).length, 1, 'the plane recorded the current result from the live label');
+  await advance(11 * 60_000);
+  assert.deepEqual(archived(), ['T-r-stale', 'T-v-current', 'T-v-old'], 'once recorded, the current verifier is finished too');
+  assert.equal(plant.issues.get('MET-50')!.status, 'Deploying', 'archived while the issue is still Deploying');
+  assert.equal(plant.issues.get('MET-60')!.status, 'In Review');
+  assert.equal(plant.threads.get('T-MET-60')!.archived, false, 'the builder is kept through review');
+  assert.equal(plant.threads.get('T-r-current')!.archived, false, 'the current-head reviewer without a verdict is kept');
 });
 
 test('P4.5: an owned open PR beyond the first 100 and a merged one beyond 100 search results both count; mentions do not own', async t => {

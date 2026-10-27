@@ -232,9 +232,13 @@ export function verdictFor(threads: readonly LiveThread[], headSha: string): Ver
   return undefined;
 }
 
-/** Review rounds spent on the issue: distinct heads that received a `changes` verdict. */
-export function changesRounds(threads: readonly LiveThread[]): number {
-  const heads = new Set<string>();
+/**
+ * Review rounds spent on the issue: distinct heads that received a `changes` verdict, from live
+ * reviewer labels and from the delivered `changes-<head12>` steer keys, so a stale-head reviewer
+ * archived as finished (finishedThreads) still counts.
+ */
+export function changesRounds(threads: readonly LiveThread[], steerKeys: readonly string[] = []): number {
+  const heads = new Set(steerKeys.flatMap(key => /^changes-([a-f0-9]{12})$/.exec(key)?.slice(1) ?? []));
   for (const thread of threads) {
     for (const label of thread.labels) {
       const match = verdictPattern.exec(label);
@@ -378,7 +382,7 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
       verdict: verdictFor(threads, pr.headRefOid),
       merged: pr.state === 'MERGED',
       mergeSha: pr.mergeCommit?.oid ?? undefined,
-      changesRounds: changesRounds(threads),
+      changesRounds: changesRounds(threads, Object.keys(steers)),
       ...(headAt ? { headAt } : {}),
       ...(pr.mergedAt ? { mergedAt: pr.mergedAt } : {}),
       ...(pr.mergeable === 'CONFLICTING' ? { conflicting: true } : {}),
@@ -529,18 +533,31 @@ const roleStages: Partial<Record<keyof typeof contracts, readonly Status[]>> = {
   verifier: ['Deploying'],
 };
 
+/** What finished work is judged against: the current receipt SHA, the receipt SHA of the recorded `odd-verify` line, and the PR head. */
+export type Current = { receiptSha?: string; verifiedSha?: string; headSha?: string };
+
 /**
- * Idle role threads whose stage the issue has left: finished work to archive (§7 handoff). A log
- * reader has no stage (a failed rollback leaves the issue in Deploying, a rolled-back one moves on
- * while the reader still runs): it is finished once it is idle and `delivered`.
+ * Idle role threads whose work is finished (§7 handoff): archived on the next evaluation. A thread is
+ * finished when the issue has left its role's stage, or, inside the stage (MET-404), when it is a
+ * verifier of a superseded receipt or one whose `odd-verify-<result>` output is recorded for the
+ * current receipt (an unrecorded one is still the only copy of that output, verifiedFor), or a
+ * reviewer whose verdict is for a head that is no longer the PR's. A log reader has no stage (a
+ * failed rollback leaves the issue in Deploying, a rolled-back one moves on while the reader still
+ * runs): it is finished once it is idle and `delivered`. The builder is kept through review.
  */
-export function finishedThreads(status: Status, threads: readonly LiveThread[]): LiveThread[] {
+export function finishedThreads(status: Status, threads: readonly LiveThread[], current: Current = {}): LiveThread[] {
   // An unknown status says nothing about which stage is over: nothing is archived until it is known.
   if (status === 'Unknown') return [];
+  const { receiptSha, verifiedSha, headSha } = current;
   return threads.filter(thread => {
     const { role } = parseThreadLabels(thread.labels);
     if (ownerState(thread.state) !== 'idle') return false;
     if (role === 'deployer') return delivered(thread);
+    if (role === 'verifier' && receiptSha) {
+      if (!thread.labels.includes(receiptLabel(receiptSha))) return true;
+      if (verifiedSha === receiptSha && thread.labels.some(label => verifiedPattern.test(label))) return true;
+    }
+    if (role === 'reviewer' && headSha && thread.labels.some(label => { const match = verdictPattern.exec(label); return match !== null && !headSha.startsWith(match[2]); })) return true;
     const stages = role ? roleStages[role] : undefined;
     return stages !== undefined && !stages.includes(status);
   });
