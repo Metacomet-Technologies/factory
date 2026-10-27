@@ -75,6 +75,33 @@ export function prOwnsIssue(pr: Pick<GitHubPullRequest, 'headRefName' | 'body'>,
   return new RegExp(`^\\s*(closes|contributes)\\s+${escaped}\\b`, 'im').test(pr.body ?? '');
 }
 
+/**
+ * P4.3: the time of the latest red deploy receipt (`health=fail`, rolled back or not), or undefined
+ * when there is none. Throws when such a receipt has no creation time to order PRs by.
+ */
+export function failedReceiptAt(comments: readonly { body: string; createdAt?: string }[]): string | undefined {
+  let latest: number | undefined;
+  for (const comment of comments) {
+    if (parseDeployReceipt(comment.body)?.health !== 'fail') continue;
+    const at = Date.parse(comment.createdAt ?? '');
+    if (Number.isNaN(at)) throw new Error(`failed deploy receipt ${comment.createdAt ?? 'without a creation time'} cannot order merged PRs`);
+    latest = Math.max(latest ?? at, at);
+  }
+  return latest === undefined ? undefined : new Date(latest).toISOString();
+}
+
+/**
+ * P4.3: a merged PR whose merge is not strictly after `failedAt` (failedReceiptAt) shipped the release
+ * that failed: it no longer delivers the issue, so it neither selects the issue's PR (no return to
+ * Deploying) nor meets a builder or reviewer stop. Open PRs and later merges are unaffected.
+ */
+export const supersededMerge = (pr: Pick<GitHubPullRequest, 'mergedAt'>, failedAt: string | undefined): boolean =>
+  failedAt !== undefined && pr.mergedAt != null && !(Date.parse(pr.mergedAt) > Date.parse(failedAt));
+
+/** A PR that can deliver the issue: it owns it (prOwnsIssue) and its merge, if any, is not superseded. */
+export const prEligible = (pr: Pick<GitHubPullRequest, 'headRefName' | 'body' | 'mergedAt'>, identifier: string, failedAt: string | undefined): boolean =>
+  prOwnsIssue(pr, identifier) && !supersededMerge(pr, failedAt);
+
 /** `updatedAt` is the thread's last activity as reported by thread search; absent for a thread the index has not returned yet. */
 export type LiveThread = { id: string; labels: readonly string[]; state: string; updatedAt?: string };
 
@@ -137,7 +164,9 @@ const ownerState = (state: string): NonNullable<IssueSnapshot['owner']>['state']
  * Open blockers come from Linear relations; the caller resolves which are still open.
  */
 export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; threads?: readonly LiveThread[]; openBlockers?: readonly string[] }): IssueSnapshot {
-  const { issue, pr, threads = [], openBlockers = [] } = input;
+  const { issue, threads = [], openBlockers = [] } = input;
+  // P4.3: a PR merged at or before the latest failed receipt is history, not the issue's PR.
+  const pr = input.pr?.mergedAt && supersededMerge(input.pr, failedReceiptAt(issue.comments ?? [])) ? undefined : input.pr;
   const description = issue.description ?? '';
   const status = statuses.find(name => name === issue.status) ?? 'Backlog';
   const roleThreads = threads.filter(thread => parseThreadLabels(thread.labels).role);

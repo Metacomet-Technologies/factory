@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { admittedLoad, changesRounds, ciState, delivered, diagnosedLabel, finishedThreads, issueFromEvent, loadFrom, openRounds, prOwnsIssue, readerLabel, receiptLabel, reconciles, riskFrom, spawnRecords, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { admittedLoad, changesRounds, ciState, delivered, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, loadFrom, openRounds, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, riskFrom, spawnRecords, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
 import { contractOf, nextAction, parseSpawn, spawnKey, spawnLine } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
@@ -368,4 +368,35 @@ test('P4.6-deployer-archive: a log reader is finished by its diagnosed label for
   assert.equal(delivered(threads[4]), false);
   assert.deepEqual(openRounds(threads), { deployer: 1 }, 'an undiagnosed reader still holds its round');
   assert.deepEqual(openRounds([threads[0]]), {});
+});
+
+test('P4.3: the latest red receipt by creation time bounds which merges deliver the issue; ownership still decides', () => {
+  const red = (sha: string, rollback = 'dddddddddddd') => `odd-deploy host=h component=c sha=${sha} health=fail rollback=${rollback}`;
+  // Newest first, as list_comments returns them: the latest failure by createdAt wins, rolled back or not; pass and refused receipts never count.
+  const comments = [
+    { body: `odd-deploy host=h component=c sha=${'b'.repeat(40)} health=pass rollback=none`, createdAt: '2026-10-26T14:00:00.000Z' },
+    { body: `odd-deploy host=h component=c sha=${'b'.repeat(40)} health=refused rollback=none refusal=db-changing-legacy`, createdAt: '2026-10-26T13:30:00.000Z' },
+    { body: red('a'.repeat(40), 'none'), createdAt: '2026-10-26T12:00:00.000Z' },
+    { body: red('9'.repeat(40)), createdAt: '2026-10-26T13:00:00.000Z' },
+  ];
+  assert.equal(failedReceiptAt(comments), '2026-10-26T13:00:00.000Z');
+  assert.equal(failedReceiptAt(comments.slice(0, 2)), undefined, 'no failure, no bound');
+  assert.throws(() => failedReceiptAt([{ body: red('9'.repeat(40)) }]), /cannot order merged PRs/);
+
+  const at = '2026-10-26T13:00:00.000Z';
+  const owned = { headRefName: 'met-41-x', body: '' };
+  // GitHub reports the failure instant without milliseconds: equal, not later.
+  assert.equal(prEligible({ ...owned, mergedAt: '2026-10-26T13:00:00Z' }, 'MET-41', at), false);
+  assert.equal(prEligible({ ...owned, mergedAt: '2026-10-26T12:59:59Z' }, 'MET-41', at), false);
+  assert.equal(prEligible({ ...owned, mergedAt: '2026-10-26T13:00:01Z' }, 'MET-41', at), true);
+  assert.equal(prEligible({ ...owned, mergedAt: null }, 'MET-41', at), true, 'an open PR is never superseded');
+  assert.equal(prEligible({ ...owned, mergedAt: '2026-10-26T11:00:00Z' }, 'MET-41', undefined), true, 'no failure: history counts as before');
+  assert.equal(prEligible({ headRefName: 'met-279-x', body: 'contributes MET-279\n\nMET-41 was rolled back.', mergedAt: '2026-10-26T14:00:00Z' }, 'MET-41', at), false, 'a later mention does not own');
+
+  // The snapshot applies the same bound to the PR it is given.
+  const issue = { id: 'MET-41', status: 'In Progress', labels: ['odd'], comments };
+  const pr = (mergedAt: string): GitHubPullRequest => ({ number: 41, headRefName: 'met-41-x', headRefOid: sha, state: 'MERGED', mergeCommit: { oid: 'e'.repeat(40) }, mergedAt, statusCheckRollup: [] });
+  assert.equal(toSnapshot({ issue, pr: pr('2026-10-26T13:00:00Z') }).pr, undefined);
+  assert.equal(toSnapshot({ issue, pr: pr('2026-10-26T13:00:01Z') }).pr?.merged, true);
+  assert.equal(toSnapshot({ issue: { ...issue, comments: comments.slice(0, 2) }, pr: pr('2026-10-26T11:00:00Z') }).pr?.merged, true);
 });

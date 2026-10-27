@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { toSnapshot, type GitHubPullRequest } from './snapshot.ts';
 import { budgetLine, contractOf, correctionWindowMs, parseBudget, parseEscalation, escalationLine, reassessment, nextAction, specComplete, ralphGuard, parseDeployReceipt, deployReceiptLine, parseVerify, parseCancelled, pageText, verifyLine, cancelledLine, threadLabels, parseThreadLabels, capacity, issueTriaged, controlPlaneSilent, heartbeatLine, parseHeartbeat, silenceMs, waitAge, waitBudgets, parseSteer, steerLine, type Action, type Budget, type IssueSnapshot, type PageReason, type Wait } from './lifecycle.ts';
 
 const spec = `## Goal
@@ -357,4 +358,19 @@ test('MET-348: safety escalations stay immediate whatever budget remains', () =>
   assert.equal((nextAction({ ...deploying, deployReceipt: refused }, idle, t0) as { reason: string }).reason, 'irreversible-action');
   // A risk decision still waits on a human regardless of any budget.
   assert.equal((nextAction(issue({ status: 'Triage', labels: ['Bug', 'area:agents'], description: 'x', risk: 'security', correction: { epoch: 1, corrected: false, budget: grant() } }), idle, t0) as { reason: string }).reason, 'risk security needs a human decision');
+});
+
+test('P4.3: rollback -> Todo -> a new builder without a new PR waits for its PR instead of returning to Deploying', () => {
+  const merge = 'e'.repeat(40);
+  const old: GitHubPullRequest = { number: 41, headRefName: 'met-1-x', headRefOid: sha, state: 'MERGED', mergeCommit: { oid: merge }, mergedAt: '2026-10-26T11:00:00Z', statusCheckRollup: [] };
+  const comments = [
+    { body: `odd-merge pr=41 head=${sha} merge=${merge} release=none`, createdAt: '2026-10-26T11:00:05.000Z' },
+    { body: deployReceiptLine({ host: 'h', component: 'c', sha: merge, health: 'fail', rollback: 'dddddddddddd' }), createdAt: '2026-10-26T12:00:00.000Z' },
+  ];
+  const at = (status: string, threads: { id: string; labels: string[]; state: string }[] = []) =>
+    nextAction(toSnapshot({ issue: { id: 'MET-1', status, labels: ['odd'], description: spec, comments }, pr: old, threads }), idle);
+  assert.equal((at('Deploying') as { status?: string }).status, 'Todo');
+  assert.deepEqual(at('Todo'), { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'ready to build', round: 1 });
+  const builder = { id: 'T-2', labels: threadLabels('MET-1', 'builder', 1), state: 'idle' };
+  assert.deepEqual(at('In Progress', [builder]), { kind: 'wait', reason: 'builder has not opened a PR', stuck: 'builder' });
 });
