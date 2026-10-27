@@ -1444,14 +1444,11 @@ type Comment = { id?: string; body: string; createdAt?: string }
 // A thread an `odd-spawn` record binds is read by its ID, so search lag (or a plugin reload) never
 // hides it; one whose labels did not land carries its record's role labels.
 async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, merged?: number): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
-	const [issue, comments, found] = await Promise.all([
+	const [issue, comments, pr] = await Promise.all([
 		getIssue(ctx.tools, { id: identifier, includeRelations: true }),
 		listComments(ctx.tools, identifier),
-		pullRequestFor(ctx, identifier),
+		pullRequestFor(ctx, identifier, merged),
 	])
-	// A just-merged PR is missing from the merged search until GitHub indexes it, so the re-check right after a merge
-	// reads the PR `merged` (this process's merge) by number instead of deriving "no PR" (P4.6-recheck).
-	const pr = found ?? (merged === undefined ? undefined : await viewPullRequest(ctx, identifier, merged, 'merged'))
 	const bound = new Map(spawnRecords(comments).flatMap(record => (record.thread ? [[record.thread, record] as const] : [])))
 	const threads = (await threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, [...bound.keys()])).map(thread => {
 		const record = bound.get(thread.id)
@@ -1558,7 +1555,7 @@ async function ghJson(run: PromiseLike<ShellResult>, command: string): Promise<u
 	}
 }
 
-async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, state: 'merged' | 'open'): Promise<GitHubPullRequest | undefined> {
+async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, state: 'merged' | 'open', merged?: number): Promise<GitHubPullRequest | undefined> {
 	const command = `gh pr list --state ${state}`
 	const listed = await ghJson(state === 'open'
 		? ctx.$`gh pr list --state open --json ${prListFields} --limit ${String(prListLimit)}`
@@ -1566,7 +1563,7 @@ async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifie
 	if (!Array.isArray(listed) || listed.some(pr => typeof pr?.number !== 'number' || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string')) throw new ReadError(`${command} returned a malformed PR list`)
 	if (listed.length >= prListLimit) throw new ReadError(`${command} filled its ${prListLimit} limit; PRs past it are unread`)
 	const owned = (listed as GitHubPullRequest[]).find(pr => prOwnsIssue(pr, identifier))
-	return owned && viewPullRequest(ctx, identifier, owned.number, state)
+	return owned && viewPullRequest(ctx, identifier, owned.number, owned.number === merged ? 'merged' : state)
 }
 
 /** One owned PR read in full by number, validated to be in `state`; anything else is a failed read. */
@@ -1585,9 +1582,13 @@ async function viewPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier
 	return { ...pr, commits: [{ oid: pr.headRefOid, committedDate }] }
 }
 
-async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string): Promise<GitHubPullRequest | undefined> {
+// `merged` is the PR this process just merged (P4.6-recheck). GitHub's lists trail the merge: a stale open-list row
+// for it is read as merged, never as open, and while the merged search has not indexed it, it is read by number,
+// so the re-check right after a merge derives neither "no PR" nor an open PR. A view still open is a failed read.
+async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, merged?: number): Promise<GitHubPullRequest | undefined> {
 	// Prefer the open PR; otherwise the merged one, so a merged issue derives `Deploying`.
-	return (await ownedPullRequest(ctx, identifier, 'open')) ?? (await ownedPullRequest(ctx, identifier, 'merged'))
+	return (await ownedPullRequest(ctx, identifier, 'open', merged)) ?? (await ownedPullRequest(ctx, identifier, 'merged'))
+		?? (merged === undefined ? undefined : await viewPullRequest(ctx, identifier, merged, 'merged'))
 }
 
 // `known` are thread IDs this control plane spawned that the search index may not return yet.

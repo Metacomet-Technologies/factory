@@ -2060,8 +2060,8 @@ function readyToMerge() {
   plant.threads.set('T-review', { labels: ['odd-issue-met-8', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-ready-${sha.slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
   plant.openPr('MET-8', sha);
   const open = { ...plant.prs[0] };
-  // `search`: the merged search misses the PR; `open`: the open list and the PR view still show it open with its ready head.
-  const lag = { search: false, open: false, mergeFailures: 0 };
+  // `search`: the merged search misses the PR; `open`: the open list and the PR view still show it open with its ready head; `openList`: only the open list does.
+  const lag = { search: false, open: false, openList: false, mergeFailures: 0 };
   const merges: string[] = [];
   plant.control.gh = command => {
     if (command.startsWith('gh pr merge 8 ')) {
@@ -2072,7 +2072,8 @@ function readyToMerge() {
     }
     if (command === 'gh pr view 8 --json mergeCommit --jq .mergeCommit.oid') return { exitCode: 0, stdout: `${mergeSha}\n`, stderr: '' };
     if (lag.search && /^gh pr list --search .* --state merged /.test(command)) return { exitCode: 0, stdout: '[]', stderr: '' };
-    if (lag.open && (/^gh pr list --state open /.test(command) || /^gh pr view 8 --json number,/.test(command))) return github(command, [open]);
+    if ((lag.open || lag.openList) && /^gh pr list --state open /.test(command)) return github(command, [open]);
+    if (lag.open && /^gh pr view 8 --json number,/.test(command)) return github(command, [open]);
     return undefined;
   };
   const receipts = () => (plant.comments.get('MET-8') ?? []).filter(comment => comment.body.startsWith('odd-merge pr=')).map(comment => comment.body);
@@ -2081,7 +2082,7 @@ function readyToMerge() {
 }
 
 test('P4.6-recheck: a successful merge moves its issue to Deploying a second later, with no webhook and long before the next sweep', async t => {
-  for (const name of ['merged search caught up', 'merged search lagging']) {
+  for (const name of ['merged search caught up', 'merged search lagging', 'open list lagging, PR view caught up']) {
     await t.test(name, async () => {
       mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
       try {
@@ -2092,7 +2093,9 @@ test('P4.6-recheck: a successful merge moves its issue to Deploying a second lat
         assert.deepEqual(receipts(), [receipt]);
         assert.equal(deploying(), false, 'the merge itself does not set the status');
         // The merged PR is not searchable yet: the re-check reads it by the number its receipt names.
-        lag.search = name.endsWith('lagging');
+        lag.search = name === 'merged search lagging';
+        // A stale open-list row for the merged PR is read as merged, not as an open PR whose view disagrees.
+        lag.openList = name.startsWith('open list');
         await advance(1_000, 1_000);
         assert.ok(deploying(), 'Deploying one second after the merge');
         await advance(11 * 60_000);
