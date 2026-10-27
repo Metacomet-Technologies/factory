@@ -407,6 +407,28 @@ Each artifact is machine-checkable before the next role starts.
   parse. Only receipts newer than the
   issue's latest `odd-merge` comment (by creation time) count, so a stale
   receipt from an earlier merge cannot close a later one.
+  Receipt sets (MET-386): a pass receipt is per issue. The issue requires
+  each enabled component whose inputs (as above) one of its merged PRs
+  (`prOwnsIssue`, merge commit contained in the release) changed. When every
+  required component is healthy in the ledger at the release SHA, the
+  release's uniform line above is posted unchanged. Otherwise the issue gets
+  a complete set, `odd-deploy host=<h> component=<c1+c2> sha=<round sha>
+  health=pass rollback=none round=<tag> set=<c1>:<sha40>@<tag>,<c2>:<sha40>@<tag>`:
+  `sha` and `round` are the proven pass release that publishes it (a real
+  commit containing every listed identity), and each entry is that
+  component's own healthy ledger SHA and tag, never the round's. It is
+  published only when every required component is covered: healthy in the
+  ledger, an ancestor of the round, containing every issue merge that
+  changed it, and reported by a read-only health probe at that SHA. Any gap
+  posts nothing (`receipt-partial`, or `reconcile-refused` with `receipt set
+  incomplete: …`) and drops an older pending delivery for the issue;
+  re-receipt below publishes the set on a later tick once it is complete. A
+  set is pass and `rollback=none` only, names each component once, and its
+  `component` joins exactly the set's names in order; any other set does not
+  parse, and older uniform receipts parse unchanged. A receipt that replaces
+  a different receipt line, even at the same SHA, needs its own verification
+  (snapshot.ts): an earlier `odd-verify` is stale, so a pass for one
+  component's receipt never closes the issue's set.
   Delayed delivery (MET-353): a shipped issue that is not yet `Deploying` is
   never marked delivered; it is kept in the ledger's `deliveries` with its
   release receipt and first-seen time and retried at the start of every tick,
@@ -432,7 +454,9 @@ Each artifact is machine-checkable before the next role starts.
   own the issue (`prOwnsIssue`: branch or link line, never a mention); its
   merge commit must equal the `odd-merge` commit and be an ancestor of the
   release. Anything else logs `reconcile-refused` and posts nothing. Nothing
-  is installed; the release's own receipt line is reused, never a new one. An
+  is installed; the issue gets that release's receipt as above (its uniform
+  line, or a complete set with `round` that release), never a component it
+  does not require labelled with that release's SHA. An
   issue with a pending delivery waits for it. Before the first pass release
   after bootstrap (or on a ledger without `deployed`) nothing is re-receipted.
   Job state: ledger `~/.local/state/factory-odd/deploy.json` (`lastTag`,
@@ -452,7 +476,8 @@ Each artifact is machine-checkable before the next role starts.
   evidence link, then `odd_verify`, whose thread labels the control plane
   turns into the issue comment `odd-verify sha=<receipt sha>
   result=<pass|fail> bug=<MET-n|none>`. The control plane sets `Done` on
-  `pass` for the current receipt SHA; a `fail` names the Bug filed in
+  `pass` for the current receipt SHA (a set's round SHA; each listed
+  component is checked at its own `set` SHA); a `fail` names the Bug filed in
   `Triage` and the issue waits in `Deploying` for the next pass release that
   contains the failed SHA, which the Deployer re-receipts to it.
 

@@ -279,6 +279,26 @@ test('a new release starts a fresh verifier budget despite the old receipt\'s ve
   assert.equal(delivered(current, b), false);
 });
 
+test('MET-386: a receipt set that replaces another receipt needs its own verification: a partial or stale one never closes it, even at the same round SHA', () => {
+  const [a, b] = ['a'.repeat(40), 'b'.repeat(40)];
+  const at = (minute: number) => `2026-10-27T15:${String(minute).padStart(2, '0')}:00Z`;
+  const uniform = `odd-deploy host=factory-gpu component=kiosk sha=${b} health=pass rollback=none`;
+  const set = `odd-deploy host=factory-gpu component=meter+kiosk sha=${b} health=pass rollback=none round=v0.3.0 set=meter:${a}@v0.2.50,kiosk:${b}@v0.3.0`;
+  const derive = (bodies: string[]) => {
+    const snapshot = toSnapshot({ issue: { id: 'MET-1', status: 'Deploying', labels: ['odd'], comments: bodies.map((body, i) => ({ body, createdAt: at(i) })).reverse() } });
+    return { verify: snapshot.verify, action: nextAction(snapshot, { orbs: 0, runnerSlots: 0, buildIssues: 0 }) };
+  };
+  const spawn = { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify meter+kiosk at bbbbbbbbbbbb', round: 1 };
+  // A pass for a kiosk-only receipt at the round SHA, then the complete set at that SHA: the set needs its own verification.
+  assert.deepEqual(derive([uniform, `odd-verify sha=${b} result=pass bug=none`, set]), { verify: undefined, action: spawn });
+  // A stale pass for meter's own older SHA does not match the set's round.
+  assert.deepEqual(derive([`odd-deploy host=factory-gpu component=meter sha=${a} health=pass rollback=none`, `odd-verify sha=${a} result=pass bug=none`, set]).action, spawn);
+  // Controls: the set's own verification is Done, and a repost of the same set line keeps it.
+  const done = { kind: 'set-status', status: 'Done', reason: 'verified meter+kiosk at bbbbbbbbbbbb' };
+  assert.deepEqual(derive([set, `odd-verify sha=${b} result=pass bug=none`]).action, done);
+  assert.deepEqual(derive([set, `odd-verify sha=${b} result=pass bug=none`, set]).action, done);
+});
+
 test('P3.1: wait ages come from the head commit, the merge and the steer comment, never from the sweep; a missing source stays unknown', () => {
   const builder: LiveThread = { id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1'], state: 'idle' };
   const older = 'f'.repeat(40);

@@ -8,7 +8,8 @@
 // Deploying issue the release ships gets one `odd-deploy` receipt; one not yet Deploying stays a
 // durable pending delivery for seven days. Each tick also gives every odd Deploying issue whose
 // merged work the newest pass release contains, but which has no receipt since its merge or failed
-// verification at an older release, that release's receipt, without installing anything. The
+// verification at an older release, that release's receipt, without installing anything. A pass
+// receipt names each component the issue needs at its own healthy SHA (`issueReceipt`). The
 // control plane turns the receipt into Done, Todo + Bug, or a page (scripts/odd/lifecycle.ts).
 //
 // The unprivileged runtime (this job, the dispatcher and the usage collector) runs from
@@ -29,7 +30,7 @@ import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, rea
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { oddLabel, type Refusal } from './lifecycle.ts';
+import { deployReceiptLine, oddLabel, type ComponentIdentity, type Refusal } from './lifecycle.ts';
 import { prOwnsIssue, toSnapshot, type GitHubPullRequest } from './snapshot.ts';
 
 /** Git history and the release verifier. Never the runtime, and never run as root. */
@@ -207,9 +208,14 @@ export function plan(input: {
     if (record?.sha === input.sha && record.health === 'pass') return false;
     const baseline = input.baselines[recipe.name];
     if (!baseline) return true;
-    const inputs = [...(input.sources[recipe.name] ?? []), ...recipe.deployFiles, ...releaseInputs];
-    return input.changedSince(baseline).some(path => inputs.some(prefix => path === prefix || path.startsWith(`${prefix}/`)));
+    return touches(recipe, input.sources, input.changedSince(baseline));
   });
+}
+
+/** Does any of `paths` change `recipe`'s inputs: its inventory sources, deploy files or the shared release inputs? */
+function touches(recipe: Recipe, sources: Record<string, readonly string[]>, paths: readonly string[]): boolean {
+  const inputs = [...(sources[recipe.name] ?? []), ...recipe.deployFiles, ...releaseInputs];
+  return paths.some(path => inputs.some(prefix => path === prefix || path.startsWith(`${prefix}/`)));
 }
 
 /** What a run killed mid-component does first: a green probe means the install landed (no second install). */
@@ -440,12 +446,17 @@ function requireStaged(effects: Effects, tag: string, sha: string): void {
   throw new Error(`${tag}: staged installers in ${dir} cannot install this release (${problems.join('; ')}); nothing installed. Devon restages (deploy/sudoers/README.md)`);
 }
 
+/** Each component's sources in the release's deploy/components.json. */
+function inventorySources(effects: Effects, sha: string): Record<string, string[]> {
+  const inventory = JSON.parse(effects.run('git', ['-C', ROOT, 'show', `${sha}:deploy/components.json`]).stdout) as { components: { id: string; sources: string[] }[] };
+  return Object.fromEntries(inventory.components.map(component => [component.id, component.sources]));
+}
+
 /** Install the release's changed components; the receipt is saved in the ledger before any delivery. */
 async function installRelease(effects: Effects, tag: string, sha: string, dir: string): Promise<Receipt> {
   const inFlight = effects.readLedger().inFlight;
   const resumed = inFlight?.sha === sha ? recipes.find(recipe => recipe.name === inFlight.component) : undefined;
-  const inventory = JSON.parse(effects.run('git', ['-C', ROOT, 'show', `${sha}:deploy/components.json`]).stdout) as { components: { id: string; sources: string[] }[] };
-  const sources = Object.fromEntries(inventory.components.map(component => [component.id, component.sources]));
+  const sources = inventorySources(effects, sha);
   const select = (recovering = false) => {
     const ledger = effects.readLedger();
     // Only a healthy record is a baseline: a failed target was rolled back, so its inputs are still undeployed.
@@ -530,14 +541,18 @@ async function deployRelease(effects: Effects, tag: string, previousTag: string)
     if (pending.delivered.includes(identifier)) continue;
     // This release's receipt supersedes an older one still pending for the issue; the first-seen time stays.
     const earlier = effects.readLedger().deliveries?.find(delivery => delivery.issue === identifier);
+    // A pass release gives each issue its own receipt (issueReceipt); an incomplete set posts nothing and drops an older pending
+    // receipt, and reconcile publishes the complete set once the issue is Deploying and every component is covered.
+    const issue = receipt.health === 'pass' ? issueReceipt(effects, identifier, { tag, sha, line }) : { line };
     let delayed: Delivery | undefined;
     // A comment whose response was lost (or a crash before the ledger write) is already there: never post twice.
-    if (await effects.linear.posted(identifier, line)) effects.log('receipt-exists', { issue: identifier, line });
+    if (!('line' in issue)) effects.log('receipt-partial', { issue: identifier, tag, missing: issue.missing });
+    else if (await effects.linear.posted(identifier, issue.line)) effects.log('receipt-exists', { issue: identifier, line: issue.line });
     else if (await effects.linear.deploying(identifier)) {
-      await effects.linear.comment(identifier, line);
-      effects.log('receipt', { issue: identifier, line });
+      await effects.linear.comment(identifier, issue.line);
+      effects.log('receipt', { issue: identifier, line: issue.line });
     } else {
-      delayed = { issue: identifier, tag, line, since: earlier?.since ?? new Date(effects.now()).toISOString() };
+      delayed = { issue: identifier, tag, line: issue.line, since: earlier?.since ?? new Date(effects.now()).toISOString() };
       effects.log('receipt-skipped', { ...delayed, reason: 'not Deploying; kept as a pending delivery' });
     }
     const ledger = effects.readLedger();
@@ -576,17 +591,54 @@ function contains(effects: Effects, commit: string, target: string): boolean {
   return effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', full, target]);
 }
 
+/** Merged PRs that own the issue (prOwnsIssue) with a full merge commit, newest merge first. A malformed or truncated list throws. */
+function ownedMerges(effects: Effects, identifier: string): (GitHubPullRequest & { mergeCommit: { oid: string } })[] {
+  const limit = 1000;
+  const listed = JSON.parse(effects.run('gh', ['pr', 'list', '--search', `"${identifier}"`, '--state', 'merged', '--json', 'number,headRefName,body,mergeCommit,mergedAt', '--limit', String(limit)], { cwd: ROOT }).stdout) as GitHubPullRequest[];
+  if (!Array.isArray(listed) || listed.length >= limit) throw new Error(`gh pr list for ${identifier} returned a malformed or truncated PR list`);
+  return listed.filter((pr): pr is GitHubPullRequest & { mergeCommit: { oid: string } } => prOwnsIssue(pr, identifier) && /^[a-f0-9]{40}$/.test(pr.mergeCommit?.oid ?? ''))
+    .sort((a, b) => (b.mergedAt ?? '').localeCompare(a.mergedAt ?? ''));
+}
+
+/**
+ * MET-386: the receipt `identifier` gets at `round`, a release this job handled with a pass receipt. The issue
+ * requires each enabled component whose inputs one of its merges in the round changed (ownedMerges). When every
+ * required component is healthy in the ledger at the round's own SHA, the round's line is already true for it.
+ * Otherwise the receipt is a complete set naming each required component at its own healthy ledger SHA and tag,
+ * never the round's: each must be healthy in the ledger, contained in the round, contain every issue merge that
+ * changed it, and be reported by a read-only health probe. Any gap is `missing`, and nothing is published.
+ */
+function issueReceipt(effects: Effects, identifier: string, round: Deployed): { line: string } | { missing: string } {
+  const sources = inventorySources(effects, round.sha);
+  const changed = new Map(ownedMerges(effects, identifier).map(pr => pr.mergeCommit.oid).filter(commit => contains(effects, commit, round.sha))
+    .map(commit => [commit, effects.run('git', ['-C', ROOT, 'diff', '--name-only', `${commit}^..${commit}`]).stdout.split('\n').filter(Boolean)]));
+  const merges = (recipe: Recipe) => [...changed].filter(([, paths]) => touches(recipe, sources, paths)).map(([commit]) => commit);
+  const required = recipes.filter(recipe => merges(recipe).length);
+  const { components } = effects.readLedger();
+  if (required.every(recipe => components[recipe.name]?.health === 'pass' && components[recipe.name].sha === round.sha)) return { line: round.line };
+  const ancestor = (commit: string, target: string) => effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', commit, target]);
+  const set: ComponentIdentity[] = [];
+  for (const recipe of required) {
+    const record = components[recipe.name];
+    if (record?.health !== 'pass') return { missing: `${recipe.name} has no healthy ledger record` };
+    if (!ancestor(record.sha, round.sha)) return { missing: `${recipe.name} at ${record.sha} is not in ${round.tag}` };
+    const unshipped = merges(recipe).find(commit => !ancestor(commit, record.sha));
+    if (unshipped) return { missing: `${recipe.name} at ${record.sha} does not contain merge ${unshipped}` };
+    let reported: string | undefined;
+    try { reported = healthySha(effects.probe(recipe.health)); } catch { /* unreachable: unproven */ }
+    if (!reported || !record.sha.startsWith(reported)) return { missing: `${recipe.name} is not reported healthy at ${record.sha}` };
+    set.push({ component: recipe.name, sha: record.sha, tag: record.tag });
+  }
+  return { line: deployReceiptLine({ host: HOST, component: set.map(entry => entry.component).join('+'), sha: round.sha, health: 'pass', rollback: 'none', round: round.tag, set }) };
+}
+
 /** The merged PR an issue's receipt rests on: the one its latest `odd-merge` names, else (a manual
  * merge) the newest merged PR that owns it by branch or link line (prOwnsIssue). Never a PR that only
  * mentions the issue, and never one whose merge commit differs from the merge receipt. */
 function authoritativeMerge(effects: Effects, identifier: string, comments: readonly { body: string; createdAt: string }[]): { commit: string } | { refusal: string } {
   const latest = comments.filter(comment => mergeReceipt.test(comment.body)).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
   const named = latest && mergeReceipt.exec(latest.body)!;
-  const limit = 1000;
-  const listed = JSON.parse(effects.run('gh', ['pr', 'list', '--search', `"${identifier}"`, '--state', 'merged', '--json', 'number,headRefName,body,mergeCommit,mergedAt', '--limit', String(limit)], { cwd: ROOT }).stdout) as GitHubPullRequest[];
-  if (!Array.isArray(listed) || listed.length >= limit) throw new Error(`gh pr list for ${identifier} returned a malformed or truncated PR list`);
-  const owned = listed.filter(pr => prOwnsIssue(pr, identifier) && /^[a-f0-9]{40}$/.test(pr.mergeCommit?.oid ?? ''))
-    .sort((a, b) => (b.mergedAt ?? '').localeCompare(a.mergedAt ?? ''));
+  const owned = ownedMerges(effects, identifier);
   const pr = named ? owned.find(candidate => candidate.number === Number(named[1])) : owned[0];
   if (!pr) return { refusal: named ? `odd-merge PR #${named[1]} is not a merged PR that owns ${identifier}` : `no merged PR owns ${identifier}` };
   if (named && pr.mergeCommit!.oid !== named[2]) return { refusal: `PR #${pr.number} merged ${pr.mergeCommit!.oid}, not the odd-merge commit ${named[2]}` };
@@ -617,8 +669,10 @@ async function reconcile(effects: Effects): Promise<void> {
     const merge = authoritativeMerge(effects, identifier, comments);
     if ('refusal' in merge) { refuse(merge.refusal); continue; }
     if (!contains(effects, merge.commit, deployed.sha)) { refuse(`merge ${merge.commit} is not proven to be in ${deployed.tag}`); continue; }
-    await effects.linear.comment(identifier, deployed.line);
-    effects.log('receipt', { issue: identifier, line: deployed.line, reason: receipt ? 'failed-verification-refresh' : 'missing-receipt' });
+    const issue = issueReceipt(effects, identifier, deployed);
+    if (!('line' in issue)) { refuse(`receipt set incomplete: ${issue.missing}`); continue; }
+    await effects.linear.comment(identifier, issue.line);
+    effects.log('receipt', { issue: identifier, line: issue.line, reason: receipt ? 'failed-verification-refresh' : 'missing-receipt' });
   }
 }
 

@@ -156,6 +156,36 @@ test('a refused deploy receipt is its own type: it pages irreversible-action, ne
   ]) assert.equal(parseDeployReceipt(malformed), undefined, malformed);
 });
 
+test('MET-386: a receipt set names each component at its own SHA and tag under one round; legacy receipts are unchanged and an inconsistent set does not parse', () => {
+  const [a, b] = ['a'.repeat(40), 'b'.repeat(40)];
+  const set = `odd-deploy host=factory-gpu component=meter+kiosk sha=${b} health=pass rollback=none round=v0.3.0 set=meter:${a}@v0.2.50,kiosk:${b}@v0.3.0`;
+  const receipt = parseDeployReceipt(`note\n${set}\n`);
+  assert.deepEqual(receipt, { host: 'factory-gpu', component: 'meter+kiosk', sha: b, health: 'pass', rollback: 'none', round: 'v0.3.0',
+    set: [{ component: 'meter', sha: a, tag: 'v0.2.50' }, { component: 'kiosk', sha: b, tag: 'v0.3.0' }] });
+  assert.equal(deployReceiptLine(receipt!), set);
+  assert.deepEqual(nextAction(issue({ status: 'Deploying', deployReceipt: receipt }), idle), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify meter+kiosk at bbbbbbbbbbbb', round: 1 });
+  // Only a verification of the set's round SHA closes it; one at a component's older SHA does not.
+  assert.equal(nextAction(issue({ status: 'Deploying', deployReceipt: receipt, verify: { sha: a, result: 'pass' } }), idle).kind, 'spawn');
+  assert.deepEqual(nextAction(issue({ status: 'Deploying', deployReceipt: receipt, verify: { sha: b, result: 'pass' } }), idle), { kind: 'set-status', status: 'Done', reason: 'verified meter+kiosk at bbbbbbbbbbbb' });
+  const uniform = `odd-deploy host=factory-gpu component=meter+kiosk sha=${b} health=pass rollback=none`;
+  assert.deepEqual(parseDeployReceipt(uniform), { host: 'factory-gpu', component: 'meter+kiosk', sha: b, health: 'pass', rollback: 'none' });
+  for (const malformed of [
+    set.replace('component=meter+kiosk', 'component=meter'), // a component the set does not name, or one it omits
+    set.replace('component=meter+kiosk', 'component=kiosk+meter'),
+    set.replace(`kiosk:${b}`, `meter:${b}`).replace('component=meter+kiosk', 'component=meter+meter'),
+    set.replace(`meter:${a}`, 'meter:aaaaaaa'), // abbreviated identity
+    set.replace('@v0.2.50', ''),
+    set.replace('@v0.2.50', '@latest'),
+    set.replace('round=v0.3.0 ', ''),
+    set.replace(/ set=\S+$/, ''),
+    set.replace('health=pass', 'health=fail'),
+    set.replace('rollback=none', 'rollback=/var/backups/meter/snap'),
+    set.replace('rollback=none', 'rollback=none refusal=db-changing-v1').replace('health=pass', 'health=refused'),
+    `${set},`,
+    `${set} extra=1`,
+  ]) assert.equal(parseDeployReceipt(malformed), undefined, malformed);
+});
+
 test('ralph guard stops on the external condition or the budget, never on the agent claim', () => {
   assert.deepEqual(ralphGuard({ role: 'builder', chained: 0, stopMet: true, missing: [] }), { action: 'stop', why: 'stop-met' });
   assert.deepEqual(ralphGuard({ role: 'reviewer', chained: 2, stopMet: false, missing: [] }), { action: 'stop', why: 'budget' });
