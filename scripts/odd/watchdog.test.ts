@@ -230,9 +230,9 @@ test('a successful sweep writes one heartbeat and the next sweep updates it; a f
 
   let failed = false;
   const blind = controlOrb((name, input) => {
+    if (name === 'linear.list_issues' && input.state === 'Triage') { failed = true; throw new Error('Linear 503'); }
     if (name === 'linear.list_issues') return { issues: [], hasNextPage: false, cursor: '' };
     if (name === 'find_thread') return { threads: [] };
-    if (name === 'slack_write' && input.channelName === 'factory-alerts') { failed = true; throw new Error('invalid_blocks'); }
     return undefined;
   });
   await blind.start();
@@ -241,34 +241,134 @@ test('a successful sweep writes one heartbeat and the next sweep updates it; a f
   assert.equal(blind.updates.length, 0, 'a sweep that failed writes no heartbeat');
 });
 
-test('a digest that Slack keeps rejecting leaves the control plane blind until it pages', async t => {
-  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
-  t.after(() => mock.timers.reset());
-  let digests = 0;
-  const orb = controlOrb((name, input) => {
-    if (name === 'linear.list_issues') return { issues: [], hasNextPage: false, cursor: '' };
-    if (name === 'find_thread') return { threads: [] };
-    if (name === 'slack_write' && input.channelName === 'factory-alerts') { digests += 1; throw new Error('Failed to post message: invalid_blocks'); }
-    return undefined;
-  });
-  await orb.start();
-  await until(() => digests === 1);
-  // Sweeps until one runs at least `blindMs` after the first failure.
-  for (let sweeps = 2; (sweeps - 2) * sweepMs < blindMs; sweeps++) {
-    mock.timers.tick(sweepMs);
-    await until(() => digests === sweeps);
-  }
-  await until(() => orb.dms.length === 1);
-  assert.match(orb.dms[0], /control-plane-blind/);
-  assert.match(orb.dms[0], /invalid_blocks/);
-});
-
 const emptyWork = (name: string) => {
   if (name === 'linear.list_issues') return { issues: [], hasNextPage: false, cursor: '' };
   if (name === 'find_thread') return { threads: [] };
   return undefined;
 };
 const settle = async () => { for (let i = 0; i < 200; i++) await new Promise(resolve => setImmediate(resolve)); };
+
+type DigestWatchdog = { error?: string; blindSince?: string; paged?: boolean; digestDay?: string; digestError?: string };
+
+test('P3.8: a digest that Slack keeps rejecting is retried every sweep with its own error; heartbeats stay fresh, no health is written and the plane is never blind', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  let digests = 0;
+  let rejecting = true;
+  const health: unknown[] = [];
+  const orb = controlOrb((name, input) => {
+    if (name === 'linear.save_status_update') health.push(input.health);
+    if (name === 'slack_write' && input.channelName === 'factory-alerts') {
+      digests += 1;
+      if (rejecting) throw new Error('Failed to post message: invalid_blocks');
+    }
+    return emptyWork(name);
+  });
+  const status = await orb.start();
+  const watchdog = async () => ((await status({})) as unknown as { watchdog: DigestWatchdog }).watchdog;
+  await until(() => digests === 1 && orb.updates.length === 1);
+  const stamps = [parseHeartbeat(orb.updates[0].body)];
+  // 30 minutes of digest failures, past `blindMs`: each sweep retries the digest and still refreshes the heartbeat.
+  assert.ok(3 * sweepMs > blindMs);
+  for (let sweeps = 2; sweeps <= 4; sweeps++) {
+    mock.timers.tick(sweepMs);
+    await until(() => digests === sweeps && parseHeartbeat(orb.updates[0].body) !== stamps.at(-1));
+    stamps.push(parseHeartbeat(orb.updates[0].body));
+  }
+  await settle();
+  assert.deepEqual(stamps, ['2026-10-24T15:00:00.000Z', '2026-10-24T15:10:00.000Z', '2026-10-24T15:20:00.000Z', '2026-10-24T15:30:00.000Z'], 'successive heartbeat timestamps on one row');
+  assert.equal(orb.updates.length, 1);
+  assert.deepEqual(health, [undefined, undefined, undefined, undefined], 'the heartbeat never writes project health');
+  assert.deepEqual(orb.dms, [], 'a digest failure is not control-plane-blind');
+  let state = await watchdog();
+  assert.equal(state.error, undefined);
+  assert.equal(state.blindSince, undefined);
+  assert.equal(state.digestDay, undefined, 'the day is not marked posted');
+  assert.match(state.digestError ?? '', /invalid_blocks/);
+  // Slack accepts the digest: the next sweep posts it once and clears only the digest error.
+  rejecting = false;
+  mock.timers.tick(sweepMs);
+  await until(() => orb.alerts.length === 1);
+  await settle();
+  assert.match(orb.alerts[0], /^ODD digest 2026-10-24/);
+  state = await watchdog();
+  assert.equal(state.digestDay, '2026-10-24');
+  assert.equal(state.digestError, undefined);
+  mock.timers.tick(sweepMs);
+  await until(() => parseHeartbeat(orb.updates[0].body) === '2026-10-24T15:50:00.000Z');
+  await settle();
+  assert.equal(orb.alerts.length, 1, 'a posted digest is not posted again');
+});
+
+test('P3.8: a heartbeat write that keeps failing pages control-plane-blind exactly once and a digest success neither ends the episode nor suppresses the page; only a heartbeat success recovers', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  let heartbeatFails = true;
+  let heartbeats = 0;
+  const orb = controlOrb((name) => {
+    if (name === 'linear.save_status_update') { heartbeats += 1; if (heartbeatFails) throw new Error('Linear 500'); }
+    return emptyWork(name);
+  });
+  const status = await orb.start();
+  const watchdog = async () => ((await status({})) as unknown as { watchdog: DigestWatchdog }).watchdog;
+  await until(() => heartbeats === 1);
+  await settle();
+  // The digest goes out while the heartbeat fails, and the episode stays open.
+  assert.equal(orb.alerts.filter(text => text.startsWith('ODD digest 2026-10-24')).length, 1);
+  let state = await watchdog();
+  assert.equal(state.blindSince, '2026-10-24T15:00:00.000Z');
+  assert.equal(state.digestDay, '2026-10-24');
+  for (let sweeps = 2; sweeps <= 4; sweeps++) {
+    mock.timers.tick(sweepMs);
+    await until(() => heartbeats === sweeps);
+    await settle();
+  }
+  assert.equal(orb.dms.length, 1, 'one page per episode');
+  assert.match(orb.dms[0], /control-plane-blind/);
+  assert.match(orb.dms[0], /since 2026-10-24T15:00:00\.000Z/);
+  assert.match(orb.dms[0], /Linear 500/);
+  state = await watchdog();
+  assert.equal(state.blindSince, '2026-10-24T15:00:00.000Z', 'the episode continues after the digest posted');
+  heartbeatFails = false;
+  mock.timers.tick(sweepMs);
+  await until(() => orb.updates.length === 1);
+  await settle();
+  state = await watchdog();
+  assert.equal(state.blindSince, undefined, 'a heartbeat success ends the episode');
+  assert.equal(state.error, undefined);
+  assert.equal(state.paged, false);
+});
+
+test('P3.8: an evaluation failure with a failing digest still ages into one blind page; a digest failure never ends the episode, and the next heartbeat does', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  let evaluationFails = true;
+  let digests = 0;
+  const orb = controlOrb((name, input) => {
+    if (name === 'linear.list_issues' && input.state === 'Triage') return evaluationFails ? Promise.reject(new Error('Linear 503')) : { issues: [], hasNextPage: false, cursor: '' };
+    if (name === 'slack_write' && input.channelName === 'factory-alerts') { digests += 1; throw new Error('invalid_blocks'); }
+    return emptyWork(name);
+  });
+  const status = await orb.start();
+  const watchdog = async () => ((await status({})) as unknown as { watchdog: DigestWatchdog }).watchdog;
+  await settle();
+  for (let sweeps = 2; sweeps <= 4; sweeps++) { mock.timers.tick(sweepMs); await settle(); }
+  assert.equal(orb.updates.length, 0, 'no heartbeat while evaluation fails');
+  assert.equal(orb.dms.length, 1, 'one page per episode');
+  assert.match(orb.dms[0], /control-plane-blind/);
+  assert.match(orb.dms[0], /Linear 503/);
+  // Evaluation recovers while the digest still fails: the heartbeat goes out and ends the episode.
+  evaluationFails = false;
+  mock.timers.tick(sweepMs);
+  await until(() => orb.updates.length === 1 && digests > 0);
+  await settle();
+  const state = await watchdog();
+  assert.equal(state.blindSince, undefined);
+  assert.equal(state.paged, false);
+  assert.match(state.digestError ?? '', /invalid_blocks/);
+  assert.equal(parseHeartbeat(orb.updates[0].body), '2026-10-24T15:40:00.000Z');
+  assert.equal(orb.dms.length, 1);
+});
 
 test('P3.6: a rejected labels read fails that sweep only; the next sweep runs and writes the heartbeat', async t => {
   mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
@@ -1258,7 +1358,7 @@ test('P3.7: a read that fails while acting withholds the heartbeat and writes no
   }
 });
 
-test('P3.7: malformed digest reads fail the sweep without a heartbeat; a valid empty day posts the digest and heartbeats', async t => {
+test('P3.7, P3.8: malformed digest reads post no digest and keep the heartbeat; a valid empty day posts the digest and heartbeats', async t => {
   mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
   t.after(() => mock.timers.reset());
   const digestRead = (input: Record<string, unknown>) => Array.isArray(input.fields) && input.fields.includes('title');
@@ -1276,7 +1376,7 @@ test('P3.7: malformed digest reads fail the sweep without a heartbeat; a valid e
     ['digest merged PRs [{}]', (call: string, input: Record<string, unknown>) => call === '$' && String(input.command).startsWith('gh pr list --state merged') ? '[{}]' : undefined],
     ['digest posted-check without messages', (call: string, input: Record<string, unknown>) => call === 'slack_read' && input.channelName === 'factory-alerts' ? {} : undefined],
   ] as const) {
-    assert.deepEqual(await run(override), { heartbeats: 0, digests: 0 }, name);
+    assert.deepEqual(await run(override), { heartbeats: 1, digests: 0 }, name);
   }
 });
 
@@ -1995,7 +2095,7 @@ for (const shape of slackShapes) {
 }
 
 for (const shape of shapes) {
-  test(`P4.5 matrix: digest Done issues ${shape}: the issue done on page 2 is listed once, or no digest and no heartbeat`, async t => {
+  test(`P4.5 matrix: digest Done issues ${shape}: the issue done on page 2 is listed once, or no digest while the heartbeat stays`, async t => {
     mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
     t.after(() => mock.timers.reset());
     const rows = Array.from({ length: 101 }, (_, i) => ({ id: `MET-${i + 1}`, title: i === 100 ? 'late Done sentinel' : 'long done', completedAt: i === 100 ? '2026-10-24T14:00:00Z' : '2026-10-01T00:00:00Z' }));
@@ -2004,7 +2104,7 @@ for (const shape of shapes) {
     await orb.start();
     await settle();
     const outcome = () => ({ digests: orb.alerts.filter(text => text.startsWith('ODD digest')).length, sentinel: orb.alerts.filter(text => /^- MET-101 late Done sentinel$/m.test(text)).length, heartbeats: orb.updates.length });
-    assert.deepEqual(outcome(), shape === 'empty' ? { digests: 1, sentinel: 0, heartbeats: 1 } : failing(shape) ? { digests: 0, sentinel: 0, heartbeats: 0 } : { digests: 1, sentinel: 1, heartbeats: 1 });
+    assert.deepEqual(outcome(), shape === 'empty' ? { digests: 1, sentinel: 0, heartbeats: 1 } : failing(shape) ? { digests: 0, sentinel: 0, heartbeats: 1 } : { digests: 1, sentinel: 1, heartbeats: 1 });
     done.state.broken = false;
     await advance(sweepMs);
     if (failing(shape)) assert.deepEqual(outcome(), { digests: 1, sentinel: 1, heartbeats: 1 }, 'the next sweep posts the full digest once');
@@ -2029,7 +2129,7 @@ for (const shape of slackShapes) {
     await settle();
     const outcome = () => ({ reposted: orb.alerts.filter(text => text.startsWith('ODD digest')).length, heartbeats: orb.updates.length });
     // An empty channel is a true "not posted yet": the digest goes out.
-    assert.deepEqual(outcome(), shape === 'empty' ? { reposted: 1, heartbeats: 1 } : failing(shape) ? { reposted: 0, heartbeats: 0 } : { reposted: 0, heartbeats: 1 });
+    assert.deepEqual(outcome(), shape === 'empty' ? { reposted: 1, heartbeats: 1 } : failing(shape) ? { reposted: 0, heartbeats: 1 } : { reposted: 0, heartbeats: 1 });
     alerts.state.broken = false;
     await advance(sweepMs);
     if (failing(shape)) assert.deepEqual(outcome(), { reposted: 0, heartbeats: 1 }, 'the next sweep finds the digest and still does not repost');

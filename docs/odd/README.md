@@ -512,7 +512,9 @@ pause, the webhook can be rate-limited (10 events/min) and subscription
 engines can only be launched from a shell. The two agree because both derive
 state from Linear and GitHub, never from each other. The control plane writes
 one Software Factory project status update, `odd-heartbeat at=<ISO-8601>`,
-after each successful sweep and updates that same row on the next. The poller
+after each successful sweep and updates that same row on the next. It writes
+no project health (P3.8): liveness is the timestamp alone, and a failed
+digest never delays it. The poller
 reads it. Younger than 20 minutes, the poll logs `odd-backstop` and does not
 run the lifecycle. Missing or older, it runs the lifecycle and logs
 `odd-backstop-resume` once per silence episode. The poller has no Slack
@@ -682,7 +684,10 @@ by the previous one).
    issue without type + area gets one Intake round, then Spec. The sweep posts
    a cancellation before archiving the thread (a failed comment keeps the
    thread, so the round is not lost) and a blind episode ends only when a
-   whole sweep, digest and heartbeat included, succeeds; a rejected labels
+   sweep's evaluations and its heartbeat succeed (P3.8). The digest runs
+   after the heartbeat and apart from it: a failed digest read or post is
+   `digestError` only, retried by the next sweep, and neither withholds the
+   heartbeat nor starts or ends a blind episode; a rejected labels
    read fails one sweep and never blocks the next (MET-342). A rejected
    `get_thread_status` read (its open-dialog read times out under load and
    asks to be retried) is retried, three attempts in all, before it fails the
@@ -710,7 +715,7 @@ by the previous one).
    commits; an unreadable head time fails the read. Every such read throws a
    `ReadError`, and an evaluation that fails on one is a failed derivation
    wherever it happens, also after its action was chosen (a follow-up Bug
-   lookup, the digest, the merge confirmation). Any failed derivation
+   lookup, the merge confirmation). Any failed derivation
    withholds the sweep's heartbeat, even when other issues evaluate, while a
    failed action (a refused merge, a spawn) stays an incident. A merge whose
    merge-commit read fails posts no `merge=unknown` receipt: the next
