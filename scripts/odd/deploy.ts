@@ -5,8 +5,11 @@
 // detached at its SHA, each enabled component whose inputs changed is installed through the sudoers
 // allowlist, probed three times for the exact release SHA, rolled back once when red (and
 // re-probed: the rollback counts only when the previous release is back and healthy), and every
-// Deploying issue the release ships gets one `odd-deploy` receipt. The control plane turns the
-// receipt into Done, Todo + Bug, or a page (scripts/odd/lifecycle.ts).
+// Deploying issue the release ships gets one `odd-deploy` receipt; one not yet Deploying stays a
+// durable pending delivery for seven days. Each tick also gives every odd Deploying issue whose
+// merged work the newest pass release contains, but which has no receipt since its merge or failed
+// verification at an older release, that release's receipt, without installing anything. The
+// control plane turns the receipt into Done, Todo + Bug, or a page (scripts/odd/lifecycle.ts).
 //
 // The unprivileged runtime (this job, the dispatcher and the usage collector) runs from
 // `~/factory-tools/current`, a link to an immutable `~/factory-tools/<tag>` tree of a release this
@@ -24,7 +27,8 @@ import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, 
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Refusal } from './lifecycle.ts';
+import { oddLabel, type Refusal } from './lifecycle.ts';
+import { prOwnsIssue, toSnapshot, type GitHubPullRequest } from './snapshot.ts';
 
 /** The allowlisted installer checkout: sudo, Git history and the release verifier. Never the runtime. */
 export const ROOT = '/home/agent/work/factory';
@@ -76,11 +80,16 @@ export type ComponentRecord = { sha: string; tag: string; health: 'pass' | 'fail
 export type InFlight = { tag: string; sha: string; component: string; phase: 'installing' | 'probing'; snapshot?: string; noDbChange?: true };
 /** A release's receipt, saved before delivery so a crashed delivery resumes without redeploying. `delivered` lists issues already handled. */
 export type PendingReceipt = { tag: string; receipt: Receipt; delivered: string[] };
+/** A shipped issue that was not Deploying yet: retried every tick until it is, posted once, or expired `DELIVERY_WINDOW_MS` after `since` (first seen). */
+export type Delivery = { issue: string; tag: string; line: string; since: string };
+export const DELIVERY_WINDOW_MS = 7 * 24 * 60 * 60_000;
+/** The newest release this job handled with a pass receipt: the proven deployment that catch-up and re-receipts carry. */
+export type Deployed = { tag: string; sha: string; line: string };
 /** A tools tree: release tag/SHA and the installer checkout's HEAD it ran beside. */
 export type ToolsRecord = { tag: string; sha: string; installerSha: string };
 /** `pending` is saved before staging and cleared only by delivery or rejection; `previous` is the link target to restore. */
 export type Tools = { current?: ToolsRecord; pending?: ToolsRecord & { previous: string | null }; rejected?: ToolsRecord & { reason: string } };
-export type Ledger = { lastTag?: string; components: Record<string, ComponentRecord>; inFlight?: InFlight; receipt?: PendingReceipt; manualBaseline?: ManualBaseline; tools?: Tools };
+export type Ledger = { lastTag?: string; components: Record<string, ComponentRecord>; inFlight?: InFlight; receipt?: PendingReceipt; deliveries?: Delivery[]; deployed?: Deployed; manualBaseline?: ManualBaseline; tools?: Tools };
 export type ManualBaseline = {
   tag: string; sha: string; toolsSha: string; manifestSha256: string;
   priorLedger: Omit<Ledger, 'manualBaseline'>;
@@ -199,6 +208,8 @@ export type Effects = {
   toolsDir: string;
   log: (decision: string, details?: object) => void;
   sleep: (ms: number) => Promise<void>;
+  /** Epoch milliseconds: a delayed delivery's first-seen time and expiry. */
+  now: () => number;
   /** Run a command; non-zero exit throws with stdout+stderr in the message. */
   run: (command: string, args: readonly string[], options?: { cwd?: string; timeout?: number }) => { stdout: string; stderr: string };
   /** Exit status 0? For git predicates such as merge-base --is-ancestor. */
@@ -216,6 +227,10 @@ export type Effects = {
     /** Does the issue already carry a comment whose body is exactly `body`? */
     posted: (identifier: string, body: string) => Promise<boolean>;
     comment: (identifier: string, body: string) => Promise<void>;
+    /** Every issue labelled `odd` in Deploying, all pages. */
+    deployingIssues: () => Promise<string[]>;
+    /** Every comment on the issue, all pages. */
+    comments: (identifier: string) => Promise<{ body: string; createdAt: string }[]>;
   };
 };
 
@@ -445,18 +460,98 @@ async function deployRelease(effects: Effects, tag: string, previousTag: string)
   for (const identifier of issues) {
     const pending = effects.readLedger().receipt!;
     if (pending.delivered.includes(identifier)) continue;
+    // This release's receipt supersedes an older one still pending for the issue; the first-seen time stays.
+    const earlier = effects.readLedger().deliveries?.find(delivery => delivery.issue === identifier);
+    let delayed: Delivery | undefined;
     // A comment whose response was lost (or a crash before the ledger write) is already there: never post twice.
     if (await effects.linear.posted(identifier, line)) effects.log('receipt-exists', { issue: identifier, line });
     else if (await effects.linear.deploying(identifier)) {
       await effects.linear.comment(identifier, line);
       effects.log('receipt', { issue: identifier, line });
-    } else effects.log('receipt-skipped', { issue: identifier, reason: 'not Deploying' });
-    effects.writeLedger({ ...effects.readLedger(), receipt: { ...pending, delivered: [...pending.delivered, identifier] } });
+    } else {
+      delayed = { issue: identifier, tag, line, since: earlier?.since ?? new Date(effects.now()).toISOString() };
+      effects.log('receipt-skipped', { ...delayed, reason: 'not Deploying; kept as a pending delivery' });
+    }
+    const ledger = effects.readLedger();
+    const deliveries = [...(ledger.deliveries ?? []).filter(delivery => delivery.issue !== identifier), ...(delayed ? [delayed] : [])];
+    effects.writeLedger({ ...ledger, deliveries, receipt: { ...pending, delivered: [...pending.delivered, identifier] } });
   }
   // An unhandled refusal holds lastTag and its delivered receipt: every rerun stops here until Devon acts.
   if (receipt.health === 'refused') throw new Error(`${tag}: ${line}; held until Devon handles the refusal`);
-  effects.writeLedger({ ...effects.readLedger(), lastTag: tag, receipt: undefined });
+  effects.writeLedger({ ...effects.readLedger(), lastTag: tag, receipt: undefined, ...(receipt.health === 'pass' ? { deployed: { tag, sha, line } } : {}) });
   if (receipt.health === 'fail') throw new Error(`${tag}: ${line}`);
+}
+
+/** Retry every pending delivery: posted once when its issue reaches Deploying, never twice, and
+ * dropped with an explicit `receipt-expired` diagnostic, never as delivered, after seven days. */
+async function deliverDelayed(effects: Effects): Promise<void> {
+  for (const delivery of effects.readLedger().deliveries ?? []) {
+    const { issue, line } = delivery;
+    if (await effects.linear.posted(issue, line)) effects.log('receipt-exists', { issue, line });
+    else if (await effects.linear.deploying(issue)) {
+      await effects.linear.comment(issue, line);
+      effects.log('receipt', { issue, line, delayedSince: delivery.since });
+    } else if (effects.now() - Date.parse(delivery.since) >= DELIVERY_WINDOW_MS) {
+      effects.log('receipt-expired', { ...delivery, reason: 'not Deploying within seven days of release; no receipt was delivered' });
+    } else continue;
+    const ledger = effects.readLedger();
+    effects.writeLedger({ ...ledger, deliveries: (ledger.deliveries ?? []).filter(other => other.issue !== issue || other.line !== line) });
+  }
+}
+
+const mergeReceipt = /^odd-merge pr=(\d+) head=\S+ merge=([a-f0-9]{40})\b/m;
+
+/** Is `commit` known here and contained in `target`? An unknown commit is unproven, never contained. */
+function contains(effects: Effects, commit: string, target: string): boolean {
+  let full: string;
+  try { full = effects.run('git', ['-C', ROOT, 'rev-parse', '--verify', `${commit}^{commit}`]).stdout.trim(); } catch { return false; }
+  return effects.ok('git', ['-C', ROOT, 'merge-base', '--is-ancestor', full, target]);
+}
+
+/** The merged PR an issue's receipt rests on: the one its latest `odd-merge` names, else (a manual
+ * merge) the newest merged PR that owns it by branch or link line (prOwnsIssue). Never a PR that only
+ * mentions the issue, and never one whose merge commit differs from the merge receipt. */
+function authoritativeMerge(effects: Effects, identifier: string, comments: readonly { body: string; createdAt: string }[]): { commit: string } | { refusal: string } {
+  const latest = comments.filter(comment => mergeReceipt.test(comment.body)).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).at(-1);
+  const named = latest && mergeReceipt.exec(latest.body)!;
+  const limit = 1000;
+  const listed = JSON.parse(effects.run('gh', ['pr', 'list', '--search', `"${identifier}"`, '--state', 'merged', '--json', 'number,headRefName,body,mergeCommit,mergedAt', '--limit', String(limit)], { cwd: ROOT }).stdout) as GitHubPullRequest[];
+  if (!Array.isArray(listed) || listed.length >= limit) throw new Error(`gh pr list for ${identifier} returned a malformed or truncated PR list`);
+  const owned = listed.filter(pr => prOwnsIssue(pr, identifier) && /^[a-f0-9]{40}$/.test(pr.mergeCommit?.oid ?? ''))
+    .sort((a, b) => (b.mergedAt ?? '').localeCompare(a.mergedAt ?? ''));
+  const pr = named ? owned.find(candidate => candidate.number === Number(named[1])) : owned[0];
+  if (!pr) return { refusal: named ? `odd-merge PR #${named[1]} is not a merged PR that owns ${identifier}` : `no merged PR owns ${identifier}` };
+  if (named && pr.mergeCommit!.oid !== named[2]) return { refusal: `PR #${pr.number} merged ${pr.mergeCommit!.oid}, not the odd-merge commit ${named[2]}` };
+  return { commit: pr.mergeCommit!.oid };
+}
+
+/**
+ * Every tick, with or without a new release: an odd Deploying issue with no receipt since its
+ * latest merge, or whose pass receipt failed verification at an older release, gets the newest
+ * pass release's receipt once its authoritative merge (and the failed receipt) is proven to be in
+ * that release. Nothing is installed; the issue's own comments make a repeat (a lost response) a no-op.
+ */
+async function reconcile(effects: Effects): Promise<void> {
+  const { deployed, deliveries = [] } = effects.readLedger();
+  if (!deployed) { effects.log('reconcile-skipped', { reason: 'no pass release recorded by this deployer yet' }); return; }
+  for (const identifier of await effects.linear.deployingIssues()) {
+    // A pending delivery is this issue's receipt; posting another first would reorder them.
+    if (deliveries.some(delivery => delivery.issue === identifier)) continue;
+    const comments = await effects.linear.comments(identifier);
+    const { deployReceipt: receipt, verify } = toSnapshot({ issue: { id: identifier, status: 'Deploying', labels: [oddLabel], comments } });
+    const failed = receipt?.health === 'pass' && verify?.sha === receipt.sha && verify.result === 'fail';
+    if (receipt && !failed) continue;
+    const refuse = (reason: string) => effects.log('reconcile-refused', { issue: identifier, tag: deployed.tag, reason });
+    if (receipt && (receipt.sha === deployed.sha || !contains(effects, receipt.sha, deployed.sha))) {
+      refuse(`failed verification at ${receipt.sha} has no later proven deployment`);
+      continue;
+    }
+    const merge = authoritativeMerge(effects, identifier, comments);
+    if ('refusal' in merge) { refuse(merge.refusal); continue; }
+    if (!contains(effects, merge.commit, deployed.sha)) { refuse(`merge ${merge.commit} is not proven to be in ${deployed.tag}`); continue; }
+    await effects.linear.comment(identifier, deployed.line);
+    effects.log('receipt', { issue: identifier, line: deployed.line, reason: receipt ? 'failed-verification-refresh' : 'missing-receipt' });
+  }
 }
 
 function publishedTags(effects: Effects): string[] {
@@ -587,7 +682,9 @@ export async function main(effects: Effects): Promise<void> {
   const tags = publishedTags(effects);
   const cursor = ledger.manualBaseline && compareTags(ledger.manualBaseline.tag, ledger.lastTag) > 0 ? ledger.manualBaseline.tag : ledger.lastTag;
   const pending = pendingTags(tags, cursor);
-  effects.log('pending', { lastTag: ledger.lastTag, tags: pending });
+  effects.log('pending', { lastTag: ledger.lastTag, tags: pending, deliveries: ledger.deliveries?.length ?? 0 });
+  // Before any release, so a held or failing release never strands an earlier one's recipients.
+  await deliverDelayed(effects);
   let previous = cursor;
   for (const tag of pending) {
     await deployRelease(effects, tag, previous);
@@ -595,6 +692,7 @@ export async function main(effects: Effects): Promise<void> {
   }
   // Only the newest handled release: historical releases deployed above never move the runtime.
   promoteTools(effects, previous);
+  await reconcile(effects);
 }
 
 /** Side-effect-free check of the tree this module was loaded from (realpath, so a `current`
@@ -717,13 +815,29 @@ export function liveEffects(): Effects {
     if (!response.ok || payload.errors?.length || !payload.data) throw new Error(`Linear ${response.status}: ${payload.errors?.map(error => error.message).join('; ') ?? 'no data'}`);
     return payload.data;
   }
-  const issueQuery = 'query Issue($id: String!) { issue(id: $id) { id state { name } comments(first: 250) { nodes { body } } } }';
-  type IssueData = { issue: { id: string; state: { name: string }; comments: { nodes: { body: string }[] } } };
+  const issueQuery = 'query Issue($id: String!) { issue(id: $id) { id state { name } } }';
+  type IssueData = { issue: { id: string; state: { name: string } } };
+  type Page<T> = { nodes: T[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } };
+  /** Every page of a connection; a page without a cursor to continue from is a failed read, never the end. */
+  async function all<T>(read: (after: string | null) => Promise<Page<T>>): Promise<T[]> {
+    const nodes: T[] = [];
+    for (let after: string | null = null; ;) {
+      const page = await read(after);
+      nodes.push(...page.nodes);
+      if (!page.pageInfo.hasNextPage) return nodes;
+      if (!page.pageInfo.endCursor) throw new Error('Linear page has more results but no cursor');
+      after = page.pageInfo.endCursor;
+    }
+  }
+  const comments = (identifier: string) => all(async after => (await graphql<{ issue: { comments: Page<{ body: string; createdAt: string }> } }>(
+    'query Comments($id: String!, $after: String) { issue(id: $id) { comments(first: 250, after: $after) { nodes { body createdAt } pageInfo { hasNextPage endCursor } } } }',
+    { id: identifier, after })).issue.comments);
   return {
     stateDir: STATE_DIR,
     toolsDir: TOOLS_DIR,
     log,
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+    now: () => Date.now(),
     run,
     ok: (command, args) => spawnSync(command, args, { stdio: 'ignore' }).status === 0,
     sudo: (script, args) => {
@@ -749,11 +863,15 @@ export function liveEffects(): Effects {
     },
     linear: {
       deploying: async identifier => (await graphql<IssueData>(issueQuery, { id: identifier })).issue.state.name === 'Deploying',
-      posted: async (identifier, body) => (await graphql<IssueData>(issueQuery, { id: identifier })).issue.comments.nodes.some(comment => comment.body.trim() === body),
+      posted: async (identifier, body) => (await comments(identifier)).some(comment => comment.body.trim() === body),
       comment: async (identifier, body) => {
         const { issue } = await graphql<IssueData>(issueQuery, { id: identifier });
         await graphql('mutation Comment($input: CommentCreateInput!) { commentCreate(input: $input) { success } }', { input: { issueId: issue.id, body } });
       },
+      deployingIssues: async () => (await all(async after => (await graphql<{ issues: Page<{ identifier: string }> }>(
+        'query Deploying($after: String) { issues(first: 100, after: $after, filter: { state: { name: { eq: "Deploying" } }, labels: { name: { eq: "odd" } } }) { nodes { identifier } pageInfo { hasNextPage endCursor } } }',
+        { after })).issues)).map(issue => issue.identifier),
+      comments,
     },
   };
 }

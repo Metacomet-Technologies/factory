@@ -33,6 +33,9 @@ receipt line and the SHA to verify; use that SHA, not the branch head.
 
 The control plane sets `Done` on `result=pass`; on `result=fail` the issue
 keeps its status and the Bug goes through Intake and Spec like any report.
+The Deployer posts a fresh receipt at the next pass release that contains the
+failed SHA, even when that release does not ship the issue, and you verify
+that new SHA as a new round; never reuse the failed SHA's results.
 
 ## Authority
 

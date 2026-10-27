@@ -204,9 +204,9 @@ keyed by `issue + stage + SHA`).
 | `check_suite.completed` failure | GitHub webhook | Steer the builder thread with the failing job names; count a round. | — |
 | Reviewer thread ends (`agent.end` with `odd-role-reviewer`) | Plugin | Read verdict label. `ready` → Shipper; `changes` → steer builder, round+1 or page at 3. | Shipper |
 | Merge receipt (`odd-merge`) | Control plane | Status `Deploying`; wait `release not published` until a receipt newer than the merge receipt appears. Once the receipt is written the issue is re-checked at once (P4.6-recheck), not on a webhook or the sweep; a sooner re-check replaces a pending later one. Until GitHub's lists catch up, the snapshot reads the PR the control plane just merged as merged: by number while the merged search misses it, and never as open while a stale open-list row still shows it; a receipt for the head a PR read still shows open is lag and is never merged again. A failed merge or receipt write queues no re-check and sets no `Deploying`; the failure re-check retries it. | — |
-| Release published | `factory-deploy.timer` poll on factory-gpu (no webhook: the runner paginates the GitHub releases API, oldest pending stable tag first) | Verify, install changed components, probe, roll back on red, post one receipt per issue in `Deploying`. | Deployer (runner job) |
+| Release published | `factory-deploy.timer` poll on factory-gpu (no webhook: the runner paginates the GitHub releases API, oldest pending stable tag first) | Verify, install changed components, probe, roll back on red, post one receipt per issue in `Deploying`; a shipped issue not yet in `Deploying` is a pending delivery retried every tick for seven days. Every tick, with or without a release, re-receipts odd `Deploying` issues the newest pass release contains (§7 Deployer → Verifier). | Deployer (runner job) |
 | Deploy receipt comment | Linear webhook | `health=fail` with a rollback snapshot → `Todo` plus a Bug follow-up in Triage (`Deploy failed: <component> at <sha12>`); `rollback=none` → page. Either red path also starts one log-reading Deployer on factory-gpu (thread label `odd-deploy-<sha12>`); once its excerpts are posted it adds `odd-diagnosed-<sha12>` to its own thread, and the next evaluation archives it idle with that label, whatever the issue's status (a failed rollback leaves it in Deploying). A running or unlabelled reader stays. Its lookup also searches archived threads, so neither a reload nor a repeated receipt starts a second reader for the release. `health=refused` → page `irreversible-action` only: no Bug, no log reader, no status change. The Bug and the log reader come before `Todo`, so a failure leaves the issue in `Deploying`; a failed evaluation re-checks the issue itself (90 s, doubling, up to 5 times) and a redelivered failed webhook is evaluated again; a page goes out even when its log reader cannot start, and `escalated` is set last. `health=pass` with no `odd-verify` comment for the receipt SHA → spawn Verifier. | Verifier |
-| `odd-verify` comment | Linear webhook | `result=pass` for the current receipt SHA → `Done`; `result=fail` → wait on the Bug it filed (the next release's receipt carries a new SHA and is verified again). A merged PR or a verify line for the receipt SHA satisfies the role's stop. | Intake (for the bug) |
+| `odd-verify` comment | Linear webhook | `result=pass` for the current receipt SHA → `Done`; `result=fail` → wait on the Bug it filed (the next pass release containing the failed SHA is re-receipted to the issue, shipped by it or not, and verified again). A merged PR or a verify line for the receipt SHA satisfies the role's stop. | Intake (for the bug) |
 | Sweep tick (10 min) | `setInterval` in the plugin, started by `arm` | Watchdog: evaluate every issue with a live role thread, every `Triage` issue (never Backlog) and every `odd` issue in `Todo`/`In Progress`/`Deploying`; cancel threads stale for 15 min (`odd-watchdog cancelled` comment, status restored, immediate re-evaluation); caps alert after 60 min over; `control-plane-blind` page after 15 min of failed sweeps; daily digest. Spawns deferred to the dispatcher (no `odd` label) are recorded `ignored`. | Whatever `nextAction` returns |
 | `agent.end` on any `odd-role-*` thread | Plugin | Ralph guard: continue with the role's stop condition unless budget spent or an external check passed. | — |
 
@@ -359,10 +359,33 @@ Each artifact is machine-checkable before the next role starts.
   parse. Only receipts newer than the
   issue's latest `odd-merge` comment (by creation time) count, so a stale
   receipt from an earlier merge cannot close a later one.
+  Delayed delivery (MET-353): a shipped issue that is not yet `Deploying` is
+  never marked delivered; it is kept in the ledger's `deliveries` with its
+  release receipt and first-seen time and retried at the start of every tick,
+  so it never holds later releases. It gets exactly one receipt once it is
+  `Deploying` (an existing identical comment, such as one whose response was
+  lost, counts as posted); a later release shipping it again replaces the
+  pending receipt and keeps the first-seen time. Seven days after first seen
+  it is dropped with a `receipt-expired` log line and no receipt.
+  Re-receipt: after the releases, every tick, with or without a new release,
+  reads every odd `Deploying` issue and its comments (all pages) and posts the
+  receipt of `deployed`, the newest release this job handled with
+  `health=pass`, when the issue has no receipt since its latest `odd-merge`
+  (bootstrap or manual-baseline adoption, a hand merge, a squash subject
+  without `(#n)`, a branch-only PR, an expired delivery) or failed
+  verification on a pass receipt whose SHA that release contains. The merge
+  is the PR the latest `odd-merge` names, else the newest merged PR, and must
+  own the issue (`prOwnsIssue`: branch or link line, never a mention); its
+  merge commit must equal the `odd-merge` commit and be an ancestor of the
+  release. Anything else logs `reconcile-refused` and posts nothing. Nothing
+  is installed; the release's own receipt line is reused, never a new one. An
+  issue with a pending delivery waits for it. Before the first pass release
+  after bootstrap (or on a ledger without `deployed`) nothing is re-receipted.
   Job state: ledger `~/.local/state/factory-odd/deploy.json` (`lastTag`,
   per-component `sha`/`tag`/`health`/`snapshot`, `inFlight` for resume,
   `receipt` with the issues already handled so a crashed delivery resumes
-  without redeploying, optional approved `manualBaseline` preserving the prior
+  without redeploying, `deliveries` and `deployed` as above, both absent in
+  older ledgers, optional approved `manualBaseline` preserving the prior
   ledger and deferred issue inventory), log `journalctl -u factory-deploy`.
   A missing, unreadable or malformed ledger stops the job before any remote
   read or write; only Devon's reviewed `deploy.ts --bootstrap TAG` creates one
@@ -375,7 +398,8 @@ Each artifact is machine-checkable before the next role starts.
   sha=<receipt sha> result=<pass|fail> bug=<MET-n|none>`, then one line per
   Done-means item with its evidence link. The control plane sets `Done` on
   `pass` for the current receipt SHA; a `fail` names the Bug filed in
-  `Triage` and the issue waits in `Deploying` for the next release.
+  `Triage` and the issue waits in `Deploying` for the next pass release that
+  contains the failed SHA, which the Deployer re-receipts to it.
 
 ## 8. Escalation paths
 
