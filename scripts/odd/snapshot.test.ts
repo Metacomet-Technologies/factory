@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { admittedLoad, changesRounds, ciState, delivered, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, openRounds, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, riskFrom, spawnRecords, threadState, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { admittedLoad, changesRounds, ciState, delivered, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, openRounds, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, riskFrom, spawnRecords, threadState, toSnapshot, verdictFor, verifiedFor, verifiedLabels, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
 import { contractOf, nextAction, parseSpawn, spawnKey, spawnLine } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
@@ -188,6 +188,29 @@ test('open rounds skip reviewer threads that delivered a verdict; the owner carr
   assert.deepEqual(openRounds(threads), { builder: 2, reviewer: 2 });
   const snapshot = toSnapshot({ issue: { id: 'MET-1', status: 'In Progress', labels: [] }, threads });
   assert.deepEqual(snapshot.owner, { role: 'builder', threadID: 'T-b', round: 2, state: 'idle', idleSince: '2026-10-24T15:00:00Z' });
+});
+
+test('MET-338: the Verifier\'s odd_verify output counts only on a verifier thread labelled with the current receipt, with one result and a Bug exactly on fail', () => {
+  const sha = 'c'.repeat(40);
+  const verifier = (id: string, labels: string[], role = 'verifier', receipt = sha): LiveThread => ({ id, labels: ['odd-issue-met-1', `odd-role-${role}`, 'odd-round-1', receiptLabel(receipt), ...labels], state: 'idle' });
+  const pass = verifiedLabels({ sha, result: 'pass' });
+  const fail = verifiedLabels({ sha, result: 'fail', bug: 'MET-9' });
+  assert.deepEqual(fail, [`odd-verify-fail-${sha.slice(0, 12)}`, 'odd-verify-bug-met-9']);
+  for (const label of [...pass, ...fail]) assert.match(label, /^[a-z0-9][a-z0-9-]{0,31}$/);
+  assert.deepEqual(verifiedFor([verifier('T-v', pass)], sha), { sha, result: 'pass' });
+  assert.deepEqual(verifiedFor([verifier('T-v', fail)], sha), { sha, result: 'fail', bug: 'MET-9' });
+  for (const [why, thread] of [
+    ['a reviewer thread', verifier('T-r', pass, 'reviewer')],
+    ['a verifier of another receipt', verifier('T-o', verifiedLabels({ sha: 'd'.repeat(40), result: 'pass' }), 'verifier', 'd'.repeat(40))],
+    ['a result for another receipt', verifier('T-x', verifiedLabels({ sha: 'd'.repeat(40), result: 'pass' }))],
+    ['pass with a Bug', verifier('T-pb', [...pass, 'odd-verify-bug-met-9'])],
+    ['fail without a Bug', verifier('T-f', [fail[0]])],
+    ['two results', verifier('T-2', [...pass, fail[0], fail[1]])],
+    ['two Bugs', verifier('T-2b', [...fail, 'odd-verify-bug-met-10'])],
+  ] as const) assert.equal(verifiedFor([thread], sha), undefined, why);
+  const receipt = { body: `odd-deploy host=factory-gpu component=kiosk sha=${sha} health=pass rollback=none`, createdAt: '2026-10-24T15:00:00Z' };
+  assert.deepEqual(toSnapshot({ issue: { id: 'MET-1', status: 'Deploying', labels: [], comments: [receipt] }, threads: [verifier('T-v', fail)] }).verified, { sha, result: 'fail', bug: 'MET-9' });
+  assert.equal(toSnapshot({ issue: { id: 'MET-1', status: 'Deploying', labels: [], comments: [] }, threads: [verifier('T-v', fail)] }).verified, undefined, 'no receipt, nothing to record');
 });
 
 test('cancelled rounds and verify comments come from the issue; an escalation comment resets the cancelled count', () => {

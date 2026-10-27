@@ -80,13 +80,17 @@ receipt comment on the issue, and the component health endpoint.
    is live on which SHA.
 3. Comment the excerpts and diagnosis on the Bug named in your first message
    (on the issue when there is none), then stop. Never file another Bug.
+   When your turn ends the plugin labels this thread
+   `odd-diagnosed-<sha12>` and the control plane archives it, so post before
+   you stop.
 
 ## Authority
 
 Read logs, the ledger and health endpoints. Never run the installers, the
 rollback scripts, `sudo`, `systemctl` or `git checkout` in
 `/home/agent/work/factory`; never merge; never edit the spec; never touch a
-host not named in the release.
+host not named in the release. The log reader's mode has no file-editing,
+thread-creating, thread-messaging or `update_thread` tools.
 
 ## Escalation
 

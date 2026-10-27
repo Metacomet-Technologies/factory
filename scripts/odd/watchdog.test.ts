@@ -305,7 +305,7 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
     const amp = {
       // `override('$', { command })` may answer a shell command with its stdout.
       $: fakeShell(command => (override('$', { command }) as string | undefined) ?? publishedMain(command)).$,
-      createAgent: () => ({ definition: {}, createThread: async () => ({ id: `T-spawned-${spawned.length + 1}`, setLabels: async () => {}, appendUserMessage: async (message: { content: string }) => { spawned.push(message.content); } }) }), registerAgentMode: () => {}, registerTool: (tool: typeof status) => { status = tool; },
+      createAgent: () => ({ definition: {}, createThread: async () => ({ id: `T-spawned-${spawned.length + 1}`, setLabels: async () => {}, appendUserMessage: async (message: { content: string }) => { spawned.push(message.content); } }) }), registerAgentMode: () => {}, registerTool: (tool: typeof status & { name: string }) => { if (tool.name === 'odd_control_status') status = tool; },
       on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
       createWebhook: async (options: Record<string, unknown>) => (await override('createWebhook', options)) ?? { url: 'https://hooks.example/x' },
       system: { executor: { kind: 'remote', keepAlive: async () => {} } },
@@ -975,9 +975,12 @@ function factory() {
     return control.gh?.(command) ?? github(command, prs, releases) ?? shell(strings, ...values);
   };
   let created = 0;
+  /** Every agent definition the latest plugin load created, and its role tools by name (MET-338). */
+  let agents: { instructions?: string; tools?: { add?: string[]; exclude?: string[] } }[] = [];
+  const roleTools = new Map<string, (input: Record<string, unknown>, ctx: unknown) => Promise<string>>();
   const amp = (mine: number) => ({
     $,
-    createAgent: (config: unknown) => ({ definition: config, createThread: async () => {
+    createAgent: (config: { instructions?: string; tools?: { add?: string[]; exclude?: string[] } }) => (agents.push(config), { definition: config, createThread: async () => {
       creates.push('plugin');
       if (control.spawnFails) throw new Error('Orb custom agents must be registered as an active agent mode');
       const id = `T-spawned-${++created}`;
@@ -986,11 +989,11 @@ function factory() {
       if (control.ambiguous) throw new Error('fetch failed: socket hang up');
       return { id, setLabels: async (labels: string[]) => { threads.get(id)!.labels = labels; }, appendUserMessage: async (message: { content: string }) => { outcomes.set(id, message.content); } };
     } }),
-    registerAgentMode: () => {}, registerTool: (tool: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> }) => { statuses.set(mine, tool.execute); },
+    registerAgentMode: () => {}, registerTool: (tool: { name: string; execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> }) => { if (tool.name === 'odd_control_status') statuses.set(mine, tool.execute); else roleTools.set(tool.name, tool.execute); },
     on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { if (name === 'session.start') starts.set(mine, handler); if (name === 'agent.end') ends.set(mine, handler); },
     createWebhook: async () => ({ url: 'https://hooks.example/x' }),
     system: { executor: { kind: 'remote', keepAlive: async () => {} } },
-    threads: { get: (id: string) => ({ labels: async () => threads.get(id)!.labels, addLabels: async () => [], appendUserMessage: async (message: { content: string }) => {
+    threads: { get: (id: string) => ({ labels: async () => threads.get(id)!.labels, addLabels: async (labels: string[]) => { const thread = threads.get(id)!; thread.labels = [...new Set([...thread.labels, ...labels])]; return thread.labels; }, appendUserMessage: async (message: { content: string }) => {
       if (control.steerFailures > 0) { control.steerFailures -= 1; throw new Error('thread unavailable'); }
       steers.push(`${id}: ${message.content}`);
     } }) },
@@ -1014,6 +1017,10 @@ function factory() {
     events: async () => (JSON.parse(await statuses.get(generation)!({}, { thread: { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] } })) as { events: { issue: string | null; stage: string; error?: string }[] }).events,
     /** An `odd_control_status sweep: true` call on the latest plugin load, as a human or the control thread makes it. */
     sweep: () => statuses.get(generation)!({ sweep: true }, { thread: { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] }, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools }),
+    /** The latest plugin load's agent definitions. */
+    agents: () => agents,
+    /** A role tool (odd_verdict, odd_verify) called by the agent of thread `id`, in its own thread's context. */
+    tool: (name: string, id: string, input: Record<string, unknown>) => roleTools.get(name)!(input, { thread: { id, labels: async () => [...threads.get(id)!.labels] }, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools }),
     /** The Ralph guard as the latest plugin load runs it at the end of a role thread's turn. */
     guard: (labels: string[]) => ends.get(generation)!({ status: 'done', message: '', thread: { id: 'T-role' } }, { thread: { id: 'T-role', labels: async () => labels }, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools, $ }),
     /** A comment one second after the previous planted one, so creation order is unambiguous. */
@@ -1023,6 +1030,7 @@ function factory() {
     /** `load` is the plugin's default export; pass a freshly imported module to model a control-orb restart that drops module state. */
     async start(load: unknown = plugin) {
       const mine = ++generation;
+      agents = [];
       await (load as (api: unknown) => Promise<void>)(amp(mine));
       const thread = { id: 'T-control', labels: async () => (mine === generation ? ['odd-control-plane', 'odd-perform'] : []) };
       await starts.get(mine)!({}, { thread, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools });
@@ -1844,7 +1852,7 @@ function signedOrb() {
       let tool: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> } | undefined;
       const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
       await (plugin as unknown as (api: unknown) => Promise<void>)({
-        $, createAgent: () => ({ definition: {} }), registerAgentMode: () => {}, registerTool: (definition: typeof tool) => { tool = definition; },
+        $, createAgent: () => ({ definition: {} }), registerAgentMode: () => {}, registerTool: (definition: typeof tool & { name: string }) => { if (definition.name === 'odd_control_status') tool = definition; },
         on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
         createWebhook: async ({ key, handler }: { key: string; handler: (event: unknown, ctx: unknown) => Promise<void> }) => { registrations.push(key); webhooks.set(key, handler); return { url: `https://hooks.example/${key}` }; },
         system: { executor: { kind: 'remote', keepAlive: async () => {} } },
@@ -3434,4 +3442,130 @@ test('P3.10: an errored builder at its spent budget is archived once with its ro
   const snapshot = toSnapshot({ issue: { id: 'MET-7', status: 'In Progress', labels: plant.issues.get('MET-7')!.labels, comments: plant.comments.get('MET-7') } });
   assert.deepEqual(snapshot.cancelledRounds, { builder: 3 });
   assert.equal(snapshot.owner, undefined);
+});
+
+// --- MET-338: self-scoped role tools and role grants --------------------------------------------
+
+const roleThread = (plant: ReturnType<typeof factory>, issue: string, role: string) =>
+  [...plant.threads].find(([, thread]) => thread.labels.includes(`odd-issue-${issue.toLowerCase()}`) && thread.labels.includes(`odd-role-${role}`))!;
+const outcome = (call: Promise<unknown>) => call.then(result => `accepted: ${String(result)}`, (error: unknown) => String(error));
+const labelled = (plant: ReturnType<typeof factory>, prefix: string) =>
+  [...plant.threads].flatMap(([id, thread]) => thread.labels.filter(label => label.startsWith(prefix)).map(label => `${id} ${label}`));
+
+test('MET-338: odd_verdict labels only the calling reviewer thread for its assigned head; a wrong role, an unassigned thread, a stale head and a second verdict record nothing', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  const [a, b] = ['a'.repeat(40), 'b'.repeat(40)];
+  plant.issue('MET-50', 'In Progress');
+  plant.builder('MET-50');
+  plant.openPr('MET-50', a);
+  await plant.start();
+  await settle();
+  const [reviewer, thread] = roleThread(plant, 'MET-50', 'reviewer');
+  assert.ok(plant.spawnLines('MET-50').includes(`odd-spawn role=reviewer round=1 key=reviewer-${a.slice(0, 12)} thread=${reviewer}`), 'the plane bound the reviewer to head a');
+  // Same role labels, but no odd-spawn record binds it: labels alone are no assignment.
+  plant.threads.set('T-forged', { labels: ['odd-issue-met-50', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai'], state: 'running', archived: false, updatedAt: new Date().toISOString() });
+
+  assert.match(await outcome(plant.tool('odd_verdict', 'T-MET-50', { state: 'ready' })), /odd_verdict is the reviewer role's tool; this thread is the builder on MET-50/);
+  assert.match(await outcome(plant.tool('odd_verify', reviewer, { result: 'pass' })), /odd_verify is the verifier role's tool; this thread is the reviewer/);
+  assert.match(await outcome(plant.tool('odd_verdict', 'T-forged', { state: 'ready' })), /no odd-spawn record on MET-50 assigns this thread a reviewer round 1/);
+  assert.match(await outcome(plant.tool('odd_verdict', reviewer, { state: 'approve' })), /state must be ready or changes/);
+  // The builder pushed b after the reviewer was assigned a.
+  Object.assign(plant.prs[0], { headRefOid: b, commits: [{ oid: b, committedDate: new Date().toISOString() }] });
+  assert.match(await outcome(plant.tool('odd_verdict', reviewer, { state: 'ready' })), new RegExp(`stale assignment: this thread reviews head ${a.slice(0, 12)}, but MET-50's open PR is #50 at ${b}`));
+  assert.deepEqual(labelled(plant, 'odd-verdict-'), [], 'no refused call labelled any thread');
+
+  Object.assign(plant.prs[0], { headRefOid: a, commits: [{ oid: a, committedDate: new Date().toISOString() }] });
+  // A thread or SHA in the input is not an input: only the caller is labelled, for its assigned head.
+  assert.match(await outcome(plant.tool('odd_verdict', reviewer, { state: 'changes', thread: 'T-MET-50', sha: b })), new RegExp(`accepted: Recorded odd-verdict-changes-${a.slice(0, 12)} on this thread: changes for PR #50 at ${a}`));
+  assert.deepEqual(labelled(plant, 'odd-verdict-'), [`${reviewer} odd-verdict-changes-${a.slice(0, 12)}`]);
+  assert.match(await outcome(plant.tool('odd_verdict', reviewer, { state: 'ready' })), /already carries its verdict odd-verdict-changes-/);
+  assert.deepEqual(labelled(plant, 'odd-verdict-'), [`${reviewer} odd-verdict-changes-${a.slice(0, 12)}`], 'one verdict per head');
+  assert.equal(await plant.guard(thread.labels), undefined, 'the label the tool set meets the reviewer\'s stop');
+});
+
+test('MET-338: odd_verify reports only for the receipt assigned to the calling verifier; the plane writes one complete odd-verify line, sets Done on pass and waits on the Bug on fail', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  plant.control.statuses = true;
+  const [pass, fail, old, newer] = ['c', 'd', 'e', 'f'].map(x => `0${x}`.repeat(20));
+  plant.issue('MET-60', 'Deploying');
+  plant.say('MET-60', deployLine(pass));
+  plant.issue('MET-61', 'Deploying');
+  plant.say('MET-61', deployLine(fail));
+  plant.issue('MET-62', 'Deploying');
+  plant.say('MET-62', deployLine(old));
+  await plant.start();
+  await settle();
+  const [v60, t60] = roleThread(plant, 'MET-60', 'verifier');
+  const [v61, t61] = roleThread(plant, 'MET-61', 'verifier');
+  const [v62] = roleThread(plant, 'MET-62', 'verifier');
+  assert.ok(t60.labels.includes(receiptLabel(pass)));
+  const verifyLines = (id: string) => (plant.comments.get(id) ?? []).filter(comment => comment.body.startsWith('odd-verify ')).map(comment => comment.body);
+  plant.threads.set('T-wrong', { labels: ['odd-issue-met-60', 'odd-role-reviewer', 'odd-round-1'], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+  plant.threads.set('T-forged', { labels: ['odd-issue-met-60', 'odd-role-verifier', 'odd-round-1', receiptLabel(pass)], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+
+  assert.match(await outcome(plant.tool('odd_verify', 'T-wrong', { result: 'pass' })), /odd_verify is the verifier role's tool; this thread is the reviewer on MET-60/);
+  assert.match(await outcome(plant.tool('odd_verdict', v60, { state: 'ready' })), /odd_verdict is the reviewer role's tool; this thread is the verifier/);
+  assert.match(await outcome(plant.tool('odd_verify', 'T-forged', { result: 'pass' })), /no odd-spawn record on MET-60 assigns this thread a verifier round 1/);
+  for (const input of [{ result: 'fail' }, { result: 'fail', bug: 'Bug 9' }, { result: 'pass', bug: 'MET-9' }, { result: 'maybe' }]) {
+    assert.match(await outcome(plant.tool('odd_verify', v60, input)), /result=fail needs bug=<MET-n>|result must be pass or fail/, JSON.stringify(input));
+  }
+  // A newer receipt replaced the one MET-62's verifier was assigned.
+  plant.say('MET-62', deployLine(newer));
+  assert.match(await outcome(plant.tool('odd_verify', v62, { result: 'pass' })), new RegExp(`stale assignment: this thread verifies receipt ${old.slice(0, 12)}, but MET-62 is Deploying with receipt ${newer} health=pass`));
+  assert.deepEqual(labelled(plant, 'odd-verify-'), [], 'no refused call labelled any thread');
+
+  assert.match(await outcome(plant.tool('odd_verify', v60, { result: 'pass', sha: newer, thread: v61 })), /accepted: Recorded odd-verify-pass-/);
+  assert.match(await outcome(plant.tool('odd_verify', v61, { result: 'fail', bug: 'met-900' })), /accepted: .*odd-verify sha=0d0d.* result=fail bug=MET-900/);
+  assert.deepEqual(labelled(plant, 'odd-verify-'), [`${v60} odd-verify-pass-${pass.slice(0, 12)}`, `${v61} odd-verify-fail-${fail.slice(0, 12)}`, `${v61} odd-verify-bug-met-900`]);
+  assert.match(await outcome(plant.tool('odd_verify', v60, { result: 'fail', bug: 'MET-9' })), /already recorded; one per receipt/);
+  assert.equal(await plant.guard(t60.labels), undefined, 'the tool output meets the verifier\'s stop before the plane comments');
+  assert.deepEqual([verifyLines('MET-60'), verifyLines('MET-61')], [[], []], 'the plane writes nothing while the verifiers run');
+
+  t60.state = 'idle';
+  t61.state = 'idle';
+  // The recheck records the line; the immediate recheck after it acts on it.
+  await advance(120_000);
+  assert.deepEqual(verifyLines('MET-60'), [verifyLine({ sha: pass, result: 'pass' })]);
+  assert.deepEqual(verifyLines('MET-61'), [`odd-verify sha=${fail} result=fail bug=MET-900`]);
+  assert.equal(plant.issues.get('MET-60')!.status, 'Done');
+  assert.equal(plant.issues.get('MET-61')!.status, 'Deploying', 'a failed verification waits on its Bug');
+  await advance(3 * sweepMs);
+  assert.deepEqual([verifyLines('MET-60').length, verifyLines('MET-61').length], [1, 1], 'recorded once');
+  assert.equal(rolesOf(plant, 'MET-61', 'verifier').length, 1, 'no second verifier for the recorded receipt');
+});
+
+test('MET-338: role agents get only their own role tool; none creates, messages or relabels threads (Intake keeps its own outcome label); reviewer, verifier and log reader cannot edit but keep the shell; only Intake writes Slack', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  await plant.start();
+  const editing = ['apply_patch', 'edit_file', 'create_file', 'Task'];
+  const own: Record<string, string | undefined> = { reviewer: 'odd_verdict', verifier: 'odd_verify' };
+  for (const role of ['intake', 'spec', 'builder', 'reviewer', 'verifier', 'deployer']) {
+    const grants = plant.agents().filter(agent => agent.instructions?.includes(`skill \`odd-${role}\``)).map(agent => agent.tools ?? {});
+    assert.equal(grants.length, role === 'reviewer' ? 2 : 1, role);
+    for (const { add = [], exclude = [] } of grants) {
+      const granted = (tool: string) => add.includes(tool) && !exclude.includes(tool);
+      const denied = (tool: string) => exclude.includes(tool) && !add.includes(tool);
+      for (const tool of ['create_thread', 'send_thread_message', 'wait_for_threads', 'get_thread_status']) assert.ok(!granted(tool), `${role} ${tool}`);
+      for (const tool of ['create_thread', 'send_thread_message']) assert.ok(denied(tool), `${role} excludes ${tool}`);
+      assert.ok(role === 'intake' ? granted('update_thread') : denied('update_thread'), `${role} update_thread`);
+      for (const tool of ['odd_verdict', 'odd_verify']) assert.ok(tool === own[role] ? granted(tool) : denied(tool), `${role} ${tool}`);
+      for (const tool of editing) assert.ok(['reviewer', 'verifier', 'deployer'].includes(role) ? denied(tool) : !exclude.includes(tool), `${role} ${tool}`);
+      assert.ok(!exclude.includes('shell_command'), `${role} keeps the shell for Evidence`);
+      assert.ok(role === 'intake' ? granted('slack_write') : !add.includes('slack_write'), `${role} slack_write`);
+    }
+  }
+
+  // The log reader has no update_thread: the plugin marks its own release diagnosed when its turn ends.
+  const red = '0d9a'.repeat(10);
+  const labels = ['odd-issue-met-9', 'odd-role-deployer', 'odd-round-1', readerLabel(red)];
+  plant.threads.set('T-role', { labels: [...labels], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+  plant.issue('MET-9', 'Deploying');
+  await plant.guard(labels);
+  assert.deepEqual(plant.threads.get('T-role')!.labels, [...labels, diagnosedLabel(red)]);
 });

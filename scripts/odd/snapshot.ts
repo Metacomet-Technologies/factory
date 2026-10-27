@@ -297,6 +297,7 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     if (steered?.key.startsWith('changes-')) correction.corrected = true;
   }
   const headAt = pr?.commits?.find(commit => commit.oid === pr.headRefOid)?.committedDate;
+  const verified = receipt ? verifiedFor(threads, receipt.sha) : undefined;
   return {
     identifier: issue.id.toUpperCase(),
     status,
@@ -320,6 +321,7 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     } : undefined,
     deployReceipt: receipt,
     verify,
+    ...(verified ? { verified } : {}),
     openRounds: openRounds(roleThreads, receipt?.sha),
     cancelledRounds,
     steers,
@@ -379,6 +381,27 @@ export function admittedLoad(threads: readonly LiveThread[], reservations: reado
 
 /** The label the control plane gives a verifier thread: the receipt SHA (12-character prefix) it verifies. */
 export const receiptLabel = (sha: string) => `odd-receipt-${sha.slice(0, 12)}`;
+
+/** The labels `odd_verify` puts on the Verifier's own thread: the result for the receipt (12-character prefix) and, on fail, the Bug it filed. */
+export const verifiedLabels = (verify: Verify) => [`odd-verify-${verify.result}-${verify.sha.slice(0, 12)}`, ...(verify.bug ? [`odd-verify-bug-${verify.bug.toLowerCase()}`] : [])];
+const verifiedPattern = /^odd-verify-(pass|fail)-([a-f0-9]{12})$/;
+const verifiedBugPattern = /^odd-verify-bug-(met-[1-9]\d*)$/;
+
+/**
+ * The Verifier's `odd_verify` output for the receipt `receiptSha`: a verifier thread the control
+ * plane labelled with that receipt carrying exactly one result for it, plus exactly one Bug on
+ * fail and none on pass. Anything else is no output, so the plane records nothing.
+ */
+export function verifiedFor(threads: readonly LiveThread[], receiptSha: string): Verify | undefined {
+  for (const thread of threads) {
+    if (parseThreadLabels(thread.labels).role !== 'verifier' || !thread.labels.includes(receiptLabel(receiptSha))) continue;
+    const results = thread.labels.flatMap(label => { const match = verifiedPattern.exec(label); return match && receiptSha.startsWith(match[2]) ? [match[1] as Verify['result']] : []; });
+    const bugs = thread.labels.flatMap(label => { const match = verifiedBugPattern.exec(label); return match ? [match[1].toUpperCase()] : []; });
+    if (results.length !== 1 || bugs.length !== (results[0] === 'fail' ? 1 : 0)) continue;
+    return { sha: receiptSha, result: results[0], ...(bugs.length ? { bug: bugs[0] } : {}) };
+  }
+  return undefined;
+}
 
 /** The label the control plane gives a red release's log reader (Deployer): the release SHA (12-character prefix) it reads. */
 export const readerLabel = (sha: string) => `odd-deploy-${sha.slice(0, 12)}`;

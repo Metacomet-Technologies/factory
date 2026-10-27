@@ -68,6 +68,8 @@ export type IssueSnapshot = {
   deployReceipt?: DeployReceipt;
   /** Latest `odd-verify` comment (the Verifier's judgement); it counts only when its SHA is the receipt's. */
   verify?: Verify;
+  /** The Verifier's `odd_verify` output for the current receipt (labels on its own thread, snapshot.verifiedFor); the control plane records it as the `odd-verify` comment. */
+  verified?: Verify;
   /** Highest `odd-round-<n>` per role among live threads that have not produced their artifact (snapshot.ts `delivered`). */
   openRounds?: Partial<Record<Role, number>>;
   /** Rounds the Watchdog cancelled per role since the current correction epoch began (`odd-watchdog cancelled` comments); verifier rounds since the latest receipt. */
@@ -169,6 +171,8 @@ export type Action =
   | { kind: 'admit'; budget: Budget }
   /** Devon removed `escalated` from a latched issue: record `odd-resume`, which starts the next epoch once. */
   | { kind: 'resume'; escalation: string; epoch: number }
+  /** Write the Verifier's `odd_verify` output as the complete `odd-verify` comment (verifyLine) for the receipt SHA. */
+  | { kind: 'record-verify'; verify: Verify }
   /** `stuck` names the idle role whose thread the wait depends on; the Watchdog cancels it once stale. */
   | { kind: 'wait'; reason: string; stuck?: Role; wait?: Wait };
 
@@ -403,6 +407,7 @@ const blocker = (action: Action): string => {
     case 'set-status': return `set ${action.status} (${action.reason})`;
     case 'admit': return `admit epoch ${action.budget.epoch}`;
     case 'resume': return `resume epoch ${action.epoch}`;
+    case 'record-verify': return `record odd-verify ${action.verify.result} at ${action.verify.sha.slice(0, 12)}`;
   }
 };
 
@@ -541,10 +546,11 @@ function proceed(issue: IssueSnapshot, load: Load, now: number): Action {
         } };
     }
     // Green receipt: the Verifier judges the Done-means items against the deployed system and
-    // posts `odd-verify` for the receipt's SHA (verifyLine). A failed verification waits on the
+    // reports through `odd_verify`; the control plane writes `odd-verify` for the receipt's SHA (verifyLine). A failed verification waits on the
     // Bug it filed; the Deployer re-receipts the issue at the next pass release that contains the
     // failed SHA, even one that does not ship it (deploy.ts reconcile), and that SHA is verified again.
     const verify = issue.verify?.sha === receipt.sha ? issue.verify : undefined;
+    if (!verify && issue.verified?.sha === receipt.sha) return { kind: 'record-verify', verify: issue.verified };
     if (!verify) return spawn('verifier', load, `verify ${receipt.component} at ${receipt.sha.slice(0, 12)}`, issue);
     if (verify.result === 'pass') return { kind: 'set-status', status: 'Done', reason: `verified ${receipt.component} at ${receipt.sha.slice(0, 12)}` };
     return waiting(`verification failed at ${receipt.sha.slice(0, 12)}; bug ${verify.bug ?? 'not filed'}`, 'verification', `verification-${receipt.sha.slice(0, 12)}`);
