@@ -23,8 +23,8 @@ import release as r
 
 ROOT = Path(__file__).resolve().parents[2]
 BINARIES = ("meter", "factory-api", "pricing", "factory-ups-control")
-# Only these link shared's build script; pricing and ups-control embed no release identity.
-IDENTIFIED = ("meter", "factory-api")
+# Only these have a component fingerprint contract; pricing and ups-control embed an empty one.
+FINGERPRINTED = ("meter", "factory-api")
 MARKER = "release-target-v2-"  # the first release.yml revision with the repaired cache key
 CLONE = re.compile(r"Cloning into '.*/\.amp/in/release'")
 STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z ")
@@ -71,23 +71,49 @@ def build(work, sha, environment, version):
     return checkout, env, elapsed
 
 
+def unique_keys(pairs):
+    keys = [key for key, _ in pairs]
+    r.require(len(keys) == len(set(keys)), f"duplicate keys {keys}")
+    return dict(pairs)
+
+
+def identity(binary, expected):
+    """Run `binary --build-info`; require one JSON line equal to expected in keys, JSON types and values."""
+    result = subprocess.run([str(binary), "--build-info"], capture_output=True, timeout=60)
+    name = binary.name
+    r.require(result.returncode == 0, f"{name} --build-info exited {result.returncode}: {result.stderr[-400:]!r}")
+    text = result.stdout.decode()
+    r.require(text.endswith("\n") and text.count("\n") == 1, f"{name} --build-info is not one JSON line: {text!r}")
+    try:
+        value = json.loads(text, object_pairs_hook=unique_keys)
+    except ValueError as error:
+        raise ValueError(f"{name} --build-info is not JSON: {text!r}: {error}") from None
+    r.require(isinstance(value, dict) and set(value) == set(expected),
+              f"{name} embedded identity keys {sorted(value) if isinstance(value, dict) else value!r} "
+              f"!= {sorted(expected)}")
+    # bool is an int subclass and 1 == 1.0 in Python: compare JSON types exactly.
+    wrong = [key for key, want in expected.items() if type(value[key]) is not type(want) or value[key] != want]
+    r.require(not wrong, f"{name} embedded identity {value} != {expected} (wrong: {', '.join(wrong)})")
+    return value
+
+
 def inspect(checkout, env, sha, version, foreign):
-    """Hash the shipped binaries and check their embedded identity against the exact SHA."""
-    built_at = int(git("show", "-s", "--format=%ct", sha)) * 1000
+    """Hash the shipped binaries and require every one's embedded identity to be the exact release."""
+    built_at = int(git("show", "-s", "--format=%ct", sha, root=checkout)) * 1000
     result = {}
     for name in BINARIES:
-        data = (checkout / "target/release" / name).read_bytes()
+        binary = checkout / "target/release" / name
+        data = binary.read_bytes()
         for other in foreign:
             r.require(other.encode() not in data, f"{name} embeds foreign SHA {other}")
-        identity = None
-        if name in IDENTIFIED:
-            identity = json.loads(subprocess.check_output([str(checkout / "target/release" / name), "--build-info"]))
+        fingerprint = ""
+        if name in FINGERPRINTED:
             fingerprint = subprocess.check_output(["bash", "scripts/build-fingerprint.sh", name], cwd=checkout,
                                                   env=env, text=True).strip()
-            expected = {"version": version, "git_sha": sha, "git_dirty": False, "built_at_ms": built_at,
-                        "inputs_fingerprint": fingerprint}
-            r.require(identity == expected, f"{name} embedded identity {identity} != {expected}")
-        result[name] = {"sha256": r.digest(data), "size": len(data), "identity": identity}
+            r.require(fingerprint, f"{name} build fingerprint is empty")
+        expected = {"version": version, "git_sha": sha, "git_dirty": False, "built_at_ms": built_at,
+                    "inputs_fingerprint": fingerprint}
+        result[name] = {"sha256": r.digest(data), "size": len(data), "identity": identity(binary, expected)}
     return result
 
 
@@ -148,8 +174,7 @@ def prove(sha, parent, seed, version):
         print(binary)
         for scenario, result in builds.items():
             print(f"  {scenario:6} sha256={result[binary]['sha256']} size={result[binary]['size']}")
-        print("  identity:", json.dumps(builds["cold"][binary]["identity"]) if binary in IDENTIFIED
-              else "none embedded (no shared build script); byte identity and no parent/seed SHA only")
+        print("  identity:", json.dumps(builds["cold"][binary]["identity"], sort_keys=True))
     print("elapsed seconds:", json.dumps({k: round(v, 1) for k, v in timings.items()}))
     compare(builds)
     print("identical: warm, cold and seeded builds of", sha)

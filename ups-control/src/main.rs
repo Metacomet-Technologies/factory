@@ -37,6 +37,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // No component fingerprint contract: the release identity alone.
+    shared::exit_if_build_info("");
     let args = Args::parse();
     if matches!(args.command, Some(Command::Migrate)) {
         let _lock = migration_lock(&args.db_path)?;

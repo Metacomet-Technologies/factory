@@ -410,7 +410,8 @@ override; override tests use an isolated generated Cargo/TypeScript fixture.
 Cache byte identity (MET-368), from a committed checkout:
 
 ```sh
-python3 -B scripts/release/prove-cache.py --sha "$(git rev-parse HEAD)" --parent "$(git rev-parse HEAD^)"
+python3 -B scripts/release/prove-cache.py --sha "$(git rev-parse HEAD)" --parent "$(git rev-parse HEAD^)" \
+  --seed "$(git rev-parse "$(git log -1 --format=%H HEAD^ -- Cargo.lock)^")"
 python3 -B scripts/release/prove-cache.py --release-run-evidence
 ```
 
@@ -419,12 +420,21 @@ own `RUSTUP_TOOLCHAIN`, `RUSTFLAGS` and `cargo build` lines with one fixed
 `FACTORY_RELEASE_VERSION` (default: the target's `VERSION`; build time is the
 commit time). It builds the target warm (parent first), cold, and seeded by the
 commit before the last `Cargo.lock` change (same toolchain, override with
-`--seed`), then prints each build's elapsed time and the SHA-256 of meter,
-factory-api, pricing and factory-ups-control. It exits nonzero on any byte
-difference, on meter/factory-api `--build-info` that is not the exact SHA, fixed
-version, clean state and commit time, or on a parent/seed SHA embedded in any
-binary. Pricing and UPS control embed no release identity. Nothing is
-published, dispatched or deployed.
+`--seed`), then prints each build's elapsed time and the SHA-256 and embedded
+identity of meter, factory-api, pricing and factory-ups-control. When the
+target or its parent changed `Cargo.lock`, the default seed can equal the
+parent; pass `--seed` explicitly as above. It exits nonzero on any byte or
+identity difference between builds, on a parent/seed SHA embedded in any
+binary, and unless every binary's `--build-info` exits 0 and prints exactly one
+JSON line whose keys, JSON types and values are exactly `version` (the fixed
+release version), `git_sha` (the full target SHA), `git_dirty` (`false`),
+`built_at_ms` (target commit time × 1000, an integer) and `inputs_fingerprint`.
+Key order is irrelevant. There is no identity exemption: absent, malformed,
+truncated, failed, stale or wrongly typed identity fails even when hashes
+match. meter and factory-api must report their computed `build-fingerprint.sh`
+value; pricing and factory-ups-control have no component fingerprint contract
+and must report the empty string. A pass is evidence only, never permission to
+publish or deploy. Nothing is published, dispatched or deployed.
 
 Prerequisites: the pinned Rust toolchain from `rust-toolchain.toml` (no
 user-global rustup default or `RUSTUP_TOOLCHAIN` is needed) and `ld.lld` on

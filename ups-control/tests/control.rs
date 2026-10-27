@@ -998,3 +998,76 @@ async fn tracking_success_failure_pending_timeout_and_plain_ok() {
         );
     }
 }
+
+#[tokio::test]
+async fn build_info_prints_shared_identity_before_credentials_lock_or_socket() {
+    // Spawns children: exclude calls holding file locks, like the shims.
+    let _spawn = SHIM_FORK_GATE.write().await;
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("audit.db");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_factory-ups-control"))
+            .env_clear()
+            .current_dir(temp.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let listing = || {
+        let mut names: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    let db_arg = db.to_str().unwrap();
+    // Port 1 is privileged: a daemon start would fail to bind, not print identity.
+    for args in [
+        &["--build-info"][..],
+        &[
+            "--build-info",
+            "--db-path",
+            db_arg,
+            "--listen",
+            "127.0.0.1:1",
+        ],
+        &["--build-info", "migrate"],
+    ] {
+        let output = run(args);
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+        assert_eq!(stdout.lines().count(), 1, "{stdout}");
+        let identity: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(identity, shared::build_info_json(""));
+        let fields = identity.as_object().unwrap();
+        let mut keys: Vec<_> = fields.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "built_at_ms",
+                "git_dirty",
+                "git_sha",
+                "inputs_fingerprint",
+                "version"
+            ]
+        );
+        assert!(fields["version"].is_string() && fields["git_sha"].is_string());
+        assert!(fields["git_dirty"].is_boolean() && fields["built_at_ms"].is_u64());
+        assert_eq!(fields["inputs_fingerprint"], "");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+    assert!(listing().is_empty(), "{:?}", listing());
+    // Ordinary CLI: the flag is only recognised first; migrate still writes the DB.
+    let output = run(&["migrate", "--build-info"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(listing().is_empty());
+    let output = run(&["--db-path", db_arg, "migrate"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        listing().contains(&"audit.db".to_owned()),
+        "{:?}",
+        listing()
+    );
+}

@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 factory-db = { path = "../factory-db" }
+shared = { path = "../shared" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 regex = "1"

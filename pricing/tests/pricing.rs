@@ -113,6 +113,66 @@ fn cli_feed_precedence_defaults_and_startup_validation() {
     }
 }
 
+#[test]
+fn build_info_prints_shared_identity_before_cli_config_or_db() {
+    let temp = tempfile::tempdir().unwrap();
+    let blocked = temp.path().join("file");
+    std::fs::write(&blocked, "not a directory").unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_pricing"))
+            .env_clear()
+            .current_dir(temp.path())
+            // Unusable DB, missing config and public feeds would all fail startup.
+            .env("PRICING_DB", blocked.join("pricing.db"))
+            .env("PRICING_OPENROUTER_FEED_URL", "http://public.example/feed")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["--build-info"][..],
+        &["--build-info", "--config", "missing.toml", "show"],
+    ] {
+        let output = run(args);
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+        assert_eq!(stdout.lines().count(), 1, "{stdout}");
+        assert!(stdout.ends_with('\n'));
+        let identity: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(identity, shared::build_info_json(""));
+        let fields = identity.as_object().unwrap();
+        let mut keys: Vec<_> = fields.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "built_at_ms",
+                "git_dirty",
+                "git_sha",
+                "inputs_fingerprint",
+                "version"
+            ]
+        );
+        assert!(fields["version"].is_string() && fields["git_sha"].is_string());
+        assert!(fields["git_dirty"].is_boolean() && fields["built_at_ms"].is_u64());
+        assert_eq!(fields["inputs_fingerprint"], "");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+    // No DB, lock or journal anywhere in the scratch directory.
+    let mut entries: Vec<_> = std::fs::read_dir(temp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, ["file"]);
+    // Ordinary CLI: the flag is only recognised first, and a subcommand is required.
+    for args in [&[][..], &["show", "--build-info"]] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
 fn references() -> Vec<Reference> {
     vec![Reference {
         name: "Claude Sonnet".into(),
