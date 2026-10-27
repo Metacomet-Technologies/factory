@@ -74,6 +74,8 @@ export type IssueSnapshot = {
   openRounds?: Partial<Record<Role, number>>;
   /** Rounds the Watchdog cancelled per role since the current correction epoch began (`odd-watchdog cancelled` comments); verifier rounds since the latest receipt. */
   cancelledRounds?: Partial<Record<Role, number>>;
+  /** Rounds spent before the current correction epoch that still number the role's spawns (the verifier's for the current receipt, MET-406): only rounds above them count against the budget. */
+  epochBase?: Partial<Record<Role, number>>;
   /** Steers delivered to the builder (`odd-steer` comments, written only after delivery): steer key -> comment `createdAt` ('' when Linear gave none). */
   steers?: Readonly<Record<string, string>>;
   /** Spawn records (`odd-spawn` comments), one per role, round and key; `thread` is absent while the create is unconfirmed. */
@@ -393,7 +395,9 @@ export function capacityWait(role: Role, load: Load, newBuild: boolean): string 
  * be respawned forever; the Watchdog cancels it once it is stale, see scripts/odd/watchdog.ts).
  * Cancelled rounds count too; once the budget is spent and no thread of the role is live, the
  * issue pages instead of waiting silently. Cancelled rounds restart with each correction epoch
- * (an `odd-resume` after Devon clears `escalated`), never at the escalation comment itself. Only `openRounds` counts live rounds: an
+ * (an `odd-resume` after Devon clears `escalated`), never at the escalation comment itself. The verifier's
+ * rounds belong to a receipt, so a resume keeps numbering them past `epochBase` (spawn records stay
+ * unique per round and key) but budgets only the epoch's own. Only `openRounds` counts live rounds: an
  * owner that delivered its artifact (a reviewer with a verdict for an older head, a verifier of an
  * older receipt) has finished its round and must not block the next one.
  */
@@ -401,10 +405,11 @@ function spawn(role: Role, load: Load, reason: string, issue: IssueSnapshot): Ac
   const { executor, rounds } = contracts[role];
   const live = issue.openRounds?.[role] ?? 0;
   const previous = Math.max(live, issue.cancelledRounds?.[role] ?? 0);
-  if (previous >= rounds) {
+  const spent = Math.max(0, previous - (issue.epochBase?.[role] ?? 0));
+  if (spent >= rounds) {
     return live > 0
-      ? { kind: 'wait', reason: `${role} round budget spent (${previous}/${rounds})`, stuck: role }
-      : { kind: 'page', reason: 'budget-ceiling', detail: `${issue.identifier}: ${role} spent ${previous}/${rounds} rounds (${reason})`, pr: issue.pr?.number, sha: issue.pr?.headSha };
+      ? { kind: 'wait', reason: `${role} round budget spent (${spent}/${rounds})`, stuck: role }
+      : { kind: 'page', reason: 'budget-ceiling', detail: `${issue.identifier}: ${role} spent ${spent}/${rounds} rounds (${reason})`, pr: issue.pr?.number, sha: issue.pr?.headSha };
   }
   // An issue that already has a builder thread is inside the build count; only a new issue needs a free build slot.
   const full = capacityWait(role, load, live === 0);
