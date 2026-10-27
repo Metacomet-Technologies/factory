@@ -8,6 +8,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { CHECK_TIMEOUT_MS, ROOT, toolChecks, bootstrap, deployComponent, emptyLedger, issuesFromSubjects, liveEffects, main, parseSnapshot, pendingTags, plan, probeResult, promoteTools, receiptLine, recipes, reconcileManual, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
 import { nextAction, parseDeployReceipt, type Action } from './lifecycle.ts';
+import { toSnapshot } from './snapshot.ts';
 import plugin, { diagnose, page, setStatus } from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
 
@@ -157,6 +158,10 @@ function world(options: {
   comments?: [string, string][];
   /** What `install-meter.sh --plan` reports (default an eligible v2 rerun). */
   meterPlan?: { ok: boolean; output: string };
+  /** The odd issues Linear lists in Deploying (read live, so a fixture can move an issue between ticks). */
+  deploying?: string[];
+  /** Merged PRs GitHub's quoted search returns for an issue (by title or body); `gh pr view` reads their bodies. */
+  prs?: { number: number; title: string; headRefName: string; body: string; mergeCommit: { oid: string }; mergedAt: string }[];
 }) {
   const stateDir = mkdtempSync(join(tmpdir(), 'odd-deploy-'));
   let ledger = structuredClone(options.ledger);
@@ -168,6 +173,8 @@ function world(options: {
   let failComment = options.failComment;
   let lostComment = options.lostComment;
   let failPrView = options.failPrView;
+  const clock = { now: Date.parse('2026-10-27T00:00:00.000Z') };
+  const logs: [string, Record<string, unknown>][] = [];
   const index = (value: string) => order.findIndex(full => full.startsWith(value));
   const changedBetween = (from: string, to: string) => order.slice(Math.min(index(from), index(to)) + 1, Math.max(index(from), index(to)) + 1)
     .flatMap(full => options.changes[(Object.keys(shas) as Tag[]).find(tag => shas[tag] === full)!] ?? []);
@@ -187,8 +194,9 @@ function world(options: {
   const effects: Effects = {
     stateDir,
     toolsDir: join(stateDir, 'factory-tools'),
-    log: () => {},
+    log: (decision, details = {}) => { logs.push([decision, details as Record<string, unknown>]); },
     sleep: async () => {},
+    now: () => clock.now,
     run: (command, args) => {
       const out = (stdout: string) => ({ stdout, stderr: '' });
       // Tools self-checks pass here; the promotion fixtures run the real ones.
@@ -196,8 +204,13 @@ function world(options: {
       if (command === 'gh' && args[0] === 'api') return out(JSON.stringify([options.tags.map(tag_name => ({ tag_name, draft: false, prerelease: false }))]));
       if (command === 'gh' && args[0] === 'pr') {
         if (failPrView) { failPrView = false; throw new Error(`gh pr view ${args[2]} exited 1\nHTTP 503: Service Unavailable`); }
+        if (args[1] === 'list') {
+          const query = args[args.indexOf('--search') + 1].replaceAll('"', '').toLowerCase();
+          calls.push(`gh pr list ${query}`);
+          return out(JSON.stringify((options.prs ?? []).filter(pr => `${pr.title}\n${pr.body}`.toLowerCase().includes(query)).map(({ title: _, ...pr }) => pr)));
+        }
         if (args[2] === '404') throw new Error('gh pr view 404 exited 1\nGraphQL: Could not resolve to a PullRequest with the number of 404. (repository.pullRequest)');
-        return out(JSON.stringify({ body: `closes MET-${args[2]}` }));
+        return out(JSON.stringify({ body: options.prs?.find(pr => pr.number === Number(args[2]))?.body ?? `closes MET-${args[2]}` }));
       }
       if (command === 'python3') {
         assert.equal(args[0], join(ROOT, 'scripts/release/release.py'));
@@ -282,10 +295,13 @@ function world(options: {
         comments.push([identifier, body]);
         if (lostComment === identifier) { lostComment = undefined; throw new Error('Linear request timed out'); }
       },
+      deployingIssues: async () => [...options.deploying ?? []],
+      // Creation order is array order.
+      comments: async identifier => comments.flatMap(([issue, body], i) => issue === identifier ? [{ body, createdAt: new Date(Date.parse('2026-10-01T00:00:00.000Z') + i * 1000).toISOString() }] : []),
     },
   };
   const cleanup = () => rmSync(stateDir, { recursive: true, force: true });
-  return { effects, calls, comments, live, ledger: () => ledger!, stateDir, cleanup, exists: () => ledger !== undefined };
+  return { effects, calls, comments, live, logs, clock, ledger: () => ledger!, stateDir, cleanup, exists: () => ledger !== undefined };
 }
 
 // Components have no ledger records yet; baselines come from the health endpoints.
@@ -886,7 +902,7 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
   git('tag', 'v0.2.11');
   mkdirSync(join(runtime, 'scripts/odd'), { recursive: true });
   mkdirSync(join(runtime, 'scripts/release'), { recursive: true });
-  const tools = ['scripts/odd/deploy.ts', 'scripts/release/release.py', ...recipes.flatMap(recipe => [recipe.installer, recipe.rollback])];
+  const tools = ['scripts/odd/deploy.ts', 'scripts/odd/lifecycle.ts', 'scripts/odd/snapshot.ts', 'scripts/odd/engines.ts', 'scripts/release/release.py', ...recipes.flatMap(recipe => [recipe.installer, recipe.rollback])];
   for (const path of tools) writeFileSync(join(runtime, path), readFileSync(new URL(`../../${path}`, import.meta.url)));
   const toolsSha = commit('deployment machinery');
   git('update-ref', 'refs/remotes/origin/main', toolsSha);
@@ -940,7 +956,9 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
       return JSON.stringify({ git_sha: live.get(url), git_dirty: false, status: 'ok' });
     },
     readLedger: () => structuredClone(ledger), writeLedger: next => { ledger = structuredClone(next); },
-    linear: { deploying: async () => true, posted: async (id, body) => comments.some(([i, b]) => i === id && b === body), comment: async (id, body) => { comments.push([id, body]); } },
+    now: () => Date.now(),
+    linear: { deploying: async () => true, posted: async (id, body) => comments.some(([i, b]) => i === id && b === body), comment: async (id, body) => { comments.push([id, body]); },
+      deployingIssues: async () => [], comments: async () => [] },
   };
   const entry = pathToFileURL(join(runtime, 'scripts/odd/deploy.ts')).href;
   // A symlink or Git-file alias must fail before it can change HEAD, install, or handle the tag.
@@ -1226,6 +1244,7 @@ test('sandbox: a kiosk release installs, three green probes report its SHA, Depl
   assert.deepEqual(deploying(pass), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify kiosk at 111111111111', round: 1 });
   assert.equal(host.ledger().lastTag, 'v0.3.0');
   assert.equal(host.ledger().receipt, undefined);
+  assert.deepEqual(host.ledger().deliveries?.map(delivery => delivery.issue), ['MET-302'], 'the issue not yet Deploying stays a pending delivery');
   // release.py downloads 0644; the meter and factory-api installers require -x.
   for (const binary of ['meter-linux-x86_64', 'factory-api-linux-x86_64']) assert.equal(statSync(join(dir, binary)).mode & 0o100, 0o100, binary);
 });
@@ -1652,6 +1671,152 @@ test('sandbox: a transient PR lookup failure keeps the release pending; the reru
   assert.deepEqual(sudoCalls(rerun.calls), []);
   assert.deepEqual(rerun.comments, [['MET-301', line(`component=kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
   assert.equal(rerun.ledger().lastTag, 'v0.3.0');
+});
+
+// --- Delayed recipients and receipt reconciliation (MET-353).
+
+const DAY = 24 * 60 * 60_000;
+const kioskAt = (tag: Tag) => line(`component=kiosk sha=${shas[tag]} health=pass rollback=none`);
+const mergeLine = (pr: number, merge: string) => `odd-merge pr=${pr} head=${'d'.repeat(40)} merge=${merge} release=none`;
+const verifyFail = (tag: Tag) => `odd-verify sha=${shas[tag]} result=fail bug=MET-900`;
+const merged = (pr: number, merge: string, extra: Partial<{ title: string; headRefName: string; body: string }> = {}) =>
+  ({ number: pr, title: `MET-${pr}: change`, headRefName: `met-${pr}-change`, body: `closes MET-${pr}`, mergeCommit: { oid: merge }, mergedAt: '2026-10-20T00:00:00Z', ...extra });
+const issueComments = (host: ReturnType<typeof world>, issue: string) => host.comments.filter(([id]) => id === issue).map(([, body]) => body);
+const decisions = (host: ReturnType<typeof world>, decision: string) => host.logs.filter(([name]) => name === decision).map(([, details]) => details);
+/** What the control plane does next from the issue's own comments, through the authoritative derivation. */
+const lifecycleOf = async (host: ReturnType<typeof world>, issue: string) =>
+  nextAction(toSnapshot({ issue: { id: issue, status: 'Deploying', labels: ['odd'], comments: await host.effects.linear.comments(issue) } }), idle);
+
+test('sandbox: a recipient not yet Deploying stays pending across later releases and gets exactly one receipt once it is, through a lost response, with no repeated install', async t => {
+  const tags: Tag[] = ['v0.2.9', 'v0.3.0'];
+  const notDeploying = ['MET-302'];
+  const options = { tags, notDeploying, changes: { 'v0.3.0': ['kiosk/src/App.tsx'], 'v0.3.1': ['kiosk/src/App.tsx'] }, issues: { 'v0.3.0': ['MET-301', 'MET-302'], 'v0.3.1': ['MET-303'] } };
+  const host = world({ ...options, ledger: baseline() });
+  t.after(host.cleanup);
+  await main(host.effects);
+  const since = new Date(host.clock.now).toISOString();
+  assert.deepEqual(host.comments, [['MET-301', kioskAt('v0.3.0')]]);
+  assert.deepEqual(host.ledger().deliveries, [{ issue: 'MET-302', tag: 'v0.3.0', line: kioskAt('v0.3.0'), since }], 'retained, never marked delivered');
+  assert.equal(host.ledger().lastTag, 'v0.3.0', 'a pending recipient never holds the release');
+  // A later release ships without waiting for it; the recipient keeps its release and first-seen time.
+  host.clock.now += 3 * DAY;
+  tags.push('v0.3.1');
+  await main(host.effects);
+  assert.deepEqual(host.comments, [['MET-301', kioskAt('v0.3.0')], ['MET-303', kioskAt('v0.3.1')]]);
+  assert.deepEqual(host.ledger().deliveries, [{ issue: 'MET-302', tag: 'v0.3.0', line: kioskAt('v0.3.0'), since }]);
+  assert.equal(host.ledger().lastTag, 'v0.3.1');
+  // It reaches Deploying on a tick with no new release; Linear stores the comment but the response is lost.
+  notDeploying.length = 0;
+  const lost = world({ ...options, ledger: host.ledger(), comments: host.comments, lostComment: 'MET-302', deploying: ['MET-301', 'MET-302', 'MET-303'] });
+  t.after(lost.cleanup);
+  await assert.rejects(main(lost.effects), /timed out/);
+  assert.deepEqual(lost.ledger().deliveries?.map(delivery => delivery.issue), ['MET-302'], 'a crashed delivery keeps the recipient');
+  // The restarted job finds the stored comment: dropped, never posted twice, and reconciliation adds nothing.
+  for (let tick = 0; tick < 2; tick++) {
+    const rerun = world({ ...options, ledger: lost.ledger(), comments: lost.comments, deploying: ['MET-301', 'MET-302', 'MET-303'] });
+    t.after(rerun.cleanup);
+    await main(rerun.effects);
+    assert.deepEqual(issueComments(rerun, 'MET-302'), [kioskAt('v0.3.0')], 'exactly one receipt');
+    assert.deepEqual(rerun.comments.length, 3);
+    assert.deepEqual(rerun.ledger().deliveries, []);
+    assert.deepEqual(sudoCalls(rerun.calls), []);
+    assert.deepEqual(rerun.calls.filter(call => call.startsWith('verify') || call.startsWith('checkout')), []);
+    assert.deepEqual(await lifecycleOf(rerun, 'MET-302'), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify kiosk at 111111111111', round: 1 });
+  }
+  assert.deepEqual(sudoCalls([...host.calls, ...lost.calls]), [`sudo deploy/install-kiosk.sh ${host.stateDir}/releases/v0.3.0/kiosk`, `sudo deploy/install-kiosk.sh ${host.stateDir}/releases/v0.3.1/kiosk`]);
+});
+
+test('sandbox: a pending recipient a later release ships again keeps one entry; it expires after seven days with a diagnostic and no receipt', async t => {
+  const tags: Tag[] = ['v0.2.9', 'v0.3.0'];
+  const host = world({ tags, notDeploying: ['MET-302'], changes: { 'v0.3.0': ['kiosk/src/App.tsx'], 'v0.3.1': ['docs/x.md'] }, issues: { 'v0.3.0': ['MET-302'], 'v0.3.1': ['MET-302'] }, ledger: baseline() });
+  t.after(host.cleanup);
+  await main(host.effects);
+  const since = new Date(host.clock.now).toISOString();
+  host.clock.now += DAY;
+  tags.push('v0.3.1');
+  await main(host.effects);
+  const v301 = line(`component=none sha=${shas['v0.3.1']} health=pass rollback=none`);
+  assert.deepEqual(host.ledger().deliveries, [{ issue: 'MET-302', tag: 'v0.3.1', line: v301, since }], 'superseded by the newer receipt, first seen unchanged');
+  host.clock.now = Date.parse(since) + 7 * DAY - 1;
+  await main(host.effects);
+  assert.equal(host.ledger().deliveries?.length, 1, 'still retried just inside the window');
+  host.clock.now += 1;
+  await main(host.effects);
+  assert.deepEqual(host.ledger().deliveries, []);
+  assert.deepEqual(decisions(host, 'receipt-expired'), [{ issue: 'MET-302', tag: 'v0.3.1', line: v301, since, reason: 'not Deploying within seven days of release; no receipt was delivered' }]);
+  assert.deepEqual(host.comments, [], 'expired, never called delivered');
+  assert.deepEqual(decisions(host, 'receipt').filter(details => details.issue === 'MET-302'), []);
+  assert.equal(sudoCalls(host.calls).length, 1);
+});
+
+test('sandbox: bootstrap and failed-verification recovery: the next proven release receipts every Deploying issue it contains, once, without reinstalling', async t => {
+  const tags: Tag[] = ['v0.2.9', 'v0.3.0'];
+  const host = world({ tags, ledger: undefined, live: Object.fromEntries(recipes.map(recipe => [recipe.name, shas['v0.3.0']])),
+    changes: { 'v0.3.0': ['kiosk/src/App.tsx'], 'v0.3.1': ['kiosk/src/App.tsx'] }, issues: { 'v0.3.1': ['MET-301'] },
+    deploying: ['MET-300', 'MET-301', 'MET-305'], prs: [merged(300, shas['v0.3.0']), merged(305, shas['v0.2.9'])],
+    comments: [['MET-300', mergeLine(300, shas['v0.3.0'])], ['MET-305', mergeLine(305, shas['v0.2.9'])],
+      ['MET-305', line(`component=kiosk sha=${shas['v0.2.9']} health=pass rollback=none`)], ['MET-305', verifyFail('v0.2.9')]] });
+  t.after(host.cleanup);
+  await bootstrap(host.effects, 'v0.3.0');
+  await main(host.effects);
+  assert.equal(host.comments.length, 4, 'an adopted release is no proven deployment: no historical receipt');
+  assert.deepEqual(decisions(host, 'reconcile-skipped'), [{ reason: 'no pass release recorded by this deployer yet' }]);
+  tags.push('v0.3.1');
+  await main(host.effects);
+  assert.deepEqual(sudoCalls(host.calls), [`sudo deploy/install-kiosk.sh ${host.stateDir}/releases/v0.3.1/kiosk`]);
+  for (const issue of ['MET-300', 'MET-301']) assert.deepEqual(issueComments(host, issue).filter(body => body.startsWith('odd-deploy')), [kioskAt('v0.3.1')], issue);
+  assert.deepEqual(issueComments(host, 'MET-305').at(-1), kioskAt('v0.3.1'));
+  for (const issue of ['MET-300', 'MET-305']) assert.deepEqual(await lifecycleOf(host, issue), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify kiosk at 222222222222', round: 1 }, issue);
+  // Ticks with no new release add nothing: no comment, verify, checkout or install.
+  const count = host.comments.length;
+  const calls = host.calls.length;
+  await main(host.effects);
+  await main(host.effects);
+  assert.equal(host.comments.length, count);
+  assert.deepEqual(host.calls.slice(calls).filter(call => !call.startsWith('gh pr list')), []);
+});
+
+test('sandbox: a no-new-release tick routes branch-, body- and edited-subject-owned work and failed verifications to the proven release, refusing unrelated or unproven ancestry', async t => {
+  const v290 = line(`component=kiosk sha=${shas['v0.2.50']} health=pass rollback=none`);
+  const issues = {
+    'MET-310': { prs: [merged(310, shas['v0.2.50'])], comments: [mergeLine(310, shas['v0.2.50'])] }, // edited squash subject: no `(#310)`
+    'MET-311': { prs: [merged(311, shas['v0.2.50'], { body: 'Fixes the kiosk.' })], comments: [] }, // branch-only, merged by hand
+    'MET-312': { prs: [merged(900, shas['v0.2.50'], { title: 'MET-900: other', headRefName: 'met-900-other', body: 'closes MET-900\nNoticed while fixing MET-312.' })], comments: [] },
+    'MET-313': { prs: [merged(313, 'e'.repeat(40))], comments: [] }, // merge commit unknown here
+    'MET-314': { prs: [merged(314, shas['v0.3.1'])], comments: [mergeLine(314, shas['v0.3.1'])] }, // not deployed yet
+    'MET-315': { prs: [merged(315, shas['v0.2.50'])], comments: [mergeLine(315, shas['v0.3.0'])] }, // merge receipt disagrees with GitHub
+    'MET-316': { prs: [merged(316, shas['v0.2.50'])], comments: [mergeLine(999, shas['v0.2.50'])] }, // merge receipt names another PR
+    'MET-320': { prs: [merged(320, shas['v0.2.50'])], comments: [mergeLine(320, shas['v0.2.50']), v290, verifyFail('v0.2.50')] },
+    'MET-321': { prs: [merged(321, shas['v0.3.0'])], comments: [mergeLine(321, shas['v0.3.0']), kioskAt('v0.3.0'), verifyFail('v0.3.0')] },
+    'MET-322': { prs: [merged(322, shas['v0.2.50'])], comments: [mergeLine(322, shas['v0.2.50']), kioskAt('v0.3.1'), verifyFail('v0.3.1')] },
+    'MET-323': { prs: [merged(323, shas['v0.2.50'])], comments: [mergeLine(323, shas['v0.2.50']), v290] }, // awaiting its verifier
+    'MET-324': { prs: [merged(324, shas['v0.3.0'])], comments: [mergeLine(324, shas['v0.2.50']), v290, mergeLine(324, shas['v0.3.0'])] }, // re-merged
+  };
+  const host = world({ tags: ['v0.2.9', 'v0.3.0'], changes: {}, lostComment: 'MET-310', deploying: Object.keys(issues),
+    ledger: baseline({ lastTag: 'v0.3.0', deployed: { tag: 'v0.3.0', sha: shas['v0.3.0'], line: kioskAt('v0.3.0') } }),
+    prs: Object.values(issues).flatMap(issue => issue.prs), comments: Object.entries(issues).flatMap(([id, issue]) => issue.comments.map(body => [id, body] as [string, string])) });
+  t.after(host.cleanup);
+  const before = Object.fromEntries(Object.keys(issues).map(id => [id, issueComments(host, id)]));
+  await assert.rejects(main(host.effects), /timed out/);
+  await main(host.effects);
+  const receipted = ['MET-310', 'MET-311', 'MET-320', 'MET-324'];
+  for (const id of Object.keys(issues)) {
+    assert.deepEqual(issueComments(host, id), receipted.includes(id) ? [...before[id], kioskAt('v0.3.0')] : before[id], id);
+  }
+  assert.deepEqual(Object.fromEntries(decisions(host, 'reconcile-refused').map(details => [details.issue, details.reason])), {
+    'MET-312': 'no merged PR owns MET-312',
+    'MET-313': `merge ${'e'.repeat(40)} is not proven to be in v0.3.0`,
+    'MET-314': `merge ${shas['v0.3.1']} is not proven to be in v0.3.0`,
+    'MET-315': `PR #315 merged ${shas['v0.2.50']}, not the odd-merge commit ${shas['v0.3.0']}`,
+    'MET-316': 'odd-merge PR #999 is not a merged PR that owns MET-316',
+    'MET-321': `failed verification at ${shas['v0.3.0']} has no later proven deployment`,
+    'MET-322': `failed verification at ${shas['v0.3.1']} has no later proven deployment`,
+  });
+  for (const id of receipted) assert.deepEqual(await lifecycleOf(host, id), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify kiosk at 111111111111', round: 1 }, id);
+  assert.deepEqual(host.calls.filter(call => !call.startsWith('gh pr list')), [], 'no verify, checkout, probe or install');
+  const count = host.comments.length;
+  await main(host.effects);
+  assert.equal(host.comments.length, count, 'idempotent from the issues\' own comments');
 });
 
 test('pending releases are immutable v-tags newer than the ledger, oldest first; a missing or cursorless ledger is never silently adopted', async t => {

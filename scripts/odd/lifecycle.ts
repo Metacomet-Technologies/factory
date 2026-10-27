@@ -514,7 +514,8 @@ function proceed(issue: IssueSnapshot, load: Load, now: number): Action {
     }
     // Green receipt: the Verifier judges the Done-means items against the deployed system and
     // posts `odd-verify` for the receipt's SHA (verifyLine). A failed verification waits on the
-    // Bug it filed; the next release's receipt carries a new SHA and is verified again.
+    // Bug it filed; the Deployer re-receipts the issue at the next pass release that contains the
+    // failed SHA, even one that does not ship it (deploy.ts reconcile), and that SHA is verified again.
     const verify = issue.verify?.sha === receipt.sha ? issue.verify : undefined;
     if (!verify) return spawn('verifier', load, `verify ${receipt.component} at ${receipt.sha.slice(0, 12)}`, issue);
     if (verify.result === 'pass') return { kind: 'set-status', status: 'Done', reason: `verified ${receipt.component} at ${receipt.sha.slice(0, 12)}` };
