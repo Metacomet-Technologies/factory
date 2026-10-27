@@ -186,6 +186,43 @@ test('MET-386: a receipt set names each component at its own SHA and tag under o
   ]) assert.equal(parseDeployReceipt(malformed), undefined, malformed);
 });
 
+test('MET-367: tagged receipts round-trip and act exactly like their tagless forms; an invalid tag is never formatted or parsed', () => {
+  const lines = [
+    'odd-deploy host=factory-gpu component=meter+kiosk sha=abcdef1234 tag=v0.12.3 health=pass rollback=none',
+    'odd-deploy host=factory-gpu component=kiosk sha=abcdef1234 tag=v0.12.3 health=fail rollback=/var/backups/kiosk/snap',
+    'odd-deploy host=factory-gpu component=kiosk sha=abcdef1234 tag=v0.12.3 health=fail rollback=unchanged',
+    'odd-deploy host=factory-gpu component=kiosk sha=abcdef1234 tag=v0.12.3 health=fail rollback=none',
+    'odd-deploy host=factory-gpu component=meter sha=abcdef1234 tag=v0.12.3 health=refused rollback=none refusal=db-changing-v1',
+    // A MET-386 set: its tag is its round, and each component keeps its own tag.
+    `odd-deploy host=factory-gpu component=meter+kiosk sha=abcdef1234 tag=v0.12.3 health=pass rollback=none round=v0.12.3 set=meter:${'a'.repeat(40)}@v0.11.0,kiosk:${'b'.repeat(40)}@v0.12.3`,
+  ];
+  for (const line of lines) {
+    const receipt = parseDeployReceipt(`note\n${line}\n`)!;
+    assert.equal(receipt?.tag, 'v0.12.3', line);
+    assert.equal(deployReceiptLine(receipt), line);
+    const legacy = line.replace(' tag=v0.12.3', '');
+    const { tag: _, ...untagged } = receipt;
+    assert.deepEqual(parseDeployReceipt(legacy), untagged, legacy);
+    // The decision is the same; only the quoted receipt and the diagnosed receipt name the release.
+    const untag = (action: Action) => JSON.parse(JSON.stringify(action, (key, value) => key === 'tag' ? undefined : value).replaceAll(line, legacy));
+    assert.deepEqual(untag(nextAction(issue({ status: 'Deploying', deployReceipt: receipt }), idle)), nextAction(issue({ status: 'Deploying', deployReceipt: untagged }), idle), line);
+  }
+  const pass = lines[0];
+  for (const malformed of [
+    pass.replace('tag=v0.12.3', 'tag=latest'),
+    pass.replace('tag=v0.12.3', 'tag=v0.12'),
+    pass.replace('tag=v0.12.3', 'tag=0.12.3'),
+    pass.replace('tag=v0.12.3', 'tag=v0.12.3-rc1'),
+    pass.replace('tag=v0.12.3', 'tag='),
+    pass.replace(' tag=v0.12.3', '').replace('rollback=none', 'rollback=none tag=v0.12.3'),
+    pass.replace('tag=v0.12.3', 'tag=v0.12.3 tag=v0.12.4'),
+    lines[5].replace('tag=v0.12.3', 'tag=v0.11.0'),
+  ]) assert.equal(parseDeployReceipt(malformed), undefined, malformed);
+  const receipt = parseDeployReceipt(pass)!;
+  for (const tag of ['latest', 'v0.12', 'v0.12.3 health=fail', '']) assert.throws(() => deployReceiptLine({ ...receipt, tag }), /not a vX\.Y\.Z release/, tag);
+  assert.throws(() => deployReceiptLine({ ...parseDeployReceipt(lines[5])!, tag: 'v0.11.0' }), /equal to its round v0\.12\.3/);
+});
+
 test('ralph guard stops on the external condition or the budget, never on the agent claim', () => {
   assert.deepEqual(ralphGuard({ role: 'builder', chained: 0, stopMet: true, missing: [] }), { action: 'stop', why: 'stop-met' });
   assert.deepEqual(ralphGuard({ role: 'reviewer', chained: 2, stopMet: false, missing: [] }), { action: 'stop', why: 'budget' });

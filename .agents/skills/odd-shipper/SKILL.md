@@ -30,10 +30,11 @@ that SHA, CI green at that SHA, issue labelled `odd`.
 3. Comment the merge receipt on the issue: `odd-merge pr=<n> head=<sha>
    merge=<sha> release=<tag|none>`. The merged PR derives the issue's next
    status (`Deploying`) on the next evaluation.
-4. From phase 5: tag and publish the release per `docs/release.md` for every
-   component the PR touched, with components and issue identifiers in the
-   notes, and close PRs superseded by this merge with a comment naming the
-   replacement.
+4. Close PRs superseded by this merge with a comment naming the
+   replacement. Never write release notes or publish a release: the
+   publisher (`docs/release.md`) owns immutable releases whose body is only
+   the manifest marker, and the Deployer's `odd-deploy ... tag=<vX.Y.Z>`
+   receipt on each issue links the issue to its release.
 
 ## Self-deploying paths
 

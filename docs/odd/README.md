@@ -384,11 +384,16 @@ Each artifact is machine-checkable before the next role starts.
   discriminating probes, smallest shared fix). Builder and Spec skills
   require a reusable end-to-end proof matrix built from existing fixtures.
 - Shipper → Deployer: merge receipt comment `odd-merge pr=<n> head=<sha>
-  merge=<sha> release=<tag|none>`; from phase 5 a GitHub release whose notes
-  list components and issues (`docs/release.md`).
+  merge=<sha> release=<tag|none>`. The publisher (`docs/release.md`), not
+  the Shipper, publishes each immutable release with a marker-only body; it
+  lists no issues or components. The Deployer finds a release's issues from
+  its squash subjects and PR bodies, and its receipt links issue to tag.
 - Deployer → Verifier: deploy receipt comment `odd-deploy host=<h>
-  component=<c> sha=<s> health=<pass|fail> rollback=<none|unchanged|snapshot>`, one per
-  issue per release. `component` is `+`-joined install order (`meter+kiosk`),
+  component=<c> sha=<s> tag=<vX.Y.Z> health=<pass|fail> rollback=<none|unchanged|snapshot>`, one per
+  issue per release. `tag` is the verified release the Deployer handled, from
+  its pending release or ledger record, never inferred from a SHA or the
+  latest release (MET-367); receipts from before it carry no `tag` and parse
+  unchanged, and a malformed `tag` does not parse. `component` is `+`-joined install order (`meter+kiosk`),
   `none` when the release changed nothing the host runs, or the failed
   component. A component changed when its `sources`, its deploy files, or
   one of the inputs `scripts/release/release.py` fingerprints for every
@@ -413,9 +418,10 @@ Each artifact is machine-checkable before the next role starts.
   required component is healthy in the ledger at the release SHA, the
   release's uniform line above is posted unchanged. Otherwise the issue gets
   a complete set, `odd-deploy host=<h> component=<c1+c2> sha=<round sha>
-  health=pass rollback=none round=<tag> set=<c1>:<sha40>@<tag>,<c2>:<sha40>@<tag>`:
-  `sha` and `round` are the proven pass release that publishes it (a real
-  commit containing every listed identity), and each entry is that
+  tag=<tag> health=pass rollback=none round=<tag> set=<c1>:<sha40>@<tag>,<c2>:<sha40>@<tag>`:
+  `sha`, `tag` and `round` are the proven pass release that publishes it (a
+  real commit containing every listed identity; a `tag` other than `round`
+  does not parse), and each entry is that
   component's own healthy ledger SHA and tag, never the round's. It is
   published only when every required component is covered: healthy in the
   ledger, an ancestor of the round, containing every issue merge that
@@ -434,7 +440,8 @@ Each artifact is machine-checkable before the next role starts.
   release receipt and first-seen time and retried at the start of every tick,
   so it never holds later releases. It gets exactly one receipt once it is
   `Deploying` (an existing identical comment, such as one whose response was
-  lost, counts as posted); a later release shipping it again replaces the
+  lost, or the same receipt without `tag` from an earlier Deployer, counts as
+  posted); a later release shipping it again replaces the
   pending receipt and keeps the first-seen time. Seven days after first seen
   it is dropped with a `receipt-expired` log line and no receipt.
   Drain (MET-366): each tick prepares and installs at most the oldest pending
