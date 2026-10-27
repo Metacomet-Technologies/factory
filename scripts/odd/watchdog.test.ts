@@ -2248,3 +2248,37 @@ test('P4.6-deployer-archive: an archived reader is never respawned for its relea
     mock.timers.reset();
   }
 });
+
+test('P4.6-deployer-archive: a diagnosed reader thread search has never returned is archived and frees its runner slot for a waiting receipt; undiagnosed hidden readers keep theirs', async () => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  try {
+    const plant = factory();
+    plant.control.indexLag = true;
+    const shas = ['0d6a', '0d7a', '0d8a'].map(x => x.repeat(10));
+    const ids = ['MET-91', 'MET-92', 'MET-93'];
+    const readerOf = (sha: string) => [...plant.threads.values()].find(thread => thread.labels.includes(readerLabel(sha)));
+    for (const [i, id] of ids.slice(0, 2).entries()) {
+      plant.issue(id, 'Deploying');
+      plant.say(id, deployLine(shas[i], 'fail', '/var/snap/x'));
+    }
+    await plant.start();
+    await settle();
+    assert.ok(readerOf(shas[0]) && readerOf(shas[1]), 'two readers fill both runner slots');
+    plant.issue(ids[2], 'Deploying');
+    plant.say(ids[2], deployLine(shas[2], 'fail', '/var/snap/x'));
+    await advance(sweepMs);
+    assert.equal(readerOf(shas[2]), undefined, 'a third reader waits for a runner slot');
+    // The first reader finishes; thread search still returns neither.
+    const first = readerOf(shas[0])!;
+    first.state = 'idle';
+    first.labels.push(diagnosedLabel(shas[0]));
+    await advance(sweepMs);
+    assert.equal(first.archived, true, 'the diagnosed reader is archived though search never returned it');
+    assert.equal(readerOf(shas[1])!.archived, false, 'the running hidden reader stays');
+    await advance(sweepMs);
+    assert.ok(readerOf(shas[2]), 'the freed slot admits the waiting receipt\'s reader');
+    assert.equal([...plant.threads.values()].filter(thread => thread.labels.includes('odd-role-deployer') && !thread.archived && thread.state === 'running').length, 2, 'never past 2 runner slots');
+  } finally {
+    mock.timers.reset();
+  }
+});

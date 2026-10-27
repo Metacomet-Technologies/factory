@@ -436,7 +436,10 @@ export default async function (amp: PluginAPI) {
 		let performing = false
 		let issue: IssueSnapshot | undefined
 		try {
-			const derived = await snapshotFor(ctx, identifier, merged.get(identifier))
+			// The issue's log readers this process spawned are read by ID, like bound spawn records: one search has not
+			// returned yet is still archived once diagnosed, which frees its runner slot (no issue record holds it).
+			const readers = [...ledger].flatMap(([slot, held]) => (held.role === 'deployer' && held.thread && slot.split(' ').includes(`odd-issue-${identifier.toLowerCase()}`) ? [held.thread] : []))
+			const derived = await snapshotFor(ctx, identifier, merged.get(identifier), readers)
 			const { threads, comments } = derived
 			issue = derived.snapshot
 			loadEpisodes(state, issue.identifier, comments)
@@ -446,7 +449,7 @@ export default async function (amp: PluginAPI) {
 			const finished = finishedThreads(issue.status, threads)
 			if (finished.length && performing) {
 				await archiveThreads(ctx, finished)
-				// An archived log reader leaves thread search before admission may have seen it indexed; its slot is free now.
+				// An archived log reader may never have been returned by thread search, which is what admission waits for; its slot is free now.
 				for (const [slot, held] of ledger) if (finished.some(thread => thread.id === held.thread)) ledger.delete(slot)
 			}
 			const { usage, threads: live } = await currentLoad(ctx)
@@ -1447,15 +1450,16 @@ const listComments = (tools: Tools, issueId: string): Promise<Comment[]> => allP
 type Comment = { id?: string; body: string; createdAt?: string }
 
 // A thread an `odd-spawn` record binds is read by its ID, so search lag (or a plugin reload) never
-// hides it; one whose labels did not land carries its record's role labels.
-async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, merged?: number): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
+// hides it; one whose labels did not land carries its record's role labels. `known` are other
+// threads of the issue to read by ID (the log readers this process spawned).
+async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, merged?: number, known: readonly string[] = []): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
 	const [issue, comments, pr] = await Promise.all([
 		getIssue(ctx.tools, { id: identifier, includeRelations: true }),
 		listComments(ctx.tools, identifier),
 		pullRequestFor(ctx, identifier, merged),
 	])
 	const bound = new Map(spawnRecords(comments).flatMap(record => (record.thread ? [[record.thread, record] as const] : [])))
-	const threads = (await threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, [...bound.keys()])).map(thread => {
+	const threads = (await threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, [...bound.keys(), ...known])).map(thread => {
 		const record = bound.get(thread.id)
 		return record && !parseThreadLabels(thread.labels).role ? { ...thread, labels: [...thread.labels, ...threadLabels(identifier, record.role, record.round)] } : thread
 	})
