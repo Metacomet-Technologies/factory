@@ -45,7 +45,7 @@ import {
 	type SpawnRecord,
 } from '../../scripts/odd/lifecycle.ts'
 import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { admittedLoad, finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, receiptLabel, reconciles, roleLabelQueries, spawnRecords, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
+import { admittedLoad, diagnosedLabel, finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
 import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
 import { builderArgs, launch } from '../../scripts/odd/launch.ts'
 import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, digestHeading, episodeLine, incidentPageDue, incidentText, incidents, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, resolutionText, restoreStatus, sanitizeError, slackMessages, staleThreads, sweepMs, unknownAge, type DigestInput, type DigestWait, type Episode, type Plane } from '../../scripts/odd/watchdog.ts'
@@ -436,7 +436,10 @@ export default async function (amp: PluginAPI) {
 		let performing = false
 		let issue: IssueSnapshot | undefined
 		try {
-			const derived = await snapshotFor(ctx, identifier, merged.get(identifier))
+			// The issue's log readers this process spawned are read by ID, like bound spawn records: one search has not
+			// returned yet is still archived once diagnosed, which frees its runner slot (no issue record holds it).
+			const readers = [...ledger].flatMap(([slot, held]) => (held.role === 'deployer' && held.thread && slot.split(' ').includes(`odd-issue-${identifier.toLowerCase()}`) ? [held.thread] : []))
+			const derived = await snapshotFor(ctx, identifier, merged.get(identifier), readers)
 			const { threads, comments } = derived
 			issue = derived.snapshot
 			loadEpisodes(state, issue.identifier, comments)
@@ -444,7 +447,11 @@ export default async function (amp: PluginAPI) {
 			if (performing) await reconcileSpawns(ctx, issue, threads)
 			holdSpawns(issue, threads)
 			const finished = finishedThreads(issue.status, threads)
-			if (finished.length && performing) await archiveThreads(ctx, finished)
+			if (finished.length && performing) {
+				await archiveThreads(ctx, finished)
+				// An archived log reader may never have been returned by thread search, which is what admission waits for; its slot is free now.
+				for (const [slot, held] of ledger) if (finished.some(thread => thread.id === held.thread)) ledger.delete(slot)
+			}
 			const { usage, threads: live } = await currentLoad(ctx)
 			// The issue's own reservations are left out: a pending one must reach perform's fail-closed check and page, not wait on its own slot.
 			const { load } = admittedLoad(live, [...ledger.values()].filter(held => held.issue !== issue!.identifier))
@@ -1251,7 +1258,7 @@ export async function followUp(ctx: Pick<WebhookHandlerContext, 'tools' | 'logge
 // journal excerpts to the Bug, or to the issue when the rollback failed and no Bug exists.
 const diagnosed = new Set<string>()
 export async function diagnose(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, issue: IssueSnapshot, receipt: DeployReceipt, bug: string | undefined, spawn: Spawn) {
-	const label = `odd-deploy-${receipt.sha.slice(0, 12)}`
+	const label = readerLabel(receipt.sha)
 	const found = listOf(await readJson(ctx.tools, 'find_thread', { query: `label:${label}`, limit: 1 }), 'threads', 'find_thread', row => named(row.id))
 	if (diagnosed.has(label) || found.length) {
 		ctx.logger.log(marker, 'deploy log reader exists', issue.identifier, label)
@@ -1265,6 +1272,7 @@ export async function diagnose(ctx: Pick<WebhookHandlerContext, 'tools' | 'logge
 			`${marker} Outcome ${issue.identifier}. Role: deployer. Reason: red deploy.`,
 			`Receipt: \`${deployReceiptLine(receipt)}\`.`,
 			`Attach the installer and journal excerpts (\`journalctl -u factory-deploy\`, the ledger) for this release to ${target}${bug ? ` (Bug follow-up of ${issue.identifier})` : ' (the rollback failed; Devon is paged)'}.`,
+			`Once that comment is posted, add the label \`${diagnosedLabel(receipt.sha)}\` to this thread with \`update_thread\` (\`labels.add\`); the control plane archives the thread on that label.`,
 			`Load the \`${contracts.deployer.skill}\` skill and start.`,
 		].join(' '))
 	} catch (error: unknown) {
@@ -1442,15 +1450,16 @@ const listComments = (tools: Tools, issueId: string): Promise<Comment[]> => allP
 type Comment = { id?: string; body: string; createdAt?: string }
 
 // A thread an `odd-spawn` record binds is read by its ID, so search lag (or a plugin reload) never
-// hides it; one whose labels did not land carries its record's role labels.
-async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, merged?: number): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
+// hides it; one whose labels did not land carries its record's role labels. `known` are other
+// threads of the issue to read by ID (the log readers this process spawned).
+async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, merged?: number, known: readonly string[] = []): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
 	const [issue, comments, pr] = await Promise.all([
 		getIssue(ctx.tools, { id: identifier, includeRelations: true }),
 		listComments(ctx.tools, identifier),
 		pullRequestFor(ctx, identifier, merged),
 	])
 	const bound = new Map(spawnRecords(comments).flatMap(record => (record.thread ? [[record.thread, record] as const] : [])))
-	const threads = (await threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, [...bound.keys()])).map(thread => {
+	const threads = (await threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, [...bound.keys(), ...known])).map(thread => {
 		const record = bound.get(thread.id)
 		return record && !parseThreadLabels(thread.labels).role ? { ...thread, labels: [...thread.labels, ...threadLabels(identifier, record.role, record.round)] } : thread
 	})

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, slackMessages, staleThreads, sweepMs, staleMs, type DigestInput, type Episode } from './watchdog.ts';
 import { deployReceiptLine, heartbeatLine, parseHeartbeat, verifyLine } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
-import { receiptLabel, type LiveThread } from './snapshot.ts';
+import { diagnosedLabel, readerLabel, receiptLabel, type LiveThread } from './snapshot.ts';
 import plugin, { followUp } from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
 import { io } from './launch.ts';
@@ -449,6 +449,8 @@ function factory() {
   /** Threads thread search does not return yet, and every create call the plane made (plugin agents and builder launches). */
   const hidden = new Set<string>();
   const creates: string[] = [];
+  /** The outcome message each plugin-agent thread was started with. */
+  const outcomes = new Map<string, string>();
   /** Lifecycle mutations: status writes, builder launches and heartbeats (comments, archives, steers and DMs are kept above). */
   const saves: string[] = [];
   const launches: string[] = [];
@@ -496,8 +498,10 @@ function factory() {
       }
       case 'linear.save_issue': saves.push(`${input.id} ${JSON.stringify(input.state ?? input.addLabels)}`); return {};
       case 'find_thread': {
+        // Like Amp's thread search, archived threads are left out only when the query says `archived:false`.
         const label = /label:(\S+)/.exec(String(input.query))?.[1] ?? '';
-        return { threads: [...threads].filter(([id, thread]) => !hidden.has(id) && !thread.archived && thread.labels.includes(label)).map(([id, thread]) => ({ id, updatedAt: thread.updatedAt })) };
+        const live = String(input.query).includes('archived:false');
+        return { threads: [...threads].filter(([id, thread]) => !hidden.has(id) && !(live && thread.archived) && thread.labels.includes(label)).map(([id, thread]) => ({ id, updatedAt: thread.updatedAt })) };
       }
       case 'get_thread_status': { const thread = threads.get(String(input.thread))!; return { metadata: { labels: thread.labels, archived: thread.archived }, agentState: { state: thread.state } }; }
       case 'update_thread': threads.get(String(input.thread))!.archived = true; return {};
@@ -529,7 +533,7 @@ function factory() {
       threads.set(id, { labels: [], state: 'running', archived: false, updatedAt: new Date().toISOString() });
       if (control.indexLag) hidden.add(id);
       if (control.ambiguous) throw new Error('fetch failed: socket hang up');
-      return { id, setLabels: async (labels: string[]) => { threads.get(id)!.labels = labels; }, appendUserMessage: async () => {} };
+      return { id, setLabels: async (labels: string[]) => { threads.get(id)!.labels = labels; }, appendUserMessage: async (message: { content: string }) => { outcomes.set(id, message.content); } };
     } }),
     registerAgentMode: () => {}, registerTool: (tool: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> }) => { statuses.set(mine, tool.execute); },
     on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { if (name === 'session.start') starts.set(mine, handler); if (name === 'agent.end') ends.set(mine, handler); },
@@ -550,7 +554,7 @@ function factory() {
     prs.push({ number: n, headRefName: `${issue.toLowerCase()}-x`, headRefOid: sha, state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: sha, committedDate: new Date().toISOString() }], statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }], body: `closes ${issue}`, ...over });
   };
   return {
-    issues, comments, prs, releases, threads, dms, steers, control, builder, openPr, saves, launches, hidden, creates, heartbeats: () => heartbeats, slackAttempts: () => slackAttempts,
+    issues, comments, prs, releases, threads, dms, steers, control, builder, openPr, saves, launches, hidden, creates, outcomes, heartbeats: () => heartbeats, slackAttempts: () => slackAttempts,
     /** Thread search catches up with every hidden thread. */
     index: () => hidden.clear(),
     /** The `odd-spawn` lines on an issue, oldest first. */
@@ -565,9 +569,10 @@ function factory() {
     say: (issue: string, body: string) => comments.set(issue, [...(comments.get(issue) ?? []), { id: `said-${++said}`, body, createdAt: new Date(Date.parse('2026-10-26T12:00:00Z') + said * 1000).toISOString() }]),
     issue: (id: string, status: string) => issues.set(id, { id, status, labels: ['odd', 'Bug', 'area:agents'], description: fullSpec }),
     episodes: (id: string) => (comments.get(id) ?? []).filter(comment => comment.body.startsWith('odd-failure')).map(comment => comment.body.split('\n')[0]),
-    async start() {
+    /** `load` is the plugin's default export; pass a freshly imported module to model a control-orb restart that drops module state. */
+    async start(load: unknown = plugin) {
       const mine = ++generation;
-      await (plugin as unknown as (api: unknown) => Promise<void>)(amp(mine));
+      await (load as (api: unknown) => Promise<void>)(amp(mine));
       const thread = { id: 'T-control', labels: async () => (mine === generation ? ['odd-control-plane', 'odd-perform'] : []) };
       await starts.get(mine)!({}, { thread, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools });
     },
@@ -2153,5 +2158,127 @@ test('P4.6-recheck: duplicate events, a lagging PR index, a failed merge and a f
         mock.timers.reset();
       }
     });
+  }
+});
+
+const readers = (plant: ReturnType<typeof factory>) => [...plant.threads].filter(([, thread]) => thread.labels.includes('odd-role-deployer'));
+
+test('P4.6-deployer-archive: a diagnosed idle log reader is archived once, also while a failed rollback keeps the issue in Deploying; running, undiagnosed and other-release readers stay', async t => {
+  // Each case its own release, used by no other test: one module load remembers the readers it spawned.
+  for (const [name, rollback, moved, red] of [['failed rollback, issue stays Deploying', 'none', 'Deploying', '0d1a'.repeat(10)], ['rolled back, issue moves to Todo', '/var/snap/1', 'Todo', '0d2a'.repeat(10)]] as const) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const plant = factory();
+        plant.control.launch = true;
+        plant.issue('MET-9', 'Deploying');
+        plant.say('MET-9', deployLine(red, 'fail', rollback));
+        const archives: string[] = [];
+        plant.control.inject = (call, input) => { if (call === 'update_thread' && input.archived === true) archives.push(String(input.thread)); return undefined; };
+        await plant.start();
+        await settle();
+        const [[id, reader]] = readers(plant);
+        assert.equal(readers(plant).length, 1);
+        assert.ok(reader.labels.includes(readerLabel(red)));
+        assert.match(plant.outcomes.get(id)!, new RegExp(`add the label \`${diagnosedLabel(red)}\` to this thread`), 'the reader is told its handoff label');
+        plant.issues.get('MET-9')!.status = moved;
+        const sweep = async (state: string, labels: string[]) => {
+          reader.state = state;
+          reader.labels = [...reader.labels.filter(label => !label.startsWith('odd-diagnosed-')), ...labels];
+          await advance(sweepMs);
+        };
+        await sweep('running', [diagnosedLabel(red)]);
+        assert.equal(reader.archived, false, 'a running reader stays even with its label');
+        await sweep('idle', []);
+        assert.equal(reader.archived, false, `an idle reader without its diagnosed label stays (issue ${moved})`);
+        await sweep('idle', [diagnosedLabel('f'.repeat(40))]);
+        assert.equal(reader.archived, false, 'another release\'s diagnosed label is not this reader\'s handoff');
+        await sweep('idle', [diagnosedLabel(red)]);
+        assert.equal(reader.archived, true, `the diagnosed idle reader is archived (issue ${moved})`);
+        await advance(3 * sweepMs);
+        assert.deepEqual(archives.filter(archived => archived === id), [id], 'archived once');
+        assert.equal(readers(plant).length, 1);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('P4.6-deployer-archive: an archived reader is never respawned for its release across repeated receipts and a reload; a new release gets one reader and runner slots are freed', async () => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  try {
+    const plant = factory();
+    // The fixture never applies a status write, so the issue stays in Deploying and every evaluation repeats the red receipt's action.
+    plant.issue('MET-9', 'Deploying');
+    const finish = async (sha: string) => {
+      const found = readers(plant).filter(([, thread]) => thread.labels.includes(readerLabel(sha)));
+      assert.equal(found.length, 1, `one reader for ${sha.slice(0, 12)}`);
+      const [, thread] = found[0];
+      thread.state = 'idle';
+      thread.labels.push(diagnosedLabel(sha));
+      await advance(sweepMs);
+      assert.equal(thread.archived, true);
+    };
+    const [a, b, c] = ['0d3a', '0d4a', '0d5a'].map(x => x.repeat(10));
+    plant.say('MET-9', deployLine(a, 'fail', '/var/snap/a'));
+    await plant.start();
+    await settle();
+    await finish(a);
+    await advance(2 * sweepMs);
+    plant.say('MET-9', deployLine(a, 'fail', '/var/snap/a'));
+    await advance(sweepMs);
+    assert.equal(readers(plant).length, 1, 'a redelivered receipt for the archived release starts no reader');
+    // Two further releases, each archived before any admission saw its reader indexed: the archived readers hold no runner slot.
+    for (const sha of [b, c]) {
+      plant.say('MET-9', deployLine(sha, 'fail', `/var/snap/${sha.slice(0, 4)}`));
+      await advance(sweepMs);
+      await finish(sha);
+    }
+    assert.equal(readers(plant).length, 3, 'one reader per release');
+    // A restarted control orb: a fresh module load with no memory of the readers it spawned; only thread search remembers them.
+    await plant.start((await import(`../../.amp/plugins/factory-odd.ts?restart=deployer-archive`)).default);
+    await settle();
+    await advance(2 * sweepMs);
+    plant.say('MET-9', deployLine(a, 'fail', '/var/snap/a'));
+    await advance(2 * sweepMs);
+    assert.equal(readers(plant).length, 3, 'a reload and a repeated receipt start no reader for an archived release');
+    assert.ok(readers(plant).every(([, thread]) => thread.archived));
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('P4.6-deployer-archive: a diagnosed reader thread search has never returned is archived and frees its runner slot for a waiting receipt; undiagnosed hidden readers keep theirs', async () => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  try {
+    const plant = factory();
+    plant.control.indexLag = true;
+    const shas = ['0d6a', '0d7a', '0d8a'].map(x => x.repeat(10));
+    const ids = ['MET-91', 'MET-92', 'MET-93'];
+    const readerOf = (sha: string) => [...plant.threads.values()].find(thread => thread.labels.includes(readerLabel(sha)));
+    for (const [i, id] of ids.slice(0, 2).entries()) {
+      plant.issue(id, 'Deploying');
+      plant.say(id, deployLine(shas[i], 'fail', '/var/snap/x'));
+    }
+    await plant.start();
+    await settle();
+    assert.ok(readerOf(shas[0]) && readerOf(shas[1]), 'two readers fill both runner slots');
+    plant.issue(ids[2], 'Deploying');
+    plant.say(ids[2], deployLine(shas[2], 'fail', '/var/snap/x'));
+    await advance(sweepMs);
+    assert.equal(readerOf(shas[2]), undefined, 'a third reader waits for a runner slot');
+    // The first reader finishes; thread search still returns neither.
+    const first = readerOf(shas[0])!;
+    first.state = 'idle';
+    first.labels.push(diagnosedLabel(shas[0]));
+    await advance(sweepMs);
+    assert.equal(first.archived, true, 'the diagnosed reader is archived though search never returned it');
+    assert.equal(readerOf(shas[1])!.archived, false, 'the running hidden reader stays');
+    await advance(sweepMs);
+    assert.ok(readerOf(shas[2]), 'the freed slot admits the waiting receipt\'s reader');
+    assert.equal([...plant.threads.values()].filter(thread => thread.labels.includes('odd-role-deployer') && !thread.archived && thread.state === 'running').length, 2, 'never past 2 runner slots');
+  } finally {
+    mock.timers.reset();
   }
 });
