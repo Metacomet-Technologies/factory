@@ -140,7 +140,7 @@ export const prEligible = (pr: Pick<GitHubPullRequest, 'headRefName' | 'body' | 
 /** `updatedAt` is the thread's last activity as reported by thread search; absent for a thread the index has not returned yet. */
 export type LiveThread = { id: string; labels: readonly string[]; state: string; updatedAt?: string };
 
-const statuses: readonly Status[] = ['Backlog', 'Triage', 'Todo', 'In Progress', 'Deploying', 'Done', 'Canceled', 'Duplicate'];
+const statuses: readonly Status[] = ['Backlog', 'Triage', 'Todo', 'In Progress', 'In Review', 'Deploying', 'Done', 'Canceled', 'Duplicate'];
 
 export function ciState(checks: GitHubPullRequest['statusCheckRollup'] = []): 'pending' | 'success' | 'failure' {
   const words = checks.map(check => (check.conclusion ?? check.state ?? '').toUpperCase());
@@ -203,7 +203,8 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
   // P4.3: a PR merged at or before the latest failed receipt is history, not the issue's PR.
   const pr = input.pr?.mergedAt && supersededMerge(input.pr, failedReceiptAt(issue.comments ?? [])) ? undefined : input.pr;
   const description = issue.description ?? '';
-  const status = statuses.find(name => name === issue.status) ?? 'Backlog';
+  // Any other name is Unknown, never Backlog: Backlog is parked and silent, an unknown status pages (lifecycle.ts).
+  const status = statuses.find(name => name === issue.status) ?? 'Unknown';
   const roleThreads = threads.filter(thread => parseThreadLabels(thread.labels).role);
   const owned = roleThreads.find(thread => ownerState(thread.state) === 'running')
     ?? roleThreads.find(thread => parseThreadLabels(thread.labels).role === 'builder')
@@ -277,6 +278,7 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
   return {
     identifier: issue.id.toUpperCase(),
     status,
+    ...(status === 'Unknown' ? { unknownStatus: issue.status } : {}),
     labels: issue.labels,
     description,
     openBlockers,
@@ -411,8 +413,9 @@ export function loadFrom(threads: readonly LiveThread[]): Load {
 const roleStages: Partial<Record<keyof typeof contracts, readonly Status[]>> = {
   intake: ['Triage'],
   spec: ['Triage'],
-  builder: ['Todo', 'In Progress'],
-  reviewer: ['In Progress'],
+  // The builder is kept through review, so a `changes` verdict steers the same thread and its build slot stays held.
+  builder: ['Todo', 'In Progress', 'In Review'],
+  reviewer: ['In Progress', 'In Review'],
   verifier: ['Deploying'],
 };
 
@@ -422,6 +425,8 @@ const roleStages: Partial<Record<keyof typeof contracts, readonly Status[]>> = {
  * while the reader still runs): it is finished once it is idle and `delivered`.
  */
 export function finishedThreads(status: Status, threads: readonly LiveThread[]): LiveThread[] {
+  // An unknown status says nothing about which stage is over: nothing is archived until it is known.
+  if (status === 'Unknown') return [];
   return threads.filter(thread => {
     const { role } = parseThreadLabels(thread.labels);
     if (ownerState(thread.state) !== 'idle') return false;
