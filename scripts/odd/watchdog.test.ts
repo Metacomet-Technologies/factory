@@ -557,6 +557,8 @@ function factory() {
     spawnLines: (id: string) => (comments.get(id) ?? []).filter(comment => comment.body.startsWith('odd-spawn ')).map(comment => comment.body),
     /** The latest plugin load's `odd_control_status`: its handled events. */
     events: async () => (JSON.parse(await statuses.get(generation)!({}, { thread: { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] } })) as { events: { issue: string | null; stage: string; error?: string }[] }).events,
+    /** An `odd_control_status sweep: true` call on the latest plugin load, as a human or the control thread makes it. */
+    sweep: () => statuses.get(generation)!({ sweep: true }, { thread: { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] }, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools }),
     /** The Ralph guard as the latest plugin load runs it at the end of a role thread's turn. */
     guard: (labels: string[]) => ends.get(generation)!({ status: 'done', message: '', thread: { id: 'T-role' } }, { thread: { id: 'T-role', labels: async () => labels }, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools, $ }),
     /** A comment one second after the previous planted one, so creation order is unambiguous. */
@@ -2044,4 +2046,112 @@ test('MET-348 matrix: an interrupted escalation retries only its missing steps, 
   assert.equal(plant.steers.length, 0);
   assert.equal(plant.saves.filter(save => save.includes('escalated')).length, 1, 'the label is set once');
   assert.equal(lines('odd-resume').length, 0, 'no resume while the label is present');
+});
+
+// --- P4.6-recheck: a successful merge re-evaluates its issue at once ---
+
+/** MET-8 with a ready verdict at its open PR's head. GitHub merges on `gh pr merge`; `lag` makes reads trail the merge. */
+function readyToMerge() {
+  const plant = factory();
+  const sha = 'c'.repeat(40);
+  const mergeSha = '7'.repeat(40);
+  plant.issue('MET-8', 'In Progress');
+  plant.builder('MET-8');
+  plant.threads.set('T-review', { labels: ['odd-issue-met-8', 'odd-role-reviewer', 'odd-round-1', 'odd-engine-openai', `odd-verdict-ready-${sha.slice(0, 12)}`], state: 'idle', archived: false, updatedAt: new Date().toISOString() });
+  plant.openPr('MET-8', sha);
+  const open = { ...plant.prs[0] };
+  // `search`: the merged search misses the PR; `open`: the open list and the PR view still show it open with its ready head; `openList`: only the open list does.
+  const lag = { search: false, open: false, openList: false, mergeFailures: 0 };
+  const merges: string[] = [];
+  plant.control.gh = command => {
+    if (command.startsWith('gh pr merge 8 ')) {
+      merges.push(command);
+      if (lag.mergeFailures > 0) { lag.mergeFailures -= 1; return { exitCode: 1, stdout: '', stderr: 'GraphQL: Base branch was modified. Review and try the merge again.' }; }
+      Object.assign(plant.prs[0], { state: 'MERGED', mergeCommit: { oid: mergeSha }, mergedAt: new Date().toISOString() });
+      return { exitCode: 0, stdout: '', stderr: '' };
+    }
+    if (command === 'gh pr view 8 --json mergeCommit --jq .mergeCommit.oid') return { exitCode: 0, stdout: `${mergeSha}\n`, stderr: '' };
+    if (lag.search && /^gh pr list --search .* --state merged /.test(command)) return { exitCode: 0, stdout: '[]', stderr: '' };
+    if ((lag.open || lag.openList) && /^gh pr list --state open /.test(command)) return github(command, [open]);
+    if (lag.open && /^gh pr view 8 --json number,/.test(command)) return github(command, [open]);
+    return undefined;
+  };
+  const receipts = () => (plant.comments.get('MET-8') ?? []).filter(comment => comment.body.startsWith('odd-merge pr=')).map(comment => comment.body);
+  const deploying = () => plant.saves.includes('MET-8 "Deploying"');
+  return { plant, lag, merges, receipts, deploying, receipt: `odd-merge pr=8 head=${sha} merge=${mergeSha} release=none` };
+}
+
+test('P4.6-recheck: a successful merge moves its issue to Deploying a second later, with no webhook and long before the next sweep', async t => {
+  for (const name of ['merged search caught up', 'merged search lagging', 'open list lagging, PR view caught up']) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const { plant, lag, merges, receipts, deploying, receipt } = readyToMerge();
+        await plant.start();
+        await settle();
+        assert.equal(merges.length, 1);
+        assert.deepEqual(receipts(), [receipt]);
+        assert.equal(deploying(), false, 'the merge itself does not set the status');
+        // The merged PR is not searchable yet: the re-check reads it by the number its receipt names.
+        lag.search = name === 'merged search lagging';
+        // A stale open-list row for the merged PR is read as merged, not as an open PR whose view disagrees.
+        lag.openList = name.startsWith('open list');
+        await advance(1_000, 1_000);
+        assert.ok(deploying(), 'Deploying one second after the merge');
+        await advance(11 * 60_000);
+        assert.equal(merges.length, 1, 'never merged twice');
+        assert.deepEqual(receipts(), [receipt]);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('P4.6-recheck: duplicate events, a lagging PR index, a failed merge and a failed receipt each yield one merge and one receipt, and Deploying only after the receipt', async t => {
+  const cases = ['duplicate events', 'pending refusal re-check', 'open PR read lags the merge', 'merge error', 'receipt error'] as const;
+  for (const name of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+      try {
+        const { plant, lag, merges, receipts, deploying, receipt } = readyToMerge();
+        let receiptFailures = name === 'receipt error' ? 1 : 0;
+        plant.control.inject = (tool, input) => {
+          if (tool === 'linear.save_comment' && String(input.body).startsWith('odd-merge pr=') && receiptFailures > 0) { receiptFailures -= 1; throw new Error('Linear 503'); }
+          return undefined;
+        };
+        if (name === 'merge error') lag.mergeFailures = 1;
+        // GitHub's merge state lags CI: the first evaluation is refused and re-checks in 90 s.
+        if (name === 'pending refusal re-check') plant.control.refuse = 'mergeStateStatus BLOCKED';
+        await plant.start();
+        await settle();
+        if (name === 'pending refusal re-check') {
+          assert.equal(merges.length, 0);
+          plant.control.refuse = '';
+          // An event (here a sweep request) merges while the refusal's 90 s re-check is pending; the merge's re-check replaces it.
+          await plant.sweep();
+          await settle();
+        }
+        if (name === 'open PR read lags the merge') lag.open = true;
+        if (name === 'duplicate events') {
+          // Two more evaluations race the merge's own re-check.
+          void plant.sweep();
+          void plant.sweep();
+        }
+        await advance(1_000, 1_000);
+        const failed = ['merge error', 'receipt error', 'open PR read lags the merge'].includes(name);
+        assert.equal(merges.length, 1, 'one merge attempt so far');
+        assert.deepEqual(receipts(), name === 'merge error' || name === 'receipt error' ? [] : [receipt]);
+        assert.equal(deploying(), !failed, failed ? 'no Deploying without a merge and its receipt' : 'Deploying one second after the merge');
+        lag.open = false;
+        // The failure re-check (90 s), still before the 10-minute sweep, completes the handoff.
+        await advance(2 * 60_000);
+        assert.equal(merges.length, name === 'merge error' ? 2 : 1, name === 'merge error' ? 'the failed merge is retried once' : 'never merged twice');
+        assert.deepEqual(receipts(), [receipt], 'exactly one receipt');
+        assert.ok(deploying());
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
 });
