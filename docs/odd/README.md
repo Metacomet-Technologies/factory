@@ -555,7 +555,12 @@ archive are each recorded in `done=` once they succeed, and a failed step is
 retried alone by the next evaluation while the issue holds. The draft step
 drafts only a PR that is ready for review and then records
 `odd-drafted pr=<n> escalation=<comment id>` (P4.4); a PR that is already a
-draft is left as it is and unrecorded. `merge()` marks a draft ready only
+draft is left as it is and unrecorded. The step reads the PR state first: a
+merged or closed PR has nothing to draft or release later, so `draft` is
+recorded done with no `gh pr ready --undo` and no `odd-drafted` line, and the
+latch finishes instead of retrying a command GitHub refuses (MET-399). A
+failed state read is a failed read: `draft` stays pending and the evaluation
+fails. `merge()` marks a draft ready only
 when such a record has an `odd-resume` for the same escalation and no
 `odd-undrafted` line, which it writes before `gh pr ready`; any other draft,
 a human's included, stays a draft and the merge is refused once per head.

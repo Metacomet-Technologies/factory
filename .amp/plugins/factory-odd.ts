@@ -1440,7 +1440,10 @@ export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 	if (action.pr !== undefined) {
 		// P4.4: a PR that is already a draft is not the plane's to release later; only a draft the plane made is recorded
 		// (`odd-drafted`, after it succeeded). A lost record leaves the PR a draft for its author: it fails closed.
+		// MET-399: a merged or closed PR has nothing to draft or release later, so the step is done with no record;
+		// GitHub refuses `gh pr ready --undo` on it, and retrying that kept the latch pending on every sweep.
 		await step('draft', async () => {
+			if (await prState(ctx, action.pr!) !== 'OPEN') return
 			if (await isDraft(ctx, action.pr!)) return
 			const draft = await ctx.$`gh pr ready ${String(action.pr)} --undo`
 			if (draft.exitCode !== 0) throw new Error(`gh pr ready ${action.pr} --undo failed: ${draft.stderr.trim()}`)
@@ -1828,6 +1831,15 @@ async function isDraft(ctx: Pick<WebhookHandlerContext, '$'>, pr: number): Promi
 	const value = draft.stdout.trim()
 	if (value !== 'true' && value !== 'false') throw new ReadError(`gh pr view ${pr} --json isDraft returned ${JSON.stringify(value.slice(0, 60))}, not true or false`)
 	return value === 'true'
+}
+
+/** GitHub's state of a PR; a failed or malformed read is a failed read, never "closed". */
+async function prState(ctx: Pick<WebhookHandlerContext, '$'>, pr: number): Promise<'OPEN' | 'MERGED' | 'CLOSED'> {
+	const read = await shellRead(ctx.$`gh pr view ${String(pr)} --json state --jq .state`, `gh pr view ${pr} --json state`)
+	if (read.exitCode !== 0) throw new ReadError(`gh pr view ${pr} --json state failed: ${read.stderr.trim()}`)
+	const value = read.stdout.trim()
+	if (value !== 'OPEN' && value !== 'MERGED' && value !== 'CLOSED') throw new ReadError(`gh pr view ${pr} --json state returned ${JSON.stringify(value.slice(0, 60))}, not OPEN, MERGED or CLOSED`)
+	return value
 }
 
 /** A shell read: a rejected run (the shell or gh never answered) is a failed read, like a nonzero exit. */

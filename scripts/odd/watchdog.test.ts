@@ -855,8 +855,17 @@ function github(command: string, prs: readonly Pr[], releases: ReadonlyMap<strin
   // `gh pr view <n> --json isDraft --jq .isDraft`: ready for review unless `isDraft`; `gh pr ready <n> [--undo]` sets it.
   const draft = /^gh pr view (\d+) --json isDraft --jq \.isDraft$/.exec(command);
   if (draft) { const pr = prs.find(candidate => candidate.number === Number(draft[1])); return pr ? { exitCode: 0, stdout: `${pr.isDraft === true}\n`, stderr: '' } : { exitCode: 1, stdout: '', stderr: `GraphQL: Could not resolve to a PullRequest with the number of ${draft[1]}.` }; }
+  // `gh pr view <n> --json state --jq .state`: OPEN, MERGED or CLOSED.
+  const stateView = /^gh pr view (\d+) --json state --jq \.state$/.exec(command);
+  if (stateView) { const pr = prs.find(candidate => candidate.number === Number(stateView[1])); return pr ? { exitCode: 0, stdout: `${pr.state}\n`, stderr: '' } : { exitCode: 1, stdout: '', stderr: `GraphQL: Could not resolve to a PullRequest with the number of ${stateView[1]}.` }; }
+  // GitHub refuses either direction on a merged or closed PR (MET-399, PR #235).
   const ready = /^gh pr ready (\d+)( --undo)?$/.exec(command);
-  if (ready) { const pr = prs.find(candidate => candidate.number === Number(ready[1])); if (pr) pr.isDraft = ready[2] !== undefined; return pr ? { exitCode: 0, stdout: '', stderr: '' } : { exitCode: 1, stdout: '', stderr: 'no PR' }; }
+  if (ready) {
+    const pr = prs.find(candidate => candidate.number === Number(ready[1]));
+    if (pr && pr.state !== 'OPEN') return { exitCode: 1, stdout: '', stderr: `X Pull request Metacomet-Technologies/factory#${pr.number} is ${pr.state === 'MERGED' ? 'merged' : 'closed'}. Only draft pull requests can be marked as "ready for review"` };
+    if (pr) pr.isDraft = ready[2] !== undefined;
+    return pr ? { exitCode: 0, stdout: '', stderr: '' } : { exitCode: 1, stdout: '', stderr: 'no PR' };
+  }
   const view = /^gh pr view (\d+) --json ([\w,]+)$/.exec(command);
   const list = /^gh pr list (?:--search "([^"]+)" )?--state (open|merged) --json ([\w,]+) --limit (\d+)$/.exec(command);
   if (!view && !list) return undefined;
@@ -3053,6 +3062,52 @@ test('P4.4: an escalation drafts a ready PR and records it, leaves a human draft
         assert.deepEqual(readies, human ? [] : ['gh pr ready 7']);
         assert.equal(merges.length, human ? 0 : 1);
         assert.equal(pr.isDraft, human, 'a human draft is still a draft');
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('MET-399: a page for a merged or closed PR drafts nothing and finishes its latch; a failed state read leaves draft pending', async t => {
+  const cases: { name: string; pr: Partial<Pr>; stateRead?: Shell; finished: boolean }[] = [
+    { name: 'closed PR', pr: { state: 'CLOSED' }, finished: true },
+    { name: 'merged PR', pr: { state: 'MERGED', mergeCommit: { oid: '7'.repeat(40) }, mergedAt: '2026-10-27T02:00:00Z' }, finished: true },
+    { name: 'closed PR, state read fails', pr: { state: 'CLOSED' }, stateRead: { exitCode: 1, stdout: '', stderr: 'HTTP 502' }, finished: false },
+    { name: 'closed PR, state read malformed', pr: { state: 'CLOSED' }, stateRead: { exitCode: 0, stdout: 'null\n', stderr: '' }, finished: false },
+  ];
+  for (const { name, pr, stateRead, finished } of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-27T03:00:00Z') });
+      try {
+        const { plant, lines } = boundPlant([7], pr);
+        plant.threads.delete('T-review-7');
+        const commands: string[] = [];
+        const bound = plant.control.gh;
+        plant.control.gh = command => {
+          commands.push(command);
+          if (stateRead && command === 'gh pr view 7 --json state --jq .state') return stateRead;
+          return bound?.(command);
+        };
+        // The latch was written and labelled, paged and archived; only its draft step is left (the MET-361 shape).
+        plant.say('MET-7', `odd-escalated reason=budget-ceiling pr=7 sha=${head(7)} done=label,page,archive\n\nMET-7: budget spent.`);
+        plant.issues.get('MET-7')!.labels.push('escalated');
+        await plant.start();
+        await settle();
+        const states = () => commands.filter(command => command === 'gh pr view 7 --json state --jq .state').length;
+        assert.ok(states() >= 1, 'the PR state was read');
+        assert.deepEqual(commands.filter(command => command.startsWith('gh pr ready')), [], 'no gh pr ready on a closed or merged PR');
+        assert.deepEqual(lines('odd-drafted'), [], 'nothing drafted, nothing to release later');
+        assert.deepEqual(lines('odd-escalated'), [`odd-escalated reason=budget-ceiling pr=7 sha=${head(7)} done=${finished ? 'label,draft,page,archive' : 'label,page,archive'}`]);
+        const events = (await plant.events()).filter(event => event.issue === 'MET-7');
+        if (finished) assert.ok(events.every(event => event.stage !== 'failed'), 'the page evaluation succeeded');
+        else assert.ok(events.some(event => event.stage === 'failed' && /gh pr view 7 --json state/.test(event.error ?? '')), 'the failed read fails the evaluation');
+        // The next sweeps: a finished latch holds without another draft attempt; a pending one retries the read.
+        const before = states();
+        await advance(20 * 60_000);
+        assert.equal(states() > before, !finished, finished ? 'the finished latch is not retried' : 'the pending draft step is retried');
+        assert.deepEqual(commands.filter(command => command.startsWith('gh pr ready')), []);
+        assert.equal(plant.dms.filter(dm => dm.includes('budget-ceiling')).length, 0, 'the delivered page is not sent again');
       } finally {
         mock.timers.reset();
       }
