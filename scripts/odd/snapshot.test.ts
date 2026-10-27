@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { admittedLoad, changesRounds, ciState, delivered, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, loadFrom, openRounds, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, riskFrom, spawnRecords, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { admittedLoad, changesRounds, ciState, delivered, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, openRounds, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, riskFrom, spawnRecords, toSnapshot, verdictFor, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
 import { contractOf, nextAction, parseSpawn, spawnKey, spawnLine } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
@@ -18,6 +18,52 @@ test('webhook deliveries resolve to one issue or none', () => {
   assert.equal(issueFromEvent('github', JSON.stringify({ release: { tag_name: 'v1' } })), undefined);
   assert.equal(issueFromEvent('slack', JSON.stringify({ event: { text: 'MET-1 is broken' } })), undefined);
   assert.equal(issueFromEvent('linear', '{not json'), undefined);
+});
+
+test('P3.13: a documented Linear Comment payload resolves its issue from the comment URL; explicit identifiers keep priority; malformed or foreign URLs never resolve', () => {
+  const issueId = '731161c3-191b-46df-8500-c493d2eba9e1';
+  const comment = (url: unknown, data: Record<string, unknown> = {}, type = 'Comment') =>
+    JSON.stringify({ action: 'create', type, data: { id: 'c1', body: 'please retry', issueId, ...data }, url, webhookTimestamp: 1 });
+  const documented = 'https://linear.app/metacomet/issue/MET-358/odd-optionally-resolve#comment-b9a7f299';
+  const rows: [string, string, string | undefined, string | undefined][] = [
+    // [name, body, issue, diagnostic]
+    ['documented Comment URL', comment(documented), 'MET-358', undefined],
+    ['URL without slug', comment('https://linear.app/metacomet/issue/MET-358'), 'MET-358', undefined],
+    ['URL with trailing slash and query', comment('https://linear.app/metacomet/issue/met-358/?x=1'), 'MET-358', undefined],
+    ['data.issue.identifier beats the URL', comment(documented, { issue: { id: issueId, identifier: 'MET-9' } }), 'MET-9', undefined],
+    ['data.identifier beats the URL', comment(documented, { identifier: 'MET-10' }), 'MET-10', undefined],
+    ['a malformed explicit identifier does not fall back to the URL', comment(documented, { issue: { identifier: 'ENG-9' } }), undefined, 'linear-unresolved type=Comment'],
+    ['an explicit identifier with trailing text is malformed', comment(documented, { identifier: 'MET-10 MET-11' }), undefined, 'linear-unresolved type=Comment'],
+    ['data.issue without identifier still uses the URL', comment(documented, { issue: { id: issueId, title: 't' } }), 'MET-358', undefined],
+    ['Issue payload keeps its identifier', JSON.stringify({ type: 'Issue', data: { id: issueId, identifier: 'MET-5' }, url: documented }), 'MET-5', undefined],
+    ['Issue payload never uses the URL', JSON.stringify({ type: 'Issue', data: { id: issueId }, url: documented }), undefined, 'linear-unresolved type=Issue'],
+    ['foreign team prefix', comment('https://linear.app/metacomet/issue/ENG-358/x'), undefined, 'linear-unresolved type=Comment'],
+    ['foreign host', comment('https://linear.app.evil.example/metacomet/issue/MET-1/x'), undefined, 'linear-unresolved type=Comment'],
+    ['plain http', comment('http://linear.app/metacomet/issue/MET-358/x'), undefined, 'linear-unresolved type=Comment'],
+    ['credentials in the URL', comment('https://a:b@linear.app/metacomet/issue/MET-358/x'), undefined, 'linear-unresolved type=Comment'],
+    ['identifier only in the fragment', comment('https://linear.app/metacomet/project/p#MET-358'), undefined, 'linear-unresolved type=Comment'],
+    ['identifier only in the query', comment('https://linear.app/metacomet/issue/x?MET-358'), undefined, 'linear-unresolved type=Comment'],
+    ['identifier glued to more text', comment('https://linear.app/metacomet/issue/MET-358x/y'), undefined, 'linear-unresolved type=Comment'],
+    ['two identifiers in the path', comment('https://linear.app/metacomet/issue/MET-1/issue/MET-2'), undefined, 'linear-unresolved type=Comment'],
+    ['zero or leading-zero number', comment('https://linear.app/metacomet/issue/MET-0358/x'), undefined, 'linear-unresolved type=Comment'],
+    ['truncated URL', comment('https://linear.app/metacomet/iss'), undefined, 'linear-unresolved type=Comment'],
+    ['not a URL', comment('MET-358'), undefined, 'linear-unresolved type=Comment'],
+    ['URL not a string', comment(['https://linear.app/metacomet/issue/MET-358/x']), undefined, 'linear-unresolved type=Comment'],
+    ['no URL', comment(undefined), undefined, 'linear-unresolved type=Comment'],
+    ['issueId not a UUID', comment(documented, { issueId: 'MET-358' }), undefined, 'linear-unresolved type=Comment'],
+    ['issueId missing', comment(documented, { issueId: undefined }), undefined, 'linear-unresolved type=Comment'],
+    ['another type with an issueId', comment(documented, {}, 'Reaction'), undefined, 'linear-unresolved type=Reaction'],
+    ['an unsafe type is not echoed', comment(documented, {}, 'Reaction url=https://x'), undefined, 'linear-unresolved type=unknown'],
+    ['not issue-scoped', JSON.stringify({ type: 'Project', data: { name: 'p' }, url: documented }), undefined, undefined],
+    ['unparseable', '{"type":"Comment"', undefined, undefined],
+  ];
+  for (const [name, body, issue, diagnostic] of rows) {
+    assert.equal(issueFromEvent('linear', body), issue, name);
+    assert.equal(linearUnresolved(body), diagnostic, `${name}: diagnostic`);
+  }
+  // A Comment URL in a GitHub or Slack delivery is never read.
+  assert.equal(issueFromEvent('github', comment(documented)), undefined);
+  assert.equal(issueFromEvent('slack', comment(documented)), undefined);
 });
 
 test('a PR owns an issue by branch prefix or closes/contributes line, not by a mention in prose', () => {

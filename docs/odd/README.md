@@ -525,6 +525,20 @@ under another event ID inside that window are a replay. A missing, malformed,
 invalid, stale or replayed delivery is recorded `rejected` and read no
 further. Slack has no webhook; `#factory-intake` is polled.
 
+Linear issue resolution (P3.13, `issueFromEvent` in `scripts/odd/snapshot.ts`).
+An explicit `data.issue.identifier`, else `data.identifier`, names the issue
+and must be exactly `MET-<n>`; a present but malformed one resolves nothing.
+Only when neither is present does a documented `Comment` payload, with a UUID
+`data.issueId`, resolve from its `url`: `https://linear.app/<workspace>/issue/MET-<n>[/<slug>]`,
+path only, so a foreign team, host, scheme, credentials or an identifier in the
+query or fragment never resolves another issue. An authenticated Issue,
+Comment or `issueId`-carrying delivery that still resolves nothing is recorded
+`ignored` with no snapshot read or mutation and logs one line,
+`linear-unresolved type=<type>` (`unknown` unless the type is a plain word),
+never the payload, URL or signature. This is defensive: no live outage is
+proven: the audited receipts were all handled within the Watchdog sweep
+interval, and the sweep re-reads every live issue whatever its webhooks did.
+
 Signing secrets (MET-382): the project environment takes precedence over
 private input, per provider.
 

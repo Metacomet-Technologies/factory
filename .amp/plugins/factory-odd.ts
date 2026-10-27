@@ -45,7 +45,7 @@ import {
 	type SpawnRecord,
 } from '../../scripts/odd/lifecycle.ts'
 import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { admittedLoad, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, loadFrom, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
+import { admittedLoad, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
 import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
 import { builderArgs, launch } from '../../scripts/odd/launch.ts'
 import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, digestHeading, episodeLine, incidentPageDue, incidentText, incidents, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, resolutionText, restoreStatus, sanitizeError, slackMessages, staleThreads, sweepMs, unknownAge, type DigestInput, type DigestWait, type Episode, type Plane } from '../../scripts/odd/watchdog.ts'
@@ -330,9 +330,13 @@ export default async function (amp: PluginAPI) {
 			}
 			if (seen.has(event.id)) return
 			seen.add(event.id)
-			const identifier = issueFromEvent(source, new TextDecoder().decode(event.body))
+			const body = new TextDecoder().decode(event.body)
+			const identifier = issueFromEvent(source, body)
 			if (!identifier) {
 				record(state, { at: event.receivedAt, source, issue: null, stage: 'ignored' })
+				// P3.13: an issue-scoped Linear delivery that names no issue; only its type is logged.
+				const unresolved = source === 'linear' ? linearUnresolved(body) : undefined
+				if (unresolved) hctx.logger.log(marker, unresolved)
 				return
 			}
 			const entry = await evaluate(hctx, state, source, identifier, event.receivedAt)
