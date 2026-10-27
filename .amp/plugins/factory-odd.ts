@@ -534,7 +534,7 @@ export default async function (amp: PluginAPI) {
 			if (performing && derived.bind && issue.labels.includes(oddLabel)) await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: prBindingLine(derived.bind) })
 			if (performing) await reconcileSpawns(ctx, issue, threads)
 			holdSpawns(issue, threads)
-			const finished = finishedThreads(issue.status, threads)
+			const finished = finishedThreads(issue.status, threads, { receiptSha: issue.deployReceipt?.sha, verifiedSha: issue.verify?.sha, headSha: issue.pr?.headSha })
 			if (finished.length && performing) {
 				await archiveThreads(ctx, finished)
 				// An archived log reader may never have been returned by thread search, which is what admission waits for; its slot is free now.

@@ -170,6 +170,97 @@ test('finished threads: idle role threads whose stage the issue has left; runnin
   assert.deepEqual(finishedThreads('Duplicate', threads).map(t => t.id), ['intake-idle', 'spec-idle', 'builder-idle', 'reviewer-idle', 'verifier-idle']);
 });
 
+// MET-404: finished verifier and reviewer threads are archived inside their stage, from durable inputs only.
+const [oldReceipt, receipt, otherSha] = ['1'.repeat(40), '2'.repeat(40), '3'.repeat(40)];
+const role = (id: string, name: string, state: string, extra: string[] = []): LiveThread => ({ id, labels: ['odd-issue-met-9', `odd-role-${name}`, 'odd-round-1', ...extra], state });
+const verifier = (id: string, receiptSha: string, state = 'idle', extra: string[] = []) => role(id, 'verifier', state, [receiptLabel(receiptSha), ...extra]);
+const ids = (threads: readonly LiveThread[]) => threads.map(t => t.id);
+
+test('MET-404 Done-means 1: an idle verifier with an odd-verify label is archived while the issue is still Deploying, once the plane recorded its result', () => {
+  const failed = verifier('fail-recorded', receipt, 'idle', verifiedLabels({ sha: receipt, result: 'fail', bug: 'MET-51' }));
+  const passed = verifier('pass-recorded', receipt, 'idle', verifiedLabels({ sha: receipt, result: 'pass' }));
+  assert.deepEqual(ids(finishedThreads('Deploying', [failed], { receiptSha: receipt, verifiedSha: receipt })), ['fail-recorded']);
+  assert.deepEqual(ids(finishedThreads('Deploying', [passed], { receiptSha: receipt, verifiedSha: receipt })), ['pass-recorded']);
+  // Unrecorded, the label is the only copy of the output the plane writes as `odd-verify` (verifiedFor): kept until recorded.
+  assert.deepEqual(finishedThreads('Deploying', [failed], { receiptSha: receipt }), []);
+  assert.deepEqual(verifiedFor([failed], receipt), { sha: receipt, result: 'fail', bug: 'MET-51' });
+  // A recorded line for another receipt (a replacing receipt at another SHA) does not record this one's output.
+  assert.deepEqual(finishedThreads('Deploying', [failed], { receiptSha: receipt, verifiedSha: otherSha }), []);
+  // Through the snapshot: the recorded `odd-verify` comment for the current receipt is what lets the thread go.
+  const comments = [
+    { body: `odd-deploy host=h component=api sha=${receipt} health=pass rollback=none`, createdAt: '2026-10-27T20:00:00Z' },
+    { body: `odd-verify sha=${receipt} result=fail bug=MET-51\n- fail x`, createdAt: '2026-10-27T20:10:00Z' },
+  ];
+  const snap = toSnapshot({ issue: { id: 'MET-9', status: 'Deploying', labels: ['odd'], comments }, threads: [failed] });
+  assert.deepEqual(ids(finishedThreads(snap.status, [failed], { receiptSha: snap.deployReceipt?.sha, verifiedSha: snap.verify?.sha })), ['fail-recorded']);
+  // Unchanged without the current inputs: the stage rule alone keeps every verifier in Deploying.
+  assert.deepEqual(finishedThreads('Deploying', [failed, passed]), []);
+});
+
+test('MET-404 Done-means 2: an idle verifier of a superseded receipt is archived while Deploying; the current-receipt verifier with no result is kept', () => {
+  const threads = [
+    verifier('superseded', oldReceipt),
+    verifier('superseded-failed', oldReceipt, 'idle', verifiedLabels({ sha: oldReceipt, result: 'fail', bug: 'MET-50' })),
+    verifier('current', receipt),
+  ];
+  assert.deepEqual(ids(finishedThreads('Deploying', threads, { receiptSha: receipt })), ['superseded', 'superseded-failed']);
+  // The control on the other side of the boundary: with the old receipt current, only the newer-labelled thread is foreign.
+  assert.deepEqual(ids(finishedThreads('Deploying', threads, { receiptSha: oldReceipt })), ['current']);
+  // No receipt known (none parsed, or reset by a new merge): only the stage rule decides.
+  assert.deepEqual(finishedThreads('Deploying', threads, {}), []);
+  assert.deepEqual(ids(finishedThreads('Done', threads, {})), ['superseded', 'superseded-failed', 'current']);
+});
+
+test('MET-404 Done-means 3: an idle reviewer whose verdict is for a stale head is archived; the current-head reviewer with no verdict yet is kept', () => {
+  const [stale, head] = ['a'.repeat(40), 'b'.repeat(40)];
+  const threads = [
+    role('stale-changes', 'reviewer', 'idle', [`odd-verdict-changes-${stale.slice(0, 12)}`]),
+    role('stale-ready', 'reviewer', 'idle', [`odd-verdict-ready-${stale.slice(0, 12)}`]),
+    role('current-no-verdict', 'reviewer', 'idle'),
+    // A verdict for the current head is what the plane merges or steers on (verdictFor): kept.
+    role('current-changes', 'reviewer', 'idle', [`odd-verdict-changes-${head.slice(0, 12)}`]),
+  ];
+  for (const status of ['In Progress', 'In Review'] as const) {
+    assert.deepEqual(ids(finishedThreads(status, threads, { headSha: head })), ['stale-changes', 'stale-ready'], status);
+  }
+  // The other side: with the old head still the PR's, its verdict is current and nothing in the stage is finished.
+  assert.deepEqual(ids(finishedThreads('In Review', threads, { headSha: stale })), ['current-changes']);
+  assert.equal(verdictFor(finishedThreads('In Review', threads, { headSha: head }), head), undefined, 'archiving stale reviewers never removes the current verdict');
+  assert.deepEqual(finishedThreads('In Review', threads), [], 'no PR head known: the stage rule alone keeps them');
+});
+
+test('MET-404 Done-means 4: a builder idle in In Review is kept, and a running or approval-blocked verifier or reviewer is never archived', () => {
+  const head = 'b'.repeat(40);
+  const stale = `odd-verdict-changes-${'a'.repeat(12)}`;
+  const current = { receiptSha: receipt, verifiedSha: receipt, headSha: head };
+  const threads = [
+    role('builder-idle', 'builder', 'idle', [stale]),
+    verifier('verifier-running', oldReceipt, 'running'),
+    verifier('verifier-working', receipt, 'working', verifiedLabels({ sha: receipt, result: 'pass' })),
+    verifier('verifier-approval', oldReceipt, 'awaiting-approval'),
+    verifier('verifier-error', oldReceipt, 'error'),
+    role('reviewer-running', 'reviewer', 'tool_use', [stale]),
+    role('reviewer-approval', 'reviewer', 'awaiting_approval', [stale]),
+  ];
+  for (const status of ['In Progress', 'In Review', 'Deploying'] as const) {
+    assert.deepEqual(ids(finishedThreads(status, threads, current)), status === 'Deploying' ? ['builder-idle'] : [], status);
+  }
+  assert.deepEqual(finishedThreads('Unknown', [...threads, verifier('superseded', oldReceipt)], current), [], 'an Unknown status still archives nothing');
+});
+
+test('MET-404: review rounds survive archiving stale-head reviewers, counted from the delivered changes steers', () => {
+  const [h1, h2, h3] = ['a'.repeat(40), 'b'.repeat(40), 'c'.repeat(40)];
+  const pr: GitHubPullRequest = { number: 9, headRefName: 'met-9-x', headRefOid: h3, state: 'OPEN', statusCheckRollup: [check('SUCCESS')] };
+  const steer = (head: string, minute: number) => ({ body: `odd-steer key=changes-${head.slice(0, 12)} thread=T-b`, createdAt: `2026-10-27T20:0${minute}:00Z` });
+  const current = role('r3', 'reviewer', 'idle', [`odd-verdict-changes-${h3.slice(0, 12)}`]);
+  const issue = { id: 'MET-9', status: 'In Review', labels: ['odd'], comments: [steer(h1, 1), steer(h2, 2), { body: 'odd-steer key=ci-failed-cccccccccccc thread=T-b', createdAt: '2026-10-27T20:03:00Z' }] };
+  // h1 and h2 reviewers are archived; their steers still count, a ci steer does not, and the live h3 verdict adds one.
+  assert.equal(toSnapshot({ issue, pr, threads: [current] }).pr?.changesRounds, 3);
+  // A head both steered and still labelled counts once.
+  assert.equal(changesRounds([role('r1', 'reviewer', 'idle', [`odd-verdict-changes-${h1.slice(0, 12)}`])], [`changes-${h1.slice(0, 12)}`]), 1);
+  assert.equal(changesRounds([], ['changes-not-a-sha', `conflict-${h1.slice(0, 12)}`]), 0);
+});
+
 test('the owner is the running thread, else the builder, so a steer targets the builder beside an idle reviewer', () => {
   const builder: LiveThread = { id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1'], state: 'idle' };
   const reviewer: LiveThread = { id: 'T-r', labels: ['odd-issue-met-1', 'odd-role-reviewer', 'odd-round-1', `odd-verdict-changes-${sha.slice(0, 12)}`], state: 'idle' };
