@@ -351,6 +351,10 @@ Each artifact is machine-checkable before the next role starts.
   component=<c> sha=<s> health=<pass|fail> rollback=<none|sha>`, one per
   issue per release. `component` is `+`-joined install order (`meter+kiosk`),
   `none` when the release changed nothing the host runs, or the failed
+  component. A component changed when its `sources`, its deploy files, or
+  one of the inputs `scripts/release/release.py` fingerprints for every
+  component (`VERSION`, `Cargo.toml`, `Cargo.lock`, `deploy/components.json`,
+  exact paths) changed; a shared input intentionally selects every enabled
   component. `rollback` is the snapshot the rollback restored, and only when
   a re-probe finds the previous release healthy. A refused release (§10
   phase 5, meter DB generations) posts `health=refused rollback=none

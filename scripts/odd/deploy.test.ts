@@ -99,6 +99,23 @@ test('plan: changed inputs since the baseline, recipe order, skips components th
   assert.deepEqual(plan({ sha, sources, baselines: all, ledger: emptyLedger(), changedSince: () => ['kiosk-docs/readme.md', 'docs/odd/README.md'], isAncestor: () => true }), []);
 });
 
+test('plan: each release fingerprint input alone selects every enabled recipe; lookalikes, docs and healthy same-SHA records do not', () => {
+  const sources = { meter: ['meter', 'shared', 'factory-db'], 'factory-api': ['factory-api', 'shared', 'factory-db', 'pricing'], kiosk: ['kiosk', 'factory-api/openapi.json'] };
+  const all = { meter: 'base', 'factory-api': 'base', kiosk: 'base' };
+  const names = (changed: string[], ledger = emptyLedger()) =>
+    plan({ sha, sources, baselines: all, ledger, changedSince: () => changed, isAncestor: () => true }).map(recipe => recipe.name);
+  // scripts/release/release.py fingerprints these four for every component.
+  for (const shared of ['VERSION', 'Cargo.toml', 'Cargo.lock', 'deploy/components.json']) {
+    assert.deepEqual(names([shared]), ['meter', 'factory-api', 'kiosk'], shared);
+    assert.deepEqual(names([shared], { components: { meter: { sha, tag: 'v', health: 'pass' }, kiosk: { sha, tag: 'v', health: 'pass' } } }), ['factory-api'], `${shared}: healthy same-SHA records still skip`);
+    assert.throws(() => plan({ sha, sources, baselines: all, ledger: emptyLedger(), changedSince: () => [shared], isAncestor: () => false }), /older or divergent/, `${shared}: ancestry still refuses`);
+  }
+  for (const lookalike of ['VERSION.md', 'docs/VERSION', 'Cargo.toml.bak', 'meter-cli/Cargo.toml', 'Cargo.lock~', 'kiosk-docs/Cargo.lock', 'deploy/components.json.orig', 'deploy/components.jsonc', 'docs/deploy/components.json', 'docs/odd/README.md']) {
+    assert.deepEqual(names([lookalike]), [], lookalike);
+  }
+  assert.deepEqual(names([]), []);
+});
+
 test('issues come from squash subjects and PR bodies; snapshots and probes parse installer and health output', () => {
   const bodies: Record<number, string> = { 181: 'closes MET-302\nSee MET-999 for context', 180: 'contributes MET-279', 7: 'nothing' };
   assert.deepEqual(issuesFromSubjects(['MET-302: note (#181)', 'Phase 4 fixes (#180)', 'docs (#7)', 'no pr'], pr => bodies[pr] ?? ''), ['MET-302', 'MET-279']);
@@ -1580,6 +1597,27 @@ test('sandbox: a release that touches no enabled component posts component=none 
   const none = line(`component=none sha=${shas['v0.3.0']} health=pass rollback=none`);
   assert.deepEqual(host.comments, [['MET-301', none]]);
   assert.deepEqual(deploying(none), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify none at 111111111111', round: 1 });
+});
+
+test('sandbox: a Cargo.lock-only release installs and probes meter, factory-api and kiosk instead of posting component=none; the rerun skips them', async t => {
+  const changes = { 'v0.3.0': ['Cargo.lock'] };
+  const host = world({ tags: ['v0.2.9', 'v0.3.0'], changes, issues: { 'v0.3.0': ['MET-301'] }, ledger: baseline() });
+  t.after(host.cleanup);
+  await main(host.effects);
+  const dir = `${host.stateDir}/releases/v0.3.0`;
+  assert.deepEqual(sudoCalls(host.calls), [
+    `sudo deploy/install-meter.sh --no-db-change ${dir}/meter-linux-x86_64`,
+    `sudo deploy/install-factory-api.sh ${dir}/factory-api-linux-x86_64`,
+    `sudo deploy/install-kiosk.sh ${dir}/kiosk`,
+  ]);
+  assert.equal(host.calls.filter(call => call === 'probe').length, 3 + 3 * 3, 'three baseline reads, then each component\'s window');
+  assert.deepEqual(host.live, { meter: shas['v0.3.0'], 'factory-api': shas['v0.3.0'], kiosk: shas['v0.3.0'] });
+  assert.deepEqual(host.comments, [['MET-301', line(`component=meter+factory-api+kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
+  // Already installed at this SHA: a rerun of the same release installs nothing more.
+  const rerun = world({ tags: ['v0.2.9', 'v0.3.0'], changes, live: host.live, ledger: { ...host.ledger(), lastTag: 'v0.2.9' } });
+  t.after(rerun.cleanup);
+  await main(rerun.effects);
+  assert.deepEqual(sudoCalls(rerun.calls), []);
 });
 
 test('sandbox: killed between install and probe, the rerun resumes the in-flight kiosk without a second install and finishes the probe', async t => {
