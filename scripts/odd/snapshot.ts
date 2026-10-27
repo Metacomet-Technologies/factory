@@ -308,14 +308,17 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
   // Correction epochs (MET-348). A new epoch starts at an `odd-resume` for the open latch, written
   // only after Devon removed `escalated` from it, or at a legacy `odd-escalated` comment from before
   // latches (prior semantics; honoured only until the issue's first latch, budget or resume record).
-  // It restarts the cancelled rounds (not the verifier's, which belong to a release) and the budget.
+  // It restarts the cancelled rounds and the budget. The verifier's belong to a release: they keep
+  // numbering its spawns, and become the epoch's base, so only the new epoch's rounds are budgeted (MET-406).
   let correction: Correction = { epoch: 1, corrected: false };
+  let epochBase: Partial<Record<Role, number>> = {};
   let escalation: Escalation | undefined;
   let recorded = false;
   const resumed = new Set<string>();
   const nextEpoch = () => {
     correction = { epoch: correction.epoch + 1, corrected: false };
     cancelledRounds = cancelledRounds.verifier ? { verifier: cancelledRounds.verifier } : {};
+    epochBase = cancelledRounds.verifier ? { verifier: cancelledRounds.verifier } : {};
   };
   const oldestFirst = [...issue.comments ?? []].sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''));
   for (const comment of oldestFirst) {
@@ -352,7 +355,10 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     }
     // Verifier rounds belong to one release: a receipt for a new SHA is a fresh verification budget.
     const next = parseDeployReceipt(comment.body);
-    if (next && next.sha !== receipt?.sha) delete cancelledRounds.verifier;
+    if (next && next.sha !== receipt?.sha) {
+      delete cancelledRounds.verifier;
+      delete epochBase.verifier;
+    }
     // MET-386: a receipt that replaces a different one, even at the same round SHA (a receipt set after a
     // partial uniform receipt), needs its own verification; a repost of the same line keeps it.
     if (next && receipt && deployReceiptLine(next) !== deployReceiptLine(receipt)) verify = undefined;
@@ -392,6 +398,7 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     ...(verified ? { verified } : {}),
     openRounds: openRounds(roleThreads, receipt?.sha),
     cancelledRounds,
+    ...(epochBase.verifier ? { epochBase } : {}),
     steers,
     spawns: spawnRecords(issue.comments ?? []),
     ...(escalation ? { escalation } : {}),

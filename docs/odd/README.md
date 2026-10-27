@@ -581,9 +581,13 @@ A lost record fails closed: the PR stays a draft for its author. The escalation
 comment never resets a budget or a round count. When Devon removes
 `escalated` from a latch whose label step was recorded, the control plane
 writes `odd-resume escalation=<comment id> epoch=<n+1>` once; that record
-alone starts the next epoch (fresh budget and Watchdog round counts, not the
-verifier's). A resume that names another latch or epoch, or a malformed
-record, grants nothing and holds the issue.
+alone starts the next epoch (fresh budget and Watchdog round counts). The
+verifier's rounds belong to the receipt, so they keep their numbers: the
+epoch's first verifier on an unchanged receipt is round 3 after two spent
+rounds, and only the rounds above that base count against its budget of 2;
+a second spent budget pages `budget-ceiling` again (MET-406). A resume that
+names another latch or epoch, or a malformed record, grants nothing and holds
+the issue.
 
 Every Slack DM uses one format, `pageText` in `scripts/odd/lifecycle.ts`:
 `ODD page: <condition> | issue MET-<n> | <PR #n or host> | <sha> | default if
@@ -816,7 +820,8 @@ by the previous one).
    never a candidate (open rows then need a usable creation time). A
    delivered thread (reviewer
    with a verdict, verifier labelled `odd-receipt-<sha12>` for an older
-   receipt) holds no round; verifier rounds count per receipt. The sweep
+   receipt) holds no round; verifier rounds count per receipt and correction
+   epoch. The sweep
    reads every page of issues and threads, and the digest is not reposted
    after a plugin reload (it checks `#factory-alerts`). Every other
    authoritative read follows its pages too (MET-345): issue comments for the
