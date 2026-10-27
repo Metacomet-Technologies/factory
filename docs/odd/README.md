@@ -874,7 +874,11 @@ by the previous one).
    parts the channel lacks, a day with its completion line (or a pre-MET-354
    digest) is never posted again, and if the facts changed before a reload
    re-rendered them, the new rendering is posted and completed in full rather
-   than leaving a tail missing. One digest per New York calendar day after
+   than leaving a tail missing. The channel check reads each post as posted:
+   `slack_read` returns the plane's posts wrapped in `(Reply from @Amp Agent
+   on Slack) …` and a closing `from @…’s thread …` line, which it strips
+   before matching first lines; so does the unreleased-main page record
+   (MET-403). One digest per New York calendar day after
    08:00 (DST included); one first rendered from 08:30 opens with a
    `Late catch-up` line, which a retry of a partial delivery keeps as posted.
    The digest lists risk decisions, failed verifications, machine waits over

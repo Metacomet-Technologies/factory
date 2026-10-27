@@ -1,6 +1,6 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, staleReason, staleThreads, sweepMs, staleMs, type DigestInput, type Episode, digestParts, digestSends, digestCompleteLine, digestDelivered, digestLate, stalledWork, firstParentSince, newestRelease, publisherSnapshot, publisherPage, publisherLine, publisherStallMs, type DigestList, type MainCommit, type Publisher, type Run } from './watchdog.ts';
+import { blindMs, digest, digestDue, postedText, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, staleReason, staleThreads, sweepMs, staleMs, type DigestInput, type Episode, digestParts, digestSends, digestCompleteLine, digestDelivered, digestLate, stalledWork, firstParentSince, newestRelease, publisherSnapshot, publisherPage, publisherLine, publisherStallMs, type DigestList, type MainCommit, type Publisher, type Run } from './watchdog.ts';
 import { controlPlaneSilent, deployReceiptLine, heartbeatLine, parseHeartbeat, silenceMs, verifyLine } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
 import { diagnosedLabel, loadFrom, readerLabel, receiptLabel, toSnapshot, type LiveThread } from './snapshot.ts';
@@ -257,6 +257,19 @@ function publishedMain(command: string): string | undefined {
 /** Counts digest deliveries: messages that are a digest's first part, or a pre-identity digest. */
 const digestsIn = (alerts: readonly string[]) => alerts.filter(text => /^ODD digest \S+(\n| part 1\/)/.test(text)).length;
 
+/**
+ * A #factory-alerts post as slack_read returns it: the shape read from the channel on 2026-10-27
+ * (MET-403), where the control plane's posts come back as the Amp Agent bot's reply, wrapped in an
+ * attribution prefix and a closing thread line.
+ */
+const asRead = (text: string, i: number) => ({
+  ts: `1793103146.${String(i).padStart(6, '0')}`,
+  text: `(Reply from @Amp Agent on Slack) ${text}\nfrom @U07M44KLR24’s thread Factory Control Plane (https://ampcode.com/threads/T-be9163dd-4715-4094-bb5a-05b9a0b48a16?amp-slack-attribution=1)`,
+  userID: 'U07M44KLR24',
+  userName: 'Amp Agent',
+  originThreadID: 'T-be9163dd-4715-4094-bb5a-05b9a0b48a16',
+});
+
 /** Linear, thread search and #factory-alerts shared by every plugin instance; each `start()` is a fresh plugin load arming the control thread and returns its `odd_control_status` tool. `override` also sees `thread.labels` and `createWebhook`. */
 function controlOrb(override: (name: string, input: Record<string, unknown>) => unknown = () => undefined) {
   const evaluated: string[] = [];
@@ -285,7 +298,8 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
         if (input.channelName !== 'factory-alerts') return { messages: [] };
         alertReads += 1;
         const terms = (input.filter as { containsAll: string[] }).containsAll;
-        return { messages: alerts.filter(text => terms.every(term => text.includes(term))).map(text => ({ text })) };
+        // Newest first, each post wrapped as slack_read returns it (asRead).
+        return { messages: alerts.map(asRead).filter(message => terms.every(term => message.text.includes(term))).reverse() };
       }
       case 'slack_write': (input.channelName === 'factory-alerts' ? alerts : dms).push(String(input.text)); return {};
       case 'linear.get_status_updates': return { statusUpdates: updates.filter(update => parseHeartbeat(update.body)), hasNextPage: false, cursor: '' };
@@ -340,6 +354,73 @@ test('the sweep reads every page of issues and threads, and a plugin reload does
   await until(() => orb.reads() === 2);
   for (let i = 0; i < 200; i++) await new Promise(resolve => setImmediate(resolve));
   assert.equal(orb.alerts.length, 2, 'one part and its completion line, posted once');
+});
+
+// --- MET-403: the posted check reads the channel in the shape slack_read returns ----------
+
+type DigestState = { digestDay?: string; digestError?: string; digestPending?: unknown };
+const digestState = async (status: (input: Record<string, unknown>) => Promise<unknown>) => ((await status({})) as { watchdog: DigestState }).watchdog;
+
+test('MET-403: a reload after a completed set posts no digest messages; today\'s observed sets, read in the real slack_read shape, count as delivered', async t => {
+  // First lines of the six sets in #factory-alerts on 2026-10-27 (completion ids 57eaa155, d818d811, …), as posted.
+  const set = (id: string) => [1, 2, 3].map(n => `ODD digest 2026-10-27 part ${n}/3 id=${id}\n- body ${n}`).concat(`ODD digest 2026-10-27 complete id=${id} parts=3`);
+  // The real read wraps the text (asRead); unwrapped, it is the post exactly.
+  assert.equal(asRead('ODD digest 2026-10-27 complete id=d818d811 parts=3', 0).text.split('\n')[0], '(Reply from @Amp Agent on Slack) ODD digest 2026-10-27 complete id=d818d811 parts=3', 'the observed first line');
+  assert.equal(postedText(asRead(set('d818d811')[0], 0).text), set('d818d811')[0]);
+  assert.equal(postedText('ODD digest 2026-10-27\nfrom here on'), 'ODD digest 2026-10-27\nfrom here on', 'text without attribution is unchanged');
+  const cases: [string, string[], number][] = [
+    ['one completed set (57eaa155)', set('57eaa155'), 0],
+    ['two completed sets and a later partial one', [...set('57eaa155'), ...set('d818d811'), ...set('fbc02407').slice(0, 2)], 0],
+    ['a digest from before part identities (bare heading)', ['ODD digest 2026-10-27\nMerged PRs (0):'], 0],
+    ['control: only yesterday\'s completed set', set('57eaa155').map(text => text.replace('2026-10-27', '2026-10-26')), 2],
+  ];
+  for (const [name, seeded, posts] of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-27T19:40:00Z') });
+      try {
+        const orb = controlOrb((call) => emptyWork(call));
+        orb.alerts.push(...seeded);
+        // A fresh plugin process: `digestDay` is empty.
+        const status = await orb.start();
+        await until(() => orb.reads() >= 1);
+        await settle();
+        assert.equal(orb.alerts.length - seeded.length, posts, 'digest messages posted by the fresh process');
+        const state = await digestState(status);
+        assert.deepEqual([state.digestDay, state.digestError], ['2026-10-27', undefined]);
+        // Later sweeps and another reload the same day post nothing more.
+        await orb.start();
+        await advance(2 * sweepMs);
+        assert.equal(orb.alerts.length - seeded.length, posts, 'nothing reposted');
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('MET-403: a failing slack_read posts nothing and records digestError; the digest stays pending and the next sweep posts it once', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-27T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  let failing = true;
+  const orb = controlOrb((name, input) => {
+    if (name === 'slack_read' && input.channelName === 'factory-alerts' && failing) throw new Error('slack_read 503');
+    return emptyWork(name);
+  });
+  const status = await orb.start();
+  await until(() => orb.updates.length === 1);
+  await settle();
+  assert.deepEqual(orb.alerts, [], 'a failed read is not "not yet posted"');
+  let state = await digestState(status);
+  assert.match(state.digestError ?? '', /slack_read 503/);
+  assert.equal(state.digestDay, undefined, 'a failed read is not "delivered"');
+  await advance(sweepMs);
+  assert.deepEqual(orb.alerts, [], 'still failing: still nothing');
+  failing = false;
+  await advance(sweepMs);
+  assert.equal(digestsIn(orb.alerts), 1);
+  assert.match(orb.alerts.at(-1)!, /^ODD digest 2026-10-27 complete id=/);
+  state = await digestState(status);
+  assert.deepEqual([state.digestDay, state.digestError], ['2026-10-27', undefined]);
 });
 
 test('the sweep records a cancellation on the issue before it archives the stale thread', async t => {
