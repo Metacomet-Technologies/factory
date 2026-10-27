@@ -16,5 +16,6 @@
   "sqlite3": "",
   "zstd": "",
   "rsync": "",
-  "xz": ""
+  "xz": "",
+  "ld.lld": ""
 }

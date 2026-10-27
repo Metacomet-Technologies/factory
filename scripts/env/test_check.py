@@ -187,6 +187,21 @@ esac
         self.assertFalse(items["shellcheck"]["ok"])
         self.assertIsNone(items["shellcheck"]["actual"])
 
+    def test_release_linker_is_required_everywhere(self):
+        code, _, items = self.run_check("orb")
+        self.assertEqual(code, 0, [i for i in items.values() if not i["ok"]])
+        self.assertEqual((items["lld"]["expected"], items["lld"]["actual"]),
+                         ("ld.lld on PATH", os.path.join(self.bin, "ld.lld")))
+        del self.outputs["ld.lld"]
+        os.remove(os.path.join(self.bin, "ld.lld"))
+        for env_name in ("orb", "sandbox", "ci", "factory-gpu", "factory-console"):
+            code, report, items = self.run_check(env_name)
+            self.assertEqual(code, 1, env_name)
+            self.assertFalse(report["ok"], env_name)
+            self.assertEqual((items["lld"]["ok"], items["lld"]["required"], items["lld"]["actual"]),
+                             (False, True, None), env_name)
+        self.assertEqual(self.run_check("orb", "--failing"), (1, "lld\tld.lld on PATH\tNone\n"))
+
     def test_vite_plus_shims_resolve_the_pin_without_running(self):
         self.vite_plus_shims(installed=True)
         code, _, items = self.run_check("factory-gpu")

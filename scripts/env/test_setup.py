@@ -308,6 +308,31 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(code, 1, err)
         self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "yq")))
 
+    def test_release_linker_is_installed_only_when_missing(self):
+        self.assertIn("lld", PACKAGES)
+        self.mark(*(f"apt-{p}" for p in PACKAGES if p != "lld"), "rust", "js", "vite-plus")
+        os.makedirs(os.path.join(self.repo, "kiosk", "node_modules"))
+        write(os.path.join(self.base, "bin", "bun"), "#!/bin/sh\necho 1.4.2\n", 0o755)
+        # The orb's ~/.local/bin is already set up, so the only change left is the package.
+        write(os.path.join(self.home, ".profile"), 'export PATH="$PATH:$HOME/.local/bin"\n')
+        os.makedirs(os.path.join(self.home, ".local", "bin"))
+        before = self.tree()
+        code, err, calls = self.run_setup("--env", "orb", "--check-only")
+        self.assertEqual((code, calls), (0, []), err)
+        self.assertEqual(self.tree(), before)
+        self.assertEqual([a for _, a in actions(err)], ["install apt packages: lld"])
+
+        code, err, calls = self.run_setup("--env", "orb")
+        self.assertEqual(code, 0, err)
+        # Without root the calls also pass through the sudo stub; only the installs matter.
+        self.assertEqual([c for c in calls if not c.startswith("sudo ")],
+                         ["apt-get update", "apt-get install --no-install-recommends -y lld"])
+        tree = self.tree()
+        code, err, calls = self.run_setup("--env", "orb")
+        self.assertEqual((code, calls), (0, []), err)
+        self.assertIn("0 change(s)", err)
+        self.assertEqual(self.tree(), tree)
+
     def test_existing_vite_plus_with_older_system_bun_converges(self):
         # The orb image: its own bun 1.3.10 on PATH, then a Vite+ install that saw it
         # and left the bun shim in fallback-bin, behind the system one.

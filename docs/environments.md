@@ -99,7 +99,7 @@ refuses to start, naming each failing item, until the host meets the contract.
 | Package manager | Bun 1.4.2 in `kiosk/` (package manager only; Node stays the runtime) | `kiosk/package.json` `devEngines.packageManager` |
 | Vite+ | `vp` v1.1.0 on PATH in `kiosk/` | `kiosk/package.json` `catalog.vite-plus` |
 | Playwright | an installed Chromium executable (`chromium-*/chrome-linux*/chrome` with `INSTALLATION_COMPLETE`) in Playwright's effective location: `PLAYWRIGHT_BROWSERS_PATH` when set (no fallback), otherwise `~/.cache/ms-playwright`; required where kiosk UI checks run | — |
-| System packages | build-essential (`cc`, `make`), pkg-config, ca-certificates, curl, python3, util-linux (`flock`), bubblewrap (`bwrap`), shellcheck, sqlite3, zstd, rsync, xz-utils (`xz`) | `SYSTEM` in `scripts/env/check` |
+| System packages | build-essential (`cc`, `make`), pkg-config, ca-certificates, curl, python3, util-linux (`flock`), bubblewrap (`bwrap`), shellcheck, sqlite3, zstd, rsync, xz-utils (`xz`), lld (`ld.lld`, the release linker in `scripts/release/build.sh`) | `SYSTEM` in `scripts/env/check` |
 
 System packages are checked by the command each provides, not by package
 manager records. `scripts/dispatch` and `scripts/usage` keep their own
