@@ -51,7 +51,7 @@ import { contextNamesSource, intakeChannel, intakeLookback, intakeEmoji, intakeP
 import { admittedLoad, bindingCandidate, buildEpoch, currentBinding, diagnosedLabel, draftedLine, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, prBindingLine, prOwnsIssue, readerLabel, receiptLabel, reconciles, releasedDraft, roleLabelQueries, spawnRecords, threadState, toSnapshot, verdictPattern, verifiedFor, verifiedLabels, type GitHubPullRequest, type LinearIssue, type LiveThread, type PrBinding, type Reservation, undraftedLine } from '../../scripts/odd/snapshot.ts'
 import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
 import { builderArgs, launch } from '../../scripts/odd/launch.ts'
-import { alertsChannel, blindMs, capsAlertMs, digest, digestDelivered, digestDue, digestHeading, digestLate, digestParts, digestSends, episodeLine, firstParentSince, incidentPageDue, incidentText, incidents, newestRelease, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, postedLate, publisherPage, publisherPagedLine, publisherSnapshot, resolutionText, restoreStatus, sanitizeError, staleReason, staleThreads, stalledWork, sweepMs, type DigestInput, type DigestList, type DigestWait, type Episode, type MainCommit, type Plane, type Publisher, type Run } from '../../scripts/odd/watchdog.ts'
+import { alertsChannel, blindMs, capsAlertMs, digest, digestDelivered, digestDue, digestHeading, digestLate, digestParts, digestSends, episodeLine, firstParentSince, postedText, incidentPageDue, incidentText, incidents, newestRelease, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, postedLate, publisherPage, publisherPagedLine, publisherSnapshot, resolutionText, restoreStatus, sanitizeError, staleReason, staleThreads, stalledWork, sweepMs, type DigestInput, type DigestList, type DigestWait, type Episode, type MainCommit, type Plane, type Publisher, type Run } from '../../scripts/odd/watchdog.ts'
 
 export const description =
 	'Factory ODD control plane: Linear, GitHub and Slack webhooks drive a deterministic outcome lifecycle; role agents run in orbs; Ralph loops are bounded by external checks. See docs/odd/README.md.'
@@ -920,7 +920,7 @@ export default async function (amp: PluginAPI) {
 		if (!text || !sha || watchdog.publisherPaged === sha) return
 		try {
 			const record = publisherPagedLine(sha)
-			const recorded = (await slackMessagesFor(ctx.tools, { operation: 'read_messages', channelName: alertsChannel, lookback: 'P7D', limit: 100, filter: { containsAll: [record] } }, row => typeof row.text === 'string')).some(message => message.text.split('\n').includes(record))
+			const recorded = (await slackMessagesFor(ctx.tools, { operation: 'read_messages', channelName: alertsChannel, lookback: 'P7D', limit: 100, filter: { containsAll: [record] } }, row => typeof row.text === 'string')).some(message => postedText(message.text).split('\n').includes(record))
 			if (recorded) {
 				watchdog.publisherPaged = sha
 				return
@@ -954,7 +954,8 @@ export default async function (amp: PluginAPI) {
 	// The day's digest messages in #factory-alerts. Slack filters each page after the limit, so every page of the last day is read.
 	async function digestMessages(tools: Tools, day: string): Promise<string[]> {
 		// A malformed read is not "no digest yet": that would post the day's digest twice, or count a failed check as healthy.
-		return (await slackMessagesFor(tools, { operation: 'read_messages', channelName: alertsChannel, lookback: 'P1D', limit: 100, filter: { containsAll: [digestHeading(day)] } }, row => typeof row.text === 'string')).map(message => message.text)
+		// Slack wraps each agent post in attribution (postedText); unwrapped, a delivered day's first lines match again.
+		return (await slackMessagesFor(tools, { operation: 'read_messages', channelName: alertsChannel, lookback: 'P1D', limit: 100, filter: { containsAll: [digestHeading(day)] } }, row => typeof row.text === 'string')).map(message => postedText(message.text))
 	}
 
 	// Every page: the sweep must see every issue in the status, not the first 100.

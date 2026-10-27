@@ -153,6 +153,16 @@ export function digestParts(text: string, day: string, max = slackMessageMax): s
   }
 }
 
+/**
+ * A message's text as posted. slack_read returns an agent's post wrapped in attribution, as observed
+ * in #factory-alerts on 2026-10-27: `(Reply from @Amp Agent on Slack) ODD digest … complete id=…`
+ * and a last line `from @U…’s thread Factory Control Plane (https://ampcode.com/threads/…)`. Unwrapped,
+ * a digest's first line is its identity again (MET-403).
+ */
+export function postedText(text: string): string {
+  return text.replace(/^\(Reply from [^)\n]*\) /, '').replace(/\nfrom @[^\n]*['’]s thread [^\n]*$/, '');
+}
+
 /** True when the channel holds the day's completion line, or a digest from before part identities (its first line is the bare heading). */
 export function digestDelivered(day: string, posted: readonly string[]): boolean {
   const heading = digestHeading(day);
