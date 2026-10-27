@@ -403,17 +403,21 @@ export default async function (amp: PluginAPI) {
 	// Linear nor the PR head, so after a spawn, and while the owner is still running, the issue
 	// is re-evaluated after a delay until the owner is idle. A failed evaluation may change
 	// nothing that raises another event (a Bug lookup failing before the status change), so it is
-	// re-evaluated too, with backoff, up to `failureRechecks` times. One pending re-check per issue.
+	// re-evaluated too, with backoff, up to `failureRechecks` times. One pending re-check per issue;
+	// a sooner one replaces a later one, so a merge's immediate re-check is not held behind a backoff.
 	const recheckMs = 90_000
 	const failureRechecks = 5
-	const rechecks = new Map<string, ReturnType<typeof setTimeout>>()
+	const rechecks = new Map<string, { timer: ReturnType<typeof setTimeout>; due: number }>()
 	const failures = new Map<string, number>()
 	const recheck = (ctx: EvalContext, state: ArmState, identifier: string, delayMs: number) => {
-		if (rechecks.has(identifier)) return
-		rechecks.set(identifier, setTimeout(() => {
+		const due = Date.now() + delayMs
+		const pending = rechecks.get(identifier)
+		if (pending && pending.due <= due) return
+		if (pending) clearTimeout(pending.timer)
+		rechecks.set(identifier, { due, timer: setTimeout(() => {
 			rechecks.delete(identifier)
 			void evaluate(ctx, state, 'recheck', identifier, new Date().toISOString())
-		}, delayMs))
+		}, delayMs) })
 	}
 	// Linear sends several webhooks for one change and `find_thread` indexes a new thread with a
 	// lag, so evaluations of one issue run one at a time, and every spawn is recorded on the issue
@@ -432,7 +436,7 @@ export default async function (amp: PluginAPI) {
 		let performing = false
 		let issue: IssueSnapshot | undefined
 		try {
-			const derived = await snapshotFor(ctx, identifier)
+			const derived = await snapshotFor(ctx, identifier, merged.get(identifier))
 			const { threads, comments } = derived
 			issue = derived.snapshot
 			loadEpisodes(state, issue.identifier, comments)
@@ -1047,7 +1051,7 @@ export default async function (amp: PluginAPI) {
 				return true
 			}
 			case 'merge': {
-				const refusal = await merge(ctx, state, issue, action.pr, action.sha)
+				const refusal = await merge(ctx, state, issue, action.pr, action.sha, comments)
 				if (refusal) {
 					const failure = failureKey(issue, action)
 					touched.add(failure.key)
@@ -1090,8 +1094,13 @@ export default async function (amp: PluginAPI) {
 	// CI by a minute or so (MET-280's PR #182), so the issue is re-checked instead of waiting for
 	// a webhook that nothing will send.
 	const refused = new Set<string>()
+	/** The PR this process merged per issue, read by number while GitHub's merged search has not indexed it (P4.6-recheck). */
+	const merged = new Map<string, number>()
 	// Every refusal and failed merge at one head counts toward that head's failure episode, which pages at the third attempt.
-	async function merge(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, pr: number, sha: string): Promise<string | undefined> {
+	// A durable receipt for this head means the merge happened; a PR read still showing it open is lag, never a second merge.
+	// Once the receipt is written the issue is re-evaluated at once, so it moves to Deploying without a webhook or the sweep.
+	async function merge(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, pr: number, sha: string, comments: readonly Comment[]): Promise<string | undefined> {
+		if (comments.some(comment => comment.body.startsWith(`odd-merge pr=${pr} head=${sha} `))) throw new ReadError(`PR #${pr} has a merge receipt at ${sha} but still reads open; waiting for GitHub to catch up`)
 		const draft = await shellRead(ctx.$`gh pr view ${String(pr)} --json isDraft --jq .isDraft`, `gh pr view ${pr} --json isDraft`)
 		if (draft.exitCode !== 0) throw new ReadError(`gh pr view ${pr} --json isDraft failed: ${draft.stderr.trim()}`)
 		const isDraft = draft.stdout.trim()
@@ -1113,8 +1122,8 @@ export default async function (amp: PluginAPI) {
 			recheck(ctx, state, issue.identifier, recheckMs)
 			return cause
 		}
-		const merged = await ctx.$`gh pr merge ${String(pr)} --squash --match-head-commit ${sha}`
-		if (merged.exitCode !== 0) throw new Error(`gh pr merge ${pr} at ${sha} failed: ${merged.stderr.trim()}`)
+		const result = await ctx.$`gh pr merge ${String(pr)} --squash --match-head-commit ${sha}`
+		if (result.exitCode !== 0) throw new Error(`gh pr merge ${pr} at ${sha} failed: ${result.stderr.trim()}`)
 		// The receipt needs the merge commit. The merge has happened, so a failed confirmation is a failed read, not a
 		// receipt with `merge=unknown`: the next evaluation finds the PR merged and posts the receipt once (receiptMerge).
 		const view = await shellRead(ctx.$`gh pr view ${String(pr)} --json mergeCommit --jq .mergeCommit.oid`, `gh pr view ${pr} --json mergeCommit`)
@@ -1122,6 +1131,8 @@ export default async function (amp: PluginAPI) {
 		if (view.exitCode !== 0 || !sha40(mergeSha)) throw new ReadError(`PR #${pr} merged at ${sha}, but its merge commit was not read (${view.exitCode !== 0 ? view.stderr.trim() : `got ${JSON.stringify(mergeSha.slice(0, 60))}`}); the merge receipt waits for the next evaluation`)
 		await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: mergeReceipt(pr, sha, mergeSha) })
 		ctx.logger.log(marker, 'merged', issue.identifier, pr, sha, mergeSha)
+		merged.set(issue.identifier, pr)
+		recheck(ctx, state, issue.identifier, 0)
 		return undefined
 	}
 
@@ -1432,12 +1443,15 @@ type Comment = { id?: string; body: string; createdAt?: string }
 
 // A thread an `odd-spawn` record binds is read by its ID, so search lag (or a plugin reload) never
 // hides it; one whose labels did not land carries its record's role labels.
-async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
-	const [issue, comments, pr] = await Promise.all([
+async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, merged?: number): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
+	const [issue, comments, found] = await Promise.all([
 		getIssue(ctx.tools, { id: identifier, includeRelations: true }),
 		listComments(ctx.tools, identifier),
 		pullRequestFor(ctx, identifier),
 	])
+	// A just-merged PR is missing from the merged search until GitHub indexes it, so the re-check right after a merge
+	// reads the PR `merged` (this process's merge) by number instead of deriving "no PR" (P4.6-recheck).
+	const pr = found ?? (merged === undefined ? undefined : await viewPullRequest(ctx, identifier, merged, 'merged'))
 	const bound = new Map(spawnRecords(comments).flatMap(record => (record.thread ? [[record.thread, record] as const] : [])))
 	const threads = (await threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, [...bound.keys()])).map(thread => {
 		const record = bound.get(thread.id)
@@ -1552,13 +1566,17 @@ async function ownedPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifie
 	if (!Array.isArray(listed) || listed.some(pr => typeof pr?.number !== 'number' || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string')) throw new ReadError(`${command} returned a malformed PR list`)
 	if (listed.length >= prListLimit) throw new ReadError(`${command} filled its ${prListLimit} limit; PRs past it are unread`)
 	const owned = (listed as GitHubPullRequest[]).find(pr => prOwnsIssue(pr, identifier))
-	if (!owned) return undefined
-	const pr = await ghJson(ctx.$`gh pr view ${String(owned.number)} --json ${prFields}`, `gh pr view ${owned.number}`) as GitHubPullRequest | null
+	return owned && viewPullRequest(ctx, identifier, owned.number, state)
+}
+
+/** One owned PR read in full by number, validated to be in `state`; anything else is a failed read. */
+async function viewPullRequest(ctx: Pick<WebhookHandlerContext, '$'>, identifier: string, number: number, state: 'merged' | 'open'): Promise<GitHubPullRequest> {
+	const pr = await ghJson(ctx.$`gh pr view ${String(number)} --json ${prFields}`, `gh pr view ${number}`) as GitHubPullRequest | null
 	// A merged PR's merge time is the durable start of its receipt wait, so it must be a usable timestamp.
 	const merged = state === 'merged' ? isRow(pr?.mergeCommit) && sha40(pr.mergeCommit.oid) && timestamp(pr.mergedAt) : pr?.mergedAt === null || pr?.mergedAt === undefined || timestamp(pr.mergedAt)
-	if (!isRow(pr) || pr.number !== owned.number || pr.state !== state.toUpperCase() || !sha40(pr.headRefOid) || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string' || !optional(pr, 'mergeable', 'string')
+	if (!isRow(pr) || pr.number !== number || pr.state !== state.toUpperCase() || !sha40(pr.headRefOid) || typeof pr.headRefName !== 'string' || typeof pr.body !== 'string' || !optional(pr, 'mergeable', 'string')
 		|| !merged || !Array.isArray(pr.statusCheckRollup) || !pr.statusCheckRollup.every(checkRecord) || !prOwnsIssue(pr, identifier)) {
-		throw new ReadError(`gh pr view ${owned.number} returned malformed or changed details for ${state} ${identifier}`)
+		throw new ReadError(`gh pr view ${number} returned malformed or changed details for ${state} ${identifier}`)
 	}
 	const head = await shellRead(ctx.$`gh api ${`repos/{owner}/{repo}/commits/${pr.headRefOid}`} --jq .commit.committer.date`, `gh api head commit ${pr.headRefOid}`)
 	if (head.exitCode !== 0) throw new ReadError(`gh api head commit ${pr.headRefOid} failed: ${head.stderr.trim()}`)
