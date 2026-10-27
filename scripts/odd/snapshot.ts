@@ -111,7 +111,9 @@ export function trustedComments<T extends AuthoredComment>(comments: readonly T[
     const keep = author === identity.deployer ? (line: string) => receiptLinePattern.test(line)
       : author === identity.plane ? (line: string) => !receiptLinePattern.test(line) || Date.parse(comment.createdAt ?? '') < since
         : undefined;
-    return keep ? [{ ...comment, body: comment.body.split('\n').filter(keep).join('\n') }] : [];
+    // Split on every terminator the markers' /m parsers treat as a line end (LF, CR, U+2028, U+2029),
+    // so no line hides a marker behind a separator the filter would not see.
+    return keep ? [{ ...comment, body: comment.body.split(/\r\n|[\n\r\u2028\u2029]/).filter(keep).join('\n') }] : [];
   });
 }
 

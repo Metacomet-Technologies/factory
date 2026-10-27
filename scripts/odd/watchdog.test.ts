@@ -3933,7 +3933,7 @@ test('MET-338: role agents get only their own role tool; none creates, messages 
   t.after(() => mock.timers.reset());
   const plant = factory();
   await plant.start();
-  const editing = ['apply_patch', 'edit_file', 'create_file', 'Task'];
+  const editing = ['apply_patch', 'edit_file', 'create_file'];
   const own: Record<string, string | undefined> = { reviewer: 'odd_verdict', verifier: 'odd_verify' };
   for (const role of ['intake', 'spec', 'builder', 'reviewer', 'verifier', 'deployer']) {
     const grants = plant.agents().filter(agent => agent.instructions?.includes(`skill \`odd-${role}\``)).map(agent => agent.tools ?? {});
@@ -3948,9 +3948,15 @@ test('MET-338: role agents get only their own role tool; none creates, messages 
       for (const tool of editing) assert.ok(['reviewer', 'verifier', 'deployer'].includes(role) ? denied(tool) : !exclude.includes(tool), `${role} ${tool}`);
       assert.ok(!exclude.includes('shell_command'), `${role} keeps the shell for Evidence`);
       assert.ok(role === 'intake' ? granted('slack_write') : !add.includes('slack_write'), `${role} slack_write`);
-      // MET-339: the Linear connection is the plane's marker writer; a role comments as the Amp app.
-      for (const tool of ['mcp__linear__save_comment', 'mcp__linear__delete_comment']) assert.ok(denied(tool), `${role} excludes ${tool}`);
-      assert.ok(granted('comment_on_linear_issue'), `${role} comments as the Amp app`);
+      // MET-339: the effective boundary under the plugin API's rules (glob names; the default list
+      // inherits every external MCP tool; `exclude` always wins). No route to the plane's Linear
+      // identity remains: its comment tools, the Metacomet portal that fronts it, or a Task subagent.
+      const glob = (pattern: string, tool: string) => new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replaceAll('*', '.*')}$`).test(tool);
+      const effective = (tool: string) => (tool.startsWith('mcp__') || add.some(pattern => glob(pattern, tool))) && !exclude.some(pattern => glob(pattern, tool));
+      for (const tool of ['mcp__linear__save_comment', 'mcp__linear__delete_comment', 'mcp__metacomet__portal_codemode_execute', 'mcp__metacomet__portal_codemode_search', 'mcp__metacomet__portal_toggle_servers', 'Task']) {
+        assert.ok(!effective(tool), `${role} has no ${tool}`);
+      }
+      for (const tool of ['comment_on_linear_issue', 'mcp__linear__get_issue', 'mcp__linear__list_comments', 'mcp__linear__save_issue']) assert.ok(effective(tool), `${role} keeps ${tool}`);
     }
   }
 

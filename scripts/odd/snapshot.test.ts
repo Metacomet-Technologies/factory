@@ -758,3 +758,24 @@ test('MET-339: with the identity active, the snapshot ignores forged, human-auth
   assert.equal(open.escalation?.reason, 'budget-ceiling');
   assert.equal(open.spawns.length, 2);
 });
+
+test('MET-339: the author filter splits lines exactly where the marker parsers do, so CR, CRLF, U+2028 and U+2029 hide no marker in either direction', () => {
+  const identity = { plane: '00000000-0000-4000-8000-0000000000aa', deployer: '00000000-0000-4000-8000-0000000000bb', since: '2026-10-26T00:00:00.000Z' };
+  const sha = 'a'.repeat(40);
+  const receipt = `odd-deploy host=factory-gpu component=kiosk sha=${sha} health=pass rollback=none`;
+  const verify = `odd-verify sha=${sha} result=pass bug=none`;
+  const idle = { orbs: 0, runnerSlots: 0, buildIssues: 0 };
+  const derive = (comments: { author: { id: string }; createdAt: string; body: string }[]) =>
+    toSnapshot({ issue: { id: 'MET-1', status: 'Deploying', labels: ['odd'], comments: trustedComments(comments, identity) } });
+  for (const separator of ['\n', '\r', '\r\n', '\u2028', '\u2029']) {
+    const name = JSON.stringify(separator);
+    // A deployer comment smuggling the plane's verification after its receipt: the receipt counts, the verification does not.
+    const smuggled = derive([{ author: { id: identity.deployer }, createdAt: '2026-10-27T00:00:00.000Z', body: `${receipt}${separator}${verify}` }]);
+    assert.equal(smuggled.deployReceipt?.sha, sha, name);
+    assert.equal(smuggled.verify, undefined, name);
+    assert.equal(nextAction(smuggled, idle).kind, 'spawn', `${name}: the receipt still needs its verifier, never Done`);
+    // A post-activation plane comment smuggling a receipt after other text: no receipt counts.
+    const planeReceipt = derive([{ author: { id: identity.plane }, createdAt: '2026-10-27T00:00:00.000Z', body: `diagnosis${separator}${receipt}` }]);
+    assert.equal(planeReceipt.deployReceipt, undefined, name);
+  }
+});

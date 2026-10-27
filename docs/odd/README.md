@@ -715,10 +715,11 @@ the separation holds:
 | Writer | Principal | Writes |
 | --- | --- | --- |
 | Plane (control orb plugin) | Devon's Linear connection (`linear.save_comment`, `linear.save_issue`); user `3017c6e0-5bc4-4cf6-9a39-1a8d5ca74fc0` | Every lifecycle marker except receipts: `odd-spawn`, `odd-merge`, `odd-verify`, `odd-escalated`, `odd-resume`, `odd-watchdog`, `odd-budget`, `odd-steer`, `odd-pr`, `odd-drafted`, episodes |
-| Role agents (plugin modes) | The Amp Linear app, through `comment_on_linear_issue`. Role grants exclude `mcp__linear__save_comment` and `mcp__linear__delete_comment` | Evidence and diagnoses; never a marker the plane accepts |
+| Role agents (plugin modes) | The Amp Linear app, through `comment_on_linear_issue`. Role grants exclude `mcp__linear__save_comment`, `mcp__linear__delete_comment`, the Metacomet portal (`mcp__metacomet__*`, a generic executor that fronts the same Linear user) and `Task` (a subagent gets the owner's MCP servers) | Evidence and diagnoses; never a marker the plane accepts |
+| Claude Code builder | Unresolved: launched by `amp -ox` under the owner's account, it has the plane's Linear connection (see below) | PR evidence comments |
 | Host deployer (`scripts/odd/deploy.ts`) | Linear OAuth app "ODD Deployer" (client credentials, actor=app); app user `9b96bc7d-30b6-433f-8dab-5c62b82ee92a` | `odd-deploy` receipts only |
 | GitHub merges | Devon's existing `gh` auth (accepted exception, `mergedBy` DGarbs51) | Merges |
-| Slack pages and alerts | The Amp bot (`slack_write` with `postAs: "bot"`) once the identity is activated | Pages, alerts, digest |
+| Slack pages and alerts | The Amp bot (`slack_write` with `postAs: "bot"`), from merge on | Pages, alerts, digest |
 
 The activated identity is one line, `plane=<uuid> deployer=<uuid>
 since=<ISO-8601 with ms>Z`, in the `metacomet/factory` project environment
@@ -740,30 +741,35 @@ receipt an issue loses this way (a hand or forged one) is reposted by the
 deployer's reconcile on its next tick, when the proven release contains the
 merge (`docs/release.md`).
 
-Activation checklist. Devon or the coordinator runs these steps in order;
-a Builder never does.
+Provisioning, acceptance and activation. Devon or the coordinator runs these
+steps in order; a Builder never does. Enforcement is activated only after
+Devon's acceptance, and only after the builder gap below is closed.
 
 1. Done 2026-10-27: Devon created the ODD Deployer app and recorded its app
    user ID on MET-339.
-2. Merge MET-339 and let the deploy tools advance to its release. Nothing
-   changes yet.
-3. Devon installs `/etc/factory-dispatch/odd-deployer-oauth.json`
+2. Before merge: invite the Amp bot to `#factory-alerts`. From merge on, every
+   plane Slack write uses `postAs: "bot"`, which never falls back to Devon's
+   user token, so the bot must already be a member.
+3. Merge MET-339 and let the deploy tools advance to its release. Nothing is
+   enforced yet.
+4. Devon installs `/etc/factory-dispatch/odd-deployer-oauth.json`
    (`{"client_id":"...","client_secret":"..."}`, root-owned, readable by
    `agent` only) on factory-gpu. From the next tick the deployer requests a
    fresh client-credentials token each run (scope `read,write`, never
-   persisted) and writes receipts as ODD Deployer. Check that the next
-   receipt's `list_comments` author ID is the deployer's.
-4. Invite the Amp bot to `#factory-alerts`. An explicit `postAs` never falls
-   back to Devon's user token.
-5. Pick `since`: the current time, after step 3's first deployer receipt.
-   Write the line to `/etc/factory-dispatch/odd-identity` on the host and to
-   `ODD_IDENTITY` on the project, then run `amp orb restart-processes` on
-   the control orb (a plugin reload alone does not read new environment).
-   Both writers already use their final principals, so the order does not
-   matter and in-flight issues keep their markers.
-6. Acceptance (MET-339 Done means 2): Devon records the principal IDs and
-   the observed authors of normal writes (an `odd-spawn`, an `odd-deploy`, a
-   merge's `mergedBy`, a Slack page) on MET-339. No log shows a secret.
+   persisted) and writes receipts as ODD Deployer.
+5. Observe normal writes with enforcement still off: an `odd-spawn` authored
+   by the plane ID, the next `odd-deploy` authored by the deployer ID (its
+   `list_comments` author ID), a merge's `mergedBy`, and a Slack page or
+   alert posted by the bot. No log shows a secret.
+6. Acceptance (MET-339 Done means 2): Devon records on MET-339 the principal
+   IDs and the authors observed in step 5.
+7. Only then activate. Pick `since`: the current time, which is after step
+   4's first deployer receipt. Write the line to
+   `/etc/factory-dispatch/odd-identity` on the host and to `ODD_IDENTITY` on
+   the project, then run `amp orb restart-processes` on the control orb (a
+   plugin reload alone does not read new environment). Both writers already
+   use their final principals, so the order does not matter and in-flight
+   issues keep their markers.
 
 To deactivate, remove both values; every author counts again. To change the
 deployer principal, install the new credential and update both identity
@@ -771,12 +777,19 @@ lines together: receipts lost in the change are reposted by reconcile. To
 change the plane principal, drain every `odd` issue out of In Progress, In
 Review and Deploying first, because markers from the old ID stop counting.
 
-Residual risks, accepted by Devon or tracked: any comment written as Devon
-(coordinator or hand comments) counts as a plane marker. Claude Code
-builders run through the CLI with the owner's MCP connections, so plugin
-role grants do not reach them (MET-407). The legacy dispatcher keeps
+Open: the Claude Code builder. The plane launches it with `amp -ox` under
+Devon's Amp account, so it inherits Devon's remote Linear MCP connection,
+the plane's marker-writer principal. No launch flag removes a remote MCP
+server, and `amp.tools.disable` does not apply to remote MCP definitions, so
+nothing inside this issue's Isolation separates them. Closing it needs a
+decision recorded on MET-339: move the plane's marker writes to a credential
+the builder's account does not hold, or launch builders under an account
+without Devon's Linear connection. Do not activate enforcement until then.
+
+Residual risks accepted by Devon: any comment written as Devon (coordinator
+or hand comments) counts as a plane marker. The legacy dispatcher keeps
 Devon's key on the host and writes no ODD lifecycle markers. Tool grants are
-not an OS sandbox.
+not an OS sandbox: a role's shell runs under the same Amp account.
 
 What stays in `scripts/dispatch/`: the launcher (`amp -x` construction,
 worktrees, caps), `qa.ts check` and merge, the ledger as the backstop's cache,
