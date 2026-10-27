@@ -1,7 +1,7 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, slackMessages, staleThreads, sweepMs, staleMs, type DigestInput, type Episode } from './watchdog.ts';
-import { deployReceiptLine, heartbeatLine, parseHeartbeat, verifyLine } from './lifecycle.ts';
+import { controlPlaneSilent, deployReceiptLine, heartbeatLine, parseHeartbeat, silenceMs, verifyLine } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
 import { receiptLabel, type LiveThread } from './snapshot.ts';
 import plugin, { followUp } from '../../.amp/plugins/factory-odd.ts';
@@ -311,6 +311,192 @@ test('P3.6: a heartbeat write that keeps failing pages control-plane-blind once,
   await until(() => heartbeats === 4);
   await settle();
   assert.equal(orb.dms.length, 1, 'one page per episode');
+});
+
+// MET-385: the error Amp's get_thread_status rejects with when its open-dialog read times out under load.
+const dialogTimeout = () => Promise.reject(new Error('Could not read whether the thread is blocked on a question for the user: Timed out reading the thread\'s open dialogs after 10000ms. Retry get_thread_status.'));
+const statusEnvelope = { isError: true, content: [{ type: 'text', text: 'Timed out reading the thread\'s open dialogs after 10000ms. Retry get_thread_status.' }] };
+/** Resolves `answer()` only after every read already in flight has settled: a late, reordered result. */
+const late = async (answer: () => unknown) => { for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve)); return answer(); };
+type Watchdog = { sweptAt?: string; error?: string; blindSince?: string; paged?: boolean };
+
+/**
+ * MET-385: Builders T-1 and T-2 hold finished issues MET-1 and MET-2, so an evaluation that reads them archives each.
+ * `t2(n)` may answer T-2's nth get_thread_status read; undefined keeps the valid status. `extra` may answer any other call first.
+ */
+function flakyPlane(t2: (read: number) => unknown, extra: (name: string, input: Record<string, unknown>) => unknown = () => undefined) {
+  let reads = 0;
+  const archived: string[] = [];
+  const orb = controlOrb((name, input) => {
+    const answered = extra(name, input);
+    if (answered !== undefined) return answered;
+    switch (name) {
+      case 'linear.list_issues': return { issues: [], hasNextPage: false, cursor: '' };
+      case 'find_thread': {
+        const query = String(input.query);
+        return { threads: ['1', '2'].filter(n => query === 'label:odd-role-builder archived:false' || query === `label:odd-issue-met-${n} archived:false`).map(n => ({ id: `T-${n}` })) };
+      }
+      case 'get_thread_status': return input.thread === 'T-2' ? t2(++reads) : undefined;
+      case 'update_thread': archived.push(String(input.thread)); return {};
+      default: return undefined;
+    }
+  });
+  const watchdog = async (status: Awaited<ReturnType<typeof orb.start>>) => ((await status({})) as unknown as { watchdog: Watchdog }).watchdog;
+  return { ...orb, archived, watchdog };
+}
+
+test('MET-385: a get_thread_status rejection that a retry answers leaves the sweep whole: every thread is acted on and the heartbeat persists', async t => {
+  const cases: [string, (read: number) => unknown][] = [
+    ['healthy control', () => undefined],
+    ['one timeout at role enumeration', read => (read === 1 ? dialogTimeout() : undefined)],
+    ['one timeout during an issue evaluation', read => (read === 2 ? dialogTimeout() : undefined)],
+    ['two timeouts in a row on one read', read => (read <= 2 ? dialogTimeout() : undefined)],
+    ['timeouts on two different reads', read => (read === 1 || read === 3 ? dialogTimeout() : undefined)],
+    ['an MCP error envelope once', read => (read === 1 ? statusEnvelope : undefined)],
+    ['a late timeout, then a late valid answer', read => (read === 1 ? late(dialogTimeout) : read === 2 ? late(() => undefined) : undefined)],
+  ];
+  for (const [name, t2] of cases) {
+    await t.test(name, async () => {
+      mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+      try {
+        const orb = flakyPlane(t2);
+        const status = await orb.start();
+        await until(() => orb.updates.length === 1);
+        await settle();
+        assert.deepEqual(orb.updates.map(update => update.body), [heartbeatLine('2026-10-24T15:00:00.000Z')], 'one row, this sweep');
+        assert.deepEqual([...orb.archived].sort(), ['T-1', 'T-2'], 'both finished threads are archived on complete reads');
+        const watchdog = await orb.watchdog(status);
+        assert.equal(watchdog.error, undefined);
+        assert.equal(watchdog.blindSince, undefined);
+      } finally {
+        mock.timers.reset();
+      }
+    });
+  }
+});
+
+test('MET-385: a status read that keeps failing withholds the heartbeat and every effect resting on it; the next wholly successful scheduled sweep updates the same row and ends blindness', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  let mode: 'ok' | 'timeout' | 'timeout-once' | 'malformed-then-valid' = 'ok';
+  let malformed = false;
+  let writeFails = false;
+  const orb = flakyPlane(() => {
+    if (mode === 'timeout') return new Promise((_, reject) => setTimeout(() => dialogTimeout().catch(reject), 10_000));
+    if (mode === 'timeout-once') { mode = 'ok'; return dialogTimeout(); }
+    if (mode === 'malformed-then-valid' && !malformed) { malformed = true; return { metadata: { labels: ['odd-issue-met-2', 'odd-role-builder', 'odd-round-1'] } }; }
+    return undefined;
+  }, name => (name === 'linear.save_status_update' && writeFails ? Promise.reject(new Error('Linear 500')) : undefined));
+  const status = await orb.start();
+  await until(() => orb.updates.length === 1);
+  await settle();
+  const [{ id }] = orb.updates;
+  const body = (at: string) => assert.deepEqual(orb.updates, [{ id, body: heartbeatLine(at) }], `the one row holds ${at}`);
+  body('2026-10-24T15:00:00.000Z');
+  const archives = orb.archived.length;
+
+  // 15:10 and 15:20: T-2 times out on every attempt, each after Amp's 10 s. The enumeration is incomplete: nothing is
+  // evaluated, archived or written. The failed sweep releases its exclusion, so the next scheduled sweep still runs.
+  mode = 'timeout';
+  await advance(sweepMs + 60_000, 5_000);
+  let watchdog = await orb.watchdog(status);
+  assert.equal(watchdog.sweptAt, '2026-10-24T15:10:00.000Z');
+  assert.match(watchdog.error ?? '', /Timed out reading the thread's open dialogs/);
+  assert.equal(watchdog.blindSince, '2026-10-24T15:10:00.000Z');
+  await advance(sweepMs, 5_000);
+  watchdog = await orb.watchdog(status);
+  assert.equal(watchdog.sweptAt, '2026-10-24T15:20:00.000Z', 'the 15:20 sweep ran: no sweep is left holding the exclusion');
+  assert.match(watchdog.error ?? '', /Timed out reading the thread's open dialogs/);
+  assert.equal(watchdog.blindSince, '2026-10-24T15:10:00.000Z', 'the episode continues');
+  assert.equal(orb.archived.length, archives, 'no archive on an incomplete read');
+  assert.deepEqual(orb.dms, [], 'no page 10 minutes into the episode');
+  body('2026-10-24T15:00:00.000Z');
+  const persisted = Date.parse(parseHeartbeat(orb.updates[0].body)!);
+  assert.equal(controlPlaneSilent([orb.updates[0].body], persisted + silenceMs - 1), false, 'the backstop skips 1 ms before 20 minutes');
+  assert.equal(controlPlaneSilent([orb.updates[0].body], persisted + silenceMs), true, 'and resumes at exactly 20 minutes');
+  assert.equal(controlPlaneSilent([orb.updates[0].body], persisted + silenceMs + 1), true);
+  assert.equal(controlPlaneSilent([], persisted), true, 'and when the row is missing');
+
+  // 15:30: a malformed status is not retried into a valid one; the sweep fails again, and 20 minutes blind pages once.
+  mode = 'malformed-then-valid';
+  await advance(sweepMs, 5_000);
+  await until(() => malformed && orb.dms.length === 1);
+  await settle();
+  watchdog = await orb.watchdog(status);
+  assert.match(watchdog.error ?? '', /get_thread_status T-2 returned no labels or agent state/);
+  assert.match(orb.dms[0], /control-plane-blind \| .*every sweep since 2026-10-24T15:10:00\.000Z failed/);
+  assert.equal(orb.archived.length, archives);
+  body('2026-10-24T15:00:00.000Z');
+
+  // 15:40: one timeout that a retry answers, but the heartbeat write fails. No false recovery.
+  mode = 'timeout-once';
+  writeFails = true;
+  await advance(sweepMs, 5_000);
+  await until(() => mode === 'ok');
+  await settle();
+  watchdog = await orb.watchdog(status);
+  assert.match(watchdog.error ?? '', /Linear 500/);
+  assert.equal(watchdog.blindSince, '2026-10-24T15:10:00.000Z');
+  assert.equal(watchdog.paged, true);
+  body('2026-10-24T15:00:00.000Z');
+
+  // 15:50: every read and the write succeed. The same row advances; blindness ends without a reload.
+  writeFails = false;
+  await advance(sweepMs, 5_000);
+  await until(() => orb.updates[0].body.includes('15:50'));
+  await settle();
+  body('2026-10-24T15:50:00.000Z');
+  watchdog = await orb.watchdog(status);
+  assert.equal(watchdog.error, undefined);
+  assert.equal(watchdog.blindSince, undefined);
+  assert.equal(watchdog.paged, false);
+  assert.equal(controlPlaneSilent([orb.updates[0].body], Date.now()), false, 'the recovered row is fresh to the backstop');
+  assert.equal(orb.dms.length, 1, 'one page per episode');
+});
+
+test('MET-385: after a reload the existing heartbeat row is found on a later page; a failing later page or a status timeout creates no second row, and recovery updates the same row', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  let pageTwo: 'fails' | 'ok' = 'fails';
+  let lookups = 0;
+  const orb = flakyPlane(() => (Date.now() < Date.parse('2026-10-24T15:10:00Z') ? dialogTimeout() : undefined), (name, input) => {
+    if (name !== 'linear.get_status_updates') return undefined;
+    lookups += 1;
+    // Newest first: other project updates fill page 1; the heartbeat row is on page 2, after an older unrelated row.
+    if (!input.cursor) return { statusUpdates: [{ id: 'weekly-2', body: 'weekly update' }, { id: 'weekly-1', body: 'kickoff' }], hasNextPage: true, cursor: 'p2' };
+    if (pageTwo === 'fails') return Promise.reject(new Error('Linear 502'));
+    return { statusUpdates: [{ id: 'old', body: 'notes' }, ...orb.updates], hasNextPage: false, cursor: '' };
+  });
+  // The row the previous plugin load wrote; this load has forgotten its id.
+  orb.updates.push({ id: 'row-1', body: heartbeatLine('2026-10-24T14:50:00.000Z') });
+  const status = await orb.start();
+  // 15:00: the first enumeration read of T-2 times out on every attempt; nothing is looked up or written.
+  await settle();
+  assert.equal(lookups, 0, 'a failed derivation never reaches the heartbeat lookup');
+  assert.match((await orb.watchdog(status)).error ?? '', /Timed out reading the thread's open dialogs/);
+  // 15:10: every read succeeds but the lookup's second page fails: no new row and no recovery.
+  mock.timers.tick(sweepMs);
+  await until(() => lookups >= 2);
+  await settle();
+  assert.deepEqual(orb.updates, [{ id: 'row-1', body: heartbeatLine('2026-10-24T14:50:00.000Z') }]);
+  let watchdog = await orb.watchdog(status);
+  assert.match(watchdog.error ?? '', /Linear 502/);
+  assert.equal(watchdog.blindSince, '2026-10-24T15:00:00.000Z');
+  // 15:20: the lookup reaches page 2 and updates the same row.
+  pageTwo = 'ok';
+  mock.timers.tick(sweepMs);
+  await until(() => orb.updates[0].body.includes('15:20'));
+  await settle();
+  assert.deepEqual(orb.updates, [{ id: 'row-1', body: heartbeatLine('2026-10-24T15:20:00.000Z') }]);
+  watchdog = await orb.watchdog(status);
+  assert.equal(watchdog.error, undefined);
+  assert.equal(watchdog.blindSince, undefined);
+  // 15:30: the id is kept; the row advances again without another lookup.
+  const looked = lookups;
+  mock.timers.tick(sweepMs);
+  await until(() => orb.updates[0].body.includes('15:30'));
+  assert.deepEqual(orb.updates, [{ id: 'row-1', body: heartbeatLine('2026-10-24T15:30:00.000Z') }]);
+  assert.equal(lookups, looked);
 });
 
 test('P3.6: a partially failed arm keeps its error, and arm: true retries it with one timer per purpose', async t => {
@@ -814,6 +1000,12 @@ test('P3.7: a failed, malformed or truncated read is never missing work: no canc
     { name: 'get_issue without labels', error: /linear\.get_issue MET-7 returned a malformed issue/, setup: plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, labels: undefined, relations: { blockedBy: [] } } : undefined; } },
     { name: 'a blocker without an id', error: /linear\.get_issue MET-7 returned a malformed issue/, setup: plant => { plant.control.inject = (name, input) => name === 'linear.get_issue' ? { ...plant.issues.get(String(input.id))!, relations: { blockedBy: [{}] } } : undefined; } },
     { name: 'a thread search row without an id', error: /find_thread returned a malformed threads row at 0/, setup: plant => { plant.control.inject = name => name === 'find_thread' ? { threads: [{ updatedAt: '2026-10-26T14:30:00.000Z' }] } : undefined; } },
+    // MET-385: a status read that times out on every attempt, or returns an MCP error each time, is not idleness either.
+    { name: 'thread status that times out on every attempt', error: /Timed out reading the thread's open dialogs after 10000ms/, setup: plant => {
+      plant.threads.get('T-MET-7')!.state = 'running';
+      plant.prs.length = 0;
+      plant.control.inject = (name, input) => name === 'get_thread_status' && input.thread === 'T-MET-7' ? dialogTimeout() : undefined; } },
+    { name: 'thread status that is an MCP error on every attempt', error: /get_thread_status returned an error: Timed out/, setup: plant => { plant.control.inject = (name, input) => name === 'get_thread_status' && input.thread === 'T-MET-7' ? statusEnvelope : undefined; } },
     { name: 'thread labels that are not strings', error: /get_thread_status T-MET-7 returned no labels or agent state/, setup: plant => { plant.control.inject = (name, input) => name === 'get_thread_status' && input.thread === 'T-MET-7' ? { metadata: { labels: [null], archived: false }, agentState: { state: 'idle' } } : undefined; } },
     { name: 'a merged PR without its merge commit', error: /gh pr view 7 returned malformed or changed details for merged MET-7/, guard: /malformed or changed details for merged/, setup: plant => { plant.prs[0] = { ...plant.prs[0], state: 'MERGED', mergeCommit: null, mergedAt: '2026-10-26T14:00:00Z' }; } },
     // Re-review of 223e4f5, and the same boundaries' equivalent omissions.
