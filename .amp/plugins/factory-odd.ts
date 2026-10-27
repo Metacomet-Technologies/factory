@@ -715,15 +715,8 @@ export default async function (amp: PluginAPI) {
 
 	// Slack filters each page after the limit, so every page of the last day is read.
 	async function digestPosted(tools: Tools, day: string): Promise<boolean> {
-		let cursor: string | undefined
-		do {
-			const page = await readJson<Row>(tools, 'slack_read', { operation: 'read_messages', channelName: alertsChannel, lookback: 'P1D', limit: 100, filter: { containsAll: [digestHeading(day)] }, ...(cursor ? { cursor } : {}) })
-			// A malformed read is not "no digest yet": that would post the day's digest twice, or count a failed check as healthy.
-			if (listOf(page, 'messages', 'slack_read').length) return true
-			if (!optional(page, 'nextCursor', 'string')) throw new ReadError('slack_read returned a malformed nextCursor')
-			cursor = page.nextCursor as string | undefined
-		} while (cursor)
-		return false
+		// A malformed read is not "no digest yet": that would post the day's digest twice, or count a failed check as healthy.
+		return (await slackMessagesFor(tools, { operation: 'read_messages', channelName: alertsChannel, lookback: 'P1D', limit: 100, filter: { containsAll: [digestHeading(day)] } })).length > 0
 	}
 
 	// Every page: the sweep must see every issue in the status, not the first 100.
@@ -744,14 +737,17 @@ export default async function (amp: PluginAPI) {
 		const since = new Date(now.getTime() - 24 * 60 * 60_000).toISOString()
 		// Every read and every field the digest uses is validated: a malformed read fails the sweep (no heartbeat), never an empty day.
 		type MergedPr = { number: number; title: string; headRefOid: string; mergeCommit: { oid: string }; mergedAt: string }
-		const prs = await ghJson(ctx.$`gh pr list --state merged --search ${`merged:>=${since.slice(0, 10)}`} --json number,title,headRefOid,mergeCommit,mergedAt --limit 50`, 'gh pr list for the digest')
+		const prs = await ghJson(ctx.$`gh pr list --state merged --search ${`merged:>=${since.slice(0, 10)}`} --json number,title,headRefOid,mergeCommit,mergedAt --limit ${String(prListLimit)}`, 'gh pr list for the digest')
 		if (!Array.isArray(prs) || !prs.every(pr => isRow(pr) && typeof pr.number === 'number' && typeof pr.title === 'string' && sha40(pr.headRefOid) && isRow(pr.mergeCommit) && sha40(pr.mergeCommit.oid) && timestamp(pr.mergedAt))) {
 			throw new ReadError('gh pr list for the digest returned a malformed PR list')
 		}
+		if (prs.length >= prListLimit) throw new ReadError(`gh pr list for the digest filled its ${prListLimit} limit; PRs past it are unread`)
 		type Issue = { id: string; title: string; completedAt?: string; createdAt?: string }
-		const issues = async (filter: Record<string, unknown>, fields: string[]) =>
-			listOf<Issue>(await readJson(ctx.tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields }), 'issues', 'linear.list_issues',
-				row => named(row.id) && typeof row.title === 'string' && fields.slice(2).every(field => timestamp(row[field])))
+		const issues = (filter: Record<string, unknown>, fields: string[]) => allPages<Issue>('linear.list_issues', async cursor => {
+			const page = await readJson<unknown>(ctx.tools, 'linear.list_issues', { team: 'Metacomet', ...filter, limit: 100, fields, ...(cursor ? { cursor } : {}) })
+			const rows = listOf<Issue>(page, 'issues', 'linear.list_issues', row => named(row.id) && typeof row.title === 'string' && fields.slice(2).every(field => timestamp(row[field])))
+			return { rows, next: nextPage(page, 'linear.list_issues') }
+		}, issue => issue.id)
 		const titled = (list: Issue[]) => list.map(issue => ({ identifier: issue.id, title: issue.title }))
 		const [done, bugs, escalated] = await Promise.all([
 			issues({ state: 'Done' }, ['id', 'title', 'completedAt']).then(list => list.filter(issue => issue.completedAt! >= since)),
@@ -781,15 +777,16 @@ export default async function (amp: PluginAPI) {
 		const at = new Date().toISOString()
 		state.slack.polledAt = at
 		try {
-			const read = await callJson<{ messages?: SlackMessage[] }>(ctx.tools, 'slack_read', {
+			// A Slack intake message needs its ts and text (pendingIntake, intakePrompt).
+			const messages = await slackMessagesFor(ctx.tools, {
 				operation: 'read_messages',
 				channelName: intakeChannel,
 				lookback: 'P2D',
 				limit: 50,
 				include: { resolveUsers: true },
-			})
+			}, row => named(row.ts) && typeof row.text === 'string')
 			const perform = (await ctx.thread.labels()).includes(performLabel)
-			for (const message of pendingIntake(read.messages ?? []).filter(message => !state.slack.spawned.includes(message.ts))) {
+			for (const message of pendingIntake(messages).filter(message => !state.slack.spawned.includes(message.ts))) {
 				const action: Action = { kind: 'spawn', role: 'intake', executor: 'orb', reason: `slack ${message.ts}`, round: 1 }
 				const entry = record(state, { at, source: 'slack-poll', issue: null, stage: perform ? 'performed' : 'dry-run', action })
 				if (!perform) continue
@@ -1229,8 +1226,48 @@ async function getIssue(tools: Tools, input: Record<string, unknown>): Promise<L
 	return issue as unknown as LinearIssue
 }
 
-const listComments = async (tools: Tools, issueId: string): Promise<Comment[]> =>
-	listOf<Comment>(await readJson(tools, 'linear.list_comments', { issueId, limit: 50 }), 'comments', 'linear.list_comments', row => typeof row.body === 'string' && optional(row, 'id', 'string') && optional(row, 'createdAt', 'string'))
+/**
+ * Every page of a cursor read (MET-345), in page order. `read` validates one page and returns its
+ * rows and next cursor; a cursor already sent fails the read, since following it would loop or
+ * skip pages. A row repeated across overlapping pages counts once by `key`.
+ */
+async function allPages<T>(name: string, read: (cursor: string | undefined) => Promise<{ rows: readonly T[]; next?: string }>, key: (row: T) => string | undefined): Promise<T[]> {
+	const rows: T[] = []
+	const keys = new Set<string>()
+	const sent = new Set<string>()
+	let cursor: string | undefined
+	for (;;) {
+		const page = await read(cursor)
+		for (const row of page.rows) {
+			const id = key(row)
+			if (id !== undefined && keys.has(id)) continue
+			if (id !== undefined) keys.add(id)
+			rows.push(row)
+		}
+		if (page.next === undefined) return rows
+		if (sent.has(page.next)) throw new ReadError(`${name} repeated cursor ${page.next.slice(0, 60)} after ${sent.size + 1} pages`)
+		sent.add(page.next)
+		cursor = page.next
+	}
+}
+
+/** Every page of a Slack `read_messages`; `nextCursor` names the next page. */
+function slackMessagesFor(tools: Tools, input: Record<string, unknown>, valid: (row: Row) => boolean = () => true): Promise<SlackMessage[]> {
+	return allPages<SlackMessage>(`slack_read ${String(input.channelName)}`, async cursor => {
+		const page = await readJson<Row>(tools, 'slack_read', { ...input, ...(cursor ? { cursor } : {}) })
+		const rows = listOf<SlackMessage>(page, 'messages', 'slack_read', valid)
+		if (!optional(page, 'nextCursor', 'string')) throw new ReadError('slack_read returned a malformed nextCursor')
+		return { rows, next: named(page.nextCursor) ? page.nextCursor : undefined }
+	}, message => (named(message.ts) ? message.ts : undefined))
+}
+
+// Every comment, so a receipt or marker older than the newest 100 still counts; toSnapshot orders them by createdAt.
+// Like every Linear read, each page must say whether another follows (nextPage): a page without `hasNextPage` is malformed.
+const listComments = (tools: Tools, issueId: string): Promise<Comment[]> => allPages<Comment>(`linear.list_comments ${issueId}`, async cursor => {
+	const page = await readJson<unknown>(tools, 'linear.list_comments', { issueId, limit: 100, ...(cursor ? { cursor } : {}) })
+	const rows = listOf<Comment>(page, 'comments', 'linear.list_comments', row => typeof row.body === 'string' && optional(row, 'id', 'string') && optional(row, 'createdAt', 'string'))
+	return { rows, next: nextPage(page, 'linear.list_comments') }
+}, comment => comment.id)
 
 type Comment = { id?: string; body: string; createdAt?: string }
 

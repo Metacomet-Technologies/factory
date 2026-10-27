@@ -1,7 +1,7 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { blindMs, digest, digestDue, episodeLine, failureBudget, failureDue, incidentPageDue, incidentText, incidents, localClock, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, restoreStatus, sanitizeError, slackMessageMax, slackMessages, staleThreads, sweepMs, staleMs, type DigestInput, type Episode } from './watchdog.ts';
-import { heartbeatLine, parseHeartbeat } from './lifecycle.ts';
+import { deployReceiptLine, heartbeatLine, parseHeartbeat, verifyLine } from './lifecycle.ts';
 import { capacity, type Action } from './lifecycle.ts';
 import { receiptLabel, type LiveThread } from './snapshot.ts';
 import plugin, { followUp } from '../../.amp/plugins/factory-odd.ts';
@@ -102,6 +102,7 @@ test('a digest longer than one Slack message is split on line breaks', () => {
 /** Linear, thread search and #factory-alerts shared by every plugin instance; each `start()` is a fresh plugin load arming the control thread and returns its `odd_control_status` tool. `override` also sees `thread.labels` and `createWebhook`. */
 function controlOrb(override: (name: string, input: Record<string, unknown>) => unknown = () => undefined) {
   const evaluated: string[] = [];
+  const spawned: string[] = [];
   const alerts: string[] = [];
   const dms: string[] = [];
   const calls: string[] = [];
@@ -117,7 +118,7 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
         if (input.state !== 'Triage') return { issues: [], hasNextPage: false, cursor: '' };
         return input.cursor === 'page-2' ? { issues: triage.slice(100), hasNextPage: false, cursor: 'end' } : { issues: triage.slice(0, 100), hasNextPage: true, cursor: 'page-2' };
       case 'linear.get_issue': evaluated.push(String(input.id)); return { id: input.id, status: 'Done', labels: [], description: '', relations: { blockedBy: [] } };
-      case 'linear.list_comments': return { comments: [] };
+      case 'linear.list_comments': return { comments: [], hasNextPage: false };
       case 'find_thread':
         if (input.query !== 'label:odd-role-builder archived:false') return { threads: [] };
         return input.cursor === 'threads-2' ? { threads: [{ id: 'T-200' }] } : { threads: [{ id: 'T-199' }], nextCursor: 'threads-2' };
@@ -145,7 +146,7 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
     const amp = {
       // `override('$', { command })` may answer a shell command with its stdout.
       $: fakeShell(command => override('$', { command }) as string | undefined).$,
-      createAgent: () => ({ definition: {} }), registerAgentMode: () => {}, registerTool: (tool: typeof status) => { status = tool; },
+      createAgent: () => ({ definition: {}, createThread: async () => ({ id: `T-spawned-${spawned.length + 1}`, setLabels: async () => {}, appendUserMessage: async (message: { content: string }) => { spawned.push(message.content); } }) }), registerAgentMode: () => {}, registerTool: (tool: typeof status) => { status = tool; },
       on: (name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => { handlers.set(name, handler); },
       createWebhook: async (options: Record<string, unknown>) => (await override('createWebhook', options)) ?? { url: 'https://hooks.example/x' },
       system: { executor: { kind: 'remote', keepAlive: async () => {} } },
@@ -154,9 +155,9 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
     const thread = { id: 'T-control', labels: async () => (await override('thread.labels', {})) ?? ['odd-control-plane', 'odd-perform'] };
     const ctx = { thread, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools };
     await handlers.get('session.start')!({}, ctx);
-    return async (input: Record<string, unknown>) => JSON.parse(await status!.execute(input, ctx)) as { armed: boolean; error?: string };
+    return async (input: Record<string, unknown>) => JSON.parse(await status!.execute(input, ctx)) as { armed: boolean; error?: string; slack: { error?: string } };
   };
-  return { start, evaluated, alerts, dms, calls, updates, reads: () => alertReads };
+  return { start, evaluated, spawned, alerts, dms, calls, updates, reads: () => alertReads };
 }
 
 const until = async (done: () => boolean) => {
@@ -457,7 +458,13 @@ function factory() {
       case 'linear.get_issue':
         if (input.id === control.unreadable) throw new Error('Linear 503');
         return { ...issues.get(String(input.id))!, relations: { blockedBy: [] } };
-      case 'linear.list_comments': return { comments: [...(comments.get(String(input.issueId)) ?? [])].reverse() };
+      case 'linear.list_comments': {
+        // Newest first, `limit` per page; each page repeats the previous page's last comment, as overlapping pages can.
+        const all = [...(comments.get(String(input.issueId)) ?? [])].reverse();
+        const from = Number(input.cursor ?? 0);
+        const to = from + Number(input.limit ?? 50);
+        return { comments: all.slice(from, to), hasNextPage: to < all.length, cursor: String(to - 1) };
+      }
       case 'linear.save_comment': {
         if (input.id) {
           for (const list of comments.values()) for (const comment of list) if (comment.id === input.id) comment.body = String(input.body);
@@ -515,6 +522,7 @@ function factory() {
   const ends = new Map<number, (event: unknown, ctx: unknown) => Promise<unknown>>();
   const statuses = new Map<number, (input: Record<string, unknown>, ctx: unknown) => Promise<string>>();
   const builder = (issue: string, state = 'idle', updatedAt = new Date().toISOString()) => threads.set(`T-${issue}`, { labels: [`odd-issue-${issue.toLowerCase()}`, 'odd-role-builder', 'odd-round-1', 'odd-engine-anthropic'], state, archived: false, updatedAt });
+  let said = 0;
   const openPr = (issue: string, sha: string, over: Partial<Pr> = {}) => {
     const n = Number(issue.slice(4));
     prs.push({ number: n, headRefName: `${issue.toLowerCase()}-x`, headRefOid: sha, state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: sha, committedDate: new Date().toISOString() }], statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }], body: `closes ${issue}`, ...over });
@@ -525,6 +533,8 @@ function factory() {
     events: async () => (JSON.parse(await statuses.get(generation)!({}, { thread: { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] } })) as { events: { issue: string | null; stage: string; error?: string }[] }).events,
     /** The Ralph guard as the latest plugin load runs it at the end of a role thread's turn. */
     guard: (labels: string[]) => ends.get(generation)!({ status: 'done', message: '', thread: { id: 'T-role' } }, { thread: { id: 'T-role', labels: async () => labels }, ui: { confirm: async () => true, notify: async () => {} }, logger: { log: () => {} }, tools, $ }),
+    /** A comment one second after the previous planted one, so creation order is unambiguous. */
+    say: (issue: string, body: string) => comments.set(issue, [...(comments.get(issue) ?? []), { id: `said-${++said}`, body, createdAt: new Date(Date.parse('2026-10-26T12:00:00Z') + said * 1000).toISOString() }]),
     issue: (id: string, status: string) => issues.set(id, { id, status, labels: ['odd', 'Bug', 'area:agents'], description: fullSpec }),
     episodes: (id: string) => (comments.get(id) ?? []).filter(comment => comment.body.startsWith('odd-failure')).map(comment => comment.body.split('\n')[0]),
     async start() {
@@ -1240,7 +1250,7 @@ test('P3.7: a recovered receipt keeps a deployment of a release containing the m
         // Let the issue follow its status writes, so the next evaluation sees Deploying.
         plant.control.inject = (call, input) => {
           if (call === 'linear.save_issue' && typeof input.state === 'string') plant.issues.get(String(input.id))!.status = input.state;
-          if (call === 'linear.list_comments' && oldestFirst) return { comments: [...(plant.comments.get(String(input.issueId)) ?? [])] };
+          if (call === 'linear.list_comments' && oldestFirst) return { comments: [...(plant.comments.get(String(input.issueId)) ?? [])], hasNextPage: false };
           return undefined;
         };
         if (unreadable) plant.control.gh = command => command.startsWith('gh api repos/{owner}/{repo}/compare/') && command.includes(`...${unreadable}`) ? { exitCode: 1, stdout: '', stderr: 'HTTP 502' } : undefined;
@@ -1287,7 +1297,7 @@ function signedOrb() {
       case 'linear.list_issues': return { issues: [], hasNextPage: false };
       case 'find_thread': return { threads: [] };
       case 'linear.get_issue': reads.push(String(input.id)); return { id: input.id, status: 'Todo', labels: ['odd'], description: '', relations: { blockedBy: [] } };
-      case 'linear.list_comments': return { comments: [] };
+      case 'linear.list_comments': return { comments: [], hasNextPage: false };
       case 'slack_read': return { messages: [] };
       case 'linear.get_status_updates': return { statusUpdates: [], hasNextPage: false };
       default: if (name !== 'linear.save_status_update') effects.push(name); return {};
@@ -1450,3 +1460,175 @@ test('P4.6-webhooks: without a secret (first arm, dismissed dialog, plugin reloa
   }
   assert.ok(orb.output.some(text => text.includes('"signing"')), 'status output was captured');
 });
+
+// --- P4.5: every authoritative lifecycle read follows its pages --------------------------
+
+const unrelatedPr = (n: number, state: Pr['state'] = 'OPEN'): Pr =>
+  ({ number: 1000 + n, headRefName: `renovate-${n}`, headRefOid: 'f'.repeat(40), state, mergeCommit: null, mergeable: 'MERGEABLE', commits: [], statusCheckRollup: [], body: `Mentions MET-30 and MET-32 without owning them (${n}).` });
+const rolesOf = (plant: ReturnType<typeof factory>, issue: string, role: string) =>
+  [...plant.threads.values()].filter(thread => thread.labels.includes(`odd-issue-${issue.toLowerCase()}`) && thread.labels.includes(`odd-role-${role}`));
+
+test('P4.5: a receipt beyond comment 50 starts the verifier, and the verifier\'s guard reads it and the verdict on another page', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  const sha = 'e'.repeat(40);
+  plant.issue('MET-20', 'Deploying');
+  plant.say('MET-20', deployReceiptLine({ host: 'gpu', component: 'api', sha, health: 'pass', rollback: 'none' }));
+  for (let i = 0; i < 120; i++) plant.say('MET-20', `note ${i}`);
+  await plant.start();
+  await settle();
+  assert.equal(rolesOf(plant, 'MET-20', 'verifier').length, 1, 'the receipt is the oldest of 121 comments');
+  const labels = ['odd-issue-met-20', 'odd-role-verifier', 'odd-round-1'];
+  const unmet = await plant.guard(labels) as Promise<{ userMessage: string } | undefined>;
+  assert.match(unmet?.userMessage ?? '', new RegExp(`odd-verify sha=${sha}`), 'the guard found the receipt and waits for its verdict');
+  plant.say('MET-20', verifyLine({ sha, result: 'pass' }));
+  assert.equal(await plant.guard(labels) as Promise<{ userMessage: string } | undefined>, undefined, 'verdict on page 1, receipt on page 2: stop met');
+});
+
+test('P4.5: an owned open PR beyond the first 100 and a merged one beyond 100 search results both count; mentions do not own', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  for (let i = 0; i < 150; i++) plant.prs.push(unrelatedPr(i));
+  plant.issue('MET-30', 'In Progress');
+  plant.builder('MET-30');
+  plant.openPr('MET-30', 'a'.repeat(40));
+  // 150 merged PRs the quoted search matches (they mention MET-32) but that do not own it, newer than the owner.
+  plant.prs.push({ ...unrelatedPr(999, 'MERGED'), number: 32, headRefName: 'met-32-x', headRefOid: '3'.repeat(40), mergeCommit: { oid: '4'.repeat(40) } as never, mergedAt: '2026-10-26T14:00:00Z', commits: [{ oid: '3'.repeat(40), committedDate: '2026-10-26T13:00:00Z' }], body: 'MET-32' } as Pr);
+  for (let i = 0; i < 150; i++) plant.prs.unshift({ ...unrelatedPr(i, 'MERGED'), mergeCommit: { oid: '5'.repeat(40) } as never, mergedAt: '2026-10-26T14:00:00Z' } as Pr);
+  plant.issue('MET-32', 'In Progress');
+  plant.builder('MET-32');
+  await plant.start();
+  await settle();
+  assert.equal(rolesOf(plant, 'MET-30', 'reviewer').length, 1, 'open PR #30 is the 151st open PR');
+  assert.ok(plant.saves.includes('MET-32 "Deploying"'), 'merged PR #32 is the 151st search result');
+});
+
+
+// The P4.5 proof matrix: each paged read the lifecycle acts on, through the real plugin, under
+// every page shape. Rows are cut at the plugin's `limit` and each page repeats the previous
+// page's last row, as overlapping pages can. A shape breaks the page after the first (or the
+// first page's cursor) until `broken` is cleared; the recovery step then reruns the consumer.
+// Every row asserts what the plane did, so a failure prints the concrete wrong decision.
+type Shape = 'complete' | 'empty' | 'malformed' | 'error' | 'no-cursor' | 'no-flag' | 'no-metadata' | 'repeated-cursor';
+const shapes: readonly Shape[] = ['complete', 'empty', 'malformed', 'error', 'no-cursor', 'no-flag', 'no-metadata', 'repeated-cursor'];
+// Slack's read_messages has no hasNextPage: a page without nextCursor is the last page by contract, so the
+// Linear-only shapes (no-cursor: more without a cursor; no-flag and no-metadata: a page without hasNextPage) are not Slack shapes.
+const slackShapes = shapes.filter(shape => !['no-cursor', 'no-flag', 'no-metadata'].includes(shape));
+const failing = (shape: Shape) => shape !== 'complete' && shape !== 'empty';
+
+function pager<T>(all: readonly T[], shape: Shape, style: 'linear' | 'slack', key: string) {
+  const state = { broken: true, reads: 0 };
+  const read = (input: Record<string, unknown>) => {
+    state.reads += 1;
+    const rows = shape === 'empty' ? [] : all;
+    const size = Number(input.limit);
+    const from = Number(input.cursor ?? 0);
+    const to = from + size;
+    let page: unknown[] = rows.slice(from, to);
+    let more = to < rows.length;
+    let next: string | undefined = more ? String(to - 1) : undefined;
+    const late = state.broken && from > 0;
+    if (late && shape === 'error') throw new Error(`${style} 503 on page 2`);
+    if (late && shape === 'malformed') page = [...page, null];
+    if (state.broken && shape === 'no-cursor' && more) next = undefined;
+    // A server that keeps handing back the cursor it was sent; it gives up after ten reads so an unguarded reader ends.
+    if (late && shape === 'repeated-cursor' && state.reads < 10) { next = String(input.cursor); more = true; }
+    if (style === 'slack') return { [key]: page, ...(next ? { nextCursor: next } : {}) };
+    // A first page that omits hasNextPage: with its cursor (`{ comments, cursor }`), or with no pagination fields at all.
+    if (state.broken && from === 0 && shape === 'no-flag') return { [key]: page, ...(next ? { cursor: next } : {}) };
+    if (state.broken && from === 0 && shape === 'no-metadata') return { [key]: page };
+    return { [key]: page, hasNextPage: more, ...(next ? { cursor: next } : {}) };
+  };
+  return { state, read };
+}
+
+const verifierLabels = ['odd-issue-met-40', 'odd-role-verifier', 'odd-round-1'];
+for (const shape of shapes) for (const total of shape === 'complete' ? [100, 101, 200, 201] : [201]) {
+  test(`P4.5 matrix: issue comments ${shape}${shape === 'complete' ? ` (${total})` : ''}: the verdict on the oldest comment is read or nothing acts`, async t => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+    t.after(() => mock.timers.reset());
+    const plant = factory();
+    const sha = 'e'.repeat(40);
+    plant.issue('MET-40', 'Deploying');
+    // Newest first: the green receipt, notes, and the pass verdict for it as the oldest comment.
+    const at = (i: number) => new Date(Date.parse('2026-10-26T14:00:00Z') - i * 1000).toISOString();
+    const rows = Array.from({ length: total }, (_, i) => ({ id: `c-${i}`, createdAt: at(i),
+      body: i === 0 ? deployReceiptLine({ host: 'gpu', component: 'api', sha, health: 'pass', rollback: 'none' }) : i === total - 1 ? verifyLine({ sha, result: 'pass' }) : `note ${i}` }));
+    const comments = pager(rows, shape, 'linear', 'comments');
+    plant.control.inject = (name, input) => name === 'linear.list_comments' && input.issueId === 'MET-40' ? comments.read(input) : undefined;
+    const outcome = async () => {
+      const guard = await (plant.guard(verifierLabels) as Promise<{ userMessage: string } | undefined>).then(result => !result ? 'stop' : result.userMessage.includes('no odd-deploy receipt') ? 'continue: no receipt' : result.userMessage.includes('odd-verify sha=') ? 'continue: no verdict' : `continue: ${result.userMessage}`, (error: unknown) => `refused: ${String(error).slice(0, 40)}`);
+      return { status: plant.saves.filter(save => save.startsWith('MET-40 ')), verifiers: rolesOf(plant, 'MET-40', 'verifier').length, guard: guard.startsWith('refused') ? 'refused' : guard };
+    };
+    await plant.start();
+    await settle();
+    const empty = { status: [], verifiers: 0, guard: 'continue: no receipt' };
+    const done = { status: ['MET-40 "Done"'], verifiers: 0, guard: 'stop' };
+    assert.deepEqual(await outcome(), shape === 'empty' ? empty : failing(shape) ? { status: [], verifiers: 0, guard: 'refused' } : done);
+    comments.state.broken = false;
+    await advance(90_000);
+    if (failing(shape)) assert.deepEqual(await outcome(), done, 'the recheck reads every page and acts once');
+  });
+}
+
+const intakeMessage = (ts: string, text: string) => ({ ts, text, userID: 'U1' });
+for (const shape of slackShapes) {
+  test(`P4.5 matrix: Slack intake ${shape}: the message on page 2 gets one Intake thread or none does`, async t => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+    t.after(() => mock.timers.reset());
+    const rows = Array.from({ length: 51 }, (_, i) => intakeMessage(`1761310000.${String(i).padStart(6, '0')}`, i === 50 ? 'late intake sentinel' : `intake ${i}`));
+    const intake = pager(rows, shape, 'slack', 'messages');
+    const orb = controlOrb((name, input) => name === 'slack_read' && input.channelName === '#factory-intake' && input.operation === 'read_messages' ? intake.read(input) : emptyWork(name));
+    const status = await orb.start();
+    await settle();
+    const outcome = async () => ({ spawned: orb.spawned.length, sentinel: orb.spawned.filter(prompt => prompt.includes('late intake sentinel')).length, error: Boolean((await status({})).slack.error) });
+    assert.deepEqual(await outcome(), shape === 'empty' ? { spawned: 0, sentinel: 0, error: false } : failing(shape) ? { spawned: 0, sentinel: 0, error: true } : { spawned: 51, sentinel: 1, error: false });
+    intake.state.broken = false;
+    await advance(5 * 60_000);
+    if (failing(shape)) assert.deepEqual(await outcome(), { spawned: 51, sentinel: 1, error: false }, 'the next poll hands every message to Intake once');
+  });
+}
+
+for (const shape of shapes) {
+  test(`P4.5 matrix: digest Done issues ${shape}: the issue done on page 2 is listed once, or no digest and no heartbeat`, async t => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+    t.after(() => mock.timers.reset());
+    const rows = Array.from({ length: 101 }, (_, i) => ({ id: `MET-${i + 1}`, title: i === 100 ? 'late Done sentinel' : 'long done', completedAt: i === 100 ? '2026-10-24T14:00:00Z' : '2026-10-01T00:00:00Z' }));
+    const done = pager(rows, shape, 'linear', 'issues');
+    const orb = controlOrb((name, input) => name === 'linear.list_issues' && input.state === 'Done' ? done.read(input) : emptyWork(name));
+    await orb.start();
+    await settle();
+    const outcome = () => ({ digests: orb.alerts.filter(text => text.startsWith('ODD digest')).length, sentinel: orb.alerts.filter(text => /^- MET-101 late Done sentinel$/m.test(text)).length, heartbeats: orb.updates.length });
+    assert.deepEqual(outcome(), shape === 'empty' ? { digests: 1, sentinel: 0, heartbeats: 1 } : failing(shape) ? { digests: 0, sentinel: 0, heartbeats: 0 } : { digests: 1, sentinel: 1, heartbeats: 1 });
+    done.state.broken = false;
+    await advance(sweepMs);
+    if (failing(shape)) assert.deepEqual(outcome(), { digests: 1, sentinel: 1, heartbeats: 1 }, 'the next sweep posts the full digest once');
+  });
+
+}
+
+for (const shape of slackShapes) {
+  test(`P4.5 matrix: digest-posted check ${shape}: a digest posted on page 2 is never posted again`, async t => {
+    mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-24T15:00:00Z') });
+    t.after(() => mock.timers.reset());
+    // #factory-alerts today: other alerts, then the day's digest past the first page. Slack filters each page after the limit.
+    const rows = Array.from({ length: 101 }, (_, i) => ({ ts: `1761300000.${String(i).padStart(6, '0')}`, text: i === 100 ? 'ODD digest 2026-10-24\nMerged PRs (0):' : `alert ${i}` }));
+    const alerts = pager(rows, shape, 'slack', 'messages');
+    const orb = controlOrb((name, input) => {
+      if (name !== 'slack_read' || input.channelName !== 'factory-alerts') return emptyWork(name);
+      const page = alerts.read(input) as { messages: ({ text: string } | null)[] };
+      const terms = (input.filter as { containsAll: string[] }).containsAll;
+      return { ...page, messages: page.messages.filter(message => message === null || terms.every(term => message.text.includes(term))) };
+    });
+    await orb.start();
+    await settle();
+    const outcome = () => ({ reposted: orb.alerts.filter(text => text.startsWith('ODD digest')).length, heartbeats: orb.updates.length });
+    // An empty channel is a true "not posted yet": the digest goes out.
+    assert.deepEqual(outcome(), shape === 'empty' ? { reposted: 1, heartbeats: 1 } : failing(shape) ? { reposted: 0, heartbeats: 0 } : { reposted: 0, heartbeats: 1 });
+    alerts.state.broken = false;
+    await advance(sweepMs);
+    if (failing(shape)) assert.deepEqual(outcome(), { reposted: 0, heartbeats: 1 }, 'the next sweep finds the digest and still does not repost');
+  });
+}

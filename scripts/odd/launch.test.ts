@@ -91,7 +91,7 @@ function controlPlane(options: { status?: string; threads?: Omit<FakeThread, 'ar
   const tools = { call: async (name: string, input: Record<string, unknown>) => {
     switch (name) {
       case 'linear.get_issue': return { ...issue, relations: { blockedBy: [] } };
-      case 'linear.list_comments': return { comments: comments.map((body, i) => ({ body, createdAt: new Date(Date.UTC(2026, 9, 26, 0, i)).toISOString() })) };
+      case 'linear.list_comments': return { comments: comments.map((body, i) => ({ body, createdAt: new Date(Date.UTC(2026, 9, 26, 0, i)).toISOString() })), hasNextPage: false };
       case 'linear.save_comment': comments.push(String(input.body)); return {};
       case 'linear.save_issue': if (typeof input.state === 'string') issue.status = input.state; return {};
       // The sweep's own enumeration is not under test; issues reach evaluation through webhooks.

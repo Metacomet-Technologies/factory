@@ -1336,7 +1336,7 @@ async function controlPlane(options: { issue: string; receipt: string; failOnce:
     if (name === failOnce) { failOnce = undefined; calls.push(`${name} failed`); throw new Error(`${name}: HTTP 503`); }
     switch (name) {
       case 'linear.get_issue': return { id: options.issue, status, labels: ['odd'], description: '', relations: { blockedBy: [] } };
-      case 'linear.list_comments': return { comments: [{ body: options.receipt, createdAt: '2026-10-24T15:00:00Z' }, { body: 'odd-merge pr=1 head=a merge=b release=none', createdAt: '2026-10-24T14:00:00Z' }] };
+      case 'linear.list_comments': return { comments: [{ body: options.receipt, createdAt: '2026-10-24T15:00:00Z' }, { body: 'odd-merge pr=1 head=a merge=b release=none', createdAt: '2026-10-24T14:00:00Z' }], hasNextPage: false };
       case 'linear.list_issues': calls.push('Bug lookup'); return { issues: bugs.map(title => ({ id: 'MET-900', title })) };
       case 'linear.save_issue':
         if (typeof input.title === 'string') { bugs.push(input.title); calls.push('Bug created'); return { identifier: 'MET-900' }; }

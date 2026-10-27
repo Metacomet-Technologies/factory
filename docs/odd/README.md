@@ -533,7 +533,14 @@ by the previous one).
    with a verdict, verifier labelled `odd-receipt-<sha12>` for an older
    receipt) holds no round; verifier rounds count per receipt. The sweep
    reads every page of issues and threads, and the digest is not reposted
-   after a plugin reload (it checks `#factory-alerts`). Backlog is on demand
+   after a plugin reload (it checks `#factory-alerts`). Every other
+   authoritative read follows its pages too (MET-345): issue comments for the
+   snapshot and the Ralph guard (read once per evaluation), the digest's
+   Linear issues, and Slack intake and digest checks. A page that reports more
+   without a cursor, or repeats a cursor, fails the read instead of acting on
+   what was read so far; items repeated across pages count once. The digest's
+   merged-PR list uses the same flat-field `--limit 1000` as PR ownership
+   (MET-344) and fails when it fills the limit. Backlog is on demand
    (MET-304): the sweep and `nextAction` never work a Backlog issue; a Triage
    issue without type + area gets one Intake round, then Spec. The sweep posts
    a cancellation before archiving the thread (a failed comment keeps the
