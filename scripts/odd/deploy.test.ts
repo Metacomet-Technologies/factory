@@ -50,16 +50,17 @@ const green = JSON.stringify({ git_sha: sha, git_dirty: false, status: 'ok' });
 const previous = JSON.stringify({ git_sha: 'b'.repeat(40), git_dirty: false, status: 'ok' });
 
 test('install, three green probes 20 s apart, pass receipt, ledger records the component', async () => {
-  const { effects, calls, ledger } = fixture({ bodies: [green, green, green] });
+  const { effects, calls, ledger } = fixture({ bodies: [previous, green, green, green] });
   const receipt = await deployComponent(effects, kiosk, 'v0.3.0', sha, '/tmp/rel');
   assert.deepEqual(receipt, { component: 'kiosk', sha, health: 'pass', rollback: 'none' });
-  assert.deepEqual(calls, ['sudo deploy/install-kiosk.sh --source-checkout /nonexistent/source /tmp/rel/kiosk', 'probe', 'sleep', 'probe', 'sleep', 'probe']);
+  // The first probe captures the healthy identity before the install.
+  assert.deepEqual(calls, ['probe', 'sudo deploy/install-kiosk.sh --source-checkout /nonexistent/source /tmp/rel/kiosk', 'probe', 'sleep', 'probe', 'sleep', 'probe']);
   assert.deepEqual(ledger(), { components: { kiosk: { sha, tag: 'v0.3.0', health: 'pass', snapshot } }, inFlight: undefined });
   assert.equal(receiptLine(receipt), `odd-deploy host=factory-gpu component=kiosk sha=${sha} health=pass rollback=none`);
 });
 
 test('an installer failure after its snapshot rolls back and re-probes; before any change it does not', async () => {
-  const withSnapshot = fixture({ bodies: [previous, previous, previous], installOk: false });
+  const withSnapshot = fixture({ bodies: [previous, previous, previous, previous], installOk: false });
   assert.deepEqual(await deployComponent(withSnapshot.effects, kiosk, 'v0.3.0', sha, '/tmp/rel'), { component: 'kiosk', sha, health: 'fail', rollback: snapshot });
   assert.equal(withSnapshot.calls.filter(call => call.includes('rollback')).length, 1);
   const unchanged = fixture({ bodies: [], installOk: false });
@@ -69,13 +70,61 @@ test('an installer failure after its snapshot rolls back and re-probes; before a
   // recheck after the snapshot (deploy/install-meter.sh output; MeterPlanTest). The service is already
   // stopped, so it is not a not-executed refusal: the v2 snapshot is rolled back once, binaries only.
   const meter = recipes.find(recipe => recipe.name === 'meter')!;
-  const stopped = fixture({ bodies: [previous, previous, previous] });
+  const stopped = fixture({ bodies: [previous, previous, previous, previous] });
   const sudo = stopped.effects.sudo;
   stopped.effects.sudo = (script, args) => script.startsWith('deploy/install-')
     ? (sudo(script, args), { ok: false, output: `Rollback snapshot: ${snapshot}\nERROR: DB version changed since preflight.\nRecover with: sudo bash deploy/rollback-meter-v1.sh ${snapshot}\n` })
     : sudo(script, args);
   assert.deepEqual(await deployComponent(stopped.effects, meter, 'v0.3.0', sha, '/tmp/rel'), { component: 'meter', sha, health: 'fail', rollback: snapshot });
   assert.deepEqual(stopped.calls.filter(call => call.startsWith('sudo')), [`sudo deploy/install-meter.sh --source-checkout /nonexistent/source --no-db-change ${meter.artifact('/tmp/rel')}`, `sudo deploy/rollback-meter-v1.sh ${snapshot}`]);
+});
+
+test('a pre-snapshot installer failure is rollback=unchanged only when three probes find the exact healthy identity captured before it; never a rollback', async t => {
+  const body = (fields: object) => JSON.stringify({ git_sha: 'b'.repeat(40), git_dirty: false, status: 'ok', ...fields });
+  const [dirty, degraded, other, short] = [body({ git_dirty: true }), body({ status: 'degraded' }), body({ git_sha: 'c'.repeat(40) }), body({ git_sha: 'bbbbbbb' })];
+  const install = 'sudo deploy/install-kiosk.sh --source-checkout /nonexistent/source /tmp/rel/kiosk';
+  const reprobe = ['probe', 'sleep', 'probe', 'sleep', 'probe'];
+  // [case, health bodies in probe order (undefined: connection refused), rollback, calls]
+  const cases: [string, (string | undefined)[], string, string[]][] = [
+    ['exact previous identity before and three times after', [previous, previous, previous, previous], 'unchanged', ['probe', install, ...reprobe]],
+    ['unavailable before the install', [undefined, previous, previous, previous], 'none', ['probe', install]],
+    ['dirty before the install', [dirty, previous, previous, previous], 'none', ['probe', install]],
+    ['degraded before the install', [degraded, previous, previous, previous], 'none', ['probe', install]],
+    ['malformed before the install', ['<html>502</html>', previous, previous, previous], 'none', ['probe', install]],
+    ['healthy on another release after', [previous, other, other, other], 'none', ['probe', install, 'probe']],
+    ['healthy on the target release after', [previous, green, green, green], 'none', ['probe', install, 'probe']],
+    ['an abbreviated identity after, not the exact one', [previous, short, short, short], 'none', ['probe', install, 'probe']],
+    ['degraded on the third probe after', [previous, previous, previous, degraded], 'none', ['probe', install, ...reprobe]],
+    ['unavailable on the second probe after', [previous, previous, undefined, previous], 'none', ['probe', install, 'probe', 'sleep', 'probe']],
+  ];
+  for (const [name, bodies, rollback, calls] of cases) {
+    await t.test(name, async () => {
+      const host = fixture({ bodies: [] });
+      host.effects.probe = () => {
+        host.calls.push('probe');
+        const next = bodies.shift();
+        if (next === undefined) throw new Error('curl: (7) Failed to connect');
+        return next;
+      };
+      host.effects.sudo = (script, args) => {
+        host.calls.push(`sudo ${script} ${args.join(' ')}`);
+        return script.startsWith('deploy/install-') ? { ok: false, output: 'ERROR: preflight failed\nNo deployment changes made; no rollback snapshot exists.\n' } : { ok: true, output: '' };
+      };
+      const receipt = await deployComponent(host.effects, kiosk, 'v0.3.0', sha, '/tmp/rel');
+      assert.deepEqual(receipt, { component: 'kiosk', sha, health: 'fail', rollback });
+      assert.deepEqual(host.calls, calls, 'no rollback subprocess, and the re-probe stops at the first mismatch');
+      assert.deepEqual(host.ledger().receipt, { tag: 'v0.3.0', receipt, delivered: [] });
+      assert.deepEqual(host.ledger().components.kiosk, { sha, tag: 'v0.3.0', health: 'fail', snapshot: undefined });
+      assert.equal(receiptLine(receipt), `odd-deploy host=factory-gpu component=kiosk sha=${sha} health=fail rollback=${rollback}`);
+    });
+  }
+  // Crash recovery: a resumed install's prior state is unproven, so a healthy previous release afterwards is still `none`.
+  await t.test('a resumed install that fails before its snapshot', async () => {
+    const host = fixture({ bodies: [previous, previous, previous, previous], ledger: { components: {}, inFlight: { tag: 'v0.3.0', sha, component: 'kiosk', phase: 'installing' } } });
+    host.effects.sudo = (script, args) => { host.calls.push(`sudo ${script} ${args.join(' ')}`); return { ok: false, output: 'No deployment changes made; no rollback snapshot exists.\n' }; };
+    assert.deepEqual(await deployComponent(host.effects, kiosk, 'v0.3.0', sha, '/tmp/rel'), { component: 'kiosk', sha, health: 'fail', rollback: 'none' });
+    assert.deepEqual(host.calls, ['probe', install], 'the red resume probe, then the reinstall; no identity capture, no re-probe, no rollback');
+  });
 });
 
 test('the enabled set is meter, factory-api and kiosk in install order, each with a restoring rollback', () => {
@@ -1254,7 +1303,7 @@ test('sandbox: a kiosk release installs, three green probes report its SHA, Depl
   t.after(host.cleanup);
   await main(host.effects);
   const dir = join(host.stateDir, 'releases/v0.3.0');
-  assert.deepEqual(host.calls, ['verify v0.3.0', 'checkout 1111111', 'probe', 'probe', 'probe', `sudo deploy/install-kiosk.sh ${dir}/kiosk`, 'probe', 'probe', 'probe']);
+  assert.deepEqual(host.calls, ['verify v0.3.0', 'checkout 1111111', 'probe', 'probe', 'probe', 'probe', `sudo deploy/install-kiosk.sh ${dir}/kiosk`, 'probe', 'probe', 'probe']);
   assert.equal(host.live.kiosk, shas['v0.3.0']);
   const pass = line(`component=kiosk sha=${shas['v0.3.0']} health=pass rollback=none`);
   assert.deepEqual(host.comments, [['MET-301', pass]]);
@@ -1553,12 +1602,33 @@ test('sandbox: the installer rechecks after an eligible plan; a generation chang
     assert.equal(action.reason, 'irreversible-action');
     assert.equal(action.diagnose, undefined, 'no log reader');
   }
-  // Control: an installer failure without a refusal plan line is still an ordinary red receipt.
-  const red = world({ ...meterRelease, tags: ['v0.2.9', 'v0.3.0'], ledger: baseline() });
-  t.after(red.cleanup);
-  const redSudo = red.effects.sudo;
-  red.effects.sudo = (script, args) => args.includes('--no-db-change') ? { ok: false, output: `${v2Plan}\nERROR: Required command missing: zstd\nNo deployment changes made; no rollback snapshot exists.\n` } : redSudo(script, args);
-  await assert.rejects(main(red.effects), /health=fail rollback=none/);
+  // Control: an installer failure without a refusal plan line is still an ordinary red receipt. Before any
+  // change it is `unchanged` (Todo + Bug) only when the meter is still healthy on its captured release;
+  // degraded or unavailable beforehand it stays `none` and pages failed-rollback.
+  for (const [name, options, rollback] of [['healthy', {}, 'unchanged'], ['degraded', { startDegraded: ['meter'] }, 'none'], ['unavailable', { unreachable: ['meter'] }, 'none']] as const) {
+    const red = world({ ...meterRelease, tags: ['v0.2.9', 'v0.3.0'], ledger: baseline(), ...options });
+    t.after(red.cleanup);
+    const redSudo = red.effects.sudo;
+    red.effects.sudo = (script, args) => args.includes('--no-db-change')
+      ? (red.calls.push(`sudo ${script}`), { ok: false, output: `${v2Plan}\nERROR: Required command missing: zstd\nNo deployment changes made; no rollback snapshot exists.\n` })
+      : redSudo(script, args);
+    await assert.rejects(main(red.effects), new RegExp(`health=fail rollback=${rollback}$`), name);
+    assert.deepEqual(sudoCalls(red.calls), ['sudo deploy/install-meter.sh'], `${name}: no rollback subprocess`);
+    assert.equal(red.live.meter, shas['v0.2.9'], name);
+    const fail = line(`component=meter sha=${shas['v0.3.0']} health=fail rollback=${rollback}`);
+    assert.deepEqual(red.comments, [['MET-364', fail]], name);
+    assert.equal(red.ledger().lastTag, 'v0.3.0', `${name}: a red receipt completes the release`);
+    const action = deploying(fail);
+    if (rollback === 'none') {
+      assert.deepEqual([action.kind, (action as { reason?: string }).reason], ['page', 'failed-rollback'], name);
+      continue;
+    }
+    const todo = action as Extract<Action, { kind: 'set-status' }>;
+    assert.deepEqual([todo.kind, todo.status, todo.followUp?.title], ['set-status', 'Todo', 'Deploy failed: meter at 111111111111']);
+    assert.deepEqual(todo.diagnose, parseDeployReceipt(fail), 'the log reader still attaches the installer output');
+    assert.match(todo.followUp!.body, /refused before changing anything/);
+    assert.doesNotMatch(`${todo.reason}\n${todo.followUp!.body}`, /rolled back/);
+  }
 });
 
 test('sandbox: an eligible v2 plan precedes every installer, meter installs with --no-db-change, and the pass receipt is unchanged', async t => {
@@ -1610,7 +1680,7 @@ test('sandbox: a Cargo.lock-only release installs and probes meter, factory-api 
     `sudo deploy/install-factory-api.sh ${dir}/factory-api-linux-x86_64`,
     `sudo deploy/install-kiosk.sh ${dir}/kiosk`,
   ]);
-  assert.equal(host.calls.filter(call => call === 'probe').length, 3 + 3 * 3, 'three baseline reads, then each component\'s window');
+  assert.equal(host.calls.filter(call => call === 'probe').length, 3 + 3 * (1 + 3), 'three baseline reads, then each component\'s pre-install identity and window');
   assert.deepEqual(host.live, { meter: shas['v0.3.0'], 'factory-api': shas['v0.3.0'], kiosk: shas['v0.3.0'] });
   assert.deepEqual(host.comments, [['MET-301', line(`component=meter+factory-api+kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
   // Already installed at this SHA: a rerun of the same release installs nothing more.

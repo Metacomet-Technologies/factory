@@ -109,6 +109,27 @@ test('deploy receipts: no receipt waits, healthy is Done, rolled back returns to
   assert.equal(parseDeployReceipt('odd-deploy host=x component=y sha=zz health=pass rollback=none'), undefined);
 });
 
+test('an unchanged red receipt (refused before change, prior release re-proven) is Todo plus a Bug that says no rollback ran; never a failed-rollback page', () => {
+  const line = 'odd-deploy host=factory-gpu component=kiosk sha=abcdef1234 health=fail rollback=unchanged';
+  const receipt = parseDeployReceipt(line);
+  assert.deepEqual(receipt, { host: 'factory-gpu', component: 'kiosk', sha: 'abcdef1234', health: 'fail', rollback: 'unchanged' });
+  assert.equal(deployReceiptLine(receipt!), line);
+  assert.deepEqual(nextAction(issue({ status: 'Deploying', deployReceipt: receipt }), idle), {
+    kind: 'set-status', status: 'Todo', diagnose: receipt, reason: 'refused before change; kiosk still healthy on its previous release',
+    followUp: {
+      title: 'Deploy failed: kiosk at abcdef1234',
+      body: `The kiosk installer for MET-1 refused before changing anything on factory-gpu; no rollback ran, and three probes found the previous healthy release still serving.\n\n\`\`\`\n${line}\n\`\`\`\n\nRead \`journalctl -u factory-deploy\` on factory-gpu for the installer and probe output.`,
+    },
+  });
+  // Control: an unproven recovery still pages failed-rollback, and a real rollback still says so.
+  assert.equal((nextAction(issue({ status: 'Deploying', deployReceipt: parseDeployReceipt(line.replace('unchanged', 'none')) }), idle) as { reason?: string }).reason, 'failed-rollback');
+  const rolledBack = nextAction(issue({ status: 'Deploying', deployReceipt: parseDeployReceipt(line.replace('unchanged', '/var/backups/kiosk/snap')) }), idle) as Extract<Action, { kind: 'set-status' }>;
+  assert.equal(rolledBack.reason, 'rolled back to /var/backups/kiosk/snap');
+  assert.match(rolledBack.followUp!.body, /^MET-1 was rolled back on factory-gpu\./);
+  // `unchanged` is only a red receipt's outcome.
+  for (const health of ['pass', 'refused']) assert.equal(parseDeployReceipt(line.replace('health=fail', `health=${health}`)), undefined, health);
+});
+
 test('a refused deploy receipt is its own type: it pages irreversible-action, never reads as pass, unchanged or a failed rollback, and malformed refusals do not parse', () => {
   const refused = 'odd-deploy host=factory-gpu component=meter sha=abcdef1234 health=refused rollback=none refusal=db-changing-v1';
   const receipt = parseDeployReceipt(`note\n${refused}\n`);

@@ -107,7 +107,8 @@ export function contractOf(description: string, risk: RiskClass | undefined): st
   return createHash('sha256').update(text).digest('hex').slice(0, 12);
 }
 
-/** `component` is the `+`-joined set the release installed (`none` when it touched no enabled component), or the component that failed or was refused. */
+/** `component` is the `+`-joined set the release installed (`none` when it touched no enabled component), or the component that failed or was refused.
+ * `rollback` is the restored snapshot, `unchanged` (fail only: refused before any change, prior healthy release re-proven), or `none`. */
 export type DeployReceipt = { host: string; component: string; sha: string; health: 'pass' | 'fail' | 'refused'; rollback: 'none' | string; refusal?: Refusal };
 
 /** Why the Deployer installed nothing: the meter plan would change the DB generation (fresh, legacy or v1 migration) or could not be
@@ -334,7 +335,7 @@ export function parseDeployReceipt(text: string): DeployReceipt | undefined {
   const match = /^odd-deploy host=(\S+) component=(\S+) sha=([a-f0-9]{7,40}) health=(pass|fail|refused) rollback=(\S+)(?: refusal=(db-changing-(?:fresh|legacy|v1|unknown|snapshot)))?$/m.exec(text);
   if (!match) return undefined;
   const refused = match[4] === 'refused';
-  if (refused !== (match[6] !== undefined) || (refused && match[5] !== 'none')) return undefined;
+  if (refused !== (match[6] !== undefined) || (refused && match[5] !== 'none') || (match[5] === 'unchanged' && match[4] !== 'fail')) return undefined;
   return { host: match[1], component: match[2], sha: match[3], health: match[4] as DeployReceipt['health'], rollback: match[5], ...(refused ? { refusal: match[6] as Refusal } : {}) };
 }
 
@@ -507,10 +508,16 @@ function proceed(issue: IssueSnapshot, load: Load, now: number): Action {
     }
     if (receipt.health === 'fail' && receipt.rollback === 'none') return { kind: 'page', reason: 'failed-rollback', detail: `${receipt.component} on ${receipt.host} unhealthy at ${receipt.sha}: ${line}`, diagnose: receipt };
     if (receipt.health === 'fail') {
-      return { kind: 'set-status', status: 'Todo', reason: `rolled back to ${receipt.rollback}`, diagnose: receipt, followUp: {
-        title: `Deploy failed: ${receipt.component} at ${receipt.sha.slice(0, 12)}`,
-        body: `${issue.identifier} was rolled back on ${receipt.host}.\n\n\`\`\`\n${line}\n\`\`\`\n\nRead \`journalctl -u factory-deploy\` on ${receipt.host} for the installer and probe output.`,
-      } };
+      // `unchanged`: the installer refused before its snapshot and three probes found the exact prior healthy release; no rollback ran.
+      const unchanged = receipt.rollback === 'unchanged';
+      return { kind: 'set-status', status: 'Todo', diagnose: receipt,
+        reason: unchanged ? `refused before change; ${receipt.component} still healthy on its previous release` : `rolled back to ${receipt.rollback}`,
+        followUp: {
+          title: `Deploy failed: ${receipt.component} at ${receipt.sha.slice(0, 12)}`,
+          body: `${unchanged
+            ? `The ${receipt.component} installer for ${issue.identifier} refused before changing anything on ${receipt.host}; no rollback ran, and three probes found the previous healthy release still serving.`
+            : `${issue.identifier} was rolled back on ${receipt.host}.`}\n\n\`\`\`\n${line}\n\`\`\`\n\nRead \`journalctl -u factory-deploy\` on ${receipt.host} for the installer and probe output.`,
+        } };
     }
     // Green receipt: the Verifier judges the Done-means items against the deployed system and
     // posts `odd-verify` for the receipt's SHA (verifyLine). A failed verification waits on the
