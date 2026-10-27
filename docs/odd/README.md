@@ -108,7 +108,7 @@ defines Amp-native agents for the roles that need Amp coordination tools.
 
 | Role | Trigger | Produces | Authority | Engine | Loop budget | Escalates when |
 | --- | --- | --- | --- | --- | --- | --- |
-| Intake | Slack message in `#factory-intake`; Linear issue in `Triage` without a type or area label (Backlog is never triaged). | A Linear issue in the template, or a comment on the existing issue, with `area:*`, type and a duplicate check. | Create and edit *its own* issue; link duplicates. | Plugin agent pinned to `openai/gpt-6-astra` low (ChatGPT). | 1 turn + 2 continuations. | Never. Ambiguity becomes a question inside the spec. |
+| Intake | Slack message in `#factory-intake` from Devon (`U07M44KLR24`) or Dave (`U07M44L2DLY`), matched by user ID; Linear issue in `Triage` without a type or area label (Backlog is never triaged). | A Linear issue in the template, or a comment on the existing issue, with `area:*`, type and a duplicate check. | Create and edit *its own* issue; link duplicates. | Plugin agent pinned to `openai/gpt-6-astra` low (ChatGPT). | 1 turn + 2 continuations. | Never. Ambiguity becomes a question inside the spec. |
 | Spec | Issue reaches `Triage` with a type and area. | `## Isolation`, `## Build`, `## Done means`, `## Evidence`, size estimate, risk class. Status moves to `Todo`. | Edit its own issue; split into children; mark blocked-by. | Plugin agent pinned to `openai/gpt-6-astra` medium (ChatGPT). | 1 turn + 3 continuations. | Risk class is `irreversible` or `security` and no existing pattern covers it. |
 | Builder | Issue in `Todo` labelled `odd` with a free build slot. | A PR whose body carries the Evidence section filled with real output; the same thread and branch across review rounds. | Push to its own branch; open and update its PR; comment on its issue. | Claude Code (`claude-opus-5-5`, effort high) on an orb, launched through the CLI and served by the Claude Subscription (§6). | A fixed 120-minute correction budget per epoch (§8); 3 review rounds for a history without one. | Budget deadline (`budget-ceiling`), a changed contract, a safety condition, or Isolation cannot be respected. |
 | Reviewer | PR head SHA with CI green and no verdict for that SHA. | Verdict `ready` or `changes` as a PR comment and the thread label `odd-verdict-<ready\|changes>-<sha12>`, findings bound to the SHA; reruns Evidence commands itself in its own orb. | Request changes; approve. Never pushes to the builder's branch. GitHub refuses a review on a PR the same account opened, so the verdict is a comment, not a review. | Plugin agent pinned to ChatGPT `openai/gpt-6-astra` or SuperGrok (`Cursor`) `xai/grok-4.7`, high reasoning, never the Builder's lab (§6). | 1 per SHA; 2 rounds after a Watchdog cancellation. | Second spent round (page: budget ceiling). Re-reviews focus on the delta and the affected proof, still rerun every Evidence line and the mandatory checks, and label any reused investigation historical. |
@@ -198,7 +198,7 @@ keyed by `issue + stage + SHA`).
 | --- | --- | --- | --- |
 | `issue.create`, `issue.update` (status, labels) | Linear webhook | Compute next action for that issue. | Spec, Builder, or nothing. |
 | `comment.create` on an issue with an owner thread | Linear webhook | Decision model: is this a human instruction? If yes, `appendUserMessage({steer:true})` to the owner thread. | — |
-| `message` in `#factory-intake` | Slack (Amp Slack integration or webhook) | Spawn Intake with the message and permalink. | Intake |
+| `message` in `#factory-intake` from an allowed user ID | Slack poll every 5 min (P3.12, below) | Spawn Intake with the channel, ts and the message as escaped data. | Intake |
 | `pull_request.opened/synchronize` | GitHub webhook | Record head SHA; wait for `check_suite`. | — |
 | `check_suite.completed` success on a PR head | GitHub webhook | If no verdict for SHA: spawn Reviewer. | Reviewer |
 | `check_suite.completed` failure | GitHub webhook | Steer the builder thread with the failing job names; count a round. | — |
@@ -421,6 +421,7 @@ Each artifact is machine-checkable before the next role starts.
 | Release would change the meter DB generation (`health=refused` receipt) | Deployer, then control plane | Slack DM (`irreversible-action`), `escalated` label | Not executed: nothing in the release installs and `lastTag` holds until Devon migrates manually and clears the held receipt. |
 | Role round budget spent (builder 3, reviewer 2, verifier 2, intake and spec 1) after a Watchdog cancellation | Control plane | Slack DM (`budget-ceiling`), `escalated` label, `odd-escalated` comment, PR back to draft when one exists | Issue waits with no owner thread until Devon removes `escalated`; the next evaluation starts a fresh round. |
 | Soft caps exceeded for 60 min | Watchdog sweep | `#factory-alerts`, once per episode | Launches already stop at the caps; the alert only reports it. |
+| Slack intake poll failing three times in a row (P3.12) | Control plane | `#factory-alerts`, once per episode, retried on the next failure until Slack takes it; a clean poll ends the episode | Messages wait in the channel; nothing is handed past one not yet handed. |
 | Control plane blind (every sweep failing for 15 min) | Watchdog sweep | Slack DM (`control-plane-blind`), once per episode | Backstop poller runs the lifecycle at 60 s cadence (phase 7). |
 | Pinned model served off its subscription (arm check), or a role thread's usage routed elsewhere or missing (on archive) | Control plane | Slack DM (`subscription-mismatch`) once per thread; `odd-routing` comment on the issue | Roles keep their pinned models; nothing is relaunched on another engine. |
 | Control plane silent (no heartbeat for 20 min) | Runner poller | Journal line `odd-backstop-resume`, once per episode | The poller runs the lifecycle until a fresh heartbeat. |
@@ -543,6 +544,33 @@ Comment or `issueId`-carrying delivery that still resolves nothing is recorded
 never the payload, URL or signature. This is defensive: no live outage is
 proven: the audited receipts were all handled within the Watchdog sweep
 interval, and the sweep re-reads every live issue whatever its webhooks did.
+
+Slack intake (P3.12). Every 5 minutes the control plane reads every page of
+`#factory-intake` (P4.5) and hands each new top-level message to its own
+Intake thread through admission (P4.1), oldest first.
+
+- Authority is the exact Slack `userID`: Devon `U07M44KLR24` and Dave
+  `U07M44L2DLY` (`intakeAuthors` in `scripts/odd/intake.ts`). Messages from
+  any other or missing ID are ignored; display and resolved names are never
+  identity.
+- The prompt carries the channel and ts and the exact Context line
+  `Source: Slack #factory-intake ts <ts>`; the text is one JSON string in a
+  fenced block, with `<`, `>` and backticks escaped, so no text in it can
+  close the block or pass as instructions.
+- Handed is not done. The thread label `odd-slack-<ts>` and the
+  `inbox_tray` reaction mark a message handed; a reload, or a reaction Slack
+  refused, finds the labelled thread (archived or not) and hands nothing
+  twice. The first message that waits for admission or fails ends the poll,
+  and the read window (`intakeLookback`) reaches back to it past two days.
+- The outcome is the issue Intake names with its thread label
+  `odd-outcome-<met-n>`, whose Context records the message's channel and
+  exact ts. That is the Slack Intake thread's external stop, read from Linear
+  by the Ralph guard, and an idle Slack Intake thread is archived only once
+  it holds. A thread without an outcome stays unarchived (idle threads hold
+  no slot) until Devon archives it.
+- Failed polls (a read, a reaction, an outcome read or an archive) are
+  counted in memory; the third in a row posts one alert to `#factory-alerts`,
+  and the next clean poll resets the count. A reload starts the count anew.
 
 Signing secrets (MET-382): the project environment takes precedence over
 private input, per provider.
