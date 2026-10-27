@@ -48,7 +48,7 @@ new=$(mktemp -d /usr/local/lib/.factory-deploy.XXXXXX)
 cp -R -- "$source/." "$new/"
 chown -R root:root "$new"
 chmod -R u+rwX,go+rX,go-w "$new"
-(cd "$new" && find . -type f -printf '%P\0' | LC_ALL=C sort -z | xargs -0 sha256sum --) > "$new/.SHA256SUMS"
+(cd "$new" && find . -type f ! -path ./.SHA256SUMS -printf '%P\0' | LC_ALL=C sort -z | xargs -0 sha256sum --) > "$new/.SHA256SUMS"
 mv -T -- "$new/.SHA256SUMS" "$new/SHA256SUMS"
 chmod 0644 "$new/SHA256SUMS"
 chmod 0755 "$new"
