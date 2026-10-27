@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { nextAction, specComplete, ralphGuard, parseDeployReceipt, deployReceiptLine, parseVerify, parseCancelled, pageText, verifyLine, cancelledLine, threadLabels, parseThreadLabels, capacity, issueTriaged, controlPlaneSilent, heartbeatLine, parseHeartbeat, silenceMs, waitAge, waitBudgets, parseSteer, steerLine, type Action, type IssueSnapshot, type PageReason, type Wait } from './lifecycle.ts';
+import { budgetLine, contractOf, correctionWindowMs, parseBudget, parseEscalation, escalationLine, reassessment, nextAction, specComplete, ralphGuard, parseDeployReceipt, deployReceiptLine, parseVerify, parseCancelled, pageText, verifyLine, cancelledLine, threadLabels, parseThreadLabels, capacity, issueTriaged, controlPlaneSilent, heartbeatLine, parseHeartbeat, silenceMs, waitAge, waitBudgets, parseSteer, steerLine, type Action, type Budget, type IssueSnapshot, type PageReason, type Wait } from './lifecycle.ts';
 
 const spec = `## Goal
 Ship it.
@@ -75,13 +75,13 @@ test('changes steer the live builder; the third rejected head pages instead of l
   const pr = { number: 9, headSha: sha, ci: 'success' as const, merged: false, verdict: { state: 'changes' as const, sha }, changesRounds: 2 };
   const owner = { role: 'builder' as const, threadID: 'T-1', round: 1, state: 'idle' as const };
   assert.deepEqual(nextAction(issue({ status: 'In Progress', pr, owner }), idle),
-    { kind: 'steer', role: 'builder', threadID: 'T-1', key: `changes-${sha.slice(0, 12)}`, message: `QA requested changes at ${sha}; see the odd-verdict comment on PR #9. Address every finding, rerun the Evidence commands, push to the same branch.` });
+    { kind: 'steer', role: 'builder', threadID: 'T-1', key: `changes-${sha.slice(0, 12)}`, message: `QA requested changes at ${sha}; see the odd-verdict comment on PR #9. Address every finding, rerun the Evidence commands, push to the same branch. ${reassessment}` });
   assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: { ...pr, changesRounds: 3 }, owner }), idle),
     { kind: 'page', reason: 'third-failed-qa-round', detail: 'MET-1: PR #9 rejected 3 times', pr: 9, sha });
   assert.equal(nextAction(issue({ status: 'In Progress', pr, owner: { ...owner, state: 'running' } }), idle).kind, 'wait');
   assert.deepEqual(nextAction(issue({ status: 'In Progress', labels: ['escalated'], pr, owner }), idle), { kind: 'wait', reason: 'escalated to Devon' });
   // No live builder thread: the next round spawns one; the builder rounds are counted on the PR, not the thread.
-  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr }), idle), { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'qa changes, round 3', round: 1 });
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr }), idle), { kind: 'spawn', role: 'builder', executor: 'orb', reason: 'qa changes, round 3; design reassessment required', round: 1 });
 });
 
 test('deploy receipts: no receipt waits, healthy is Done, rolled back returns to Todo with a Bug, unhealthy without rollback pages; red ones ask for a log reader', () => {
@@ -260,4 +260,89 @@ test('P3.1: a delivered steer is not repeated; the issue waits for the answer fr
   assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: pushed, owner, steers: { [key]: at } }), idle).kind, 'steer');
   assert.deepEqual(parseSteer(`note\n${steerLine(key, 'T-1')}`), { key, threadID: 'T-1' });
   for (const reason of ['wait-overdue', 'action-failed', 'plane-blocked'] as const) assert.match(pageText('MET-1', { kind: 'page', reason, detail: 'x' }), /default if silent: .*nothing .*automatically|default if silent: the issue keeps waiting/);
+});
+
+// --- MET-348: outcome correction budget --------------------------------------------------------
+
+const t0 = Date.parse('2026-10-27T03:00:00.000Z');
+const grant = (over: Partial<Budget> = {}): Budget => ({ epoch: 1, start: new Date(t0).toISOString(), deadline: new Date(t0 + correctionWindowMs).toISOString(), contract: contractOf(spec, undefined), ...over });
+const rejected = (round: number, head = sha) => ({ number: 9, headSha: head, ci: 'success' as const, merged: false, verdict: { state: 'changes' as const, sha: head }, changesRounds: round });
+const builder = { role: 'builder' as const, threadID: 'T-1', round: 1, state: 'idle' as const };
+const budgeted = (round: number, budget: Budget | undefined, over: Partial<IssueSnapshot> = {}) =>
+  issue({ status: 'In Progress', pr: rejected(round), owner: builder, correction: { epoch: 1, corrected: round > 1, ...(budget ? { budget } : {}) }, ...over });
+
+test('MET-348: the first correction of an epoch records its budget before any steer or spawn', () => {
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: rejected(1), owner: builder, correction: { epoch: 1, corrected: false } }), idle, t0),
+    { kind: 'admit', budget: grant() });
+  // Without a live builder the admission still comes first.
+  assert.equal(nextAction(issue({ status: 'In Progress', pr: rejected(1), correction: { epoch: 2, corrected: false } }), idle, t0).kind, 'admit');
+  assert.equal(budgetLine(grant()), `odd-budget epoch=1 start=2026-10-27T03:00:00.000Z deadline=2026-10-27T05:00:00.000Z contract=${contractOf(spec, undefined)}`);
+  assert.deepEqual(parseBudget(budgetLine(grant())), grant());
+});
+
+test('MET-348: prior behavior paged the third rejected head; inside the budget it is corrected, and at the deadline exactly it holds', () => {
+  // Prior (no budget, legacy history): the third head pages third-failed-qa-round.
+  assert.equal((nextAction(budgeted(3, undefined), idle, t0 + 60_000) as { reason?: string }).reason, 'third-failed-qa-round');
+  // New: third and fourth heads inside the window are steered, with the design reassessment.
+  for (const round of [3, 4]) {
+    const head = round === 3 ? sha : 'd'.repeat(40);
+    const action = nextAction(issue({ status: 'In Progress', pr: rejected(round, head), owner: builder, correction: { epoch: 1, corrected: true, budget: grant() } }), idle, t0 + correctionWindowMs - 1);
+    assert.equal(action.kind, 'steer');
+    assert.ok((action as { message: string }).message.endsWith(reassessment));
+  }
+  // At the deadline exactly: budget-ceiling with the deadline, head and last blocker, whatever the issue is doing.
+  for (const over of [{}, { owner: { ...builder, state: 'running' as const } }, { pr: { ...rejected(1), verdict: { state: 'ready' as const, sha } } }]) {
+    const at = nextAction(budgeted(3, grant(), over), idle, t0 + correctionWindowMs) as Extract<Action, { kind: 'page' }>;
+    assert.equal(at.kind, 'page');
+    assert.equal(at.reason, 'budget-ceiling');
+    assert.equal(at.sha, sha);
+    assert.match(at.detail, /correction budget ended at 2026-10-27T05:00:00\.000Z/);
+    assert.match(at.detail, new RegExp(`Head ${sha}; last blocker: `));
+  }
+  assert.match(pageText('MET-1', nextAction(budgeted(3, grant()), idle, t0 + correctionWindowMs) as Extract<Action, { kind: 'page' }>), /default if silent: nothing more is started, steered or merged for the issue; running work and its results are kept/);
+  // A ready verdict at a green current head one millisecond before the deadline merges normally.
+  assert.deepEqual(nextAction(budgeted(1, grant(), { pr: { ...rejected(1), verdict: { state: 'ready', sha } } }), idle, t0 + correctionWindowMs - 1), { kind: 'merge', pr: 9, sha });
+  // A ready verdict for an older head never merges the current one.
+  assert.equal(nextAction(budgeted(1, grant(), { pr: { ...rejected(1), verdict: { state: 'ready', sha: 'd'.repeat(40) } } }), idle, t0).kind, 'spawn');
+});
+
+test('MET-348: a changed contract or untrusted budget state holds instead of granting time; cosmetic edits and new heads do not', () => {
+  const changed = spec.replace('- doc merged', '- doc merged and announced');
+  assert.match((nextAction(budgeted(2, grant(), { description: changed }), idle, t0) as { detail: string }).detail, /accepted contract changed/);
+  assert.equal((nextAction(budgeted(2, grant(), { risk: 'security' }), idle, t0) as { reason: string }).reason, 'budget-ceiling');
+  // A trailing note outside the contract sections (in Goal-less text) and a new head keep the grant.
+  assert.equal(nextAction(budgeted(2, grant(), { description: `${spec}  ` , pr: rejected(2, 'e'.repeat(40)) }), idle, t0).kind, 'steer');
+  const invalid = issue({ status: 'In Progress', pr: rejected(2), owner: builder, correction: { epoch: 1, corrected: true, invalid: 'malformed odd-budget comment' } });
+  assert.match((nextAction(invalid, idle, t0) as { detail: string }).detail, /cannot be trusted \(malformed odd-budget comment\); no time is granted/);
+  assert.equal(parseBudget('odd-budget epoch=1 start=2026-10-27T03:00:00.000Z deadline=2026-10-27T07:00:00.000Z contract=abcdefabcdef'), 'malformed', 'a window longer than 120 min');
+  assert.equal(parseBudget('odd-budget epoch=0 start=x'), 'malformed');
+});
+
+test('MET-348: the latch finishes its missing steps, waits while labelled, and resumes once only after the label is removed', () => {
+  const line = escalationLine({ reason: 'budget-ceiling', pr: 9, sha, done: ['page', 'label'] });
+  assert.equal(line, `odd-escalated reason=budget-ceiling pr=9 sha=${sha} done=label,page`);
+  assert.deepEqual(parseEscalation(`${line}\n\ndetail`), { reason: 'budget-ceiling', pr: 9, sha, done: ['label', 'page'], detail: 'detail' });
+  assert.equal(parseEscalation('odd-escalated reason=third-failed-qa-round\n\nMET-1: PR #9 rejected 3 times'), 'legacy');
+  assert.equal(parseEscalation('odd-escalated reason=budget-ceiling done=everything'), 'malformed');
+  const latch = { id: 'c-9', reason: 'budget-ceiling' as const, pr: 9, sha, done: ['label' as const, 'page' as const], detail: 'd' };
+  const latched = (over: Partial<IssueSnapshot>) => issue({ status: 'In Progress', pr: rejected(3), owner: builder, escalation: latch, labels: ['escalated'], ...over });
+  assert.deepEqual(nextAction(latched({}), idle, t0), { kind: 'page', reason: 'budget-ceiling', detail: 'd', pr: 9, sha, latch: { id: 'c-9', done: ['label', 'page'] } });
+  // A running worker does not delay the remaining steps.
+  assert.equal(nextAction(latched({ owner: { ...builder, state: 'running' } }), idle, t0).kind, 'page');
+  assert.deepEqual(nextAction(latched({ escalation: { ...latch, done: ['label', 'draft', 'page', 'archive'] } }), idle, t0), { kind: 'wait', reason: 'escalated to Devon' });
+  assert.deepEqual(nextAction(latched({ labels: [], correction: { epoch: 1, corrected: true } }), idle, t0), { kind: 'resume', escalation: 'c-9', epoch: 2 });
+  // The label was never set: removing nothing is not a resume; the label step is retried.
+  assert.equal(nextAction(latched({ labels: [], escalation: { ...latch, done: [] } }), idle, t0).kind, 'page');
+  // A legacy label with no latch keeps holding.
+  assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: rejected(3), labels: ['escalated'] }), idle, t0), { kind: 'wait', reason: 'escalated to Devon' });
+});
+
+test('MET-348: safety escalations stay immediate whatever budget remains', () => {
+  const receipt = parseDeployReceipt('odd-deploy host=factory-gpu component=kiosk sha=abcdef1234 health=fail rollback=none')!;
+  const deploying = issue({ status: 'Deploying', deployReceipt: receipt, correction: { epoch: 1, corrected: true, budget: grant() } });
+  assert.equal((nextAction(deploying, idle, t0) as { reason: string }).reason, 'failed-rollback');
+  const refused = parseDeployReceipt('odd-deploy host=factory-gpu component=meter sha=abcdef1234 health=refused rollback=none refusal=db-changing-legacy')!;
+  assert.equal((nextAction({ ...deploying, deployReceipt: refused }, idle, t0) as { reason: string }).reason, 'irreversible-action');
+  // A risk decision still waits on a human regardless of any budget.
+  assert.equal((nextAction(issue({ status: 'Triage', labels: ['Bug', 'area:agents'], description: 'x', risk: 'security', correction: { epoch: 1, corrected: false, budget: grant() } }), idle, t0) as { reason: string }).reason, 'risk security needs a human decision');
 });

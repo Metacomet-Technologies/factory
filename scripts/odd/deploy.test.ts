@@ -1252,6 +1252,7 @@ function pluginContext(found: { id: string }[] = [], fail?: string) {
       if (name === 'find_thread') return { threads: found };
       if (name === 'linear.list_issues') return { issues: bugs.map(title => ({ id: 'MET-900', title })) };
       if (name === 'linear.save_issue' && typeof input.title === 'string') bugs.push(input.title);
+      if (name === 'linear.save_comment') return { id: input.id ?? 'c-latch' };
       return name === 'linear.save_issue' && input.title ? { identifier: 'MET-900' } : {};
     } },
     $: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
@@ -1402,14 +1403,17 @@ test('control plane, through the registered webhook: a transient Bug-lookup fail
   assert.equal(again.calls.filter(call => call === 'Bug created').length, 1);
 });
 
-test('control plane: a failed rollback pages even when its log reader cannot start, says so in the page, and sets escalated last', async () => {
+test('control plane: a failed rollback pages even when its log reader cannot start, says so in the page, and latches escalated before any side effect', async () => {
   const issue = redIssue('e'.repeat(40), 'none');
   const action = nextAction(issue, idle) as Extract<Action, { kind: 'page' }>;
   const { ctx, tools } = pluginContext();
   await page(ctx, issue, action, flakySpawn(true).spawn);
   const slack = tools.find(([tool]) => tool === 'slack_write')?.[1] as { text: string };
   assert.match(slack.text, /log reader not started: Error: runner factory-gpu offline/);
-  assert.deepEqual(tools.at(-1), ['linear.save_issue', { id: 'MET-311', addLabels: ['escalated'] }]);
+  // MET-348: the latch comment comes first, then the label; each finished step is recorded on the latch.
+  assert.deepEqual(tools[0], ['linear.save_comment', { issueId: 'MET-311', body: `odd-escalated reason=failed-rollback pr=- sha=- done=-\n\n${action.detail}` }]);
+  assert.deepEqual(tools[1], ['linear.save_issue', { id: 'MET-311', addLabels: ['escalated'] }]);
+  assert.deepEqual(tools.at(-1), ['linear.save_comment', { id: 'c-latch', body: `odd-escalated reason=failed-rollback pr=- sha=- done=label,page,archive\n\n${action.detail}` }]);
 });
 
 // MET-364: automatic deploys never change the meter DB generation.
@@ -1540,7 +1544,8 @@ test('control plane: a refused receipt pages irreversible-action with default no
   assert.ok(slack.text.includes(refused), slack.text);
   assert.deepEqual(spawned.spawned, []);
   assert.equal(tools.filter(([tool, input]) => tool === 'linear.save_issue' && (input.title || input.state)).length, 0, 'no Bug, no status change');
-  assert.deepEqual(tools.at(-1), ['linear.save_issue', { id: 'MET-364', addLabels: ['escalated'] }]);
+  assert.deepEqual(tools.find(([tool]) => tool === 'linear.save_issue'), ['linear.save_issue', { id: 'MET-364', addLabels: ['escalated'] }]);
+  assert.match(String(tools.at(-1)?.[1].body), /^odd-escalated reason=irreversible-action pr=- sha=1{40} done=label,page,archive\n/);
   assert.deepEqual(nextAction({ ...issue, labels: ['odd', 'escalated'] }, idle), { kind: 'wait', reason: 'escalated to Devon' });
 });
 

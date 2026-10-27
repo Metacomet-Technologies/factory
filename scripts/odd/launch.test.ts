@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { createHmac } from 'node:crypto';
 import { builderArgs, io, launch, type Launcher } from './launch.ts';
 import { reviewerEngines } from './engines.ts';
+import { correctionWindowMs, reassessment } from './lifecycle.ts';
 import { fakeConnections, fakeShell, servedBy } from './fixtures.ts';
 import plugin from '../../.amp/plugins/factory-odd.ts';
 
@@ -334,4 +335,20 @@ test('control plane: every plugin agent pins its model; a pin served off its sub
   assert.equal(plane.threads.get(child)!.archived, true);
   assert.match(plane.comments.find(body => body.startsWith('odd-routing'))!, /result=mismatch\n- anthropic\/claude-opus-5-5 Agent: 15 via Amp\n- problem: /);
   assert.ok(!plane.dms.join('\n').includes(fakeConnections[0].id), 'no connection IDs in pages');
+});
+
+test('MET-348: role skills and the launch contract agree on the correction budget, proof matrix, reassessment and current-head review', () => {
+  const skill = (role: string) => readFileSync(new URL(`../../.agents/skills/odd-${role}/SKILL.md`, import.meta.url), 'utf8').replace(/\s+/g, ' ');
+  const builder = skill('builder');
+  assert.match(builder, /fixed 120-minute window/);
+  assert.match(builder, /proof matrix/);
+  assert.match(builder, /After two rejected heads .*design reassessment: the invariant, competing root-cause hypotheses/);
+  assert.doesNotMatch(builder, /Up to three review rounds per PR/);
+  assert.match(reassessment, /design reassessment \(the invariant, competing root-cause hypotheses/);
+  assert.equal(correctionWindowMs, 120 * 60_000);
+  assert.match(skill('spec'), /proof matrix/);
+  const reviewer = skill('reviewer');
+  assert.match(reviewer, /self-reported output never substitutes/);
+  assert.match(reviewer, /labelled as historical, never as proof for this head/);
+  assert.match(reviewer, /cargo clippy --all-targets -- -D warnings/);
 });

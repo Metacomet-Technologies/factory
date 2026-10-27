@@ -30,13 +30,20 @@ A Linear issue in `Triage` with a type and an `area:*` label.
    a command and its expected result, or `screenshot of <state>`. Prefer
    commands already in the repository (`cargo test -p <crate>`, `vp test
    --run`, `node --test scripts/<dir>`, `scripts/env/check --env <name>`).
+   Require a reusable end-to-end proof matrix built from existing fixtures:
+   the relevant success, error, malformed and truncated cases, combined
+   failures, retries, reordered evidence and asymmetric boundary controls,
+   asserting observable effects. For control-plane, DB, deploy or permission
+   work, name the point where a result authorizes an action.
 6. Fill `## Sandbox check` from `docs/sandbox.md` when the change touches a
    service; otherwise write `none: <reason>`.
 7. Set priority 1–4 from impact and urgency. Add a risk line to `Context`:
-   `risk: ordinary | security | irreversible`. Set `engine/*` and
+   `risk: ordinary | security | authority | irreversible`. Changing Goal,
+   Isolation, Build, Done means, Evidence or risk after a build started
+   invalidates its correction budget and holds it for a human. Set `engine/*` and
    `agent-effort/*` labels per `scripts/dispatch/README.md` §"Choosing engine,
    effort and advisor" only when the default round-robin is wrong.
-8. If the work needs more than three build rounds, split into child issues,
+8. If the work will not fit one 120-minute correction budget, split into child issues,
    each with its own full spec, and mark blocked-by order.
 9. Move the issue to `Todo`. The control plane does the same on its next
    Linear event once `specComplete` holds, and moves a `Todo` issue whose

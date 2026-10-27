@@ -31,15 +31,27 @@ orb checkout.
 4. Rerun every `Evidence` line yourself at this SHA. Compare with the output
    in the PR body. A mismatch or a missing line is a blocking finding. For
    `screenshot of <state>` lines, render the state and inspect the capture.
-5. Check the issue comment for this SHA exists with PR URL, head SHA and the
+5. Judge the proof, not the Builder's report of it. The Builder's
+   self-reported output never substitutes for your own run. A re-review
+   (an earlier head of this PR has a verdict) focuses on the delta since
+   that head, the affected rows of the proof matrix and the regressions they
+   could cause, but still reruns every Evidence line and the mandatory
+   checks (`scripts/env/check`, `cargo fmt --check`, `cargo clippy
+   --all-targets -- -D warnings`, `cargo test --workspace`) and requires full
+   CI green at this head. An earlier investigation may be reused only when
+   its inputs and environment are unchanged, and only labelled as
+   historical, never as proof for this head. Safety gates are never waived;
+   style alone is not a blocking finding.
+6. Check the issue comment for this SHA exists with PR URL, head SHA and the
    full file list (AGENTS.md rule). Missing comment is a finding.
-6. Post the verdict as a PR comment whose first line is
+7. Post the verdict as a PR comment whose first line is
    `odd-verdict ready sha=<sha>` or `odd-verdict changes sha=<sha>` (GitHub
    refuses a review from the account that opened the PR, so a comment is the
    verdict). Every finding names file and line and the smallest fix. Then add
    the label `odd-verdict-<ready|changes>-<sha12>` to this thread with
    `update_thread` (`sha12` is the first 12 characters of the head SHA); the
-   control plane reads the label, not the comment.
+   control plane reads the label, not the comment. One verdict per head.
+   Report milestones and decisions in it, not routine progress.
 
 ## Authority
 

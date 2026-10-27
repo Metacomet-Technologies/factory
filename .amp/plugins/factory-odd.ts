@@ -10,12 +10,14 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { Agent, AgentThreadExecutor, PluginAPI, PluginEventContext, ThreadID, WebhookEvent, WebhookHandlerContext } from '@ampcode/plugin'
 import {
+	budgetLine,
 	cancelledLine,
 	capacity,
 	capacityWait,
 	contracts,
 	deployReceiptLine,
 	escalatedLabel,
+	escalationLine,
 	issueTriaged,
 	heartbeatLine,
 	heartbeatProject,
@@ -26,6 +28,7 @@ import {
 	parseHeartbeat,
 	parseThreadLabels,
 	ralphGuard,
+	resumeLine,
 	spawnKey,
 	spawnLine,
 	specComplete,
@@ -35,6 +38,7 @@ import {
 	waitAge,
 	type Action,
 	type DeployReceipt,
+	type EscalationStep,
 	type IssueSnapshot,
 	type Load,
 	type Role,
@@ -441,7 +445,7 @@ export default async function (amp: PluginAPI) {
 			// The issue's own reservations are left out: a pending one must reach perform's fail-closed check and page, not wait on its own slot.
 			const { load } = admittedLoad(live, [...ledger.values()].filter(held => held.issue !== issue!.identifier))
 			state.plane = { load, building: [...new Set(live.flatMap(thread => { const labels = parseThreadLabels(thread.labels); return labels.role === 'builder' && labels.issue ? [labels.issue] : [] }))].sort(), waiting: state.plane.waiting }
-			const action = nextAction(issue, load)
+			const action = nextAction(issue, load, Date.now())
 			ctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
 			entry.status = issue.status
 			entry.action = action
@@ -962,6 +966,8 @@ export default async function (amp: PluginAPI) {
 	// failed delivery writes nothing and is retried; a delivered steer whose comment failed is
 	// only recorded on the retry (`steered`).
 	const steered = new Set<string>()
+	// Latch IDs whose page Slack took in this process, in case recording the step on the latch failed.
+	const paged = new Set<string>()
 	/** Returns false when nothing was done because the action is not this control plane's to take. `touched` collects episode keys refused without an exception. */
 	async function perform(ctx: EvalContext, state: ArmState, issue: IssueSnapshot, action: Action, threads: readonly LiveThread[], usage: Partial<Record<Lab, number>> = {}, touched = new Set<string>(), comments: readonly Comment[] = []): Promise<boolean> {
 		const owned = issue.status === 'Triage' || issue.labels.includes(oddLabel)
@@ -1050,7 +1056,16 @@ export default async function (amp: PluginAPI) {
 				return true
 			}
 			case 'page':
-				await page(ctx, issue, action, spawnDeployer(ctx), threads)
+				await page(ctx, issue, action, spawnDeployer(ctx), threads, paged)
+				return true
+			// Budget and resume records change what the issue may do next, so it is evaluated again at once.
+			case 'admit':
+				await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: budgetLine(action.budget) })
+				recheck(ctx, state, issue.identifier, 0)
+				return true
+			case 'resume':
+				await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: resumeLine(action.escalation, action.epoch) })
+				recheck(ctx, state, issue.identifier, 0)
 				return true
 			default:
 				ctx.logger.log(marker, 'deferred to a later phase', action.kind)
@@ -1135,24 +1150,45 @@ export async function setStatus(ctx: Pick<WebhookHandlerContext, 'tools' | 'logg
 	await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: action.status })
 }
 
-// Escalation (§8): the issue stays In Progress with the `escalated` label (the lifecycle waits
-// on it), the PR goes back to draft so nothing merges it, and Devon gets one Slack DM in the one
-// page format (pageText). `slack_write` without a recipient DMs the thread owner. The label is
-// written last, so a failed step is retried by the next evaluation, and a page while the label
-// is present is a no-op (MET-304 paged twice). A failed rollback starts its log reader first; a
-// page is never held back by that spawn, so its failure goes into the page instead. Reviewer
-// threads holding `changes` verdicts for older heads are archived, so the round count restarts
-// when Devon clears the label.
-export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, issue: IssueSnapshot, action: Extract<Action, { kind: 'page' }>, spawn?: Spawn, threads: readonly LiveThread[] = []) {
-	if (issue.labels.includes(escalatedLabel)) {
-		ctx.logger.log(marker, 'already paged', issue.identifier, action.reason)
-		return
+// Escalation (§8) is a latch (MET-348). The `odd-escalated` comment is written before any side
+// effect, so the lifecycle holds from then on; each step after it (the `escalated` label, the PR
+// back to draft so nothing merges it, one Slack DM in the one page format, archiving reviewer
+// threads with `changes` verdicts for older heads so the next epoch counts afresh) is recorded on
+// the latch once it succeeded. A failed step does not stop the others, the evaluation fails, and
+// the next one retries only the missing steps (nextAction returns the page with its latch), so a
+// partial failure loses no notification and repeats none: the DM is also remembered here, for a
+// latch record that failed after Slack took it. `slack_write` without a recipient DMs the thread
+// owner. A failed rollback starts its log reader before the DM; a page is never held back by that
+// spawn, so its failure goes into the page instead.
+export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, issue: IssueSnapshot, action: Extract<Action, { kind: 'page' }>, spawn?: Spawn, threads: readonly LiveThread[] = [], delivered = new Set<string>()) {
+	const done = new Set<EscalationStep>(action.latch?.done ?? [])
+	const body = () => `${escalationLine({ reason: action.reason, pr: action.pr, sha: action.sha, done: [...done] })}\n\n${action.detail}`
+	let id = action.latch?.id
+	if (!id) id = (await callJson<{ id?: string } | undefined>(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: body() }))?.id
+	const failures: unknown[] = []
+	const step = async (name: EscalationStep, run: () => Promise<void>) => {
+		if (done.has(name)) return
+		try {
+			await run()
+			done.add(name)
+			if (id) await callJson(ctx.tools, 'linear.save_comment', { id, body: body() })
+		} catch (error: unknown) {
+			failures.push(error)
+		}
+	}
+	await step('label', async () => {
+		if (!issue.labels.includes(escalatedLabel)) await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, addLabels: [escalatedLabel] })
+	})
+	if (action.pr !== undefined) {
+		await step('draft', async () => {
+			const draft = await ctx.$`gh pr ready ${String(action.pr)} --undo`
+			if (draft.exitCode !== 0) throw new Error(`gh pr ready ${action.pr} --undo failed: ${draft.stderr.trim()}`)
+		})
 	}
 	let detail = action.detail
-	// The page is never held back by its log reader. A failed read on the way is still a failed read: it is
-	// rethrown once the page is out, so the sweep does not report this evaluation healthy.
+	// A failed read on the way is still a failed read: it is rethrown once the page is out, so the sweep does not report this evaluation healthy.
 	let unread: ReadError | undefined
-	if (action.diagnose && spawn) {
+	if (!done.has('page') && action.diagnose && spawn) {
 		try {
 			await diagnose(ctx, issue, action.diagnose, undefined, spawn)
 		} catch (error: unknown) {
@@ -1160,22 +1196,22 @@ export async function page(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'log
 			detail += ` (log reader not started: ${String(error)}; read journalctl -u factory-deploy on ${action.diagnose.host})`
 		}
 	}
-	try {
-		if (action.pr !== undefined) {
-			const draft = await ctx.$`gh pr ready ${String(action.pr)} --undo`
-			if (draft.exitCode !== 0) ctx.logger.log(marker, 'draft failed', action.pr, draft.stderr.trim())
-		}
-		await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: `odd-escalated reason=${action.reason}\n\n${detail}` })
-		await ctx.tools.call('slack_write', { text: `${marker} ${pageText(issue.identifier, { ...action, detail })} Remove the \`${escalatedLabel}\` label to resume.` })
+	await step('page', async () => {
+		if (id && delivered.has(id)) return
+		const sent = (await ctx.tools.call('slack_write', { text: `${marker} ${pageText(issue.identifier, { ...action, detail })} Remove the \`${escalatedLabel}\` label to resume.` })) as { isError?: boolean } | undefined
+		if (sent?.isError) throw new Error(`slack_write reported an error for the ${action.reason} page`)
+		if (id) delivered.add(id)
+	})
+	await step('archive', async () => {
 		const head = issue.pr?.headSha.slice(0, 12)
-		const spent = threads.filter(thread => thread.labels.some(label => {
+		await archiveThreads(ctx, threads.filter(thread => thread.labels.some(label => {
 			const match = verdictPattern.exec(label)
 			return match?.[1] === 'changes' && match[2] !== head
-		}))
-		await archiveThreads(ctx, spent)
-		await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, addLabels: [escalatedLabel] })
-	} catch (error: unknown) {
-		// A failed page write after a failed read keeps the read classification, and names both failures.
+		})))
+	})
+	if (failures.length) {
+		const error = failures[0]
+		// A failed page step after a failed read keeps the read classification, and names both failures.
 		if (unread) throw new ReadError(`${unread.message}; then the page failed: ${String(error)}`)
 		throw error
 	}
