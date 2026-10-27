@@ -172,7 +172,7 @@ export type PageReason = 'third-failed-qa-round' | 'failed-rollback' | 'irrevers
 /** What happens when Devon does not answer a page (docs/odd/README.md §8); every page states it. */
 export const pageDefaults: Record<PageReason, string> = Object.freeze({
   'third-failed-qa-round': 'issue stays In Progress and the PR stays a draft until the `escalated` label is removed',
-  'failed-rollback': 'component stays on the previous release; deploys of that component pause',
+  'failed-rollback': 'recovery is not confirmed: the component may stay degraded on the failed release or in an unknown state and needs attention; nothing pauses, and the next release retries it',
   'irreversible-action': 'not executed',
   'security-finding': 'issue stays In Progress; nothing merges',
   'budget-ceiling': 'nothing more is started, steered or merged for the issue; running work and its results are kept until the `escalated` label is removed',
