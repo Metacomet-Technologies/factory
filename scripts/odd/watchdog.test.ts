@@ -118,7 +118,7 @@ function controlOrb(override: (name: string, input: Record<string, unknown>) => 
         if (input.state !== 'Triage') return { issues: [], hasNextPage: false, cursor: '' };
         return input.cursor === 'page-2' ? { issues: triage.slice(100), hasNextPage: false, cursor: 'end' } : { issues: triage.slice(0, 100), hasNextPage: true, cursor: 'page-2' };
       case 'linear.get_issue': evaluated.push(String(input.id)); return { id: input.id, status: 'Done', labels: [], description: '', relations: { blockedBy: [] } };
-      case 'linear.list_comments': return { comments: [] };
+      case 'linear.list_comments': return { comments: [], hasNextPage: false };
       case 'find_thread':
         if (input.query !== 'label:odd-role-builder archived:false') return { threads: [] };
         return input.cursor === 'threads-2' ? { threads: [{ id: 'T-200' }] } : { threads: [{ id: 'T-199' }], nextCursor: 'threads-2' };
@@ -1250,7 +1250,7 @@ test('P3.7: a recovered receipt keeps a deployment of a release containing the m
         // Let the issue follow its status writes, so the next evaluation sees Deploying.
         plant.control.inject = (call, input) => {
           if (call === 'linear.save_issue' && typeof input.state === 'string') plant.issues.get(String(input.id))!.status = input.state;
-          if (call === 'linear.list_comments' && oldestFirst) return { comments: [...(plant.comments.get(String(input.issueId)) ?? [])] };
+          if (call === 'linear.list_comments' && oldestFirst) return { comments: [...(plant.comments.get(String(input.issueId)) ?? [])], hasNextPage: false };
           return undefined;
         };
         if (unreadable) plant.control.gh = command => command.startsWith('gh api repos/{owner}/{repo}/compare/') && command.includes(`...${unreadable}`) ? { exitCode: 1, stdout: '', stderr: 'HTTP 502' } : undefined;
@@ -1297,7 +1297,7 @@ function signedOrb() {
       case 'linear.list_issues': return { issues: [], hasNextPage: false };
       case 'find_thread': return { threads: [] };
       case 'linear.get_issue': reads.push(String(input.id)); return { id: input.id, status: 'Todo', labels: ['odd'], description: '', relations: { blockedBy: [] } };
-      case 'linear.list_comments': return { comments: [] };
+      case 'linear.list_comments': return { comments: [], hasNextPage: false };
       case 'slack_read': return { messages: [] };
       case 'linear.get_status_updates': return { statusUpdates: [], hasNextPage: false };
       default: if (name !== 'linear.save_status_update') effects.push(name); return {};
@@ -1511,10 +1511,11 @@ test('P4.5: an owned open PR beyond the first 100 and a merged one beyond 100 se
 // page's last row, as overlapping pages can. A shape breaks the page after the first (or the
 // first page's cursor) until `broken` is cleared; the recovery step then reruns the consumer.
 // Every row asserts what the plane did, so a failure prints the concrete wrong decision.
-type Shape = 'complete' | 'empty' | 'malformed' | 'error' | 'no-cursor' | 'repeated-cursor';
-const shapes: readonly Shape[] = ['complete', 'empty', 'malformed', 'error', 'no-cursor', 'repeated-cursor'];
-// Slack's read_messages has no hasNextPage: a page without nextCursor is the last page by contract, so no-cursor is not a Slack shape.
-const slackShapes = shapes.filter(shape => shape !== 'no-cursor');
+type Shape = 'complete' | 'empty' | 'malformed' | 'error' | 'no-cursor' | 'no-flag' | 'no-metadata' | 'repeated-cursor';
+const shapes: readonly Shape[] = ['complete', 'empty', 'malformed', 'error', 'no-cursor', 'no-flag', 'no-metadata', 'repeated-cursor'];
+// Slack's read_messages has no hasNextPage: a page without nextCursor is the last page by contract, so the
+// Linear-only shapes (no-cursor: more without a cursor; no-flag and no-metadata: a page without hasNextPage) are not Slack shapes.
+const slackShapes = shapes.filter(shape => !['no-cursor', 'no-flag', 'no-metadata'].includes(shape));
 const failing = (shape: Shape) => shape !== 'complete' && shape !== 'empty';
 
 function pager<T>(all: readonly T[], shape: Shape, style: 'linear' | 'slack', key: string) {
@@ -1534,7 +1535,11 @@ function pager<T>(all: readonly T[], shape: Shape, style: 'linear' | 'slack', ke
     if (state.broken && shape === 'no-cursor' && more) next = undefined;
     // A server that keeps handing back the cursor it was sent; it gives up after ten reads so an unguarded reader ends.
     if (late && shape === 'repeated-cursor' && state.reads < 10) { next = String(input.cursor); more = true; }
-    return style === 'linear' ? { [key]: page, hasNextPage: more, ...(next ? { cursor: next } : {}) } : { [key]: page, ...(next ? { nextCursor: next } : {}) };
+    if (style === 'slack') return { [key]: page, ...(next ? { nextCursor: next } : {}) };
+    // A first page that omits hasNextPage: with its cursor (`{ comments, cursor }`), or with no pagination fields at all.
+    if (state.broken && from === 0 && shape === 'no-flag') return { [key]: page, ...(next ? { cursor: next } : {}) };
+    if (state.broken && from === 0 && shape === 'no-metadata') return { [key]: page };
+    return { [key]: page, hasNextPage: more, ...(next ? { cursor: next } : {}) };
   };
   return { state, read };
 }

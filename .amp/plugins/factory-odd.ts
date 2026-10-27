@@ -1262,11 +1262,11 @@ function slackMessagesFor(tools: Tools, input: Record<string, unknown>, valid: (
 }
 
 // Every comment, so a receipt or marker older than the newest 100 still counts; toSnapshot orders them by createdAt.
-// A page without `hasNextPage` is the last (older fixtures and single-page replies); `hasNextPage: true` needs a cursor.
+// Like every Linear read, each page must say whether another follows (nextPage): a page without `hasNextPage` is malformed.
 const listComments = (tools: Tools, issueId: string): Promise<Comment[]> => allPages<Comment>(`linear.list_comments ${issueId}`, async cursor => {
 	const page = await readJson<unknown>(tools, 'linear.list_comments', { issueId, limit: 100, ...(cursor ? { cursor } : {}) })
 	const rows = listOf<Comment>(page, 'comments', 'linear.list_comments', row => typeof row.body === 'string' && optional(row, 'id', 'string') && optional(row, 'createdAt', 'string'))
-	return { rows, next: isRow(page) && page.hasNextPage === undefined ? undefined : nextPage(page, 'linear.list_comments') }
+	return { rows, next: nextPage(page, 'linear.list_comments') }
 }, comment => comment.id)
 
 type Comment = { id?: string; body: string; createdAt?: string }
