@@ -11,6 +11,10 @@ import { nextAction, parseDeployReceipt, type Action } from './lifecycle.ts';
 import plugin, { diagnose, page, setStatus } from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
 
+// No fixture signs with the host's injected webhook secrets: the plugin prefers the project
+// environment over the dialog, so both names are removed and only the synthetic secret signs.
+for (const name of ['ODD_GITHUB_WEBHOOK_SECRET', 'ODD_LINEAR_WEBHOOK_SECRET']) delete process.env[name];
+
 const sha = 'a'.repeat(40);
 const kiosk = recipes.find(recipe => recipe.name === 'kiosk')!;
 const snapshot = '/var/backups/factory-kiosk/20261024T120000.000000Z.abc123';

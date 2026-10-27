@@ -8,6 +8,10 @@ import { correctionWindowMs, reassessment } from './lifecycle.ts';
 import { fakeConnections, fakeShell, servedBy } from './fixtures.ts';
 import plugin from '../../.amp/plugins/factory-odd.ts';
 
+// No fixture signs with the host's injected webhook secrets: the plugin prefers the project
+// environment over the dialog, so both names are removed and only the synthetic secret signs.
+for (const name of ['ODD_GITHUB_WEBHOOK_SECRET', 'ODD_LINEAR_WEBHOOK_SECRET']) delete process.env[name];
+
 const child = 'T-11111111-1111-4111-8111-111111111111';
 const init = (id: string) => JSON.stringify({ type: 'system', subtype: 'init', cwd: '/home/user/workspace/repo', session_id: id, tools: [] });
 
