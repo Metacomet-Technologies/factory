@@ -9,6 +9,10 @@ import { fakeShell } from './fixtures.ts';
 import { io } from './launch.ts';
 import { createHmac } from 'node:crypto';
 
+// No test arms with the host's injected webhook secrets: each plugin load sees only the synthetic environment it is given.
+const secretNames = ['ODD_GITHUB_WEBHOOK_SECRET', 'ODD_LINEAR_WEBHOOK_SECRET'] as const;
+for (const name of secretNames) delete process.env[name];
+
 const now = new Date('2026-10-24T15:16:00Z');
 const idleFor = (minutes: number, over: Partial<LiveThread> = {}): LiveThread =>
   ({ id: `T-${minutes}`, labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1'], state: 'idle', updatedAt: new Date(now.getTime() - minutes * 60_000).toISOString(), ...over });
@@ -1283,7 +1287,7 @@ const linearSecret = 'p46-linear-signing-secret-fixture';
 const hmac = (secret: string, bytes: Uint8Array | string) => createHmac('sha256', secret).update(bytes).digest('hex');
 const received = '2026-10-26T15:00:00.000Z';
 
-/** A control orb with every external transport faked: Linear, thread search, Slack and the shell. `answers` feeds the secret dialogs, in order. Counts snapshot reads and lifecycle effects. */
+/** A control orb with every external transport faked: Linear, thread search, Slack and the shell. `answers` feeds the secret dialogs, in order. Counts snapshot reads and lifecycle effects. Each load sees only the synthetic project environment it is given, never the host's. */
 function signedOrb() {
   const reads: string[] = [];
   const effects: string[] = [];
@@ -1316,8 +1320,18 @@ function signedOrb() {
   const ctx = { thread, ui, logger, tools, $ };
   return {
     reads, effects, output, dialogs, registrations, commands,
-    /** A fresh plugin load arming the control thread; `secrets` answer its dialogs (undefined = dismissed). */
-    async start(...secrets: (string | undefined)[]) {
+    /** A fresh plugin load arming the control thread with no project secrets; `secrets` answer its dialogs (undefined = dismissed). */
+    start(...secrets: (string | undefined)[]) { return this.startWith({}, ...secrets); },
+    /** `start` with the project environment `env` in place while the plugin loads and arms. */
+    async startWith(env: Partial<Record<typeof secretNames[number], string>>, ...secrets: (string | undefined)[]) {
+      Object.assign(process.env, env);
+      try {
+        await this.load(...secrets);
+      } finally {
+        for (const name of secretNames) delete process.env[name];
+      }
+    },
+    async load(...secrets: (string | undefined)[]) {
       answers = secrets;
       webhooks = new Map();
       let tool: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> } | undefined;
@@ -1459,6 +1473,71 @@ test('P4.6-webhooks: without a secret (first arm, dismissed dialog, plugin reloa
     assert.ok(!orb.output.some(text => text.includes(secret)), 'a secret leaked into status, logs, errors or tool inputs');
   }
   assert.ok(orb.output.some(text => text.includes('"signing"')), 'status output was captured');
+});
+
+test('MET-382: project-environment secrets survive plugin reload without dialogs; partial, empty and removed values fail closed per provider; a changed value on a fresh runtime replaces the old one; private input never overrides the environment', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse(received) });
+  t.after(() => mock.timers.reset());
+  const orb = signedOrb();
+  const rotated = 'met382-rotated-github-signing-secret-fixture';
+  const both = { ODD_GITHUB_WEBHOOK_SECRET: githubSecret, ODD_LINEAR_WEBHOOK_SECRET: ` ${linearSecret}\n` };
+  let n = 0;
+  const linear = (secret: string) => { const body = linearBody(sent + ++n); return orb.deliver('linear', `lin-${n}`, body, { 'linear-signature': hmac(secret, body) }); };
+  const github = (secret: string) => orb.deliver('github', `gh-${++n}`, githubBody, { 'x-hub-signature-256': `sha256=${hmac(secret, githubBody)}` });
+  const readsAfter = async (deliver: () => Promise<void>) => { const before = orb.reads.length; await deliver(); return orb.reads.slice(before); };
+
+  // Both configured: arming asks nothing, and both providers verify; a reload (fresh plugin state) needs no re-entry.
+  for (const load of ['first arm', 'reload']) {
+    await orb.startWith(both);
+    assert.deepEqual(orb.dialogs, [], `${load}: no dialog for configured providers`);
+    const status = await orb.status();
+    assert.deepEqual(status.signing, { linear: 'set', github: 'set' }, load);
+    assert.deepEqual(status.signingSource, { linear: 'environment', github: 'environment' }, load);
+    assert.deepEqual(await readsAfter(() => linear(linearSecret)), ['MET-8'], `${load}: linear evaluated`);
+    assert.deepEqual(await readsAfter(() => github(githubSecret)), ['MET-7'], `${load}: github evaluated`);
+    assert.deepEqual(await readsAfter(() => github(linearSecret)), [], `${load}: wrong secret still refused`);
+  }
+  // Explicit private setup does not prompt for, or replace, an environment-configured provider.
+  orb.answer(rotated, rotated);
+  assert.deepEqual((await orb.status({ set_secrets: true })).signingSource, { linear: 'environment', github: 'environment' });
+  assert.deepEqual(orb.dialogs, []);
+  assert.deepEqual(await readsAfter(() => github(rotated)), []);
+  assert.deepEqual(await readsAfter(() => github(githubSecret)), ['MET-7']);
+
+  // Partial (Linear empty): only Linear is asked; dismissed, Linear fails closed while GitHub works.
+  await orb.startWith({ ODD_GITHUB_WEBHOOK_SECRET: githubSecret, ODD_LINEAR_WEBHOOK_SECRET: '  ' }, undefined);
+  assert.deepEqual(orb.dialogs.map(dialog => String(dialog.title)), ['ODD Linear webhook signing secret']);
+  assert.deepEqual((await orb.status()).signing, { linear: 'missing', github: 'set' });
+  await assert.rejects(linear(linearSecret), /linear signing secret not set; set project secret ODD_LINEAR_WEBHOOK_SECRET/);
+  assert.deepEqual(await readsAfter(() => github(githubSecret)), ['MET-7']);
+  // The private fallback fills only the missing provider, for this runtime.
+  orb.answer(linearSecret);
+  assert.deepEqual((await orb.status({ set_secrets: true })).signingSource, { linear: 'private', github: 'environment' });
+  assert.equal(orb.dialogs.length, 2);
+  assert.deepEqual(await readsAfter(() => linear(linearSecret)), ['MET-8']);
+
+  // Fresh runtime with GitHub rotated and Linear removed: the old GitHub secret and the private Linear one are gone.
+  orb.dialogs.length = 0;
+  await orb.startWith({ ODD_GITHUB_WEBHOOK_SECRET: rotated }, undefined);
+  assert.deepEqual(orb.dialogs.map(dialog => String(dialog.title)), ['ODD Linear webhook signing secret']);
+  assert.deepEqual((await orb.status()).signingSource, { github: 'environment' });
+  assert.deepEqual(await readsAfter(() => github(githubSecret)), [], 'the replaced secret is not reused');
+  assert.deepEqual(await readsAfter(() => github(rotated)), ['MET-7']);
+  await assert.rejects(linear(linearSecret), /linear signing secret not set/);
+
+  // Neither configured: both fail closed, as before.
+  orb.dialogs.length = 0;
+  await orb.startWith({ ODD_GITHUB_WEBHOOK_SECRET: '', ODD_LINEAR_WEBHOOK_SECRET: '' }, undefined, undefined);
+  assert.equal(orb.dialogs.length, 2);
+  assert.deepEqual((await orb.status()).signing, { linear: 'missing', github: 'missing' });
+  await assert.rejects(github(rotated), /github signing secret not set/);
+  await assert.rejects(linear(linearSecret), /linear signing secret not set/);
+  assert.deepEqual(orb.effects, []);
+
+  await orb.status({ show_urls: true });
+  for (const secret of [githubSecret, linearSecret, rotated]) {
+    assert.ok(!orb.output.some(text => text.includes(secret)), 'a secret leaked into status, logs, errors or tool inputs');
+  }
 });
 
 // --- P4.5: every authoritative lifecycle read follows its pages --------------------------

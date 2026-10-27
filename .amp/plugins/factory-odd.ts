@@ -64,6 +64,8 @@ const deployRunner = 'factory-gpu'
 // checked against its provider's signing secret before it is deduplicated or read.
 type Provider = 'github' | 'linear'
 const providers: readonly Provider[] = ['linear', 'github']
+/** Project secrets Amp injects into the orb's environment; read once per arm, never logged or returned. */
+const secretEnv: Record<Provider, string> = { github: 'ODD_GITHUB_WEBHOOK_SECRET', linear: 'ODD_LINEAR_WEBHOOK_SECRET' }
 /** GitHub signs as `sha256=<hex>`, Linear as bare `<hex>`: HMAC-SHA256 of the raw body. */
 const signatureHeaders: Record<Provider, { name: string; format: RegExp }> = {
 	github: { name: 'x-hub-signature-256', format: /^sha256=([0-9a-f]{64})$/i },
@@ -186,8 +188,10 @@ export default async function (amp: PluginAPI) {
 		error?: string
 		webhooks: string[]
 		urls: string[]
-		/** Signing secrets, in memory only: entered through secret dialogs, never logged, returned or persisted, so a reload starts without them. */
+		/** Signing secrets, in memory only, never logged, returned or persisted: from the project environment (secretEnv) at arm, else entered through a secret dialog until the next reload. */
 		secrets: Partial<Record<Provider, string>>
+		/** Providers whose secret came from the project environment; a private dialog never replaces them. */
+		configured: Provider[]
 		events: HandledEvent[]
 		/** Slack intake poll: last run, last error, and the message timestamps handed to Intake. */
 		slack: { polledAt?: string; error?: string; spawned: string[] }
@@ -201,7 +205,7 @@ export default async function (amp: PluginAPI) {
 		timers: ReturnType<typeof setInterval>[]
 	}
 	const armState = new Map<ThreadID, ArmState>()
-	const emptyState = (): ArmState => ({ armed: false, webhooks: [], urls: [], secrets: {}, events: [], slack: { spawned: [] }, watchdog: { cancelled: [], waits: {}, overdue: [] }, episodes: {}, plane: { load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, building: [], waiting: [] }, pins: {}, timers: [] })
+	const emptyState = (): ArmState => ({ armed: false, webhooks: [], urls: [], secrets: {}, configured: [], events: [], slack: { spawned: [] }, watchdog: { cancelled: [], waits: {}, overdue: [] }, episodes: {}, plane: { load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, building: [], waiting: [] }, pins: {}, timers: [] })
 	const record = (state: ArmState, event: HandledEvent) => {
 		state.events.push(event)
 		state.events.splice(0, Math.max(0, state.events.length - 20))
@@ -218,7 +222,7 @@ export default async function (amp: PluginAPI) {
 	amp.registerTool({
 		name: 'odd_control_status',
 		description:
-			'ODD control plane state for this thread: labels, executor kind, whether webhooks are armed, last arming error, the last 20 handled events (webhooks, Slack intake polls, Watchdog sweeps), Slack poll and Watchdog state. Pass arm: true to arm now (control thread in an orb only). Pass poll_slack: true to poll #factory-intake now. Pass sweep: true to run the Watchdog sweep now. Pass show_urls: true to show the webhook URLs to the human in a confirm dialog; the call blocks until they answer. URLs are never returned to the agent. Pass set_secrets: true to ask the human for the GitHub and Linear signing secrets in private dialogs; until a provider\'s secret is set its deliveries are refused and nothing is evaluated. Secrets are never returned; status shows only set or missing.',
+			'ODD control plane state for this thread: labels, executor kind, whether webhooks are armed, last arming error, the last 20 handled events (webhooks, Slack intake polls, Watchdog sweeps), Slack poll and Watchdog state. Pass arm: true to arm now (control thread in an orb only). Pass poll_slack: true to poll #factory-intake now. Pass sweep: true to run the Watchdog sweep now. Pass show_urls: true to show the webhook URLs to the human in a confirm dialog; the call blocks until they answer. URLs are never returned to the agent. Signing secrets come from the project environment (ODD_GITHUB_WEBHOOK_SECRET, ODD_LINEAR_WEBHOOK_SECRET) at arm; pass set_secrets: true to ask the human in private dialogs for each provider the environment does not configure (kept only until the next reload). Until a provider\'s secret is set its deliveries are refused and nothing is evaluated. Secrets are never returned; status shows only set or missing and the source (environment or private).',
 		inputSchema: {
 			type: 'object',
 			properties: {
@@ -226,7 +230,7 @@ export default async function (amp: PluginAPI) {
 				poll_slack: { type: 'boolean', description: 'Poll #factory-intake now and hand new messages to Intake (dry run without the odd-perform label)' },
 				sweep: { type: 'boolean', description: 'Run the Watchdog sweep now: re-evaluate every live or ODD-owned issue' },
 				show_urls: { type: 'boolean', description: 'Show the webhook URLs to the human in a dialog and wait for them to confirm' },
-				set_secrets: { type: 'boolean', description: 'Ask the human for the GitHub and Linear webhook signing secrets in private dialogs (URLs unchanged)' },
+				set_secrets: { type: 'boolean', description: 'Ask the human in private dialogs for the webhook signing secret of each provider not configured by the project environment (URLs unchanged)' },
 			},
 		},
 		async execute(input, ctx) {
@@ -236,10 +240,11 @@ export default async function (amp: PluginAPI) {
 			if (input.poll_slack === true && current?.armed) await pollSlackIntake(ctx, current)
 			if (input.sweep === true && current?.armed) await sweep({ ...ctx, $: amp.$ }, current)
 			if (input.set_secrets === true && current) await setSecrets(ctx, current, true)
-			const { urls, secrets, timers: _timers, ...state } = current ?? emptyState()
+			const { urls, secrets, configured, timers: _timers, ...state } = current ?? emptyState()
 			const dialog = input.show_urls === true && urls.length > 0 ? await showUrls(ctx, urls) : undefined
 			const signing = Object.fromEntries(providers.map(provider => [provider, secrets[provider] ? 'set' : 'missing']))
-			return JSON.stringify({ thread: ctx.thread.id, labels, executor: amp.system.executor.kind, ...state, signing, dialog })
+			const signingSource = Object.fromEntries(providers.filter(provider => secrets[provider]).map(provider => [provider, configured.includes(provider) ? 'environment' : 'private']))
+			return JSON.stringify({ thread: ctx.thread.id, labels, executor: amp.system.executor.kind, ...state, signing, signingSource, dialog })
 		},
 	})
 
@@ -254,8 +259,15 @@ export default async function (amp: PluginAPI) {
 	async function arm(ctx: ArmContext & Partial<Pick<WebhookHandlerContext, '$'>>, labels: readonly string[], retry = false) {
 		const previous = armState.get(ctx.thread.id)
 		if (!labels.includes(controlLabel) || (previous && !(retry && previous.error))) return
-		// A retried arm keeps the secrets already entered; a plugin reload has none.
-		const state = { ...emptyState(), secrets: previous?.secrets ?? {} }
+		// The project environment wins; a retried arm keeps secrets already entered privately for
+		// the rest; a plugin reload keeps only what the environment (fixed per process) provides.
+		const state = { ...emptyState(), secrets: { ...previous?.secrets } }
+		for (const provider of providers) {
+			const value = process.env[secretEnv[provider]]?.trim()
+			if (!value) continue
+			state.secrets[provider] = value
+			state.configured.push(provider)
+		}
 		armState.set(ctx.thread.id, state)
 		try {
 			await armWebhooks(ctx, state)
@@ -300,7 +312,7 @@ export default async function (amp: PluginAPI) {
 			if (!secret) {
 				// Fail closed and let Amp retry (up to an hour) until the secret is set in private.
 				record(state, { at: event.receivedAt, source, issue: null, stage: 'rejected', error: 'signing secret not set' })
-				throw new Error(`${source} signing secret not set; odd_control_status set_secrets:true`)
+				throw new Error(`${source} signing secret not set; set project secret ${secretEnv[source]} and amp orb restart-processes, or odd_control_status set_secrets:true`)
 			}
 			const rejected = rejectDelivery(source, secret, event) ?? (source === 'linear' ? replayed(event) : undefined)
 			if (rejected) {
@@ -334,14 +346,15 @@ export default async function (amp: PluginAPI) {
 		void setSecrets(ctx, state).catch((error: unknown) => ctx.logger.log(marker, 'signing secret dialog failed', String(error)))
 	}
 
-	// Each missing (or, with `all`, every) signing secret through an owner-only secret dialog. A
-	// dismissed dialog leaves that provider refusing deliveries.
+	// Each missing (or, with `all`, every privately entered) signing secret through an owner-only
+	// secret dialog; a provider configured by the project environment is never asked. A dismissed
+	// dialog leaves that provider refusing deliveries.
 	async function setSecrets(ctx: Pick<ArmContext, 'ui'>, state: ArmState, all = false) {
 		for (const provider of providers) {
-			if (state.secrets[provider] && !all) continue
+			if (state.configured.includes(provider) || (state.secrets[provider] && !all)) continue
 			const value = (await ctx.ui.input({
 				title: `ODD ${provider === 'github' ? 'GitHub' : 'Linear'} webhook signing secret`,
-				helpText: `The signing secret of the existing ${provider} webhook. Until it is set, ${provider} deliveries are refused and nothing is evaluated. The URL does not change.`,
+				helpText: `The signing secret of the existing ${provider} webhook, kept in memory only until the next plugin reload; set project secret ${secretEnv[provider]} to keep it. Until it is set, ${provider} deliveries are refused and nothing is evaluated. The URL does not change.`,
 				secret: true,
 				requireHuman: true,
 			}))?.trim()
