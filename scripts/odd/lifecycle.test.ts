@@ -443,6 +443,18 @@ test('MET-348: the latch finishes its missing steps, waits while labelled, and r
   assert.deepEqual(nextAction(issue({ status: 'In Progress', pr: rejected(3), labels: ['escalated'] }), idle, t0), { kind: 'wait', reason: 'escalated to Devon' });
 });
 
+test('MET-399: a latch whose draft step finished on a merged or closed PR yields no further page action', () => {
+  // The PR is closed or merged, so the snapshot binds no open PR; the latch still names it.
+  const at = (done: Parameters<typeof escalationLine>[0]['done']) => {
+    const parsed = parseEscalation(`${escalationLine({ reason: 'budget-ceiling', pr: 235, sha, done })}\n\nMET-361: budget spent.`);
+    assert.ok(parsed && typeof parsed === 'object');
+    return nextAction(issue({ status: 'In Progress', labels: ['escalated'], escalation: { id: 'c-235', ...parsed } }), idle, t0);
+  };
+  assert.deepEqual(at(['label', 'draft', 'page', 'archive']), { kind: 'wait', reason: 'escalated to Devon' });
+  // Control: without `draft` recorded the same latch is still pending and pages again.
+  assert.equal(at(['label', 'page', 'archive']).kind, 'page');
+});
+
 test('MET-348: safety escalations stay immediate whatever budget remains', () => {
   const receipt = parseDeployReceipt('odd-deploy host=factory-gpu component=kiosk sha=abcdef1234 health=fail rollback=none')!;
   const deploying = issue({ status: 'Deploying', deployReceipt: receipt, correction: { epoch: 1, corrected: true, budget: grant() } });
