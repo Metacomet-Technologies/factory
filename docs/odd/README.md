@@ -630,7 +630,11 @@ by the previous one).
    a cancellation before archiving the thread (a failed comment keeps the
    thread, so the round is not lost) and a blind episode ends only when a
    whole sweep, digest and heartbeat included, succeeds; a rejected labels
-   read fails one sweep and never blocks the next (MET-342). Authoritative
+   read fails one sweep and never blocks the next (MET-342). A rejected
+   `get_thread_status` read (its open-dialog read times out under load and
+   asks to be retried) is retried, three attempts in all, before it fails the
+   derivation; a resolved status is validated and never retried, so a sweep
+   that errors on a thread read had every attempt rejected (MET-385). Authoritative
    reads fail closed (MET-344): an MCP `isError` envelope, a missing payload
    or a malformed issue, comment, thread or PR collection or record (an
    issue row or issue without a non-blank identifier, status or labels, a

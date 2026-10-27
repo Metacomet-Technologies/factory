@@ -1600,6 +1600,8 @@ async function pullRequestFor(ctx: Pick<WebhookHandlerContext, '$'>, identifier:
 		?? (merged === undefined ? undefined : await viewPullRequest(ctx, identifier, merged, 'merged'))
 }
 
+const statusReads = 3
+
 // `known` are thread IDs this control plane spawned that the search index may not return yet.
 // Thread search pages at 100; every page is read so load and the sweep see every live thread.
 async function threadsFor(tools: Tools, query: string, known: readonly string[] = []): Promise<LiveThread[]> {
@@ -1615,7 +1617,19 @@ async function threadsFor(tools: Tools, query: string, known: readonly string[] 
 	const updated = new Map(found.map(({ id, updatedAt }) => [id, updatedAt]))
 	const ids = new Set([...found.map(({ id }) => id), ...known])
 	const threads = await Promise.all([...ids].map(async id => {
-		const status = await readJson<{ metadata: { labels: string[]; archived?: boolean }; agentState?: { state?: string } }>(tools, 'get_thread_status', { thread: id })
+		// get_thread_status rejects when its own open-dialog read times out, asking to be retried (MET-385). A sweep reads
+		// every live thread once per evaluation, so one transient rejection would otherwise fail the whole sweep. The read
+		// has no side effect: a rejection is retried up to `statusReads` attempts, the last one still fails the derivation,
+		// and a resolved status is validated below and never retried.
+		let status: { metadata: { labels: string[]; archived?: boolean }; agentState?: { state?: string } }
+		for (let attempt = 1; ; attempt++) {
+			try {
+				status = await readJson(tools, 'get_thread_status', { thread: id })
+				break
+			} catch (error: unknown) {
+				if (attempt === statusReads) throw error
+			}
+		}
 		// An unknown execution state is not idleness: it would let the Watchdog cancel a running thread.
 		if (!strings(status?.metadata?.labels) || !named(status.agentState?.state) || !optional(status.metadata, 'archived', 'boolean')) throw new ReadError(`get_thread_status ${id} returned no labels or agent state`)
 		return { id, labels: status.metadata.labels, state: status.agentState.state, archived: status.metadata.archived === true, updatedAt: updated.get(id) }
