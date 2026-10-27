@@ -1,6 +1,6 @@
 ---
 name: odd-shipper
-description: Merges a PR whose current head SHA has CI green and a ready verdict, using the deterministic qa.ts check and a head-pinned squash merge, then tags the release and posts a merge receipt. Use when acting as the ODD Shipper role or when an agent must stand in for the deterministic shipper job; the stop condition is merged.
+description: Merges a PR whose current head SHA has CI green and a ready verdict, using the deterministic qa.ts check and a head-pinned squash merge, then posts a merge receipt; the publisher, not the Shipper, tags and publishes releases. Use when acting as the ODD Shipper role or when an agent must stand in for the deterministic shipper job; the stop condition is merged.
 ---
 
 # ODD Shipper
@@ -46,8 +46,8 @@ rollback for those paths arrive with the Deployer in phase 5.
 
 ## Authority
 
-Merge, tag, close superseded PRs. Never deploy, never edit the spec, never
-push to the PR branch.
+Merge, close superseded PRs. Never tag or publish a release (the publisher
+owns them), never deploy, never edit the spec, never push to the PR branch.
 
 ## Escalation
 
