@@ -597,8 +597,9 @@ test('agent contract and prompt byte budgets, scoped reads and single startup ch
   }
 });
 
-test('worktree collisions and preparation failures comment, retain claims, and never launch or retry', { timeout: 15_000 }, async t => {
-  for (const runner of ['gpu', 'console']) for (const failure of ['FAKE_EXISTING_BRANCH', 'FAKE_EXISTING_DIR', 'FAKE_FETCH_FAIL', 'FAKE_ADD_FAIL', ...(runner === 'console' ? ['FAKE_SSH_AFTER_PREFLIGHT'] : [])]) {
+// One test per case: each case spawns ~20 Node processes, so a shared budget grew with the case count.
+for (const runner of ['gpu', 'console']) for (const failure of ['FAKE_EXISTING_BRANCH', 'FAKE_EXISTING_DIR', 'FAKE_FETCH_FAIL', 'FAKE_ADD_FAIL', ...(runner === 'console' ? ['FAKE_SSH_AFTER_PREFLIGHT'] : [])]) {
+  test(`worktree collisions and preparation failures comment, retain claims, and never launch or retry: ${runner} ${failure}`, { timeout: 10_000 }, async t => {
     const i = issue(); i.labels.push(group('runner', runner));
     const f = await fixture(t, [i]);
     const result = await f.run(['poll'], { [failure]: '1' });
@@ -610,8 +611,8 @@ test('worktree collisions and preparation failures comment, retain claims, and n
     await f.run(['issue', 'MET-123']);
     assert.equal(f.calls().length, 0);
     assert.deepEqual(f.worktrees(), { gpu: [], console: [] });
-  }
-});
+  });
+}
 
 test('unreachable console preserves explicit and overflow builders without claims or cleanup noise', { timeout: 10_000 }, async t => {
   for (const explicit of [false, true]) {
@@ -1875,8 +1876,8 @@ test('QA merge gate names its cause: old gh and failing queries', { timeout: 10_
   assert.match(passing.stdout, /QA merge gate passed/);
 });
 
-test('QA self-deploying additions/deletions/renames on later file pages ping once, never merge', { timeout: 10_000 }, async t => {
-  for (const path of ['scripts/dispatch/dispatch.ts', 'scripts/usage/collect.ts']) for (const status of ['modified', 'removed', 'renamed']) {
+for (const path of ['scripts/dispatch/dispatch.ts', 'scripts/usage/collect.ts']) for (const status of ['modified', 'removed', 'renamed']) {
+  test(`QA self-deploying additions/deletions/renames on later file pages ping once, never merge: ${status} ${path}`, { timeout: 10_000 }, async t => {
     const i = reviewed();
     const file = status === 'renamed' ? { filename: 'docs/moved.ts', previous_filename: path, status } : { filename: path, status };
     const f = await fixture(t, [i], { github: { 90: githubPR({ pages: [Array.from({ length: 100 }, (_, n) => ({ filename: `widgets/file${n}.rs` })), [file]] }) }, submissionsOnly: true });
@@ -1884,8 +1885,8 @@ test('QA self-deploying additions/deletions/renames on later file pages ping onc
     assert.equal(f.calls().length, 0);
     assert.equal(i.comments.filter((c: any) => c.body.includes('ready; merging deploys it')).length, 1);
     assert.equal((await f.check()).code, 1);
-  }
-});
+  });
+}
 
 for (const step of ['start', 'review-claim', 'followup-claim', 'round', 'merge-claim', 'merge-sent', 'human', 'retired']) for (const boundary of ['before', 'after']) {
   test(`QA crash ${boundary} ${step} never duplicates submission`, { timeout: 10_000 }, async t => {
