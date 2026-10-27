@@ -30,7 +30,7 @@ import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, rea
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { deployReceiptLine, oddLabel, type ComponentIdentity, type Refusal } from './lifecycle.ts';
+import { deployReceiptLine, oddLabel, parseDeployReceipt, type ComponentIdentity, type Refusal } from './lifecycle.ts';
 import { prOwnsIssue, toSnapshot, type GitHubPullRequest } from './snapshot.ts';
 
 /** Git history and the release verifier. Never the runtime, and never run as root. */
@@ -169,8 +169,21 @@ export function restoredResult(sha: string, body: string): 'pass' | 'fail' {
 
 /** `refused`: nothing was installed, migrated or rolled back; the control plane pages irreversible-action. */
 export type Receipt = { component: string; sha: string; health: 'pass' | 'fail' | 'refused'; rollback: string; refusal?: Refusal };
-export const receiptLine = (receipt: Receipt) =>
-  `odd-deploy host=${HOST} component=${receipt.component} sha=${receipt.sha} health=${receipt.health} rollback=${receipt.rollback}${receipt.refusal ? ` refusal=${receipt.refusal}` : ''}`;
+/** The receipt line for the verified release `tag` that produced it (MET-367; lifecycle.ts formats and parses it). */
+export const receiptLine = (receipt: Receipt, tag?: string) => deployReceiptLine({ host: HOST, ...receipt, tag });
+
+/** A stored line (tagless when an earlier deployer saved it) as the receipt of its verified release `tag`. */
+function tagged(line: string, tag: string): string {
+  const receipt = parseDeployReceipt(line);
+  if (!receipt || (receipt.tag && receipt.tag !== tag)) throw new Error(`Stored receipt is not a receipt of ${tag}: ${line}`);
+  return deployReceiptLine({ ...receipt, tag });
+}
+
+/** The issue already has this receipt, exactly or as the tagless line an earlier deployer posted: never post it twice. */
+async function posted(effects: Effects, identifier: string, line: string): Promise<boolean> {
+  const equivalent = [line, deployReceiptLine({ ...parseDeployReceipt(line)!, tag: undefined })];
+  return (await effects.linear.comments(identifier)).some(comment => equivalent.includes(comment.body.trim()));
+}
 
 /** A DB-guarded installer's verdict: `eligible` for exactly one v2 no-DB-change `meter-plan` line,
  * a refusal for any other plan line, undefined when the output carries no plan line. */
@@ -249,8 +262,6 @@ export type Effects = {
   writeLedger: (ledger: Ledger, options?: { create?: boolean }) => void;
   linear: {
     deploying: (identifier: string) => Promise<boolean>;
-    /** Does the issue already carry a comment whose body is exactly `body`? */
-    posted: (identifier: string, body: string) => Promise<boolean>;
     comment: (identifier: string, body: string) => Promise<void>;
     /** Every issue labelled `odd` in Deploying, all pages. */
     deployingIssues: () => Promise<string[]>;
@@ -535,7 +546,7 @@ async function deployRelease(effects: Effects, tag: string, previousTag: string)
   const receipt = saved?.tag === tag ? saved.receipt : await installRelease(effects, tag, sha, dir);
   if (saved?.tag === tag) effects.log('receipt-resume', { tag, delivered: saved.delivered });
   const issues = releaseIssues(effects, sha, previousTag);
-  const line = receiptLine(receipt);
+  const line = receiptLine(receipt, tag);
   for (const identifier of issues) {
     const pending = effects.readLedger().receipt!;
     if (pending.delivered.includes(identifier)) continue;
@@ -547,7 +558,7 @@ async function deployRelease(effects: Effects, tag: string, previousTag: string)
     let delayed: Delivery | undefined;
     // A comment whose response was lost (or a crash before the ledger write) is already there: never post twice.
     if (!('line' in issue)) effects.log('receipt-partial', { issue: identifier, tag, missing: issue.missing });
-    else if (await effects.linear.posted(identifier, issue.line)) effects.log('receipt-exists', { issue: identifier, line: issue.line });
+    else if (await posted(effects, identifier, issue.line)) effects.log('receipt-exists', { issue: identifier, line: issue.line });
     else if (await effects.linear.deploying(identifier)) {
       await effects.linear.comment(identifier, issue.line);
       effects.log('receipt', { issue: identifier, line: issue.line });
@@ -569,8 +580,9 @@ async function deployRelease(effects: Effects, tag: string, previousTag: string)
  * dropped with an explicit `receipt-expired` diagnostic, never as delivered, after seven days. */
 async function deliverDelayed(effects: Effects): Promise<void> {
   for (const delivery of effects.readLedger().deliveries ?? []) {
-    const { issue, line } = delivery;
-    if (await effects.linear.posted(issue, line)) effects.log('receipt-exists', { issue, line });
+    const { issue } = delivery;
+    const line = tagged(delivery.line, delivery.tag);
+    if (await posted(effects, issue, line)) effects.log('receipt-exists', { issue, line });
     else if (await effects.linear.deploying(issue)) {
       await effects.linear.comment(issue, line);
       effects.log('receipt', { issue, line, delayedSince: delivery.since });
@@ -578,7 +590,7 @@ async function deliverDelayed(effects: Effects): Promise<void> {
       effects.log('receipt-expired', { ...delivery, reason: 'not Deploying within seven days of release; no receipt was delivered' });
     } else continue;
     const ledger = effects.readLedger();
-    effects.writeLedger({ ...ledger, deliveries: (ledger.deliveries ?? []).filter(other => other.issue !== issue || other.line !== line) });
+    effects.writeLedger({ ...ledger, deliveries: (ledger.deliveries ?? []).filter(other => other.issue !== issue || other.line !== delivery.line) });
   }
 }
 
@@ -629,7 +641,7 @@ function issueReceipt(effects: Effects, identifier: string, round: Deployed): { 
     if (!reported || !record.sha.startsWith(reported)) return { missing: `${recipe.name} is not reported healthy at ${record.sha}` };
     set.push({ component: recipe.name, sha: record.sha, tag: record.tag });
   }
-  return { line: deployReceiptLine({ host: HOST, component: set.map(entry => entry.component).join('+'), sha: round.sha, health: 'pass', rollback: 'none', round: round.tag, set }) };
+  return { line: deployReceiptLine({ host: HOST, component: set.map(entry => entry.component).join('+'), sha: round.sha, tag: round.tag, health: 'pass', rollback: 'none', round: round.tag, set }) };
 }
 
 /** The merged PR an issue's receipt rests on: the one its latest `odd-merge` names, else (a manual
@@ -669,7 +681,8 @@ async function reconcile(effects: Effects): Promise<void> {
     const merge = authoritativeMerge(effects, identifier, comments);
     if ('refusal' in merge) { refuse(merge.refusal); continue; }
     if (!contains(effects, merge.commit, deployed.sha)) { refuse(`merge ${merge.commit} is not proven to be in ${deployed.tag}`); continue; }
-    const issue = issueReceipt(effects, identifier, deployed);
+    // A ledger an earlier deployer wrote holds a tagless line for its recorded tag.
+    const issue = issueReceipt(effects, identifier, { ...deployed, line: tagged(deployed.line, deployed.tag) });
     if (!('line' in issue)) { refuse(`receipt set incomplete: ${issue.missing}`); continue; }
     await effects.linear.comment(identifier, issue.line);
     effects.log('receipt', { issue: identifier, line: issue.line, reason: receipt ? 'failed-verification-refresh' : 'missing-receipt' });
@@ -985,7 +998,6 @@ export function liveEffects(): Effects {
     },
     linear: {
       deploying: async identifier => (await graphql<IssueData>(issueQuery, { id: identifier })).issue.state.name === 'Deploying',
-      posted: async (identifier, body) => (await comments(identifier)).some(comment => comment.body.trim() === body),
       comment: async (identifier, body) => {
         const { issue } = await graphql<IssueData>(issueQuery, { id: identifier });
         await graphql('mutation Comment($input: CommentCreateInput!) { commentCreate(input: $input) { success } }', { input: { issueId: issue.id, body } });

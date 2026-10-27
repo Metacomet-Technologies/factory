@@ -299,6 +299,21 @@ test('MET-386: a receipt set that replaces another receipt needs its own verific
   assert.deepEqual(derive([set, `odd-verify sha=${b} result=pass bug=none`, set]).action, done);
 });
 
+test('MET-367: historical tagless and new tagged receipts both drive the snapshot; a malformed tag is no receipt', () => {
+  const [a, b] = ['a'.repeat(40), 'b'.repeat(40)];
+  const at = (minute: number) => `2026-10-24T15:${String(minute).padStart(2, '0')}:00.000Z`;
+  const historical = { body: `odd-deploy host=factory-gpu component=kiosk sha=${a} health=fail rollback=/var/backups/kiosk/snap`, createdAt: at(1) };
+  const tagged = { body: `odd-deploy host=factory-gpu component=meter+kiosk sha=${b} tag=v0.3.1 health=pass rollback=none`, createdAt: at(3) };
+  const malformed = { body: `odd-deploy host=factory-gpu component=kiosk sha=${a} tag=latest health=fail rollback=none`, createdAt: at(4) };
+  const snapshot = (comments: { body: string; createdAt: string }[]) => toSnapshot({ issue: { id: 'MET-1', status: 'Deploying', labels: ['odd'], comments } });
+  assert.deepEqual(snapshot([historical]).deployReceipt, { host: 'factory-gpu', component: 'kiosk', sha: a, health: 'fail', rollback: '/var/backups/kiosk/snap' });
+  assert.deepEqual(snapshot([historical, tagged, malformed]).deployReceipt, { host: 'factory-gpu', component: 'meter+kiosk', sha: b, tag: 'v0.3.1', health: 'pass', rollback: 'none' });
+  assert.deepEqual(nextAction(snapshot([historical, tagged, malformed]), { orbs: 0, runnerSlots: 0, buildIssues: 0 }), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify meter+kiosk at bbbbbbbbbbbb', round: 1 });
+  // Red receipts bound merged PRs whether tagged or not; the malformed one never counts.
+  assert.equal(failedReceiptAt([historical, malformed]), at(1));
+  assert.equal(failedReceiptAt([historical, { ...tagged, body: tagged.body.replace('health=pass rollback=none', 'health=fail rollback=unchanged') }]), at(3));
+});
+
 test('P3.1: wait ages come from the head commit, the merge and the steer comment, never from the sweep; a missing source stays unknown', () => {
   const builder: LiveThread = { id: 'T-b', labels: ['odd-issue-met-1', 'odd-role-builder', 'odd-round-1'], state: 'idle' };
   const older = 'f'.repeat(40);

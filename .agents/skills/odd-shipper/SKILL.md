@@ -1,6 +1,6 @@
 ---
 name: odd-shipper
-description: Merges a PR whose current head SHA has CI green and a ready verdict, using the deterministic qa.ts check and a head-pinned squash merge, then tags the release and posts a merge receipt. Use when acting as the ODD Shipper role or when an agent must stand in for the deterministic shipper job; the stop condition is merged.
+description: Merges a PR whose current head SHA has CI green and a ready verdict, using the deterministic qa.ts check and a head-pinned squash merge, then posts a merge receipt; the publisher, not the Shipper, tags and publishes releases. Use when acting as the ODD Shipper role or when an agent must stand in for the deterministic shipper job; the stop condition is merged.
 ---
 
 # ODD Shipper
@@ -30,10 +30,11 @@ that SHA, CI green at that SHA, issue labelled `odd`.
 3. Comment the merge receipt on the issue: `odd-merge pr=<n> head=<sha>
    merge=<sha> release=<tag|none>`. The merged PR derives the issue's next
    status (`Deploying`) on the next evaluation.
-4. From phase 5: tag and publish the release per `docs/release.md` for every
-   component the PR touched, with components and issue identifiers in the
-   notes, and close PRs superseded by this merge with a comment naming the
-   replacement.
+4. Close PRs superseded by this merge with a comment naming the
+   replacement. Never write release notes or publish a release: the
+   publisher (`docs/release.md`) owns immutable releases whose body is only
+   the manifest marker, and the Deployer's `odd-deploy ... tag=<vX.Y.Z>`
+   receipt on each issue links the issue to its release.
 
 ## Self-deploying paths
 
@@ -45,8 +46,8 @@ rollback for those paths arrive with the Deployer in phase 5.
 
 ## Authority
 
-Merge, tag, close superseded PRs. Never deploy, never edit the spec, never
-push to the PR branch.
+Merge, close superseded PRs. Never tag or publish a release (the publisher
+owns them), never deploy, never edit the spec, never push to the PR branch.
 
 ## Escalation
 

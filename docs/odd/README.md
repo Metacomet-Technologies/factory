@@ -113,7 +113,7 @@ defines Amp-native agents for the roles that need Amp coordination tools.
 | Spec | Issue reaches `Triage` with a type and area. | `## Isolation`, `## Build`, `## Done means`, `## Evidence`, size estimate, risk class. Status moves to `Todo`. | Edit its own issue; split into children; mark blocked-by. | Plugin agent pinned to `openai/gpt-6-astra` medium (ChatGPT). | 1 turn + 3 continuations. | Risk class is `irreversible` or `security` and no existing pattern covers it. |
 | Builder | Issue in `Todo` labelled `odd` with a free build slot. | A PR whose body carries the Evidence section filled with real output; the same thread and branch across review rounds. | Push to its own branch; open and update its PR; comment on its issue. | Claude Code (`claude-opus-5-5`, effort high) on an orb, launched through the CLI and served by the Claude Subscription (§6). | A fixed 120-minute correction budget per epoch (§8); 3 review rounds for a history without one. | Budget deadline (`budget-ceiling`), a changed contract, a safety condition, or Isolation cannot be respected. |
 | Reviewer | PR head SHA with CI green and no verdict for that SHA. | Verdict `ready` or `changes` as a PR comment and the thread label `odd-verdict-<ready\|changes>-<sha12>` set by its `odd_verdict` tool, findings bound to the SHA; reruns Evidence commands itself in its own orb. | Request changes; approve. Never pushes to the builder's branch. GitHub refuses a review on a PR the same account opened, so the verdict is a comment, not a review. | Plugin agent pinned to ChatGPT `openai/gpt-6-astra` or SuperGrok (`Cursor`) `xai/grok-4.7`, high reasoning, never the Builder's lab (§6). | 1 per SHA; 2 rounds after a Watchdog cancellation. | Second spent round (page: budget ceiling). Re-reviews focus on the delta and the affected proof, still rerun every Evidence line and the mandatory checks, and label any reused investigation historical. |
-| Shipper | Verdict `ready` on the current head. | Squash merge with `--match-head-commit`; merge receipt `odd-merge pr=<n> head=<sha> merge=<sha>` on the issue; release tag per `docs/release.md` from phase 5. | Merge; tag; close superseded PRs. | Deterministic (`qa.ts check --self-deploying-ok` + `gh pr merge` inside the control plane), no agent. | n/a | `qa.ts check` refuses: the refusal is posted once per head as `odd-merge-refused`; the builder's next push re-enters the loop. |
+| Shipper | Verdict `ready` on the current head. | Squash merge with `--match-head-commit`; merge receipt `odd-merge pr=<n> head=<sha> merge=<sha>` on the issue. The publisher (`docs/release.md`), not the Shipper, tags and publishes the marker-only release. | Merge; close superseded PRs. Never tags or publishes a release. | Deterministic (`qa.ts check --self-deploying-ok` + `gh pr merge` inside the control plane), no agent. | n/a | `qa.ts check` refuses: the refusal is posted once per head as `odd-merge-refused`; the builder's next push re-enters the loop. |
 | Deployer | GitHub release newer than the host ledger's `lastTag` (`factory-deploy.timer` on factory-gpu, every 2 min). | Verified release unpacked under `~/.local/state/factory-odd/releases/<tag>`, each changed enabled component (`meter`, `factory-api`, `kiosk`) installed and probed at the exact SHA, one deploy receipt per issue the release closes. | `sudo -n /usr/bin/bash /usr/local/lib/factory-deploy/deploy/<script>` on the runner, only after every staged privileged file matches the release (else the release is held, `staged-assets-held`); detaches `~/.local/state/factory-odd/source` at the release SHA as the artifacts' identity checkout; then advances the deploy, dispatch and usage runtime link `~/factory-tools/current` to the release that tick handled only after each tool's self-check passes in the candidate and through the link, restoring the prior link otherwise ([cutover](deployer-recovery.md#tools-runtime-cutover-met-346-p28)). | Deterministic job (`scripts/odd/deploy.ts`); on a red receipt the control plane starts one plugin agent (`odd-deployer`, `openai/gpt-6-astra` low) on the factory-gpu runner that only reads logs and attaches them to the Bug. | 1 deploy + 1 rollback per component per release. | Rollback missing, fails, or leaves the component unhealthy on re-probe, or a pre-snapshot failure without the prior healthy identity re-proven (`rollback=none`, page: failed rollback). |
 | Verifier | Green deploy receipt (`health=pass`) with no `odd-verify` comment for its SHA. | One issue comment line per Done-means item, a `Bug` issue in `Triage` on fail, and the result through its `odd_verify` tool; the control plane writes `odd-verify sha=<receipt sha> result=pass\|fail bug=<MET-n\|none>` from it and sets `Done` on `pass`. | Comment on its issue; file Bugs. Never sets status. | Plugin agent pinned to `openai/gpt-6-astra` low (ChatGPT); reruns the Evidence lines against the deployed system. | 1 turn + 2 continuations; 2 rounds. | Never pages; files a bug and lets Intake handle it. Second spent round pages (budget ceiling). |
 | Watchdog | Every 10 minutes (`setInterval` in the plugin). | Role threads stale for 15 min (idle without activity, or running without agent activity, P3.10) and errored threads at a spent budget archived with an `odd-watchdog cancelled` comment and its exact reason, and the issue restored (builder without PR and no other live builder → `Todo`); caps alert after 60 min over; `control-plane-blind` page after 15 min of failed sweeps; daily digest at 08:00 America/New_York. | Archive threads; comment; restore status; add `escalated`; post alerts and pages; read releases, compare and runs with `gh`. | Deterministic (`scripts/odd/watchdog.ts`), no agent. | n/a | Every sweep failing for 15 minutes; soft caps exceeded for an hour. |
@@ -166,7 +166,7 @@ Role boundaries that keep this from being "one man":
                  └──────┬──────┘
                         ▼ verdict:ready at SHA
                  ┌─────────────┐  qa.ts check + merge --match-head-commit
-                 │   Shipper   │  release tag (docs/release.md)
+                 │   Shipper   │  merge receipt; publisher tags (docs/release.md)
                  └──────┬──────┘
                         ▼ release published (GitHub webhook)
                  ┌─────────────┐  allowlisted sudo script on the runner
@@ -384,11 +384,16 @@ Each artifact is machine-checkable before the next role starts.
   discriminating probes, smallest shared fix). Builder and Spec skills
   require a reusable end-to-end proof matrix built from existing fixtures.
 - Shipper → Deployer: merge receipt comment `odd-merge pr=<n> head=<sha>
-  merge=<sha> release=<tag|none>`; from phase 5 a GitHub release whose notes
-  list components and issues (`docs/release.md`).
+  merge=<sha> release=<tag|none>`. The publisher (`docs/release.md`), not
+  the Shipper, publishes each immutable release with a marker-only body; it
+  lists no issues or components. The Deployer finds a release's issues from
+  its squash subjects and PR bodies, and its receipt links issue to tag.
 - Deployer → Verifier: deploy receipt comment `odd-deploy host=<h>
-  component=<c> sha=<s> health=<pass|fail> rollback=<none|unchanged|snapshot>`, one per
-  issue per release. `component` is `+`-joined install order (`meter+kiosk`),
+  component=<c> sha=<s> tag=<vX.Y.Z> health=<pass|fail> rollback=<none|unchanged|snapshot>`, one per
+  issue per release. `tag` is the verified release the Deployer handled, from
+  its pending release or ledger record, never inferred from a SHA or the
+  latest release (MET-367); receipts from before it carry no `tag` and parse
+  unchanged, and a malformed `tag` does not parse. `component` is `+`-joined install order (`meter+kiosk`),
   `none` when the release changed nothing the host runs, or the failed
   component. A component changed when its `sources`, its deploy files, or
   one of the inputs `scripts/release/release.py` fingerprints for every
@@ -413,9 +418,10 @@ Each artifact is machine-checkable before the next role starts.
   required component is healthy in the ledger at the release SHA, the
   release's uniform line above is posted unchanged. Otherwise the issue gets
   a complete set, `odd-deploy host=<h> component=<c1+c2> sha=<round sha>
-  health=pass rollback=none round=<tag> set=<c1>:<sha40>@<tag>,<c2>:<sha40>@<tag>`:
-  `sha` and `round` are the proven pass release that publishes it (a real
-  commit containing every listed identity), and each entry is that
+  tag=<tag> health=pass rollback=none round=<tag> set=<c1>:<sha40>@<tag>,<c2>:<sha40>@<tag>`:
+  `sha`, `tag` and `round` are the proven pass release that publishes it (a
+  real commit containing every listed identity; a `tag` other than `round`
+  does not parse), and each entry is that
   component's own healthy ledger SHA and tag, never the round's. It is
   published only when every required component is covered: healthy in the
   ledger, an ancestor of the round, containing every issue merge that
@@ -434,7 +440,8 @@ Each artifact is machine-checkable before the next role starts.
   release receipt and first-seen time and retried at the start of every tick,
   so it never holds later releases. It gets exactly one receipt once it is
   `Deploying` (an existing identical comment, such as one whose response was
-  lost, counts as posted); a later release shipping it again replaces the
+  lost, or the same receipt without `tag` from an earlier Deployer, counts as
+  posted); a later release shipping it again replaces the
   pending receipt and keeps the first-seen time. Seven days after first seen
   it is dropped with a `receipt-expired` log line and no receipt.
   Drain (MET-366): each tick prepares and installs at most the oldest pending

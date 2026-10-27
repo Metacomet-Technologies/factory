@@ -41,7 +41,7 @@ function fixture(options: { installOk?: boolean; rollbackOk?: boolean; bodies: s
     probe: () => { calls.push('probe'); return bodies.shift() ?? 'unreachable'; },
     readLedger: () => structuredClone(ledger),
     writeLedger: next => { ledger = structuredClone(next); },
-    linear: { deploying: async () => true, posted: async () => false, comment: async () => {} },
+    linear: { deploying: async () => true, comment: async () => {} },
   };
   return { effects, calls, ledger: () => ledger };
 }
@@ -369,7 +369,6 @@ function world(options: {
     },
     linear: {
       deploying: async identifier => !options.notDeploying?.includes(identifier),
-      posted: async (identifier, body) => comments.some(([issue, text]) => issue === identifier && text === body),
       comment: async (identifier, body) => {
         if (failComment === identifier) { failComment = undefined; throw new Error('Linear 503'); }
         comments.push([identifier, body]);
@@ -496,7 +495,7 @@ test('manual v0.2.49 / failed v0.2.10 ledger: refuse v0.2.11, explicitly adopt w
   assert.equal(host.ledger().lastTag, 'v0.2.50');
   assert.equal(host.ledger().receipt, undefined);
   assert.deepEqual(host.ledger().manualBaseline?.priorLedger, original, 'original failed attempt survives later component replacement');
-  assert.deepEqual(host.comments, [['MET-350', line(`component=meter+factory-api+kiosk sha=${shas['v0.2.50']} health=pass rollback=none`)]]);
+  assert.deepEqual(host.comments, [['MET-350', line(`component=meter+factory-api+kiosk sha=${shas['v0.2.50']} tag=v0.2.50 health=pass rollback=none`)]]);
 });
 
 test('manual reconciliation fails closed on mixed, dirty, stale or unverifiable evidence without state/receipt writes', async t => {
@@ -603,7 +602,7 @@ test('adoption retains rollback recovery for an interrupted forward attempt with
   assert.equal(host.ledger().inFlight, undefined);
   assert.deepEqual(host.ledger().manualBaseline, preview);
   assert.deepEqual(host.live, Object.fromEntries(recipes.map(recipe => [recipe.name, shas['v0.2.49']])));
-  assert.deepEqual(host.comments, [['MET-350', line(`component=meter sha=${shas['v0.2.50']} health=fail rollback=${snapshot}`)]]);
+  assert.deepEqual(host.comments, [['MET-350', line(`component=meter sha=${shas['v0.2.50']} tag=v0.2.50 health=fail rollback=${snapshot}`)]]);
 });
 
 test('recorded API recovery restores its dependent kiosk endpoint before any further install or success receipt', async t => {
@@ -654,12 +653,12 @@ test('recorded API recovery restores its dependent kiosk endpoint before any fur
         await assert.rejects(main(host.effects), /health=fail/);
         assert.equal(sudoCalls(host.calls).length, 1);
         assert.equal(host.live['factory-api'], shas['v0.2.49']);
-        assert.deepEqual(host.comments, [['MET-350', line(`component=factory-api sha=${shas['v0.2.50']} health=fail rollback=${snapshot}`)]]);
+        assert.deepEqual(host.comments, [['MET-350', line(`component=factory-api sha=${shas['v0.2.50']} tag=v0.2.50 health=fail rollback=${snapshot}`)]]);
       } else {
         await main(host.effects);
         assert.equal(sudoCalls(host.calls).length, 2, 'API reinstall and kiosk install, no meter replay');
         assert.equal(host.live.kiosk, shas['v0.2.50']);
-        assert.deepEqual(host.comments, [['MET-350', line(`component=meter+factory-api+kiosk sha=${shas['v0.2.50']} health=pass rollback=none`)]]);
+        assert.deepEqual(host.comments, [['MET-350', line(`component=meter+factory-api+kiosk sha=${shas['v0.2.50']} tag=v0.2.50 health=pass rollback=none`)]]);
       }
       assert.ok(dependentChecks > 0, 'both recovery outcomes recheck dependent health');
       assert.deepEqual(host.ledger().manualBaseline, preview);
@@ -707,7 +706,7 @@ test('an initially healthy kiosk must remain healthy after recorded API recovery
   assert.equal(sudoCalls(host.calls).length, 1, 'healthy retry delivers without reinstalling API');
   assert.equal(host.ledger().lastTag, 'v0.2.50');
   assert.deepEqual(host.ledger().manualBaseline, preview);
-  assert.deepEqual(host.comments, [['MET-350', line(`component=factory-api sha=${shas['v0.2.50']} health=pass rollback=none`)]]);
+  assert.deepEqual(host.comments, [['MET-350', line(`component=factory-api sha=${shas['v0.2.50']} tag=v0.2.50 health=pass rollback=none`)]]);
 });
 
 test('API recovery does not excuse a usable unsafe kiosk identity or an unrelated outage', async t => {
@@ -1063,8 +1062,8 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
     },
     readLedger: () => structuredClone(ledger), writeLedger: next => { ledger = structuredClone(next); },
     now: () => Date.now(),
-    linear: { deploying: async () => true, posted: async (id, body) => comments.some(([i, b]) => i === id && b === body), comment: async (id, body) => { comments.push([id, body]); },
-      deployingIssues: async () => [], comments: async () => [] },
+    linear: { deploying: async () => true, comment: async (id, body) => { comments.push([id, body]); },
+      deployingIssues: async () => [], comments: async id => comments.filter(([i]) => i === id).map(([, body]) => ({ body, createdAt: '2026-10-01T00:00:00.000Z' })) },
   };
   const entry = pathToFileURL(join(runtime, 'scripts/odd/deploy.ts')).href;
   // A symlink or Git-file alias must fail before it can change HEAD, install, or handle the tag.
@@ -1096,8 +1095,8 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
   assert.deepEqual([...live.values()], [second, second, second]);
   assert.deepEqual(verified, ['v0.2.10', 'v0.2.11']);
   assert.deepEqual(comments, [
-    ['MET-310', line(`component=meter sha=${first} health=fail rollback=none`)],
-    ['MET-311', line(`component=meter+factory-api+kiosk sha=${second} health=pass rollback=none`)],
+    ['MET-310', line(`component=meter sha=${first} tag=v0.2.10 health=fail rollback=none`)],
+    ['MET-311', line(`component=meter+factory-api+kiosk sha=${second} tag=v0.2.11 health=pass rollback=none`)],
   ]);
   assert.equal(git('rev-parse', 'HEAD'), toolsSha);
   assert.equal(git('status', '--porcelain'), '');
@@ -1229,7 +1228,7 @@ test('tools promotion: a good release once and forward only; missing, failed, ti
       if (crash?.(next)) { crash = undefined; throw new Error('killed before the ledger write'); }
       ledger = structuredClone(next);
     },
-    linear: { deploying: forbidden, posted: forbidden, comment: forbidden },
+    linear: { deploying: forbidden, comment: forbidden, comments: forbidden },
   };
   const verify = (tag: string, sha = shas[tag]) => { mkdirSync(join(stateDir, 'releases', tag), { recursive: true }); writeFileSync(join(stateDir, 'releases', tag, '.verified'), `${sha}\n`); };
   const decisions = () => logs.map(([decision]) => decision);
@@ -1345,7 +1344,7 @@ test('sandbox: a kiosk release installs, three green probes report its SHA, Depl
   const dir = join(host.stateDir, 'releases/v0.3.0');
   assert.deepEqual(host.calls.filter(call => !call.startsWith('gh pr list')), ['verify v0.3.0', 'checkout 1111111', 'probe', 'probe', 'probe', 'probe', `sudo deploy/install-kiosk.sh ${dir}/kiosk`, 'probe', 'probe', 'probe']);
   assert.equal(host.live.kiosk, shas['v0.3.0']);
-  const pass = line(`component=kiosk sha=${shas['v0.3.0']} health=pass rollback=none`);
+  const pass = line(`component=kiosk sha=${shas['v0.3.0']} tag=v0.3.0 health=pass rollback=none`);
   assert.deepEqual(host.comments, [['MET-301', pass]]);
   assert.deepEqual(deploying(pass), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify kiosk at 111111111111', round: 1 });
   assert.equal(host.ledger().lastTag, 'v0.3.0');
@@ -1432,7 +1431,7 @@ test('sandbox: a red probe runs the rollback once, the restored release is re-pr
   await assert.rejects(main(host.effects), /health=fail/);
   assert.deepEqual(sudoCalls(host.calls), [`sudo deploy/install-kiosk.sh ${host.stateDir}/releases/v0.3.0/kiosk`, 'sudo deploy/install-kiosk.sh --rollback /var/backups/kiosk/snap']);
   assert.equal(host.live.kiosk, shas['v0.2.9']);
-  const fail = line(`component=kiosk sha=${shas['v0.3.0']} health=fail rollback=/var/backups/kiosk/snap`);
+  const fail = line(`component=kiosk sha=${shas['v0.3.0']} tag=v0.3.0 health=fail rollback=/var/backups/kiosk/snap`);
   assert.deepEqual(host.comments, [['MET-301', fail]]);
   const action = deploying(fail) as Extract<Action, { kind: 'set-status' }>;
   assert.equal(action.status, 'Todo');
@@ -1497,7 +1496,7 @@ for (const [name, options] of [['exits non-zero', { rollbackOk: false }], ['exit
     t.after(host.cleanup);
     await assert.rejects(main(host.effects), /health=fail rollback=none/);
     assert.equal(sudoCalls(host.calls).filter(call => call.includes('rollback')).length, 1);
-    const fail = line(`component=kiosk sha=${shas['v0.3.0']} health=fail rollback=none`);
+    const fail = line(`component=kiosk sha=${shas['v0.3.0']} tag=v0.3.0 health=fail rollback=none`);
     assert.deepEqual(host.comments, [['MET-301', fail]]);
     const action = deploying(fail) as Extract<Action, { kind: 'page' }>;
     assert.equal(action.kind, 'page');
@@ -1733,7 +1732,7 @@ test('sandbox: a fresh, legacy, v1 or unknown meter plan refuses the whole relea
       await assert.rejects(main(host.effects), /health=refused/);
       assert.deepEqual(sudoCalls(host.calls), [], 'no install, migration or rollback for any component');
       assert.deepEqual(host.calls.filter(call => call.startsWith('plan')), ['plan meter']);
-      const refused = line(`component=meter sha=${shas['v0.3.0']} health=refused rollback=none refusal=${refusalOf(mode)}`);
+      const refused = line(`component=meter sha=${shas['v0.3.0']} tag=v0.3.0 health=refused rollback=none refusal=${refusalOf(mode)}`);
       assert.deepEqual(host.comments, [['MET-364', refused]]);
       assert.equal(host.ledger().lastTag, 'v0.2.9', 'lastTag never moves past an unhandled refusal');
       assert.deepEqual(host.ledger().components, {});
@@ -1777,7 +1776,7 @@ test('sandbox: an interrupted meter resume with a red probe never runs a rollbac
       continue;
     }
     assert.deepEqual(sudoCalls(host.calls), [], 'no rollback and no install');
-    const refused = line(`component=meter sha=${shas['v0.3.0']} health=refused rollback=none refusal=db-changing-snapshot`);
+    const refused = line(`component=meter sha=${shas['v0.3.0']} tag=v0.3.0 health=refused rollback=none refusal=db-changing-snapshot`);
     assert.deepEqual(host.comments, [['MET-364', refused]]);
     assert.deepEqual(host.ledger().inFlight, inFlight, 'recovery state is kept for Devon');
     assert.equal(host.ledger().lastTag, 'v0.2.9');
@@ -1799,7 +1798,7 @@ test('sandbox: the installer rechecks after an eligible plan; a generation chang
     await assert.rejects(main(host.effects), /health=refused/);
     const meter = `${host.stateDir}/releases/v0.3.0/meter-linux-x86_64`;
     assert.deepEqual(host.calls.filter(call => /^(plan|sudo)/.test(call)), ['plan meter', `sudo deploy/install-meter.sh --no-db-change ${meter}`]);
-    const refused = line(`component=meter sha=${shas['v0.3.0']} health=refused rollback=none refusal=${refusal}`);
+    const refused = line(`component=meter sha=${shas['v0.3.0']} tag=v0.3.0 health=refused rollback=none refusal=${refusal}`);
     assert.deepEqual(host.comments, [['MET-364', refused]]);
     assert.equal(host.ledger().lastTag, 'v0.2.9');
     assert.equal(host.ledger().receipt?.tag, 'v0.3.0', 'the refusal is held, not completed as a failed release');
@@ -1821,7 +1820,7 @@ test('sandbox: the installer rechecks after an eligible plan; a generation chang
     await assert.rejects(main(red.effects), new RegExp(`health=fail rollback=${rollback}$`), name);
     assert.deepEqual(sudoCalls(red.calls), ['sudo deploy/install-meter.sh'], `${name}: no rollback subprocess`);
     assert.equal(red.live.meter, shas['v0.2.9'], name);
-    const fail = line(`component=meter sha=${shas['v0.3.0']} health=fail rollback=${rollback}`);
+    const fail = line(`component=meter sha=${shas['v0.3.0']} tag=v0.3.0 health=fail rollback=${rollback}`);
     assert.deepEqual(red.comments, [['MET-364', fail]], name);
     assert.equal(red.ledger().lastTag, 'v0.3.0', `${name}: a red receipt completes the release`);
     const action = deploying(fail);
@@ -1844,12 +1843,12 @@ test('sandbox: an eligible v2 plan precedes every installer, meter installs with
   const dir = `${host.stateDir}/releases/v0.3.0`;
   assert.deepEqual(host.calls.filter(call => /^(plan|sudo)/.test(call)), ['plan meter', `sudo deploy/install-meter.sh --no-db-change ${dir}/meter-linux-x86_64`,
     `sudo deploy/install-factory-api.sh ${dir}/factory-api-linux-x86_64`, `sudo deploy/install-kiosk.sh ${dir}/kiosk`]);
-  assert.deepEqual(host.comments, [['MET-364', line(`component=meter+factory-api+kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
+  assert.deepEqual(host.comments, [['MET-364', line(`component=meter+factory-api+kiosk sha=${shas['v0.3.0']} tag=v0.3.0 health=pass rollback=none`)]]);
   assert.equal(host.ledger().lastTag, 'v0.3.0');
 });
 
 test('control plane: a refused receipt pages irreversible-action with default not executed, files no Bug and starts no log reader', async () => {
-  const refused = line(`component=meter sha=${shas['v0.3.0']} health=refused rollback=none refusal=db-changing-legacy`);
+  const refused = line(`component=meter sha=${shas['v0.3.0']} tag=v0.3.0 health=refused rollback=none refusal=db-changing-legacy`);
   const issue = { identifier: 'MET-364', status: 'Deploying' as const, labels: ['odd'], description: '', openBlockers: [], deployReceipt: parseDeployReceipt(refused) };
   const action = nextAction(issue, idle) as Extract<Action, { kind: 'page' }>;
   const { ctx, tools } = pluginContext();
@@ -1870,7 +1869,7 @@ test('sandbox: a release that touches no enabled component posts component=none 
   t.after(host.cleanup);
   await main(host.effects);
   assert.deepEqual(sudoCalls(host.calls), []);
-  const none = line(`component=none sha=${shas['v0.3.0']} health=pass rollback=none`);
+  const none = line(`component=none sha=${shas['v0.3.0']} tag=v0.3.0 health=pass rollback=none`);
   assert.deepEqual(host.comments, [['MET-301', none]]);
   assert.deepEqual(deploying(none), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify none at 111111111111', round: 1 });
 });
@@ -1888,7 +1887,7 @@ test('sandbox: a Cargo.lock-only release installs and probes meter, factory-api 
   ]);
   assert.equal(host.calls.filter(call => call === 'probe').length, 3 + 3 * (1 + 3), 'three baseline reads, then each component\'s pre-install identity and window');
   assert.deepEqual(host.live, { meter: shas['v0.3.0'], 'factory-api': shas['v0.3.0'], kiosk: shas['v0.3.0'] });
-  assert.deepEqual(host.comments, [['MET-301', line(`component=meter+factory-api+kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
+  assert.deepEqual(host.comments, [['MET-301', line(`component=meter+factory-api+kiosk sha=${shas['v0.3.0']} tag=v0.3.0 health=pass rollback=none`)]]);
   // Already installed at this SHA: a rerun of the same release installs nothing more.
   const rerun = world({ tags: ['v0.2.9', 'v0.3.0'], changes, live: host.live, ledger: { ...host.ledger(), lastTag: 'v0.2.9' } });
   t.after(rerun.cleanup);
@@ -1904,7 +1903,7 @@ test('sandbox: killed between install and probe, the rerun resumes the in-flight
   await main(host.effects);
   assert.deepEqual(sudoCalls(host.calls), []);
   assert.equal(host.calls.filter(call => call === 'probe').length, 3 + 3, 'three baseline reads (meter, factory-api, kiosk), then the kiosk window');
-  assert.deepEqual(host.comments, [['MET-301', line(`component=kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
+  assert.deepEqual(host.comments, [['MET-301', line(`component=kiosk sha=${shas['v0.3.0']} tag=v0.3.0 health=pass rollback=none`)]]);
   assert.equal(host.ledger().inFlight, undefined);
   assert.deepEqual(host.ledger().components.kiosk, { sha: shas['v0.3.0'], tag: 'v0.3.0', health: 'pass', snapshot: '/var/backups/kiosk/snap' });
   assert.equal(host.ledger().lastTag, 'v0.3.0');
@@ -1921,7 +1920,7 @@ test('sandbox: killed between install and probe, the rerun resumes the in-flight
   await main(earlier.effects);
   assert.deepEqual(sudoCalls(earlier.calls), [`sudo deploy/install-meter.sh --no-db-change ${earlier.stateDir}/releases/v0.3.0/meter-linux-x86_64`]);
   assert.deepEqual(earlier.ledger().components.kiosk, { sha: shas['v0.3.0'], tag: 'v0.3.0', health: 'pass', snapshot: '/var/backups/kiosk/snap' });
-  assert.deepEqual(earlier.comments, [['MET-301', line(`component=meter+kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
+  assert.deepEqual(earlier.comments, [['MET-301', line(`component=meter+kiosk sha=${shas['v0.3.0']} tag=v0.3.0 health=pass rollback=none`)]]);
 });
 
 test('sandbox: a rolled-back component is retried by the next release even when that release touches only docs', async t => {
@@ -1933,7 +1932,7 @@ test('sandbox: a rolled-back component is retried by the next release even when 
   t.after(next.cleanup);
   await main(next.effects);
   assert.deepEqual(sudoCalls(next.calls), [`sudo deploy/install-kiosk.sh ${next.stateDir}/releases/v0.3.1/kiosk`]);
-  assert.deepEqual(next.comments, [['MET-303', line(`component=kiosk sha=${shas['v0.3.1']} health=pass rollback=none`)]]);
+  assert.deepEqual(next.comments, [['MET-303', line(`component=kiosk sha=${shas['v0.3.1']} tag=v0.3.1 health=pass rollback=none`)]]);
   // A failed rollback left v0.3.0 running degraded: a degraded endpoint is no baseline, so kiosk reinstalls.
   const degraded = world({ tags: ['v0.2.9', 'v0.3.0', 'v0.3.1'], changes: { 'v0.3.0': ['kiosk/src/App.tsx'], 'v0.3.1': ['docs/x.md'] }, live: { kiosk: shas['v0.3.0'] }, startDegraded: ['kiosk'], ledger: host.ledger() });
   t.after(degraded.cleanup);
@@ -1947,7 +1946,7 @@ test('sandbox: a receipt delivery that fails midway is resumed by the rerun with
   t.after(host.cleanup);
   await assert.rejects(main(host.effects), /Linear 503/);
   assert.equal(host.ledger().lastTag, 'v0.2.9');
-  const fail = line(`component=kiosk sha=${shas['v0.3.0']} health=fail rollback=/var/backups/kiosk/snap`);
+  const fail = line(`component=kiosk sha=${shas['v0.3.0']} tag=v0.3.0 health=fail rollback=/var/backups/kiosk/snap`);
   assert.deepEqual(host.comments, [['MET-301', fail]]);
   const rerun = world({ ...options, ledger: host.ledger() });
   t.after(rerun.cleanup);
@@ -1967,7 +1966,7 @@ test('sandbox: a comment Linear stored but whose response was lost is not posted
   t.after(rerun.cleanup);
   await main(rerun.effects);
   assert.deepEqual(sudoCalls([...host.calls, ...rerun.calls]), [`sudo deploy/install-kiosk.sh ${host.stateDir}/releases/v0.3.0/kiosk`]);
-  assert.deepEqual(rerun.comments, [['MET-301', line(`component=kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
+  assert.deepEqual(rerun.comments, [['MET-301', line(`component=kiosk sha=${shas['v0.3.0']} tag=v0.3.0 health=pass rollback=none`)]]);
   assert.equal(rerun.ledger().lastTag, 'v0.3.0');
 });
 
@@ -1983,14 +1982,14 @@ test('sandbox: a transient PR lookup failure keeps the release pending; the reru
   t.after(rerun.cleanup);
   await main(rerun.effects);
   assert.deepEqual(sudoCalls(rerun.calls), []);
-  assert.deepEqual(rerun.comments, [['MET-301', line(`component=kiosk sha=${shas['v0.3.0']} health=pass rollback=none`)]]);
+  assert.deepEqual(rerun.comments, [['MET-301', line(`component=kiosk sha=${shas['v0.3.0']} tag=v0.3.0 health=pass rollback=none`)]]);
   assert.equal(rerun.ledger().lastTag, 'v0.3.0');
 });
 
 // --- Delayed recipients and receipt reconciliation (MET-353).
 
 const DAY = 24 * 60 * 60_000;
-const kioskAt = (tag: Tag) => line(`component=kiosk sha=${shas[tag]} health=pass rollback=none`);
+const kioskAt = (tag: Tag) => line(`component=kiosk sha=${shas[tag]} tag=${tag} health=pass rollback=none`);
 const mergeLine = (pr: number, merge: string) => `odd-merge pr=${pr} head=${'d'.repeat(40)} merge=${merge} release=none`;
 const verifyFail = (tag: Tag) => `odd-verify sha=${shas[tag]} result=fail bug=MET-900`;
 const merged = (pr: number, merge: string, extra: Partial<{ title: string; headRefName: string; body: string }> = {}) =>
@@ -2049,7 +2048,7 @@ test('sandbox: a pending recipient a later release ships again keeps one entry; 
   host.clock.now += DAY;
   tags.push('v0.3.1');
   await main(host.effects);
-  const v301 = line(`component=none sha=${shas['v0.3.1']} health=pass rollback=none`);
+  const v301 = line(`component=none sha=${shas['v0.3.1']} tag=v0.3.1 health=pass rollback=none`);
   assert.deepEqual(host.ledger().deliveries, [{ issue: 'MET-302', tag: 'v0.3.1', line: v301, since }], 'superseded by the newer receipt, first seen unchanged');
   host.clock.now = Date.parse(since) + 7 * DAY - 1;
   await main(host.effects);
@@ -2150,7 +2149,7 @@ test('MET-386 sandbox: a mixed-SHA receipt set keeps meter at its release and ki
     const body = probe(url);
     return meterDegraded && url.includes(':11434') ? JSON.stringify({ ...JSON.parse(body), status: 'degraded' }) : body;
   };
-  const meterAtA = line(`component=meter sha=${A} health=pass rollback=none`);
+  const meterAtA = line(`component=meter sha=${A} tag=v0.2.50 health=pass rollback=none`);
   // v0.2.50: every component each issue needs is at the release SHA, so the uniform receipt stays as it was.
   await main(host.effects);
   assert.deepEqual(issueComments(host, 'MET-500'), [meterAtA]);
@@ -2170,7 +2169,7 @@ test('MET-386 sandbox: a mixed-SHA receipt set keeps meter at its release and ki
   // A tick with no new release, meter healthy again: the complete set is published at round v0.3.0, each component at its own SHA.
   meterDegraded = false;
   await main(host.effects);
-  const set = line(`component=meter+kiosk sha=${B} health=pass rollback=none round=v0.3.0 set=meter:${A}@v0.2.50,kiosk:${B}@v0.3.0`);
+  const set = line(`component=meter+kiosk sha=${B} tag=v0.3.0 health=pass rollback=none round=v0.3.0 set=meter:${A}@v0.2.50,kiosk:${B}@v0.3.0`);
   assert.deepEqual(issueComments(host, 'MET-500').at(-1), set);
   assert.deepEqual(parseDeployReceipt(set)?.set, [{ component: 'meter', sha: A, tag: 'v0.2.50' }, { component: 'kiosk', sha: B, tag: 'v0.3.0' }]);
   assert.deepEqual(await lifecycleOf(host, 'MET-500'), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: `verify meter+kiosk at ${B.slice(0, 12)}`, round: 1 });
@@ -2178,13 +2177,58 @@ test('MET-386 sandbox: a mixed-SHA receipt set keeps meter at its release and ki
   host.comments.push(['MET-500', `odd-verify sha=${B} result=fail bug=MET-900`]);
   tags.push('v0.3.1');
   await main(host.effects);
-  const refreshed = line(`component=meter+kiosk sha=${C} health=pass rollback=none round=v0.3.1 set=meter:${A}@v0.2.50,kiosk:${B}@v0.3.0`);
+  const refreshed = line(`component=meter+kiosk sha=${C} tag=v0.3.1 health=pass rollback=none round=v0.3.1 set=meter:${A}@v0.2.50,kiosk:${B}@v0.3.0`);
   assert.deepEqual(issueComments(host, 'MET-500').filter(body => body.startsWith('odd-deploy')), [meterAtA, set, refreshed], 'never factory-api at v0.3.1 for this issue');
   assert.deepEqual(await lifecycleOf(host, 'MET-500'), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: `verify meter+kiosk at ${C.slice(0, 12)}`, round: 1 });
   host.comments.push(['MET-500', `odd-verify sha=${C} result=pass bug=none`]);
   assert.deepEqual(await lifecycleOf(host, 'MET-500'), { kind: 'set-status', status: 'Done', reason: `verified meter+kiosk at ${C.slice(0, 12)}` });
   assert.deepEqual(sudoCalls(host.calls).map(call => call.split(' ')[1]), ['deploy/install-meter.sh', 'deploy/install-kiosk.sh', 'deploy/install-factory-api.sh'], 'one install per release, no replay for a receipt');
   assert.deepEqual(issueComments(host, 'MET-501'), [meterAtA], 'the meter-only issue keeps its one receipt');
+});
+
+test('MET-367: receipts carry the verified release tag; tagless receipts an earlier deployer saved or posted are tagged once and never reposted', async t => {
+  const receipt = { component: 'kiosk', sha: shas['v0.3.0'], health: 'pass' as const, rollback: 'none' };
+  assert.equal(receiptLine(receipt, 'v0.3.0'), kioskAt('v0.3.0'));
+  assert.deepEqual(parseDeployReceipt(receiptLine(receipt, 'v0.3.0')), { host: 'factory-gpu', ...receipt, tag: 'v0.3.0' });
+  for (const tag of ['latest', 'v0.3', '0.3.0', 'v0.3.0-rc1', '']) assert.throws(() => receiptLine(receipt, tag), /not a vX\.Y\.Z release/, tag);
+  const pass = (sha: string) => line(`component=kiosk sha=${sha} health=pass rollback=none`);
+  // A MET-386 set saved before tags: tagged with its round, each component keeping its own tag.
+  const set = (tag: string) => line(`component=meter+kiosk sha=${shas['v0.3.0']}${tag} health=pass rollback=none round=v0.3.0 set=meter:${shas['v0.2.50']}@v0.2.50,kiosk:${shas['v0.3.0']}@v0.3.0`);
+  // An earlier deployer saved v0.3.0's receipt and posted it to MET-301 before the response was lost.
+  const resumed = world({ tags: ['v0.2.9', 'v0.3.0'], changes: {}, issues: { 'v0.3.0': ['MET-301', 'MET-302', 'MET-303'] },
+    ledger: baseline({ receipt: { tag: 'v0.3.0', receipt, delivered: [] } }),
+    // Controls: MET-303's receipt for the same SHA is a different (failed) one, so it is not this receipt.
+    comments: [['MET-301', pass(shas['v0.3.0'])], ['MET-303', line(`component=kiosk sha=${shas['v0.3.0']} health=fail rollback=/var/backups/kiosk/snap`)]] });
+  t.after(resumed.cleanup);
+  await main(resumed.effects);
+  assert.deepEqual(sudoCalls(resumed.calls), [], 'the saved receipt is delivered, never reinstalled');
+  assert.deepEqual(issueComments(resumed, 'MET-301'), [pass(shas['v0.3.0'])], 'the equivalent tagless receipt counts as posted');
+  assert.deepEqual(issueComments(resumed, 'MET-302'), [kioskAt('v0.3.0')]);
+  assert.deepEqual(issueComments(resumed, 'MET-303').at(-1), kioskAt('v0.3.0'));
+  assert.deepEqual(resumed.ledger().deployed, { tag: 'v0.3.0', sha: shas['v0.3.0'], line: kioskAt('v0.3.0') });
+  for (const issue of ['MET-301', 'MET-302']) assert.deepEqual(await lifecycleOf(resumed, issue), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify kiosk at 111111111111', round: 1 }, issue);
+  // A no-release tick from a ledger an earlier deployer wrote: tagless deliveries and catch-up line.
+  const since = '2026-10-26T00:00:00.000Z';
+  const ledger = baseline({ lastTag: 'v0.3.0', deployed: { tag: 'v0.3.0', sha: shas['v0.3.0'], line: pass(shas['v0.3.0']) }, deliveries: [
+    { issue: 'MET-304', tag: 'v0.3.0', line: pass(shas['v0.3.0']), since },
+    { issue: 'MET-305', tag: 'v0.2.50', line: pass(shas['v0.2.50']), since },
+    { issue: 'MET-307', tag: 'v0.3.0', line: set(''), since },
+  ] });
+  const options = { tags: ['v0.2.9', 'v0.3.0'] as Tag[], changes: {}, deploying: ['MET-306'], prs: [merged(306, shas['v0.3.0'])] };
+  const later = world({ ...options, ledger, comments: [['MET-305', pass(shas['v0.2.50'])], ['MET-306', mergeLine(306, shas['v0.3.0'])]] });
+  t.after(later.cleanup);
+  await main(later.effects);
+  assert.deepEqual(later.comments.slice(2), [['MET-304', kioskAt('v0.3.0')], ['MET-307', set(' tag=v0.3.0')], ['MET-306', kioskAt('v0.3.0')]], 'MET-305 already had its receipt');
+  assert.deepEqual(later.ledger().deliveries, []);
+  assert.deepEqual(decisions(later, 'receipt-exists'), [{ issue: 'MET-305', line: kioskAt('v0.2.50') }]);
+  const count = later.comments.length;
+  await main(later.effects);
+  assert.equal(later.comments.length, count, 'retries stay idempotent');
+  // A stored line naming another release than its record is never relabelled or posted.
+  const mismatched = world({ ...options, deploying: [], ledger: { ...ledger, deliveries: [{ issue: 'MET-304', tag: 'v0.3.0', line: kioskAt('v0.3.1'), since }] } });
+  t.after(mismatched.cleanup);
+  await assert.rejects(main(mismatched.effects), /not a receipt of v0\.3\.0/);
+  assert.deepEqual(mismatched.comments, []);
 });
 
 test('pending releases are immutable v-tags newer than the ledger, oldest first; a missing or cursorless ledger is never silently adopted', async t => {
@@ -2221,7 +2265,7 @@ test('drain: three pending releases take three ticks, oldest first, each prepari
     issues: { 'v0.2.50': ['MET-350'], 'v0.3.0': ['MET-300'], 'v0.3.1': ['MET-301'] }, ledger: baseline() });
   t.after(host.cleanup);
   const kioskAt = (tag: Tag) => `sudo deploy/install-kiosk.sh ${host.stateDir}/releases/${tag}/kiosk`;
-  const receipt = (issue: string, tag: Tag) => [issue, line(`component=kiosk sha=${shas[tag]} health=pass rollback=none`)];
+  const receipt = (issue: string, tag: Tag) => [issue, line(`component=kiosk sha=${shas[tag]} tag=${tag} health=pass rollback=none`)];
   for (const [tag, issue] of [['v0.2.50', 'MET-350'], ['v0.3.0', 'MET-300'], ['v0.3.1', 'MET-301']] as const) {
     const before = host.comments.length;
     assert.deepEqual(await tick(host), { ok: true, prepared: [`verify ${tag}`], installs: [kioskAt(tag)], lastTag: tag, tools: tag }, tag);
@@ -2259,7 +2303,7 @@ test('drain: a failed preparation, killed install, failed delivery or failed ins
     : sudo(script, args);
   let reconciled = 0;
   host.effects.linear = { ...linear, deployingIssues: async () => { reconciled++; return linear.deployingIssues!(); } };
-  const pass = (tag: Tag, component: string) => line(`component=${component} sha=${shas[tag]} health=pass rollback=none`);
+  const pass = (tag: Tag, component: string) => line(`component=${component} sha=${shas[tag]} tag=${tag} health=pass rollback=none`);
 
   // 1. Preparation fails: nothing installed, the cursor stays, no later release is prepared.
   assert.deepEqual(await tick(host), { ok: false, prepared: [], installs: [], lastTag: 'v0.2.9', tools: undefined });
@@ -2276,7 +2320,7 @@ test('drain: a failed preparation, killed install, failed delivery or failed ins
   assert.deepEqual(await tick(host), { ok: true, prepared: [], installs: [], lastTag: 'v0.2.50', tools: 'v0.2.50' });
   assert.deepEqual(host.comments, [['MET-350', pass('v0.2.50', 'meter+kiosk')], ['MET-351', pass('v0.2.50', 'meter+kiosk')]]);
   // 5. v0.3.0 fails without a change: its fail receipt waits for MET-300 and v0.3.1 is not prepared.
-  const failed = line(`component=kiosk sha=${shas['v0.3.0']} health=fail rollback=unchanged`);
+  const failed = line(`component=kiosk sha=${shas['v0.3.0']} tag=v0.3.0 health=fail rollback=unchanged`);
   assert.deepEqual(await tick(host), { ok: false, prepared: ['verify v0.3.0'], installs: [`sudo deploy/install-kiosk.sh ${dir('v0.3.0')}/kiosk`], lastTag: 'v0.3.0', tools: 'v0.2.50' });
   assert.equal(host.live.kiosk, shas['v0.2.50']);
   assert.deepEqual(host.ledger().deliveries?.map(delivery => [delivery.issue, delivery.line]), [['MET-300', failed]]);
@@ -2314,7 +2358,7 @@ test('bootstrap: an absent ledger adopts one healthy published release without i
   tags.push('v0.3.1');
   await main(host.effects);
   assert.deepEqual(sudoCalls(host.calls), [`sudo deploy/install-kiosk.sh ${host.stateDir}/releases/v0.3.1/kiosk`]);
-  assert.deepEqual(host.comments, [['MET-301', line(`component=kiosk sha=${shas['v0.3.1']} health=pass rollback=none`)]]);
+  assert.deepEqual(host.comments, [['MET-301', line(`component=kiosk sha=${shas['v0.3.1']} tag=v0.3.1 health=pass rollback=none`)]]);
   assert.equal(host.ledger().lastTag, 'v0.3.1');
 });
 
