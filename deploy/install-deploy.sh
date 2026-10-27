@@ -51,7 +51,7 @@ safe_path /var/backups/factory-deploy
 allowed=$(sudo -u agent sudo -n -l 2>/dev/null) || fail 'agent has no passwordless sudo allowlist.'
 # MET-375: only the root-owned staged tree; an entry naming the agent checkout is effective root for agent.
 [[ "$allowed" != *"/home/agent/"* ]] || fail 'Allowlist still names agent-writable scripts; restage (deploy/sudoers/README.md).'
-for script in install-meter.sh rollback-meter-v1.sh install-factory-api.sh rollback-factory-api.sh install-kiosk.sh rollback-kiosk.sh; do
+for script in install-meter.sh rollback-meter-v1.sh install-factory-api.sh rollback-factory-api.sh install-kiosk.sh; do
     [[ "$allowed" == *"/usr/bin/bash /usr/local/lib/factory-deploy/deploy/$script *"* ]] || fail "Allowlist lacks the staged deploy/$script."
 done
 sudo -u agent test -r /etc/factory-dispatch/linear-api-key || fail 'agent cannot read /etc/factory-dispatch/linear-api-key.'

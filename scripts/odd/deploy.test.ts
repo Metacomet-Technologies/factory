@@ -35,7 +35,7 @@ function fixture(options: { installOk?: boolean; rollbackOk?: boolean; bodies: s
     ok: () => true,
     sudo: (script, args) => {
       calls.push(`sudo ${script} ${args.join(' ')}`.trim());
-      if (script.startsWith('deploy/install-')) return { ok: options.installOk ?? true, output: `preflight ok\nRollback snapshot: ${snapshot}\ninstalled\n` };
+      if (script.startsWith('deploy/install-') && args[0] !== '--rollback') return { ok: options.installOk ?? true, output: `preflight ok\nRollback snapshot: ${snapshot}\ninstalled\n` };
       return { ok: options.rollbackOk ?? true, output: '' };
     },
     probe: () => { calls.push('probe'); return bodies.shift() ?? 'unreachable'; },
@@ -128,8 +128,9 @@ test('a pre-snapshot installer failure is rollback=unchanged only when three pro
 });
 
 test('the enabled set is meter, factory-api and kiosk in install order, each with a restoring rollback', () => {
-  assert.deepEqual(recipes.map(recipe => [recipe.name, recipe.rollback]), [
-    ['meter', 'deploy/rollback-meter-v1.sh'], ['factory-api', 'deploy/rollback-factory-api.sh'], ['kiosk', 'deploy/rollback-kiosk.sh'],
+  // MET-375: rollback-kiosk.sh is not allowlisted; the kiosk installer validates the snapshot and runs it.
+  assert.deepEqual(recipes.map(recipe => [recipe.name, recipe.rollback, recipe.rollbackArgs]), [
+    ['meter', 'deploy/rollback-meter-v1.sh', undefined], ['factory-api', 'deploy/rollback-factory-api.sh', undefined], ['kiosk', 'deploy/install-kiosk.sh', ['--rollback']],
   ]);
 });
 
@@ -333,7 +334,7 @@ function world(options: {
     },
     sudo: (script, args) => {
       const component = /deploy\/(?:install|rollback)-(.+?)(?:-v1)?\.sh$/.exec(script)![1];
-      if (script.includes('/install-')) {
+      if (script.includes('/install-') && args[0] !== '--rollback') {
         assert.deepEqual(args.slice(0, 2), ['--source-checkout', join(stateDir, 'source')]);
         // The read-only plan is recorded apart from sudo installs and rollbacks.
         if (args[2] === '--plan') { calls.push(`plan ${component}`); return options.meterPlan ?? { ok: true, output: `${v2Plan}\n` }; }
@@ -745,7 +746,7 @@ function installerHost(t: { after: (fn: () => void) => void }) {
   for (const path of [bin, units, join(temp, 'etc/factory-dispatch'), join(temp, 'home/agent/.local/state/factory-odd'), join(root, 'deploy'), join(root, 'scripts/odd'), join(root, 'scripts/release')]) mkdirSync(path, { recursive: true });
   const paths = ['scripts/odd/deploy.ts', 'scripts/odd/lifecycle.ts', 'scripts/release/release.py', 'deploy/components.json',
     'deploy/factory-deploy.service', 'deploy/factory-deploy.timer', 'deploy/install-deploy.sh', 'deploy/rollback-deploy.sh',
-    ...recipes.flatMap(recipe => [recipe.installer, recipe.rollback]), 'deploy/install-usage.sh', 'deploy/rollback-usage.sh'];
+    ...new Set(recipes.flatMap(recipe => [recipe.installer, recipe.rollback])), 'deploy/rollback-kiosk.sh', 'deploy/install-usage.sh', 'deploy/rollback-usage.sh'];
   for (const path of paths) {
     // Existing installer-test convention: relocate fixed paths and simulate root, never run sudo.
     const text = readFileSync(new URL(`../../${path}`, import.meta.url), 'utf8')
@@ -768,7 +769,7 @@ function installerHost(t: { after: (fn: () => void) => void }) {
     gh: '[[ $* == "auth status" ]]',
     git: '[[ $* == *"fetch --quiet --tags origin" || $* == *"status --porcelain" ]] || { [[ $* == *"rev-parse HEAD" ]] && echo 1111111111111111111111111111111111111111; }',
     sudo: `if [[ $* == '-n -l' ]]; then
-  printf '%s\\n' ${recipes.flatMap(recipe => [recipe.installer, recipe.rollback]).map(path => `' /usr/bin/bash /usr/local/lib/factory-deploy/${path} *'`).join(' ')}
+  printf '%s\\n' ${[...new Set(recipes.flatMap(recipe => [recipe.installer, recipe.rollback]))].map(path => `' /usr/bin/bash /usr/local/lib/factory-deploy/${path} *'`).join(' ')}
   # MET-375: the pre-hardening entry for an agent-writable checkout script.
   if [[ -n \${OLD_ALLOWLIST:-} ]]; then printf '%s\\n' ' /usr/bin/bash ${root}/deploy/install-kiosk.sh *'; fi
   exit 0
@@ -1000,7 +1001,7 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
   git('tag', 'v0.2.11');
   mkdirSync(join(runtime, 'scripts/odd'), { recursive: true });
   mkdirSync(join(runtime, 'scripts/release'), { recursive: true });
-  const tools = ['scripts/odd/deploy.ts', 'scripts/odd/lifecycle.ts', 'scripts/odd/snapshot.ts', 'scripts/odd/engines.ts', 'scripts/release/release.py', ...recipes.flatMap(recipe => [recipe.installer, recipe.rollback])];
+  const tools = ['scripts/odd/deploy.ts', 'scripts/odd/lifecycle.ts', 'scripts/odd/snapshot.ts', 'scripts/odd/engines.ts', 'scripts/release/release.py', ...new Set(recipes.flatMap(recipe => [recipe.installer, recipe.rollback]))];
   for (const path of tools) writeFileSync(join(runtime, path), readFileSync(new URL(`../../${path}`, import.meta.url)));
   const toolsSha = commit('deployment machinery');
   git('update-ref', 'refs/remotes/origin/main', toolsSha);
@@ -1425,7 +1426,7 @@ test('sandbox: a red probe runs the rollback once, the restored release is re-pr
   const host = world({ tags: ['v0.2.9', 'v0.3.0'], changes: { 'v0.3.0': ['kiosk/src/App.tsx'] }, issues: { 'v0.3.0': ['MET-301'] }, broken: ['kiosk'], ledger: baseline() });
   t.after(host.cleanup);
   await assert.rejects(main(host.effects), /health=fail/);
-  assert.deepEqual(sudoCalls(host.calls), [`sudo deploy/install-kiosk.sh ${host.stateDir}/releases/v0.3.0/kiosk`, 'sudo deploy/rollback-kiosk.sh /var/backups/kiosk/snap']);
+  assert.deepEqual(sudoCalls(host.calls), [`sudo deploy/install-kiosk.sh ${host.stateDir}/releases/v0.3.0/kiosk`, 'sudo deploy/install-kiosk.sh --rollback /var/backups/kiosk/snap']);
   assert.equal(host.live.kiosk, shas['v0.2.9']);
   const fail = line(`component=kiosk sha=${shas['v0.3.0']} health=fail rollback=/var/backups/kiosk/snap`);
   assert.deepEqual(host.comments, [['MET-301', fail]]);

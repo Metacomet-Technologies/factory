@@ -769,21 +769,21 @@ out=$(/usr/bin/stat "$@") || exit
 if [[ $fmt == %u* && ${out%% *} == "$(id -u)" ]]; then out="0${out#"$(id -u)"}"; fi
 printf '%s\\n' "$out"
 """
-# (script, args) for each allowlisted entry point, run from the staged tree.
+# label: (script, args) for each entry point a root caller can reach in the staged tree, and what it
+# prints once its trusted-asset check has passed, still before any change.
 ENTRY_POINTS = {
-    "install-meter.sh": lambda binary, dist: [str(binary)],
-    "install-factory-api.sh": lambda binary, dist: [str(binary)],
-    "install-kiosk.sh": lambda binary, dist: [str(dist)],
-    "rollback-meter.sh": lambda binary, dist: [],
-    "rollback-meter-v1.sh": lambda binary, dist: ["/var/backups/meter/snap"],
-    "rollback-factory-api.sh": lambda binary, dist: ["/var/backups/factory-api/snap"],
+    "install-meter.sh": ("install-meter.sh", lambda binary, dist: [str(binary)], "matches checkout"),
+    "install-factory-api.sh": ("install-factory-api.sh", lambda binary, dist: [str(binary)], "matches checkout"),
+    "install-kiosk.sh": ("install-kiosk.sh", lambda binary, dist: [str(dist)], "matches checkout"),
+    "install-kiosk.sh --rollback": ("install-kiosk.sh", lambda binary, dist: ["--rollback", "/var/backups/factory-kiosk/snap"], "Run as root"),
+    "rollback-meter.sh": ("rollback-meter.sh", lambda binary, dist: [], "Run as root"),
+    "rollback-meter-v1.sh": ("rollback-meter-v1.sh", lambda binary, dist: ["/var/backups/meter/snap"], "Run as root"),
+    "rollback-factory-api.sh": ("rollback-factory-api.sh", lambda binary, dist: ["/var/backups/factory-api/snap"], "Run as root"),
 }
-# What each entry point prints once its trusted-asset check has passed, still before any change.
-PASSED = {"install-meter.sh": "matches checkout", "install-factory-api.sh": "matches checkout", "install-kiosk.sh": "matches checkout",
-          "rollback-meter.sh": "Run as root", "rollback-meter-v1.sh": "Run as root", "rollback-factory-api.sh": "Run as root"}
 ASSETS = ["deploy/sudoers/trusted-assets.sh", "deploy/install-meter.sh", "deploy/meter.service", "deploy/set_ollama_host.py",
           "deploy/rollback-meter-v1.sh", "deploy/rollback-meter.sh", "deploy/install-factory-api.sh", "deploy/factory-api.service",
-          "deploy/alerts/factory-api-alerts.conf", "deploy/device-tokens.sh", "deploy/rollback-factory-api.sh", "deploy/install-kiosk.sh"]
+          "deploy/alerts/factory-api-alerts.conf", "deploy/device-tokens.sh", "deploy/rollback-factory-api.sh", "deploy/install-kiosk.sh",
+          "deploy/rollback-kiosk.sh"]
 
 
 class TrustedTreeTest(unittest.TestCase):
@@ -830,8 +830,8 @@ class TrustedTreeTest(unittest.TestCase):
 
     def run_entry(self, script, env=None):
         self.calls.unlink(missing_ok=True)
-        args = ENTRY_POINTS[script](self.binary, self.dist)
-        result = subprocess.run(["bash", str(self.tree / "deploy" / script), *args], env=env or self.env,
+        name, args, _ = ENTRY_POINTS[script]
+        result = subprocess.run(["bash", str(self.tree / "deploy" / name), *args(self.binary, self.dist)], env=env or self.env,
                                 text=True, capture_output=True, check=False)
         calls = self.calls.read_text() if self.calls.exists() else ""
         return result, calls
@@ -840,14 +840,14 @@ class TrustedTreeTest(unittest.TestCase):
         result, calls = self.run_entry(script, env)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertRegex(result.stderr, message)
-        self.assertNotIn(PASSED[script], result.stdout + result.stderr)
+        self.assertNotIn(ENTRY_POINTS[script][2], result.stdout + result.stderr)
         self.assertEqual(calls, "", "a refused tree ran nothing through sudo")
 
     def test_intact_staged_tree_passes_every_entry_point(self):
         for script in ENTRY_POINTS:
             with self.subTest(script=script):
                 result, _ = self.run_entry(script)
-                self.assertIn(PASSED[script], result.stdout + result.stderr)
+                self.assertIn(ENTRY_POINTS[script][2], result.stdout + result.stderr)
                 self.assertNotIn("trusted asset", (result.stdout + result.stderr).lower())
 
     def test_tree_owned_by_a_non_root_user_is_refused(self):
@@ -896,21 +896,30 @@ class TrustedTreeTest(unittest.TestCase):
             "duplicate digest": (duplicate_digest, "Duplicate staged digest: deploy/{script}"),
         }
         for case, (tamper, message) in cases.items():
-            for script in ENTRY_POINTS:
-                with self.subTest(case=case, script=script):
+            for label, (script, _, _) in ENTRY_POINTS.items():
+                with self.subTest(case=case, entry=label):
                     self.stage()
                     tamper(f"deploy/{script}")
-                    self.assert_refused(script, re.compile(message.format(script=re.escape(script)), re.M))
+                    self.assert_refused(label, re.compile(message.format(script=re.escape(script)), re.M))
         # A helper an installer reads as root, not only the script itself: changed or missing.
         helpers = (("deploy/meter.service", "install-meter.sh"), ("deploy/set_ollama_host.py", "rollback-meter.sh"),
                    ("deploy/factory-api.service", "install-factory-api.sh"), ("deploy/device-tokens.sh", "rollback-factory-api.sh"),
-                   ("deploy/rollback-meter-v1.sh", "install-meter.sh"), ("deploy/alerts/factory-api-alerts.conf", "rollback-factory-api.sh"))
+                   ("deploy/rollback-meter-v1.sh", "install-meter.sh"), ("deploy/alerts/factory-api-alerts.conf", "rollback-factory-api.sh"),
+                   ("deploy/rollback-kiosk.sh", "install-kiosk.sh --rollback"), ("deploy/rollback-kiosk.sh", "install-kiosk.sh"))
         for name, script in helpers:
             for case, tamper, message in (("changed", append, "Trusted asset changed since staging"), ("missing", lambda n: (self.tree / n).unlink(), "Missing trusted asset")):
                 with self.subTest(helper=name, case=case):
                     self.stage()
                     tamper(name)
                     self.assert_refused(script, f"{message}: .*/{re.escape(name)}")
+
+    def test_every_allowlisted_script_is_a_covered_entry_point(self):
+        # Each sudoers entry names a staged script that the tamper cases above run; a new entry without a
+        # trusted-asset check, or one naming another tree, fails here.
+        entries = re.findall(r"^\s*/usr/bin/bash (\S+) \*", (repo / "deploy/sudoers/factory-agent-deploy").read_text(), re.M)
+        self.assertEqual(sorted(entries), sorted({f"{TRUSTED}/deploy/{script}" for script, _, _ in ENTRY_POINTS.values()} - {f"{TRUSTED}/deploy/rollback-meter.sh"}))
+        for entry in entries:
+            self.assertIn("trusted_assets deploy/sudoers/trusted-assets.sh", pathlib.Path(repo, entry.removeprefix(f"{TRUSTED}/")).read_text(), entry)
 
     def test_meter_reads_its_unit_from_its_own_tree_not_the_callers_checkout(self):
         # The caller's checkout holds no unit; only the build identity is checked against it.
@@ -925,14 +934,20 @@ class TrustedTreeTest(unittest.TestCase):
 
     def test_rollbacks_accept_only_a_root_owned_installer_snapshot(self):
         backups = self.base / "backups"
-        for script, directory in (("rollback-meter-v1.sh", "/var/backups/meter"), ("rollback-factory-api.sh", "/var/backups/factory-api")):
+        incomplete = "Snapshot is incomplete"
+        cases = (("rollback-meter-v1.sh", [], "/var/backups/meter", incomplete), ("rollback-factory-api.sh", [], "/var/backups/factory-api", incomplete),
+                 # The kiosk rollback is reached only through the installer, which then runs rollback-kiosk.sh (stubbed).
+                 ("install-kiosk.sh", ["--rollback"], "/var/backups/factory-kiosk", "ROLLBACK-KIOSK"))
+        for script, flags, directory, passed in cases:
             with self.subTest(script=script):
                 home = backups / directory.rsplit("/", 1)[1]
                 home.mkdir(parents=True)
                 # Not run from the staged tree: only the snapshot rule is under test, as uid 0.
                 body = (repo / "deploy" / script).read_text().replace(directory, str(home)).replace("[[ $EUID -eq 0 ]]", "true")
-                copy = self.base / script
+                copy = self.base / script.removesuffix(".sh") / "deploy" / script
+                copy.parent.mkdir(parents=True)
                 copy.write_text(body)
+                (copy.parent / "rollback-kiosk.sh").write_text('echo "ROLLBACK-KIOSK $1" >&2; exit 1\n')
                 inside = home / "20261027T000000.000000Z.abc123"
                 inside.mkdir()
                 outside = self.base / "agent-snapshot"
@@ -942,16 +957,18 @@ class TrustedTreeTest(unittest.TestCase):
                 env = {**self.env, "FAKE_ROOT_TREE": str(backups)}
 
                 def run(snapshot, environment=env):
-                    return subprocess.run(["bash", str(copy), str(snapshot)], env=environment, text=True, capture_output=True, check=False)
+                    return subprocess.run(["bash", str(copy), *flags, str(snapshot)], env=environment, text=True, capture_output=True, check=False)
 
                 for snapshot in (outside, link, home, inside / "nested", backups):
                     result = run(snapshot)
                     self.assertEqual(result.returncode, 1)
                     self.assertRegex(result.stderr, "Not an installer snapshot|No snapshot directory", snapshot)
-                    self.assertNotIn("Snapshot is incomplete", result.stderr)
+                    self.assertNotIn(passed, result.stderr)
                 # Control: the root-owned installer snapshot passes and reaches the snapshot's own validation.
                 result = run(inside)
-                self.assertIn("Snapshot is incomplete", result.stderr)
+                self.assertIn(passed, result.stderr)
+                if flags:
+                    self.assertIn(f"ROLLBACK-KIOSK {inside}", result.stderr)
                 # A writable snapshot home is refused even for a snapshot inside it.
                 home.chmod(0o777)
                 self.assertRegex(run(inside).stderr, "Not an installer snapshot")

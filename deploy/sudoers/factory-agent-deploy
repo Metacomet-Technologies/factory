@@ -13,7 +13,6 @@ Cmnd_Alias FACTORY_GPU_DEPLOY = \
     /usr/bin/bash /usr/local/lib/factory-deploy/deploy/install-kiosk.sh *, \
     /usr/bin/bash /usr/local/lib/factory-deploy/deploy/install-meter.sh *, \
     /usr/bin/bash /usr/local/lib/factory-deploy/deploy/rollback-factory-api.sh *, \
-    /usr/bin/bash /usr/local/lib/factory-deploy/deploy/rollback-kiosk.sh *, \
     /usr/bin/bash /usr/local/lib/factory-deploy/deploy/rollback-meter-v1.sh *
 
 agent factory-gpu = (root) NOPASSWD: FACTORY_GPU_DEPLOY

@@ -56,8 +56,9 @@ export type Recipe = {
   /** Installer argument from the verified release directory. */
   artifact: (releaseDir: string) => string;
   installer: string;
-  /** Restores the installer's snapshot. */
+  /** Restores the installer's snapshot: `sudo rollback ...rollbackArgs SNAPSHOT`. */
   rollback: string;
+  rollbackArgs?: readonly string[];
   /** Every file the installer and rollback run or read as root from TRUSTED (deploy/sudoers/trusted-assets.sh callers). */
   staged: readonly string[];
   /** Health endpoint reporting `git_sha`. */
@@ -80,7 +81,8 @@ export const recipes: readonly Recipe[] = [
     staged: ['deploy/install-factory-api.sh', 'deploy/factory-api.service', 'deploy/alerts/factory-api-alerts.conf', 'deploy/device-tokens.sh', 'deploy/rollback-factory-api.sh'],
     health: 'http://127.0.0.1:8080/v1/health' },
   { name: 'kiosk', deployFiles: ['deploy/install-kiosk.sh'], artifact: dir => join(dir, 'kiosk'),
-    installer: 'deploy/install-kiosk.sh', rollback: 'deploy/rollback-kiosk.sh',
+    // rollback-kiosk.sh is not allowlisted: the installer validates the snapshot, then runs it (MET-375).
+    installer: 'deploy/install-kiosk.sh', rollback: 'deploy/install-kiosk.sh', rollbackArgs: ['--rollback'],
     staged: ['deploy/install-kiosk.sh', 'deploy/rollback-kiosk.sh'],
     health: 'http://127.0.0.1:8080/version.json' },
 ];
@@ -294,7 +296,7 @@ async function probeWindow(effects: Effects, recipe: Recipe, sha: string, check 
 /** Run the rollback once, then re-probe: the snapshot when the previous release is back and healthy, else `none`. */
 async function rollback(effects: Effects, recipe: Recipe, sha: string, snapshot: string | undefined): Promise<string> {
   if (!snapshot) { effects.log('rollback-missing-snapshot', { component: recipe.name }); return 'none'; }
-  const result = effects.sudo(recipe.rollback, [snapshot]);
+  const result = effects.sudo(recipe.rollback, [...recipe.rollbackArgs ?? [], snapshot]);
   effects.log('rollback', { component: recipe.name, ok: result.ok, snapshot });
   if (!result.ok) return 'none';
   return (await probeWindow(effects, recipe, sha, restoredResult, 'rollback-probe')) === 'pass' ? snapshot : 'none';

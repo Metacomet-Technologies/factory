@@ -1,9 +1,11 @@
 # Agent deploy sudoers
 
-`factory-agent-deploy` lets `agent` on factory-gpu run the six scripts
+`factory-agent-deploy` lets `agent` on factory-gpu run the five scripts
 `scripts/odd/deploy.ts` calls as root without a password:
-`install-{meter,factory-api,kiosk}.sh`, `rollback-meter-v1.sh`,
-`rollback-factory-api.sh` and `rollback-kiosk.sh`. Each entry names a script in
+`install-{meter,factory-api,kiosk}.sh`, `rollback-meter-v1.sh` and
+`rollback-factory-api.sh`. The kiosk rollback is `install-kiosk.sh --rollback
+SNAPSHOT`, which validates the snapshot and then runs the staged
+`rollback-kiosk.sh`; `rollback-kiosk.sh` itself is not allowlisted. Each entry names a script in
 `/usr/local/lib/factory-deploy`, a root-owned tree Devon stages from a verified
 immutable release (MET-375). No entry names the agent-writable checkout
 `/home/agent/work/factory`. Nothing installs the file automatically; Devon
@@ -44,10 +46,10 @@ and the factory-api move scripts, needs Devon.
   `lastTag`. The deployer retries on every tick until Devon restages, so a
   release that changes an installer waits for Devon. Replacing privileged
   wrappers stays a human operation.
-- Snapshot paths. `rollback-meter-v1.sh` and `rollback-factory-api.sh` accept
-  only a root-owned snapshot directly inside root-owned `/var/backups/meter` or
-  `/var/backups/factory-api`. `rollback-kiosk.sh` already restores only into
-  its fixed destination.
+- Snapshot paths. `rollback-meter-v1.sh`, `rollback-factory-api.sh` and
+  `install-kiosk.sh --rollback` accept only a root-owned snapshot directly inside
+  root-owned `/var/backups/meter`, `/var/backups/factory-api` or
+  `/var/backups/factory-kiosk`, never a caller-chosen tree.
 - A clean environment. sudo-rs resets the environment, so `BASH_ENV` and
   similar variables do not reach root `bash`.
 
@@ -58,7 +60,7 @@ and the factory-api move scripts, needs Devon.
   binaries run as their own service users, never as root, but `agent` can still
   pick which binary runs. MET-158's constrained executor closes this gap; this
   file does not.
-- Any process running as `agent` can still use the six entries until
+- Any process running as `agent` can still use the five entries until
   `NoNewPrivileges` covers the runner (below). `factory-deploy.service` keeps
   `NoNewPrivileges=false` because it needs these entries.
 - sudo-rs logs each command and its arguments to the journal, and root can
@@ -116,7 +118,7 @@ Run these in order. Each step validates before the next one changes anything.
 
    The next tick installs the held release through the staged tree.
 
-4. Confirm that `sudo -l -U agent` lists only the six
+4. Confirm that `sudo -l -U agent` lists only the five
    `/usr/local/lib/factory-deploy/deploy/...` entries and no `/home/agent` path:
 
    ```sh
