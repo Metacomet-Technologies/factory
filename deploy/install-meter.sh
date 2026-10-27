@@ -2,6 +2,8 @@
 set -Eeuo pipefail
 umask 0077
 root=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")
+# --source-checkout only names the clean checkout the artifact's build identity must match (MET-239);
+# units and helpers always come from this script's own tree, never from the caller (MET-375).
 checkout=$root
 if [[ ${1:-} == --source-checkout ]]; then
     checkout=${2:?Supply a clean source checkout after --source-checkout.}
@@ -170,6 +172,12 @@ classified_plan() {
 }
 # Source only the DB helpers for non-root shell regression tests.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
+# MET-375: from the staged root-owned tree, read only its verified assets (deploy/sudoers/README.md).
+if [[ ${BASH_SOURCE[0]} == /usr/local/lib/factory-deploy/* || $root == /usr/local/lib/factory-deploy ]]; then
+    # shellcheck source=SCRIPTDIR/sudoers/trusted-assets.sh
+    source /usr/local/lib/factory-deploy/deploy/sudoers/trusted-assets.sh
+    trusted_assets deploy/sudoers/trusted-assets.sh deploy/install-meter.sh deploy/meter.service deploy/set_ollama_host.py deploy/rollback-meter-v1.sh
+fi
 flags=$((check_only + plan + no_db_change))
 [[ $# -eq $((1 + flags)) ]] || fail 'Supply exactly one prebuilt binary path, optionally after --check-only, --plan or --no-db-change.'
 [[ -f "$binary" && -x "$binary" ]] || fail 'Supply an executable prebuilt meter binary.'
@@ -189,8 +197,9 @@ for command in systemctl curl sudo tailscale nvidia-smi useradd getent id instal
 done
 binary=$(realpath "$binary")
 [[ "$binary" != "$destination" ]] || fail 'Use a separate prebuilt binary, not the installed destination.'
-"$binary" --version
-for path in "$checkout/deploy/meter.service" "$root/deploy/set_ollama_host.py" "$drop_in" "$backup/factory-backup.sh" "$backup/restore-check.sh" /etc/factory-backup/nodes.conf; do
+# The caller's artifact never runs as root.
+sudo -u agent "$binary" --version
+for path in "$root/deploy/meter.service" "$root/deploy/set_ollama_host.py" "$drop_in" "$backup/factory-backup.sh" "$backup/restore-check.sh" /etc/factory-backup/nodes.conf; do
     [[ -f "$path" && -r "$path" ]] || fail "Required artifact missing: $path"
 done
 [[ $(hostname -s) == factory-gpu ]] || fail 'Meter must be deployed on factory-gpu.'
@@ -394,7 +403,7 @@ for path in "$db" "$db-wal" "$db-shm"; do
 done
 install -m 0755 "$stage/meter" /usr/local/bin/meter.new
 mv -f -- /usr/local/bin/meter.new "$destination"
-install -m 0644 "$checkout/deploy/meter.service" "$installed_unit"
+install -m 0644 "$root/deploy/meter.service" "$installed_unit"
 python3 "$root/deploy/set_ollama_host.py" "$drop_in" 127.0.0.1:11435
 systemctl daemon-reload
 if cmp -s "$drop_in" "$snapshot/ollama-drop-in"; then

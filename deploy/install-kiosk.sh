@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 root=$(dirname "$(dirname "$(realpath "$0")")")
+# --source-checkout only names the clean checkout the artifact's build identity must match (MET-239);
+# units and helpers always come from this script's own tree, never from the caller (MET-375).
 checkout=$root
 if [[ ${1:-} == --source-checkout ]]; then
     checkout=${2:?Supply a clean source checkout after --source-checkout.}
@@ -14,6 +16,12 @@ snapshot=
 stage=
 response=
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+# MET-375: from the staged root-owned tree, read only its verified assets (deploy/sudoers/README.md).
+if [[ $0 == /usr/local/lib/factory-deploy/* || $root == /usr/local/lib/factory-deploy ]]; then
+    # shellcheck source=SCRIPTDIR/sudoers/trusted-assets.sh
+    source /usr/local/lib/factory-deploy/deploy/sudoers/trusted-assets.sh
+    trusted_assets deploy/sudoers/trusted-assets.sh deploy/install-kiosk.sh
+fi
 # MET-239: refuse an artifact not built from this clean checkout. No override;
 # a mismatch means rebuild. Runs before the root check and any change.
 verify_artifact() {

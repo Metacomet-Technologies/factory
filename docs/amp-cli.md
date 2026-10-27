@@ -391,6 +391,11 @@ owned by that user. A dedicated runner user/container and restricted mounts are
 the safer future boundary. Journald user logs and user-manager operation were
 not exercised. No systemd unit, linger setting or installed service was changed.
 
+The factory-gpu `amp-runner.service` gets `NoNewPrivileges=yes` through a
+drop-in. Devon installs it separately, and the restart interrupts running
+threads. Its review of `--amp-env` (keep) and `--remote-control-terminal`
+(remove unless used) is in `deploy/sudoers/README.md` (MET-375).
+
 ## 8. Credentials and environment
 
 `AMP_API_KEY` was absent throughout live dispatch. The existing Amp login worked

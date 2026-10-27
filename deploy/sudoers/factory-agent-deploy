@@ -1,27 +1,19 @@
 # /etc/sudoers.d/factory-agent-deploy (root:root 0440), sudo-rs dialect.
-# See deploy/sudoers/README.md, including its risk section: the scripts are
-# agent-writable, so this rule gives `agent` root on each host. It is
-# convenience and an audit trail, not a security boundary.
+# MET-375: every entry runs a script from the root-owned tree Devon staged from a verified release
+# (/usr/local/lib/factory-deploy, deploy/sudoers/stage-trusted.sh), never from the agent-writable
+# checkout. Install only through stage-trusted.sh, which validates that tree first. See
+# deploy/sudoers/README.md, including what this still grants.
 # Each entry fixes the interpreter and the exact script path. The trailing `*`
 # is sudo-rs's only argument wildcard: zero or more further arguments, which
 # the scripts need for snapshot and artifact paths.
+# Only the scripts scripts/odd/deploy.ts calls; every other installer is Devon's.
 
 Cmnd_Alias FACTORY_GPU_DEPLOY = \
-    /usr/bin/bash /home/agent/work/factory/deploy/install-dispatch.sh *, \
-    /usr/bin/bash /home/agent/work/factory/deploy/install-factory-api.sh *, \
-    /usr/bin/bash /home/agent/work/factory/deploy/install-kiosk.sh *, \
-    /usr/bin/bash /home/agent/work/factory/deploy/install-meter.sh *, \
-    /usr/bin/bash /home/agent/work/factory/deploy/install-usage.sh *, \
-    /usr/bin/bash /home/agent/work/factory/deploy/rollback-dispatch.sh *, \
-    /usr/bin/bash /home/agent/work/factory/deploy/rollback-factory-api.sh *, \
-    /usr/bin/bash /home/agent/work/factory/deploy/rollback-kiosk.sh *, \
-    /usr/bin/bash /home/agent/work/factory/deploy/rollback-meter.sh *, \
-    /usr/bin/bash /home/agent/work/factory/deploy/rollback-meter-v1.sh *, \
-    /usr/bin/bash /home/agent/work/factory/deploy/rollback-usage.sh *
-
-Cmnd_Alias FACTORY_CONSOLE_DEPLOY = \
-    /usr/bin/bash /home/agent/work/factory/deploy/devices-agent/install-devices-agent.sh *, \
-    /usr/bin/bash /home/agent/work/factory/deploy/devices-agent/rollback-devices-agent.sh *
+    /usr/bin/bash /usr/local/lib/factory-deploy/deploy/install-factory-api.sh *, \
+    /usr/bin/bash /usr/local/lib/factory-deploy/deploy/install-kiosk.sh *, \
+    /usr/bin/bash /usr/local/lib/factory-deploy/deploy/install-meter.sh *, \
+    /usr/bin/bash /usr/local/lib/factory-deploy/deploy/rollback-factory-api.sh *, \
+    /usr/bin/bash /usr/local/lib/factory-deploy/deploy/rollback-kiosk.sh *, \
+    /usr/bin/bash /usr/local/lib/factory-deploy/deploy/rollback-meter-v1.sh *
 
 agent factory-gpu = (root) NOPASSWD: FACTORY_GPU_DEPLOY
-agent factory-console = (root) NOPASSWD: FACTORY_CONSOLE_DEPLOY

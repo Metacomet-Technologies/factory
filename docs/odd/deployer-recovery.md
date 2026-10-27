@@ -412,8 +412,11 @@ three resolved `ExecStart` paths, a later release promoted automatically
 ### Installer changes stay a separate batched move
 
 `tools-promoted` lists `installerChanges`. When it is non-empty, the runtime has
-advanced but the allowlisted installers have not. Review those files, then repeat
-the Batch 1 checkout with the newly approved SHA in a separate Devon move,
+advanced but the allowlisted installers have not. Since MET-375 sudo runs only the
+root-owned staged tree `/usr/local/lib/factory-deploy`, and a release whose
+privileged files differ from it is held with `staged-assets-held` before any
+privileged call. Review those files, then restage that release
+(`deploy/sudoers/README.md`, Activation steps 2 and 3) in a separate Devon move,
 batched with any other installer changes. Units that changed under `deploy/` are
 never installed automatically. A rejected tag stays rejected; do not edit the
 ledger to retry it, and fix forward in the next release.
