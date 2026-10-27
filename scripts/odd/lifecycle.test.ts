@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { budgetLine, contractOf, correctionWindowMs, parseBudget, parseEscalation, escalationLine, reassessment, nextAction, specComplete, ralphGuard, parseDeployReceipt, deployReceiptLine, parseVerify, parseCancelled, pageText, verifyLine, cancelledLine, threadLabels, parseThreadLabels, capacity, issueTriaged, controlPlaneSilent, heartbeatLine, parseHeartbeat, silenceMs, waitAge, waitBudgets, parseSteer, steerLine, type Action, type Budget, type IssueSnapshot, type PageReason, type Wait } from './lifecycle.ts';
 
 const spec = `## Goal
@@ -194,6 +195,17 @@ test('every page uses the one format with the condition, issue, place, SHA and t
   assert.equal(pageText('MET-1', pages[0]), `ODD page: third-failed-qa-round | issue MET-1 | PR #9 | ${sha} | default if silent: issue stays In Progress and the PR stays a draft until the \`escalated\` label is removed. MET-1: PR #9 rejected 3 times`);
   assert.match(pageText('MET-1', pages[1]), /\| host factory-gpu \| abcdef1234 \|/);
   assert.match(pageText('MET-1', pages[2]), /\| - \| - \| default if silent: not executed\./);
+});
+
+test('a failed-rollback page promises neither a pause nor a restored release, and says the next release retries', () => {
+  const receipt = parseDeployReceipt('odd-deploy host=factory-gpu component=kiosk sha=abcdef1234 health=fail rollback=none')!;
+  const safe = 'recovery is not confirmed: the component may stay degraded on the failed release or in an unknown state and needs attention; nothing pauses, and the next release retries it';
+  const page = pageText('MET-1', { kind: 'page', reason: 'failed-rollback', detail: 'kiosk unhealthy', diagnose: receipt });
+  assert.equal(page, `ODD page: failed-rollback | issue MET-1 | host factory-gpu | abcdef1234 | default if silent: ${safe}. kiosk unhealthy`);
+  assert.doesNotMatch(page, /previous release|restored|deploys .*pause/i);
+  const readme = readFileSync(new URL('../../docs/odd/README.md', import.meta.url), 'utf8');
+  const row = readme.split('\n').find(l => l.startsWith('| Health red after rollback |'));
+  assert.equal(row, `| Health red after rollback | Deployer | Slack DM | ${safe[0].toUpperCase()}${safe.slice(1)}. |`);
 });
 
 test('a heartbeat is silent at 20 minutes and not one millisecond before', () => {
