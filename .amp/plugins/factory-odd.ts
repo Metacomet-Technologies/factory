@@ -44,7 +44,7 @@ import {
 	type Role,
 	type SpawnRecord,
 } from '../../scripts/odd/lifecycle.ts'
-import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
+import { contextNamesSource, intakeChannel, intakeLookback, intakeEmoji, intakePrompt, outcomeIssue, pendingIntake, slackSourceLabel, slackSourceTs, sourceLine, type SlackMessage } from '../../scripts/odd/intake.ts'
 import { admittedLoad, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
 import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
 import { builderArgs, launch } from '../../scripts/odd/launch.ts'
@@ -64,6 +64,8 @@ const performLabel = 'odd-perform'
 const marker = '[odd]'
 const liveRoles: ReadonlySet<Role> = new Set<Role>(['intake', 'spec', 'builder', 'reviewer', 'verifier'])
 const slackPollMs = 5 * 60_000
+/** Consecutive failed Slack intake polls that post the episode's one alert. */
+const slackAlertAfter = 3
 /** Runner ID of the host the deploy job runs on; the red-deploy log reader runs there. */
 const deployRunner = 'factory-gpu'
 
@@ -161,9 +163,11 @@ export default async function (amp: PluginAPI) {
 		const labels = await ctx.thread.labels()
 		await arm(ctx, labels)
 		const { role, issue } = parseThreadLabels(labels)
-		if (!role || !issue || event.status !== 'done') return
+		// A Slack-only Intake thread has no issue label; its stop is the issue its outcome label names (P3.12).
+		const source = role === 'intake' && !issue ? slackSourceTs(labels) : undefined
+		if (!role || !(issue || source) || event.status !== 'done') return
 		const count = event.message.includes(marker) ? (chained.get(event.thread.id) ?? 0) : 0
-		const { stopMet, missing } = await externalStop(ctx, role, issue, labels)
+		const { stopMet, missing } = source ? await slackOutcome(ctx.tools, source, labels) : await externalStop(ctx, role, issue as string, labels)
 		const verdict = ralphGuard({ role, chained: count, stopMet, missing })
 		if (verdict.action === 'stop') {
 			chained.delete(event.thread.id)
@@ -201,8 +205,8 @@ export default async function (amp: PluginAPI) {
 		/** Providers whose secret came from the project environment; a private dialog never replaces them. */
 		configured: Provider[]
 		events: HandledEvent[]
-		/** Slack intake poll: last run, last error, and the message timestamps handed to Intake. */
-		slack: { polledAt?: string; error?: string; spawned: string[] }
+		/** Slack intake poll: last run, last error, the message timestamps handed to Intake (not completed), consecutive failed polls since `failingSince`, whether that episode's alert went out, and the oldest message not yet handed. */
+		slack: { polledAt?: string; error?: string; spawned: string[]; failures: number; failingSince?: string; alerted?: boolean; pending?: string }
 		/** Watchdog sweep (scripts/odd/watchdog.ts): last run, issues swept, episodes in progress, digest day, cancellations today. */
 		watchdog: { sweptAt?: string; error?: string; issues?: number; overSince?: string; alerted?: boolean; blindSince?: string; paged?: boolean; digestDay?: string; heartbeatId?: string; cancelled: string[]; waits: Record<string, DigestWait & { list: 'risk' | 'failedVerification' | 'unknownAge' }>; overdue: string[] }
 		/** Failing actions by `<issue> <episode key>` (scripts/odd/watchdog.ts Episode), and the build slots the incidents are judged against. */
@@ -213,7 +217,7 @@ export default async function (amp: PluginAPI) {
 		timers: ReturnType<typeof setInterval>[]
 	}
 	const armState = new Map<ThreadID, ArmState>()
-	const emptyState = (): ArmState => ({ armed: false, webhooks: [], urls: [], secrets: {}, configured: [], events: [], slack: { spawned: [] }, watchdog: { cancelled: [], waits: {}, overdue: [] }, episodes: {}, plane: { load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, building: [], waiting: [] }, pins: {}, timers: [] })
+	const emptyState = (): ArmState => ({ armed: false, webhooks: [], urls: [], secrets: {}, configured: [], events: [], slack: { spawned: [], failures: 0 }, watchdog: { cancelled: [], waits: {}, overdue: [] }, episodes: {}, plane: { load: { orbs: 0, runnerSlots: 0, buildIssues: 0 }, building: [], waiting: [] }, pins: {}, timers: [] })
 	const record = (state: ArmState, event: HandledEvent) => {
 		state.events.push(event)
 		state.events.splice(0, Math.max(0, state.events.length - 20))
@@ -863,64 +867,97 @@ export default async function (amp: PluginAPI) {
 		}
 	}
 
-	// Every fresh top-level message in #factory-intake gets its own Intake orb thread, then the
-	// intake reaction so the next poll skips it. Intake creates the Linear issue (or comments on
-	// the duplicate); the Linear webhook takes over from there.
+	// Every fresh top-level message from an allowed author in #factory-intake (P3.12) gets its own
+	// Intake orb thread, then the intake reaction so the next poll skips it. The reaction and the
+	// thread's `odd-slack-<ts>` label mean handed, not done: after a reload, or a reaction that
+	// failed, the labelled thread is found (archived or not) and nothing is handed twice. Messages
+	// are handed oldest first; the first that waits for admission or fails ends the poll, so none
+	// after it is handed first, and the read window keeps reaching back to it (intakeLookback).
+	// Intake's outcome is the issue whose Context records the ts, named by the thread's
+	// `odd-outcome-<issue>` label (slackOutcome); an idle Slack Intake thread is archived only then.
+	// Three failed polls in a row post one alert to #factory-alerts; a clean poll ends the episode.
 	async function pollSlackIntake(ctx: ArmContext, state: ArmState) {
 		const at = new Date().toISOString()
-		state.slack.polledAt = at
+		const { slack } = state
+		slack.polledAt = at
+		let perform: boolean | undefined
 		try {
-			// A Slack intake message needs its ts and text (pendingIntake, intakePrompt).
+			// A Slack intake message needs its ts and text (pendingIntake, intakePrompt). Authors are matched by
+			// userID, so names are not resolved.
 			const messages = await slackMessagesFor(ctx.tools, {
 				operation: 'read_messages',
 				channelName: intakeChannel,
-				lookback: 'P2D',
+				lookback: intakeLookback(slack.pending, Date.now()),
 				limit: 50,
-				include: { resolveUsers: true },
-			}, row => named(row.ts) && typeof row.text === 'string')
-			const perform = (await ctx.thread.labels()).includes(performLabel)
-			for (const message of pendingIntake(messages).filter(message => !state.slack.spawned.includes(message.ts))) {
+			}, row => named(row.ts) && typeof row.text === 'string' && optional(row, 'userID', 'string'))
+			perform = (await ctx.thread.labels()).includes(performLabel)
+			let waiting: string | undefined
+			for (const message of pendingIntake(messages).filter(message => !slack.spawned.includes(message.ts))) {
 				const action: Action = { kind: 'spawn', role: 'intake', executor: 'orb', reason: `slack ${message.ts}`, round: 1 }
 				const entry = record(state, { at, source: 'slack-poll', issue: null, stage: perform ? 'performed' : 'dry-run', action })
 				if (!perform) continue
 				const slot = `slack ${message.ts}`
+				const label = slackSourceLabel(message.ts)
 				let creating = false
 				let thread: string | undefined
 				try {
-					const wait = await admit(ctx, slot, { role: 'intake' })
-					if (wait) {
-						entry.stage = 'dry-run'
-						entry.action = { kind: 'wait', reason: wait }
-						break
-					}
-					// Marked handed before the create: a create that never confirms its thread is not retried, it pages.
-					state.slack.spawned.push(message.ts)
-					creating = true
-					thread = await spawnThread(ctx.thread.id, 'intake', ['odd-role-intake', 'odd-round-1', slackSourceLabel(message.ts)], intakePrompt(message, marker), 'orb', undefined, async id => {
-						const held = ledger.get(slot)
-						if (held) held.thread = id
-					})
-					await ctx.tools.call('slack_read', { operation: 'add_reaction', channelName: intakeChannel, messageTs: message.ts, emoji: intakeEmoji })
+					thread = listOf<{ id: string }>(await readJson(ctx.tools, 'find_thread', { query: `label:${label}`, limit: 1 }), 'threads', 'find_thread', row => named(row.id))[0]?.id
+					if (!thread) {
+						const wait = await admit(ctx, slot, { role: 'intake' })
+						if (wait) {
+							entry.stage = 'dry-run'
+							entry.action = { kind: 'wait', reason: wait }
+							waiting = message.ts
+							break
+						}
+						// Marked handed before the create: a create that never confirms its thread is not retried, it pages.
+						slack.spawned.push(message.ts)
+						creating = true
+						thread = await spawnThread(ctx.thread.id, 'intake', ['odd-role-intake', 'odd-round-1', label], intakePrompt(message, marker), 'orb', undefined, async id => {
+							const held = ledger.get(slot)
+							if (held) held.thread = id
+						})
+					} else if (!slack.spawned.includes(message.ts)) slack.spawned.push(message.ts)
+					const reacted = (await ctx.tools.call('slack_read', { operation: 'add_reaction', channelName: intakeChannel, messageTs: message.ts, emoji: intakeEmoji })) as { isError?: boolean } | undefined
+					if (reacted?.isError) throw new Error(`add_reaction ${intakeEmoji} on ${message.ts} reported an error`)
 					ctx.logger.log(marker, 'slack intake', message.ts, '->', thread)
 				} catch (error: unknown) {
 					entry.stage = 'failed'
 					entry.error = String(error)
 					ctx.logger.log(marker, 'slack intake failed', message.ts, entry.error)
+					slack.pending = message.ts
 					if (creating && !thread) {
 						await deliver(ctx, `${marker} ${pageText('-', { kind: 'page', reason: 'action-failed', detail: `Slack intake ${message.ts}: the Intake thread create did not confirm a thread (${sanitizeError(String(error))}); it holds an orb slot and is not retried until the control orb reloads. Look for an odd-slack thread for it before reacting ${intakeEmoji} on the message.` })}`)
 					}
+					throw error
 				}
 			}
-			delete state.slack.error
+			slack.pending = waiting
 			// A Slack-sourced intake thread has no issue label, so no issue evaluation archives it.
 			if (perform) {
-				const idle = (await threadsFor(ctx.tools, 'label:odd-role-intake archived:false'))
-					.filter(thread => thread.labels.some(label => label.startsWith('odd-slack-')) && thread.state === 'idle')
-				await archiveThreads({ ...ctx, $: amp.$ }, idle)
+				const done: LiveThread[] = []
+				for (const thread of await threadsFor(ctx.tools, 'label:odd-role-intake archived:false')) {
+					const ts = slackSourceTs(thread.labels)
+					if (thread.state === 'idle' && ts && !parseThreadLabels(thread.labels).issue && (await slackOutcome(ctx.tools, ts, thread.labels)).stopMet) done.push(thread)
+				}
+				await archiveThreads({ ...ctx, $: amp.$ }, done)
 			}
+			delete slack.error
+			slack.failures = 0
+			delete slack.failingSince
+			slack.alerted = false
 		} catch (error: unknown) {
-			state.slack.error = String(error)
-			ctx.logger.log(marker, 'slack poll failed', state.slack.error)
+			slack.error = String(error)
+			slack.failures += 1
+			slack.failingSince ??= at
+			ctx.logger.log(marker, 'slack poll failed', slack.failures, slack.error)
+			if (slack.failures >= slackAlertAfter && !slack.alerted && (perform ?? (await ctx.thread.labels().catch(() => [])).includes(performLabel))) {
+				const text = `${marker} Slack intake poll failed ${slack.failures} times in a row since ${slack.failingSince}: ${sanitizeError(slack.error)}`
+				slack.alerted = await ctx.tools.call('slack_write', { channelName: alertsChannel, text }).then(result => !(result as { isError?: boolean } | undefined)?.isError, (alertError: unknown) => {
+					ctx.logger.log(marker, 'slack poll alert failed', String(alertError))
+					return false
+				})
+			}
 		}
 	}
 
@@ -1660,6 +1697,17 @@ async function currentLoad(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>)
 	const load = loadFrom(threads)
 	ctx.logger.log(marker, 'load', JSON.stringify(load), 'of', JSON.stringify(capacity))
 	return { load, usage: engineUsage(threads), threads }
+}
+
+// A Slack Intake thread's outcome (P3.12): its `odd-outcome-<issue>` label names an issue whose Context records the
+// message's channel and ts. The label alone is the agent's claim; the issue read is the check. A failed read throws.
+async function slackOutcome(tools: Tools, ts: string, labels: readonly string[]): Promise<{ stopMet: boolean; missing: string[] }> {
+	const linked = outcomeIssue(labels)
+	if (!linked) return { stopMet: false, missing: [`an issue whose Context has the line \`${sourceLine(ts)}\`, named on this thread by the label odd-outcome-<met-n> (update_thread)`] }
+	const issue = await getIssue(tools, { id: linked })
+	return contextNamesSource(issue.description ?? '', ts)
+		? { stopMet: true, missing: [] }
+		: { stopMet: false, missing: [`the line \`${sourceLine(ts)}\` in the Context section of ${linked}`] }
 }
 
 // The Ralph guard's external checks: each is read from Linear or GitHub, never from the agent.
