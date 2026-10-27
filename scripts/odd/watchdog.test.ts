@@ -444,13 +444,27 @@ function factory() {
   const threads = new Map<string, { labels: string[]; state: string; archived: boolean; updatedAt: string }>();
   const dms: string[] = [];
   const steers: string[] = [];
-  const control = { slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '', gh: undefined as ((command: string) => Shell | undefined) | undefined, inject: undefined as ((name: string, input: Record<string, unknown>) => unknown) | undefined };
+  // P4.1: `launch` lets a builder launch succeed; `indexLag` hides new threads from thread search until `index()`; `ambiguous` creates the thread, unlabelled, and then fails the call; `bindFailures` fails that many `odd-spawn` bindings.
+  const control = { slackDown: 0, spawnFails: false, steerFailures: 0, refuse: '', unreadable: '', indexLag: false, ambiguous: false, bindFailures: 0, launch: false, gh: undefined as ((command: string) => Shell | undefined) | undefined, inject: undefined as ((name: string, input: Record<string, unknown>) => unknown) | undefined };
+  /** Threads thread search does not return yet, and every create call the plane made (plugin agents and builder launches). */
+  const hidden = new Set<string>();
+  const creates: string[] = [];
   /** Lifecycle mutations: status writes, builder launches and heartbeats (comments, archives, steers and DMs are kept above). */
   const saves: string[] = [];
   const launches: string[] = [];
   let heartbeats = 0;
   // No fixture starts a live `amp` builder; an attempt is recorded and fails.
-  mock.method(io, 'start', (argv: readonly string[]) => { launches.push(argv.join(' ')); throw new Error('fixture: no live launch'); });
+  // With `control.launch`, a launch prints the child's session_id and the child runs with the labels it was given (`--label`).
+  let children = 0;
+  mock.method(io, 'start', (argv: readonly string[]) => {
+    launches.push(argv.join(' '));
+    creates.push('builder');
+    if (!control.launch) throw new Error('fixture: no live launch');
+    const id = `T-00000000-0000-4000-8000-${String(++children).padStart(12, '0')}`;
+    threads.set(id, { labels: argv.flatMap((value, i) => (argv[i - 1] === '--label' ? [value] : [])), state: 'running', archived: false, updatedAt: new Date().toISOString() });
+    if (control.indexLag) hidden.add(id);
+    return { lines: (async function* () { yield JSON.stringify({ type: 'system', session_id: id }); })(), stderr: () => '', kill: () => {} };
+  });
   let slackAttempts = 0;
   let commentIds = 0;
   let generation = 0;
@@ -470,6 +484,7 @@ function factory() {
         return { comments: all.slice(from, to), hasNextPage: to < all.length, cursor: String(to - 1) };
       }
       case 'linear.save_comment': {
+        if (control.bindFailures > 0 && /^odd-spawn .* thread=T-/.test(String(input.body))) { control.bindFailures -= 1; throw new Error('Linear 503'); }
         if (input.id) {
           for (const list of comments.values()) for (const comment of list) if (comment.id === input.id) comment.body = String(input.body);
           return { id: input.id };
@@ -482,7 +497,7 @@ function factory() {
       case 'linear.save_issue': saves.push(`${input.id} ${JSON.stringify(input.state ?? input.addLabels)}`); return {};
       case 'find_thread': {
         const label = /label:(\S+)/.exec(String(input.query))?.[1] ?? '';
-        return { threads: [...threads].filter(([, thread]) => !thread.archived && thread.labels.includes(label)).map(([id, thread]) => ({ id, updatedAt: thread.updatedAt })) };
+        return { threads: [...threads].filter(([id, thread]) => !hidden.has(id) && !thread.archived && thread.labels.includes(label)).map(([id, thread]) => ({ id, updatedAt: thread.updatedAt })) };
       }
       case 'get_thread_status': { const thread = threads.get(String(input.thread))!; return { metadata: { labels: thread.labels, archived: thread.archived }, agentState: { state: thread.state } }; }
       case 'update_thread': threads.get(String(input.thread))!.archived = true; return {};
@@ -508,9 +523,12 @@ function factory() {
   const amp = (mine: number) => ({
     $,
     createAgent: (config: unknown) => ({ definition: config, createThread: async () => {
+      creates.push('plugin');
       if (control.spawnFails) throw new Error('Orb custom agents must be registered as an active agent mode');
       const id = `T-spawned-${++created}`;
       threads.set(id, { labels: [], state: 'running', archived: false, updatedAt: new Date().toISOString() });
+      if (control.indexLag) hidden.add(id);
+      if (control.ambiguous) throw new Error('fetch failed: socket hang up');
       return { id, setLabels: async (labels: string[]) => { threads.get(id)!.labels = labels; }, appendUserMessage: async () => {} };
     } }),
     registerAgentMode: () => {}, registerTool: (tool: { execute: (input: Record<string, unknown>, ctx: unknown) => Promise<string> }) => { statuses.set(mine, tool.execute); },
@@ -532,7 +550,11 @@ function factory() {
     prs.push({ number: n, headRefName: `${issue.toLowerCase()}-x`, headRefOid: sha, state: 'OPEN', mergeCommit: null, mergeable: 'MERGEABLE', commits: [{ oid: sha, committedDate: new Date().toISOString() }], statusCheckRollup: [{ name: 'ci', conclusion: 'SUCCESS' }], body: `closes ${issue}`, ...over });
   };
   return {
-    issues, comments, prs, releases, threads, dms, steers, control, builder, openPr, saves, launches, heartbeats: () => heartbeats, slackAttempts: () => slackAttempts,
+    issues, comments, prs, releases, threads, dms, steers, control, builder, openPr, saves, launches, hidden, creates, heartbeats: () => heartbeats, slackAttempts: () => slackAttempts,
+    /** Thread search catches up with every hidden thread. */
+    index: () => hidden.clear(),
+    /** The `odd-spawn` lines on an issue, oldest first. */
+    spawnLines: (id: string) => (comments.get(id) ?? []).filter(comment => comment.body.startsWith('odd-spawn ')).map(comment => comment.body),
     /** The latest plugin load's `odd_control_status`: its handled events. */
     events: async () => (JSON.parse(await statuses.get(generation)!({}, { thread: { id: 'T-control', labels: async () => ['odd-control-plane', 'odd-perform'] } })) as { events: { issue: string | null; stage: string; error?: string }[] }).events,
     /** The Ralph guard as the latest plugin load runs it at the end of a role thread's turn. */
@@ -596,7 +618,7 @@ test('P3.1: the MET-379 self-deadlock pages one actionable plane-blocked inciden
   assert.equal(plant.dms.length, 1, 'one page for both issues and every recheck');
   const [page] = plant.dms;
   assert.match(page, /^\[odd\] ODD page: plane-blocked \| issue MET-364, MET-368 \| /);
-  assert.match(page, /spawn-reviewer failing since 2026-10-26T15:00:00\.000Z \(\d+ min, \d+ attempts\): Error: Orb custom agents must be registered as an active agent mode\./);
+  assert.match(page, /spawn-reviewer failing since 2026-10-26T15:00:00\.000Z \(\d+ min, \d+ attempts\): Error: Orb custom agents must be registered as an active agent mode \(odd-spawn role=reviewer round=1 key=reviewer-[ab]{12} thread=pending stays pending: .*\)\./);
   assert.match(page, /Occupied build slots 2\/2: MET-364, MET-368\. Ready work waiting for a build slot: MET-379\./);
   assert.match(page, /Needed: make the reviewer startable/);
   assert.match(plant.episodes('MET-364')[0], /state=open alert=plane-blocked$/);
@@ -606,8 +628,13 @@ test('P3.1: the MET-379 self-deadlock pages one actionable plane-blocked inciden
   await advance(20 * 60_000);
   assert.equal(plant.dms.length, 1);
 
-  // Recovery: the reviewer can spawn again. Both issues advance; one resolution closes the incident.
+  // P4.1: a failed create is never retried blind; each issue made one create call and holds a pending record.
+  assert.equal(plant.creates.length, 2, 'one create per issue across every recheck, sweep and reload');
+  assert.deepEqual(plant.spawnLines('MET-364'), ['odd-spawn role=reviewer round=1 key=reviewer-aaaaaaaaaaaa thread=pending']);
+
+  // Recovery: the reviewer can spawn again, and Devon removes the unconfirmed records. Both issues advance; one resolution closes the incident.
   plant.control.spawnFails = false;
+  for (const id of ['MET-364', 'MET-368']) plant.comments.set(id, plant.comments.get(id)!.filter(comment => !comment.body.startsWith('odd-spawn ')));
   await advance(10 * 60_000);
   assert.equal(plant.dms.length, 2);
   assert.match(plant.dms[1], /^\[odd\] ODD resolved: plane-blocked \| issue MET-364, MET-368 \| spawn-reviewer advances again after \d+ min\./);
@@ -1706,7 +1733,14 @@ for (const shape of slackShapes) {
     t.after(() => mock.timers.reset());
     const rows = Array.from({ length: 51 }, (_, i) => intakeMessage(`1761310000.${String(i).padStart(6, '0')}`, i === 50 ? 'late intake sentinel' : `intake ${i}`));
     const intake = pager(rows, shape, 'slack', 'messages');
-    const orb = controlOrb((name, input) => name === 'slack_read' && input.channelName === '#factory-intake' && input.operation === 'read_messages' ? intake.read(input) : emptyWork(name));
+    // Each Intake thread is indexed and idle as soon as it exists, so the orb cap (P4.1) never holds a message back here.
+    const intakeThreads = () => ({ threads: orb.spawned.map((_, i) => ({ id: `T-spawned-${i + 1}` })) });
+    const orb: ReturnType<typeof controlOrb> = controlOrb((name, input) => {
+      if (name === 'slack_read' && input.channelName === '#factory-intake' && input.operation === 'read_messages') return intake.read(input);
+      if (name === 'find_thread' && input.query === 'label:odd-role-intake archived:false') return intakeThreads();
+      if (name === 'get_thread_status' && String(input.thread).startsWith('T-spawned-')) return { metadata: { labels: ['odd-role-intake', 'odd-round-1'] }, agentState: { state: 'idle' } };
+      return emptyWork(name);
+    });
     const status = await orb.start();
     await settle();
     const outcome = async () => ({ spawned: orb.spawned.length, sentinel: orb.spawned.filter(prompt => prompt.includes('late intake sentinel')).length, error: Boolean((await status({})).slack.error) });
@@ -1758,3 +1792,133 @@ for (const shape of slackShapes) {
     if (failing(shape)) assert.deepEqual(outcome(), { reposted: 0, heartbeats: 1 }, 'the next sweep finds the digest and still does not repost');
   });
 }
+
+// --- P4.1: durable spawn intent and one admission queue --------------------------------
+
+const rolesIn = (plant: ReturnType<typeof factory>, role: string) => [...plant.threads.values()].filter(thread => thread.labels.includes(`odd-role-${role}`));
+
+test('P4.1: duplicate events separated by a reload, with thread search lagging, create and message one reviewer and one builder, each bound by its odd-spawn record', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  plant.control.indexLag = true;
+  plant.control.launch = true;
+  plant.issue('MET-50', 'In Progress');
+  plant.builder('MET-50');
+  plant.openPr('MET-50', 'a'.repeat(40));
+  plant.issue('MET-51', 'Todo');
+  await plant.start();
+  await settle();
+  assert.equal(rolesOf(plant, 'MET-50', 'reviewer').length, 1);
+  assert.equal(rolesOf(plant, 'MET-51', 'builder').length, 1);
+
+  // Reload: no memory survives and thread search still returns neither thread. The duplicate events (sweep, rechecks) find them by their records.
+  await plant.start();
+  await settle();
+  await advance(5 * 60_000);
+  assert.equal(plant.creates.length, 2, 'one create per issue across the reload');
+  assert.equal(rolesOf(plant, 'MET-50', 'reviewer').length, 1);
+  assert.equal(rolesOf(plant, 'MET-51', 'builder').length, 1);
+  assert.deepEqual(plant.dms, []);
+  // One record per spawn: written before the create, bound to the returned ID before the outcome is sent.
+  const reviewer = [...plant.threads].find(([, thread]) => thread.labels.includes('odd-role-reviewer'))![0];
+  const builder = [...plant.threads].find(([, thread]) => thread.labels.includes('odd-issue-met-51'))![0];
+  assert.deepEqual(plant.spawnLines('MET-50'), ['odd-spawn role=reviewer round=1 key=reviewer-aaaaaaaaaaaa thread=pending', `odd-spawn role=reviewer round=1 key=reviewer-aaaaaaaaaaaa thread=${reviewer}`]);
+  assert.deepEqual(plant.spawnLines('MET-51'), ['odd-spawn role=builder round=1 key=builder thread=pending', `odd-spawn role=builder round=1 key=builder thread=${builder}`]);
+});
+
+test('P4.1: an ambiguous create keeps its reservation: no second thread or launch across rechecks and a reload, and the failure pages', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  plant.control.indexLag = true;
+  // The reviewer create fails after the thread exists; the builder launcher prints no session_id.
+  plant.control.ambiguous = true;
+  plant.issue('MET-52', 'In Progress');
+  plant.builder('MET-52');
+  plant.openPr('MET-52', 'b'.repeat(40));
+  plant.issue('MET-53', 'Todo');
+  await plant.start();
+  await settle();
+  assert.deepEqual(plant.creates.sort(), ['builder', 'plugin']);
+  await advance(6 * 60_000);
+  await plant.start();
+  await advance(15 * 60_000);
+  assert.deepEqual(plant.creates.sort(), ['builder', 'plugin'], 'neither create is retried blind');
+  assert.deepEqual(plant.spawnLines('MET-52'), ['odd-spawn role=reviewer round=1 key=reviewer-bbbbbbbbbbbb thread=pending']);
+  assert.deepEqual(plant.spawnLines('MET-53'), ['odd-spawn role=builder round=1 key=builder thread=pending']);
+  assert.equal((plant.comments.get('MET-53') ?? []).filter(comment => comment.body.startsWith('odd-launch-failed')).length, 1, 'the launch failure is still reported once');
+  assert.ok(!plant.saves.includes('MET-53 "In Progress"'), 'the issue status is unchanged');
+  // Each page names the record to reconcile.
+  assert.match(plant.dms.join('\n'), /ODD page: action-failed \| issue MET-52 \| .*spawn-reviewer failing .*socket hang up \(odd-spawn role=reviewer round=1 key=reviewer-bbbbbbbbbbbb thread=pending stays pending/);
+  assert.match(plant.dms.join('\n'), /ODD page: action-failed \| issue MET-53 \| .*spawn-builder failing .*no live launch \(odd-spawn role=builder round=1 key=builder thread=pending stays pending/);
+  const events = await plant.events();
+  assert.ok(events.some(event => event.issue === 'MET-52' && /odd-spawn role=reviewer round=1 key=reviewer-bbbbbbbbbbbb thread=pending has no confirmed thread/.test(event.error ?? '')));
+});
+
+test('P4.1: each interruption boundary of a spawn resolves to one thread with its round: a failed reservation creates nothing; a lost binding is reconciled from the labelled thread, never relaunched', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  plant.control.indexLag = true;
+  // Before the create: the reservation write fails once, so no thread is created until it lands.
+  let reservationFailures = 1;
+  plant.control.inject = (name, input) => {
+    if (name === 'linear.save_comment' && /^odd-spawn .* thread=pending$/.test(String(input.body)) && reservationFailures-- > 0) throw new Error('Linear 503');
+    return undefined;
+  };
+  plant.issue('MET-54', 'In Progress');
+  plant.builder('MET-54');
+  plant.openPr('MET-54', 'c'.repeat(40));
+  await plant.start();
+  await settle();
+  assert.deepEqual(plant.creates, [], 'no create without its record');
+  assert.deepEqual(plant.spawnLines('MET-54'), []);
+  // After the create, before the binding: the thread is labelled, the binding write fails, nothing is sent.
+  plant.control.bindFailures = 1;
+  await advance(90_000);
+  assert.deepEqual(plant.creates, ['plugin']);
+  assert.deepEqual(plant.spawnLines('MET-54'), ['odd-spawn role=reviewer round=1 key=reviewer-cccccccccccc thread=pending']);
+  // Thread search still lags: the pending record holds and fails closed.
+  await advance(5 * 60_000);
+  assert.deepEqual(plant.creates, ['plugin'], 'an unconfirmed record is never relaunched');
+  // Search catches up: the one thread with the record's labels binds it, with its round, and the issue waits on it.
+  plant.index();
+  await advance(10 * 60_000);
+  assert.deepEqual(plant.creates, ['plugin']);
+  assert.deepEqual(plant.spawnLines('MET-54'), ['odd-spawn role=reviewer round=1 key=reviewer-cccccccccccc thread=pending', 'odd-spawn role=reviewer round=1 key=reviewer-cccccccccccc thread=T-spawned-1']);
+  assert.deepEqual(rolesOf(plant, 'MET-54', 'reviewer').map(thread => thread.labels.find(label => label.startsWith('odd-round-'))), ['odd-round-1']);
+});
+
+test('P4.1: concurrent issue, Slack and log-reader admissions stay at 4 orbs, 2 runner slots and 2 build issues while thread search returns nothing new', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: Date.parse('2026-10-26T15:00:00Z') });
+  t.after(() => mock.timers.reset());
+  const plant = factory();
+  plant.control.indexLag = true;
+  plant.control.launch = true;
+  // Orb demand 6 for 4 orbs: an issue Intake, a Slack Intake, 3 Builders (2 build slots) and a Verifier, evaluated in that
+  // order or racing it; runner demand 3 log readers for 2 runner slots.
+  plant.issues.set('MET-60', { id: 'MET-60', status: 'Triage', labels: [], description: '' });
+  for (const id of ['MET-61', 'MET-62', 'MET-63']) plant.issue(id, 'Todo');
+  for (const [i, id] of ['MET-64', 'MET-65', 'MET-66', 'MET-67'].entries()) {
+    plant.issue(id, 'Deploying');
+    plant.say(id, deployReceiptLine({ host: 'gpu', component: 'kiosk', sha: String(i + 1).repeat(40), health: i === 3 ? 'pass' : 'fail', rollback: i === 3 ? 'none' : '/var/backups/kiosk/snap' }));
+  }
+  const slack = [{ ts: '1761490000.000001', text: 'slack intake', userID: 'U1' }];
+  plant.control.inject = (name, input) => name === 'slack_read' && input.channelName === '#factory-intake' && input.operation === 'read_messages' ? { messages: slack } : undefined;
+  const running = () => {
+    const live = [...plant.threads.values()].filter(thread => !thread.archived && thread.state === 'running');
+    const count = (roles: string[]) => live.filter(thread => roles.some(role => thread.labels.includes(`odd-role-${role}`))).length;
+    return { orbs: count(['intake', 'spec', 'builder', 'reviewer', 'verifier']), runnerSlots: count(['deployer']), buildIssues: new Set(live.filter(thread => thread.labels.includes('odd-role-builder')).map(thread => thread.labels.find(label => label.startsWith('odd-issue-')))).size };
+  };
+  await plant.start();
+  await settle();
+  // Rechecks of every issue fire together and race the Slack poll and the sweep.
+  await advance(30 * 60_000);
+  assert.deepEqual(running(), { orbs: capacity.orbs, runnerSlots: capacity.runnerSlots, buildIssues: capacity.buildIssues });
+  assert.equal(plant.hidden.size, capacity.orbs + capacity.runnerSlots, 'thread search returned none of them');
+  // Search catches up and nothing has finished: still nothing past the caps.
+  plant.index();
+  await advance(20 * 60_000);
+  assert.deepEqual(running(), { orbs: capacity.orbs, runnerSlots: capacity.runnerSlots, buildIssues: capacity.buildIssues });
+});

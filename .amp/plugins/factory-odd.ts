@@ -12,6 +12,7 @@ import type { Agent, AgentThreadExecutor, PluginAPI, PluginEventContext, ThreadI
 import {
 	cancelledLine,
 	capacity,
+	capacityWait,
 	contracts,
 	deployReceiptLine,
 	escalatedLabel,
@@ -25,6 +26,8 @@ import {
 	parseHeartbeat,
 	parseThreadLabels,
 	ralphGuard,
+	spawnKey,
+	spawnLine,
 	specComplete,
 	steerLine,
 	threadLabels,
@@ -35,9 +38,10 @@ import {
 	type IssueSnapshot,
 	type Load,
 	type Role,
+	type SpawnRecord,
 } from '../../scripts/odd/lifecycle.ts'
 import { intakeChannel, intakeEmoji, intakePrompt, pendingIntake, slackSourceLabel, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, receiptLabel, roleLabelQueries, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread } from '../../scripts/odd/snapshot.ts'
+import { admittedLoad, finishedThreads, issueFromEvent, loadFrom, prOwnsIssue, receiptLabel, reconciles, roleLabelQueries, spawnRecords, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
 import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
 import { builderArgs, launch } from '../../scripts/odd/launch.ts'
 import { alertsChannel, blindMs, capsAlertMs, digest, digestDue, digestHeading, episodeLine, incidentPageDue, incidentText, incidents, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, resolutionText, restoreStatus, sanitizeError, slackMessages, staleThreads, sweepMs, unknownAge, type DigestInput, type DigestWait, type Episode, type Plane } from '../../scripts/odd/watchdog.ts'
@@ -408,10 +412,10 @@ export default async function (amp: PluginAPI) {
 		}, delayMs))
 	}
 	// Linear sends several webhooks for one change and `find_thread` indexes a new thread with a
-	// lag, so evaluations of one issue run one at a time and remember the threads they spawned
-	// until the index returns them; otherwise two events seconds apart spawn two role threads.
+	// lag, so evaluations of one issue run one at a time, and every spawn is recorded on the issue
+	// (`odd-spawn`) before its create and bound to the returned thread before its outcome is sent.
+	// The next evaluation, in this process or after a reload, reads the bound thread by its ID.
 	const queues = new Map<string, Promise<unknown>>()
-	const spawned = new Map<string, string[]>()
 	function evaluate(ctx: EvalContext, state: ArmState, source: string, identifier: string, at: string): Promise<HandledEvent> {
 		const run = (queues.get(identifier) ?? Promise.resolve()).then(() => evaluateNow(ctx, state, source, identifier, at))
 		queues.set(identifier, run.catch(() => undefined))
@@ -424,14 +428,18 @@ export default async function (amp: PluginAPI) {
 		let performing = false
 		let issue: IssueSnapshot | undefined
 		try {
-			const derived = await snapshotFor(ctx, identifier, spawned.get(identifier) ?? [])
+			const derived = await snapshotFor(ctx, identifier)
 			const { threads, comments } = derived
 			issue = derived.snapshot
 			loadEpisodes(state, issue.identifier, comments)
 			performing = (await ctx.thread.labels()).includes(performLabel)
+			if (performing) await reconcileSpawns(ctx, issue, threads)
+			holdSpawns(issue, threads)
 			const finished = finishedThreads(issue.status, threads)
 			if (finished.length && performing) await archiveThreads(ctx, finished)
-			const { load, usage, threads: live } = await currentLoad(ctx)
+			const { usage, threads: live } = await currentLoad(ctx)
+			// The issue's own reservations are left out: a pending one must reach perform's fail-closed check and page, not wait on its own slot.
+			const { load } = admittedLoad(live, [...ledger.values()].filter(held => held.issue !== issue!.identifier))
 			state.plane = { load, building: [...new Set(live.flatMap(thread => { const labels = parseThreadLabels(thread.labels); return labels.role === 'builder' && labels.issue ? [labels.issue] : [] }))].sort(), waiting: state.plane.waiting }
 			const action = nextAction(issue, load)
 			ctx.logger.log(marker, source, issue.identifier, issue.status, JSON.stringify(action))
@@ -474,6 +482,59 @@ export default async function (amp: PluginAPI) {
 		}
 		if (performing) await raiseIncidents(ctx, state)
 		return entry
+	}
+
+	// --- Admission (P4.1). Every spawn path (issue roles, Slack intake, the red-deploy log reader)
+	// takes its cap check and its reservation in one global queue, so concurrent evaluations
+	// cannot each see the same free slot. A reservation counts against the caps until thread
+	// search returns its thread; one whose create never confirmed a thread is never released in
+	// this process. Slots: `<issue> <role> <round> <key>`, `slack <ts>`, `deployer <labels>`.
+	const ledger = new Map<string, Reservation>()
+	let admission: Promise<unknown> = Promise.resolve()
+	const spawnSlot = (identifier: string, record: SpawnRecord) => `${identifier} ${record.role} ${record.round} ${record.key}`
+	/** Reserves `slot`, or returns why it must wait. */
+	function admit(ctx: Pick<WebhookHandlerContext, 'tools' | 'logger'>, slot: string, reservation: Reservation): Promise<string | undefined> {
+		const run = admission.then(async () => {
+			if (ledger.has(slot)) return `${slot} is already reserved`
+			const { threads } = await currentLoad(ctx)
+			const indexed = new Set(threads.map(thread => thread.id))
+			for (const [key, held] of ledger) if (held.thread && indexed.has(held.thread)) ledger.delete(key)
+			const { load, building } = admittedLoad(threads, [...ledger.values()])
+			const wait = capacityWait(reservation.role, load, !(reservation.issue && building.has(reservation.issue)))
+			if (!wait) ledger.set(slot, reservation)
+			return wait
+		})
+		admission = run.catch(() => undefined)
+		return run
+	}
+	/** Records from the issue's comments rebuild its reservations after a reload: a pending one is held, a bound one until its thread is archived. */
+	function holdSpawns(issue: IssueSnapshot, threads: readonly LiveThread[]) {
+		const live = new Set(threads.map(thread => thread.id))
+		const pending = new Set<string>()
+		for (const record of issue.spawns ?? []) {
+			const slot = spawnSlot(issue.identifier, record)
+			const held = ledger.get(slot)
+			if (!record.thread) {
+				pending.add(slot)
+				if (!held) ledger.set(slot, { role: record.role, issue: issue.identifier })
+			} else if (held) held.thread = record.thread
+		}
+		for (const [slot, held] of ledger) {
+			if (held.issue === issue.identifier && (held.thread ? !live.has(held.thread) : !pending.has(slot))) ledger.delete(slot)
+		}
+	}
+	/** A pending record is bound to the one live thread carrying its role and round labels that no other record owns; the record is never guessed otherwise. */
+	async function reconcileSpawns(ctx: EvalContext, issue: IssueSnapshot, threads: readonly LiveThread[]) {
+		const bound = new Set((issue.spawns ?? []).flatMap(record => (record.thread ? [record.thread] : [])))
+		for (const record of issue.spawns ?? []) {
+			if (record.thread) continue
+			const match = threads.filter(thread => reconciles(record, thread, bound))
+			if (match.length !== 1) continue
+			await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: spawnLine({ ...record, thread: match[0].id }) })
+			record.thread = match[0].id
+			bound.add(match[0].id)
+			ctx.logger.log(marker, 'spawn reconciled', issue.identifier, spawnLine(record))
+		}
 	}
 
 	// Human waits and waits of unknown age go to the digest; the entry shows every wait's age.
@@ -803,21 +864,32 @@ export default async function (amp: PluginAPI) {
 				const action: Action = { kind: 'spawn', role: 'intake', executor: 'orb', reason: `slack ${message.ts}`, round: 1 }
 				const entry = record(state, { at, source: 'slack-poll', issue: null, stage: perform ? 'performed' : 'dry-run', action })
 				if (!perform) continue
+				const slot = `slack ${message.ts}`
+				let creating = false
+				let thread: string | undefined
 				try {
-					const { load } = await currentLoad(ctx)
-					if (load.orbs >= capacity.orbs) {
+					const wait = await admit(ctx, slot, { role: 'intake' })
+					if (wait) {
 						entry.stage = 'dry-run'
-						entry.action = { kind: 'wait', reason: 'orb capacity (intake)' }
+						entry.action = { kind: 'wait', reason: wait }
 						break
 					}
-					const thread = await spawnThread(ctx.thread.id, 'intake', ['odd-role-intake', 'odd-round-1', slackSourceLabel(message.ts)], intakePrompt(message, marker))
+					// Marked handed before the create: a create that never confirms its thread is not retried, it pages.
 					state.slack.spawned.push(message.ts)
+					creating = true
+					thread = await spawnThread(ctx.thread.id, 'intake', ['odd-role-intake', 'odd-round-1', slackSourceLabel(message.ts)], intakePrompt(message, marker), 'orb', undefined, async id => {
+						const held = ledger.get(slot)
+						if (held) held.thread = id
+					})
 					await ctx.tools.call('slack_read', { operation: 'add_reaction', channelName: intakeChannel, messageTs: message.ts, emoji: intakeEmoji })
 					ctx.logger.log(marker, 'slack intake', message.ts, '->', thread)
 				} catch (error: unknown) {
 					entry.stage = 'failed'
 					entry.error = String(error)
 					ctx.logger.log(marker, 'slack intake failed', message.ts, entry.error)
+					if (creating && !thread) {
+						await deliver(ctx, `${marker} ${pageText('-', { kind: 'page', reason: 'action-failed', detail: `Slack intake ${message.ts}: the Intake thread create did not confirm a thread (${sanitizeError(String(error))}); it holds an orb slot and is not retried until the control orb reloads. Look for an odd-slack thread for it before reacting ${intakeEmoji} on the message.` })}`)
+					}
 				}
 			}
 			delete state.slack.error
@@ -834,12 +906,16 @@ export default async function (amp: PluginAPI) {
 	}
 
 	// Plugin agents run every role but the builder; `engine` is the reviewer's lab choice, else the role's pin.
-	async function spawnThread(parentThreadID: ThreadID, role: Role, labels: string[], content: string, executor: AgentThreadExecutor = 'orb', engine?: Engine): Promise<string> {
+	// Labels, then `bind` (the durable record of the returned ID), then the outcome: a lost binding
+	// leaves a labelled thread reconciliation can find, and no thread gets its outcome unrecorded.
+	async function spawnThread(parentThreadID: ThreadID, role: Role, labels: string[], content: string, executor: AgentThreadExecutor = 'orb', engine?: Engine, bind?: (thread: string) => Promise<void>): Promise<string> {
 		const pin = engine ?? pluginPins[role as keyof typeof pluginPins]
 		const agent = role === 'builder' ? undefined : role === 'reviewer' ? reviewerAgents.get(pin?.lab as Lab) : agents[role]
 		if (!agent || !pin) throw new Error(`no plugin agent for role ${role}${engine ? ` on ${engine.lab}` : ''}`)
 		const thread = await agent.createThread({ executor, parentThreadID, visibility: 'workspace' })
-		await thread.setLabels([engineLabel(pin.lab), ...labels])
+		const unlabelled = await thread.setLabels([engineLabel(pin.lab), ...labels]).then(() => undefined, (error: unknown) => error ?? new Error('setLabels failed'))
+		await bind?.(thread.id)
+		if (unlabelled) throw unlabelled
 		await thread.appendUserMessage({ type: 'user-message', content })
 		return thread.id
 	}
@@ -849,14 +925,14 @@ export default async function (amp: PluginAPI) {
 	// failure is posted on the issue once per error and thrown; no plugin agent or other engine
 	// stands in for it.
 	const launchFailures = new Set<string>()
-	async function launchBuilder(ctx: EvalContext, issue: IssueSnapshot, labels: string[], content: string, round: number): Promise<string> {
+	async function launchBuilder(ctx: EvalContext, issue: IssueSnapshot, labels: string[], content: string, round: number, bind: (thread: string) => Promise<void>): Promise<string> {
 		const expected = [...labels, engineLabel(builderEngine.lab)]
 		try {
 			return await launch(builderArgs(content, labels, `${issue.identifier} builder round ${round}`), async id => {
 				const child = amp.threads.get(id as ThreadID)
 				const present = await child.labels()
 				if (expected.some(label => !present.includes(label))) await child.addLabels(expected)
-				spawned.set(issue.identifier, [...(spawned.get(issue.identifier) ?? []), id])
+				await bind(id)
 				ctx.logger.log(marker, 'builder launched', issue.identifier, id, builderEngine.model)
 			})
 		} catch (error: unknown) {
@@ -904,22 +980,47 @@ export default async function (amp: PluginAPI) {
 					ctx.logger.log(marker, 'launch request for runner', issue.identifier, action.role)
 					return false
 				}
+				// A create that never confirmed its thread may have started one: nothing relaunches the role, so the
+				// failure episode pages until a live thread with the record's labels binds it or Devon removes the record.
+				const unconfirmed = issue.spawns?.find(record => record.role === action.role && !record.thread)
+				if (unconfirmed) throw new Error(`${spawnLine(unconfirmed)} has no confirmed thread; no ${action.role} is launched until a live thread with its labels binds it or the record is removed`)
 				// A verifier is labelled with the receipt it verifies, so the next release's receipt starts a fresh budget.
 				const receipt = action.role === 'verifier' && issue.deployReceipt ? [receiptLabel(issue.deployReceipt.sha)] : []
 				const labels = [...threadLabels(issue.identifier, action.role, action.round), ...receipt]
 				const content = `${marker} Outcome ${issue.identifier}. Role: ${action.role}. Reason: ${action.reason}.${spawnTarget(issue, action.role)} Load the \`${contracts[action.role].skill}\` skill and start.`
-				if (action.role === 'builder') {
-					await launchBuilder(ctx, issue, labels, content, action.round)
-				} else {
-					// Cross-lab review: never the lab the issue's builder thread runs on.
-					let engine: Engine | undefined
-					if (action.role === 'reviewer') {
-						const builderLab = labOf(threads.find(thread => parseThreadLabels(thread.labels).role === 'builder')?.labels ?? [])
-						engine = selectReviewer(builderLab, usage)
-						if (!engine) throw new Error(`no reviewer engine outside the builder's lab ${builderLab ?? builderEngine.lab}`)
-					}
-					const threadID = await spawnThread(ctx.thread.id, action.role, labels, content, 'orb', engine)
-					spawned.set(issue.identifier, [...(spawned.get(issue.identifier) ?? []), threadID])
+				// Cross-lab review: never the lab the issue's builder thread runs on.
+				let engine: Engine | undefined
+				if (action.role === 'reviewer') {
+					const builderLab = labOf(threads.find(thread => parseThreadLabels(thread.labels).role === 'builder')?.labels ?? [])
+					engine = selectReviewer(builderLab, usage)
+					if (!engine) throw new Error(`no reviewer engine outside the builder's lab ${builderLab ?? builderEngine.lab}`)
+				}
+				const record: SpawnRecord = { role: action.role, round: action.round, key: spawnKey(issue, action.role) }
+				const slot = spawnSlot(issue.identifier, record)
+				const wait = await admit(ctx, slot, { role: action.role, issue: issue.identifier })
+				if (wait) {
+					ctx.logger.log(marker, 'spawn waits', issue.identifier, action.role, wait)
+					recheck(ctx, state, issue.identifier, recheckMs)
+					return false
+				}
+				try {
+					await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: spawnLine(record) })
+				} catch (error: unknown) {
+					// The record may still have been written; then the next evaluation holds it as pending.
+					ledger.delete(slot)
+					throw error
+				}
+				const bind = async (thread: string) => {
+					const held = ledger.get(slot)
+					if (held) held.thread = thread
+					await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: spawnLine({ ...record, thread }) })
+				}
+				try {
+					if (action.role === 'builder') await launchBuilder(ctx, issue, labels, content, action.round, bind)
+					else await spawnThread(ctx.thread.id, action.role, labels, content, 'orb', engine, bind)
+				} catch (error: unknown) {
+					// The episode's first error is what the incident page quotes, so it names what to reconcile.
+					throw new Error(`${error instanceof Error ? error.message : String(error)} (${spawnLine(record)} stays pending: nothing relaunches the ${action.role} until a live thread with its labels binds it or the record is removed)`)
 				}
 				// Todo -> In Progress is the builder's claim; the status change is the handoff artifact (§7).
 				if (action.role === 'builder' && issue.status === 'Todo') await callJson(ctx.tools, 'linear.save_issue', { id: issue.identifier, state: 'In Progress' })
@@ -1009,9 +1110,18 @@ export default async function (amp: PluginAPI) {
 		return undefined
 	}
 
-	// The red-deploy log reader (§4 Deployer, Build 6): an Amp low thread on the deploy host.
-	const spawnDeployer = (ctx: EvalContext) => (labels: string[], content: string) =>
-		spawnThread(ctx.thread.id, 'deployer', labels, content, { type: 'runner', id: deployRunner })
+	// The red-deploy log reader (§4 Deployer, Build 6): an Amp low thread on the deploy host, admitted
+	// against the runner slots. A create that never confirmed its thread keeps its slot, so the
+	// same reader is refused for the rest of this process instead of created again.
+	const spawnDeployer = (ctx: EvalContext) => async (labels: string[], content: string) => {
+		const slot = `deployer ${labels.join(' ')}`
+		const wait = await admit(ctx, slot, { role: 'deployer' })
+		if (wait) throw new Error(`log reader not admitted: ${wait}`)
+		return spawnThread(ctx.thread.id, 'deployer', labels, content, { type: 'runner', id: deployRunner }, undefined, async id => {
+			const held = ledger.get(slot)
+			if (held) held.thread = id
+		})
+	}
 }
 
 type Spawn = (labels: string[], content: string) => Promise<string>
@@ -1284,13 +1394,19 @@ const listComments = (tools: Tools, issueId: string): Promise<Comment[]> => allP
 
 type Comment = { id?: string; body: string; createdAt?: string }
 
-async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string, knownThreads: readonly string[]): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
-	const [issue, comments, pr, threads] = await Promise.all([
+// A thread an `odd-spawn` record binds is read by its ID, so search lag (or a plugin reload) never
+// hides it; one whose labels did not land carries its record's role labels.
+async function snapshotFor(ctx: Pick<WebhookHandlerContext, 'tools' | '$' | 'logger'>, identifier: string): Promise<{ snapshot: IssueSnapshot; threads: LiveThread[]; comments: Comment[] }> {
+	const [issue, comments, pr] = await Promise.all([
 		getIssue(ctx.tools, { id: identifier, includeRelations: true }),
 		listComments(ctx.tools, identifier),
 		pullRequestFor(ctx, identifier),
-		threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, knownThreads),
 	])
+	const bound = new Map(spawnRecords(comments).flatMap(record => (record.thread ? [[record.thread, record] as const] : [])))
+	const threads = (await threadsFor(ctx.tools, `label:odd-issue-${identifier.toLowerCase()} archived:false`, [...bound.keys()])).map(thread => {
+		const record = bound.get(thread.id)
+		return record && !parseThreadLabels(thread.labels).role ? { ...thread, labels: [...thread.labels, ...threadLabels(identifier, record.role, record.round)] } : thread
+	})
 	// `blockedBy` lists the relation's issues without their status; a blocker is open until closed.
 	const blockers = await Promise.all((issue.relations?.blockedBy ?? []).map(({ id }) => getIssue(ctx.tools, { id })))
 	const openBlockers = blockers.filter(blocker => !['Done', 'Canceled', 'Duplicate'].includes(blocker.status)).map(blocker => blocker.id)

@@ -2,7 +2,7 @@
 // report (docs/odd/README.md §9). Pure functions; the control-plane plugin does the IO.
 
 import { builderEngine, labOf } from './engines.ts';
-import { capacity, contracts, parseCancelled, parseDeployReceipt, parseSteer, parseThreadLabels, parseVerify, roles, type DeployReceipt, type IssueSnapshot, type Load, type RiskClass, type Role, type Status, type Verdict, type Verify } from './lifecycle.ts';
+import { capacity, contracts, parseCancelled, parseDeployReceipt, parseSpawn, parseSteer, parseThreadLabels, parseVerify, roles, type DeployReceipt, type IssueSnapshot, type Load, type RiskClass, type Role, type SpawnRecord, type Status, type Verdict, type Verify } from './lifecycle.ts';
 
 export type WebhookSource = 'linear' | 'github' | 'slack';
 
@@ -194,7 +194,56 @@ export function toSnapshot(input: { issue: LinearIssue; pr?: GitHubPullRequest; 
     openRounds: openRounds(roleThreads, receipt?.sha),
     cancelledRounds,
     steers,
+    spawns: spawnRecords(issue.comments ?? []),
   };
+}
+
+/** One record per role, round and key: bound when any of its `odd-spawn` lines names a thread, else pending. */
+export function spawnRecords(comments: readonly { body: string }[]): SpawnRecord[] {
+  const records = new Map<string, SpawnRecord>();
+  for (const comment of comments) {
+    const record = parseSpawn(comment.body);
+    if (!record) continue;
+    const id = `${record.role} ${record.round} ${record.key}`;
+    if (!records.get(id)?.thread) records.set(id, record);
+  }
+  return [...records.values()];
+}
+
+/**
+ * A live thread that a pending record's create may have produced: the record's role and round
+ * labels, no other record's thread, and still owed its artifact for the record's key (a reviewer
+ * without a verdict, a verifier labelled with the record's receipt).
+ */
+export function reconciles(record: SpawnRecord, thread: LiveThread, bound: ReadonlySet<string>): boolean {
+  const { role, round } = parseThreadLabels(thread.labels);
+  if (bound.has(thread.id) || role !== record.role || round !== record.round) return false;
+  if (role === 'reviewer') return !thread.labels.some(label => verdictPattern.test(label));
+  if (role === 'verifier') return thread.labels.includes(receiptLabel(record.key.replace(/^verifier-/, '')));
+  return true;
+}
+
+/** A spawn admitted but not yet returned by thread search: `thread` is set once the create returned it. */
+export type Reservation = { role: Role; issue?: string; thread?: string };
+
+/**
+ * Load for admission (P4.1): live load plus every reservation whose thread search has not
+ * returned yet, counted as a running thread of its role's executor and, for a builder, as its
+ * issue's build slot. `building` is the issues holding one.
+ */
+export function admittedLoad(threads: readonly LiveThread[], reservations: readonly Reservation[]): { load: Load; building: Set<string> } {
+  const load = loadFrom(threads);
+  const indexed = new Set(threads.map(thread => thread.id));
+  const building = new Set(threads.flatMap(thread => { const { role, issue } = parseThreadLabels(thread.labels); return role === 'builder' && issue ? [issue] : []; }));
+  for (const reservation of reservations) {
+    if (reservation.thread && indexed.has(reservation.thread)) continue;
+    const executor = contracts[reservation.role].executor;
+    if (executor === 'orb') load.orbs += 1;
+    else if (executor === 'runner') load.runnerSlots += 1;
+    if (reservation.role === 'builder' && reservation.issue) building.add(reservation.issue);
+  }
+  load.buildIssues = building.size;
+  return { load, building };
 }
 
 /** The label the control plane gives a verifier thread: the receipt SHA (12-character prefix) it verifies. */
