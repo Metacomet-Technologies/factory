@@ -182,6 +182,11 @@ test('a green receipt spawns the Verifier; its pass comment sets Done, its fail 
     { kind: 'wait', reason: 'verification failed at abcdef1234; bug MET-9', wait: { kind: 'verification', key: 'verification-abcdef1234' } });
   // A verdict for an older release does not count for this receipt.
   assert.equal(deploying({ sha: '0123456789', result: 'pass' }).kind, 'spawn');
+  // MET-338: the Verifier's odd_verify output for this receipt is recorded as the complete line; output for another receipt is not, and a recorded line wins.
+  const output = (verified: IssueSnapshot['verified'], verify?: IssueSnapshot['verify']) => nextAction(issue({ status: 'Deploying', deployReceipt: receipt, verified, verify }), idle);
+  assert.deepEqual(output({ sha: 'abcdef1234', result: 'fail', bug: 'MET-9' }), { kind: 'record-verify', verify: { sha: 'abcdef1234', result: 'fail', bug: 'MET-9' } });
+  assert.equal(output({ sha: '0123456789', result: 'pass' }).kind, 'spawn');
+  assert.deepEqual(output({ sha: 'abcdef1234', result: 'fail', bug: 'MET-9' }, { sha: 'abcdef1234', result: 'pass' }), { kind: 'set-status', status: 'Done', reason: 'verified kiosk at abcdef1234' });
   assert.equal(parseVerify('odd-verify sha=abcdef1234 result=maybe bug=none'), undefined);
   assert.equal(verifyLine({ sha: 'abcdef1234', result: 'fail', bug: 'MET-9' }), 'odd-verify sha=abcdef1234 result=fail bug=MET-9');
   assert.deepEqual(parseCancelled(cancelledLine('builder', 'T-1', 2)), { role: 'builder', threadID: 'T-1', round: 2 });

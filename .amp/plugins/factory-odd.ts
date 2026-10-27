@@ -45,9 +45,10 @@ import {
 	type Load,
 	type Role,
 	type SpawnRecord,
+	type Verify,
 } from '../../scripts/odd/lifecycle.ts'
 import { contextNamesSource, intakeChannel, intakeLookback, intakeEmoji, intakePrompt, outcomeIssue, pendingIntake, slackSourceLabel, slackSourceTs, sourceLine, type SlackMessage } from '../../scripts/odd/intake.ts'
-import { admittedLoad, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, threadState, toSnapshot, verdictPattern, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
+import { admittedLoad, diagnosedLabel, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, roleLabelQueries, spawnRecords, threadState, toSnapshot, verdictPattern, verifiedFor, verifiedLabels, type GitHubPullRequest, type LinearIssue, type LiveThread, type Reservation } from '../../scripts/odd/snapshot.ts'
 import { builderEngine, checkAccess, checkRouting, engineLabel, engineUsage, expectedEngine, labOf, parseRouting, pluginPins, reviewerEngines, routingRecord, selectReviewer, type Connection, type Engine, type Lab, type Routing } from '../../scripts/odd/engines.ts'
 import { builderArgs, launch } from '../../scripts/odd/launch.ts'
 import { alertsChannel, blindMs, capsAlertMs, digest, digestDelivered, digestDue, digestHeading, digestLate, digestParts, digestSends, episodeLine, firstParentSince, incidentPageDue, incidentText, incidents, newestRelease, overCaps, overdueKeys, overdueLine, overduePage, parseEpisode, postedLate, publisherPage, publisherPagedLine, publisherSnapshot, resolutionText, restoreStatus, sanitizeError, staleReason, staleThreads, stalledWork, sweepMs, type DigestInput, type DigestList, type DigestWait, type Episode, type MainCommit, type Plane, type Publisher, type Run } from '../../scripts/odd/watchdog.ts'
@@ -106,9 +107,28 @@ export function rejectDelivery(provider: Provider, secret: string, event: Pick<W
 	return Math.abs(received - sent) > linearFreshMs ? `stale delivery (${Math.round((received - sent) / 1000)} s from receipt)` : undefined
 }
 
+/** The self-scoped role tools (MET-338): each acts only on the calling thread and its plane-recorded assignment. */
+const roleTools: Partial<Record<Role, string>> = { reviewer: 'odd_verdict', verifier: 'odd_verify' }
+
+/**
+ * A role agent's tool grant (MET-338). No role creates, messages or relabels other threads; each
+ * gets only its own self-scoped role tool. The reviewer, verifier and log reader also lose the
+ * editing tools and `Task` (a subagent edits files), keeping the shell their Evidence runs in:
+ * tool lists are not an OS sandbox. Intake alone writes Slack (it replies in the message's
+ * thread) and keeps `update_thread`, the only way its Slack contract (scripts/odd/intake.ts,
+ * odd-intake skill) names its outcome issue on its own thread.
+ */
+function roleGrant(role: Role): { add: string[]; exclude: string[] } {
+	const own = roleTools[role]
+	const add = ['mcp__linear__*', 'slack_read', ...(role === 'intake' ? ['slack_write', 'update_thread'] : []), ...(own ? [own] : [])]
+	const readOnly = role === 'reviewer' || role === 'verifier' || role === 'deployer'
+	const exclude = ['create_thread', 'update_thread', 'send_thread_message', ...Object.values(roleTools), ...(readOnly ? ['apply_patch', 'edit_file', 'create_file', 'Task'] : [])]
+	return { add, exclude: exclude.filter(tool => !add.includes(tool)) }
+}
+
 export default async function (amp: PluginAPI) {
 	// Every agent pins its model and effort (scripts/odd/engines.ts); none inherits a mode default.
-	const roleAgent = (role: Role, extendsMode: 'low' | 'medium' | 'high', label: string, extra: string, pin: Engine, tools?: { exclude?: string[] }): Agent =>
+	const roleAgent = (role: Role, extendsMode: 'low' | 'medium' | 'high', label: string, extra: string, pin: Engine): Agent =>
 		amp.createAgent({
 			extends: extendsMode,
 			model: pin.model,
@@ -120,23 +140,21 @@ export default async function (amp: PluginAPI) {
 				'Never write artifacts another role is supposed to check. Never edit Done means. Follow AGENTS.md.',
 				extra,
 			].join(' '),
-			// update_thread lets a role label its own thread (the reviewer's verdict is a label).
-			tools: { add: ['mcp__linear__*', 'slack_read', 'slack_write', 'create_thread', 'get_thread_status', 'wait_for_threads', 'update_thread'], ...tools },
+			tools: roleGrant(role),
 			display: { label, color: '#0f766e' },
 		})
 
-	const reviewerExtra = 'Rerun the Evidence commands yourself at the exact head SHA. Verdict is bound to that SHA: a PR comment plus the odd-verdict thread label.'
-	const readOnly = { exclude: ['edit_file', 'create_file'] }
+	const reviewerExtra = 'Rerun the Evidence commands yourself at the exact head SHA. Verdict is bound to that SHA: a PR comment, then the odd_verdict tool, which labels this thread for its assigned head.'
 	// One reviewer agent per lab; the control plane picks one outside the Builder's lab (selectReviewer).
-	const reviewerAgents = new Map<Lab, Agent>(reviewerEngines.map(engine => [engine.lab, roleAgent('reviewer', 'high', 'ODD Reviewer', reviewerExtra, engine, readOnly)]))
+	const reviewerAgents = new Map<Lab, Agent>(reviewerEngines.map(engine => [engine.lab, roleAgent('reviewer', 'high', 'ODD Reviewer', reviewerExtra, engine)]))
 	const modes: { key: string; label: string; agent: Agent }[] = [
 		{ key: 'intake', label: 'ODD Intake', agent: roleAgent('intake', 'low', 'ODD Intake', 'Turn a message or bare issue into a Linear issue in the team template, with type and area labels and a duplicate check.', pluginPins.intake) },
 		{ key: 'spec', label: 'ODD Spec', agent: roleAgent('spec', 'medium', 'ODD Spec', 'Write Isolation, Build, Done means and Evidence; one Evidence line per Done-means item; set priority and risk.', pluginPins.spec) },
 		// Manual use only: the control plane launches Claude Code builders through the CLI (launchBuilder).
 		{ key: 'builder', label: 'ODD Builder', agent: roleAgent('builder', 'medium', 'ODD Builder', 'Implement the smallest correct change on your own branch, open the PR with the Evidence output in its body, and keep the same thread and branch across review rounds.', pluginPins.builder) },
 		{ key: 'reviewer', label: 'ODD Reviewer', agent: reviewerAgents.get(reviewerEngines[0].lab)! },
-		{ key: 'verifier', label: 'ODD Verifier', agent: roleAgent('verifier', 'low', 'ODD Verifier', 'Check each Done-means item against the deployed system using the Evidence lines and the deploy receipt.', pluginPins.verifier, readOnly) },
-		{ key: 'deployer', label: 'ODD Deployer', agent: roleAgent('deployer', 'low', 'ODD Deployer', 'Read the factory-deploy journal and ledger for the red receipt you were given and attach the installer and journal excerpts to the named issue. Never run installers, rollbacks, sudo or systemctl.', pluginPins.deployer, readOnly) },
+		{ key: 'verifier', label: 'ODD Verifier', agent: roleAgent('verifier', 'low', 'ODD Verifier', 'Check each Done-means item against the deployed system using the Evidence lines and the deploy receipt, then report the result with the odd_verify tool.', pluginPins.verifier) },
+		{ key: 'deployer', label: 'ODD Deployer', agent: roleAgent('deployer', 'low', 'ODD Deployer', 'Read the factory-deploy journal and ledger for the red receipt you were given and attach the installer and journal excerpts to the named issue. Never run installers, rollbacks, sudo or systemctl.', pluginPins.deployer) },
 	]
 	const agents: Partial<Record<Role, Agent>> = Object.fromEntries(modes.map((m) => [m.key, m.agent]))
 	const control = amp.createAgent({
@@ -168,6 +186,9 @@ export default async function (amp: PluginAPI) {
 		// A Slack-only Intake thread has no issue label; its stop is the issue its outcome label names (P3.12).
 		const source = role === 'intake' && !issue ? slackSourceTs(labels) : undefined
 		if (!role || !(issue || source) || event.status !== 'done') return
+		// A log reader has no update_thread (MET-338): the plugin marks its own release diagnosed when its turn ends.
+		const read = role === 'deployer' ? labels.map(label => /^odd-deploy-([a-f0-9]{12})$/.exec(label)?.[1]).find(Boolean) : undefined
+		if (read && !labels.includes(diagnosedLabel(read))) await amp.threads.get(event.thread.id).addLabels([diagnosedLabel(read)])
 		const count = event.message.includes(marker) ? (chained.get(event.thread.id) ?? 0) : 0
 		const { stopMet, missing } = source ? await slackOutcome(ctx.tools, source, labels) : await externalStop(ctx, role, issue as string, labels)
 		const verdict = ralphGuard({ role, chained: count, stopMet, missing })
@@ -259,6 +280,60 @@ export default async function (amp: PluginAPI) {
 			const signing = Object.fromEntries(providers.map(provider => [provider, secrets[provider] ? 'set' : 'missing']))
 			const signingSource = Object.fromEntries(providers.filter(provider => secrets[provider]).map(provider => [provider, configured.includes(provider) ? 'environment' : 'private']))
 			return JSON.stringify({ thread: ctx.thread.id, labels, executor: amp.system.executor.kind, ...state, signing, signingSource, dialog })
+		},
+	})
+
+	// --- Self-scoped role tools (MET-338). Neither takes a thread ID or SHA: the role, issue and round
+	// come from the calling thread's labels, the assigned head or receipt from the `odd-spawn` record
+	// the plane bound to that thread, and the only write is a label on the calling thread itself.
+	type ToolContext = Pick<WebhookHandlerContext, 'tools'> & { thread: { id: ThreadID; labels(): Promise<readonly string[]> } }
+	async function assignment(ctx: ToolContext, role: Role) {
+		const tool = roleTools[role]
+		const labels = await ctx.thread.labels()
+		const own = parseThreadLabels(labels)
+		if (own.role !== role || !own.issue) throw new Error(`${tool} is the ${role} role's tool; this thread is ${own.role ? `the ${own.role}` : 'not an ODD role thread'}${own.issue ? ` on ${own.issue}` : ''}. Nothing was recorded.`)
+		const comments = await listComments(ctx.tools, own.issue)
+		const record = spawnRecords(comments).find(candidate => candidate.thread === ctx.thread.id)
+		const sha12 = record?.role === role && record.round === own.round ? new RegExp(`^${role}-([a-f0-9]{12})$`).exec(record.key)?.[1] : undefined
+		if (!sha12) throw new Error(`no odd-spawn record on ${own.issue} assigns this thread a ${role} round ${own.round}. Nothing was recorded.`)
+		return { issue: own.issue, sha12, labels, comments }
+	}
+
+	amp.registerTool({
+		name: 'odd_verdict',
+		description: 'ODD Reviewer only: record your verdict for the PR head the control plane assigned this thread, by labelling this thread odd-verdict-<state>-<sha12>. Post the PR comment `odd-verdict <state> sha=<sha>` with your findings first. Refuses another role, a thread without a reviewer assignment, a head that is no longer the open PR\'s head, and a second verdict.',
+		inputSchema: { type: 'object', properties: { state: { type: 'string', enum: ['ready', 'changes'], description: 'ready to merge, or changes requested' } }, required: ['state'] },
+		async execute(input, ctx) {
+			const state = input.state
+			if (state !== 'ready' && state !== 'changes') throw new Error('state must be ready or changes')
+			const { issue, sha12, labels } = await assignment(ctx, 'reviewer')
+			const prior = labels.find(label => verdictPattern.test(label))
+			if (prior) throw new Error(`this thread already carries its verdict ${prior}; one verdict per head`)
+			const pr = await ownedPullRequest({ $: amp.$ }, issue, 'open', undefined)
+			if (!pr || !pr.headRefOid.startsWith(sha12)) throw new Error(`stale assignment: this thread reviews head ${sha12}, but ${issue}'s open PR is ${pr ? `#${pr.number} at ${pr.headRefOid}` : 'gone'}. Nothing was recorded; the control plane reviews the new head in a new thread.`)
+			const label = `odd-verdict-${state}-${sha12}`
+			await amp.threads.get(ctx.thread.id).addLabels([label])
+			return `Recorded ${label} on this thread: ${state} for PR #${pr.number} at ${pr.headRefOid}.`
+		},
+	})
+
+	amp.registerTool({
+		name: 'odd_verify',
+		description: 'ODD Verifier only: report the result for the deploy receipt the control plane assigned this thread. result=pass, or result=fail with bug=<MET-n>, the Bug you filed in Triage. The control plane then writes the `odd-verify` comment on the issue and sets Done on pass. Refuses another role, a thread without a verifier assignment, a receipt that is no longer current, a malformed result and a second report.',
+		inputSchema: { type: 'object', properties: { result: { type: 'string', enum: ['pass', 'fail'] }, bug: { type: 'string', description: 'The Bug issue (MET-n) filed for a failing Done-means item; required with fail, omitted with pass' } }, required: ['result'] },
+		async execute(input, ctx) {
+			const result = input.result
+			const bug = typeof input.bug === 'string' && input.bug.trim() !== '' ? input.bug.trim().toUpperCase() : undefined
+			if (result !== 'pass' && result !== 'fail') throw new Error('result must be pass or fail')
+			if (result === 'fail' ? !bug || !/^MET-[1-9]\d*$/.test(bug) : bug !== undefined) throw new Error('result=fail needs bug=<MET-n>, the Bug filed in Triage; result=pass takes no bug')
+			const { issue, sha12, labels, comments } = await assignment(ctx, 'verifier')
+			const snapshot = toSnapshot({ issue: { ...(await getIssue(ctx.tools, { id: issue })), comments } })
+			const receipt = snapshot.deployReceipt
+			if (snapshot.status !== 'Deploying' || receipt?.health !== 'pass' || !receipt.sha.startsWith(sha12)) throw new Error(`stale assignment: this thread verifies receipt ${sha12}, but ${issue} is ${snapshot.status}${receipt ? ` with receipt ${receipt.sha} health=${receipt.health}` : ' without a receipt'}. Nothing was recorded.`)
+			if (snapshot.verify?.sha === receipt.sha || labels.some(label => label.startsWith('odd-verify-'))) throw new Error(`a result for receipt ${receipt.sha} is already recorded; one per receipt`)
+			const verify: Verify = { sha: receipt.sha, result, ...(bug ? { bug } : {}) }
+			await amp.threads.get(ctx.thread.id).addLabels(verifiedLabels(verify))
+			return `Recorded ${verifiedLabels(verify).join(', ')} on this thread; the control plane writes \`${verifyLine(verify)}\` on ${issue}.`
 		},
 	})
 
@@ -1229,6 +1304,11 @@ export default async function (amp: PluginAPI) {
 				await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: resumeLine(action.escalation, action.epoch) })
 				recheck(ctx, state, issue.identifier, 0)
 				return true
+			// The verifier's odd_verify output becomes the one complete `odd-verify` line, which the next evaluation acts on.
+			case 'record-verify':
+				await callJson(ctx.tools, 'linear.save_comment', { issueId: issue.identifier, body: verifyLine(action.verify) })
+				recheck(ctx, state, issue.identifier, 0)
+				return true
 			default:
 				ctx.logger.log(marker, 'deferred to a later phase', action.kind)
 				return false
@@ -1240,7 +1320,7 @@ export default async function (amp: PluginAPI) {
 		if (role === 'reviewer' && issue.pr) return ` Review PR #${issue.pr.number} at head ${issue.pr.headSha}.`
 		if (role === 'verifier' && issue.deployReceipt) {
 			const { sha } = issue.deployReceipt
-			return ` Receipt: \`${deployReceiptLine(issue.deployReceipt)}\`. Check every Done-means item against the deployed system and comment \`${verifyLine({ sha, result: 'pass' })}\` (or \`result=fail bug=<MET-n>\` after filing the Bug in Triage) on ${issue.identifier}.`
+			return ` Receipt: \`${deployReceiptLine(issue.deployReceipt)}\` (sha ${sha}). Check every Done-means item against the deployed system, comment one line per item on ${issue.identifier}, then call \`odd_verify\` with result=pass (or result=fail and bug=<MET-n> after filing the Bug in Triage); the control plane writes the \`odd-verify\` line.`
 		}
 		return ''
 	}
@@ -1433,7 +1513,7 @@ export async function diagnose(ctx: Pick<WebhookHandlerContext, 'tools' | 'logge
 			`${marker} Outcome ${issue.identifier}. Role: deployer. Reason: red deploy.`,
 			`Receipt: \`${deployReceiptLine(receipt)}\`.`,
 			`Attach the installer and journal excerpts (\`journalctl -u factory-deploy\`, the ledger) for this release to ${target}${bug ? ` (Bug follow-up of ${issue.identifier})` : ' (the rollback failed; Devon is paged)'}.`,
-			`Once that comment is posted, add the label \`${diagnosedLabel(receipt.sha)}\` to this thread with \`update_thread\` (\`labels.add\`); the control plane archives the thread on that label.`,
+			`Post that comment before you end your turn: the plugin will add the label \`${diagnosedLabel(receipt.sha)}\` to this thread when your turn ends, and the control plane archives the thread on that label.`,
 			`Load the \`${contracts.deployer.skill}\` skill and start.`,
 		].join(' '))
 	} catch (error: unknown) {
@@ -1861,11 +1941,12 @@ async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools' | 'lo
 			getIssue(ctx.tools, { id: issue }),
 			listComments(ctx.tools, issue),
 		])
+		// Its own odd_verify output for that receipt also meets it: the control plane writes the comment from it.
 		const { deployReceipt, verify } = toSnapshot({ issue: { ...snapshot, comments } })
 		if (!deployReceipt) return { stopMet: false, missing: [`no odd-deploy receipt on ${issue}`] }
-		return verify?.sha === deployReceipt.sha
+		return verify?.sha === deployReceipt.sha || verifiedFor([{ id: 'self', labels, state: 'idle' }], deployReceipt.sha)
 			? { stopMet: true, missing: [] }
-			: { stopMet: false, missing: [`comment \`${verifyLine({ sha: deployReceipt.sha, result: 'pass' })}\` (or result=fail bug=<MET-n>) on ${issue}`] }
+			: { stopMet: false, missing: [`the odd_verify tool (result=pass, or result=fail with bug=<MET-n>), from which the control plane comments \`${verifyLine({ sha: deployReceipt.sha, result: 'pass' })}\` on ${issue}`] }
 	}
 	if (role !== 'builder' && role !== 'reviewer') return { stopMet: true, missing: [] }
 	// A failed PR read throws: the guard neither continues the thread nor claims the PR is missing.
@@ -1882,7 +1963,7 @@ async function externalStop(ctx: Pick<WebhookHandlerContext, '$' | 'tools' | 'lo
 		// The verdict is the reviewer thread's own label for the current head (snapshot.verdictFor).
 		const head = headRefOid.slice(0, 12)
 		const posted = labels.some(label => label === `odd-verdict-ready-${head}` || label === `odd-verdict-changes-${head}`)
-		return posted ? { stopMet: true, missing: [] } : { stopMet: false, missing: [`thread label odd-verdict-<ready|changes>-${head} for PR head ${headRefOid}`] }
+		return posted ? { stopMet: true, missing: [] } : { stopMet: false, missing: [`thread label odd-verdict-<ready|changes>-${head} for PR head ${headRefOid}, set by the odd_verdict tool`] }
 	}
 	const failing = statusCheckRollup.filter(check => (check.conclusion ?? check.state ?? '').toUpperCase() in { FAILURE: 1, ERROR: 1, CANCELLED: 1 }).map(check => check.name ?? 'check')
 	const pending = statusCheckRollup.some(check => !check.conclusion && (check.state ?? '').toUpperCase() !== 'SUCCESS')

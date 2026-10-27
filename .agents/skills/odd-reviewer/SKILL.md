@@ -47,17 +47,20 @@ orb checkout.
 7. Post the verdict as a PR comment whose first line is
    `odd-verdict ready sha=<sha>` or `odd-verdict changes sha=<sha>` (GitHub
    refuses a review from the account that opened the PR, so a comment is the
-   verdict). Every finding names file and line and the smallest fix. Then add
-   the label `odd-verdict-<ready|changes>-<sha12>` to this thread with
-   `update_thread` (`sha12` is the first 12 characters of the head SHA); the
-   control plane reads the label, not the comment. One verdict per head.
-   Report milestones and decisions in it, not routine progress.
+   verdict). Every finding names file and line and the smallest fix. Then call
+   `odd_verdict` with `state` `ready` or `changes`. It takes no thread or SHA:
+   it labels this thread `odd-verdict-<state>-<sha12>` for the head the
+   control plane assigned it, and refuses when the PR has moved to another
+   head (post nothing more; a new Reviewer judges the new head). The control
+   plane reads the label, not the comment. One verdict per head. Report
+   milestones and decisions in it, not routine progress.
 
 ## Authority
 
 Approve or request changes. Never push to the builder's branch, never edit
 the issue's spec, never merge, never write `factory-qa` markers (the
-existing QA flow owns them).
+existing QA flow owns them). Your mode has no file-editing, thread-creating,
+thread-messaging or `update_thread` tools; the shell stays for Evidence.
 
 ## Stop and handoff
 
