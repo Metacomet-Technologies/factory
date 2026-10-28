@@ -1491,6 +1491,134 @@ def commit(root, message):
         "commit", "-qm", message)
 
 
+class ReproducibleManifest(unittest.TestCase):
+    """Real package() over a stub source tree; only meter/API health is faked."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = root = Path(self.temp.name) / "source"
+        for name in INVENTORY["required_files"]:
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_text("fixture; never execute\n")
+        (root / "deploy/components.json").write_bytes(r.canonical(INVENTORY))
+        (root / "scripts/build-fingerprint.sh").write_text("printf '123456abcdef\\n'\n")
+        (root / "kiosk/scripts").mkdir(parents=True)
+        (root / "kiosk/scripts/build-info.ts").write_text(
+            'import { execFileSync } from "node:child_process";\n'
+            'export function buildInfo() {\n'
+            '  const git_sha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();\n'
+            '  return { version: "0.2.1", git_sha, git_dirty: false, built_at_ms: 1792000000000,\n'
+            '           inputs_fingerprint: "123456abcdef" };\n}\n')
+        (root / "VERSION").write_text("0.2.0\n")
+        (root / ".gitignore").write_text(".sandbox/\nkiosk/dist/\ntarget/\n")
+        run(root, "git", "init", "-q")
+        commit(root, "fixture release source")
+        self.sha = r.git(root, "rev-parse", "HEAD")
+        (root / ".sandbox").mkdir()
+        (root / ".sandbox/ports.json").write_text('{"meter": 1, "factory-api": 2}')
+        (root / "kiosk/dist/assets").mkdir(parents=True)
+        (root / "kiosk/dist/index.html").write_text("fixture kiosk")
+        (root / "kiosk/dist/version.json").write_text('{"build":"fixture"}')
+        (root / "kiosk/dist/assets/index.js").write_text(
+            f'const b={{version:"0.2.1",git_sha:"{self.sha}",inputs_fingerprint:"123456abcdef",git_dirty:!1}};')
+        (root / "target/release").mkdir(parents=True)
+        for binary in ("meter", "factory-api", "pricing", "factory-ups-control"):
+            (root / "target/release" / binary).write_bytes(b"fixture binary " + binary.encode())
+
+    def health(self, clock, meter_openapi="0123456789ab"):
+        """Health as served: stable build fields plus live readings that move with `clock`."""
+        build = {"status": "ok", "version": "0.2.1", "git_sha": self.sha, "git_dirty": False,
+                 "built_at_ms": 1792000000000, "inputs_fingerprint": "123456abcdef"}
+        return {
+            "meter": {**build, "openapi_sha256": meter_openapi, "queue_depth": clock % 7,
+                      "maintenance": {"status": "ok", "checked_at_ms": 1793000000000 + clock}},
+            "factory-api": {**build, "openapi_sha256": "abcdef012345", "meter_openapi_expected": meter_openapi,
+                            "meter_openapi_sha256": meter_openapi, "uptime_ms": clock,
+                            "maintenance": {"checked_at_ms": 1793000000000 + clock},
+                            "retention": {"status": "ok", "checked_at_ms": 1793000000000 + clock,
+                                          "cutoff_ms": 1761000000000 + clock,
+                                          "pruned_at_ms": 1793000000000 + clock, "pruned_rows": 0}}}
+
+    def package(self, reservation, output, health):
+        def urlopen(url, timeout):
+            return io.BytesIO(json.dumps(health["meter" if "/meter/" in url else "factory-api"]).encode())
+        output.mkdir(parents=True, exist_ok=True)
+        with patch.object(r.urllib.request, "urlopen", side_effect=urlopen):
+            r.package(self.root, output, reservation)
+        return (output / "manifest.json").read_bytes()
+
+    def test_same_inputs_with_different_clocks_and_uptimes_build_byte_identical_manifest(self):
+        out = Path(self.temp.name)
+        first = self.package(plan(self.sha), out / "first", self.health(601))
+        second = self.package(plan(self.sha), out / "second", self.health(617))
+        self.assertEqual(first, second)
+        identity = json.loads(first)["build_identity"]
+        self.assertEqual(identity["factory-api"]["openapi_sha256"], "abcdef012345")
+        for component in ("meter", "factory-api"):
+            self.assertLessEqual(set(identity[component]), r.IDENTITY_FIELDS)
+        # Control: a stable field (served contract hash) still changes the manifest.
+        changed = self.package(plan(self.sha), out / "changed", self.health(601, "ba9876543210"))
+        self.assertNotEqual(first, changed)
+
+    def test_resume_partial_draft_with_manifest_and_some_binaries_uploads_only_missing(self):
+        out = Path(self.temp.name)
+        for case in ("rebuild", "changed_manifest"):
+            with self.subTest(case=case):
+                reservation = plan(self.sha)
+                api = FakeGitHub()
+                r.reserve(api, reservation)
+                api.request("releases", "POST", {"tag_name": "v0.2.1", "draft": True, "prerelease": False})
+                interrupted = out / case / "interrupted"
+                self.package(reservation, interrupted, self.health(601))
+                partial = ["manifest.json", "factory-api-linux-x86_64", "kiosk.tar.gz", "meter-linux-x86_64"]
+                for name in partial:
+                    api.request(f"releases/1/assets?name={name}", "POST", upload=interrupted / name)
+                r.resume_release(api, "v0.2.1=1")
+                api.uploaded.clear()
+                rebuilt = self.health(617) if case == "rebuild" else self.health(617, "ba9876543210")
+                builder = lambda p, d: self.package(p, d, rebuilt)
+                if case == "rebuild":
+                    self.assertEqual(r.publish_one(api, reservation, INVENTORY, out / case / "resume", builder),
+                                     "complete")
+                    self.assertEqual(sorted(n for _, n in api.uploaded), sorted(r.ASSETS - set(partial)))
+                    self.assertFalse(api.releases[0]["draft"])
+                    self.assertEqual(api.releases[0]["body"],
+                                     "factory-release-v1:" + r.digest((interrupted / "manifest.json").read_bytes()))
+                else:
+                    writes = api.writes
+                    with self.assertRaisesRegex(ValueError, "immutable asset conflict: v0.2.1/manifest.json"):
+                        r.publish_one(api, reservation, INVENTORY, out / case / "resume", builder)
+                    self.assertEqual((api.writes, api.uploaded), (writes, []))
+                    self.assertTrue(api.releases[0]["draft"])
+
+    def test_transient_health_observation_is_refused_before_any_upload_then_healthy_build_publishes(self):
+        def unavailable(h): h["factory-api"]["meter_openapi_sha256"] = None
+        def unsynchronized(h): h["factory-api"]["status"] = "clock_unsynchronized"
+        def meter_unhealthy(h): h["meter"]["status"] = "degraded"
+        def stale_meter(h): h["meter"]["openapi_sha256"] = h["factory-api"]["meter_openapi_sha256"] = "ba9876543210"
+        out = Path(self.temp.name)
+        for name, transient in (("unavailable", unavailable), ("unsynchronized", unsynchronized),
+                                ("meter_unhealthy", meter_unhealthy), ("stale_meter", stale_meter)):
+            with self.subTest(case=name):
+                health = self.health(601)
+                transient(health)
+                with self.assertRaisesRegex(ValueError, "health is not ok|observed meter contract"):
+                    self.package(plan(self.sha), out / name / "direct", health)
+                self.assertFalse((out / name / "direct/manifest.json").exists())
+                api = FakeGitHub()
+                with self.assertRaisesRegex(ValueError, "health is not ok|observed meter contract"):
+                    r.publish_one(api, plan(self.sha), INVENTORY, out / name / "first",
+                                  lambda p, d: self.package(p, d, health))
+                self.assertEqual(api.uploaded, [])
+                self.assertEqual(api.releases, [])
+                # The tag is reserved, so recovery creates the draft from the healthy rebuild.
+                api.create_reserved_releases.add("v0.2.1")
+                self.assertEqual(r.publish_one(api, plan(self.sha), INVENTORY, out / name / "healthy",
+                                               lambda p, d: self.package(p, d, self.health(617))), "complete")
+                self.assertEqual(json.loads((out / name / "healthy/manifest.json").read_bytes())["build_identity"]
+                                 ["factory-api"]["meter_openapi_sha256"], "0123456789ab")
+
+
 class RunnerProvisioning(unittest.TestCase):
     def test_historical_sandbox_gets_system_bubblewrap_before_build(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()

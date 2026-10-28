@@ -373,6 +373,16 @@ Schema 1 manifest includes the repository, full SHA, source/release versions,
 tag, bump and reservation evidence; complete component/target/installer/health/
 rollback policy; each artifact's size and SHA-256; per-component tracked-source
 fingerprints; embedded health/build identities; and every archive member's digest.
+Meter/API identities keep only health fields fixed by the source SHA and inputs
+(`IDENTITY_FIELDS` in `release.py`: status, build identity and OpenAPI hashes);
+uptime, queue depth and maintenance/retention clocks are dropped. The retained
+`status` and the API's observed `meter_openapi_sha256` are live probes too, so
+packaging refuses to build unless both services report `ok` and the observed meter
+hash equals both the build-time `meter_openapi_expected` and the meter's own
+`openapi_sha256`; a transient reading never reaches a draft. Rebuilding the
+same SHA therefore yields a byte-identical `manifest.json`, so a resumed draft
+uploads only its missing assets. A manifest that genuinely differs still stops
+with the immutable-asset conflict.
 The meter/API/kiosk inputs fingerprints retain their existing narrower build-input
 algorithm; component fingerprints additionally cover declared deployment inputs.
 Deployment packaging reads tracked `deploy/` and `scripts/` files from the same
