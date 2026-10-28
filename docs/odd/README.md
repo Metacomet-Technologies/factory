@@ -720,7 +720,7 @@ the separation holds:
 | --- | --- | --- |
 | Plane (control orb plugin) | Devon's Linear connection (`linear.save_comment`, `linear.save_issue`); user `3017c6e0-5bc4-4cf6-9a39-1a8d5ca74fc0` | Every lifecycle marker except receipts: `odd-spawn`, `odd-merge`, `odd-verify`, `odd-escalated`, `odd-resume`, `odd-watchdog`, `odd-budget`, `odd-steer`, `odd-pr`, `odd-drafted`, episodes |
 | Role agents (plugin modes) | The Amp Linear app, through `comment_on_linear_issue`. Role grants exclude `mcp__linear__save_comment`, `mcp__linear__delete_comment`, the Metacomet portal (`mcp__metacomet__*`, a generic executor that fronts the same Linear user) and `Task` (a subagent gets the owner's MCP servers) | Evidence and diagnoses; never a marker the plane accepts |
-| Claude Code builder | Unresolved: launched by `amp -ox` under the owner's account, it has the plane's Linear connection (see below) | PR evidence comments |
+| Claude Code builder | Devon's account (launched by `amp -ox`), so it holds the plane's Linear connection; accepted risk, see below | PR evidence comments, never plane markers |
 | Host deployer (`scripts/odd/deploy.ts`) | Linear OAuth app "ODD Deployer" (client credentials, actor=app); app user `9b96bc7d-30b6-433f-8dab-5c62b82ee92a` | `odd-deploy` receipts only |
 | GitHub merges | Devon's existing `gh` auth (accepted exception, `mergedBy` DGarbs51) | Merges |
 | Slack pages and alerts | The Amp bot (`slack_write` with `postAs: "bot"`), from merge on | Pages, alerts, digest |
@@ -747,7 +747,7 @@ merge (`docs/release.md`).
 
 Provisioning, acceptance and activation. Devon or the coordinator runs these
 steps in order; a Builder never does. Enforcement is activated only after
-Devon's acceptance, and only after the builder gap below is closed.
+Devon's acceptance.
 
 1. Done 2026-10-27: Devon created the ODD Deployer app and recorded its app
    user ID on MET-339.
@@ -781,14 +781,18 @@ lines together: receipts lost in the change are reposted by reconcile. To
 change the plane principal, drain every `odd` issue out of In Progress, In
 Review and Deploying first, because markers from the old ID stop counting.
 
-Open: the Claude Code builder. The plane launches it with `amp -ox` under
-Devon's Amp account, so it inherits Devon's remote Linear MCP connection,
-the plane's marker-writer principal. No launch flag removes a remote MCP
-server, and `amp.tools.disable` does not apply to remote MCP definitions, so
-nothing inside this issue's Isolation separates them. Closing it needs a
-decision recorded on MET-339: move the plane's marker writes to a credential
-the builder's account does not hold, or launch builders under an account
-without Devon's Linear connection. Do not activate enforcement until then.
+Accepted risk, Devon 2026-10-28 ("reuse the credentials and trust the
+agents until proven otherwise"): the Claude Code builder can write as the
+plane. The plane launches it with `amp -ox` under Devon's Amp account, so it
+inherits Devon's remote Linear MCP connection, the plane's marker-writer
+principal; no launch flag removes a remote MCP server, and
+`amp.tools.disable` does not apply to remote MCP definitions. A plane
+credential in project secrets would not help: builder orbs run in the same
+project and receive them. The builder's contract forbids marker writes; it
+posts evidence only. If a builder is ever seen writing a marker, close the
+gap (MET-407) with a plane principal builders cannot reach: an "ODD Plane"
+client-credentials app whose secret lives in a separate Amp project for the
+control orb, or only in plugin memory via a private dialog.
 
 Residual risks accepted by Devon: any comment written as Devon (coordinator
 or hand comments) counts as a plane marker. The legacy dispatcher keeps
