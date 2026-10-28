@@ -32,6 +32,10 @@ ASSETS = {"meter-linux-x86_64", "factory-api-linux-x86_64", "pricing-linux-x86_6
 COMPONENTS = {"meter", "factory-api", "kiosk", "pricing", "ups-control", "dispatcher",
               "usage", "alerts", "backup", "reboot", "nut", "migration-and-host-tools",
               "external-host-services"}
+# Meter/API health fields stable for one source SHA; queue depth, uptime and
+# maintenance/retention clocks are live readings and stay out of the manifest.
+IDENTITY_FIELDS = {"status", "version", "git_sha", "git_dirty", "built_at_ms", "inputs_fingerprint",
+                   "openapi_sha256", "meter_openapi_expected", "meter_openapi_sha256"}
 
 
 def require(condition, message):
@@ -611,7 +615,9 @@ def package(root, output, plan):
     identities = {}
     for component, endpoint in (("meter", "/meter/health"), ("factory-api", "/v1/health")):
         with urllib.request.urlopen(f"http://127.0.0.1:{ports[component]}{endpoint}", timeout=10) as response:
-            identities[component] = json.load(response)
+            # Keep only fields fixed by the source SHA and inputs, so a rebuild of
+            # an interrupted draft reproduces manifest.json byte for byte.
+            identities[component] = {k: v for k, v in json.load(response).items() if k in IDENTITY_FIELDS}
         expected = subprocess.check_output(["bash", "scripts/build-fingerprint.sh", component], cwd=root, text=True).strip()
         require(identities[component]["inputs_fingerprint"] == expected, "binary inputs fingerprint mismatch")
     identities["kiosk"] = json.loads(subprocess.check_output(
