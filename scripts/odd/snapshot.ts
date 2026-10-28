@@ -70,6 +70,53 @@ export function linearUnresolved(body: string): string | undefined {
   return `linear-unresolved type=${typeof type === 'string' && /^[A-Za-z]{1,32}$/.test(type) ? type : 'unknown'}`;
 }
 
+/**
+ * MET-339: the immutable Linear user IDs that author lifecycle markers, and the instant enforcement
+ * began. `plane` writes every marker but receipts; `deployer` writes only `odd-deploy` receipts.
+ */
+export type Identity = { plane: string; deployer: string; since: string };
+
+/**
+ * The identity configuration `plane=<uuid> deployer=<uuid> since=<ISO-8601>` (ODD_IDENTITY on the
+ * control orb, /etc/factory-dispatch/odd-identity on the host). Absent or blank is undefined:
+ * enforcement is not activated. Anything else that does not parse exactly, or names one principal
+ * for both, throws, so a broken activation fails closed instead of trusting every author.
+ */
+export function parseIdentity(text: string | undefined): Identity | undefined {
+  if (text === undefined || text.trim() === '') return undefined;
+  const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+  const match = new RegExp(`^plane=(${uuid}) deployer=(${uuid}) since=(\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\d\\.\\d{3}Z)$`).exec(text.trim());
+  if (!match || Number.isNaN(Date.parse(match[3]))) throw new Error('ODD identity configuration is malformed; expected plane=<uuid> deployer=<uuid> since=<ISO-8601>');
+  if (match[1] === match[2]) throw new Error('ODD identity configuration names one principal as both plane and deployer');
+  return { plane: match[1], deployer: match[2], since: match[3] };
+}
+
+/** A comment as read, with its author's immutable Linear user ID when the read reports one. */
+export type AuthoredComment = { id?: string; body: string; createdAt?: string; author?: { id?: string } | null };
+
+const receiptLinePattern = /^odd-deploy\b/;
+
+/**
+ * MET-339: the comments whose lifecycle markers count. Before activation (`identity` undefined)
+ * every comment does. After it, a comment counts only by its author's user ID, never a display name:
+ * a `deployer` comment keeps only its `odd-deploy` lines; a `plane` comment keeps every other line,
+ * and its `odd-deploy` lines only when created before `since` (the host deployer wrote receipts with
+ * the plane principal's key until then). Any other author, or none, contributes nothing.
+ */
+export function trustedComments<T extends AuthoredComment>(comments: readonly T[], identity: Identity | undefined): T[] {
+  if (!identity) return [...comments];
+  const since = Date.parse(identity.since);
+  return comments.flatMap(comment => {
+    const author = comment.author?.id;
+    const keep = author === identity.deployer ? (line: string) => receiptLinePattern.test(line)
+      : author === identity.plane ? (line: string) => !receiptLinePattern.test(line) || Date.parse(comment.createdAt ?? '') < since
+        : undefined;
+    // Split on every terminator the markers' /m parsers treat as a line end (LF, CR, U+2028, U+2029),
+    // so no line hides a marker behind a separator the filter would not see.
+    return keep ? [{ ...comment, body: comment.body.split(/\r\n|[\n\r\u2028\u2029]/).filter(keep).join('\n') }] : [];
+  });
+}
+
 /** Subset of the Linear MCP `get_issue` result the lifecycle needs. */
 export type LinearIssue = {
   id: string;

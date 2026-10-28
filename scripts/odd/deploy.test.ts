@@ -6,15 +6,16 @@ import { tmpdir } from 'node:os';
 import { createHash, createHmac } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { CHECK_TIMEOUT_MS, ROOT, toolChecks, bootstrap, deployComponent, emptyLedger, issuesFromSubjects, liveEffects, main, parseSnapshot, pendingTags, plan, probeResult, promoteTools, receiptLine, recipes, reconcileManual, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
+import { CHECK_TIMEOUT_MS, DEPLOYER_OAUTH_FILE, LINEAR_KEY_FILE, ROOT, toolChecks, bootstrap, deployerAuthorization, deployComponent, emptyLedger, issuesFromSubjects, liveEffects, main, parseSnapshot, pendingTags, plan, probeResult, promoteTools, receiptLine, recipes, reconcileManual, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
 import { nextAction, parseDeployReceipt, type Action } from './lifecycle.ts';
-import { toSnapshot } from './snapshot.ts';
+import { toSnapshot, trustedComments, type Identity } from './snapshot.ts';
 import plugin, { diagnose, page, setStatus } from '../../.amp/plugins/factory-odd.ts';
 import { fakeShell } from './fixtures.ts';
 
 // No fixture signs with the host's injected webhook secrets: the plugin prefers the project
 // environment over the dialog, so both names are removed and only the synthetic secret signs.
-for (const name of ['ODD_GITHUB_WEBHOOK_SECRET', 'ODD_LINEAR_WEBHOOK_SECRET']) delete process.env[name];
+// MET-339: nor does an activated identity on the host leak in; fixtures pass their own.
+for (const name of ['ODD_GITHUB_WEBHOOK_SECRET', 'ODD_LINEAR_WEBHOOK_SECRET', 'ODD_IDENTITY']) delete process.env[name];
 
 const sha = 'a'.repeat(40);
 const kiosk = recipes.find(recipe => recipe.name === 'kiosk')!;
@@ -221,8 +222,10 @@ function world(options: {
   failPrView?: boolean;
   /** Components whose endpoint is unreachable until they are installed. */
   unreachable?: string[];
-  /** Comments already on the issues. */
-  comments?: [string, string][];
+  /** Comments already on the issues: issue, body and, when given, the author's Linear user ID. */
+  comments?: [string, string, string?][];
+  /** MET-339: the activated identity; the deployer's own comments are then authored by its `deployer`. */
+  identity?: Identity;
   /** What `install-meter.sh --plan` reports (default an eligible v2 rerun). */
   meterPlan?: { ok: boolean; output: string };
   /** The odd issues Linear lists in Deploying (read live, so a fixture can move an issue between ticks). */
@@ -240,7 +243,7 @@ function world(options: {
   const before: Record<string, string> = {};
   const start = { ...live };
   const calls: string[] = [];
-  const comments: [string, string][] = [...options.comments ?? []];
+  const comments: [string, string, string?][] = [...options.comments ?? []];
   let failComment = options.failComment;
   let lostComment = options.lostComment;
   let failPrView = options.failPrView;
@@ -371,13 +374,14 @@ function world(options: {
       deploying: async identifier => !options.notDeploying?.includes(identifier),
       comment: async (identifier, body) => {
         if (failComment === identifier) { failComment = undefined; throw new Error('Linear 503'); }
-        comments.push([identifier, body]);
+        comments.push(options.identity ? [identifier, body, options.identity.deployer] : [identifier, body]);
         if (lostComment === identifier) { lostComment = undefined; throw new Error('Linear request timed out'); }
       },
       deployingIssues: async () => [...options.deploying ?? []],
       // Creation order is array order.
-      comments: async identifier => comments.flatMap(([issue, body], i) => issue === identifier ? [{ body, createdAt: new Date(Date.parse('2026-10-01T00:00:00.000Z') + i * 1000).toISOString() }] : []),
+      comments: async identifier => comments.flatMap(([issue, body, author], i) => issue === identifier ? [{ body, createdAt: new Date(Date.parse('2026-10-01T00:00:00.000Z') + i * 1000).toISOString(), ...(author ? { author: { id: author } } : {}) }] : []),
     },
+    ...(options.identity ? { identity: options.identity } : {}),
   };
   const cleanup = () => rmSync(stateDir, { recursive: true, force: true });
   return { effects, calls, comments, live, logs, clock, ledger: () => ledger!, stateDir, trustedDir, cleanup, exists: () => ledger !== undefined };
@@ -1998,7 +2002,7 @@ const issueComments = (host: ReturnType<typeof world>, issue: string) => host.co
 const decisions = (host: ReturnType<typeof world>, decision: string) => host.logs.filter(([name]) => name === decision).map(([, details]) => details);
 /** What the control plane does next from the issue's own comments, through the authoritative derivation. */
 const lifecycleOf = async (host: ReturnType<typeof world>, issue: string) =>
-  nextAction(toSnapshot({ issue: { id: issue, status: 'Deploying', labels: ['odd'], comments: await host.effects.linear.comments(issue) } }), idle);
+  nextAction(toSnapshot({ issue: { id: issue, status: 'Deploying', labels: ['odd'], comments: trustedComments(await host.effects.linear.comments(issue), host.effects.identity) } }), idle);
 
 test('sandbox: a recipient not yet Deploying stays pending across later releases and gets exactly one receipt once it is, through a lost response, with no repeated install', async t => {
   const tags: Tag[] = ['v0.2.9', 'v0.3.0'];
@@ -2130,6 +2134,97 @@ test('sandbox: a no-new-release tick routes branch-, body- and edited-subject-ow
   const count = host.comments.length;
   await main(host.effects);
   assert.equal(host.comments.length, count, 'idempotent from the issues\' own comments');
+});
+
+// --- MET-339: authenticated receipts and the deployer's own credential.
+
+/** Synthetic principals: the plane (Devon's Linear user), the ODD Deployer app user, a role (the Amp app) and another human. */
+const plane = '00000000-0000-4000-8000-0000000000aa';
+const deployer = '00000000-0000-4000-8000-0000000000bb';
+const role = '00000000-0000-4000-8000-0000000000cc';
+const human = '00000000-0000-4000-8000-0000000000dd';
+
+test('MET-339 sandbox: once identity enforcement is active, only the deployer\'s receipts and the plane\'s other markers count; legacy plane receipts before activation still do', async t => {
+  // World comment i is created at 2026-10-01T00:00:<i>Z; activation falls between the legacy and the new comments.
+  const identity: Identity = { plane, deployer, since: '2026-10-01T00:00:05.500Z' };
+  const v290 = line(`component=kiosk sha=${shas['v0.2.50']} health=pass rollback=none`);
+  const comments: [string, string, string?][] = [
+    ['MET-331', mergeLine(331, shas['v0.2.50']), plane], // 0
+    ['MET-331', v290, plane], // 1: the host deployer's receipt, written with the plane's key before activation
+    ['MET-331', verifyFail('v0.2.50'), plane], // 2: so a refresh is owed
+    ['MET-332', mergeLine(332, shas['v0.2.50']), plane], // 3
+    ['MET-332', v290, deployer], // 4: the deployer's own receipt, awaiting its verifier
+    ['MET-330', mergeLine(330, shas['v0.2.50']), plane], // 5
+    ['MET-330', kioskAt('v0.3.0'), role], // 6: a role forges the receipt the deployer owes
+    ['MET-333', mergeLine(333, shas['v0.2.50']), plane], // 7
+    ['MET-333', kioskAt('v0.3.0'), plane], // 8: a plane-authored receipt after activation (a hand comment)
+    ['MET-334', mergeLine(334, shas['v0.2.50']), plane], // 9
+    ['MET-334', v290, deployer], // 10
+    ['MET-334', verifyFail('v0.2.50'), human], // 11: a human forges a failed verification
+    ['MET-335', mergeLine(335, shas['v0.2.50']), plane], // 12
+    ['MET-335', `${v290}\n${verifyFail('v0.2.50')}`, deployer], // 13: the deployer may write receipts only
+    ['MET-336', mergeLine(336, shas['v0.2.50'])], // 14: a merge marker without an author
+  ];
+  const issues = ['MET-330', 'MET-331', 'MET-332', 'MET-333', 'MET-334', 'MET-335', 'MET-336'];
+  const host = world({ tags: ['v0.2.9', 'v0.3.0'], changes: {}, deploying: issues, identity, comments,
+    ledger: baseline({ lastTag: 'v0.3.0', deployed: { tag: 'v0.3.0', sha: shas['v0.3.0'], line: kioskAt('v0.3.0') } }),
+    prs: [330, 331, 332, 333, 334, 335, 336].map(pr => merged(pr, shas['v0.2.50'])) });
+  t.after(host.cleanup);
+  const before = host.comments.length;
+  await main(host.effects);
+  const posted = host.comments.slice(before);
+  assert.deepEqual(posted.map(([issue]) => issue).sort(), ['MET-330', 'MET-331', 'MET-333', 'MET-336'],
+    'forged and post-activation plane receipts owe a receipt; a legacy plane receipt with a failed verification is refreshed; the deployer\'s own receipts stand');
+  assert.ok(posted.every(([, body, author]) => body === kioskAt('v0.3.0') && author === deployer), 'every new receipt is the deployer\'s');
+  // MET-336's merge has no author: the PR found by branch and body is the manual-merge fallback, not the unauthenticated receipt.
+  for (const issue of ['MET-330', 'MET-331', 'MET-333', 'MET-336']) assert.deepEqual(await lifecycleOf(host, issue), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify kiosk at 111111111111', round: 1 }, issue);
+  for (const issue of ['MET-332', 'MET-334', 'MET-335']) assert.deepEqual(await lifecycleOf(host, issue), { kind: 'spawn', role: 'verifier', executor: 'orb', reason: 'verify kiosk at cccccccccccc', round: 1 }, issue);
+  const count = host.comments.length;
+  await main(host.effects);
+  assert.equal(host.comments.length, count, 'the deployer\'s receipts are recognised as posted: no repeat');
+
+  // Control: before activation every author counts, so the same forgeries suppress or redirect the receipts (the pre-fix behaviour).
+  const open = world({ tags: ['v0.2.9', 'v0.3.0'], changes: {}, deploying: issues, comments,
+    ledger: baseline({ lastTag: 'v0.3.0', deployed: { tag: 'v0.3.0', sha: shas['v0.3.0'], line: kioskAt('v0.3.0') } }),
+    prs: [330, 331, 332, 333, 334, 335, 336].map(pr => merged(pr, shas['v0.2.50'])) });
+  t.after(open.cleanup);
+  const openBefore = open.comments.length;
+  await main(open.effects);
+  assert.deepEqual(open.comments.slice(openBefore).map(([issue]) => issue).sort(), ['MET-331', 'MET-334', 'MET-335', 'MET-336']);
+});
+
+test('MET-339: the deployer writes with its own client-credentials principal; an active identity refuses the shared key, a malformed credential or another principal, and no error carries a secret', async () => {
+  const identity: Identity = { plane, deployer, since: '2026-10-01T00:00:00.000Z' };
+  const secret = 'synthetic-client-secret-value';
+  const files = (entries: Record<string, string>) => (path: string) => entries[path];
+  const calls: string[] = [];
+  const io = (read: (path: string) => string | undefined, viewer = deployer) => ({
+    read,
+    token: async (id: string, value: string) => { calls.push(`token ${id}`); assert.equal(value, secret); return 'synthetic-access-token'; },
+    viewer: async (authorization: string) => { calls.push(`viewer ${authorization === 'Bearer synthetic-access-token'}`); return viewer; },
+  });
+  const oauth = { [DEPLOYER_OAUTH_FILE]: JSON.stringify({ client_id: 'odd-deployer', client_secret: secret }) };
+  const shared = { [LINEAR_KEY_FILE]: 'lin_api_shared\n' };
+
+  // Before activation: the legacy key until the credential is installed, then the credential (no principal check yet).
+  assert.equal(await deployerAuthorization(undefined, io(files(shared))), 'lin_api_shared');
+  assert.equal(await deployerAuthorization(undefined, io(files({ ...shared, ...oauth }))), 'Bearer synthetic-access-token');
+  await assert.rejects(deployerAuthorization(undefined, io(files({}))), /linear-api-key is absent or empty/);
+  // Active: the credential, proven to be the configured deployer by its own viewer read.
+  calls.length = 0;
+  assert.equal(await deployerAuthorization(identity, io(files({ ...shared, ...oauth }))), 'Bearer synthetic-access-token');
+  assert.deepEqual(calls, ['token odd-deployer', 'viewer true']);
+  const refusals: [string, Promise<string>, RegExp][] = [
+    ['shared key only', deployerAuthorization(identity, io(files(shared))), /Identity enforcement is active but .*odd-deployer-oauth\.json is absent; refusing to write receipts with the shared Linear key/],
+    ['nothing installed', deployerAuthorization(identity, io(files({}))), /is absent; refusing/],
+    ['credential of another principal', deployerAuthorization(identity, io(files(oauth), plane)), new RegExp(`authenticates Linear user ${plane}, not the configured deployer ${deployer}`)],
+    ['unparseable credential', deployerAuthorization(identity, io(files({ [DEPLOYER_OAUTH_FILE]: `{"client_secret":"${secret}"` }))), /is not \{"client_id"/],
+    ['credential without a secret', deployerAuthorization(identity, io(files({ [DEPLOYER_OAUTH_FILE]: JSON.stringify({ client_id: 'odd-deployer', client_secret: '' }) }))), /is not \{"client_id"/],
+    ['token request failure', deployerAuthorization(identity, { ...io(files(oauth)), token: async () => { throw new Error('Linear token 401: invalid_client'); } }), /Linear token 401: invalid_client/],
+  ];
+  for (const [name, attempt, error] of refusals) {
+    await assert.rejects(attempt, (thrown: Error) => { assert.match(thrown.message, error, name); assert.ok(!thrown.message.includes(secret) && !thrown.message.includes('lin_api_shared'), `${name} carries no secret`); return true; });
+  }
 });
 
 test('MET-386 sandbox: a mixed-SHA receipt set keeps meter at its release and kiosk at its own; a partial set waits, and only verification of the complete set reaches Done', async t => {

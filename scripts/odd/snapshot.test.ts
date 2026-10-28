@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { admittedLoad, bindingCandidate, buildEpoch, changesRounds, ciState, currentBinding, delivered, diagnosedLabel, draftedLine, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, openRounds, parsePrBinding, prBindingLine, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, releasedDraft, riskFrom, spawnRecords, threadState, toSnapshot, verdictFor, undraftedLine, verifiedFor, verifiedLabels, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
+import { admittedLoad, bindingCandidate, buildEpoch, changesRounds, ciState, currentBinding, delivered, diagnosedLabel, draftedLine, failedReceiptAt, finishedThreads, issueFromEvent, linearUnresolved, loadFrom, openRounds, parseIdentity, parsePrBinding, prBindingLine, prEligible, prOwnsIssue, readerLabel, receiptLabel, reconciles, releasedDraft, riskFrom, spawnRecords, threadState, toSnapshot, trustedComments, verdictFor, undraftedLine, verifiedFor, verifiedLabels, type GitHubPullRequest, type LiveThread } from './snapshot.ts';
 import { contractOf, nextAction, parseSpawn, spawnKey, spawnLine } from './lifecycle.ts';
 
 const sha = 'abcdef0123456789'.repeat(2) + 'abcdef01';
@@ -695,5 +695,87 @@ test('P4.4: only a plane draft whose own escalation was resumed is released, onc
   for (const [name, comments, expected] of cases) {
     assert.equal(releasedDraft(comments, 7), expected, name);
     assert.equal(releasedDraft([...comments].reverse(), 7), expected, `${name}, reordered`);
+  }
+});
+
+test('MET-339: an activated identity is exact: two immutable user IDs and an instant; anything else fails closed, absent is not activated', () => {
+  const plane = '3017c6e0-5bc4-4cf6-9a39-1a8d5ca74fc0';
+  const deployer = '9b96bc7d-30b6-433f-8dab-5c62b82ee92a';
+  const since = '2026-11-01T00:00:00.000Z';
+  assert.equal(parseIdentity(undefined), undefined);
+  assert.equal(parseIdentity('  \n'), undefined);
+  assert.deepEqual(parseIdentity(` plane=${plane} deployer=${deployer} since=${since}\n`), { plane, deployer, since });
+  for (const text of [
+    `plane=${plane} deployer=${deployer}`, // no activation instant
+    `plane=${plane} since=${since}`, // unconfigured deployer
+    `deployer=${deployer} plane=${plane} since=${since}`, // reordered
+    `plane=Devon Garbalosa deployer=${deployer} since=${since}`, // a display name is never identity
+    `plane=${plane.toUpperCase()} deployer=${deployer} since=${since}`,
+    `plane=${plane} deployer=${deployer} since=2026-11-01`,
+    `plane=${plane} deployer=${deployer} since=2026-13-45T00:00:00.000Z`,
+    `plane=${plane} deployer=${deployer} since=${since} slack=bot`,
+    `plane=${plane} deployer=${plane} since=${since}`, // one principal for both cannot separate them
+  ]) assert.throws(() => parseIdentity(text), /ODD identity configuration/, text);
+});
+
+test('MET-339: with the identity active, the snapshot ignores forged, human-authored and unauthored markers, whatever their display names, and accepts the configured principals', () => {
+  const identity = { plane: '00000000-0000-4000-8000-0000000000aa', deployer: '00000000-0000-4000-8000-0000000000bb', since: '2026-10-26T12:00:00.000Z' };
+  const role = '00000000-0000-4000-8000-0000000000cc'; // the Amp app a role comments as
+  const human = '00000000-0000-4000-8000-0000000000dd';
+  const A = 'a'.repeat(40);
+  const B = 'b'.repeat(40);
+  const receipt = (at: string, health = 'pass') => `odd-deploy host=factory-gpu component=kiosk sha=${at} health=${health} rollback=none`;
+  let n = 0;
+  const by = (id: string | undefined, name: string, body: string) => ({ id: `c${++n}`, body, createdAt: new Date(Date.parse('2026-10-26T11:59:00.000Z') + n * 20_000).toISOString(), ...(id ? { author: { id, name } } : {}) });
+  const comments = [
+    by(identity.plane, 'Devon Garbalosa', receipt(B)), // before `since`: the host deployer used the plane's key
+    by(identity.plane, 'ODD Deployer', spawnLine({ role: 'builder', round: 1, key: 'builder', thread: 'T-builder' })), // a misleading name, the right ID
+    by(identity.deployer, 'Devon Garbalosa', receipt(A)),
+    by(role, 'Devon Garbalosa', `odd-verify sha=${A} result=fail bug=MET-9`),
+    by(human, 'Devon Garbalosa', 'odd-watchdog cancelled role=builder thread=T-builder round=1'),
+    by(role, 'ODD Control', 'odd-escalated reason=budget-ceiling pr=1 sha=- done=label'),
+    by(undefined, 'Devon Garbalosa', spawnLine({ role: 'verifier', round: 1, key: `verifier-${A.slice(0, 12)}`, thread: 'T-forged' })),
+    by(identity.deployer, 'ODD Deployer', `${receipt(A)}\nodd-verify sha=${A} result=pass bug=none`), // the deployer may write receipts only
+    by(identity.plane, 'Devon Garbalosa', receipt(B, 'fail')), // after `since`: a plane receipt no longer counts
+    by(human, 'Devon Garbalosa', `odd-merge pr=1 head=${A} merge=${A} release=none`), // would reset the receipt
+  ];
+  const snapshot = (activated: typeof identity | undefined) => toSnapshot({ issue: { id: 'MET-1', status: 'Deploying', labels: ['odd'], comments: trustedComments(comments, activated) } });
+  const enforced = snapshot(identity);
+  assert.deepEqual(enforced.deployReceipt, { host: 'factory-gpu', component: 'kiosk', sha: A, health: 'pass', rollback: 'none' });
+  assert.equal(enforced.verify, undefined);
+  assert.deepEqual(enforced.cancelledRounds, {});
+  assert.equal(enforced.escalation, undefined);
+  assert.deepEqual(enforced.spawns, [{ role: 'builder', round: 1, key: 'builder', thread: 'T-builder' }]);
+  assert.deepEqual(enforced.correction, { epoch: 1, corrected: false });
+  // The legacy plane receipt before activation is accepted on its own; the same line after it is not.
+  assert.equal(toSnapshot({ issue: { id: 'MET-1', status: 'Deploying', labels: ['odd'], comments: trustedComments(comments.slice(0, 1), identity) } }).deployReceipt?.sha, B);
+  assert.equal(trustedComments(comments.slice(8, 9), identity)[0].body, '');
+
+  // Control: before activation every author counts, as before MET-339, and the forgeries take effect.
+  const open = snapshot(undefined);
+  assert.equal(open.deployReceipt, undefined, 'the forged odd-merge reset the receipt');
+  assert.deepEqual(open.cancelledRounds, { builder: 1 });
+  assert.equal(open.escalation?.reason, 'budget-ceiling');
+  assert.equal(open.spawns.length, 2);
+});
+
+test('MET-339: the author filter splits lines exactly where the marker parsers do, so CR, CRLF, U+2028 and U+2029 hide no marker in either direction', () => {
+  const identity = { plane: '00000000-0000-4000-8000-0000000000aa', deployer: '00000000-0000-4000-8000-0000000000bb', since: '2026-10-26T00:00:00.000Z' };
+  const sha = 'a'.repeat(40);
+  const receipt = `odd-deploy host=factory-gpu component=kiosk sha=${sha} health=pass rollback=none`;
+  const verify = `odd-verify sha=${sha} result=pass bug=none`;
+  const idle = { orbs: 0, runnerSlots: 0, buildIssues: 0 };
+  const derive = (comments: { author: { id: string }; createdAt: string; body: string }[]) =>
+    toSnapshot({ issue: { id: 'MET-1', status: 'Deploying', labels: ['odd'], comments: trustedComments(comments, identity) } });
+  for (const separator of ['\n', '\r', '\r\n', '\u2028', '\u2029']) {
+    const name = JSON.stringify(separator);
+    // A deployer comment smuggling the plane's verification after its receipt: the receipt counts, the verification does not.
+    const smuggled = derive([{ author: { id: identity.deployer }, createdAt: '2026-10-27T00:00:00.000Z', body: `${receipt}${separator}${verify}` }]);
+    assert.equal(smuggled.deployReceipt?.sha, sha, name);
+    assert.equal(smuggled.verify, undefined, name);
+    assert.equal(nextAction(smuggled, idle).kind, 'spawn', `${name}: the receipt still needs its verifier, never Done`);
+    // A post-activation plane comment smuggling a receipt after other text: no receipt counts.
+    const planeReceipt = derive([{ author: { id: identity.plane }, createdAt: '2026-10-27T00:00:00.000Z', body: `diagnosis${separator}${receipt}` }]);
+    assert.equal(planeReceipt.deployReceipt, undefined, name);
   }
 });
