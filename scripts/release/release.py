@@ -620,6 +620,11 @@ def package(root, output, plan):
             identities[component] = {k: v for k, v in json.load(response).items() if k in IDENTITY_FIELDS}
         expected = subprocess.check_output(["bash", "scripts/build-fingerprint.sh", component], cwd=root, text=True).strip()
         require(identities[component]["inputs_fingerprint"] == expected, "binary inputs fingerprint mismatch")
+        require(identities[component]["status"] == "ok", f"{component} health is not ok")
+    # The API's meter hash is a live probe; freeze it only once it equals the source-built contract.
+    meter_contract = identities["factory-api"]["meter_openapi_expected"]
+    require(identities["factory-api"]["meter_openapi_sha256"] == meter_contract == identities["meter"]["openapi_sha256"],
+            "observed meter contract does not match the built contract")
     identities["kiosk"] = json.loads(subprocess.check_output(
         ["node", "--input-type=module", "-e",
          'import {buildInfo} from "./kiosk/scripts/build-info.ts"; console.log(JSON.stringify(buildInfo()))'], cwd=root))

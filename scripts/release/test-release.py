@@ -1591,6 +1591,33 @@ class ReproducibleManifest(unittest.TestCase):
                     self.assertEqual((api.writes, api.uploaded), (writes, []))
                     self.assertTrue(api.releases[0]["draft"])
 
+    def test_transient_health_observation_is_refused_before_any_upload_then_healthy_build_publishes(self):
+        def unavailable(h): h["factory-api"]["meter_openapi_sha256"] = None
+        def unsynchronized(h): h["factory-api"]["status"] = "clock_unsynchronized"
+        def meter_unhealthy(h): h["meter"]["status"] = "degraded"
+        def stale_meter(h): h["meter"]["openapi_sha256"] = h["factory-api"]["meter_openapi_sha256"] = "ba9876543210"
+        out = Path(self.temp.name)
+        for name, transient in (("unavailable", unavailable), ("unsynchronized", unsynchronized),
+                                ("meter_unhealthy", meter_unhealthy), ("stale_meter", stale_meter)):
+            with self.subTest(case=name):
+                health = self.health(601)
+                transient(health)
+                with self.assertRaisesRegex(ValueError, "health is not ok|observed meter contract"):
+                    self.package(plan(self.sha), out / name / "direct", health)
+                self.assertFalse((out / name / "direct/manifest.json").exists())
+                api = FakeGitHub()
+                with self.assertRaisesRegex(ValueError, "health is not ok|observed meter contract"):
+                    r.publish_one(api, plan(self.sha), INVENTORY, out / name / "first",
+                                  lambda p, d: self.package(p, d, health))
+                self.assertEqual(api.uploaded, [])
+                self.assertEqual(api.releases, [])
+                # The tag is reserved, so recovery creates the draft from the healthy rebuild.
+                api.create_reserved_releases.add("v0.2.1")
+                self.assertEqual(r.publish_one(api, plan(self.sha), INVENTORY, out / name / "healthy",
+                                               lambda p, d: self.package(p, d, self.health(617))), "complete")
+                self.assertEqual(json.loads((out / name / "healthy/manifest.json").read_bytes())["build_identity"]
+                                 ["factory-api"]["meter_openapi_sha256"], "0123456789ab")
+
 
 class RunnerProvisioning(unittest.TestCase):
     def test_historical_sandbox_gets_system_bubblewrap_before_build(self):
