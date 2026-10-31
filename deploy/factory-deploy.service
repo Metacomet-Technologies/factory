@@ -12,7 +12,9 @@ WorkingDirectory=/home/agent/work
 Environment=HOME=/home/agent
 Environment="PATH=@PATH@"
 ExecStartPre=/usr/bin/mkdir -p /home/agent/.local/state/factory-odd
-ExecStart=/usr/bin/flock -n /home/agent/.local/state/factory-odd/deploy.lock @NODE@ /home/agent/factory-tools/current/scripts/odd/deploy.ts
+# The Vite+ node shim takes Node from the promoted tools tree's .node-version, never its global
+# default (MET-411); /home/agent/work carries no pin and stays the cwd the spawned CLIs expect.
+ExecStart=/usr/bin/flock -n /home/agent/.local/state/factory-odd/deploy.lock /bin/sh -ec 'VP_NODE_VERSION=$$(cat /home/agent/factory-tools/current/.node-version); export VP_NODE_VERSION; exec @NODE@ /home/agent/factory-tools/current/scripts/odd/deploy.ts'
 # sudo through the allowlist needs new privileges.
 NoNewPrivileges=false
 Nice=10

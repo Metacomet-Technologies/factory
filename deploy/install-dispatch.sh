@@ -42,7 +42,7 @@ fi
 [[ $(stat -c '%U:%G %a' "$key") == 'root:agent 640' ]] || fail 'Require root:agent 0640: sudo chown root:agent /etc/factory-dispatch/linear-api-key; sudo chmod 0640 /etc/factory-dispatch/linear-api-key.'
 sudo -u agent test -r "$key"
 [[ -s "$key" ]] || fail 'The existing Linear key file is empty.'
-for file in scripts/dispatch/dispatch.ts scripts/dispatch/dispatch.lock scripts/dispatch/.node-version deploy/factory-dispatch.service deploy/factory-dispatch.timer; do
+for file in .node-version scripts/dispatch/dispatch.ts scripts/dispatch/dispatch.lock scripts/dispatch/.node-version deploy/factory-dispatch.service deploy/factory-dispatch.timer; do
     [[ -f "$root/$file" && ! -L "$root/$file" ]] || fail "Missing/unsafe artifact: $file"
 done
 for unit in factory-dispatch.service factory-dispatch.timer; do
@@ -102,7 +102,9 @@ LOOKUP
 )
 [[ "$node" =~ ^/[a-zA-Z0-9_./-]+$ && "$amp" =~ ^/[a-zA-Z0-9_./-]+$ ]] || fail 'Node and Amp must resolve to absolute executable paths without spaces.'
 path="$(dirname "$node"):$(dirname "$amp"):/usr/local/bin:/usr/bin:/bin"
-as_agent() { sudo -u agent env -i HOME=/home/agent USER=agent PATH="$path" "$@"; }
+# Pin the Vite+ shim as the units do (MET-411); the global default may be unset or newer.
+pin=$(<"$root/.node-version")
+as_agent() { sudo -u agent env -i HOME=/home/agent USER=agent PATH="$path" VP_NODE_VERSION="$pin" "$@"; }
 supported_node() { [[ $1 =~ ^v?24\.([0-9]+)\.([0-9]+)$ && ${BASH_REMATCH[1]} -ge 12 ]]; }
 node_version=$(as_agent "$node" --version)
 supported_node "$node_version" || fail "Use Node 24.x (>= 24.12.0); found $node_version"

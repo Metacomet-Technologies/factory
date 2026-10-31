@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { createHash, createHmac } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { CHECK_TIMEOUT_MS, DEPLOYER_OAUTH_FILE, LINEAR_KEY_FILE, ROOT, toolChecks, bootstrap, deployerAuthorization, deployComponent, emptyLedger, issuesFromSubjects, liveEffects, main, parseSnapshot, pendingTags, plan, probeResult, promoteTools, receiptLine, recipes, reconcileManual, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
+import { CHECK_TIMEOUT_MS, DEPLOYER_OAUTH_FILE, LINEAR_KEY_FILE, ROOT, toolChecks, bootstrap, deployerAuthorization, deployComponent, emptyLedger, issuesFromSubjects, liveEffects, main, parseSnapshot, pendingTags, plan, probeResult, promoteTools, receiptLine, recipes, reconcileManual, requireSupportedNode, restoredResult, resume, type Effects, type Ledger } from './deploy.ts';
 import { nextAction, parseDeployReceipt, type Action } from './lifecycle.ts';
 import { toSnapshot, trustedComments, type Identity } from './snapshot.ts';
 import plugin, { diagnose, page, setStatus } from '../../.amp/plugins/factory-odd.ts';
@@ -751,7 +751,7 @@ function installerHost(t: { after: (fn: () => void) => void }) {
   const bin = join(temp, 'bin');
   const units = join(temp, 'etc/systemd/system');
   for (const path of [bin, units, join(temp, 'etc/factory-dispatch'), join(temp, 'home/agent/.local/state/factory-odd'), join(root, 'deploy'), join(root, 'scripts/odd'), join(root, 'scripts/release')]) mkdirSync(path, { recursive: true });
-  const paths = ['scripts/odd/deploy.ts', 'scripts/odd/lifecycle.ts', 'scripts/release/release.py', 'deploy/components.json',
+  const paths = ['.node-version', 'scripts/odd/deploy.ts', 'scripts/odd/lifecycle.ts', 'scripts/release/release.py', 'deploy/components.json',
     'deploy/factory-deploy.service', 'deploy/factory-deploy.timer', 'deploy/install-deploy.sh', 'deploy/rollback-deploy.sh',
     ...new Set(recipes.flatMap(recipe => [recipe.installer, recipe.rollback])), 'deploy/rollback-kiosk.sh', 'deploy/install-usage.sh', 'deploy/rollback-usage.sh'];
   for (const path of paths) {
@@ -849,7 +849,7 @@ test('install-only persistently disables an enabled-but-stopped timer; normal in
   assert.equal(readFileSync(ledgerPath, 'utf8'), ledger);
   const normal = run('install-deploy.sh');
   assert.equal(normal.status, 0, normal.stdout + normal.stderr);
-  assert.match(readFileSync(join(units, 'factory-deploy.service'), 'utf8'), new RegExp(`^ExecStart=.* ${temp}/home/agent/factory-tools/current/scripts/odd/deploy\\.ts$`, 'm'));
+  assert.match(readFileSync(join(units, 'factory-deploy.service'), 'utf8'), new RegExp(`^ExecStart=.* ${temp}/home/agent/factory-tools/current/scripts/odd/deploy\\.ts'$`, 'm'));
   assert.equal(existsSync(join(temp, 'service-started')), true);
   assert.equal(readFileSync(join(temp, 'enabled'), 'utf8'), 'enabled\n');
   assert.equal(readFileSync(join(temp, 'active'), 'utf8'), 'active\n');
@@ -892,6 +892,51 @@ test('install-only persistently disables an enabled-but-stopped timer; normal in
   assert.deepEqual(readdirSync(dirname(ledgerPath)), [], 'install-only never initializes the ledger');
 });
 
+test('deploy.ts refuses a Node major outside the pin with the dispatcher message', () => {
+  for (const version of ['24.12.0', '24.22.1']) assert.doesNotThrow(() => requireSupportedNode(version));
+  for (const version of ['26.13.0', '25.0.0', '23.99.0', '22.18.0', '24.11.9', 'v24.22.1']) {
+    assert.throws(() => requireSupportedNode(version), { message: `Use Node 24.x (>= 24.12.0); found ${version}` });
+  }
+});
+
+test('each unit gives the node shim the promoted tools tree .node-version at every start and never runs node without it', t => {
+  const temp = mkdtempSync(join(tmpdir(), 'odd-pin-'));
+  t.after(() => rmSync(temp, { recursive: true, force: true }));
+  const tools = join(temp, 'home/agent/factory-tools');
+  const current = join(tools, 'current');
+  mkdirSync(join(temp, 'home/agent/.local/state/factory-odd'), { recursive: true });
+  for (const [version, pin] of [['v9.9.8', '24.12.0'], ['v9.9.9', '24.22.1']]) {
+    mkdirSync(join(tools, version), { recursive: true });
+    writeFileSync(join(tools, version, '.node-version'), `${pin}\n`);
+  }
+  mkdirSync(join(tools, 'v9.9.7'));
+  const node = join(temp, 'node');
+  writeFileSync(node, '#!/bin/sh\necho "VP_NODE_VERSION=${VP_NODE_VERSION-unset} $*"\n', { mode: 0o755 });
+  // systemd unescapes $$ to $; the rest of each ExecStart is shell syntax. No pin in the inherited environment.
+  const start = (unit: string) => spawnSync('/bin/sh', ['-c', /^ExecStart=(.*)$/m.exec(readFileSync(new URL(`../../deploy/${unit}`, import.meta.url), 'utf8'))![1]
+    .replaceAll('$$', '$').replaceAll('/home/agent/', `${temp}/home/agent/`).replace('@NODE@', node)], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+  const units = { 'factory-dispatch.service': 'dispatch/dispatch.ts poll', 'factory-usage.service': 'usage/collect.ts', 'factory-deploy.service': 'odd/deploy.ts' };
+  for (const [version, pin] of [['v9.9.9', '24.22.1'], ['v9.9.8', '24.12.0']]) {
+    rmSync(current, { force: true });
+    symlinkSync(version, current);
+    for (const [unit, script] of Object.entries(units)) {
+      const result = start(unit);
+      assert.equal(result.status, 0, unit + result.stderr);
+      assert.equal(result.stdout, `VP_NODE_VERSION=${pin} ${current}/scripts/${script}\n`, unit);
+    }
+  }
+  // A tree without a pin, or no tools link at all, fails before node starts.
+  for (const target of ['v9.9.7', undefined]) {
+    rmSync(current, { force: true });
+    if (target) symlinkSync(target, current);
+    for (const unit of Object.keys(units)) {
+      const result = start(unit);
+      assert.notEqual(result.status, 0, unit);
+      assert.equal(result.stdout, '', unit);
+    }
+  }
+});
+
 test('tools cutover repoints only the three ExecStart paths to one tools link, preserving settings and trigger states; refusals change nothing; revert restores the snapshot', t => {
   const { temp, units, ledgerPath, ledger, run } = installerHost(t);
   const state = join(temp, 'unit-state');
@@ -901,7 +946,7 @@ test('tools cutover repoints only the three ExecStart paths to one tools link, p
   // Installed units as install-deploy/-dispatch/-usage rendered them before the cutover, plus a local setting.
   const old: Record<string, string> = {};
   for (const unit of ['factory-deploy.service', 'factory-dispatch.service', 'factory-usage.service']) {
-    old[unit] = readFileSync(new URL(`../../deploy/${unit}`, import.meta.url), 'utf8').replaceAll('/home/agent/', `${temp}/home/agent/`)
+    old[unit] = readFileSync(new URL(`../../deploy/${unit}`, import.meta.url), 'utf8').replace(/\/bin\/sh -ec '.*exec (@NODE@ [^']+)'$/m, '$1').replaceAll('/home/agent/', `${temp}/home/agent/`)
       .replaceAll(link, work).replace('@NODE@', '/opt/node/bin/node').replace('@PATH@', '/opt/node/bin:/usr/bin:/bin')
       .replace('[Service]\n', '[Service]\nEnvironment="DISPATCH_RUNNER_CAPS=gpu=3"\n');
     writeFileSync(join(units, unit), old[unit]);
@@ -972,7 +1017,7 @@ test('tools cutover repoints only the three ExecStart paths to one tools link, p
   assert.deepEqual(triggerStates(), triggers);
   assert.equal(readFileSync(ledgerPath, 'utf8'), ledger);
   // The repository templates the installers render all execute the same link.
-  for (const unit of Object.keys(old)) assert.match(readFileSync(new URL(`../../deploy/${unit}`, import.meta.url), 'utf8'), /^ExecStart=.*@NODE@ \/home\/agent\/factory-tools\/current\/scripts\/(odd\/deploy|dispatch\/dispatch|usage\/collect)\.ts( poll)?$/m);
+  for (const unit of Object.keys(old)) assert.match(readFileSync(new URL(`../../deploy/${unit}`, import.meta.url), 'utf8'), /^ExecStart=.*@NODE@ \/home\/agent\/factory-tools\/current\/scripts\/(odd\/deploy|dispatch\/dispatch|usage\/collect)\.ts( poll)?'$/m);
 });
 
 test('real Git: releases predating the deployer cannot remove its runtime or tools, including the tick after a failed install', async t => {

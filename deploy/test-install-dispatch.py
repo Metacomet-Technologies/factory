@@ -42,7 +42,7 @@ def run(dropin=None, *, service_dropins=None, timer_dropins="", mode=0o644, owne
     temp = Path(tempfile.mkdtemp(prefix="install-dispatch-"))
     work = temp / "home/agent/work"
     checkout = work / "factory"
-    for relative in ("deploy/factory-dispatch.service", "deploy/factory-dispatch.timer",
+    for relative in (".node-version", "deploy/factory-dispatch.service", "deploy/factory-dispatch.timer",
                      "scripts/dispatch/dispatch.lock", "scripts/dispatch/.node-version"):
         (checkout / relative).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(REPO / relative, checkout / relative)

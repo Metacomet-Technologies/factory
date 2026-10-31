@@ -838,6 +838,14 @@ export async function main(effects: Effects): Promise<void> {
   await reconcile(effects);
 }
 
+/** The units pin Node through the tools tree's .node-version (MET-411); refuse any other runtime
+ * with the dispatcher's and usage collector's rule and message. Kept local, as in the collector:
+ * importing the dispatcher would let a broken dispatcher fail the deployer's own self-check. */
+export function requireSupportedNode(version = process.versions.node) {
+  const match = version.match(/^24\.(\d+)\.(\d+)$/);
+  if (match === null || Number(match[1]) < 12) throw new Error(`Use Node 24.x (>= 24.12.0); found ${version}`);
+}
+
 /** Side-effect-free check of the tree this module was loaded from (realpath, so a `current`
  * link resolves to its version): imports, inventory and planning only. No ledger, lock, Git,
  * network, sudo or write. */
@@ -1080,6 +1088,7 @@ export function liveEffects(): Effects {
 if (process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(process.argv[1])) {
   const args = process.argv.slice(2);
   const run = async () => {
+    requireSupportedNode();
     if (args.length === 1 && args[0] === '--self-check') return console.log(JSON.stringify(selfCheck()));
     const effects = liveEffects();
     if (!args.length) return main(effects);

@@ -581,6 +581,34 @@ Not deployed by the job: dispatcher, usage (until it has a rollback that
 restores the previous timer; `rollback-usage.sh` removes the units), pricing,
 ups-control, alerts, backup, reboot, nut, devices-agent. Those stay with Devon.
 
+Node runtime (MET-411). The `factory-deploy`, `factory-dispatch` and
+`factory-usage` units run `node` through the agent's Vite+ shim
+(`/home/agent/.local/share/vite-plus/bin/node`, rendered as `@NODE@`). Their
+`WorkingDirectory=/home/agent/work` carries no `.node-version`, so the shim on its
+own would use `vp env default` or, when no default is set, the latest LTS. A new LTS
+(Node 26, 2026-10-28) then stopped dispatch and usage for about 11 hours. Each
+`ExecStart` therefore reads the repository pin from the promoted tools tree at
+every start and passes it to the shim:
+`VP_NODE_VERSION=$(cat /home/agent/factory-tools/current/.node-version)`. The
+shim downloads that version if it is not installed yet. A missing link or pin
+fails the start before Node runs. The global default no longer matters, and the
+cwd the spawned CLIs see is unchanged. The installers check Node the same way,
+using the `.node-version` of the checkout they run from. All three scripts
+refuse a runtime outside Node 24.x (>= 24.12.0) with
+`Use Node 24.x (>= 24.12.0); found <version>`.
+
+To change the pin, edit the root `.node-version` in a PR. Keep the per-tool
+copies in `scripts/dispatch/.node-version` and `scripts/usage/.node-version` (CI
+reads the dispatch copy) equal to it. For a new major, also change the 24.x rule
+in `dispatch.ts`, `collect.ts`, `deploy.ts` and the installers. Once a release
+carrying the new pin is promoted to `~/factory-tools/current`, the next run of
+each unit uses it, with no reinstall. Installing these unit files is a Devon
+step from the Mac. Run `install-deploy.sh` (or `--install-only`), then
+`install-dispatch.sh` and `install-usage.sh`, as documented for each. The units
+installed before MET-411 keep resolving through the global default until then.
+Keep `vp env default 24.22.1` (applied 2026-10-29) as the stopgap until the
+reinstall.
+
 One-time install from the Mac, after the merge is on main and the host
 checkout is at or past it (the script refuses any other root path or host):
 

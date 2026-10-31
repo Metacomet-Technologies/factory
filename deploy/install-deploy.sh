@@ -34,7 +34,7 @@ safe_path() {
         path=$(dirname "$path")
     done
 }
-for file in scripts/odd/deploy.ts scripts/odd/lifecycle.ts scripts/release/release.py deploy/components.json deploy/factory-deploy.service deploy/factory-deploy.timer deploy/install-deploy.sh deploy/rollback-deploy.sh \
+for file in .node-version scripts/odd/deploy.ts scripts/odd/lifecycle.ts scripts/release/release.py deploy/components.json deploy/factory-deploy.service deploy/factory-deploy.timer deploy/install-deploy.sh deploy/rollback-deploy.sh \
     deploy/install-meter.sh deploy/rollback-meter-v1.sh deploy/install-factory-api.sh deploy/rollback-factory-api.sh deploy/install-kiosk.sh deploy/rollback-kiosk.sh deploy/install-usage.sh deploy/rollback-usage.sh; do
     safe_path "$root/$file"
     [[ -f "$root/$file" ]] || fail "Missing artifact: $file"
@@ -71,7 +71,9 @@ LOOKUP
     path="$(dirname "$executable"):$path"
     if [[ "$command" == node ]]; then node=$executable; fi
 done
-as_agent() { sudo -u agent env -i HOME=/home/agent USER=agent PATH="$path" "$@"; }
+# Pin the Vite+ shim as the units do (MET-411); the global default may be unset or newer.
+pin=$(<"$root/.node-version")
+as_agent() { sudo -u agent env -i HOME=/home/agent USER=agent PATH="$path" VP_NODE_VERSION="$pin" "$@"; }
 node_version=$(as_agent "$node" --version)
 [[ $node_version =~ ^v?24\.([0-9]+)\.([0-9]+)$ && ${BASH_REMATCH[1]} -ge 12 ]] || fail "Use Node 24.x (>= 24.12.0); found $node_version"
 as_agent gh auth status >/dev/null 2>&1 || fail 'agent is not logged in to GitHub (gh auth status).'
