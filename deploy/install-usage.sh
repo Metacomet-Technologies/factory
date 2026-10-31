@@ -25,7 +25,7 @@ safe_path() {
         path=$(dirname "$path")
     done
 }
-for file in scripts/usage/collect.ts scripts/usage/parsers.ts scripts/usage/.node-version scripts/usage/collect.lock deploy/install-usage.sh deploy/rollback-usage.sh deploy/factory-usage.service deploy/factory-usage.timer deploy/factory-usage-refresh.path; do
+for file in .node-version scripts/usage/collect.ts scripts/usage/parsers.ts scripts/usage/.node-version scripts/usage/collect.lock deploy/install-usage.sh deploy/rollback-usage.sh deploy/factory-usage.service deploy/factory-usage.timer deploy/factory-usage-refresh.path; do
     safe_path "$root/$file"
     [[ -f "$root/$file" ]] || fail "Missing artifact: $file"
     sudo -u agent test -r "$root/$file"
@@ -65,7 +65,9 @@ LOOKUP
     path="$(dirname "$executable"):$path"
     if [[ "$command" == node ]]; then node=$executable; fi
 done
-as_agent() { sudo -u agent env -i HOME=/home/agent USER=agent PATH="$path" "$@"; }
+# Pin the Vite+ shim as the units do (MET-411); the global default may be unset or newer.
+pin=$(<"$root/.node-version")
+as_agent() { sudo -u agent env -i HOME=/home/agent USER=agent PATH="$path" VP_NODE_VERSION="$pin" "$@"; }
 supported_node() { [[ $1 =~ ^v?24\.([0-9]+)\.([0-9]+)$ && ${BASH_REMATCH[1]} -ge 12 ]]; }
 node_version=$(as_agent "$node" --version)
 supported_node "$node_version" || fail "Use Node 24.x (>= 24.12.0); found $node_version"

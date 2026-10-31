@@ -12,7 +12,9 @@ Environment=HOME=/home/agent
 Environment="PATH=@PATH@"
 Environment="DISPATCH_RUNNERS=gpu=factory-gpu,console=factory-console"
 Environment="DISPATCH_LEDGER=/home/agent/.local/state/factory-dispatch/dispatch.db"
-ExecStart=@NODE@ /home/agent/factory-tools/current/scripts/dispatch/dispatch.ts poll
+# The Vite+ node shim takes Node from the promoted tools tree's .node-version, never its global
+# default (MET-411); /home/agent/work carries no pin and stays the cwd the spawned CLIs expect.
+ExecStart=/bin/sh -ec 'VP_NODE_VERSION=$$(cat /home/agent/factory-tools/current/.node-version); export VP_NODE_VERSION; exec @NODE@ /home/agent/factory-tools/current/scripts/dispatch/dispatch.ts poll'
 NoNewPrivileges=true
 TimeoutStartSec=1h
 UMask=0077
