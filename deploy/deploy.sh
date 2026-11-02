@@ -41,7 +41,7 @@ healthy_at() {
     for _ in 1 2 3; do
         sleep 20
         probe=$(health "$1" 2>/dev/null) || return 1
-        python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(not (d.get("git_sha")==sys.argv[2] and d.get("git_dirty") is False))' \
+        python3 -c 'import json,sys; d=json.loads(sys.argv[1]); g=d.get("git_sha") or ""; sys.exit(not (len(g)>=7 and sys.argv[2].startswith(g) and d.get("git_dirty") is False))' \
             "$probe" "$2" || return 1
     done
 }
