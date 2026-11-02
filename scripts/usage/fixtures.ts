@@ -194,3 +194,15 @@ export async function fixtureRun(program: string, args: string[]) {
   if (program === 'opencode') return opencodeStats;
   throw new Error('Unexpected probe');
 }
+// 2026-11-02 capture: an explanatory section now follows the balances; identity redacted.
+export const ampCharged = `Signed in as redacted@example.invalid (redacted)
+**Amp Gigawatt Tier:** agent usage $0 of $200 remaining (0%), orb usage 879.1h of 1,000h a1.xxlarge orb hours remaining (88%) - period 2026-10-10 to 2026-11-10, resets upon renewal in 7 days
+**Workspace metacomet:** $2.50 remaining (set up auto-reload to avoid running out) - https://ampcode.com/workspaces/metacomet
+
+## How Usage Is Charged
+
+- Models served by Amp: the token list price.
+- Self-hosted orbs: free.
+
+# Run \`amp usage --details\` for more detailed information.
+`;

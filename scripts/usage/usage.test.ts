@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { collect, command, readPrevious, writeSnapshot, CLAUDE_ARGS, supportedNode } from './collect.ts';
 import { age, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, parseCursor, parseKimi, parseOpencode, parseOpencodeV2, STALE_MS } from './parsers.ts';
-import { amp, ampAutoReload, ampNew, details, detailsAutoReload, detailsNew, claude, codex, cursorAbout, cursorLoggedOut, kimiLive, kimiLoggedOut, kimiUsage, opencodeStats, opencodeV2ShareCard, opencodeV2Stats, opencodeV2Zero, fixtureRun, versions } from './fixtures.ts';
+import { amp, ampAutoReload, ampCharged, ampNew, details, detailsAutoReload, detailsNew, claude, codex, cursorAbout, cursorLoggedOut, kimiLive, kimiLoggedOut, kimiUsage, opencodeStats, opencodeV2ShareCard, opencodeV2Stats, opencodeV2Zero, fixtureRun, versions } from './fixtures.ts';
 const now = 1791800000000;
 
 test('supported Node versions require Node 24.12.0 or newer', () => {
@@ -60,6 +60,11 @@ test('Amp plain summaries preserve workspace balance without identity or invente
     assert.deepEqual(parseAmp(text), parseAmp(ampNew));
   }
   assert.equal(parseAmp(ampNew.replace('$0 remaining', '$12.34 remaining')).balances[2].amount, '12.34');
+  const charged = parseAmp(ampCharged);
+  assert.deepEqual(charged.balances.map(b => [b.label ?? b.unit, b.amount]), [['usd', '0'], ['orb_hours', '879.1'], ['workspace metacomet', '2.50']]);
+  assert.equal(charged.windows[0].used_percent, 100);
+  // Only a `## ` section may follow the blank line; a stray balance-like line after it is still refused.
+  assert.throws(() => parseAmp(ampCharged.replace('## How Usage Is Charged', 'Workspace x: $1 remaining')), { message: 'format changed' });
   const bounded = ampNew + Array.from({ length: 5 }, (_, i) => `Workspace test-${i}: $1 remaining - https://ampcode.com/workspaces/test-${i}\n`).join('');
   assert.equal(parseAmp(bounded).balances.length, 8);
   for (const text of [

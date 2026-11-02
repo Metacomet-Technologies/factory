@@ -40,6 +40,10 @@ export function parseAmp(text: string): Reading {
   if (lines.at(-1) === '# Run `amp usage --details` for more detailed information.') {
     lines.pop(); check(lines.pop() === '');
   }
+  // Balances end at the first blank line. After it the CLI may add explanatory
+  // `## ` sections (2026-11: "How Usage Is Charged"); they are never read.
+  const blank = lines.indexOf('');
+  if (blank >= 0) { check(lines[blank + 1]?.startsWith('## ')); lines.length = blank; }
   const match = lines.shift()?.replace(/^\*\*Amp Gigawatt Tier:\*\*/, 'Amp Gigawatt Tier:').match(summary); check(match);
   const [, plan, remaining, total, remainingPercent, hours, hoursTotal, hoursPercent, start, end] = match;
   const resets = iso(`${end}T00:00:00Z`);
