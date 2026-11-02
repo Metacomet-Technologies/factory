@@ -850,6 +850,15 @@ impl Engine {
                 }
             }
         }
+        // Every key starts with its source; one from a retired source (such as the removed
+        // dispatch timer) has no owner left to clear it, so it resolves here.
+        let (retired, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.stored.active)
+            .into_iter()
+            .partition(|open| !SOURCES.contains(&open.key.split(':').next().unwrap_or_default()));
+        self.stored.active = keep;
+        for open in retired {
+            self.clear(open, now);
+        }
         newly
     }
     fn held(&mut self, key: &str, now: i64, hold_ms: i64) -> bool {
@@ -2555,6 +2564,32 @@ mod tests {
         assert_eq!(view.recent.len(), 1);
         assert_eq!(view.recent[0].cleared_at_ms, back);
         assert_eq!(view.recent[0].opened_at_ms, open_at);
+    }
+
+    #[test]
+    fn an_alert_from_a_retired_source_clears() {
+        let mut engine = Engine::load(config("http://127.0.0.1:9", None, false));
+        let open = |key: &str| Open {
+            ups: None,
+            key: key.into(),
+            severity: AlertSeverity::Warning,
+            summary: key.into(),
+            opened_at_ms: T0,
+            slack_ts: None,
+            attempts: 0,
+            next_post_ms: T0,
+        };
+        engine.stored.active = vec![open("dispatch:timer"), open("clock:ntp")];
+        engine.evaluate(T0 + MIN, &Signals::default());
+        // clock:ntp stays open: its source is unreadable here, not retired.
+        let keys: Vec<_> = engine
+            .stored
+            .active
+            .iter()
+            .map(|o| o.key.as_str())
+            .collect();
+        assert_eq!(keys, ["clock:ntp"]);
+        assert_eq!(engine.stored.recent[0].key, "dispatch:timer");
     }
 
     #[tokio::test]
