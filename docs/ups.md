@@ -1,8 +1,8 @@
 # NUT and UPS control on factory-gpu
 
-Deployment artifacts only. Devon runs these after merge and the dispatcher
-updates the clean `/home/agent/work/factory` checkout and builds
-`cargo build --release --locked -p factory-ups-control` as agent.
+Deployment artifacts only. Devon runs these once the change is on main, the clean
+`/home/agent/work/factory` checkout is at it, and
+`cargo build --release --locked -p factory-ups-control` has run as agent.
 Never install on factory-console: it is not connected to this UPS.
 
 ## End-to-end architecture
@@ -350,7 +350,7 @@ reinstalling NUT or changing Serve and backup configuration. The commands below
 remain the full UPS installation procedure, not prerequisites to repeat for a
 message-format update.
 
-**Devon only, after merge and dispatcher build handoff.** Both clean checkouts
+**Devon only, once the change is on main and built.** Both clean checkouts
 must be at the approved commit under `/home/agent/work/factory`; the GPU release
 binary must already exist. Verify the host timezone is America/New_York. Preserve
 the printed snapshot names from the **first** installer run on each host; later

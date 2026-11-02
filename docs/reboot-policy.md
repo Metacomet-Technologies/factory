@@ -177,7 +177,7 @@ It uses `DefaultDependencies=no` to avoid a cycle with the target enabling it,
 and retains explicit shutdown ordering. It observes rather than repairs
 services. GPU configuration includes meter, Ollama, Amp and operational NUT
 units (not optional/inactive enumerators), plus `factory-api.service` and the
-`factory-dispatch`, `factory-usage` and `factory-backup` timers. After MET-114,
+`factory-usage` and `factory-backup` timers. After MET-114,
 console includes `amp-runner.service`, `gdm.service` and `factory-backup.timer`.
 If the marker disappears after boot, it clears pending and skip state without
 overwriting the preceding reboot decision. If it remains, pending age survives.

@@ -9,16 +9,12 @@ The workspace contains `shared` (serde/utoipa API contract), `meter`
 (axum/Tokio/Hyper binary), and `pricing` (reference rates and spend-avoided
 estimates). Meter contains no pricing logic; factory-api is not built yet.
 
-## Dispatcher
+## Development and deploy
 
-`scripts/dispatch/dispatch.ts` turns Linear's `dispatch` label into a private
-Amp runner thread, with task validation, blocker checks, per-runner caps and
-crash-safe claims. After a linked PR merges, it submits the playbook wrap-up once;
-Devon still owns merge and deploy. Node 24.22.1, no npm dependencies. Start with
-`node scripts/dispatch/dispatch.ts issue MET-123 --dry-run`. Installation is an
-administrator action, not part of development; see the
-[dispatcher README](scripts/dispatch/README.md) for verification gaps, key setup,
-timer installation, recovery and rollback.
+Main-based: agents commit straight to `main` and CI runs on every push. On
+factory-gpu, `sudo factory-deploy meter factory-api kiosk` (any subset)
+fast-forwards the main checkout, builds, installs, probes health at the new SHA
+and rolls back on failure. See `deploy/sudoers/README.md` and `AGENTS.md`.
 
 ## Collector
 
@@ -70,24 +66,12 @@ vp test --run
 vp build
 ```
 
-### Releases
+### Versions
 
-Releases are manual; there is no release bot or CHANGELOG file.
-
-1. In a clean feature branch, run `scripts/bump-version.sh 0.2.1` and open a PR.
-   It updates `VERSION`, both manifests, workspace entries in `Cargo.lock`, and
-   the OpenAPI snapshot's embedded version, then checks version consistency.
-   Use a 0.x version; the script never commits, pushes, or tags.
-2. Merge the bump PR after the `rust`, `kiosk`, and `scripts` CI checks pass.
-3. From your Mac, publish the matching release:
-   `gh release create v0.2.1 --repo Metacomet-Technologies/factory --target main --generate-notes`.
-
-The release workflow checks that the existing tag exactly matches `v$(cat VERSION)`
-at its commit, uses 0.x SemVer, and belongs to `main`'s history. It reruns CI on
-that verified commit and never edits or deletes the release. For a post-merge
-dry run against an existing tag, use
-`gh workflow run release.yml --repo Metacomet-Technologies/factory -f tag=v0.2.0`.
-Artifacts and version-downloading installers remain MET-107 phase 3.
+`main` is what runs; there are no release tags or artifacts. To bump the
+reported version, run `scripts/bump-version.sh 0.2.1` and commit the result. It
+updates `VERSION`, both manifests, workspace entries in `Cargo.lock`, and the
+OpenAPI snapshot's embedded version, then checks version consistency.
 
 CI uses `factory-api/openapi.json` without a running API. Its drift test checks
 the public OpenAPI endpoint; regenerate intentional schema changes with

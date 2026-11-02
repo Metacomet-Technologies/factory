@@ -11,13 +11,6 @@ rollback_hint() {
     fi
 }
 fail() { printf 'ERROR: %s\n' "$*" >&2; rollback_hint; exit 1; }
-# MET-375: from the staged root-owned tree, read only its verified assets (deploy/sudoers/README.md).
-if [[ $0 == /usr/local/lib/factory-deploy/* || $root == /usr/local/lib/factory-deploy ]]; then
-    # shellcheck source=SCRIPTDIR/sudoers/trusted-assets.sh
-    source /usr/local/lib/factory-deploy/deploy/sudoers/trusted-assets.sh
-    trusted_assets deploy/sudoers/trusted-assets.sh deploy/install-factory-api.sh deploy/factory-api.service \
-        deploy/alerts/factory-api-alerts.conf deploy/device-tokens.sh deploy/rollback-factory-api.sh
-fi
 # MET-219: add one remote device credential hash; the token is read from stdin only.
 if [[ ${1:-} == --enroll-device ]]; then
     shift

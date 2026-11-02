@@ -91,7 +91,6 @@ test in `#factory-alerts`. Payload tests do not prove Slack's rendered layout.
 | `pricing:<family>:<model>` | `pricing.changed`: a new reference model is pending | info | pricing DB |
 | `backup:status` | status is unavailable/unreadable, a backup or off-site push failed, a pending marker is stuck for 2 h, local success is older than 26 h, or the off-site recovery point is older than 26 h | warning | `/var/lib/factory-backup-status/status.json` |
 | `clock:ntp` | `timedatectl show -p NTPSynchronized --value` is `no` | warning | timedatectl |
-| `dispatch:timer` | `factory-dispatch.timer` last fired more than 5 min ago, or never | warning | `systemctl show --timestamp=unix -p LastTriggerUSec` |
 | `usage:stale` | a collected tool's `observed_at_ms` is older than 45 min (3 collector intervals) | warning | `/var/lib/factory-usage/usage.json` |
 | `network:lan_down` | the open network event is `Down { lan }` and started 2 min or more ago; clears when that event closes or changes | critical | `net_events` (network collector, 30 s) |
 | `network:wan_down` | the same for `Down { wan }`, an ISP outage | critical | `net_events` |
@@ -242,7 +241,7 @@ disables and removes the timer, service, script and state. The API's
 
 ### Deploy MET-253 from Devon's Mac
 
-Run these commands only after merge, approval, and the dispatcher build handoff.
+Run these commands only after the change is on main and approved.
 Both clean `/home/agent/work/factory` checkouts must be at the approved commit.
 The GPU must already have approved release binaries for `factory-api` and
 `factory-ups-control` in `target/release`. This procedure assumes NUT, UPS

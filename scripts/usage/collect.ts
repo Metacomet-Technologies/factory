@@ -242,7 +242,6 @@ export async function selfCheck() {
   return { decision: 'self-check', tool: 'usage', root: realpathSync(fileURLToPath(new URL('../..', import.meta.url))) };
 }
 
-// argv[1] is the `current` tools link path; import.meta.url is the version it resolves to.
 if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   let fd: number | undefined;
   try {
@@ -251,11 +250,10 @@ if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.me
     if (args.length > 1 || (args.length === 1 && !['--dry-run', '--self-check'].includes(args[0]))) throw new Error('Invalid arguments');
     if (args[0] === '--self-check') console.log(JSON.stringify(await selfCheck()));
     else {
-      // Same lock inode from all worktrees and tools versions once deployed; only a fresh worktree
-      // uses its own existing inode before the main checkout contains this collector.
+      // Same lock inode from all worktrees; only a fresh worktree uses its own existing inode
+      // before the main checkout contains this collector.
       const mainLock = '/home/agent/work/factory/scripts/usage/collect.lock';
-      try { fd = openSync(mainLock, 'r'); } catch (error) {
-        if (fileURLToPath(import.meta.url).includes('/factory-tools/')) throw error;
+      try { fd = openSync(mainLock, 'r'); } catch {
         fd = openSync(new URL('./collect.lock', import.meta.url), 'r');
       }
       check(spawnSync('flock', ['--exclusive', '--timeout', '60', '3'], { stdio: ['ignore', 'ignore', 'ignore', fd] }).status === 0);

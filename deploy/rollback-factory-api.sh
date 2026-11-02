@@ -3,12 +3,6 @@ set -Eeuo pipefail
 umask 0077
 repo=$(dirname "$(dirname "$(realpath "$0")")")
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-# MET-375: from the staged root-owned tree, read only its verified assets (deploy/sudoers/README.md).
-if [[ $0 == /usr/local/lib/factory-deploy/* || $repo == /usr/local/lib/factory-deploy ]]; then
-    # shellcheck source=SCRIPTDIR/sudoers/trusted-assets.sh
-    source /usr/local/lib/factory-deploy/deploy/sudoers/trusted-assets.sh
-    trusted_assets deploy/sudoers/trusted-assets.sh deploy/rollback-factory-api.sh deploy/alerts/factory-api-alerts.conf deploy/device-tokens.sh
-fi
 # MET-219: remove only the credential line one enrollment added.
 if [[ ${1:-} == --unenroll-device ]]; then
     shift

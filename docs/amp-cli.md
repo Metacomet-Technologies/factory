@@ -1,5 +1,8 @@
 # Amp CLI dispatch investigation (MET-116)
 
+Historical: the dispatcher this informed was removed when factory moved to
+main-based development (2026-11-02). The Amp CLI findings still apply.
+
 Contributes MET-80. Investigated on factory-console as `agent`, 2026-10-12
 UTC (2026-10-11 America/New_York), using Amp
 `0.0.1791763306-ged595a`, released `2026-10-12T00:01:46.000Z`.
@@ -179,7 +182,7 @@ green apply, Done and archive remains to be observed on the next eligible issue.
 `-ox` means `--orb-execute -x`. `--project` accepts an Amp namespace/name,
 GitHub owner/repo, or repository URL. Without it, Git remotes determine the
 project; no match produces a warning and a no-project orb. The dispatcher always
-passes the allowlisted `ampProject` from `scripts/dispatch/repos.json` for orbs.
+passed the allowlisted `ampProject` from its repo config for orbs.
 Factory still refuses orbs; factory-access defaults to an orb with one active
 slot per repo (`maxActiveOrbs`). Only an explicit `runner/gpu` uses the configured
 fallback checkout. Failed submissions retain their claim, remove `dispatch`,

@@ -37,7 +37,7 @@ EXPECTED_FAILURE = {
     "rollback-no-snapshot.sh": "snapshot",
     "rollback-unnamed.sh": "rollback",
 }
-# Written at test time, not tracked: scripts/release/test-release.py treats tracked units under deploy/ as deployable.
+# Written at test time so the fixture units never ship as real deploy/ units.
 UNITS = {
     "lint-demo.service": "[Service]\nType=simple\nExecStart=/bin/true\n",
     "lint-oneshot.service": "[Service]\nType=oneshot\nTimeoutStartSec=30\nExecStart=/bin/true\n",

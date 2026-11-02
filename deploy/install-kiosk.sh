@@ -16,12 +16,6 @@ snapshot=
 stage=
 response=
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-# MET-375: from the staged root-owned tree, read only its verified assets (deploy/sudoers/README.md).
-if [[ $0 == /usr/local/lib/factory-deploy/* || $root == /usr/local/lib/factory-deploy ]]; then
-    # shellcheck source=SCRIPTDIR/sudoers/trusted-assets.sh
-    source /usr/local/lib/factory-deploy/deploy/sudoers/trusted-assets.sh
-    trusted_assets deploy/sudoers/trusted-assets.sh deploy/install-kiosk.sh deploy/rollback-kiosk.sh
-fi
 # MET-375: the allowlisted kiosk rollback (rollback-kiosk.sh itself is not allowlisted). As root it copies
 # the snapshot over the served kiosk, so accept only an installer snapshot: a root-owned directory
 # directly inside root-owned /var/backups/factory-kiosk, never a caller-chosen tree.

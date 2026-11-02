@@ -1,18 +1,3 @@
-# /etc/sudoers.d/factory-agent-deploy (root:root 0440), sudo-rs dialect.
-# MET-375: every entry runs a script from the root-owned tree Devon staged from a verified release
-# (/usr/local/lib/factory-deploy, deploy/sudoers/stage-trusted.sh), never from the agent-writable
-# checkout. Install only through stage-trusted.sh, which validates that tree first. See
-# deploy/sudoers/README.md, including what this still grants.
-# Each entry fixes the interpreter and the exact script path. The trailing `*`
-# is sudo-rs's only argument wildcard: zero or more further arguments, which
-# the scripts need for snapshot and artifact paths.
-# Only the scripts scripts/odd/deploy.ts calls; every other installer is Devon's.
-
-Cmnd_Alias FACTORY_GPU_DEPLOY = \
-    /usr/bin/bash /usr/local/lib/factory-deploy/deploy/install-factory-api.sh *, \
-    /usr/bin/bash /usr/local/lib/factory-deploy/deploy/install-kiosk.sh *, \
-    /usr/bin/bash /usr/local/lib/factory-deploy/deploy/install-meter.sh *, \
-    /usr/bin/bash /usr/local/lib/factory-deploy/deploy/rollback-factory-api.sh *, \
-    /usr/bin/bash /usr/local/lib/factory-deploy/deploy/rollback-meter-v1.sh *
-
-agent factory-gpu = (root) NOPASSWD: FACTORY_GPU_DEPLOY
+# /etc/sudoers.d/factory-agent-deploy (root:root 0440) on factory-gpu: the one agent sudo rule.
+# /usr/local/sbin/factory-deploy is a root-owned copy of deploy/deploy.sh.
+agent factory-gpu = (root) NOPASSWD: /usr/local/sbin/factory-deploy *

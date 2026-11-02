@@ -26,7 +26,6 @@ or a separately evaluated Litestream deployment.
 | requests | factory-gpu | `/var/lib/factory-api/requests.db` | yes | yes: frozen costs, aggregates, UPS/device/network histories and settings; not just a meter cache | 26 h; daily snapshots | snapshot-to-R2 | Explicitly accept losing up to 26 hours of cost/operational history after whole-house loss. No current requirement establishes a minutes-level billing ledger. |
 | pricing | factory-gpu | `/var/lib/factory-api/pricing.db` | yes | yes: historical prices and operator selections | 26 h; daily snapshots | snapshot-to-R2 | Refetching current prices cannot restore old rates or confirmations. Preserve the DB even though writes are infrequent. |
 | ups-control | factory-gpu | `/var/lib/factory-ups-control/audit.db` | yes | yes: action audit, confirmations, cooldowns and notification state | 26 h for history; daily snapshots | snapshot-to-R2 | Restore with control disabled and reconcile physical actions first. A fresher asynchronous copy alone cannot make physical-action replay safe. |
-| dispatch | factory-gpu | `/home/agent/.local/state/factory-dispatch/dispatch.db` | no; separate later ticket | yes: local claims, decisions, thread and QA/recovery state | 26 h target; manual reconciliation before restart | snapshot-to-R2 | Linear/GitHub are reconciliation inputs, not a complete copy of the decision ledger. Not part of this activation. |
 | atuin | factory-gpu, conditional on activation | `/var/lib/atuin/atuin.db` | yes in config; skipped if not created | no for history, assuming clients retain full encrypted history; yes for account/sync metadata | 26 h for server state; daily snapshots | snapshot-to-R2 | Cheap server recovery; no continuous replication needed for a client-encrypted sync hub. Client retention is an assumption to confirm in the drill. |
 | meter-v0 | factory-gpu | `/var/backups/factory-db/factory-gpu/meter-v0/` | no; separate later ticket, outside `DBS`, pruning and restore checks | yes: immutable historical archive | zero further loss after a verified one-time copy | snapshot-to-R2 | Upload every approved archive generation once, keep indefinitely, and include in restore drills after that import. |
 
@@ -38,8 +37,7 @@ the older issue's four-database list. Source evidence for the loss budget:
 [devices](../factory-api/src/devices_schema.sql),
 [network](../factory-api/src/network_schema.sql),
 [pricing history](../pricing/src/v1.sql),
-[UPS control safety state](ups.md), and the
-[dispatch ledger](../scripts/dispatch/README.md).
+and [UPS control safety state](ups.md).
 
 **Requests RPO decision:** Devon approved the 26-hour budget. This does not mean
 that the data is reconstructible. Meter replay cannot restore
@@ -50,12 +48,6 @@ for requests and separately reassess meter/pricing consistency. None of the
 current evidence justifies operating continuous replication for every DB.
 No database is recommended as `none`; no Litestream daemon is part of this PR.
 
-The later dispatch ticket adds `dispatch` to GPU `DBS` and console `PEER_DBS`.
-Root's SQLite `.backup` can read the `agent`-owned WAL database outside `/var/lib`; preserve
-its ownership and modes, do not copy the live DB/WAL files or widen permissions.
-Test a live WAL writer and an absent required dispatch DB before dispatch activation.
-Keep the dispatcher disabled after restore until claims and in-flight work
-are reconciled with Linear/GitHub. This prototype does not change `DBS`.
 
 In the later `meter-v0` ticket, inventory and validate the existing pairs under
 separate approval. Verify checksums, decompress in scratch, and require SQLite integrity

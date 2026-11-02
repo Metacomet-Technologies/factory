@@ -38,13 +38,13 @@ administrator command and stops rather than silently skipping tools.
 
 Linux x86_64 and these development tools provide practical parity with the
 Ubuntu factory runners. Their kernels, GPU, real Ollama, Tailscale, systemd
-deployment units, UPS, physical kiosk, backups, dispatcher, account collectors,
+deployment units, UPS, physical kiosk, backups, account collectors,
 production databases, and credentials are intentionally excluded. Python 3.10+
 is sufficient; exact runner Python/GCC versions are not required.
 
 No additional secrets or live integrations are required. Tailnet connectivity
 and production checks require separately approved scope. Do not run production
-collectors, dispatcher commands, deployment scripts, or live verification scripts.
+collectors, deployment scripts, or live verification scripts.
 
 ## Checks
 
@@ -58,7 +58,7 @@ From the repository root:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace --locked
-node --test scripts/dispatch scripts/usage
+node --test scripts/usage
 python3 -B deploy/test_set_ollama_host.py
 python3 -B deploy/backup/test-backup.py
 python3 -B deploy/reboot/test-reboot.py

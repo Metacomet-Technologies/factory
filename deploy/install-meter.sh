@@ -172,12 +172,6 @@ classified_plan() {
 }
 # Source only the DB helpers for non-root shell regression tests.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
-# MET-375: from the staged root-owned tree, read only its verified assets (deploy/sudoers/README.md).
-if [[ ${BASH_SOURCE[0]} == /usr/local/lib/factory-deploy/* || $root == /usr/local/lib/factory-deploy ]]; then
-    # shellcheck source=SCRIPTDIR/sudoers/trusted-assets.sh
-    source /usr/local/lib/factory-deploy/deploy/sudoers/trusted-assets.sh
-    trusted_assets deploy/sudoers/trusted-assets.sh deploy/install-meter.sh deploy/meter.service deploy/set_ollama_host.py deploy/rollback-meter-v1.sh
-fi
 flags=$((check_only + plan + no_db_change))
 [[ $# -eq $((1 + flags)) ]] || fail 'Supply exactly one prebuilt binary path, optionally after --check-only, --plan or --no-db-change.'
 [[ -f "$binary" && -x "$binary" ]] || fail 'Supply an executable prebuilt meter binary.'

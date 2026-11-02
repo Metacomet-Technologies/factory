@@ -65,9 +65,7 @@ exemptions=(
     'deploy/rollback-factory-api.sh|snapshot!|TODO MET-<new>: --unenroll-device execs device-tokens.sh, which rewrites /etc/factory-api/device-tokens without saving the current file.'
     'deploy/reboot/rollback-reboot-policy.sh|snapshot|TODO MET-<new>: deletes /etc/factory-reboot/node.conf without saving it, so local edits since the last install are lost.'
     'deploy/reboot/rollback-reboot-policy.sh|health|Removal only; no service remains to probe.'
-    'deploy/rollback-dispatch.sh|health|Removal only; no service remains to probe.'
     'deploy/rollback-usage.sh|health|Removal only; no service remains to probe.'
-    'deploy/rollback-deploy.sh|health|Removal only; no service remains to probe.'
 )
 
 repo=$(dirname "$(dirname "$(realpath "${BASH_SOURCE[0]}")")")

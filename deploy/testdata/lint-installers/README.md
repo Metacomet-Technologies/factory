@@ -5,8 +5,7 @@ Inputs for `deploy/test-lint-installers.py`. They are never run. Each
 fixture by one property, and `deploy/lint-installers.sh` must fail only that check.
 
 The test writes the `lint-*.service` units the fixtures name into a temporary
-copy. They are not tracked because `scripts/release/test-release.py` treats every
-tracked unit under `deploy/` as deployable.
+copy. They are not tracked so they never ship as real units under `deploy/`.
 
 - Compliant: `install-good.sh`, `install-good-oneshot.sh` (bounded oneshot health
   check), `install-called-root.sh` (root guard in a called function) and

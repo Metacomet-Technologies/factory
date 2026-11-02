@@ -45,12 +45,11 @@ const BACKUP_STALE_MS: i64 = 26 * 3_600_000;
 const RETENTION_SKIP_MS: i64 = 24 * 3_600_000;
 /// factory-backup.service TimeoutStartSec: in-run "pending" markers older than this are stuck.
 const BACKUP_RUN_MS: i64 = 2 * 3_600_000;
-const DISPATCH_STALE_MS: i64 = 5 * 60_000;
 /// Three 15-minute usage collector intervals.
 const USAGE_STALE_MS: i64 = crate::usage::STALE_MS;
 const MAX_BACKOFF_MS: i64 = 15 * 60_000;
 const MAX_RECOVERY_ATTEMPTS: u32 = 12;
-const SOURCES: [&str; 13] = [
+const SOURCES: [&str; 12] = [
     "node",
     "service",
     "gpu",
@@ -58,7 +57,6 @@ const SOURCES: [&str; 13] = [
     "pricing",
     "backup",
     "clock",
-    "dispatch",
     "usage",
     "ups",
     "devices",
@@ -189,8 +187,6 @@ pub struct Signals {
     pub pricing_pending: Option<Vec<(String, String)>>,
     pub backup: Option<Vec<BackupEntry>>,
     pub clock_synchronized: Option<bool>,
-    /// `Some(None)`: the timer is loaded but has never fired.
-    pub dispatch_last_trigger_ms: Option<Option<i64>>,
     /// Collected tools and their last good reading.
     pub usage: Option<Vec<(String, Option<i64>)>>,
     pub ups: Option<UpsRead>,
@@ -478,7 +474,6 @@ impl Message {
                     "factory-gpu clock not NTP-synchronized",
                     summary.split_once("; ").map_or(summary, |(_, s)| s),
                 ),
-                "dispatch:timer" => ("factory-dispatch.timer stale", summary),
                 "usage:stale" => (
                     "Usage snapshot stale",
                     summary
@@ -1595,22 +1590,6 @@ impl Engine {
                     );
                 }
             }
-            "dispatch" => {
-                let summary = match signals.dispatch_last_trigger_ms? {
-                    None => Some("factory-dispatch.timer has never fired".to_string()),
-                    Some(at) if now - at > DISPATCH_STALE_MS => Some(format!(
-                        "factory-dispatch.timer last fired {} ago",
-                        duration(now - at)
-                    )),
-                    Some(_) => None,
-                };
-                if let Some(summary) = summary {
-                    out.insert(
-                        "dispatch:timer".into(),
-                        Verdict::Fire(AlertSeverity::Warning, summary),
-                    );
-                }
-            }
             "usage" => {
                 let stale: Vec<_> = signals
                     .usage
@@ -1867,31 +1846,6 @@ fn parse_backup(bytes: &[u8]) -> Option<Vec<BackupEntry>> {
         })
         .collect()
 }
-/// Parses `systemctl show --timestamp=unix -p LoadState -p LastTriggerUSec`.
-fn parse_timer(text: &str) -> Option<Option<i64>> {
-    let mut load = None;
-    let mut last = None;
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix("LoadState=") {
-            load = Some(value.trim());
-        } else if let Some(value) = line.strip_prefix("LastTriggerUSec=") {
-            last = Some(value.trim());
-        }
-    }
-    if load? != "loaded" {
-        return None;
-    }
-    match last? {
-        "" | "n/a" | "0" => Some(None),
-        value => Some(Some(
-            value
-                .strip_prefix('@')?
-                .parse::<i64>()
-                .ok()?
-                .checked_mul(1000)?,
-        )),
-    }
-}
 
 impl AppState {
     pub async fn alert_signals(&self) -> Signals {
@@ -1917,23 +1871,6 @@ impl AppState {
                 _ => None,
             }
         };
-        let dispatch = async {
-            let text = fleet::command(
-                "systemctl",
-                &[
-                    "show",
-                    "--timestamp=unix",
-                    "-p",
-                    "LoadState",
-                    "-p",
-                    "LastTriggerUSec",
-                    "factory-dispatch.timer",
-                ],
-            )
-            .await
-            .ok()?;
-            parse_timer(&text)
-        };
         let pricing = async {
             let pricing = self.pricing().await.ok()?;
             Some(
@@ -1957,18 +1894,9 @@ impl AppState {
             let health: serde_json::Value = self.get("/meter/health").await.ok()?;
             serde_json::from_value(health["maintenance"]["retention"].clone()).ok()
         };
-        let (
-            backup,
-            clock_synchronized,
-            dispatch_last_trigger_ms,
-            pricing_pending,
-            usage,
-            network,
-            meter_retention,
-        ) = tokio::join!(
+        let (backup, clock_synchronized, pricing_pending, usage, network, meter_retention) = tokio::join!(
             backup,
             clock,
-            dispatch,
             pricing,
             crate::usage::observations(&self.usage_snapshot, now),
             network,
@@ -1996,7 +1924,6 @@ impl AppState {
                     }),
             ),
             clock_synchronized,
-            dispatch_last_trigger_ms,
             usage,
             ups,
             ups_events: vec![],
@@ -2780,10 +2707,11 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         *slack.block_from.lock().unwrap() = None;
     }
-    fn clock_and_dispatch(synchronized: bool, last_trigger: Option<i64>) -> Signals {
+    /// Two independent alerts: clock:ntp, and usage:stale unless `last_good` is given.
+    fn clock_and_usage(synchronized: bool, last_good: Option<i64>) -> Signals {
         Signals {
             clock_synchronized: Some(synchronized),
-            dispatch_last_trigger_ms: Some(last_trigger),
+            usage: Some(vec![("amp".into(), Some(last_good.unwrap_or(0)))]),
             ..Default::default()
         }
     }
@@ -2802,7 +2730,7 @@ mod tests {
         let path = directory.path().join("alerts.json");
         // Two alerts open together: Slack acknowledges the first, the second hangs.
         *slack.block_from.lock().unwrap() = Some(2);
-        let firing = clock_and_dispatch(false, None);
+        let firing = clock_and_usage(false, None);
         let engine = Engine::load(config(&url, Some(path.clone()), true));
         interrupted_tick(&slack, engine, T0, firing.clone()).await;
         assert_eq!(slack.posts.lock().unwrap().len(), 1);
@@ -2819,15 +2747,15 @@ mod tests {
             stored,
             [
                 ("clock:ntp", Some(posts_ts(1).as_str())),
-                ("dispatch:timer", None)
+                ("usage:stale", None)
             ]
         );
         restarted.tick(T0 + MIN, &firing).await;
         restarted.tick(T0 + 2 * MIN, &firing).await;
         assert_eq!(texts_containing(&slack, "clock not NTP-synchronized"), 1);
-        assert_eq!(texts_containing(&slack, "factory-dispatch.timer stale"), 1);
+        assert_eq!(texts_containing(&slack, "Usage snapshot stale"), 1);
         restarted
-            .tick(T0 + 3 * MIN, &clock_and_dispatch(true, Some(T0 + 3 * MIN)))
+            .tick(T0 + 3 * MIN, &clock_and_usage(true, Some(T0 + 3 * MIN)))
             .await;
         let posts = slack.posts.lock().unwrap().clone();
         assert_eq!(posts.len(), 6, "{posts:?}");
@@ -2838,7 +2766,7 @@ mod tests {
             posts[3]["text"]
                 .as_str()
                 .unwrap()
-                .contains("factory-dispatch.timer")
+                .contains("Usage snapshot stale")
         );
     }
 
@@ -2848,11 +2776,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("alerts.json");
         let mut engine = Engine::load(config(&url, Some(path.clone()), true));
-        engine.tick(T0, &clock_and_dispatch(false, None)).await;
+        engine.tick(T0, &clock_and_usage(false, None)).await;
         assert_eq!(slack.posts.lock().unwrap().len(), 2);
         // Both clear: the first recovery is acknowledged, the second hangs.
         *slack.block_from.lock().unwrap() = Some(4);
-        let cleared = clock_and_dispatch(true, Some(T0 + MIN));
+        let cleared = clock_and_usage(true, Some(T0 + MIN));
         interrupted_tick(&slack, engine, T0 + MIN, cleared.clone()).await;
         assert_eq!(slack.posts.lock().unwrap().len(), 3);
 
@@ -3025,14 +2953,6 @@ mod tests {
                 &[("Details", "pricing refreshes and data writes paused")],
             ),
             (
-                "dispatch:timer",
-                "warning",
-                "factory-dispatch.timer last fired 6 min ago",
-                "factory-dispatch.timer stale",
-                "/|Open dashboard",
-                &[("Details", "factory-dispatch.timer last fired 6 min ago")],
-            ),
-            (
                 "usage:stale",
                 "warning",
                 "usage snapshot stale: no good amp, claude-code reading for over 45 min",
@@ -3202,7 +3122,6 @@ mod tests {
                     error: None,
                 }]),
                 clock_synchronized: Some(true),
-                dispatch_last_trigger_ms: Some(Some(now)),
                 usage: Some(vec![]),
                 ups: ups(now, "OL", 99.0, 1200, "Done and passed").ups,
                 network: Some(NetworkAlertInput::default()),
@@ -3261,10 +3180,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(&url, Some(dir.path().join("alerts.json")), true);
         let mut engine = Engine::load(cfg.clone());
-        engine.tick(T0, &clock_and_dispatch(false, None)).await;
+        engine.tick(T0, &clock_and_usage(false, None)).await;
         // Two openings, two replies, then the first update succeeds and the next hangs.
         *slack.block_from.lock().unwrap() = Some(6);
-        let healthy = clock_and_dispatch(true, Some(T0 + MIN));
+        let healthy = clock_and_usage(true, Some(T0 + MIN));
         interrupted_tick(&slack, engine, T0 + MIN, healthy.clone()).await;
         let mut engine = Engine::load(cfg);
         engine.tick(T0 + 2 * MIN, &healthy).await;
@@ -3354,7 +3273,7 @@ mod tests {
         let cfg = config(&url, Some(dir.path().join("alerts.json")), true);
         let mut engine = Engine::load(cfg.clone());
         *slack.make_unwritable.lock().unwrap() = Some(dir.path().to_owned());
-        let firing = clock_and_dispatch(false, None);
+        let firing = clock_and_usage(false, None);
         engine.tick(T0, &firing).await;
         engine.tick(T0 + MIN, &firing).await;
         assert_eq!(slack.received.load(Ordering::SeqCst), 1);
@@ -3372,9 +3291,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(&url, Some(dir.path().join("alerts.json")), true);
         let mut engine = Engine::load(cfg.clone());
-        engine.tick(T0, &clock_and_dispatch(false, None)).await;
+        engine.tick(T0, &clock_and_usage(false, None)).await;
         *slack.fail_updates.lock().unwrap() = 100;
-        let healthy = clock_and_dispatch(true, Some(T0 + MIN));
+        let healthy = clock_and_usage(true, Some(T0 + MIN));
         engine.tick(T0 + MIN, &healthy).await;
         assert_eq!(slack.posts.lock().unwrap().len(), 4); // both replies succeeded
         assert_eq!(slack.received.load(Ordering::SeqCst), 6);
@@ -3544,11 +3463,10 @@ mod tests {
             );
         }
 
-        // Dispatch timer and usage snapshot staleness.
+        // Usage snapshot staleness.
         engine.evaluate(
             T0,
             &Signals {
-                dispatch_last_trigger_ms: Some(Some(T0 - 5 * MIN)),
                 usage: Some(vec![
                     ("amp".into(), Some(T0 - 45 * MIN)),
                     ("codex".into(), None),
@@ -3556,15 +3474,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(
-            !keys(&engine)
-                .iter()
-                .any(|(k, _)| k.starts_with("dispatch") || k.starts_with("usage"))
-        );
+        assert!(!keys(&engine).iter().any(|(k, _)| k.starts_with("usage")));
         engine.evaluate(
             T0,
             &Signals {
-                dispatch_last_trigger_ms: Some(Some(T0 - 5 * MIN - 1)),
                 usage: Some(vec![
                     ("amp".into(), Some(T0 - 45 * MIN - 1)),
                     ("claude-code".into(), Some(T0 - 3 * h)),
@@ -3574,10 +3487,6 @@ mod tests {
             },
         );
         let found = keys(&engine);
-        assert!(found.contains(&(
-            "dispatch:timer".into(),
-            "factory-dispatch.timer last fired 5 min ago".into()
-        )));
         assert!(found.contains(&(
             "usage:stale".into(),
             "usage snapshot stale: no good amp, claude-code reading for over 45 min".into()
@@ -3644,22 +3553,6 @@ mod tests {
 
     #[test]
     fn source_parsers() {
-        assert_eq!(
-            parse_timer("LoadState=loaded\nLastTriggerUSec=@1791897724\n"),
-            Some(Some(1_791_897_724_000))
-        );
-        assert_eq!(
-            parse_timer("LastTriggerUSec=n/a\nLoadState=loaded\n"),
-            Some(None)
-        );
-        assert_eq!(
-            parse_timer("LoadState=not-found\nLastTriggerUSec=n/a\n"),
-            None
-        );
-        assert_eq!(
-            parse_timer("LoadState=loaded\nLastTriggerUSec=Mon 2026-10-13\n"),
-            None
-        );
         let status = br#"{"meter": {"last_success_ms": 5, "last_attempt_ms": 6, "size_bytes": 1,
             "integrity": "ok", "pushed_to_peer": true, "error": null}}"#;
         assert_eq!(

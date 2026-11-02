@@ -145,8 +145,8 @@ codex, kimi, opencode. Existing `tool`, `status`, `note` fields remain; note is 
 `FACTORY_USAGE_SNAPSHOT` overrides the collector's snapshot path for both reads
 and writes, including scheduling reads during `--dry-run`. The production default
 is unchanged. Tests always use temporary paths; no test reads or writes `/var/lib`.
-The parent directory must already exist. CI runs both Node suites with the pinned
-Node 24.22.1 runtime: `node --test scripts/dispatch scripts/usage`.
+The parent directory must already exist. CI runs the suite with the pinned
+Node 24.22.1 runtime: `node --test scripts/usage`.
 
 Each tracked entry adds `reason`, `observed_at_ms`, `source`, `cli_version`,
 nullable `plan`, `windows`, nullable `balance`, `balances`, and nullable

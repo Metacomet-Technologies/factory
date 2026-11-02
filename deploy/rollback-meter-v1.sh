@@ -10,12 +10,6 @@ check_preserved_v0() {
     done
 }
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
-# MET-375: from the staged root-owned tree, read only its verified assets (deploy/sudoers/README.md).
-if [[ $0 == /usr/local/lib/factory-deploy/* || $(realpath "$0") == /usr/local/lib/factory-deploy/* ]]; then
-    # shellcheck source=SCRIPTDIR/sudoers/trusted-assets.sh
-    source /usr/local/lib/factory-deploy/deploy/sudoers/trusted-assets.sh
-    trusted_assets deploy/sudoers/trusted-assets.sh deploy/rollback-meter-v1.sh
-fi
 [[ $EUID -eq 0 ]] || fail 'Run as root: bash deploy/rollback-meter-v1.sh <snapshot-directory>.'
 [[ $# -eq 1 ]] || fail 'Supply the exact installer snapshot directory.'
 # MET-375: the snapshot's binary, unit and DB files are restored as root, so accept only an installer
