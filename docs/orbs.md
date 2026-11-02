@@ -14,8 +14,7 @@ Every version comes from the repo: Rust from `rust-toolchain.toml` (1.99.0 with
 rustfmt/clippy, matching the factory runners), Vite+ from the kiosk catalog,
 Node and Bun from the kiosk's `devEngines` and `.node-version`. The scripts keep
 their own `.node-version`. System packages provide the C compiler, Python 3,
-flock, Bubblewrap, shellcheck, SQLite CLI, zstd, rsync, xz and the lld
-release linker (`ld.lld`). SQLite used by Rust is bundled; it does not depend
+flock, Bubblewrap, shellcheck, SQLite CLI, zstd, rsync and xz. SQLite used by Rust is bundled; it does not depend
 on the host SQLite CLI version. Rust crates are fetched by the first build, not
 by setup.
 

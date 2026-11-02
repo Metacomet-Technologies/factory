@@ -308,9 +308,9 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(code, 1, err)
         self.assertFalse(os.path.exists(os.path.join(self.home, ".local", "bin", "yq")))
 
-    def test_release_linker_is_installed_only_when_missing(self):
-        self.assertIn("lld", PACKAGES)
-        self.mark(*(f"apt-{p}" for p in PACKAGES if p != "lld"), "rust", "js", "vite-plus")
+    def test_a_missing_package_is_installed_only_when_missing(self):
+        self.assertIn("xz-utils", PACKAGES)
+        self.mark(*(f"apt-{p}" for p in PACKAGES if p != "xz-utils"), "rust", "js", "vite-plus")
         os.makedirs(os.path.join(self.repo, "kiosk", "node_modules"))
         write(os.path.join(self.base, "bin", "bun"), "#!/bin/sh\necho 1.4.2\n", 0o755)
         # The orb's ~/.local/bin is already set up, so the only change left is the package.
@@ -320,13 +320,13 @@ class SetupTest(unittest.TestCase):
         code, err, calls = self.run_setup("--env", "orb", "--check-only")
         self.assertEqual((code, calls), (0, []), err)
         self.assertEqual(self.tree(), before)
-        self.assertEqual([a for _, a in actions(err)], ["install apt packages: lld"])
+        self.assertEqual([a for _, a in actions(err)], ["install apt packages: xz-utils"])
 
         code, err, calls = self.run_setup("--env", "orb")
         self.assertEqual(code, 0, err)
         # Without root the calls also pass through the sudo stub; only the installs matter.
         self.assertEqual([c for c in calls if not c.startswith("sudo ")],
-                         ["apt-get update", "apt-get install --no-install-recommends -y lld"])
+                         ["apt-get update", "apt-get install --no-install-recommends -y xz-utils"])
         tree = self.tree()
         code, err, calls = self.run_setup("--env", "orb")
         self.assertEqual((code, calls), (0, []), err)

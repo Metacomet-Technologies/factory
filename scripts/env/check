@@ -50,7 +50,6 @@ SYSTEM = [
     ("zstd", "zstd"),
     ("rsync", "rsync"),
     ("xz-utils", "xz"),
-    ("lld", "ld.lld"),
 ]
 
 EXEMPT = {
