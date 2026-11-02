@@ -402,7 +402,10 @@ Defaults and environment equivalents (CLI flags take precedence):
   default off. Skips startup/daily pricing refresh only; manual refresh,
   confirmation and snapshot reads still work. Environment value `0` keeps it enabled.
 - `--services-config` / `FACTORY_API_SERVICES_CONFIG`: optional TOML file;
-  defaults are embedded from `factory-api/config/services.toml`.
+  defaults are embedded from `factory-api/config/services.toml`. A node with
+  `satellite = true` (factory-console) is optional: while it is offline the
+  kiosk verdict stays green, its tile reads "Off · satellite", and the offline
+  alert is a one-time Info post instead of Critical.
 - `--static-dir` / `FACTORY_API_STATIC_DIR`: `/var/lib/factory-api/kiosk`;
   runtime kiosk files, not embedded in the binary.
 - `RUST_LOG`: defaults to `factory_api=info`.

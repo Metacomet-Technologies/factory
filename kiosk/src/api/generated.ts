@@ -1204,6 +1204,8 @@ export interface components {
       name: string;
       online: boolean;
       os?: string | null;
+      /** @description Optional to normal operations (factory-console): offline is not a failure. */
+      satellite: boolean;
       services: components["schemas"]["Service"][];
       tailscale_ip?: string | null;
     };

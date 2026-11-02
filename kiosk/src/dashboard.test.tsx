@@ -707,9 +707,15 @@ describe("dashboard contract", () => {
   it("shows now only for online nodes without a last-seen timestamp", () => {
     const data = fixtures().fleet;
     data.nodes = [
-      { name: "online-unknown", online: true, last_seen_ms: null, services: [] },
-      { name: "offline-unknown", online: false, last_seen_ms: null, services: [] },
-      { name: "online-dated", online: true, last_seen_ms: 0, services: [] },
+      { name: "online-unknown", satellite: false, online: true, last_seen_ms: null, services: [] },
+      {
+        name: "offline-unknown",
+        satellite: false,
+        online: false,
+        last_seen_ms: null,
+        services: [],
+      },
+      { name: "online-dated", satellite: false, online: true, last_seen_ms: 0, services: [] },
     ];
     render(
       <FleetSection

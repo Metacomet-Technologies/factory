@@ -2653,6 +2653,10 @@
               "null"
             ]
           },
+          "satellite": {
+            "description": "Optional to normal operations (factory-console): offline is not a failure.",
+            "type": "boolean"
+          },
           "services": {
             "items": {
               "$ref": "#/components/schemas/Service"
@@ -2668,6 +2672,7 @@
         },
         "required": [
           "name",
+          "satellite",
           "online",
           "services"
         ],

@@ -189,6 +189,8 @@ export function FleetSection({
 }) {
   const data = resource.data;
   const online = data?.nodes.filter((node) => node.online).length ?? 0;
+  // A satellite being off is expected, so it neither fails its tile nor the header chip.
+  const required = data?.nodes.every((node) => node.online || node.satellite) ?? false;
   return (
     <Panel
       title="Fleet"
@@ -198,7 +200,7 @@ export function FleetSection({
       index={index}
       action={
         data ? (
-          <StatusChip tone={online === data.nodes.length ? "ok" : "warn"}>
+          <StatusChip tone={required ? "ok" : "warn"}>
             {online} / {data.nodes.length} online
           </StatusChip>
         ) : null
@@ -211,7 +213,8 @@ export function FleetSection({
       <div className="node-grid">
         {data?.nodes.map((node) => {
           const device = devices.find((item) => item.device_id === node.name);
-          const tone = node.online ? undefined : "fail";
+          const standby = node.satellite && !node.online;
+          const tone = node.online || standby ? undefined : "fail";
           const body = (
             <>
               <div className="row">
@@ -228,13 +231,13 @@ export function FleetSection({
                   )}
                 </h3>
                 <span className="row chips">
-                  {device && (
+                  {device && !standby && (
                     <StatusChip tone={healthTone(device.health)}>
                       Host health{device.health === "unknown" ? "" : ` · ${device.health}`}
                     </StatusChip>
                   )}
-                  <StatusChip tone={node.online ? "ok" : "fail"} dot>
-                    {node.online ? "Online" : "Offline"}
+                  <StatusChip tone={node.online ? "ok" : standby ? "neutral" : "fail"} dot>
+                    {node.online ? "Online" : standby ? "Off · satellite" : "Offline"}
                   </StatusChip>
                 </span>
               </div>
@@ -254,13 +257,17 @@ export function FleetSection({
                           {service.name}
                           {service.version ? ` v${service.version}` : ""}
                         </span>
-                        <StatusText tone={service.ok ? "ok" : "fail"} className="service-state">
-                          {service.ok ? "OK" : "Failing"} · {ms(service.latency_ms)}
-                        </StatusText>
+                        {standby ? (
+                          <span className="muted service-state">Off</span>
+                        ) : (
+                          <StatusText tone={service.ok ? "ok" : "fail"} className="service-state">
+                            {service.ok ? "OK" : "Failing"} · {ms(service.latency_ms)}
+                          </StatusText>
+                        )}
                       </div>
                       <ServiceDetail
                         service={service.name}
-                        detail={service.ok ? null : (service.detail ?? "—")}
+                        detail={service.ok || standby ? null : (service.detail ?? "—")}
                       />
                     </li>
                   ))}

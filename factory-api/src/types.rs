@@ -94,6 +94,8 @@ pub struct Service {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Node {
     pub name: String,
+    /// Optional to normal operations (factory-console): offline is not a failure.
+    pub satellite: bool,
     pub tailscale_ip: Option<String>,
     pub online: bool,
     pub last_seen_ms: Option<i64>,

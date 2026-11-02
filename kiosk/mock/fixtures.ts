@@ -198,6 +198,7 @@ export function fixtures(
     nodes: [
       {
         name: "factory-gpu",
+        satellite: false,
         tailscale_ip: "100.91.20.10",
         online: !outage,
         last_seen_ms: outage ? null : now - 800,
@@ -236,6 +237,7 @@ export function fixtures(
       },
       {
         name: "factory-console",
+        satellite: true,
         tailscale_ip: "100.91.20.11",
         online: true,
         last_seen_ms: null,
@@ -254,6 +256,7 @@ export function fixtures(
       },
       {
         name: "factory-edge",
+        satellite: false,
         tailscale_ip: "100.91.20.12",
         online: false,
         last_seen_ms: now - 8_100_000,

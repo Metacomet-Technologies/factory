@@ -22,6 +22,10 @@ pub struct Config {
 #[derive(Clone, Deserialize)]
 pub struct NodeConfig {
     pub name: String,
+    /// Optional to normal operations: when it is off, the kiosk stays green and
+    /// its offline alert is informational.
+    #[serde(default)]
+    pub satellite: bool,
     pub services: Vec<ServiceConfig>,
     /// MET-260 per-service interval cache and in-flight probe sharing for this
     /// node's services; not part of the config text. Lives on the node because
@@ -341,6 +345,7 @@ pub fn node(config: &NodeConfig, status: &Value) -> Node {
         });
     Node {
         name: config.name.clone(),
+        satellite: config.satellite,
         tailscale_ip: peer
             .and_then(|p| p["TailscaleIPs"][0].as_str())
             .map(str::to_owned),

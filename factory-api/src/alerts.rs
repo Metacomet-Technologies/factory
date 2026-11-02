@@ -1424,7 +1424,13 @@ impl Engine {
                         self.pending_since.remove(&key);
                     } else if self.held(&key, now, NODE_OFFLINE_MS) {
                         let summary = format!("{} offline for more than 5 min", node.name);
-                        out.insert(key, Verdict::Fire(AlertSeverity::Critical, summary));
+                        // A satellite being off is expected: note it once, no recovery post.
+                        let severity = if node.satellite {
+                            AlertSeverity::Info
+                        } else {
+                            AlertSeverity::Critical
+                        };
+                        out.insert(key, Verdict::Fire(severity, summary));
                     } else {
                         out.insert(key, Verdict::Hold);
                     }
@@ -2144,6 +2150,7 @@ mod tests {
     fn fleet(at: i64, console_online: bool, ollama_ok: bool) -> Signals {
         let node = |name: &str, online, services| Node {
             name: name.into(),
+            satellite: false,
             tailscale_ip: None,
             online,
             last_seen_ms: None,
@@ -2548,6 +2555,34 @@ mod tests {
         assert_eq!(view.recent.len(), 1);
         assert_eq!(view.recent[0].cleared_at_ms, back);
         assert_eq!(view.recent[0].opened_at_ms, open_at);
+    }
+
+    #[tokio::test]
+    async fn satellite_offline_is_info_without_a_recovery_reply() {
+        let (slack, url) = fake_slack().await;
+        let mut engine = Engine::load(config(&url, None, true));
+        let signals = |now, online| {
+            let mut signals = fleet(now, online, true);
+            signals.fleet.as_mut().unwrap().nodes[1].satellite = true;
+            signals
+        };
+        for minute in 0..=6 {
+            let now = T0 + minute * MIN;
+            engine.tick(now, &signals(now, false)).await;
+        }
+        let view = engine.view();
+        assert_eq!(view.active.len(), 1, "{:?}", view.active);
+        assert_eq!(view.active[0].key, "node:factory-console");
+        assert_eq!(view.active[0].severity, AlertSeverity::Info);
+        let back = T0 + 7 * MIN;
+        engine.tick(back, &signals(back, true)).await;
+        engine.tick(back + MIN, &signals(back + MIN, true)).await;
+        assert!(engine.view().active.is_empty());
+        let posts = slack.posts.lock().unwrap().clone();
+        assert!(
+            posts.iter().all(|post| post.get("thread_ts").is_none()),
+            "{posts:?}"
+        );
     }
 
     #[tokio::test]

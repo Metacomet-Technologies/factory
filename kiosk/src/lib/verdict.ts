@@ -22,7 +22,8 @@ export type VerdictInput = {
 /**
  * Every signal the overview panels show, reduced to one list. A check is one of: a section
  * loading (fail when it errors), a fleet node, a service, a host's health, the UPS, the
- * network link, pricing freshness and the stream. Sections still loading count as neither.
+ * network link, pricing freshness and the stream. Sections still loading count as neither, and
+ * neither does an offline satellite node or its host.
  */
 export function verdict(input: VerdictInput): { issues: VerdictIssue[]; okCount: number } {
   const issues: VerdictIssue[] = [];
@@ -37,20 +38,30 @@ export function verdict(input: VerdictInput): { issues: VerdictIssue[]; okCount:
     return !resource.error;
   };
 
+  // A satellite (factory-console) is optional: off is not an issue, and its problems only warn.
+  const nodes = input.fleet.data?.nodes ?? [];
+  const satellite = (name: string) => nodes.some((node) => node.name === name && node.satellite);
+  const off = (name: string) =>
+    nodes.some((node) => node.name === name && node.satellite && !node.online);
   if (section("Fleet", input.fleet)) {
-    for (const node of input.fleet.data?.nodes ?? []) {
+    for (const node of nodes) {
+      if (off(node.name)) continue;
       check(node.online, "fail", `${node.name} offline`);
       if (!node.online) continue;
       for (const service of node.services)
-        check(service.ok, "fail", `${service.name} failing on ${node.name}`);
+        check(
+          service.ok,
+          node.satellite ? "warn" : "fail",
+          `${service.name} failing on ${node.name}`,
+        );
     }
   }
   if (section("Hosts", input.devices)) {
     for (const device of input.devices.data?.devices ?? []) {
-      if (device.health === "unknown") continue;
+      if (device.health === "unknown" || off(device.device_id)) continue;
       check(
         device.health === "healthy",
-        device.health === "critical" ? "fail" : "warn",
+        device.health === "critical" && !satellite(device.device_id) ? "fail" : "warn",
         `${device.device_id} host ${device.health}`,
       );
     }

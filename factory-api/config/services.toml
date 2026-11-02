@@ -13,6 +13,8 @@ services = [
 ]
 [[nodes]]
 name = "factory-console"
+# Satellite: optional; the factory runs normally while it is off.
+satellite = true
 services = [
   { name = "rdp", kind = "rdp", target = "factory-console:3389", interval_s = 300 },
   # Reachability only: no remote systemd/Chrome/replica freshness claim.

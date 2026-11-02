@@ -72,4 +72,37 @@ describe("verdict", () => {
     ]);
     expect(result.okCount).toBe(5);
   });
+  it("keeps an offline satellite and its stale host out of the verdict", () => {
+    const nodes = fleet.nodes.map((node) =>
+      node.name === "factory-console" ? { ...node, satellite: true } : node,
+    );
+    const result = verdict({
+      ...base,
+      fleet: loaded<Fleet>({ ...fleet, nodes }),
+      devices: loaded({
+        devices: [{ device_id: "factory-console", health: "critical", href: "" }],
+      }),
+    });
+    expect(result.issues.map((issue) => issue.label)).not.toContain("factory-console offline");
+    expect(result.issues.map((issue) => issue.label)).not.toContain(
+      "factory-console host critical",
+    );
+  });
+  it("downgrades an online satellite's failures to warnings", () => {
+    const console = {
+      ...fleet.nodes[1]!,
+      satellite: true,
+      online: true,
+      services: [{ name: "rdp", kind: "rdp", target: "", ok: false, latency_ms: null }],
+    };
+    const result = verdict({
+      ...base,
+      fleet: loaded<Fleet>({ ...fleet, nodes: [fleet.nodes[0]!, console] }),
+      devices: loaded({
+        devices: [{ device_id: "factory-console", health: "critical", href: "" }],
+      }),
+    });
+    expect(result.issues).toContainEqual({ tone: "warn", label: "rdp failing on factory-console" });
+    expect(result.issues).toContainEqual({ tone: "warn", label: "factory-console host critical" });
+  });
 });

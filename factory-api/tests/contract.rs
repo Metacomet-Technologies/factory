@@ -451,6 +451,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
             node,
             &[
                 "name",
+                "satellite",
                 "tailscale_ip",
                 "online",
                 "last_seen_ms",
@@ -458,6 +459,7 @@ async fn v1_contract_sync_ranges_events_and_outage() -> Result<()> {
                 "services",
             ],
         );
+        assert_eq!(node["satellite"], node["name"] == "factory-console");
     }
     assert_eq!(nodes[1]["online"], false);
     assert_eq!(nodes[1]["last_seen_ms"], Value::Null);
