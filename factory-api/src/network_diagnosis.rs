@@ -232,26 +232,38 @@ impl LinkState {
 }
 
 pub const DOWN_TICKS: u32 = 2;
+/// Consecutive faulty ticks before a layer names the state. A single slow or
+/// lossy burst, such as one uncached DNS lookup, opens no episode.
+pub const CONFIRM_TICKS: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Diagnosis {
     /// Consecutive Lost ticks per layer, in registry order.
     pub streak: [u32; 4],
+    /// Consecutive Degraded or Lost ticks per layer, in registry order.
+    pub faulty: [u32; 4],
     pub state: LinkState,
 }
 
-/// Advance one tick. A Lost layer is down from its second consecutive Lost
-/// tick and Degraded by loss before that; any other health, Unknown included,
-/// resets its streak, so recovery is immediate. The first layer in registry
-/// order that is down or degraded names the state, even when a later layer is
-/// down: a degraded lan masks a down wan.
+/// Advance one tick. A layer names a fault only from its CONFIRM_TICKS-th
+/// consecutive Degraded or Lost tick; the current tick's health picks the
+/// state. A Lost layer is down from its second consecutive Lost tick and
+/// Degraded by loss before that. Any other health, Unknown included, resets
+/// both streaks, so recovery is immediate. The first layer in registry order
+/// with a confirmed fault names the state, even when a later layer is down: a
+/// degraded lan masks a down wan, but a one-tick lan blip does not.
 pub fn step(previous: &Diagnosis, health: &[LayerHealth; 4]) -> Diagnosis {
     let streak = std::array::from_fn(|i| match health[i] {
         LayerHealth::Lost => previous.streak[i].saturating_add(1),
         _ => 0,
     });
+    let faulty = std::array::from_fn(|i| match health[i] {
+        LayerHealth::Lost | LayerHealth::Degraded(_) => previous.faulty[i].saturating_add(1),
+        LayerHealth::Unknown | LayerHealth::Ok => 0,
+    });
     let state = Layer::ALL
         .into_iter()
+        .filter(|&layer| faulty[layer as usize] >= CONFIRM_TICKS)
         .find_map(|layer| {
             let i = layer as usize;
             match health[i] {
@@ -265,7 +277,11 @@ pub fn step(previous: &Diagnosis, health: &[LayerHealth; 4]) -> Diagnosis {
             }
         })
         .unwrap_or_default();
-    Diagnosis { streak, state }
+    Diagnosis {
+        streak,
+        faulty,
+        state,
+    }
 }
 
 #[cfg(test)]
@@ -331,8 +347,7 @@ mod tests {
         Effective::Degraded(Jitter),
         Effective::Down,
     ];
-    /// Down is driven by the same Lost health on two consecutive ticks; the
-    /// rest need one tick.
+    /// Every fault needs two consecutive ticks; Down is the same Lost health twice.
     fn diagnose(effective: [Effective; 4]) -> LinkState {
         let health = effective.map(|e| match e {
             Effective::Unknown => Unknown,
@@ -340,12 +355,7 @@ mod tests {
             Effective::Degraded(reason) => degraded(reason),
             Effective::Down => Lost,
         });
-        let ticks = if effective.contains(&Effective::Down) {
-            2
-        } else {
-            1
-        };
-        *run(&vec![health; ticks]).last().unwrap()
+        *run(&[health; 2]).last().unwrap()
     }
 
     #[test]
@@ -447,8 +457,16 @@ mod tests {
                 down(Tailnet),
             ),
             (
-                "one tick of 100% loss is degraded, not yet down",
+                "one tick of 100% loss is not yet a fault",
                 vec![tick(fine, lost, fine, fine)],
+                LinkState::Healthy,
+            ),
+            (
+                "loss then 100% loss is degraded by loss, not yet down",
+                vec![
+                    tick(fine, burst(10, 5, 1000, 100), fine, fine),
+                    tick(fine, lost, fine, fine),
+                ],
                 loss(Wan),
             ),
             (
@@ -468,10 +486,52 @@ mod tests {
         let tick = [degraded(Latency), Lost, OK, OK];
         assert_eq!(
             run(&[tick, tick]),
-            [LinkState::Degraded {
-                layer: Lan,
+            [
+                LinkState::Healthy,
+                LinkState::Degraded {
+                    layer: Lan,
+                    reason: Latency
+                }
+            ]
+        );
+    }
+
+    /// Production pattern: one uncached DNS lookup per burst trips the dns
+    /// jitter limit for a single tick about 48 times a day. Such a blip opens
+    /// no episode and does not split a confirmed later-layer outage.
+    #[test]
+    fn single_tick_faults_name_nothing() {
+        let healthy = [OK, OK, OK, OK];
+        let dns_blip = [OK, OK, degraded(Jitter), OK];
+        for blip in [
+            dns_blip,
+            [degraded(Latency), OK, OK, OK],
+            [OK, Lost, OK, OK],
+            [OK, OK, OK, degraded(Loss)],
+        ] {
+            assert_eq!(
+                run(&[healthy, blip, healthy]),
+                [LinkState::Healthy; 3],
+                "{blip:?}"
+            );
+        }
+        // Two faulty ticks confirm, even when the reason changes between them.
+        assert_eq!(
+            run(&[
+                [OK, OK, degraded(Jitter), OK],
+                [OK, OK, degraded(Latency), OK]
+            ])[1],
+            LinkState::Degraded {
+                layer: Dns,
                 reason: Latency
-            }; 2]
+            }
+        );
+        let tailnet_down = [OK, OK, OK, Lost];
+        let blip_during_outage = [OK, OK, degraded(Jitter), Lost];
+        let down = LinkState::Down { layer: Tailnet };
+        assert_eq!(
+            run(&[tailnet_down, tailnet_down, blip_during_outage, tailnet_down]),
+            [LinkState::Healthy, down, down, down]
         );
     }
 
@@ -485,7 +545,13 @@ mod tests {
         let down_wan = LinkState::Down { layer: Wan };
         assert_eq!(
             run(&[wan(Lost), wan(Lost), wan(Lost)]),
-            [degraded_wan, down_wan, down_wan]
+            [LinkState::Healthy, down_wan, down_wan]
+        );
+        // A lossy tick confirms the fault; the following lost tick is still
+        // degraded by loss, and the second lost tick is down.
+        assert_eq!(
+            run(&[wan(degraded(Loss)), wan(Lost), wan(Lost)])[1..],
+            [degraded_wan, down_wan]
         );
         for gap in [Unknown, OK, degraded(Jitter)] {
             let states = run(&[wan(Lost), wan(gap), wan(Lost), wan(gap), wan(Lost)]);
@@ -494,19 +560,21 @@ mod tests {
         // One good tick ends an outage; no recovery streak is required.
         assert_eq!(
             run(&[wan(Lost), wan(Lost), wan(OK)]),
-            [degraded_wan, down_wan, LinkState::Healthy]
+            [LinkState::Healthy, down_wan, LinkState::Healthy]
         );
         assert_eq!(
             run(&[wan(Lost), wan(Lost), wan(Unknown)])[2],
             LinkState::Healthy
         );
-        // Streaks are per layer: wan's history does not make dns down.
+        // Streaks are per layer: wan's lost tick does not confirm dns.
+        let dns = [OK, OK, Lost, OK];
         assert_eq!(
-            run(&[wan(Lost), [OK, OK, Lost, OK]])[1],
-            LinkState::Degraded {
-                layer: Dns,
-                reason: Loss
-            }
+            run(&[wan(Lost), dns, dns]),
+            [
+                LinkState::Healthy,
+                LinkState::Healthy,
+                LinkState::Down { layer: Dns }
+            ]
         );
     }
 

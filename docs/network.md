@@ -113,11 +113,17 @@ times out after 1 s.
 - A layer with no sample this tick is unknown, for example when ping itself is
   broken. Unknown never names a fault, so a faulting layer that loses every
   sample ends its episode as `recovered`.
-- A layer is down after 2 consecutive `Lost` ticks. One `Lost` tick is
-  `Degraded { loss }`. Any other tick, unknown included, resets the count, so
-  recovery takes one good tick.
-- The first layer in registry order that is down or degraded names the state,
-  so a degraded `lan` masks a down `wan`.
+- A layer names a fault only after 2 consecutive faulty (degraded or `Lost`)
+  ticks, so a one-tick blip opens no event. In production, 94 % of events
+  were single 30 s ticks, mostly one slow uncached DNS lookup. The second
+  tick's health picks the state, and the event starts at that tick, 30 s
+  after the first faulty burst.
+- A layer is down after 2 consecutive `Lost` ticks. A confirmed fault whose
+  current tick is the first `Lost` one is `Degraded { loss }`. Any other
+  tick, unknown included, resets both counts, so recovery takes one good tick.
+- The first layer in registry order with a confirmed fault names the state,
+  so a degraded `lan` masks a down `wan`. A one-tick blip in an earlier layer
+  does not interrupt a later layer's event.
 - The `net_events` row for a state stays open while the state holds and
   tracks the peak loss, average RTT and jitter of the faulting layer's chosen
   targets. Recovery closes it as `recovered`. A different state closes it as

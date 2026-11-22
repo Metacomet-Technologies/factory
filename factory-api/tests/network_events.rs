@@ -123,21 +123,22 @@ fn episodes_open_track_peaks_change_and_recover() -> Result<()> {
     let mut db = database()?;
     let mut process = Process::start(&mut db);
     assert_eq!(process.tick(healthy(30_000))?, json!([]));
-    // Both wan targets lose 30%: degraded by loss, opened with that tick's peaks.
+    // One lossy tick is a blip: no episode.
+    assert_eq!(process.tick(wan(60_000, burst(7, 9_000, 500)))?, json!([]));
+    // The second confirms it: degraded by loss, opened with that tick's peaks.
     assert_eq!(
-        process.tick(wan(60_000, burst(7, 9_000, 500)))?,
-        json!([{"id":1,"state":"degraded","layer":"wan","reason":"loss","started_ms":60_000,
-                "ended_ms":null,"end_reason":null,"peak_loss_percent":30.0,
-                "peak_rtt_us":9_000,"peak_mdev_us":500}])
+        process.tick(wan(90_000, burst(6, 12_000, 300)))?,
+        json!([{"id":1,"state":"degraded","layer":"wan","reason":"loss","started_ms":90_000,
+                "ended_ms":null,"end_reason":null,"peak_loss_percent":40.0,
+                "peak_rtt_us":12_000,"peak_mdev_us":300}])
     );
     // The same state keeps the row and raises each peak independently.
-    assert_eq!(process.tick(wan(90_000, burst(6, 12_000, 300)))?, json!([]));
     assert_eq!(process.tick(wan(120_000, burst(8, 2_000, 900)))?, json!([]));
     // One lost tick is still degraded by loss: the same episode.
     assert_eq!(process.tick(wan(150_000, Burst::lost(10)))?, json!([]));
     assert_eq!(
         rows(process.db)?,
-        json!([{"id":1,"state":"degraded","layer":"wan","reason":"loss","started_ms":60_000,
+        json!([{"id":1,"state":"degraded","layer":"wan","reason":"loss","started_ms":90_000,
                 "ended_ms":null,"end_reason":null,"peak_loss_percent":100.0,
                 "peak_rtt_us":12_000,"peak_mdev_us":900}])
     );
@@ -145,7 +146,7 @@ fn episodes_open_track_peaks_change_and_recover() -> Result<()> {
     // down row opens at the same tick.
     assert_eq!(
         process.tick(wan(180_000, Burst::lost(10)))?,
-        json!([{"id":1,"state":"degraded","layer":"wan","reason":"loss","started_ms":60_000,
+        json!([{"id":1,"state":"degraded","layer":"wan","reason":"loss","started_ms":90_000,
                 "ended_ms":180_000,"end_reason":"changed","peak_loss_percent":100.0,
                 "peak_rtt_us":12_000,"peak_mdev_us":900},
                {"id":2,"state":"down","layer":"wan","started_ms":180_000,
@@ -172,22 +173,20 @@ fn a_restart_closes_the_previous_process_episode() -> Result<()> {
     first.tick(wan(60_000, Burst::lost(10)))?;
     let down = open_event(&db, DEVICE_ID)?.unwrap();
     assert_eq!(down.state, LinkState::Down { layer: Layer::Wan });
-    // Streaks restart, so the still-lost wan is degraded again, not a continuation.
+    // Streaks restart, so the still-lost wan must be confirmed again, not continued.
     let mut second = Process::start(&mut db);
     let changed = second.tick(wan(90_000, Burst::lost(10)))?;
     assert_eq!(
         changed,
         json!([{"id":down.id,"state":"down","layer":"wan","started_ms":60_000,
                 "ended_ms":90_000,"end_reason":"restart","peak_loss_percent":100.0,
-                "peak_rtt_us":null,"peak_mdev_us":null},
-               {"id":down.id + 1,"state":"degraded","layer":"wan","reason":"loss","started_ms":90_000,
-                "ended_ms":null,"end_reason":null,"peak_loss_percent":100.0,
                 "peak_rtt_us":null,"peak_mdev_us":null}])
     );
     // Later ticks of the same process are normal transitions.
     let changed = second.tick(wan(120_000, Burst::lost(10)))?;
-    assert_eq!(changed[0]["end_reason"], "changed");
-    assert_eq!(changed[1]["state"], "down");
+    assert_eq!(changed.as_array().unwrap().len(), 1);
+    assert_eq!(changed[0]["state"], "down");
+    assert_eq!(changed[0]["started_ms"], 120_000);
     // A healthy first tick still ends the leftover episode as restart, not recovered.
     let mut third = Process::start(&mut db);
     let changed = third.tick(healthy(150_000))?;
@@ -202,25 +201,27 @@ fn a_restart_closes_the_previous_process_episode() -> Result<()> {
 #[test]
 fn restart_stays_pending_until_a_tick_commits() -> Result<()> {
     let mut db = database()?;
-    Process::start(&mut db).tick(wan(30_000, burst(5, 1_000, 100)))?;
+    let mut first = Process::start(&mut db);
+    first.tick(wan(30_000, burst(5, 1_000, 100)))?;
+    first.tick(wan(60_000, burst(5, 1_000, 100)))?;
     let mut collector = Collector::default();
     // The first write of the new process fails (the clock is unsynchronized).
-    let lost = collector.diagnose(60_000, &healthy(60_000), &DEFAULT_THRESHOLDS);
+    let lost = collector.diagnose(90_000, &healthy(90_000), &DEFAULT_THRESHOLDS);
     assert!(lost.restart);
-    let retried = collector.diagnose(90_000, &healthy(90_000), &DEFAULT_THRESHOLDS);
+    let retried = collector.diagnose(120_000, &healthy(120_000), &DEFAULT_THRESHOLDS);
     assert!(
         retried.restart,
         "restart stays pending until a tick commits"
     );
-    let changed = record(&mut db, DEVICE_ID, &healthy(90_000), Some(&retried))?;
+    let changed = record(&mut db, DEVICE_ID, &healthy(120_000), Some(&retried))?;
     assert_eq!(
         (changed.len(), changed[0].end_reason, changed[0].ended_ms),
-        (1, Some(NetworkEndReason::Restart), Some(90_000))
+        (1, Some(NetworkEndReason::Restart), Some(120_000))
     );
     collector.committed();
     assert!(
         !collector
-            .diagnose(120_000, &healthy(120_000), &DEFAULT_THRESHOLDS)
+            .diagnose(150_000, &healthy(150_000), &DEFAULT_THRESHOLDS)
             .restart
     );
     Ok(())
@@ -241,20 +242,23 @@ fn unknown_layers_are_never_blamed() -> Result<()> {
     );
     // One unsampled wan target does not hide the other's loss.
     process.tick(healthy(120_000))?;
-    let half = tick(
-        150_000,
-        [
-            Some(fine()),
-            None,
-            Some(burst(5, 1_000, 100)),
-            Some(fine()),
-            Some(fine()),
-        ],
-    );
-    assert_eq!(process.tick(half)?[0]["layer"], "wan");
+    let half = |ts_ms| {
+        tick(
+            ts_ms,
+            [
+                Some(fine()),
+                None,
+                Some(burst(5, 1_000, 100)),
+                Some(fine()),
+                Some(fine()),
+            ],
+        )
+    };
+    process.tick(half(150_000))?;
+    assert_eq!(process.tick(half(180_000))?[0]["layer"], "wan");
     // Losing every sample of the faulting layer ends its episode: missing
     // evidence names no fault, so the link reads healthy.
-    let changed = process.tick(broken(180_000, fine()))?;
+    let changed = process.tick(broken(210_000, fine()))?;
     assert_eq!(changed[0]["end_reason"], "recovered");
     assert_eq!(open_event(&db, DEVICE_ID)?, None);
     Ok(())
@@ -263,7 +267,9 @@ fn unknown_layers_are_never_blamed() -> Result<()> {
 #[test]
 fn event_writes_share_the_sample_transaction_and_reject_stale_ticks() -> Result<()> {
     let mut db = database()?;
-    Process::start(&mut db).tick(wan(60_000, burst(5, 1_000, 100)))?;
+    let mut process = Process::start(&mut db);
+    process.tick(wan(30_000, burst(5, 1_000, 100)))?;
+    process.tick(wan(60_000, burst(5, 1_000, 100)))?;
     let samples = |db: &Connection| -> Result<i64> {
         Ok(db.query_row("SELECT COUNT(*) FROM net_probe_samples", [], |r| r.get(0))?)
     };
@@ -519,7 +525,7 @@ async fn endpoints_serve_the_stored_state_and_pages_in_constant_queries() -> Res
         .await?;
         state.network = NetworkConfig::default().targets().into();
         state.db.clock_synchronized.store(true, Ordering::Release);
-        // n wan outages that each recover, then one still down.
+        // n wan outages that each degrade, go down and recover, then one still down.
         state
             .db
             .write(&Scope::default(), move |db| {
@@ -531,14 +537,18 @@ async fn endpoints_serve_the_stored_state_and_pages_in_constant_queries() -> Res
                     collector.committed();
                     Ok(())
                 };
+                let outage = |write: &mut dyn FnMut(Vec<Sample>) -> Result<()>, ts_ms: i64| {
+                    write(wan(ts_ms, burst(5, 1_000, 100)))?;
+                    write(wan(ts_ms + 30_000, burst(5, 1_000, 100)))?;
+                    write(wan(ts_ms + 60_000, Burst::lost(10)))?;
+                    write(wan(ts_ms + 90_000, Burst::lost(10)))
+                };
                 for _ in 0..n {
-                    write(wan(ts_ms, Burst::lost(10)))?;
-                    write(wan(ts_ms + 30_000, Burst::lost(10)))?;
-                    write(healthy(ts_ms + 60_000))?;
-                    ts_ms += 90_000;
+                    outage(&mut write, ts_ms)?;
+                    write(healthy(ts_ms + 120_000))?;
+                    ts_ms += 150_000;
                 }
-                write(wan(ts_ms, Burst::lost(10)))?;
-                write(wan(ts_ms + 30_000, Burst::lost(10)))?;
+                outage(&mut write, ts_ms)?;
                 Ok(())
             })
             .await?;
@@ -556,7 +566,7 @@ async fn endpoints_serve_the_stored_state_and_pages_in_constant_queries() -> Res
         };
         let (status, body, queries) = get("/v1/network".into(), Scope::default()).await?;
         assert_eq!((status.as_u16(), queries), (200, 3), "/v1/network n={n}");
-        let down_ms = 30_000 + n * 90_000 + 30_000;
+        let down_ms = 30_000 + n * 150_000 + 90_000;
         assert_eq!(body["state"], json!({"state": "down", "layer": "wan"}));
         assert_eq!(
             body["open_event"],
