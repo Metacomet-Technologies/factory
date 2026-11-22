@@ -377,7 +377,7 @@ mod api {
         }
     }
 
-    #[utoipa::path(get, path = "/meter/health", responses((status = 200, body = MeterHealth), (status = 503, body = ApiError)))]
+    #[utoipa::path(get, path = "/meter/health", responses((status = 200, description = "OK", body = MeterHealth), (status = 503, description = "Unavailable", body = ApiError)))]
     async fn health(state: &AppState) -> Result<serde_json::Value, String> {
         state.db.health().await.map_err(|e| e.to_string())?;
         serde_json::to_value(MeterHealth {
@@ -389,7 +389,7 @@ mod api {
         .map_err(|e| e.to_string())
     }
 
-    #[utoipa::path(get, path = "/meter/gpu", responses((status = 200, body = GpuResponse), (status = 503, body = ApiError)))]
+    #[utoipa::path(get, path = "/meter/gpu", responses((status = 200, description = "OK", body = GpuResponse), (status = 503, description = "Unavailable", body = ApiError)))]
     async fn gpu(state: &AppState) -> Result<serde_json::Value, String> {
         let gpus = telemetry::gpu().await?;
         let request = Request::builder()
@@ -418,7 +418,7 @@ mod api {
         serde_json::to_value(GpuResponse { gpus, ollama_ps }).map_err(|e| e.to_string())
     }
 
-    #[utoipa::path(get, path = "/meter/stats", params(("range" = Option<String>, Query, description = "24h (default), 7d, 30d, 365d. Percentiles are exact through 30d and approximate (flagged) beyond."), ("model" = Option<String>, Query)), responses((status = 200, body = [ModelStats]), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
+    #[utoipa::path(get, path = "/meter/stats", params(("range" = Option<String>, Query, description = "24h (default), 7d, 30d, 365d. Percentiles are exact through 30d and approximate (flagged) beyond."), ("model" = Option<String>, Query)), responses((status = 200, description = "OK", body = [ModelStats]), (status = 400, description = "Invalid request", body = ApiError), (status = 503, description = "Unavailable", body = ApiError)))]
     async fn stats_doc(
         state: &AppState,
         since: i64,
@@ -435,10 +435,10 @@ mod api {
     #[utoipa::path(get, path = "/meter/requests", params(
         ("limit" = Option<usize>, Query, description = "Without after_id: 1..10000, default 100. With after_id: 1..5000, default 500."),
         ("after_id" = Option<i64>, Query, description = "Nonnegative cursor: return id > after_id in ascending order. Omit for legacy newest-first behavior.")
-    ), responses((status = 200, body = [RequestRecord], headers(
+    ), responses((status = 200, description = "OK", body = [RequestRecord], headers(
         ("next_after_id" = i64, description = "Present only with after_id: last returned ID, or the supplied cursor for an empty page."),
         ("oldest_retained_id" = i64, description = "Present only with after_id on a nonempty page: the lowest request ID meter still stores, read in the same snapshot. Lower IDs were removed by 365-day retention, which never removes a higher ID.")
-    )), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
+    )), (status = 400, description = "Invalid request", body = ApiError), (status = 503, description = "Unavailable", body = ApiError)))]
     async fn requests_doc(
         state: &AppState,
         limit: usize,
@@ -460,7 +460,7 @@ mod api {
         }
         Ok(response)
     }
-    #[utoipa::path(get, path = "/meter/gpu/history", params(("range" = Option<String>, Query, description = "24h (default), 7d, 30d, 365d. Raw samples are retained 7 days; longer ranges return hourly means (with samples) before that.")), responses((status = 200, body = [rollup::GpuPoint]), (status = 400, body = ApiError), (status = 503, body = ApiError)))]
+    #[utoipa::path(get, path = "/meter/gpu/history", params(("range" = Option<String>, Query, description = "24h (default), 7d, 30d, 365d. Raw samples are retained 7 days; longer ranges return hourly means (with samples) before that.")), responses((status = 200, description = "OK", body = [rollup::GpuPoint]), (status = 400, description = "Invalid request", body = ApiError), (status = 503, description = "Unavailable", body = ApiError)))]
     async fn history_doc(
         state: &AppState,
         since: i64,

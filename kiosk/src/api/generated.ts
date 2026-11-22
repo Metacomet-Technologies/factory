@@ -1583,6 +1583,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -1602,6 +1603,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description Accepted */
       202: {
         headers: {
           [name: string]: unknown;
@@ -1610,6 +1612,7 @@ export interface operations {
           "application/json": components["schemas"]["AgentsRefresh"];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -1618,6 +1621,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Forbidden */
       403: {
         headers: {
           [name: string]: unknown;
@@ -1626,6 +1630,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Request too large */
       413: {
         headers: {
           [name: string]: unknown;
@@ -1634,6 +1639,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Too many requests */
       429: {
         headers: {
           /** @description Seconds until next refresh, rounded up */
@@ -1644,6 +1650,7 @@ export interface operations {
           "application/json": components["schemas"]["AgentsRefreshCooldown"];
         };
       };
+      /** @description Internal error */
       500: {
         headers: {
           [name: string]: unknown;
@@ -1663,6 +1670,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -1682,6 +1690,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -1701,6 +1710,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -1709,6 +1719,7 @@ export interface operations {
           "application/json": components["schemas"]["DeviceView"];
         };
       };
+      /** @description Not found */
       404: {
         headers: {
           [name: string]: unknown;
@@ -1731,6 +1742,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -1739,6 +1751,7 @@ export interface operations {
           "application/json": components["schemas"]["DeviceHistory"];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -1747,6 +1760,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Not found */
       404: {
         headers: {
           [name: string]: unknown;
@@ -1768,6 +1782,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -1776,6 +1791,7 @@ export interface operations {
           "application/json": components["schemas"]["DeviceView"];
         };
       };
+      /** @description Not found */
       404: {
         headers: {
           [name: string]: unknown;
@@ -1800,6 +1816,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -1808,6 +1825,7 @@ export interface operations {
           "application/json": components["schemas"]["DeviceHistory"];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -1816,6 +1834,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Not found */
       404: {
         headers: {
           [name: string]: unknown;
@@ -1842,6 +1861,7 @@ export interface operations {
       };
     };
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -1850,6 +1870,7 @@ export interface operations {
           "application/json": components["schemas"]["IngestResult"];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -1858,6 +1879,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Unauthorized */
       401: {
         headers: {
           [name: string]: unknown;
@@ -1866,6 +1888,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Forbidden */
       403: {
         headers: {
           [name: string]: unknown;
@@ -1874,6 +1897,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Method not allowed */
       405: {
         headers: {
           [name: string]: unknown;
@@ -1882,6 +1906,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Request too large */
       413: {
         headers: {
           [name: string]: unknown;
@@ -1890,6 +1915,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Unsupported media type */
       415: {
         headers: {
           [name: string]: unknown;
@@ -1898,6 +1924,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Too many requests */
       429: {
         headers: {
           /** @description Seconds before retrying */
@@ -1908,6 +1935,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Internal error */
       500: {
         headers: {
           [name: string]: unknown;
@@ -1927,6 +1955,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -1949,6 +1978,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -1957,6 +1987,7 @@ export interface operations {
           "application/json": components["schemas"]["Gpu"];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -1976,6 +2007,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -1998,6 +2030,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2006,6 +2039,7 @@ export interface operations {
           "application/json": components["schemas"]["Usage"];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -2025,6 +2059,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2033,6 +2068,7 @@ export interface operations {
           "application/json": components["schemas"]["NetworkStatus"];
         };
       };
+      /** @description Internal error */
       500: {
         headers: {
           [name: string]: unknown;
@@ -2057,6 +2093,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2065,6 +2102,7 @@ export interface operations {
           "application/json": components["schemas"]["NetworkEvents"];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -2073,6 +2111,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Internal error */
       500: {
         headers: {
           [name: string]: unknown;
@@ -2095,6 +2134,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2103,6 +2143,7 @@ export interface operations {
           "application/json": components["schemas"]["NetworkHistory"];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -2111,6 +2152,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Internal error */
       500: {
         headers: {
           [name: string]: unknown;
@@ -2133,6 +2175,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2141,6 +2184,7 @@ export interface operations {
           "application/json": components["schemas"]["NetworkSpeedTests"];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -2149,6 +2193,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Internal error */
       500: {
         headers: {
           [name: string]: unknown;
@@ -2168,6 +2213,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2189,6 +2235,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2197,6 +2244,7 @@ export interface operations {
           "application/json": components["schemas"]["Pricing"];
         };
       };
+      /** @description Not found */
       404: {
         headers: {
           [name: string]: unknown;
@@ -2205,6 +2253,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Conflict */
       409: {
         headers: {
           [name: string]: unknown;
@@ -2224,6 +2273,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2243,6 +2293,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2251,6 +2302,7 @@ export interface operations {
           "application/json": components["schemas"]["UpsSettings"];
         };
       };
+      /** @description Internal error */
       500: {
         headers: {
           [name: string]: unknown;
@@ -2274,6 +2326,7 @@ export interface operations {
       };
     };
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2282,6 +2335,7 @@ export interface operations {
           "application/json": components["schemas"]["UpsSettings"];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -2290,6 +2344,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Forbidden */
       403: {
         headers: {
           [name: string]: unknown;
@@ -2298,6 +2353,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Request too large */
       413: {
         headers: {
           [name: string]: unknown;
@@ -2306,6 +2362,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Internal error */
       500: {
         headers: {
           [name: string]: unknown;
@@ -2314,6 +2371,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Unavailable */
       503: {
         headers: {
           [name: string]: unknown;
@@ -2333,6 +2391,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2352,6 +2411,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2374,6 +2434,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2382,6 +2443,7 @@ export interface operations {
           "application/json": components["schemas"]["UpsEnergy"];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -2390,6 +2452,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Internal error */
       500: {
         headers: {
           [name: string]: unknown;
@@ -2416,6 +2479,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2424,6 +2488,7 @@ export interface operations {
           "application/json": components["schemas"]["UpsEvents"];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -2432,6 +2497,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Internal error */
       500: {
         headers: {
           [name: string]: unknown;
@@ -2454,6 +2520,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
+      /** @description OK */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2462,6 +2529,7 @@ export interface operations {
           "application/json": components["schemas"]["UpsPoint"][];
         };
       };
+      /** @description Invalid request */
       400: {
         headers: {
           [name: string]: unknown;
@@ -2470,6 +2538,7 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Internal error */
       500: {
         headers: {
           [name: string]: unknown;

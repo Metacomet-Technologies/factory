@@ -524,7 +524,8 @@
                   "$ref": "#/components/schemas/GpuResponse"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "503": {
             "content": {
@@ -533,7 +534,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Unavailable"
           }
         },
         "tags": []
@@ -564,7 +566,8 @@
                   "type": "array"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -573,7 +576,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "503": {
             "content": {
@@ -582,7 +586,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Unavailable"
           }
         },
         "tags": []
@@ -599,7 +604,8 @@
                   "$ref": "#/components/schemas/MeterHealth"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "503": {
             "content": {
@@ -608,7 +614,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Unavailable"
           }
         },
         "tags": []
@@ -662,6 +669,7 @@
                 }
               }
             },
+            "description": "OK",
             "headers": {
               "next_after_id": {
                 "description": "Present only with after_id: last returned ID, or the supplied cursor for an empty page.",
@@ -686,7 +694,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "503": {
             "content": {
@@ -695,7 +704,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Unavailable"
           }
         },
         "tags": []
@@ -734,7 +744,8 @@
                   "type": "array"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -743,7 +754,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "503": {
             "content": {
@@ -752,7 +764,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Unavailable"
           }
         },
         "tags": []

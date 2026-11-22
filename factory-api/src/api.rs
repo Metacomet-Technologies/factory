@@ -305,7 +305,7 @@ fn openapi_sha256() -> &'static str {
         digest[..6].iter().map(|b| format!("{b:02x}")).collect()
     })
 }
-#[utoipa::path(get, path="/v1/health", responses((status=200, body=Health)))]
+#[utoipa::path(get, path="/v1/health", responses((status=200, description="OK", body=Health)))]
 async fn health(state: &AppState) -> Json<Health> {
     #[derive(serde::Deserialize)]
     struct MeterHealth {
@@ -340,7 +340,7 @@ async fn health(state: &AppState) -> Json<Health> {
         retention: state.retention(),
     })
 }
-#[utoipa::path(get, path="/v1/fleet", responses((status=200, body=Fleet)))]
+#[utoipa::path(get, path="/v1/fleet", responses((status=200, description="OK", body=Fleet)))]
 async fn fleet(state: &AppState) -> Json<Fleet> {
     if state.fleet.read().await.generated_at_ms == 0 {
         state.collect_fleet().await;
@@ -375,7 +375,7 @@ fn device_route(path: &str) -> Option<DeviceRoute> {
     Some(kind(id.into()))
 }
 
-#[utoipa::path(get, path="/v1/devices", responses((status=200, body=DeviceList)))]
+#[utoipa::path(get, path="/v1/devices", responses((status=200, description="OK", body=DeviceList)))]
 async fn devices_list(state: &AppState) -> Json<DeviceList> {
     let view = state.devices_view().await;
     let mut devices = vec![view.summary()];
@@ -388,7 +388,7 @@ async fn devices_list(state: &AppState) -> Json<DeviceList> {
     })
 }
 
-#[utoipa::path(get, path="/v1/devices/factory-gpu", responses((status=200, body=DeviceView),(status=404, body=ApiError)))]
+#[utoipa::path(get, path="/v1/devices/factory-gpu", responses((status=200, description="OK", body=DeviceView),(status=404, description="Not found", body=ApiError)))]
 async fn device_current(state: &AppState) -> Json<DeviceView> {
     Json(state.devices_view().await)
 }
@@ -396,7 +396,7 @@ async fn device_current(state: &AppState) -> Json<DeviceView> {
 /// An enrolled remote device: stale after 45 s of transport or collection age, and
 /// `unknown` until its first fresh sample since factory-api started. `factory-gpu`
 /// is served the same way at its literal path.
-#[utoipa::path(get, path="/v1/devices/{device_id}", params(("device_id"=String, Path)), responses((status=200, body=DeviceView),(status=404, body=ApiError)))]
+#[utoipa::path(get, path="/v1/devices/{device_id}", params(("device_id"=String, Path)), responses((status=200, description="OK", body=DeviceView),(status=404, description="Not found", body=ApiError)))]
 async fn remote_device_current(state: &AppState, device_id: &str) -> Json<DeviceView> {
     Json(state.remote.view(device_id, now_ms()).await)
 }
@@ -415,12 +415,12 @@ fn device_range(request: &Request<Body>) -> Result<(String, i64, i64, bool), Str
     Ok((range, now - hours * devices_history::HOUR_MS, now, raw))
 }
 
-#[utoipa::path(get, path="/v1/devices/factory-gpu/history", params(("range"=Option<String>, Query, description="1h (default), 24h, or 7d")), responses((status=200, body=DeviceHistory),(status=400, body=ApiError),(status=404, body=ApiError)))]
+#[utoipa::path(get, path="/v1/devices/factory-gpu/history", params(("range"=Option<String>, Query, description="1h (default), 24h, or 7d")), responses((status=200, description="OK", body=DeviceHistory),(status=400, description="Invalid request", body=ApiError),(status=404, description="Not found", body=ApiError)))]
 async fn device_history(state: &AppState, request: Request<Body>) -> Response {
     history_for(state, devices::DEVICE_ID, request).await
 }
 
-#[utoipa::path(get, path="/v1/devices/{device_id}/history", params(("device_id"=String, Path), ("range"=Option<String>, Query, description="1h (default), 24h, or 7d")), responses((status=200, body=DeviceHistory),(status=400, body=ApiError),(status=404, body=ApiError)))]
+#[utoipa::path(get, path="/v1/devices/{device_id}/history", params(("device_id"=String, Path), ("range"=Option<String>, Query, description="1h (default), 24h, or 7d")), responses((status=200, description="OK", body=DeviceHistory),(status=400, description="Invalid request", body=ApiError),(status=404, description="Not found", body=ApiError)))]
 async fn remote_device_history(
     state: &AppState,
     device_id: &str,
@@ -503,11 +503,11 @@ fn caller(request: &Request<Body>) -> (String, String) {
     request_body(content=crate::devices_ingest::DeviceSampleV1, description="Schema version 1 sample; see docs/devices-ingest.md", content_type="application/json"),
     security(("device_bearer"=[])),
     responses(
-        (status=200, body=IngestResult),
-        (status=400, body=ApiError), (status=401, body=ApiError), (status=403, body=ApiError),
-        (status=405, body=ApiError), (status=413, body=ApiError), (status=415, body=ApiError),
-        (status=429, body=ApiError, headers(("Retry-After"=u64, description="Seconds before retrying"))),
-        (status=500, body=ApiError)
+        (status=200, description="OK", body=IngestResult),
+        (status=400, description="Invalid request", body=ApiError), (status=401, description="Unauthorized", body=ApiError), (status=403, description="Forbidden", body=ApiError),
+        (status=405, description="Method not allowed", body=ApiError), (status=413, description="Request too large", body=ApiError), (status=415, description="Unsupported media type", body=ApiError),
+        (status=429, description="Too many requests", body=ApiError, headers(("Retry-After"=u64, description="Seconds before retrying"))),
+        (status=500, description="Internal error", body=ApiError)
     ))]
 async fn ingest_sample(state: &AppState, device_id: &str, request: Request<Body>) -> Response {
     let claimed = if crate::device_auth::valid_device_id(device_id) {
@@ -604,7 +604,7 @@ async fn ingest_sample(state: &AppState, device_id: &str, request: Request<Body>
     }
 }
 
-#[utoipa::path(get, path="/v1/ups", responses((status=200, body=Ups)))]
+#[utoipa::path(get, path="/v1/ups", responses((status=200, description="OK", body=Ups)))]
 async fn ups(state: &AppState) -> Json<Ups> {
     Json(state.ups().await)
 }
@@ -626,7 +626,7 @@ fn ups_range(request: &Request<Body>) -> Result<(String, i64, i64), String> {
 }
 /// Raw ranges use at most 720 time buckets. All metrics expose min/avg/max;
 /// runtime is the minimum. Longer ranges include the overlapping hourly bucket.
-#[utoipa::path(get, path="/v1/ups/history", params(("range"=Option<String>, Query, description="1h, 24h (default), 7d, 30d, 365d")), responses((status=200, body=[UpsPoint]),(status=400, body=ApiError),(status=500, body=ApiError)))]
+#[utoipa::path(get, path="/v1/ups/history", params(("range"=Option<String>, Query, description="1h, 24h (default), 7d, 30d, 365d")), responses((status=200, description="OK", body=[UpsPoint]),(status=400, description="Invalid request", body=ApiError),(status=500, description="Internal error", body=ApiError)))]
 async fn ups_history(state: &AppState, request: Request<Body>) -> Response {
     let (_, since, now) = match ups_range(&request) {
         Ok(v) => v,
@@ -649,7 +649,7 @@ struct UpsEventsQuery {
     before_ms: Option<i64>,
     before_id: Option<i64>,
 }
-#[utoipa::path(get, path="/v1/ups/events", params(("limit"=Option<u32>, Query, description="1–200; default 50"),("before_ms"=Option<i64>, Query, description="Exclusive timestamp cursor"),("before_id"=Option<i64>, Query, description="Use with next_before_ms to page simultaneous events without loss")), responses((status=200, body=UpsEvents),(status=400, body=ApiError),(status=500, body=ApiError)))]
+#[utoipa::path(get, path="/v1/ups/events", params(("limit"=Option<u32>, Query, description="1–200; default 50"),("before_ms"=Option<i64>, Query, description="Exclusive timestamp cursor"),("before_id"=Option<i64>, Query, description="Use with next_before_ms to page simultaneous events without loss")), responses((status=200, description="OK", body=UpsEvents),(status=400, description="Invalid request", body=ApiError),(status=500, description="Internal error", body=ApiError)))]
 async fn ups_events(state: &AppState, request: Request<Body>) -> Response {
     let query = match Query::<UpsEventsQuery>::try_from_uri(request.uri()) {
         Ok(Query(v)) => v,
@@ -687,7 +687,7 @@ async fn ups_events(state: &AppState, request: Request<Body>) -> Response {
 /// no more than 30s apart. An expired leading partial hour is omitted, not estimated.
 /// GPU energy uses the same covered UPS intervals and right-endpoint rounding.
 /// It is null if GPU coverage is missing or its energy exceeds the UPS load.
-#[utoipa::path(get, path="/v1/ups/energy", params(("range"=Option<String>, Query, description="1h, 24h (default), 7d, 30d, 365d")), responses((status=200, body=UpsEnergy),(status=400, body=ApiError),(status=500, body=ApiError)))]
+#[utoipa::path(get, path="/v1/ups/energy", params(("range"=Option<String>, Query, description="1h, 24h (default), 7d, 30d, 365d")), responses((status=200, description="OK", body=UpsEnergy),(status=400, description="Invalid request", body=ApiError),(status=500, description="Internal error", body=ApiError)))]
 async fn ups_energy(state: &AppState, request: Request<Body>) -> Response {
     let (range, since, now) = match ups_range(&request) {
         Ok(v) => v,
@@ -735,7 +735,7 @@ async fn ups_energy(state: &AppState, request: Request<Body>) -> Response {
     .await;
     response(result)
 }
-#[utoipa::path(get, path="/v1/settings/ups", responses((status=200, body=UpsSettings),(status=500, body=ApiError)))]
+#[utoipa::path(get, path="/v1/settings/ups", responses((status=200, description="OK", body=UpsSettings),(status=500, description="Internal error", body=ApiError)))]
 async fn get_ups_settings(state: &AppState) -> Response {
     response(
         state
@@ -745,7 +745,7 @@ async fn get_ups_settings(state: &AppState) -> Response {
             .await,
     )
 }
-#[utoipa::path(put, path="/v1/settings/ups", request_body=UpsSettings, responses((status=200, body=UpsSettings),(status=400, body=ApiError),(status=403, body=ApiError),(status=413, body=ApiError),(status=503, body=ApiError),(status=500, body=ApiError)))]
+#[utoipa::path(put, path="/v1/settings/ups", request_body=UpsSettings, responses((status=200, description="OK", body=UpsSettings),(status=400, description="Invalid request", body=ApiError),(status=403, description="Forbidden", body=ApiError),(status=413, description="Request too large", body=ApiError),(status=503, description="Unavailable", body=ApiError),(status=500, description="Internal error", body=ApiError)))]
 async fn put_ups_settings(state: &AppState, request: Request<Body>) -> Response {
     if request
         .headers()
@@ -793,7 +793,7 @@ async fn put_ups_settings(state: &AppState, request: Request<Body>) -> Response 
 }
 /// Every registry target in layer order with its latest stored sample (null
 /// before the first tick), plus network and clock warnings.
-#[utoipa::path(get, path="/v1/network", responses((status=200, body=NetworkStatus),(status=500, body=ApiError)))]
+#[utoipa::path(get, path="/v1/network", responses((status=200, description="OK", body=NetworkStatus),(status=500, description="Internal error", body=ApiError)))]
 async fn network(state: &AppState) -> Response {
     response(state.network().await)
 }
@@ -812,7 +812,7 @@ struct NetworkHistory {
 /// 1h and 24h read raw bursts in at most 720 buckets per target; jitter is the
 /// mean of the bursts' mdev. 7d and 30d read hourly rollups; jitter is the
 /// nearest-rank p95 of each hour's mdev values. Loss is lost replies over sent.
-#[utoipa::path(get, path="/v1/network/history", params(("range"=Option<String>, Query, description="1h, 24h (default), 7d, 30d")), responses((status=200, body=NetworkHistory),(status=400, body=ApiError),(status=500, body=ApiError)))]
+#[utoipa::path(get, path="/v1/network/history", params(("range"=Option<String>, Query, description="1h, 24h (default), 7d, 30d")), responses((status=200, description="OK", body=NetworkHistory),(status=400, description="Invalid request", body=ApiError),(status=500, description="Internal error", body=ApiError)))]
 async fn network_history(state: &AppState, request: Request<Body>) -> Response {
     let Ok(Query(query)) = Query::<RangeQuery>::try_from_uri(request.uri()) else {
         return error(StatusCode::BAD_REQUEST, "invalid_range", "malformed query");
@@ -856,7 +856,7 @@ struct NetworkSpeedTests {
     tests: Vec<NetworkSpeedTest>,
 }
 /// Throughput tests that started within the range, for charts.
-#[utoipa::path(get, path="/v1/network/speed-tests", params(("range"=Option<String>, Query, description="24h, 7d (default), 30d, 365d")), responses((status=200, body=NetworkSpeedTests),(status=400, body=ApiError),(status=500, body=ApiError)))]
+#[utoipa::path(get, path="/v1/network/speed-tests", params(("range"=Option<String>, Query, description="24h, 7d (default), 30d, 365d")), responses((status=200, description="OK", body=NetworkSpeedTests),(status=400, description="Invalid request", body=ApiError),(status=500, description="Internal error", body=ApiError)))]
 async fn network_speed_tests(state: &AppState, request: Request<Body>) -> Response {
     let Ok(Query(query)) = Query::<RangeQuery>::try_from_uri(request.uri()) else {
         return error(StatusCode::BAD_REQUEST, "invalid_range", "malformed query");
@@ -894,7 +894,7 @@ struct NetworkEventsQuery {
     before: Option<i64>,
 }
 /// Degraded and down episodes, newest first by started_ms then id, the open one included.
-#[utoipa::path(get, path="/v1/network/events", params(("limit"=Option<u32>, Query, description="1–200; default 50"),("before"=Option<i64>, Query, description="Exclusive cursor: an event id, such as the previous page's next_before. The page continues after that event in (started_ms, id) descending order; an unknown id is a 400.")), responses((status=200, body=NetworkEvents),(status=400, body=ApiError),(status=500, body=ApiError)))]
+#[utoipa::path(get, path="/v1/network/events", params(("limit"=Option<u32>, Query, description="1–200; default 50"),("before"=Option<i64>, Query, description="Exclusive cursor: an event id, such as the previous page's next_before. The page continues after that event in (started_ms, id) descending order; an unknown id is a 400.")), responses((status=200, description="OK", body=NetworkEvents),(status=400, description="Invalid request", body=ApiError),(status=500, description="Internal error", body=ApiError)))]
 async fn network_events(state: &AppState, request: Request<Body>) -> Response {
     let query = match Query::<NetworkEventsQuery>::try_from_uri(request.uri()) {
         Ok(Query(v)) => v,
@@ -926,20 +926,20 @@ async fn network_events(state: &AppState, request: Request<Body>) -> Response {
         Err(e) => response::<()>(Err(e)),
     }
 }
-#[utoipa::path(get, path="/v1/agents", responses((status=200, body=Agents)))]
+#[utoipa::path(get, path="/v1/agents", responses((status=200, description="OK", body=Agents)))]
 async fn agents(state: &AppState) -> Json<Agents> {
     Json(crate::usage::read(&state.usage_snapshot).await)
 }
 /// Active alerts and the last 20 cleared ones, as posted to Slack `#factory-alerts`.
-#[utoipa::path(get, path="/v1/alerts", responses((status=200, body=Alerts)))]
+#[utoipa::path(get, path="/v1/alerts", responses((status=200, description="OK", body=Alerts)))]
 async fn alerts(state: &AppState) -> Json<Alerts> {
     Json(state.alerts.view().await)
 }
 #[utoipa::path(post, path="/v1/agents/refresh", responses(
-    (status=202, body=AgentsRefresh),
-    (status=429, body=AgentsRefreshCooldown, headers(("Retry-After"=u64, description="Seconds until next refresh, rounded up"))),
-    (status=400, body=ApiError), (status=403, body=ApiError),
-    (status=413, body=ApiError), (status=500, body=ApiError)
+    (status=202, description="Accepted", body=AgentsRefresh),
+    (status=429, description="Too many requests", body=AgentsRefreshCooldown, headers(("Retry-After"=u64, description="Seconds until next refresh, rounded up"))),
+    (status=400, description="Invalid request", body=ApiError), (status=403, description="Forbidden", body=ApiError),
+    (status=413, description="Request too large", body=ApiError), (status=500, description="Internal error", body=ApiError)
 ))]
 async fn refresh_agents(state: &AppState, request: Request<Body>) -> Response {
     // Block cross-site browser submissions without adding privileges or auth.
@@ -1006,7 +1006,7 @@ async fn refresh_agents(state: &AppState, request: Request<Body>) -> Response {
         ),
     }
 }
-#[utoipa::path(get, path="/v1/stream", responses((status=200, content_type="text/event-stream", body=StreamEvent)))]
+#[utoipa::path(get, path="/v1/stream", responses((status=200, description="OK", content_type="text/event-stream", body=StreamEvent)))]
 fn stream(
     state: &AppState,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>> + use<>> {
@@ -1043,23 +1043,23 @@ fn stream(
     );
     Sse::new(events)
 }
-#[utoipa::path(get, path="/v1/llm/usage", params(("range"=Option<String>, Query, description="24h (default), 7d, 30d, 365d. Percentiles are exact nearest-rank values through 30d; 365d percentiles come from merged latency histograms and set percentiles_approximate.")), responses((status=200, body=Usage),(status=400, body=ApiError)))]
+#[utoipa::path(get, path="/v1/llm/usage", params(("range"=Option<String>, Query, description="24h (default), 7d, 30d, 365d. Percentiles are exact nearest-rank values through 30d; 365d percentiles come from merged latency histograms and set percentiles_approximate.")), responses((status=200, description="OK", body=Usage),(status=400, description="Invalid request", body=ApiError)))]
 async fn usage(state: &AppState, range: String, since: i64) -> Response {
     response(state.usage(range, since).await)
 }
-#[utoipa::path(get, path="/v1/gpu", params(("range"=Option<String>, Query, description="1h (default), 24h, 7d")), responses((status=200, body=Gpu),(status=400, body=ApiError)))]
+#[utoipa::path(get, path="/v1/gpu", params(("range"=Option<String>, Query, description="1h (default), 24h, 7d")), responses((status=200, description="OK", body=Gpu),(status=400, description="Invalid request", body=ApiError)))]
 async fn gpu(state: &AppState, range: &str, since: i64) -> Response {
     Json(state.gpu(range, since).await).into_response()
 }
-#[utoipa::path(get, path="/v1/pricing", responses((status=200, body=Pricing)))]
+#[utoipa::path(get, path="/v1/pricing", responses((status=200, description="OK", body=Pricing)))]
 async fn pricing(state: &AppState) -> Response {
     response(state.pricing().await)
 }
-#[utoipa::path(post, path="/v1/pricing/refresh", responses((status=200, body=Pricing)))]
+#[utoipa::path(post, path="/v1/pricing/refresh", responses((status=200, description="OK", body=Pricing)))]
 async fn refresh(state: &AppState) -> Response {
     response(state.refresh_pricing().await)
 }
-#[utoipa::path(post, path="/v1/pricing/confirm/{family}", params(("family"=String, Path)), responses((status=200, body=Pricing),(status=404, body=ApiError),(status=409, body=ApiError)))]
+#[utoipa::path(post, path="/v1/pricing/confirm/{family}", params(("family"=String, Path)), responses((status=200, description="OK", body=Pricing),(status=404, description="Not found", body=ApiError),(status=409, description="Conflict", body=ApiError)))]
 async fn confirm_selection(state: &AppState, family: String) -> Response {
     match state.confirm_pricing(family).await {
         Err(e) if e.to_string() == "no pending change for this family" => {

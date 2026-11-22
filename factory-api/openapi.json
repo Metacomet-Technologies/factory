@@ -3881,7 +3881,8 @@
                   "$ref": "#/components/schemas/Agents"
                 }
               }
-            }
+            },
+            "description": "OK"
           }
         },
         "tags": []
@@ -3898,7 +3899,8 @@
                   "$ref": "#/components/schemas/AgentsRefresh"
                 }
               }
-            }
+            },
+            "description": "Accepted"
           },
           "400": {
             "content": {
@@ -3907,7 +3909,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "403": {
             "content": {
@@ -3916,7 +3919,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Forbidden"
           },
           "413": {
             "content": {
@@ -3925,7 +3929,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Request too large"
           },
           "429": {
             "content": {
@@ -3935,6 +3940,7 @@
                 }
               }
             },
+            "description": "Too many requests",
             "headers": {
               "Retry-After": {
                 "description": "Seconds until next refresh, rounded up",
@@ -3953,7 +3959,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Internal error"
           }
         },
         "tags": []
@@ -3970,7 +3977,8 @@
                   "$ref": "#/components/schemas/Alerts"
                 }
               }
-            }
+            },
+            "description": "OK"
           }
         },
         "summary": "Active alerts and the last 20 cleared ones, as posted to Slack `#factory-alerts`.",
@@ -3988,7 +3996,8 @@
                   "$ref": "#/components/schemas/DeviceList"
                 }
               }
-            }
+            },
+            "description": "OK"
           }
         },
         "tags": []
@@ -4005,7 +4014,8 @@
                   "$ref": "#/components/schemas/DeviceView"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "404": {
             "content": {
@@ -4014,7 +4024,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Not found"
           }
         },
         "tags": []
@@ -4042,7 +4053,8 @@
                   "$ref": "#/components/schemas/DeviceHistory"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -4051,7 +4063,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "404": {
             "content": {
@@ -4060,7 +4073,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Not found"
           }
         },
         "tags": []
@@ -4087,7 +4101,8 @@
                   "$ref": "#/components/schemas/DeviceView"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "404": {
             "content": {
@@ -4096,7 +4111,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Not found"
           }
         },
         "summary": "An enrolled remote device: stale after 45 s of transport or collection age, and\n`unknown` until its first fresh sample since factory-api started. `factory-gpu`\nis served the same way at its literal path.",
@@ -4133,7 +4149,8 @@
                   "$ref": "#/components/schemas/DeviceHistory"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -4142,7 +4159,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "404": {
             "content": {
@@ -4151,7 +4169,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Not found"
           }
         },
         "tags": []
@@ -4189,7 +4208,8 @@
                   "$ref": "#/components/schemas/IngestResult"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -4198,7 +4218,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "401": {
             "content": {
@@ -4207,7 +4228,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Unauthorized"
           },
           "403": {
             "content": {
@@ -4216,7 +4238,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Forbidden"
           },
           "405": {
             "content": {
@@ -4225,7 +4248,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Method not allowed"
           },
           "413": {
             "content": {
@@ -4234,7 +4258,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Request too large"
           },
           "415": {
             "content": {
@@ -4243,7 +4268,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Unsupported media type"
           },
           "429": {
             "content": {
@@ -4253,6 +4279,7 @@
                 }
               }
             },
+            "description": "Too many requests",
             "headers": {
               "Retry-After": {
                 "description": "Seconds before retrying",
@@ -4271,7 +4298,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Internal error"
           }
         },
         "security": [
@@ -4294,7 +4322,8 @@
                   "$ref": "#/components/schemas/Fleet"
                 }
               }
-            }
+            },
+            "description": "OK"
           }
         },
         "tags": []
@@ -4322,7 +4351,8 @@
                   "$ref": "#/components/schemas/Gpu"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -4331,7 +4361,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           }
         },
         "tags": []
@@ -4348,7 +4379,8 @@
                   "$ref": "#/components/schemas/Health"
                 }
               }
-            }
+            },
+            "description": "OK"
           }
         },
         "tags": []
@@ -4376,7 +4408,8 @@
                   "$ref": "#/components/schemas/Usage"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -4385,7 +4418,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           }
         },
         "tags": []
@@ -4402,7 +4436,8 @@
                   "$ref": "#/components/schemas/NetworkStatus"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "500": {
             "content": {
@@ -4411,7 +4446,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Internal error"
           }
         },
         "summary": "Every registry target in layer order with its latest stored sample (null\nbefore the first tick), plus network and clock warnings.",
@@ -4452,7 +4488,8 @@
                   "$ref": "#/components/schemas/NetworkEvents"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -4461,7 +4498,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "500": {
             "content": {
@@ -4470,7 +4508,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Internal error"
           }
         },
         "summary": "Degraded and down episodes, newest first by started_ms then id, the open one included.",
@@ -4499,7 +4538,8 @@
                   "$ref": "#/components/schemas/NetworkHistory"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -4508,7 +4548,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "500": {
             "content": {
@@ -4517,7 +4558,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Internal error"
           }
         },
         "summary": "1h and 24h read raw bursts in at most 720 buckets per target; jitter is the\nmean of the bursts' mdev. 7d and 30d read hourly rollups; jitter is the\nnearest-rank p95 of each hour's mdev values. Loss is lost replies over sent.",
@@ -4546,7 +4588,8 @@
                   "$ref": "#/components/schemas/NetworkSpeedTests"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -4555,7 +4598,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "500": {
             "content": {
@@ -4564,7 +4608,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Internal error"
           }
         },
         "summary": "Throughput tests that started within the range, for charts.",
@@ -4582,7 +4627,8 @@
                   "$ref": "#/components/schemas/Pricing"
                 }
               }
-            }
+            },
+            "description": "OK"
           }
         },
         "tags": []
@@ -4609,7 +4655,8 @@
                   "$ref": "#/components/schemas/Pricing"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "404": {
             "content": {
@@ -4618,7 +4665,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Not found"
           },
           "409": {
             "content": {
@@ -4627,7 +4675,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Conflict"
           }
         },
         "tags": []
@@ -4644,7 +4693,8 @@
                   "$ref": "#/components/schemas/Pricing"
                 }
               }
-            }
+            },
+            "description": "OK"
           }
         },
         "tags": []
@@ -4661,7 +4711,8 @@
                   "$ref": "#/components/schemas/UpsSettings"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "500": {
             "content": {
@@ -4670,7 +4721,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Internal error"
           }
         },
         "tags": []
@@ -4695,7 +4747,8 @@
                   "$ref": "#/components/schemas/UpsSettings"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -4704,7 +4757,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "403": {
             "content": {
@@ -4713,7 +4767,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Forbidden"
           },
           "413": {
             "content": {
@@ -4722,7 +4777,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Request too large"
           },
           "500": {
             "content": {
@@ -4731,7 +4787,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Internal error"
           },
           "503": {
             "content": {
@@ -4740,7 +4797,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Unavailable"
           }
         },
         "tags": []
@@ -4757,7 +4815,8 @@
                   "$ref": "#/components/schemas/StreamEvent"
                 }
               }
-            }
+            },
+            "description": "OK"
           }
         },
         "tags": []
@@ -4774,7 +4833,8 @@
                   "$ref": "#/components/schemas/Ups"
                 }
               }
-            }
+            },
+            "description": "OK"
           }
         },
         "tags": []
@@ -4802,7 +4862,8 @@
                   "$ref": "#/components/schemas/UpsEnergy"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -4811,7 +4872,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "500": {
             "content": {
@@ -4820,7 +4882,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Internal error"
           }
         },
         "summary": "Costs round half-up once per range. Coverage counts intervals between reads\nno more than 30s apart. An expired leading partial hour is omitted, not estimated.\nGPU energy uses the same covered UPS intervals and right-endpoint rounding.\nIt is null if GPU coverage is missing or its energy exceeds the UPS load.",
@@ -4871,7 +4934,8 @@
                   "$ref": "#/components/schemas/UpsEvents"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -4880,7 +4944,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "500": {
             "content": {
@@ -4889,7 +4954,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Internal error"
           }
         },
         "tags": []
@@ -4920,7 +4986,8 @@
                   "type": "array"
                 }
               }
-            }
+            },
+            "description": "OK"
           },
           "400": {
             "content": {
@@ -4929,7 +4996,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Invalid request"
           },
           "500": {
             "content": {
@@ -4938,7 +5006,8 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            }
+            },
+            "description": "Internal error"
           }
         },
         "summary": "Raw ranges use at most 720 time buckets. All metrics expose min/avg/max;\nruntime is the minimum. Longer ranges include the overlapping hourly bucket.",

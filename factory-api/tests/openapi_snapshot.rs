@@ -45,6 +45,23 @@ async fn openapi_snapshot() -> Result<()> {
         }
     }
     assert!(required >= 1);
+    // OpenAPI 3.1 requires a description on every Response Object; utoipa 6 omits
+    // it unless the annotation sets one. Also covers the meter contract we build against.
+    let meter: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../meter/openapi.json"),
+    )?)?;
+    for document in [&spec, &meter] {
+        for (path, operations) in document["paths"].as_object().unwrap() {
+            for (method, operation) in operations.as_object().unwrap() {
+                for (status, response) in operation["responses"].as_object().unwrap() {
+                    assert!(
+                        response["description"].is_string() || response["$ref"].is_string(),
+                        "{method} {path} {status} has no description"
+                    );
+                }
+            }
+        }
+    }
     assert_eq!(schemes["device_bearer"]["type"], "http");
     assert_eq!(schemes["device_bearer"]["scheme"], "bearer");
     let samples = &spec["paths"]["/v1/devices/{device_id}/samples"]["post"];
