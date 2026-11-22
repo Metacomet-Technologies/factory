@@ -103,7 +103,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y shellcheck sqlite3 zstd rsync python3-venv
       - run: scripts/check --all usage shell deploy env
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
       - name: Test encrypted off-site backups against loopback moto
         run: uvx --from 'moto[server]==5.2.4' --with 'pyrage==1.4.0' --with 'boto3==1.43.118' python -B deploy/backup/test-offsite.py
 
