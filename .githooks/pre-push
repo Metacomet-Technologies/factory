@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Runs scripts/check before every push. Enable once per clone:
+# Runs the static checks (format, lint, types) before every push; tests run in
+# CI, and auto-deploy ships only commits whose CI passed. Seconds, not minutes,
+# so a push rarely loses the race to a moving main. Enable once per clone:
 #   git config core.hooksPath .githooks
-# Skip in an emergency with git push --no-verify; CI still runs everything.
 root=$(git rev-parse --show-toplevel)
 # Hooks run with GIT_DIR set; unset it so git and builds under scripts/check see a normal checkout.
 # shellcheck disable=SC2046 # one variable name per word
 unset $(git rev-parse --local-env-vars)
-exec "$root/scripts/check"
+exec "$root/scripts/check" --fast

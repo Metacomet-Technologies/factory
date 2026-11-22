@@ -9,7 +9,7 @@ Start of every session (silently, then answer):
 2. Check Linear "Software Factory" In Progress issues and whether CI on main is green.
 
 How work flows (main-based):
-- Agents commit straight to main after `scripts/check`; CI runs on every push. A red main is fixed or reverted first. Claude never edits the repo directly; it writes a task prompt for an agent thread.
+- Agents commit straight to main; the pre-push hook runs `scripts/check --fast` and CI runs on every push. A red main is fixed or reverted first. Claude never edits the repo directly; it writes a task prompt for an agent thread.
 - Work starts as a Linear issue; Devon or Claude hands it to an Amp thread. The thread works in its own worktree, pushes to main and comments the commit SHA on the issue. factory-autodeploy.timer deploys meter/factory-api/kiosk once ci-ok is green (`sudo factory-deploy` is the manual fallback). Every other deploy is a command for Devon.
 - Specs follow PLAYBOOK §4: goal, issue, off-limits, done means.
 - Agents are preconfigured (agent has Devon's gh login and git credentials on both nodes). Never add GH_TOKEN or gh auth lines.

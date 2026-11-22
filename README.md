@@ -27,9 +27,10 @@ operating manual is [docs/PLAYBOOK.md](docs/PLAYBOOK.md); agent rules are in
 
 ## Working
 
-Commit to `main` and push. Before pushing, run `scripts/check`: it runs only
-the check groups your change touches (`--list` shows them, `--all` runs all of
-them). Enable it as a pre-push hook once per clone:
+Commit to `main` and push. `scripts/check` runs the check groups your change
+touches (`--list` shows them, `--all` runs all of them, `--fast` only format,
+lint and types). The pre-push hook runs `scripts/check --fast`, which takes
+seconds; the tests run in CI. Enable the hook once per clone:
 
 ```sh
 git config core.hooksPath .githooks

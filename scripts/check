@@ -7,6 +7,7 @@
 #   scripts/check                 groups touched by the change
 #   scripts/check --all           every group
 #   scripts/check --all rust      named groups only (rust kiosk usage shell deploy env client)
+#   scripts/check --fast          static checks only (format, lint, types); the pre-push hook
 #   scripts/check --list          print the groups the change touches and exit
 set -euo pipefail
 
@@ -14,12 +15,13 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
 rust_paths='^(Cargo\.(toml|lock)|rust-toolchain\.toml|(shared|meter|pricing|factory-api|factory-db|sandbox|ups-control|devices-agent)/)'
 
-usage() { sed -n '7,10s/^# \{0,1\}//p' "$0" >&2; exit 2; }
-all=0 list=0 groups=()
+usage() { sed -n '7,11s/^# \{0,1\}//p' "$0" >&2; exit 2; }
+all=0 list=0 fast=0 groups=()
 while (($#)); do
     case $1 in
         --all) all=1 ;;
         --list) list=1 ;;
+        --fast) fast=1 ;;
         -h|--help) usage ;;
         rust|kiosk|usage|shell|deploy|env|client) groups+=("$1") ;;
         *) usage ;;
@@ -74,6 +76,7 @@ for group in "${groups[@]}"; do
         rust)
             step cargo fmt --check
             step cargo clippy --all-targets --locked -- -D warnings
+            ((fast)) && continue
             if command -v cargo-nextest >/dev/null; then
                 step cargo nextest run --workspace --locked
                 step cargo test --doc --workspace --locked
@@ -88,9 +91,11 @@ for group in "${groups[@]}"; do
         kiosk)
             in_kiosk vp install --frozen-lockfile
             in_kiosk env OPENAPI_URL="file://$root/factory-api/openapi.json" vp check
+            ((fast)) && continue
             in_kiosk vp test --run
             in_kiosk vp build ;;
         usage)
+            ((fast)) && continue
             step node --test scripts/usage ;;
         shell)
             mapfile -t scripts < <(files 'deploy/*.sh' 'scripts/*.sh' scripts/check scripts/sandbox 'scripts/sandbox-shims/*' .githooks/pre-push | grep -v '\.py$')
@@ -100,6 +105,7 @@ for group in "${groups[@]}"; do
             step shellcheck -s bash -e SC2034 client/factory.env ;;
         deploy)
             step bash deploy/lint-installers.sh
+            ((fast)) && continue
             if [[ -z ${DEVICES_TEST_GROUP:-} ]]; then
                 # deploy/devices/test-install.py needs a supplementary group of the caller.
                 DEVICES_TEST_GROUP=$(id -Gn | tr ' ' '\n' | grep -vx "$(id -gn)" | head -n 1 || true)
@@ -107,11 +113,13 @@ for group in "${groups[@]}"; do
             fi
             deploy_tests ;;
         env)
+            ((fast)) && continue
             step python3 -B scripts/env/test_check.py
             step python3 -B scripts/env/test_setup.py ;;
         client)
             if command -v zsh >/dev/null; then step zsh -n client/factory.zsh; fi
+            ((fast)) && continue
             step python3 -B client/test_factory.py ;;
     esac
 done
-printf '\nscripts/check: %s passed\n' "${groups[*]}"
+printf '\nscripts/check%s: %s passed\n' "$( ((fast)) && echo ' --fast')" "${groups[*]}"

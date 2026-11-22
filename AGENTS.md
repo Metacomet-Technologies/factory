@@ -3,10 +3,12 @@ Main-based development: commit to `main` and push. Use a worktree off
 Never print/commit secrets or production data.
 Auth works; never set token environment variables or run gh auth commands.
 
-Before pushing: `scripts/check`. It runs only the check groups your change
-touches (`--list` shows them, `--all` runs everything). Enable it as a pre-push
-hook once per clone: `git config core.hooksPath .githooks`. CI runs
-`scripts/check --all` on every push to main; `ci-ok` is the one green/red check.
+`scripts/check` runs the check groups your change touches (`--list` shows
+them, `--all` runs everything); `--fast` runs only the static checks (format,
+lint, types) in seconds. The pre-push hook runs `--fast`; enable it once per
+clone: `git config core.hooksPath .githooks`. Run the full `scripts/check` for
+the tests you want before pushing; CI runs `scripts/check --all` on every push
+to main, `ci-ok` is the one green/red check, and only green commits deploy.
 Fix a red main before anything else.
 Live checks: `scripts/sandbox` (`docs/sandbox.md`), never production.
 Read `docs/agents/<area>.md` when you touch it: `db.md` for DB work
