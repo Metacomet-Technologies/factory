@@ -16,7 +16,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
-toml = "0.9"
+toml = "1.2"
 
 [dev-dependencies]
 tempfile = "3"
