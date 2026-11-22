@@ -106,6 +106,47 @@ jobs:
           path: ${{ runner.temp }}/kiosk-verify/
           if-no-files-found: ignore
 
+  # The device matrix runs beside the kiosk job: it takes about 3 minutes on its own.
+  devices:
+    name: devices
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: kiosk
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Converge to the toolchain contract (docs/environments.md)
+        working-directory: .
+        # Installs Rust, Vite+, Node and Bun from the repo pins, puts them on PATH, then runs scripts/env/check.
+        run: scripts/env/setup.sh --ci
+      - run: node --version && bun --version && vp --version
+      - name: Install kiosk dependencies and select its local CLI
+        run: |
+          vp install --frozen-lockfile
+          echo "$GITHUB_WORKSPACE/kiosk/node_modules/.bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('kiosk/bun.lock') }}
+      - name: Install Playwright Chromium for the device matrix
+        run: vp exec playwright install --with-deps --only-shell chromium
+      - name: Check every page on phone, tablet and desktop viewports
+        run: scripts/check --all devices
+        working-directory: .
+        env:
+          VERIFY_ROOT: ${{ runner.temp }}/kiosk-verify
+      - name: Upload device matrix evidence
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kiosk-devices
+          path: ${{ runner.temp }}/kiosk-verify/
+          if-no-files-found: ignore
+
   scripts:
     name: scripts
     timeout-minutes: 20
@@ -179,7 +220,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [rust, kiosk, scripts, client, sandbox]
+    needs: [rust, kiosk, devices, scripts, client, sandbox]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:

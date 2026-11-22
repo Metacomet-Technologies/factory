@@ -28,9 +28,20 @@ const evidenceDir = `${root}/evidence`;
 const pidFile = `${runDir}/pid`;
 const logFile = `${runDir}/mock-dev.log`;
 const mockPort = 4179;
-const uiPort = 4181;
-
+const portFile = `${runDir}/ui-port`;
 const command = process.argv[2];
+// `launch --preview` builds, then serves the production build on 4180 instead of the dev
+// server on 4181; later commands read the port that launch recorded.
+const preview = command === "launch" && process.argv.includes("--preview");
+const uiPort =
+  command === "launch"
+    ? preview
+      ? 4180
+      : 4181
+    : existsSync(portFile)
+      ? Number(readFileSync(portFile, "utf8"))
+      : 4181;
+
 
 function httpGet(port, path) {
   return new Promise((resolve, reject) => {
@@ -110,11 +121,12 @@ async function launch() {
   const child = spawn(
     "bash",
     // Agent machines put vp on PATH through this env file; CI already has it on PATH.
-    ["-c", 'env="$HOME/.config/vite-plus/env"; if [ -f "$env" ]; then . "$env"; fi; exec vp run mock-dev'],
+    ["-c", 'env="$HOME/.config/vite-plus/env"; if [ -f "$env" ]; then . "$env"; fi; ' + (preview ? "vp build && exec vp run mock-preview" : "exec vp run mock-dev")],
     { cwd: kiosk, detached: true, stdio: ["ignore", logFd, logFd] },
   );
   child.unref();
   writeFileSync(pidFile, `${child.pid}\n`);
+  writeFileSync(portFile, `${uiPort}\n`);
   console.log(`launched pid ${child.pid}; log ${logFile}`);
   try {
     await waitReady(child.pid);

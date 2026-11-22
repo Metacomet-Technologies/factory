@@ -37,7 +37,8 @@ git config core.hooksPath .githooks
 ```
 
 CI runs `scripts/check --all` plus the sandbox stack on every push, including
-`journeys`, which clicks through every kiosk journey against the mock; the
+`journeys`, which clicks through every kiosk journey against the mock, and
+`devices`, which checks every page on phone, tablet and desktop viewports; the
 `ci-ok` check is the verdict. A red main is fixed or reverted before anything
 else. Test against the sandbox (`scripts/sandbox up`), never production.
 

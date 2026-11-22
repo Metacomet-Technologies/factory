@@ -6,7 +6,7 @@
 #
 #   scripts/check                 groups touched by the change
 #   scripts/check --all           every group
-#   scripts/check --all rust      named groups only (rust kiosk journeys usage shell deploy env client)
+#   scripts/check --all rust      named groups only (rust kiosk journeys devices usage shell deploy env client)
 #   scripts/check --fast          static checks only (format, lint, types); the pre-push hook
 #   scripts/check --list          print the groups the change touches and exit
 set -euo pipefail
@@ -23,7 +23,7 @@ while (($#)); do
         --list) list=1 ;;
         --fast) fast=1 ;;
         -h|--help) usage ;;
-        rust|kiosk|journeys|usage|shell|deploy|env|client) groups+=("$1") ;;
+        rust|kiosk|journeys|devices|usage|shell|deploy|env|client) groups+=("$1") ;;
         *) usage ;;
     esac
     shift
@@ -39,7 +39,7 @@ touched() { ((all)) || printf '%s\n' "${changed[@]}" | grep -Eq "$1"; }
 if ((${#groups[@]} == 0)); then
     touched "$rust_paths" && groups+=(rust)
     touched '^(kiosk/|factory-api/openapi\.json$)' && groups+=(kiosk)
-    touched '^(kiosk/|\.cursor/skills/verify-kiosk/)' && groups+=(journeys)
+    touched '^(kiosk/|\.cursor/skills/verify-kiosk/)' && groups+=(journeys devices)
     touched '^scripts/usage/' && groups+=(usage)
     touched '\.sh$|^scripts/(check|sandbox)$|^\.githooks/|^client/factory\.(zsh|env)$' && groups+=(shell)
     touched '^deploy/' && groups+=(deploy)
@@ -53,6 +53,22 @@ if ((${#groups[@]} == 0)); then echo 'scripts/check: nothing to check'; exit 0; 
 files() { git ls-files --cached --others --exclude-standard --deduplicate -- "$@" | while IFS= read -r f; do if [[ -f $f ]]; then printf '%s\n' "$f"; fi; done; }
 step() { printf '\n== %s\n' "$*"; "$@"; }
 in_kiosk() { (cd kiosk && step "$@"); }
+
+# Starts the kiosk against the mock API (dev server, or the production build with
+# --preview), runs one command against it and stops it. Needs Playwright Chromium and
+# free ports 4179 and 4180 or 4181. Evidence stays in $VERIFY_ROOT/evidence.
+verify=.cursor/skills/verify-kiosk/verify.mjs
+kiosk_ui() {
+    local flag=() ; [[ -n $1 ]] && flag=("$1"); shift
+    in_kiosk vp install --frozen-lockfile
+    export VERIFY_ROOT=${VERIFY_ROOT:-$(mktemp -d /tmp/factory-kiosk-verify.XXXXXX)}
+    if ! { step node "$verify" launch "${flag[@]}" && step node "$verify" doctor && step "$@"; }; then
+        node "$verify" cleanup || true
+        echo "kiosk UI check failed; evidence in $VERIFY_ROOT/evidence" >&2
+        exit 1
+    fi
+    step node "$verify" cleanup
+}
 
 # Python tests under deploy/. Locally, only the directories the change touches;
 # with --all, every one. CI-only tests live in .github/workflows/ci.yml:
@@ -96,19 +112,14 @@ for group in "${groups[@]}"; do
             in_kiosk vp test --run
             in_kiosk vp build ;;
         journeys)
-            # Drives every verify-kiosk journey through the UI against the mock API. Needs
-            # Playwright Chromium; the ports 4179 and 4181 must be free.
+            # Every verify-kiosk journey, clicked through on the dev server against the mock API.
             ((fast)) && continue
-            in_kiosk vp install --frozen-lockfile
-            export VERIFY_ROOT=${VERIFY_ROOT:-$(mktemp -d /tmp/factory-kiosk-verify.XXXXXX)}
-            verify=.cursor/skills/verify-kiosk/verify.mjs
-            if ! { step node "$verify" launch && step node "$verify" doctor && step node "$verify" drive all; }; then
-                tail -n 40 "$VERIFY_ROOT/run/mock-dev.log" || true
-                node "$verify" cleanup || true
-                echo "journeys failed; evidence in $VERIFY_ROOT/evidence" >&2
-                exit 1
-            fi
-            step node "$verify" cleanup ;;
+            kiosk_ui '' node "$verify" drive all ;;
+        devices)
+            # The device matrix: every page on phone, tablet and desktop viewports, both
+            # themes, against the production build served with the mock API.
+            ((fast)) && continue
+            kiosk_ui --preview env BASE_URL=http://127.0.0.1:4180 node .cursor/skills/verify-kiosk/devices.mjs ;;
         usage)
             ((fast)) && continue
             step node --test scripts/usage ;;

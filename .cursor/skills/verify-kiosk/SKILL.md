@@ -44,7 +44,7 @@ node .cursor/skills/verify-kiosk/verify.mjs drive theme   # or usage, gpu, front
 node .cursor/skills/verify-kiosk/verify.mjs drive all     # every journey, about 90 s
 ```
 
-CI runs `drive all` on every push through `scripts/check --all journeys`, which also does launch, doctor and cleanup. A journey that no longer matches the UI turns `ci-ok` red, so update its feature file and `verify.mjs` in the same commit as the UI change.
+CI runs `drive all` on every push through `scripts/check --all journeys`, and the device matrix against the production build through `scripts/check --all devices` (`launch --preview` builds and serves it on 4180); both also do launch, doctor and cleanup. A journey or device-matrix check that no longer matches the UI turns `ci-ok` red, so update its feature file and `verify.mjs` in the same commit as the UI change.
 
 That command is the theme journey in [features/theme.md](features/theme.md). It clicks the button named `Use dark theme` or `Use light theme`, then requires the accessible name to flip, `document.documentElement.dataset.theme` to change, and `localStorage['factory-theme']` to equal the new theme.
 
