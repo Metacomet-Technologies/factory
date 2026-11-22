@@ -5,7 +5,8 @@
 # Root-owned copy at /usr/local/sbin/factory-deploy; the one agent sudo rule is
 # deploy/sudoers/factory-agent-deploy. It fast-forwards the main checkout, builds
 # as agent, runs the component's installer, then requires three health probes at
-# the new SHA and rolls back to the installer's snapshot otherwise.
+# the new SHA (for the kiosk, also that every page renders in headless Chromium:
+# kiosk/scripts/render-check.ts) and rolls back to the installer's snapshot otherwise.
 # The installers come from the agent-writable checkout, so this rule trusts agent
 # with root on factory-gpu by design.
 set -Eeuo pipefail
@@ -55,6 +56,11 @@ healthy_at() {
         python3 -c 'import json,sys; d=json.loads(sys.argv[1]); g=d.get("git_sha") or ""; sys.exit(not (len(g)>=7 and sys.argv[2].startswith(g) and d.get("git_dirty") is False))' \
             "$probe" "$2" || return 1
     done
+    # version.json only proves the files are installed. A bundle that crashes on load once
+    # served it and blanked every page, so the kiosk must also render in a browser.
+    if [[ $1 == kiosk ]]; then
+        (cd kiosk && as_agent timeout 180 node scripts/render-check.ts) || return 1
+    fi
 }
 
 for component in "$@"; do
@@ -69,7 +75,9 @@ for component in "$@"; do
             rollback=(deploy/rollback-factory-api.sh) ;;
         kiosk)
             # From scratch: an install over a stale tree once left a second React behind.
-            (cd kiosk && as_agent rm -rf node_modules && as_agent vp install --frozen-lockfile && as_agent vp build)
+            # The Chromium the render check needs follows the locked @playwright/test; a no-op when present.
+            (cd kiosk && as_agent rm -rf node_modules && as_agent vp install --frozen-lockfile &&
+                as_agent vp exec playwright install --only-shell chromium && as_agent vp build)
             installer=(deploy/install-kiosk.sh kiosk/dist)
             rollback=(deploy/install-kiosk.sh --rollback) ;;
     esac

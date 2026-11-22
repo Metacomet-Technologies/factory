@@ -11,6 +11,10 @@ sudo factory-deploy meter factory-api kiosk   # any subset, in that order
 `deploy/deploy.sh` fast-forwards `/home/agent/work/factory` to `origin/main`,
 builds as `agent`, runs each component's installer, requires three health probes
 20 s apart at the new SHA, and rolls back to the installer's snapshot otherwise.
+The kiosk must also render: `kiosk/scripts/render-check.ts` opens every page in
+headless Chromium as `agent` and fails on an uncaught error or an empty page, so a
+bundle that serves `version.json` but crashes on load rolls back. The deploy
+installs the Chromium matching the locked `@playwright/test` before building.
 Meter installs with `--no-db-change`; a meter DB migration stays a manual
 `sudo bash deploy/install-meter.sh <binary>` by Devon.
 

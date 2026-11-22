@@ -70,6 +70,12 @@ kiosk_ui() {
     step node "$verify" cleanup
 }
 
+# The deploy's render check (it must pass on the build it would gate), then the device matrix.
+preview_checks() {
+    in_kiosk node scripts/render-check.ts http://127.0.0.1:4180 &&
+        step env BASE_URL=http://127.0.0.1:4180 node .cursor/skills/verify-kiosk/devices.mjs
+}
+
 # Python tests under deploy/. Locally, only the directories the change touches;
 # with --all, every one. CI-only tests live in .github/workflows/ci.yml:
 # test-offsite.py (loopback moto) and test-agent-host-config.py (namespaces).
@@ -119,7 +125,7 @@ for group in "${groups[@]}"; do
             # The device matrix: every page on phone, tablet and desktop viewports, both
             # themes, against the production build served with the mock API.
             ((fast)) && continue
-            kiosk_ui --preview env BASE_URL=http://127.0.0.1:4180 node .cursor/skills/verify-kiosk/devices.mjs ;;
+            kiosk_ui --preview preview_checks ;;
         usage)
             ((fast)) && continue
             step node --test scripts/usage ;;
