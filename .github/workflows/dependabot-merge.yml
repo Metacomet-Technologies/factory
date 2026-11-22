@@ -27,7 +27,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - name: Rebase-merge the tested group and run CI on main
+      - name: Squash-merge the tested group and run CI on main
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -37,5 +37,5 @@ jobs:
           pr=$(gh pr list -R "$REPO" --head "$BRANCH" --state open --json number,headRefOid,author \
             --jq '.[] | select(.headRefOid == env.SHA and .author.login == "app/dependabot") | .number')
           if [[ -z $pr ]]; then echo "No open Dependabot PR at $SHA; nothing to merge"; exit 0; fi
-          gh pr merge -R "$REPO" "$pr" --rebase --delete-branch
+          gh pr merge -R "$REPO" "$pr" --squash
           gh workflow run ci.yml -R "$REPO" --ref main
