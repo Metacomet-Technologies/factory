@@ -14,10 +14,10 @@ import {
 } from "node:fs";
 import { createRequire } from "node:module";
 import { request } from "node:http";
+import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
-const repo = "/home/agent/work/factory";
-const kiosk = `${repo}/kiosk`;
+const kiosk = fileURLToPath(new URL("../../../kiosk", import.meta.url));
 const root = process.env.VERIFY_ROOT;
 if (!root) {
   console.error("VERIFY_ROOT is required, for example /tmp/factory-kiosk-verify/$RUN_ID");
@@ -112,11 +112,8 @@ async function launch() {
   const logFd = openSync(logFile, "a");
   const child = spawn(
     "bash",
-    [
-      "-lc",
-      "source /home/agent/.config/vite-plus/env && cd /home/agent/work/factory/kiosk && exec vp run mock-dev",
-    ],
-    { detached: true, stdio: ["ignore", logFd, logFd] },
+    ["-lc", "source /home/agent/.config/vite-plus/env && exec vp run mock-dev"],
+    { cwd: kiosk, detached: true, stdio: ["ignore", logFd, logFd] },
   );
   child.unref();
   writeFileSync(pidFile, `${child.pid}\n`);
@@ -188,14 +185,13 @@ function parentIs(pid, ancestor) {
 }
 
 async function driveTheme() {
-  process.env.PLAYWRIGHT_BROWSERS_PATH = `${kiosk}/.browsers`;
   const { chromium } = createRequire(import.meta.url)(`${kiosk}/node_modules/@playwright/test`);
   mkdirSync(`${evidenceDir}/theme`, { recursive: true });
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
   try {
     await page.goto(`http://127.0.0.1:${uiPort}/`, { waitUntil: "domcontentloaded" });
-    await page.getByRole("heading", { level: 1, name: "factory / kiosk" }).waitFor();
+    await page.getByRole("heading", { level: 1, name: "factory", exact: true }).waitFor();
     await page.getByRole("status", { name: "Live" }).waitFor({ timeout: 20_000 }).catch(async () => {
       await page.getByText("Live", { exact: true }).waitFor({ timeout: 20_000 });
     });
@@ -223,7 +219,7 @@ async function driveTheme() {
         `before-theme: ${beforeTheme}`,
         `after-theme: ${afterTheme}`,
         `localStorage factory-theme: ${stored}`,
-        `heading: factory / kiosk`,
+        `heading: factory`,
       ].join("\n") + "\n",
     );
     console.log(`proved theme ${beforeTheme} -> ${afterTheme}; evidence ${shot} ${aria}`);

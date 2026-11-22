@@ -20,8 +20,8 @@ Preconditions:
 - The Playwright context has no `factory-theme` localStorage entry.
 
 - **Read the control.** The header shows one theme button. Its accessible name is `Use dark theme` or `Use light theme`, which is the theme the click will apply, not the theme already showing.
-- **Toggle.** Choose that button. Run `node /home/agent/work/factory/.cursor/skills/verify-kiosk/verify.mjs drive theme`. The button's accessible name flips, `document.documentElement.dataset.theme` changes, and `localStorage['factory-theme']` equals the new theme.
-- **Proof.** The command writes `$VERIFY_ROOT/evidence/theme/after.png` and `$VERIFY_ROOT/evidence/theme/after.aria.txt`. The text file names both labels and both theme values. The screenshot shows the heading `factory / kiosk`.
+- **Toggle.** Choose that button. Run `node .cursor/skills/verify-kiosk/verify.mjs drive theme`. The button's accessible name flips, `document.documentElement.dataset.theme` changes, and `localStorage['factory-theme']` equals the new theme.
+- **Proof.** The command writes `$VERIFY_ROOT/evidence/theme/after.png` and `$VERIFY_ROOT/evidence/theme/after.aria.txt`. The text file names both labels and both theme values. The screenshot shows the heading `factory`.
 
 ## Gotchas
 

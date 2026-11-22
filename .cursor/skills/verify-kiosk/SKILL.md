@@ -13,12 +13,12 @@ Other factory surfaces (meter, factory-api, the dispatcher CLI) are out of scope
 
 ## Launch
 
-From any directory, with a fresh `RUN_ID`:
+From the root of the checkout you want to verify (the harness serves that checkout's `kiosk/`), with a fresh `RUN_ID`:
 
 ```sh
 export RUN_ID="$(date +%s)-$$"
 export VERIFY_ROOT="/tmp/factory-kiosk-verify/$RUN_ID"
-node /home/agent/work/factory/.cursor/skills/verify-kiosk/verify.mjs launch
+node .cursor/skills/verify-kiosk/verify.mjs launch
 ```
 
 `launch` sources `/home/agent/.config/vite-plus/env`, starts `vp run mock-dev` from `kiosk/` in its own process group, and returns only after both of these are true:
@@ -26,24 +26,24 @@ node /home/agent/work/factory/.cursor/skills/verify-kiosk/verify.mjs launch
 - the log contains `Mock API on 127.0.0.1:4179` and `http://127.0.0.1:4181/`
 - `GET /v1/health` on port 4179 returns 200 and `GET /` on port 4181 returns the app shell
 
-The mock has no database and no migrations. Fixtures in `kiosk/mock/fixtures.ts` are the seed data. Ready means the heading `factory / kiosk` can load, not merely that a socket accepts connections.
+The mock has no database and no migrations. Fixtures in `kiosk/mock/fixtures.ts` are the seed data. Ready means the heading `factory` can load, not merely that a socket accepts connections.
 
 The process group id is `$VERIFY_ROOT/run/pid`. The log is `$VERIFY_ROOT/run/mock-dev.log`.
 
 ## Doctor
 
 ```sh
-node /home/agent/work/factory/.cursor/skills/verify-kiosk/verify.mjs doctor
+node .cursor/skills/verify-kiosk/verify.mjs doctor
 ```
 
 Doctor fails unless the recorded pid is alive, both ports are owned by that process or one of its descendants, mock `/v1/health` is HTTP 200, and the UI shell is being served. Run it before every drive.
 
 ## Drive
 
-Use Playwright from `kiosk/node_modules` with `PLAYWRIGHT_BROWSERS_PATH=/home/agent/work/factory/kiosk/.browsers`. Open a new browser context so `localStorage` key `factory-theme` starts empty. Prefer accessible names over coordinates.
+Use Playwright from `kiosk/node_modules` and its default browser cache (`~/.cache/ms-playwright`, or `PLAYWRIGHT_BROWSERS_PATH` when set). Open a new browser context so `localStorage` key `factory-theme` starts empty. Prefer accessible names over coordinates.
 
 ```sh
-node /home/agent/work/factory/.cursor/skills/verify-kiosk/verify.mjs drive theme
+node .cursor/skills/verify-kiosk/verify.mjs drive theme
 ```
 
 That command is the theme journey in [features/theme.md](features/theme.md). It clicks the button named `Use dark theme` or `Use light theme`, then requires the accessible name to flip, `document.documentElement.dataset.theme` to change, and `localStorage['factory-theme']` to equal the new theme.
@@ -61,7 +61,7 @@ Exercise the on-screen control. Capture the action's result (label, theme attrib
 ## Cleanup
 
 ```sh
-node /home/agent/work/factory/.cursor/skills/verify-kiosk/verify.mjs cleanup
+node .cursor/skills/verify-kiosk/verify.mjs cleanup
 ```
 
 Cleanup sends `SIGTERM` to the recorded process group and deletes `$VERIFY_ROOT/run`. It does not kill by process name and does not delete `$VERIFY_ROOT/evidence`.

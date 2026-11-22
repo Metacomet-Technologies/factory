@@ -16,7 +16,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 - Prefer ARIA roles and accessible names over CSS selectors or DOM position.
 - Treat every command as literal. Keep quoted names and flags unchanged.
 - Run the theme journey through `verify.mjs drive theme`.
-- Run the other journeys with Playwright from `kiosk/node_modules` and `PLAYWRIGHT_BROWSERS_PATH=$PWD/.browsers` inside `kiosk/`, using a fresh context.
+- Run the other journeys with Playwright from `kiosk/node_modules`, using a fresh context.
 - Leave `$VERIFY_ROOT/evidence` in place during cleanup.
 
 ## Proof and skip reporting
