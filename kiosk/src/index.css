@@ -1018,6 +1018,11 @@
 .service-detail[data-more] {
   mask-image: linear-gradient(to bottom, black 55%, transparent);
 }
+/* A healthy service has no detail; reserving two empty lines per row made the phone Fleet
+   list mostly gap. A failure's detail still gets its own lines. */
+.service-detail:empty {
+  height: 0;
+}
 .service-detail:focus-visible {
   outline: 2px solid var(--accent-text);
   outline-offset: 1px;
@@ -1137,8 +1142,12 @@
 .agent-list p {
   margin-top: 4px;
 }
+.agent-heading {
+  row-gap: 0;
+}
 .agent-heading > p {
   flex-basis: 100%;
+  margin-top: 2px;
 }
 .agent-list .agent-status {
   font-size: 12px;
