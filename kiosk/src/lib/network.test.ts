@@ -245,10 +245,37 @@ describe("network history shapes", () => {
       NOW,
     );
     expect(bands).toEqual([
-      { id: 1, layer: "wan", tone: "fail", x1: NOW - 600_000, x2: NOW, open: true },
-      { id: 2, layer: "wan", tone: "fail", x1: NOW - 1_200_000, x2: NOW - 900_000, open: false },
       { id: 3, layer: "wan", tone: "fail", x1: since, x2: since + 60_000, open: false },
+      { id: 2, layer: "wan", tone: "fail", x1: NOW - 1_200_000, x2: NOW - 900_000, open: false },
+      { id: 1, layer: "wan", tone: "fail", x1: NOW - 600_000, x2: NOW, open: true },
       { id: 7, layer: "wan", tone: "warn", x1: NOW - 300_000, x2: NOW - 240_000, open: false },
+    ]);
+  });
+  it("merges bands too close to tell apart, only within one layer and tone", () => {
+    // A 30 d window joins gaps up to 30 d / 500 ≈ 86 min.
+    const since = NOW - 30 * 86_400_000;
+    const blip = (id: number, start: number, link?: NetworkLinkState) =>
+      event(id, NOW - start, NOW - start + 30_000, link);
+    const dns: NetworkLinkState = { state: "degraded", layer: "dns", reason: "jitter" };
+    const bands = eventBands(
+      [
+        blip(1, 10 * 3_600_000, dns),
+        blip(2, 9 * 3_600_000, dns),
+        blip(3, 8 * 3_600_000, dns),
+        // Same window position but another layer, and a down episode on the same layer.
+        blip(4, 9 * 3_600_000, { state: "degraded", layer: "lan", reason: "jitter" }),
+        blip(5, 9 * 3_600_000, { state: "down", layer: "dns" }),
+        // Two hours after the last dns blip: too far to merge.
+        blip(6, 6 * 3_600_000 - 30_000, dns),
+      ],
+      since,
+      NOW,
+    );
+    expect(bands.map(({ id, x1, x2 }) => ({ id, x1, x2 }))).toEqual([
+      { id: 1, x1: NOW - 10 * 3_600_000, x2: NOW - 8 * 3_600_000 + 30_000 },
+      { id: 4, x1: NOW - 9 * 3_600_000, x2: NOW - 9 * 3_600_000 + 30_000 },
+      { id: 5, x1: NOW - 9 * 3_600_000, x2: NOW - 9 * 3_600_000 + 30_000 },
+      { id: 6, x1: NOW - 6 * 3_600_000 + 30_000, x2: NOW - 6 * 3_600_000 + 60_000 },
     ]);
   });
   it("starts a chart at the oldest point inside the window, or at the window start", () => {

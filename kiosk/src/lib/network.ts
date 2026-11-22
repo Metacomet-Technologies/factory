@@ -155,16 +155,38 @@ export type EventBand = {
   x2: number;
   open: boolean;
 };
-/** Shaded spans clipped to the chart window [since, now]. An open episode runs to now. */
+/**
+ * Shaded spans clipped to the chart window [since, now]. An open episode runs to now.
+ * Same-layer, same-tone spans closer than 1/500 of the window merge into one: they would
+ * touch on screen anyway, and a month of 30 s blips is thousands of SVG areas per chart,
+ * enough to freeze the page.
+ */
 export function eventBands(events: NetworkEvent[], since: number, now: number): EventBand[] {
-  return events.flatMap<EventBand>((event) => {
-    if (event.state === "healthy") return [];
-    const x1 = Math.max(event.started_ms, since);
-    const x2 = Math.min(event.ended_ms ?? now, now);
-    if (x2 <= x1) return [];
-    const tone = event.state === "down" ? "fail" : "warn";
-    return [{ id: event.id, layer: event.layer, tone, x1, x2, open: event.ended_ms == null }];
-  });
+  const join = (now - since) / 500;
+  const bands = events
+    .flatMap<EventBand>((event) => {
+      if (event.state === "healthy") return [];
+      const x1 = Math.max(event.started_ms, since);
+      const x2 = Math.min(event.ended_ms ?? now, now);
+      if (x2 <= x1) return [];
+      const tone = event.state === "down" ? "fail" : "warn";
+      return [{ id: event.id, layer: event.layer, tone, x1, x2, open: event.ended_ms == null }];
+    })
+    .sort((a, b) => a.x1 - b.x1);
+  const merged: EventBand[] = [];
+  const last = new Map<string, EventBand>();
+  for (const band of bands) {
+    const key = `${band.layer}:${band.tone}`;
+    const previous = last.get(key);
+    if (previous && band.x1 - previous.x2 <= join) {
+      previous.x2 = Math.max(previous.x2, band.x2);
+      previous.open ||= band.open;
+      continue;
+    }
+    merged.push(band);
+    last.set(key, band);
+  }
+  return merged;
 }
 
 /**
