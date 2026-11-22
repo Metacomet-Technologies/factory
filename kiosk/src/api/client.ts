@@ -14,10 +14,16 @@ export function abortApiRequests() {
   for (const controller of requests) controller.abort();
 }
 
+/**
+ * `enabled: false` skips the request (for a resource the current page does not show).
+ * `keepPrevious` keeps the last page on screen, marked `refreshing`, while a new query loads,
+ * so paging a list dims it instead of collapsing it to a skeleton.
+ */
 export function useApi<K extends keyof Endpoints>(
   path: K,
   query = "",
   revision = 0,
+  { enabled = true, keepPrevious = false }: { enabled?: boolean; keepPrevious?: boolean } = {},
 ): Resource<Endpoints[K]> & { refreshing: boolean } {
   const scope = `${path}${query}`;
   const [resource, setResource] = useState<
@@ -30,6 +36,7 @@ export function useApi<K extends keyof Endpoints>(
     loading: true,
   });
   useEffect(() => {
+    if (!enabled) return;
     const controller = new AbortController();
     requests.add(controller);
     async function refresh() {
@@ -59,7 +66,7 @@ export function useApi<K extends keyof Endpoints>(
       requests.delete(controller);
       clearInterval(timer);
     };
-  }, [path, query, scope, revision]);
+  }, [path, query, scope, revision, enabled]);
   // A revision bump refetches the same resource: the last response (or error) stays on
   // screen, marked `refreshing`, until the new one lands, so a stream-driven refresh never
   // flashes a skeleton, collapses a card or remounts its chart. A new path or query starts
@@ -68,9 +75,13 @@ export function useApi<K extends keyof Endpoints>(
   const refreshing = current && resource.revision !== revision;
   return useMemo(
     () =>
-      current
-        ? { data: resource.data, error: resource.error, loading: resource.loading, refreshing }
-        : { data: null, error: null, loading: true, refreshing: false },
-    [current, resource, refreshing],
+      !enabled
+        ? { data: null, error: null, loading: false, refreshing: false }
+        : current
+          ? { data: resource.data, error: resource.error, loading: resource.loading, refreshing }
+          : keepPrevious && resource.data !== null
+            ? { data: resource.data, error: null, loading: false, refreshing: true }
+            : { data: null, error: null, loading: true, refreshing: false },
+    [enabled, current, keepPrevious, resource, refreshing],
   );
 }

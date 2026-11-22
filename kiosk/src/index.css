@@ -2307,3 +2307,16 @@
     scroll-behavior: auto !important;
   }
 }
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 10px;
+  font-size: 12px;
+}
+/* A list fetching its next page keeps the old rows, dimmed, instead of collapsing. */
+.paging {
+  opacity: 0.55;
+  transition: opacity 120ms;
+}

@@ -122,19 +122,29 @@ export type LayerLine = { target: string; points: LayerRow[] };
 export function layerRows(series: NetworkSeries[], layer: NetworkLayer): LayerLine[] {
   return series
     .filter((line) => line.layer === layer)
-    .map((line, index) => ({
-      target: line.target,
-      points: line.points
-        .map(
-          (point) =>
-            ({
-              ts_ms: point.ts_ms,
-              [`latency${index}`]: point.latency_ms.avg ?? null,
-              [`loss${index}`]: point.loss_percent,
-            }) as LayerRow,
-        )
-        .sort((a, b) => a.ts_ms - b.ts_ms),
-    }));
+    .map((line, index) => {
+      const latency = `latency${index}` as const;
+      const loss = `loss${index}` as const;
+      const sorted = line.points.toSorted((a, b) => a.ts_ms - b.ts_ms);
+      const steps = sorted.slice(1).map((point, at) => point.ts_ms - sorted[at]!.ts_ms);
+      const step = steps.toSorted((a, b) => a - b)[Math.floor(steps.length / 2)] ?? 0;
+      return {
+        target: line.target,
+        points: sorted.flatMap((point, at) => {
+          const row = {
+            ts_ms: point.ts_ms,
+            [latency]: point.latency_ms.avg ?? null,
+            [loss]: point.loss_percent,
+          } as LayerRow;
+          // No bucket at all (the host was down) ends the line at the last bucket's end;
+          // without the null row the step line would bridge the hole as if it were healthy.
+          const next = sorted[at + 1];
+          return next && next.ts_ms - point.ts_ms > step * 1.5
+            ? [row, { ts_ms: point.ts_ms + step, [latency]: null, [loss]: null } as LayerRow]
+            : [row];
+        }),
+      };
+    });
 }
 
 export type EventBand = {

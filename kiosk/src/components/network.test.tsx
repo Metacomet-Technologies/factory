@@ -232,7 +232,7 @@ describe("network page", () => {
     serve(networkFixtures("healthy", false, "24h", "24h"));
     await open();
     const tests = within(screen.getByRole("region", { name: "Speed tests" }));
-    expect(await tests.findByText("Newest 8 of 8 in the last 24h")).toBeInTheDocument();
+    expect(await tests.findByText("8 in the last 24h, newest first")).toBeInTheDocument();
     const rows = tests.getAllByRole("row");
     expect(rows[1]).toHaveTextContent(/timeout——9.1 ms— \/ —test exceeded 60 s/);
     expect(tests.getByText("HTTP 500 from speed endpoint").closest("tr")).toHaveTextContent(
@@ -240,21 +240,38 @@ describe("network page", () => {
     );
     expect(tests.getAllByText("ok")).toHaveLength(6);
   });
-  it("pages older events and returns to the newest page", async () => {
+  it("pages older events, keeping the current page on screen until the next one lands", async () => {
     const network = networkFixtures();
+    let release = () => {};
     const fetch = serve(network, (path) =>
       path === "/v1/network/events?limit=20"
         ? json({ events: network.events.slice(0, 1), next_before: 3 })
-        : null,
+        : path === "/v1/network/events?limit=20&before=3"
+          ? new Promise((resolve) => {
+              release = () =>
+                resolve(json({ events: network.events.slice(1, 2), next_before: null }));
+            })
+          : null,
     );
     await open();
     const events = within(screen.getByRole("region", { name: "Network events" }));
-    fireEvent.click(await events.findByRole("button", { name: "Older events" }));
+    expect(await events.findByText("Page 1")).toBeInTheDocument();
+    expect(events.getByRole("button", { name: "Newer" })).toBeDisabled();
+    fireEvent.click(events.getByRole("button", { name: "Older" }));
     await waitFor(() =>
       expect(fetch).toHaveBeenCalledWith("/v1/network/events?limit=20&before=3", expect.anything()),
     );
-    fireEvent.click(await events.findByRole("button", { name: "Newest events" }));
-    expect(await events.findByRole("button", { name: "Older events" })).toBeInTheDocument();
+    expect(events.getByRole("table")).toHaveAttribute("aria-busy", "true");
+    expect(events.getAllByRole("row")).toHaveLength(2);
+    expect(events.queryByLabelText("Loading section")).not.toBeInTheDocument();
+    expect(events.getByRole("button", { name: "Older" })).toBeDisabled();
+    await act(async () => release());
+    expect(await events.findByText("Page 2")).toBeInTheDocument();
+    expect(events.getByRole("table")).toHaveAttribute("aria-busy", "false");
+    expect(events.getAllByRole("row")[1]).toHaveTextContent(/Recovered/);
+    expect(events.getByRole("button", { name: "Older" })).toBeDisabled();
+    fireEvent.click(events.getByRole("button", { name: "Newer" }));
+    expect(await events.findByText("Page 1")).toBeInTheDocument();
   });
   it("shows skeletons while history and events are pending", async () => {
     serve(networkFixtures(), (path) =>
@@ -299,6 +316,6 @@ describe("network page", () => {
     expect(
       within(screen.getByRole("region", { name: "Live network" })).getByText("Healthy"),
     ).toBeInTheDocument();
-    expect(await screen.findByText("Newest 8 of 8 in the last 24h")).toBeInTheDocument();
+    expect(await screen.findByText("8 in the last 24h, newest first")).toBeInTheDocument();
   });
 });

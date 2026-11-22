@@ -3,6 +3,7 @@ import { Gauge, Globe, History } from "lucide-react";
 import { apiUrl, useApi, type Resource } from "../api/client";
 import type { Endpoints, NetworkEvent, NetworkRange } from "../api/types";
 import { mbps, ms, number, seen } from "../lib/format";
+import { useCursorPages, usePages } from "../lib/pages";
 import {
   NETWORK_RANGES,
   endLabel,
@@ -19,8 +20,8 @@ import {
   speedRange,
 } from "../lib/network";
 import { ResourceState, Warnings } from "./sections";
-import { Button } from "./ui/button";
 import { PageHeader } from "./ui/page-header";
+import { Pager } from "./ui/pager";
 import { Panel } from "./ui/panel";
 import { RangeToggle } from "./ui/range-toggle";
 import { StatusChip } from "./ui/status-chip";
@@ -100,8 +101,10 @@ function Live({ status, now }: { status: Resource<Endpoints["/v1/network"]>; now
 }
 
 function Events({ now, index }: { now: number; index: number }) {
-  const [cursor, setCursor] = useState("");
-  const events = useApi("/v1/network/events", `?limit=20${cursor}`);
+  const pages = useCursorPages();
+  const events = useApi("/v1/network/events", `?limit=20${pages.cursor}`, 0, {
+    keepPrevious: true,
+  });
   const page = events.data;
   return (
     <Panel
@@ -116,7 +119,7 @@ function Events({ now, index }: { now: number; index: number }) {
         empty={page?.events.length === 0 ? "No network events." : undefined}
       />
       {!!page?.events.length && (
-        <Table>
+        <Table aria-busy={events.refreshing} className={events.refreshing ? "paging" : undefined}>
           <Head
             labels={[
               "Started",
@@ -150,22 +153,15 @@ function Events({ now, index }: { now: number; index: number }) {
           </TableBody>
         </Table>
       )}
-      <div className="row">
-        {cursor && (
-          <Button variant="outline" size="sm" onClick={() => setCursor("")}>
-            Newest events
-          </Button>
-        )}
-        {page?.next_before != null && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setCursor(`&before=${page.next_before}`)}
-          >
-            Older events
-          </Button>
-        )}
-      </div>
+      <Pager
+        label="Network event pages"
+        page={pages.page}
+        busy={events.refreshing}
+        onNewer={pages.newer}
+        onOlder={
+          page?.next_before != null ? () => pages.older(`&before=${page.next_before}`) : undefined
+        }
+      />
     </Panel>
   );
 }
@@ -182,13 +178,13 @@ function SpeedTests({
   index: number;
 }) {
   const tests = resource.data?.tests ?? [];
-  const recent = tests.slice(-10).reverse();
+  const { rows: recent, page, pages, newer, older } = usePages([...tests].reverse(), 10);
   return (
     <Panel
       title="Speed tests"
       subtitle={
         tests.length
-          ? `Newest ${recent.length} of ${tests.length} in the last ${speedRange[range]}`
+          ? `${tests.length} in the last ${speedRange[range]}, newest first`
           : `Last ${speedRange[range]}`
       }
       icon={<Gauge />}
@@ -222,6 +218,7 @@ function SpeedTests({
           </TableBody>
         </Table>
       )}
+      <Pager label="Speed test pages" page={page} pages={pages} onNewer={newer} onOlder={older} />
     </Panel>
   );
 }

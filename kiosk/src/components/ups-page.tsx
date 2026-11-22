@@ -4,12 +4,14 @@ import { apiUrl, useApi } from "../api/client";
 import type { LiveState } from "../api/stream";
 import type { Endpoints, UpsCurrent, UpsEvent, UpsRange, UpsSettings } from "../api/types";
 import { ms, number, usd } from "../lib/format";
+import { useCursorPages, usePages } from "../lib/pages";
 import { electricityRate, rateInput } from "../lib/ups";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { KeyValue } from "./ui/key-value";
 import { MeterBar } from "./ui/meter-bar";
 import { PageHeader } from "./ui/page-header";
+import { Pager } from "./ui/pager";
 import { Panel, Tile } from "./ui/panel";
 import { RangeToggle } from "./ui/range-toggle";
 import { Stat } from "./ui/stat";
@@ -159,8 +161,9 @@ function Energy({ range, revision }: { range: Exclude<UpsRange, "1h">; revision:
 }
 
 function Timeline({ now, index }: { now: number; index: number }) {
-  const [cursor, setCursor] = useState("");
-  const events = useApi("/v1/ups/events", `?limit=20${cursor}`);
+  const pages = useCursorPages();
+  const events = useApi("/v1/ups/events", `?limit=20${pages.cursor}`, 0, { keepPrevious: true });
+  const next = events.data;
   return (
     <Panel
       title="Power events"
@@ -173,7 +176,10 @@ function Timeline({ now, index }: { now: number; index: number }) {
         resource={events}
         empty={events.data?.events.length === 0 ? "No power events." : undefined}
       />
-      <ol className="ups-events">
+      <ol
+        className={events.refreshing ? "ups-events paging" : "ups-events"}
+        aria-busy={events.refreshing}
+      >
         {events.data?.events.map((event) => (
           <li key={event.id}>
             <div className="row">
@@ -201,26 +207,18 @@ function Timeline({ now, index }: { now: number; index: number }) {
           </li>
         ))}
       </ol>
-      <div className="row">
-        {cursor && (
-          <Button variant="outline" size="sm" onClick={() => setCursor("")}>
-            Newest events
-          </Button>
-        )}
-        {events.data?.next_before_ms != null && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() =>
-              setCursor(
-                `&before_ms=${events.data!.next_before_ms}&before_id=${events.data!.next_before_id}`,
-              )
-            }
-          >
-            Older events
-          </Button>
-        )}
-      </div>
+      <Pager
+        label="Power event pages"
+        page={pages.page}
+        busy={events.refreshing}
+        onNewer={pages.newer}
+        onOlder={
+          next?.next_before_ms != null
+            ? () =>
+                pages.older(`&before_ms=${next.next_before_ms}&before_id=${next.next_before_id}`)
+            : undefined
+        }
+      />
     </Panel>
   );
 }
@@ -320,6 +318,8 @@ export default function UpsPage({
         point.load_w.avg <= 110 &&
         point.runtime_s != null,
     ) ?? [];
+  // Newest hour first, a day per page: a year of hourly points is ~900 rows.
+  const trendPages = usePages([...trend].reverse(), 24);
   return (
     <main id="main" className="dashboard ups-page">
       <PageHeader eyebrow="Power" title="UPS · Power & battery" aside="factory-gpu, modem, eero" />
@@ -496,7 +496,7 @@ export default function UpsPage({
                   </tr>
                 </thead>
                 <tbody>
-                  {trend.map((point) => (
+                  {trendPages.rows.map((point) => (
                     <tr key={point.ts_ms}>
                       <td>{date(point.ts_ms)}</td>
                       <td>{number(point.load_w.avg)}</td>
@@ -505,6 +505,13 @@ export default function UpsPage({
                   ))}
                 </tbody>
               </table>
+              <Pager
+                label="Runtime trend pages"
+                page={trendPages.page}
+                pages={trendPages.pages}
+                onNewer={trendPages.newer}
+                onOlder={trendPages.older}
+              />
             </div>
           ) : (
             <p className="empty">No hourly samples at the reference load in the last year.</p>

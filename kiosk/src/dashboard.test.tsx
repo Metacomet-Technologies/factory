@@ -376,13 +376,22 @@ describe("UPS telemetry", () => {
     });
     render(<App />);
     const health = await screen.findByRole("region", { name: "Hourly runtime trend" });
-    expect(within(health).getAllByRole("row")).toHaveLength(3);
-    expect(within(health).getByText("70")).toBeInTheDocument();
-    expect(within(health).getByText("110")).toBeInTheDocument();
+    const trendRows = within(health).getAllByRole("row");
+    expect(trendRows).toHaveLength(3);
+    // Newest hour first.
+    expect(trendRows[1]).toHaveTextContent("110");
+    expect(trendRows[2]).toHaveTextContent("70");
     expect(screen.getByRole("region", { name: "Battery health" })).toHaveTextContent(
       new Date(at).toLocaleString(),
     );
-    fireEvent.click(await screen.findByRole("button", { name: "Older events" }));
+    fireEvent.click(
+      within(await screen.findByRole("navigation", { name: "Power event pages" })).getByRole(
+        "button",
+        {
+          name: "Older",
+        },
+      ),
+    );
     await waitFor(() =>
       expect(fetch).toHaveBeenCalledWith(
         `/v1/ups/events?limit=20&before_ms=${at}&before_id=9`,

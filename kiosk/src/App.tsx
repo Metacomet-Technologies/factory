@@ -194,7 +194,10 @@ export default function App() {
   const upsCurrent = live.upsAt > (ups.data?.generated_at_ms ?? 0) ? live.ups : ups.data?.current;
   const upsWarnings = ups.data?.warnings ?? (ups.error ? [ups.error] : []);
   const network = useApi("/v1/network", "", live.networkRevision + live.snapshotRevision);
-  const networkTrend = useApi("/v1/network/history", "?range=24h", live.snapshotRevision);
+  // Only the dashboard card shows the 24 h trend; /network loads its own range.
+  const networkTrend = useApi("/v1/network/history", "?range=24h", live.snapshotRevision, {
+    enabled: path === "/",
+  });
   const pricing = useApi("/v1/pricing", "", live.pricingRevision + live.snapshotRevision);
   const agents = useApi("/v1/agents", "", live.agentsRevision + live.snapshotRevision);
   const deviceRevision = live.devicesRevision + live.snapshotRevision;
@@ -213,6 +216,7 @@ export default function App() {
       : "/v1/devices/factory-gpu/history",
     `?range=${deviceRange}`,
     deviceRevision,
+    { enabled: path.startsWith("/devices/") },
   );
   const collectorDown = live.connected && live.devices === null;
   const deviceView = collectorDown

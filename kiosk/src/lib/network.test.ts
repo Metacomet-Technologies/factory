@@ -166,6 +166,29 @@ describe("network history shapes", () => {
     expect(lines[0]!.points[0]).toEqual({ ts_ms: 0, latency0: 9, loss0: 10 });
     expect(lines[1]!.points[2]).toEqual({ ts_ms: 120_000, latency1: null, loss1: 100 });
   });
+  it("breaks a line where buckets are missing, instead of drawing the hole as healthy", () => {
+    const [line] = layerRows(
+      [
+        series("wan", "1.1.1.1", [
+          [0, 9, 0],
+          [120_000, 10, 0],
+          [240_000, 11, 0],
+          // Host down for ~3.5 buckets.
+          [720_000, 12, 50],
+          [840_000, 13, 0],
+        ]),
+      ],
+      "wan",
+    );
+    expect(line!.points).toEqual([
+      { ts_ms: 0, latency0: 9, loss0: 0 },
+      { ts_ms: 120_000, latency0: 10, loss0: 0 },
+      { ts_ms: 240_000, latency0: 11, loss0: 0 },
+      { ts_ms: 360_000, latency0: null, loss0: null },
+      { ts_ms: 720_000, latency0: 12, loss0: 50 },
+      { ts_ms: 840_000, latency0: 13, loss0: 0 },
+    ]);
+  });
   it("gives each target its own points, so a missed bucket never breaks another line", () => {
     const lines = layerRows(
       [
