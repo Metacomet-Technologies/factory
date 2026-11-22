@@ -1,6 +1,28 @@
 version: 2
+# One grouped PR per ecosystem each week. .github/workflows/dependabot-merge.yml
+# merges a group (branch dependabot/.../weekly-*) once its CI is green; major
+# cargo and kiosk updates arrive as their own PRs for an agent to review.
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      weekly-actions:
+        patterns: ['*']
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      weekly-cargo:
+        patterns: ['*']
+        update-types: [minor, patch]
+  - package-ecosystem: bun
+    directory: /kiosk
+    schedule:
+      interval: weekly
+    groups:
+      weekly-kiosk:
+        patterns: ['*']
+        update-types: [minor, patch]

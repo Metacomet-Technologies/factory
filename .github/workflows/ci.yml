@@ -4,13 +4,15 @@ on:
   pull_request:
   push:
     branches: [main]
+  # dependabot-merge.yml dispatches CI after merging with GITHUB_TOKEN, which triggers no push run.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-# Each main push keeps its own run, so every commit on main gets a result.
+# Each main commit keeps its own run, so every commit on main gets a result.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ (github.event_name == 'push' && github.sha) || github.ref }}
+  group: ci-${{ github.workflow }}-${{ (github.event_name != 'pull_request' && github.sha) || github.ref }}
   cancel-in-progress: true
 
 jobs:

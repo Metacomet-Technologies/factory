@@ -1,0 +1,41 @@
+name: Merge Dependabot groups
+
+# Main-based development has no reviewers, so a weekly Dependabot group merges
+# itself once CI on its PR is green. Single (major) updates are left for review.
+# A merge made with GITHUB_TOKEN triggers no push workflows, so this dispatches
+# CI on main; the auto-deployer then deploys the result once ci-ok is green.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  merge:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.actor.login == 'dependabot[bot]' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/') &&
+      contains(github.event.workflow_run.head_branch, '/weekly-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Rebase-merge the tested group and run CI on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          pr=$(gh pr list -R "$REPO" --head "$BRANCH" --state open --json number,headRefOid,author \
+            --jq '.[] | select(.headRefOid == env.SHA and .author.login == "app/dependabot") | .number')
+          if [[ -z $pr ]]; then echo "No open Dependabot PR at $SHA; nothing to merge"; exit 0; fi
+          gh pr merge -R "$REPO" "$pr" --rebase --delete-branch
+          gh workflow run ci.yml -R "$REPO" --ref main
