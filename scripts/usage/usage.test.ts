@@ -5,9 +5,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createServer as createNetServer } from 'node:net';
 import { collect, command, readPrevious, writeSnapshot, CLAUDE_ARGS, supportedNode } from './collect.ts';
 import { age, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, parseCursor, parseKimi, parseOpencode, parseOpencodeV2, STALE_MS } from './parsers.ts';
 import { amp, ampAutoReload, ampCharged, ampNew, details, detailsAutoReload, detailsNew, claude, codex, cursorAbout, cursorLoggedOut, kimiLive, kimiLoggedOut, kimiUsage, opencodeStats, opencodeV2ShareCard, opencodeV2Stats, opencodeV2Zero, fixtureRun, versions } from './fixtures.ts';
+
+// A loopback port the OS reports free; fixed ports collide with other runs on the host.
+const freePort = () => new Promise<number>((resolve, reject) => {
+  const server = createNetServer().once('error', reject).listen(0, '127.0.0.1', () => {
+    const { port } = server.address() as import('node:net').AddressInfo;
+    server.close(() => resolve(port));
+  });
+});
+// Spawning node CLIs takes seconds on a loaded host; only success paths wait this long.
+const SPAWN_BUDGET_MS = 20_000;
 const now = 1791800000000;
 
 test('supported Node versions require Node 24.12.0 or newer', () => {
@@ -315,8 +326,8 @@ test('CLI dry-run writes nothing and logs only sanitized snapshot using fake bin
     };
     for (const [program, script] of Object.entries(scripts)) await writeFile(join(dir, program), `#!${process.execPath}\n${script}\n`, { mode: 0o700 });
     const path = join(dir, 'usage.json');
-    const env = { HOME: dir, PATH: `${dir}:/usr/bin:/bin`, FACTORY_USAGE_SNAPSHOT: path, FACTORY_KIMI_PORT: '58941' };
-    const invoke = (args: string[]) => spawnSync(process.execPath, ['scripts/usage/collect.ts', ...args], { cwd: fileURLToPath(new URL('../..', import.meta.url)), env, encoding: 'utf8', timeout: 5000 });
+    const env = { HOME: dir, PATH: `${dir}:/usr/bin:/bin`, FACTORY_USAGE_SNAPSHOT: path, FACTORY_KIMI_PORT: String(await freePort()) };
+    const invoke = (args: string[]) => spawnSync(process.execPath, ['scripts/usage/collect.ts', ...args], { cwd: fileURLToPath(new URL('../..', import.meta.url)), env, encoding: 'utf8', timeout: SPAWN_BUDGET_MS });
     for (const cachedVersion of [null, '0.0.1791763306-ged595a', '0.0.1791849701-g1448da']) {
       if (cachedVersion) await writeFile(path, JSON.stringify({
         schema_version: 1, tools: [],
@@ -409,14 +420,17 @@ test('kimi loopback probe rejects loose tokens, redirects and foreign servers, a
   const token = 'fixturetokenvalue0001';
   const body = JSON.stringify(kimiUsage);
   const program = join(dir, 'kimi');
-  const serve = (port: number, status: number, payload: string, location?: string) => new Promise<import('node:http').Server>(resolve => {
+  const serve = (status: number, payload: string, location?: string) => new Promise<import('node:http').Server>(resolve => {
     const server = createServer((req, res) => {
       if (req.headers.authorization !== `Bearer ${token}`) { res.writeHead(401); res.end('denied'); return; }
       if (location) res.setHeader('location', location);
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(payload);
     });
-    server.listen(port, '127.0.0.1', () => resolve(server));
+    server.listen(0, '127.0.0.1', () => {
+      process.env.FACTORY_KIMI_PORT = String((server.address() as import('node:net').AddressInfo).port);
+      resolve(server);
+    });
   });
   const close = async (server: import('node:http').Server) => { await new Promise(resolve => server.close(resolve)); };
   try {
@@ -424,8 +438,7 @@ test('kimi loopback probe rejects loose tokens, redirects and foreign servers, a
     await writeFile(program, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(join(dir, 'spawned'))}, 'yes'); process.exit(1);\n`, { mode: 0o700 });
     await writeFile(join(dir, 'server.token'), token, { mode: 0o644 });
     await chmod(join(dir, 'server.token'), 0o644);
-    process.env.FACTORY_KIMI_PORT = '58951';
-    const loose = await serve(58951, 200, body);
+    const loose = await serve(200, body);
     await assert.rejects(command(program, ['usage'], 2000), { message: 'CLI failed' });
     await assert.rejects(stat(join(dir, 'spawned')));
     await close(loose);
@@ -433,35 +446,35 @@ test('kimi loopback probe rejects loose tokens, redirects and foreign servers, a
     await chmod(join(dir, 'real.token'), 0o600);
     await rm(join(dir, 'server.token'));
     await symlink(join(dir, 'real.token'), join(dir, 'server.token'));
-    process.env.FACTORY_KIMI_PORT = '58952';
-    const linked = await serve(58952, 200, body);
+    const linked = await serve(200, body);
     await assert.rejects(command(program, ['usage'], 2000), { message: 'CLI failed' });
     await close(linked);
     await rm(join(dir, 'server.token'));
     await writeFile(join(dir, 'server.token'), token, { mode: 0o600 });
     await chmod(join(dir, 'server.token'), 0o600);
-    process.env.FACTORY_KIMI_PORT = '58953';
-    const redirect = await serve(58953, 302, '', 'http://169.254.169.254/latest');
+    const redirect = await serve(302, '', 'http://169.254.169.254/latest');
     await assert.rejects(command(program, ['usage'], 2000), { message: 'CLI failed' });
     await close(redirect);
-    process.env.FACTORY_KIMI_PORT = '58954';
-    const huge = await serve(58954, 200, 'x'.repeat(70_000));
+    const huge = await serve(200, 'x'.repeat(70_000));
     await assert.rejects(command(program, ['usage'], 2000), { message: 'CLI output too large' });
     await close(huge);
-    process.env.FACTORY_KIMI_PORT = '58955';
     let hits = 0;
     const held = await new Promise<import('node:http').Server>(resolve => {
       const server = createServer((_req, res) => { hits += 1; res.writeHead(200); res.end(body); });
-      server.listen(58955, '127.0.0.1', () => resolve(server));
+      server.listen(0, '127.0.0.1', () => {
+        process.env.FACTORY_KIMI_PORT = String((server.address() as import('node:net').AddressInfo).port);
+        resolve(server);
+      });
     });
-    const reused = await command(program, ['usage'], 2000);
+    const reused = await command(program, ['usage'], SPAWN_BUDGET_MS);
     assert.equal(hits, 1);
     assert.doesNotMatch(reused, new RegExp(token));
     await assert.rejects(stat(join(dir, 'spawned')));
     await close(held);
-    await writeFile(program, `#!${process.execPath}\nconst fs=require('node:fs'); const http=require('node:http'); fs.writeFileSync(${JSON.stringify(join(dir, 'child.pid'))}, String(process.pid)); http.createServer((_req,res)=>{res.writeHead(200);res.end(${JSON.stringify(body)});}).listen(58956,'127.0.0.1'); console.log('Token: ${token}');\n`, { mode: 0o700 });
-    process.env.FACTORY_KIMI_PORT = '58956';
-    const spawned = await command(program, ['usage'], 3000);
+    const childPort = await freePort();
+    await writeFile(program, `#!${process.execPath}\nconst fs=require('node:fs'); const http=require('node:http'); fs.writeFileSync(${JSON.stringify(join(dir, 'child.pid'))}, String(process.pid)); http.createServer((_req,res)=>{res.writeHead(200);res.end(${JSON.stringify(body)});}).listen(${childPort},'127.0.0.1'); console.log('Token: ${token}');\n`, { mode: 0o700 });
+    process.env.FACTORY_KIMI_PORT = String(childPort);
+    const spawned = await command(program, ['usage'], SPAWN_BUDGET_MS);
     assert.equal(JSON.parse(spawned).data.kind, 'ok');
     assert.doesNotMatch(spawned, new RegExp(token));
     const pid = Number(await readFile(join(dir, 'child.pid'), 'utf8'));
