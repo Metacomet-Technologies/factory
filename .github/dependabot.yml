@@ -29,4 +29,6 @@ updates:
     groups:
       weekly-kiosk:
         patterns: ['*']
+        # Vite+ is the toolchain pin (docs/environments.md); a bump needs `vp migrate`.
+        exclude-patterns: ['vite-plus']
         update-types: [minor, patch]
