@@ -95,6 +95,27 @@ export default defineConfig({
   plugins: [
     ...(lazyPlugins(() => [react(), tailwindcss()]) ?? []),
     {
+      // A stale install tree (a leftover node_modules/.pnpm/ pinning React 19.3.0 next to
+      // bun's 19.3.1) once put two Reacts in the deployed bundle, and every page died with
+      // "reading 'useMemo'". resolve.dedupe and an alias did not stop rolldown from bundling the
+      // second copy, so the build refuses to finish with more than one.
+      name: "one-react",
+      apply: "build",
+      buildEnd() {
+        const copies = new Set(
+          [...this.getModuleIds()].flatMap((id) => {
+            const match = /^(.*)\/react(-dom)?\/cjs\/react(-dom)?\.[a-z.]+\.js$/.exec(id);
+            return match ? [match[1]] : [];
+          }),
+        );
+        if (copies.size > 1)
+          this.error(
+            `React is bundled from ${copies.size} places; reinstall kiosk/node_modules from scratch:\n` +
+              [...copies].join("\n"),
+          );
+      },
+    },
+    {
       name: "kiosk-build-identity",
       apply: "build",
       generateBundle: {

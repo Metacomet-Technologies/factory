@@ -21,10 +21,7 @@ export VERIFY_ROOT="/tmp/factory-kiosk-verify/$RUN_ID"
 node .cursor/skills/verify-kiosk/verify.mjs launch
 ```
 
-`launch` sources `/home/agent/.config/vite-plus/env`, starts `vp run mock-dev` from `kiosk/` in its own process group, and returns only after both of these are true:
-
-- the log contains `Mock API on 127.0.0.1:4179` and `http://127.0.0.1:4181/`
-- `GET /v1/health` on port 4179 returns 200 and `GET /` on port 4181 returns the app shell
+`launch` sources `/home/agent/.config/vite-plus/env`, starts `vp run mock-dev` from `kiosk/` in its own process group, and returns once `GET /v1/health` on port 4179 returns 200 and `GET /` on port 4181 returns the app shell. It fails at once if `mock-dev` exits, and prints the end of its log on any failure.
 
 The mock has no database and no migrations. Fixtures in `kiosk/mock/fixtures.ts` are the seed data. Ready means the heading `factory` can load, not merely that a socket accepts connections.
 

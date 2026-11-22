@@ -84,20 +84,17 @@ function readPid() {
   return pid;
 }
 
-async function waitReady() {
+// Ready means both servers answer, not a log line: with CI set, vite colors the URL it prints.
+async function waitReady(pid) {
   const deadline = Date.now() + 90_000;
   while (Date.now() < deadline) {
-    const log = existsSync(logFile) ? readFileSync(logFile, "utf8") : "";
-    const mockReady = log.includes(`Mock API on 127.0.0.1:${mockPort}`);
-    const uiReady = log.includes(`http://127.0.0.1:${uiPort}/`);
-    if (mockReady && uiReady) {
-      const health = await httpGet(mockPort, "/v1/health").catch(() => null);
-      const ui = await httpGet(uiPort, "/").catch(() => null);
-      if (health?.status === 200 && ui?.status === 200 && ui.body.includes("kiosk")) return;
-    }
+    if (!existsSync(`/proc/${pid}`)) throw new Error("mock-dev exited before it was ready");
+    const health = await httpGet(mockPort, "/v1/health").catch(() => null);
+    const ui = await httpGet(uiPort, "/").catch(() => null);
+    if (health?.status === 200 && ui?.status === 200 && ui.body.includes("kiosk")) return;
     await delay(500);
   }
-  throw new Error(`mock-dev did not become usable; see ${logFile}`);
+  throw new Error("mock-dev did not become usable within 90 s");
 }
 
 async function launch() {
@@ -120,8 +117,10 @@ async function launch() {
   writeFileSync(pidFile, `${child.pid}\n`);
   console.log(`launched pid ${child.pid}; log ${logFile}`);
   try {
-    await waitReady();
+    await waitReady(child.pid);
   } catch (error) {
+    const log = readFileSync(logFile, "utf8").split("\n").slice(-40).join("\n");
+    console.error(`--- last lines of ${logFile}\n${log}`);
     cleanup();
     throw error;
   }

@@ -68,7 +68,8 @@ for component in "$@"; do
             installer=(deploy/install-factory-api.sh target/release/factory-api)
             rollback=(deploy/rollback-factory-api.sh) ;;
         kiosk)
-            (cd kiosk && as_agent vp install --frozen-lockfile && as_agent vp build)
+            # From scratch: an install over a stale tree once left a second React behind.
+            (cd kiosk && as_agent rm -rf node_modules && as_agent vp install --frozen-lockfile && as_agent vp build)
             installer=(deploy/install-kiosk.sh kiosk/dist)
             rollback=(deploy/install-kiosk.sh --rollback) ;;
     esac
