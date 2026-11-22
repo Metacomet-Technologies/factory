@@ -738,7 +738,55 @@ describe("dashboard contract", () => {
     expect(nodes[2]).toHaveTextContent(`seen ${seen(0)}`);
     expect(nodes[2]).not.toHaveTextContent("seen now");
   });
-  it("renders every section, null tps, pricing estimates and a read-only pending banner", async () => {
+  it("confirms a pending reference model from its banner and drops the banner", async () => {
+    const fetch = api();
+    const base = fetch.getMockImplementation()!;
+    let status = 500;
+    let confirmed = false;
+    fetch.mockImplementation((path: string, init?: RequestInit) => {
+      if (init?.method === "POST") return Promise.resolve(new Response("{}", { status }));
+      if (confirmed && new URL(path, "http://localhost").pathname === "/v1/pricing") {
+        const pricing = fixtures().pricing;
+        for (const family of pricing.families)
+          if (family.pending) ((family.selected = family.pending), (family.pending = null));
+        return Promise.resolve(new Response(JSON.stringify(pricing)));
+      }
+      return base(path);
+    });
+    render(<App />);
+    await openLlmDetails();
+    const button = await screen.findByRole("button", {
+      name: "Confirm anthropic/claude-sonnet-5.6 for Claude Sonnet",
+    });
+    fireEvent.click(button);
+    expect(await screen.findByText("Confirm failed. Try again.")).toBeInTheDocument();
+    expect(button).toBeEnabled();
+    status = 200;
+    fireEvent.click(button);
+    expect(await screen.findByText("Confirmed. Updating…")).toBeInTheDocument();
+    expect(button).toBeDisabled();
+    expect(fetch).toHaveBeenCalledWith(
+      "/v1/pricing/confirm/Claude%20Sonnet",
+      expect.objectContaining({ method: "POST" }),
+    );
+    confirmed = true;
+    act(() => {
+      MockSource.latest.dispatchEvent(
+        new MessageEvent("pricing.changed", {
+          data: JSON.stringify({
+            type: "pricing.changed",
+            ts_ms: Date.now(),
+            data: { family: "Claude Sonnet", pending_model_id: null },
+          }),
+        }),
+      );
+    });
+    await waitFor(() =>
+      expect(screen.queryByText(/New reference model available/)).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("button", { name: /^Confirm / })).not.toBeInTheDocument();
+  });
+  it("renders every section, null tps, pricing estimates and a pending banner", async () => {
     api();
     render(<App />);
     expect(screen.getAllByLabelText("Loading section").length).toBeGreaterThan(0);
@@ -761,15 +809,21 @@ describe("dashboard contract", () => {
     await openLlmDetails();
     expect(screen.getByText("+ $1.12 estimated (pre-history)")).toBeInTheDocument();
     expect(
+      screen.getByText("New reference model available: anthropic/claude-sonnet-5.6"),
+    ).toBeInTheDocument();
+    expect(
       screen.getByText(
-        "New reference model available: anthropic/claude-sonnet-5.6. Confirm via CLI",
+        /Spend avoided keeps pricing at anthropic\/claude-sonnet-5\.5 until you confirm/,
       ),
     ).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Claude Sonnet" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "ChatGPT mid-tier" })).toBeInTheDocument();
     expect(screen.getByText("8 unpriced · anthropic/claude-sonnet-5.5")).toBeInTheDocument();
     expect(screen.getByText("3 unpriced · openai/gpt-6.1-sol")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /confirm/i })).not.toBeInTheDocument();
+    // Only the family with a pending model offers a confirm button.
+    expect(
+      screen.getAllByRole("button", { name: /^Confirm / }).map((b) => b.getAttribute("aria-label")),
+    ).toEqual(["Confirm anthropic/claude-sonnet-5.6 for Claude Sonnet"]);
     expect(within(screen.getByRole("table")).getByText("— / 56.8")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("link", { name: "factory" }));
     await screen.findByRole("heading", { name: "Your local compute. In focus." });

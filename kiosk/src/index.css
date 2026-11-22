@@ -883,6 +883,13 @@
 .pending > svg {
   color: var(--warn);
 }
+.pending-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
 .skip-link {
   position: fixed;
   top: -100px;

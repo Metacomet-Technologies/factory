@@ -1,9 +1,12 @@
 import { Activity, AlertTriangle, Gauge, Receipt } from "lucide-react";
+import { useState } from "react";
+import { apiUrl } from "../api/client";
 import type { Resource } from "../api/client";
 import type { ModelUsage, Pricing, Usage, UsageRange } from "../api/types";
 import { count, ms, number, usd } from "../lib/format";
 import { ResourceState, Warnings } from "./sections";
 import { Alert, AlertDescription, AlertTitle } from "./ui/alert";
+import { Button } from "./ui/button";
 import { KeyValue } from "./ui/key-value";
 import { PageHeader } from "./ui/page-header";
 import { Panel, Tile } from "./ui/panel";
@@ -12,6 +15,48 @@ import { Stat, StatGrid } from "./ui/stat";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./ui/table";
 
 const ranges = ["24h", "7d", "30d"] as const;
+
+/**
+ * Confirms a family's pending reference model. The API emits pricing.changed, so the banner
+ * disappears when the pricing read that follows arrives; until then the button stays disabled.
+ */
+function ConfirmPending({ family, model }: { family: string; model: string }) {
+  const [state, setState] = useState<"idle" | "sent" | "failed">("idle");
+  const [busy, setBusy] = useState(false);
+  async function confirm() {
+    setBusy(true);
+    try {
+      const response = await fetch(apiUrl(`/v1/pricing/confirm/${encodeURIComponent(family)}`), {
+        method: "POST",
+      });
+      // 409: nothing pending any more, for example confirmed from another screen.
+      if (!response.ok && response.status !== 409) throw new Error(`HTTP ${response.status}`);
+      setState("sent");
+    } catch {
+      setState("failed");
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="pending-actions">
+      <Button
+        size="sm"
+        onClick={() => void confirm()}
+        disabled={busy}
+        aria-label={`Confirm ${model} for ${family}`}
+      >
+        Confirm
+      </Button>
+      <span role="status" className={state === "failed" ? "status-warn" : "muted"}>
+        {state === "sent"
+          ? "Confirmed. Updating…"
+          : state === "failed"
+            ? "Confirm failed. Try again."
+            : ""}
+      </span>
+    </div>
+  );
+}
 
 function ModelCards({ models }: { models: ModelUsage[] }) {
   return (
@@ -129,11 +174,11 @@ export default function LlmPage({
               {family.pending && (
                 <Alert className="pending">
                   <AlertTriangle aria-hidden="true" />
-                  <AlertTitle>
-                    New reference model available: {family.pending.model_id}. Confirm via CLI
-                  </AlertTitle>
+                  <AlertTitle>New reference model available: {family.pending.model_id}</AlertTitle>
                   <AlertDescription>
-                    {family.family} · This dashboard is read-only.
+                    {family.family} · Spend avoided keeps pricing at{" "}
+                    {family.selected?.model_id ?? "no model"} until you confirm.
+                    <ConfirmPending family={family.family} model={family.pending.model_id} />
                   </AlertDescription>
                 </Alert>
               )}

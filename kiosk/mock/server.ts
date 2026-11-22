@@ -20,6 +20,16 @@ if (!["ok", "stale", "unknown", "not_tracked"].includes(agentStatus))
 let refreshedAt: number | null = null;
 let nextRefreshAt = 0;
 const streams = new Set<(event: StreamEvent) => void>();
+// Families whose pending reference model was confirmed through POST /v1/pricing/confirm/.
+const confirmed = new Set<string>();
+function pricingView(pricing: ReturnType<typeof fixtures>["pricing"]) {
+  for (const family of pricing.families)
+    if (confirmed.has(family.family) && family.pending) {
+      family.selected = family.pending;
+      family.pending = null;
+    }
+  return pricing;
+}
 const agents = () => {
   const data = agentFixtures(agentStatus as Parameters<typeof agentFixtures>[0]);
   if (refreshedAt !== null && agentStatus === "ok")
@@ -54,6 +64,25 @@ createServer((request, response) => {
     response
       .writeHead(202, json)
       .end(JSON.stringify({ status: "accepted", next_allowed_at_ms: nextRefreshAt }));
+    return;
+  }
+  const confirm = url.pathname.match(/^\/v1\/pricing\/confirm\/([^/]+)$/);
+  if (request.method === "POST" && confirm) {
+    const family = decodeURIComponent(confirm[1] ?? "");
+    const pricing = pricingView(fixtures(outage).pricing);
+    const target = pricing.families.find((f) => f.family === family);
+    if (!target) return void response.writeHead(404).end();
+    if (!target.pending) return void response.writeHead(409).end();
+    confirmed.add(family);
+    const event: StreamEvent = {
+      type: "pricing.changed",
+      ts_ms: Date.now(),
+      data: { family, pending_model_id: null },
+    };
+    for (const send of streams) send(event);
+    response
+      .writeHead(200, { "Content-Type": "application/json" })
+      .end(JSON.stringify(pricingView(fixtures(outage).pricing)));
     return;
   }
   if (request.method !== "GET") {
@@ -155,7 +184,7 @@ createServer((request, response) => {
     "/v1/fleet": data.fleet,
     "/v1/llm/usage": data.usage,
     "/v1/gpu": data.gpu,
-    "/v1/pricing": data.pricing,
+    "/v1/pricing": pricingView(data.pricing),
     "/v1/agents": agents(),
     "/v1/ups": site.ups,
     "/v1/ups/history": site.upsHistory,
