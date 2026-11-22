@@ -199,7 +199,18 @@ async function journey(device, theme) {
   const problems = [];
   const atPage = async (step, path, check) => {
     await page.waitForFunction((want) => location.pathname === want, path);
-    await page.waitForTimeout(300);
+    // The app holds a restored offset for up to 2 s while the page rebuilds, so judge the
+    // page once its offset and height have not changed for 500 ms (at most 3 s).
+    await page.evaluate(async () => {
+      const sample = () => `${Math.round(scrollY)}:${document.documentElement.scrollHeight}`;
+      const deadline = performance.now() + 3000;
+      let last = sample(), since = performance.now();
+      while (performance.now() < deadline && performance.now() - since < 500) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        const now = sample();
+        if (now !== last) (last = now), (since = performance.now());
+      }
+    });
     const at = await where();
     steps.push({ step, ...at });
     const problem = check(at);
