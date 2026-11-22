@@ -55,6 +55,8 @@ pub struct AppState {
     pub usage_trigger: PathBuf,
     /// MET-74 backup status file read by the alert engine.
     pub backup_status: PathBuf,
+    /// Auto-deploy status file read by the alert engine.
+    pub deploy_status: PathBuf,
     pub devices_root: PathBuf,
     pub reboot_status: PathBuf,
     /// Remote device credentials and ingest state (docs/devices-ingest.md).
@@ -130,6 +132,7 @@ impl AppState {
             usage_snapshot: "/var/lib/factory-usage/usage.json".into(),
             usage_trigger: "/var/lib/factory-usage-trigger/request".into(),
             backup_status: alerts::DEFAULT_BACKUP_STATUS.into(),
+            deploy_status: alerts::DEFAULT_DEPLOY_STATUS.into(),
             devices_root: PathBuf::from("/"),
             reboot_status: devices::DEFAULT_REBOOT_STATUS.into(),
             remote: Arc::new(devices_ingest::Registry::new(device_auth::Tokens::new(

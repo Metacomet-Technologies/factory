@@ -121,6 +121,8 @@ export default defineConfig({
               build,
               git_sha: identity.git_sha,
               git_dirty: identity.git_dirty,
+              // deploy/autodeploy.sh deploys the kiosk when this differs from main's.
+              inputs_fingerprint: identity.inputs_fingerprint,
             }),
           });
         },

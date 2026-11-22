@@ -54,7 +54,7 @@ Keep prompts short: the goal, the Linear issue, what's off-limits and how to kno
 - **Work:** small commits straight to `main`. For anything longer than one sitting, work in `/home/agent/work/factory-<name>` from `origin/main` and rebase before pushing. Never use the main checkout `/home/agent/work/factory` for edits; `factory-deploy` refuses to run when it is dirty.
 - **Spec isolation:** a change to `factory-api/openapi.json` also regenerates `kiosk/src/api/generated.ts`. Kiosk CI rejects generated-type drift.
 - **Evidence:** reply with the commit SHA, what you ran and what you saw, deviations and anything unverified. Put the same on the Linear issue in one comment.
-- **Deploy:** meter, factory-api and kiosk with `sudo factory-deploy …` once CI on that commit is green. Anything else: give Devon the exact `gpu-ssh`/`console-ssh` command with full `/home/agent/work/factory` paths.
+- **Deploy:** meter, factory-api and kiosk deploy themselves once `ci-ok` is green (§6); confirm with the kiosk footer SHAs. Anything else: give Devon the exact `gpu-ssh`/`console-ssh` command with full `/home/agent/work/factory` paths.
 - **Threads:** one thread per task. Title probes `MET-<n> probe: …`, label them `factory` and archive them when done.
 
 ## 5. Review
@@ -63,8 +63,8 @@ Reviews are on request, not a gate. A reviewer reads the commit range (`git log 
 
 ## 6. Deploy flow
 
-1. Push to `main`; wait for CI on that SHA: `gh run list --branch main --commit <sha>`.
-2. On factory-gpu: `sudo factory-deploy meter factory-api kiosk` (only what changed). It fast-forwards the main checkout, builds as `agent`, installs, probes health three times at the new SHA and rolls back to the installer's snapshot on failure.
+1. Push to `main`. CI runs; `ci-ok` is the verdict.
+2. `factory-autodeploy.timer` (every 2 min, as `agent`) sees the green `ci-ok`, compares each component's running `inputs_fingerprint` with `scripts/build-fingerprint.sh` at the new SHA and runs `sudo factory-deploy` for the ones that differ. That fast-forwards the main checkout, builds as `agent`, installs, probes health three times at the new SHA and rolls back to the installer's snapshot on failure. A failed SHA is not retried; the next green push is. Slack alerts: `deploy:main_red`, `deploy:failed`, `deploy:stale`. Status: `/var/lib/factory-autodeploy/status.json`, log: `journalctl -u factory-autodeploy`. Manual fallback: `sudo factory-deploy <component>...`; turn it off with `deploy/rollback-autodeploy.sh`.
 3. Other components (from the Mac, Devon): `gpu-ssh "cd /tmp && sudo bash /home/agent/work/factory/deploy/install-<component>.sh …"` with **full paths**.
 4. Verify: `factory-status`, the kiosk footer SHAs, then close the Linear issue.
 

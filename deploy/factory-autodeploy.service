@@ -1,0 +1,18 @@
+[Unit]
+Description=Deploy green origin/main to factory-gpu (deploy/autodeploy.sh)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=agent
+WorkingDirectory=/home/agent/work/factory
+Environment=HOME=/home/agent
+Environment=PATH=/home/agent/.local/share/vite-plus/bin:/home/agent/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+StateDirectory=factory-autodeploy
+StateDirectoryMode=0755
+# Runs the script from the main checkout, so the deployer itself updates with main.
+ExecStart=/bin/bash /home/agent/work/factory/deploy/autodeploy.sh
+# No NoNewPrivileges: deploying goes through sudo factory-deploy.
+TimeoutStartSec=45min
+UMask=0022

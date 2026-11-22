@@ -1,6 +1,8 @@
 # Agent sudo rule
 
-Agents push to main and deploy with one command on factory-gpu:
+`factory-autodeploy.timer` (`deploy/autodeploy.sh`, installed with
+`deploy/install-autodeploy.sh`) runs this command as `agent` for each green
+main. Agents and Devon can also run it by hand on factory-gpu:
 
 ```sh
 sudo factory-deploy meter factory-api kiosk   # any subset, in that order

@@ -1,0 +1,10 @@
+[Unit]
+Description=Check origin/main for a green build to deploy every 2 minutes
+
+[Timer]
+OnActiveSec=1min
+OnUnitInactiveSec=2min
+Unit=factory-autodeploy.service
+
+[Install]
+WantedBy=timers.target

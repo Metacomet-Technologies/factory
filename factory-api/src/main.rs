@@ -74,6 +74,8 @@ struct Args {
     alerts_slack_url: String,
     #[arg(long, env = "FACTORY_API_BACKUP_STATUS", default_value = alerts::DEFAULT_BACKUP_STATUS)]
     backup_status: PathBuf,
+    #[arg(long, env = "FACTORY_API_DEPLOY_STATUS", default_value = alerts::DEFAULT_DEPLOY_STATUS)]
+    deploy_status: PathBuf,
     #[arg(long, env = "FACTORY_DEVICES_ROOT", default_value = "/")]
     devices_root: PathBuf,
     #[arg(long, env = "FACTORY_API_REBOOT_STATUS", default_value = devices::DEFAULT_REBOOT_STATUS)]
@@ -233,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
     state.pricing_sources = [args.openrouter_feed_url, args.litellm_feed_url];
     state.disable_pricing_collector = args.disable_pricing_collector;
     state.backup_status = args.backup_status;
+    state.deploy_status = args.deploy_status;
     state.devices_root = args.devices_root;
     state.reboot_status = args.reboot_status;
     state.remote = std::sync::Arc::new(factory_api::devices_ingest::Registry::new(
@@ -243,6 +246,11 @@ async fn main() -> anyhow::Result<()> {
             state.backup_status = state
                 .devices_root
                 .join("var/lib/factory-backup-status/status.json");
+        }
+        if state.deploy_status == std::path::Path::new(alerts::DEFAULT_DEPLOY_STATUS) {
+            state.deploy_status = state
+                .devices_root
+                .join(alerts::DEFAULT_DEPLOY_STATUS.trim_start_matches('/'));
         }
         if state.reboot_status == std::path::Path::new(devices::DEFAULT_REBOOT_STATUS) {
             state.reboot_status = state

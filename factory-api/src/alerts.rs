@@ -25,6 +25,8 @@ use std::{
 pub const DEFAULT_CHANNEL: &str = "C0C9N9HCRG8";
 pub const DEFAULT_SLACK_URL: &str = "https://slack.com/api";
 pub const DEFAULT_BACKUP_STATUS: &str = "/var/lib/factory-backup-status/status.json";
+/// Written by deploy/autodeploy.sh on factory-gpu.
+pub const DEFAULT_DEPLOY_STATUS: &str = "/var/lib/factory-autodeploy/status.json";
 pub const DASHBOARD_URL: &str = "https://factory-gpu.bearded-pompano.ts.net";
 /// systemd credential name; the unit loads it with `LoadCredential=`.
 pub const TOKEN_CREDENTIAL: &str = "slack-bot-token";
@@ -45,17 +47,20 @@ const BACKUP_STALE_MS: i64 = 26 * 3_600_000;
 const RETENTION_SKIP_MS: i64 = 24 * 3_600_000;
 /// factory-backup.service TimeoutStartSec: in-run "pending" markers older than this are stuck.
 const BACKUP_RUN_MS: i64 = 2 * 3_600_000;
+/// The auto-deploy timer checks main every 2 minutes.
+const DEPLOY_STALE_MS: i64 = 15 * 60_000;
 /// Three 15-minute usage collector intervals.
 const USAGE_STALE_MS: i64 = crate::usage::STALE_MS;
 const MAX_BACKOFF_MS: i64 = 15 * 60_000;
 const MAX_RECOVERY_ATTEMPTS: u32 = 12;
-const SOURCES: [&str; 12] = [
+const SOURCES: [&str; 13] = [
     "node",
     "service",
     "gpu",
     "meter",
     "pricing",
     "backup",
+    "deploy",
     "clock",
     "usage",
     "ups",
@@ -166,6 +171,26 @@ pub struct BackupEntry {
     pub recovery_point_ms: Option<i64>,
     pub error: Option<String>,
 }
+/// The auto-deployer's status file (deploy/autodeploy.sh).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeployStatus {
+    pub checked_at_ms: i64,
+    pub main_sha: String,
+    pub ci: DeployCi,
+    pub failure: Option<DeployFailure>,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DeployCi {
+    Success,
+    Pending,
+    Failure,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeployFailure {
+    pub sha: String,
+    pub components: Vec<String>,
+    pub detail: String,
+}
 /// Latest collector read and the start of its communication-loss grace period.
 #[derive(Clone, Debug)]
 pub struct UpsRead {
@@ -186,6 +211,7 @@ pub struct Signals {
     /// (family, pending model id) for every family with a pending reference change.
     pub pricing_pending: Option<Vec<(String, String)>>,
     pub backup: Option<Vec<BackupEntry>>,
+    pub deploy: Option<DeployStatus>,
     pub clock_synchronized: Option<bool>,
     /// Collected tools and their last good reading.
     pub usage: Option<Vec<(String, Option<i64>)>>,
@@ -470,6 +496,9 @@ impl Message {
                     "Backup needs attention",
                     summary.strip_prefix("backup: ").unwrap_or(summary),
                 ),
+                "deploy:stale" => ("Auto-deploy stale", summary),
+                "deploy:main_red" => ("main failed CI", summary),
+                "deploy:failed" => ("Auto-deploy rolled back", summary),
                 "clock:ntp" => (
                     "factory-gpu clock not NTP-synchronized",
                     summary.split_once("; ").map_or(summary, |(_, s)| s),
@@ -1594,6 +1623,52 @@ impl Engine {
                     );
                 }
             }
+            "deploy" => {
+                let status = signals.deploy.as_ref()?;
+                let short = |sha: &str| sha[..7].to_owned();
+                if now - status.checked_at_ms > DEPLOY_STALE_MS {
+                    out.insert(
+                        "deploy:stale".into(),
+                        Verdict::Fire(
+                            AlertSeverity::Warning,
+                            format!(
+                                "auto-deploy has not checked main for {}",
+                                duration(now - status.checked_at_ms)
+                            ),
+                        ),
+                    );
+                }
+                if status.ci == DeployCi::Failure {
+                    out.insert(
+                        "deploy:main_red".into(),
+                        Verdict::Fire(
+                            AlertSeverity::Warning,
+                            format!(
+                                "main {} failed CI; auto-deploy is holding the running build",
+                                short(&status.main_sha)
+                            ),
+                        ),
+                    );
+                }
+                if let Some(failure) = &status.failure {
+                    let action = if failure.components.is_empty() {
+                        "failed".into()
+                    } else {
+                        format!("rolled back {}", failure.components.join(", "))
+                    };
+                    out.insert(
+                        "deploy:failed".into(),
+                        Verdict::Fire(
+                            AlertSeverity::Warning,
+                            format!(
+                                "auto-deploy of {} {action}: {}",
+                                short(&failure.sha),
+                                one_line(&failure.detail, 200)
+                            ),
+                        ),
+                    );
+                }
+            }
             "clock" => {
                 if !signals.clock_synchronized? {
                     out.insert(
@@ -1862,19 +1937,58 @@ fn parse_backup(bytes: &[u8]) -> Option<Vec<BackupEntry>> {
         .collect()
 }
 
+/// Strict: any other shape (missing field, short SHA, unknown CI value or component) is None.
+fn parse_deploy(bytes: &[u8]) -> Option<DeployStatus> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let sha = |v: &serde_json::Value| {
+        v.as_str()
+            .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_owned)
+    };
+    let failure = match value.get("deploy_failure")? {
+        serde_json::Value::Null => None,
+        failure => Some(DeployFailure {
+            sha: sha(failure.get("sha")?)?,
+            components: failure
+                .get("components")?
+                .as_array()?
+                .iter()
+                .map(|c| {
+                    c.as_str()
+                        .filter(|c| ["meter", "factory-api", "kiosk"].contains(c))
+                        .map(str::to_owned)
+                })
+                .collect::<Option<_>>()?,
+            detail: failure.get("detail")?.as_str()?.to_owned(),
+        }),
+    };
+    Some(DeployStatus {
+        checked_at_ms: value.get("checked_at_ms")?.as_i64()?,
+        main_sha: sha(value.get("main_sha")?)?,
+        ci: match value.get("ci")?.as_str()? {
+            "success" => DeployCi::Success,
+            "pending" => DeployCi::Pending,
+            "failure" => DeployCi::Failure,
+            _ => return None,
+        },
+        failure,
+    })
+}
+
+async fn read_capped(path: &Path) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut bytes = vec![];
+    file.take(1_000_001).read_to_end(&mut bytes).await.ok()?;
+    (bytes.len() <= 1_000_000).then_some(bytes)
+}
+
 impl AppState {
     pub async fn alert_signals(&self) -> Signals {
         let now = now_ms();
         let fleet = self.fleet.read().await.clone();
-        let backup = async {
-            use tokio::io::AsyncReadExt;
-            let file = tokio::fs::File::open(&self.backup_status).await.ok()?;
-            let mut bytes = vec![];
-            file.take(1_000_001).read_to_end(&mut bytes).await.ok()?;
-            (bytes.len() <= 1_000_000)
-                .then(|| parse_backup(&bytes))
-                .flatten()
-        };
+        let backup = async { parse_backup(&read_capped(&self.backup_status).await?) };
+        let deploy = async { parse_deploy(&read_capped(&self.deploy_status).await?) };
         let clock = async {
             match fleet::command("timedatectl", &["show", "-p", "NTPSynchronized", "--value"])
                 .await
@@ -1909,8 +2023,9 @@ impl AppState {
             let health: serde_json::Value = self.get("/meter/health").await.ok()?;
             serde_json::from_value(health["maintenance"]["retention"].clone()).ok()
         };
-        let (backup, clock_synchronized, pricing_pending, usage, network, meter_retention) = tokio::join!(
+        let (backup, deploy, clock_synchronized, pricing_pending, usage, network, meter_retention) = tokio::join!(
             backup,
+            deploy,
             clock,
             pricing,
             crate::usage::observations(&self.usage_snapshot, now),
@@ -1938,6 +2053,7 @@ impl AppState {
                         }]
                     }),
             ),
+            deploy,
             clock_synchronized,
             usage,
             ups,
@@ -4001,6 +4117,149 @@ mod tests {
             assert!(engine.view().active.is_empty(), "{case}: recovery");
             assert!(slack.posts.lock().unwrap().len() > 1, "{case}: recovery notification");
         }
+        state.db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deploy_status_failures_and_freshness_reach_slack() {
+        let dir = tempfile::tempdir().unwrap();
+        pricing::migrate(dir.path().join("pricing.db")).unwrap();
+        let mut state = AppState::new(
+            "http://127.0.0.1:1".into(),
+            dir.path().join("requests.db"),
+            dir.path().join("pricing.db"),
+            fleet::Config { nodes: vec![] },
+        )
+        .await
+        .unwrap();
+        state.deploy_status = dir.path().join("deploy.json");
+        let main = "abc1234".to_owned() + &"0".repeat(33);
+        let bad = "def5678".to_owned() + &"f".repeat(33);
+        let status = |checked: i64, ci: &str, failure: Value| {
+            json!({"checked_at_ms": checked, "main_sha": main, "ci": ci, "deploy_failure": failure})
+                .to_string()
+        };
+        let (slack, url) = fake_slack().await;
+        let mut engine = Engine::load(config(&url, None, true));
+        let mut step = async |now: i64, contents: Option<String>| {
+            match contents {
+                Some(contents) => std::fs::write(&state.deploy_status, contents).unwrap(),
+                None => std::fs::remove_file(&state.deploy_status).unwrap(),
+            }
+            let signals = Signals {
+                deploy: state.alert_signals().await.deploy,
+                ..Default::default()
+            };
+            engine.tick(now, &signals).await;
+            engine
+                .view()
+                .active
+                .into_iter()
+                .map(|a| (a.key, a.summary))
+                .collect::<Vec<_>>()
+        };
+        let failure = json!({"sha": bad, "components": ["factory-api", "kiosk"], "detail": "health check\n  failed"});
+        let keys =
+            |active: &[(String, String)]| active.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+
+        // Pending CI and a 14-minute-old check are healthy.
+        assert!(
+            step(T0, Some(status(T0, "pending", Value::Null)))
+                .await
+                .is_empty()
+        );
+        assert!(
+            step(T0 + 14 * MIN, Some(status(T0, "success", Value::Null)))
+                .await
+                .is_empty()
+        );
+        let active = step(
+            T0 + 15 * MIN,
+            Some(status(T0 + 15 * MIN, "failure", Value::Null)),
+        )
+        .await;
+        assert_eq!(
+            active,
+            [(
+                "deploy:main_red".into(),
+                "main abc1234 failed CI; auto-deploy is holding the running build".into()
+            )]
+        );
+        assert!(
+            step(
+                T0 + 16 * MIN,
+                Some(status(T0 + 16 * MIN, "success", Value::Null))
+            )
+            .await
+            .is_empty()
+        );
+        let active = step(
+            T0 + 17 * MIN,
+            Some(status(T0 + 17 * MIN, "success", failure.clone())),
+        )
+        .await;
+        assert_eq!(
+            active,
+            [(
+                "deploy:failed".into(),
+                "auto-deploy of def5678 rolled back factory-api, kiosk: health check failed".into()
+            )]
+        );
+        assert!(
+            step(
+                T0 + 18 * MIN,
+                Some(status(T0 + 18 * MIN, "pending", Value::Null))
+            )
+            .await
+            .is_empty()
+        );
+        let active = step(
+            T0 + 40 * MIN,
+            Some(status(T0 + 18 * MIN, "failure", failure.clone())),
+        )
+        .await;
+        assert_eq!(
+            keys(&active),
+            ["deploy:failed", "deploy:main_red", "deploy:stale"]
+        );
+        assert_eq!(active[2].1, "auto-deploy has not checked main for 22 min");
+        let posts = slack.posts.lock().unwrap().len();
+
+        // Unreadable or malformed files hold every open deploy alert without reposting.
+        let short_sha = status(T0, "success", Value::Null).replace(&main, "abc1234");
+        let unknown_component =
+            json!({"checked_at_ms": T0 + 41 * MIN, "main_sha": main, "ci": "success",
+            "deploy_failure": {"sha": bad, "components": ["database"], "detail": "x"}})
+            .to_string();
+        let missing_field =
+            json!({"checked_at_ms": T0 + 41 * MIN, "main_sha": main, "ci": "success"}).to_string();
+        for contents in [
+            None,
+            Some("not json".into()),
+            Some(status(T0 + 41 * MIN, "red", Value::Null)),
+            Some(status(T0 + 41 * MIN, "SUCCESS", Value::Null)),
+            Some(short_sha),
+            Some(unknown_component),
+            Some(missing_field),
+            Some(" ".repeat(1_000_001)),
+        ] {
+            let held = step(T0 + 41 * MIN, contents.clone()).await;
+            assert_eq!(keys(&held), keys(&active), "{contents:?}");
+        }
+        assert_eq!(slack.posts.lock().unwrap().len(), posts);
+        assert!(
+            step(
+                T0 + 42 * MIN,
+                Some(status(T0 + 42 * MIN, "success", Value::Null))
+            )
+            .await
+            .is_empty()
+        );
+        assert_eq!(
+            slack.posts.lock().unwrap().len(),
+            posts + 6,
+            "three recoveries, each a thread reply and a parent update"
+        );
         state.db.close().await.unwrap();
     }
 

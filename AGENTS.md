@@ -12,9 +12,12 @@ Live checks: `scripts/sandbox` (`docs/sandbox.md`), never production.
 Read `docs/agents/<area>.md` when you touch it: `db.md` for DB work
 (incl. meter/API/pricing), `kiosk.md` for kiosk, `cloud.md`.
 
-Deploy on factory-gpu, after your commit is on `origin/main`:
-`sudo factory-deploy meter factory-api kiosk` (any subset; see
-`deploy/sudoers/README.md`). That is the only sudo you may use. Every other
+Deploys are automatic: `factory-autodeploy.timer` deploys meter, factory-api
+and kiosk within minutes of `ci-ok` going green, only the ones whose build
+inputs changed (`deploy/autodeploy.sh`; status in
+`/var/lib/factory-autodeploy/status.json`, failures alert in Slack). Do not
+deploy by hand unless it is down; then `sudo factory-deploy <component>...` on
+factory-gpu (`deploy/sudoers/README.md`). That is the only sudo you may use. Every other
 installer (backup, alerts, usage, devices, ups, pricing, reboot), DB migrations
 and anything on factory-console stay with Devon: write the command, don't run it.
 
