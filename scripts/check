@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# The one pre-push check. Runs only the groups your change touches, diffing the
+# work tree (committed, staged, unstaged and untracked) against its merge base
+# with origin/main. CI runs the same groups with --all, so this file is the one
+# list of what "checked" means.
+#
+#   scripts/check                 groups touched by the change
+#   scripts/check --all           every group
+#   scripts/check --all rust      named groups only (rust kiosk usage shell deploy env client)
+#   scripts/check --list          print the groups the change touches and exit
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+rust_paths='^(Cargo\.(toml|lock)|rust-toolchain\.toml|(shared|meter|pricing|factory-api|factory-db|sandbox|ups-control|devices-agent)/)'
+
+usage() { sed -n '7,10s/^# \{0,1\}//p' "$0" >&2; exit 2; }
+all=0 list=0 groups=()
+while (($#)); do
+    case $1 in
+        --all) all=1 ;;
+        --list) list=1 ;;
+        -h|--help) usage ;;
+        rust|kiosk|usage|shell|deploy|env|client) groups+=("$1") ;;
+        *) usage ;;
+    esac
+    shift
+done
+
+changed=()
+if ((!all)); then
+    base=$(git merge-base HEAD "${CHECK_BASE:-origin/main}")
+    mapfile -t changed < <({ git diff --name-only "$base"; git ls-files --others --exclude-standard; } | sort -u)
+fi
+touched() { ((all)) || printf '%s\n' "${changed[@]}" | grep -Eq "$1"; }
+
+if ((${#groups[@]} == 0)); then
+    touched "$rust_paths" && groups+=(rust)
+    touched '^(kiosk/|factory-api/openapi\.json$)' && groups+=(kiosk)
+    touched '^scripts/usage/' && groups+=(usage)
+    touched '\.sh$|^scripts/(check|sandbox)$|^\.githooks/|^client/factory\.(zsh|env)$' && groups+=(shell)
+    touched '^deploy/' && groups+=(deploy)
+    touched '^scripts/env/' && groups+=(env)
+    touched '^client/' && groups+=(client)
+fi
+if ((list)); then printf '%s\n' "${groups[@]}"; exit 0; fi
+if ((${#groups[@]} == 0)); then echo 'scripts/check: nothing to check'; exit 0; fi
+
+step() { printf '\n== %s\n' "$*"; "$@"; }
+in_kiosk() { (cd kiosk && step "$@"); }
+
+# Python tests under deploy/. Locally, only the directories the change touches;
+# with --all, every one. CI-only tests live in .github/workflows/ci.yml:
+# test-offsite.py (loopback moto), test-agent-host-config.py (namespaces) and
+# test-cleanup-console-rollback.py (MET-118 one-off, needs real chown).
+deploy_tests() {
+    local test dir
+    for test in $(git ls-files 'deploy/test*.py' 'deploy/*/test*.py'); do
+        case $test in
+            deploy/backup/test-offsite.py|deploy/test-agent-host-config.py|deploy/test-cleanup-console-rollback.py) continue ;;
+            deploy/backup/test-offsite-runtime.py)
+                python3 -c 'import ensurepip' 2>/dev/null || { echo "skip $test: python3-venv missing (CI runs it)"; continue; } ;;
+        esac
+        dir=$(dirname "$test")
+        ((all)) || touched "^${dir}/[^/]+$" || continue
+        step python3 -B "$test"
+    done
+}
+
+for group in "${groups[@]}"; do
+    printf '\n### %s\n' "$group"
+    case $group in
+        rust)
+            step cargo fmt --check
+            step cargo clippy --all-targets --locked -- -D warnings
+            if command -v cargo-nextest >/dev/null; then
+                step cargo nextest run --workspace --locked
+                step cargo test --doc --workspace --locked
+            else
+                step cargo test --workspace --locked
+            fi
+            if command -v sqlite3 >/dev/null; then
+                step bash meter/tests/installer-db.sh target/debug/meter
+            else
+                echo 'skip meter/tests/installer-db.sh: sqlite3 missing (CI runs it)'
+            fi ;;
+        kiosk)
+            in_kiosk vp install --frozen-lockfile
+            in_kiosk env OPENAPI_URL="file://$root/factory-api/openapi.json" vp check
+            in_kiosk vp test --run
+            in_kiosk vp build ;;
+        usage)
+            step node --test scripts/usage ;;
+        shell)
+            mapfile -t scripts < <(git ls-files --cached --others --exclude-standard 'deploy/*.sh' 'scripts/*.sh' scripts/check scripts/sandbox 'scripts/sandbox-shims/*' .githooks/pre-push | grep -v '\.py$')
+            for script in "${scripts[@]}"; do bash -n "$script"; done
+            step shellcheck -x "${scripts[@]}"
+            step shellcheck -s bash -x client/factory.zsh
+            step shellcheck -s bash -e SC2034 client/factory.env ;;
+        deploy)
+            step bash deploy/lint-installers.sh
+            if [[ -z ${DEVICES_TEST_GROUP:-} ]]; then
+                # deploy/devices/test-install.py needs a supplementary group of the caller.
+                DEVICES_TEST_GROUP=$(id -Gn | tr ' ' '\n' | grep -vx "$(id -gn)" | head -n 1 || true)
+                export DEVICES_TEST_GROUP
+            fi
+            deploy_tests ;;
+        env)
+            step python3 -B scripts/env/test_check.py
+            step python3 -B scripts/env/test_setup.py ;;
+        client)
+            if command -v zsh >/dev/null; then step zsh -n client/factory.zsh; fi
+            step python3 -B client/test_factory.py ;;
+    esac
+done
+printf '\nscripts/check: %s passed\n' "${groups[*]}"

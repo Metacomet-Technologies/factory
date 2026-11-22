@@ -3,10 +3,10 @@ Main-based development: commit to `main` and push. Use a worktree off
 Never print/commit secrets or production data.
 Auth works; never set token environment variables or run gh auth commands.
 
-Before pushing: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test --workspace`. Kiosk: `vp check`, `vp test --run`, `vp build`.
-Scripts: `node --test scripts/usage` (never `node --check`), `bash deploy/lint-installers.sh`.
-Run only the checks for what you changed; CI runs everything on every push to main.
+Before pushing: `scripts/check`. It runs only the check groups your change
+touches (`--list` shows them, `--all` runs everything). Enable it as a pre-push
+hook once per clone: `git config core.hooksPath .githooks`. CI runs
+`scripts/check --all` on every push to main; `ci-ok` is the one green/red check.
 Fix a red main before anything else.
 Live checks: `scripts/sandbox` (`docs/sandbox.md`), never production.
 Read `docs/agents/<area>.md` when you touch it: `db.md` for DB work

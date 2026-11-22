@@ -323,14 +323,7 @@ before using it for full-file recovery; normal rollback restores only the host.
 
 ## Development checks
 
-```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace
-bash -n deploy/install-meter.sh deploy/rollback-meter.sh deploy/rollback-meter-v1.sh
-bash meter/tests/installer-db.sh target/debug/meter
-python3 -B deploy/test_set_ollama_host.py
-```
+`scripts/check` (see `AGENTS.md`).
 
 Tests include fragmented usage JSON, NDJSON and SSE, missing OpenAI usage,
 upstream errors, exact body/status/header forwarding, internal routing, GPU

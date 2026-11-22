@@ -46,8 +46,6 @@ jobs:
           key: cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain*') }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
             cargo-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain*') }}-
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
       - name: Install cargo-nextest
         run: |
           version=0.9.149
@@ -58,13 +56,11 @@ jobs:
           tar -xzf "$archive" -C "$HOME/.cargo/bin" cargo-nextest
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/cargo-nextest" --version
-      - run: cargo nextest run --workspace --locked
-      - run: cargo test --doc --workspace --locked
       - name: Install installer test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y sqlite3
-      - run: bash meter/tests/installer-db.sh target/debug/meter
+      - run: scripts/check --all rust
 
   kiosk:
     name: kiosk
@@ -81,20 +77,14 @@ jobs:
       - name: Converge to the toolchain contract (docs/environments.md)
         working-directory: .
         # Installs Rust, Vite+, Node and Bun from the repo pins, puts them on PATH, then runs scripts/env/check.
-        run: |
-          python3 -B scripts/env/test_check.py
-          python3 -B scripts/env/test_setup.py
-          scripts/env/setup.sh --ci
+        run: scripts/env/setup.sh --ci
       - run: node --version && bun --version && vp --version
       - name: Install kiosk dependencies and select its local CLI
         run: |
           vp install --frozen-lockfile
           echo "$GITHUB_WORKSPACE/kiosk/node_modules/.bin" >> "$GITHUB_PATH"
-      - run: vp check
-        env:
-          OPENAPI_URL: file://${{ github.workspace }}/factory-api/openapi.json
-      - run: vp test --run
-      - run: vp build
+      - run: scripts/check --all kiosk
+        working-directory: .
 
   scripts:
     name: scripts
@@ -108,40 +98,14 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
-      - name: Test usage collector
-        run: node --test scripts/usage
       - name: Install script check dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y shellcheck sqlite3 zstd rsync python3-venv
-      - name: Check every deployment and version script
-        run: |
-          mapfile -d '' scripts < <(find deploy scripts -type f -name '*.sh' -print0)
-          for script in "${scripts[@]}"; do bash -n "$script"; done
-          shellcheck -x "${scripts[@]}"
-      - name: Lint shared client helpers
-        run: |
-          shellcheck -s bash -x client/factory.zsh
-          shellcheck -s bash -e SC2034 client/factory.env
-      - name: Lint the installer and rollback contract
-        run: |
-          bash deploy/lint-installers.sh
-          python3 -B deploy/test-lint-installers.py
-      - run: python3 -B deploy/test_set_ollama_host.py
-      - run: python3 -B deploy/backup/test-backup.py
-      - run: python3 -B deploy/backup/test-offsite-runtime.py
+      - run: scripts/check --all usage shell deploy env
       - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Test encrypted off-site backups against loopback moto
         run: uvx --from 'moto[server]==5.2.4' --with 'pyrage==1.4.0' --with 'boto3==1.43.118' python -B deploy/backup/test-offsite.py
-      - run: python3 -B deploy/reboot/test-reboot.py
-      - name: Test device installers
-        run: |
-          primary_group=$(id -gn)
-          devices_test_group=$(id -Gn | tr ' ' '\n' | grep -vx "$primary_group" | head -n 1)
-          test -n "$devices_test_group"
-          echo "Using supplementary test group: $devices_test_group"
-          DEVICES_TEST_GROUP="$devices_test_group" python3 -B deploy/devices/test-install.py
-          python3 -B deploy/devices-agent/test-install.py
 
   client:
     name: client
@@ -180,11 +144,6 @@ jobs:
           key: sandbox-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain*') }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
             sandbox-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain*') }}-
-      - name: Check sandbox scripts
-        run: |
-          scripts=(scripts/sandbox scripts/sandbox-shims/nvidia-smi scripts/sandbox-shims/tailscale scripts/sandbox-shims/timedatectl scripts/sandbox-shims/ping)
-          for script in "${scripts[@]}"; do bash -n "$script"; done
-          shellcheck -x "${scripts[@]}"
       - run: scripts/sandbox up --rows 1k
       - name: Check pricing refresh, confirmation and positive spend avoided
         run: python3 scripts/sandbox-shims/smoke.py
@@ -195,3 +154,15 @@ jobs:
       - name: Stop sandbox
         if: always()
         run: scripts/sandbox down
+
+  # The one check the auto-deployer reads: green only when every job above is.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [rust, kiosk, scripts, client, sandbox]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - run: test "$BAD" = false
+        env:
+          BAD: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}

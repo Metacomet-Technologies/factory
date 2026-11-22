@@ -51,28 +51,9 @@ Use a non-interactive login shell (`bash -lc 'command'`) for tool calls that do
 not load profiles. This selects the pinned Rust/Vite+ environment rather than
 the orb's base Node runtime. Amp supervised services already use login shells.
 
-From the repository root:
-
-```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace --locked
-node --test scripts/usage
-python3 -B deploy/test_set_ollama_host.py
-python3 -B deploy/backup/test-backup.py
-python3 -B deploy/reboot/test-reboot.py
-```
-
-From `kiosk/`, check against the committed OpenAPI schema, not production:
-
-```sh
-OPENAPI_URL="file://$(realpath ../factory-api/openapi.json)" vp check
-vp test --run
-vp build
-```
-
-Shell checks and installer tests remain available through the commands in
-`.github/workflows/ci.yml`. Running the isolated real meter/API stack is outside
+From the repository root, `scripts/check` runs the check groups the change
+touches (`--all` for everything). The kiosk group checks against the committed
+OpenAPI schema, not production. Running the isolated real meter/API stack is outside
 this setup's scope: `scripts/sandbox` additionally needs an orb-supervised
 lifecycle. It must never fall back to production services.
 
