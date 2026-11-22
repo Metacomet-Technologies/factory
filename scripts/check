@@ -46,20 +46,21 @@ fi
 if ((list)); then printf '%s\n' "${groups[@]}"; exit 0; fi
 if ((${#groups[@]} == 0)); then echo 'scripts/check: nothing to check'; exit 0; fi
 
+# Tracked and untracked files matching the pathspecs that exist in the work tree.
+files() { git ls-files --cached --others --exclude-standard --deduplicate -- "$@" | while IFS= read -r f; do if [[ -f $f ]]; then printf '%s\n' "$f"; fi; done; }
 step() { printf '\n== %s\n' "$*"; "$@"; }
 in_kiosk() { (cd kiosk && step "$@"); }
 
 # Python tests under deploy/. Locally, only the directories the change touches;
 # with --all, every one. CI-only tests live in .github/workflows/ci.yml:
-# test-offsite.py (loopback moto), test-agent-host-config.py (namespaces) and
-# test-cleanup-console-rollback.py (MET-118 one-off, needs real chown).
+# test-offsite.py (loopback moto) and test-agent-host-config.py (namespaces).
 deploy_tests() {
     local test dir
-    for test in $(git ls-files 'deploy/test*.py' 'deploy/*/test*.py'); do
+    for test in $(files 'deploy/test*.py' 'deploy/*/test*.py'); do
         dir=$(dirname "$test")
         ((all)) || touched "^${dir}/[^/]+$" || continue
         case $test in
-            deploy/backup/test-offsite.py|deploy/test-agent-host-config.py|deploy/test-cleanup-console-rollback.py) continue ;;
+            deploy/backup/test-offsite.py|deploy/test-agent-host-config.py) continue ;;
             deploy/backup/test-offsite-runtime.py)
                 python3 -c 'import ensurepip' 2>/dev/null || { echo "skip $test: python3-venv missing (CI runs it)"; continue; } ;;
         esac
@@ -92,7 +93,7 @@ for group in "${groups[@]}"; do
         usage)
             step node --test scripts/usage ;;
         shell)
-            mapfile -t scripts < <(git ls-files --cached --others --exclude-standard 'deploy/*.sh' 'scripts/*.sh' scripts/check scripts/sandbox 'scripts/sandbox-shims/*' .githooks/pre-push | grep -v '\.py$')
+            mapfile -t scripts < <(files 'deploy/*.sh' 'scripts/*.sh' scripts/check scripts/sandbox 'scripts/sandbox-shims/*' .githooks/pre-push | grep -v '\.py$')
             for script in "${scripts[@]}"; do bash -n "$script"; done
             step shellcheck -x "${scripts[@]}"
             step shellcheck -s bash -x client/factory.zsh
