@@ -112,7 +112,8 @@ async function launch() {
   const logFd = openSync(logFile, "a");
   const child = spawn(
     "bash",
-    ["-lc", "source /home/agent/.config/vite-plus/env && exec vp run mock-dev"],
+    // Agent machines put vp on PATH through this env file; CI already has it on PATH.
+    ["-c", 'env="$HOME/.config/vite-plus/env"; if [ -f "$env" ]; then . "$env"; fi; exec vp run mock-dev'],
     { cwd: kiosk, detached: true, stdio: ["ignore", logFd, logFd] },
   );
   child.unref();

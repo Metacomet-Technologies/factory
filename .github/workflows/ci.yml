@@ -87,6 +87,24 @@ jobs:
           echo "$GITHUB_WORKSPACE/kiosk/node_modules/.bin" >> "$GITHUB_PATH"
       - run: scripts/check --all kiosk
         working-directory: .
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('kiosk/bun.lock') }}
+      - name: Install Playwright Chromium for the UI journeys
+        run: vp exec playwright install --with-deps --only-shell chromium
+      - name: Drive every verify-kiosk journey against the mock API
+        run: scripts/check --all journeys
+        working-directory: .
+        env:
+          VERIFY_ROOT: ${{ runner.temp }}/kiosk-verify
+      - name: Upload journey evidence
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kiosk-journeys
+          path: ${{ runner.temp }}/kiosk-verify/
+          if-no-files-found: ignore
 
   scripts:
     name: scripts

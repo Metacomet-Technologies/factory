@@ -47,6 +47,8 @@ node .cursor/skills/verify-kiosk/verify.mjs drive theme   # or usage, gpu, front
 node .cursor/skills/verify-kiosk/verify.mjs drive all     # every journey, about 90 s
 ```
 
+CI runs `drive all` on every push through `scripts/check --all journeys`, which also does launch, doctor and cleanup. A journey that no longer matches the UI turns `ci-ok` red, so update its feature file and `verify.mjs` in the same commit as the UI change.
+
 That command is the theme journey in [features/theme.md](features/theme.md). It clicks the button named `Use dark theme` or `Use light theme`, then requires the accessible name to flip, `document.documentElement.dataset.theme` to change, and `localStorage['factory-theme']` to equal the new theme.
 
 Each `drive` journey follows its file in `features/` and exits non-zero at the first step that does not match. `frontier` waits out the refresh cooldown (about 61 s on a fresh mock, up to 3 minutes after a previous refresh). Do not substitute a unit test or a direct `dataset.theme` write for a click.

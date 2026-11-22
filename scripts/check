@@ -6,7 +6,7 @@
 #
 #   scripts/check                 groups touched by the change
 #   scripts/check --all           every group
-#   scripts/check --all rust      named groups only (rust kiosk usage shell deploy env client)
+#   scripts/check --all rust      named groups only (rust kiosk journeys usage shell deploy env client)
 #   scripts/check --fast          static checks only (format, lint, types); the pre-push hook
 #   scripts/check --list          print the groups the change touches and exit
 set -euo pipefail
@@ -23,7 +23,7 @@ while (($#)); do
         --list) list=1 ;;
         --fast) fast=1 ;;
         -h|--help) usage ;;
-        rust|kiosk|usage|shell|deploy|env|client) groups+=("$1") ;;
+        rust|kiosk|journeys|usage|shell|deploy|env|client) groups+=("$1") ;;
         *) usage ;;
     esac
     shift
@@ -39,6 +39,7 @@ touched() { ((all)) || printf '%s\n' "${changed[@]}" | grep -Eq "$1"; }
 if ((${#groups[@]} == 0)); then
     touched "$rust_paths" && groups+=(rust)
     touched '^(kiosk/|factory-api/openapi\.json$)' && groups+=(kiosk)
+    touched '^(kiosk/|\.cursor/skills/verify-kiosk/)' && groups+=(journeys)
     touched '^scripts/usage/' && groups+=(usage)
     touched '\.sh$|^scripts/(check|sandbox)$|^\.githooks/|^client/factory\.(zsh|env)$' && groups+=(shell)
     touched '^deploy/' && groups+=(deploy)
@@ -94,6 +95,20 @@ for group in "${groups[@]}"; do
             ((fast)) && continue
             in_kiosk vp test --run
             in_kiosk vp build ;;
+        journeys)
+            # Drives every verify-kiosk journey through the UI against the mock API. Needs
+            # Playwright Chromium; the ports 4179 and 4181 must be free.
+            ((fast)) && continue
+            in_kiosk vp install --frozen-lockfile
+            export VERIFY_ROOT=${VERIFY_ROOT:-$(mktemp -d /tmp/factory-kiosk-verify.XXXXXX)}
+            verify=.cursor/skills/verify-kiosk/verify.mjs
+            if ! { step node "$verify" launch && step node "$verify" doctor && step node "$verify" drive all; }; then
+                tail -n 40 "$VERIFY_ROOT/run/mock-dev.log" || true
+                node "$verify" cleanup || true
+                echo "journeys failed; evidence in $VERIFY_ROOT/evidence" >&2
+                exit 1
+            fi
+            step node "$verify" cleanup ;;
         usage)
             ((fast)) && continue
             step node --test scripts/usage ;;
