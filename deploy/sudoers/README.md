@@ -22,8 +22,10 @@ alerts, usage, devices, ups, pricing, reboot) stays a manual `sudo bash deploy/.
 One-time install, and again whenever `deploy/deploy.sh` changes (from the Mac):
 
 ```sh
-gpu-ssh 'cd /home/agent/work/factory && sudo git -c safe.directory=* pull --ff-only origin main &&
-  sudo install -o root -g root -m 0755 deploy/deploy.sh /usr/local/sbin/factory-deploy &&
-  sudo install -o root -g root -m 0440 deploy/sudoers/factory-agent-deploy /etc/sudoers.d/factory-agent-deploy &&
-  sudo visudo -cf /etc/sudoers.d/factory-agent-deploy'
+gpu-ssh 'set -e; repo=/home/agent/work/factory; sudo -u agent git -C $repo fetch -q origin main
+  sudo -u agent git -C $repo show origin/main:deploy/deploy.sh > /tmp/factory-deploy
+  sudo -u agent git -C $repo show origin/main:deploy/sudoers/factory-agent-deploy > /tmp/factory-agent-deploy
+  sudo install -o root -g root -m 0755 /tmp/factory-deploy /usr/local/sbin/factory-deploy
+  sudo install -o root -g root -m 0440 /tmp/factory-agent-deploy /etc/sudoers.d/factory-agent-deploy
+  sudo visudo -cf /etc/sudoers.d/factory-agent-deploy; rm /tmp/factory-deploy /tmp/factory-agent-deploy'
 ```

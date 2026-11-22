@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Deploy origin/main to factory-gpu: sudo factory-deploy <meter|factory-api|kiosk>...
+# Deploy origin/main to factory-gpu: sudo factory-deploy [--at SHA] <meter|factory-api|kiosk>...
+# --at deploys that exact commit of origin/main (the auto-deployer passes the
+# commit whose CI passed); without it, the current origin/main.
 # Root-owned copy at /usr/local/sbin/factory-deploy; the one agent sudo rule is
 # deploy/sudoers/factory-agent-deploy. It fast-forwards the main checkout, builds
 # as agent, runs the component's installer, then requires three health probes at
@@ -14,7 +16,13 @@ as_agent() { runuser -u agent -- env -i HOME=/home/agent USER=agent \
 
 [[ $EUID -eq 0 ]] || fail 'Run with sudo: sudo factory-deploy <meter|factory-api|kiosk>...'
 [[ $(hostname -s) == factory-gpu ]] || fail 'Deploy only on factory-gpu.'
-(( $# > 0 )) || fail 'Usage: factory-deploy <meter|factory-api|kiosk>...'
+target=origin/main
+if [[ ${1:-} == --at ]]; then
+    [[ ${2:-} =~ ^[0-9a-f]{40}$ ]] || fail '--at needs a full 40-character commit SHA.'
+    target=$2
+    shift 2
+fi
+(( $# > 0 )) || fail 'Usage: factory-deploy [--at SHA] <meter|factory-api|kiosk>...'
 for component in "$@"; do
     case $component in meter|factory-api|kiosk) ;; *) fail "Unknown component: $component" ;; esac
 done
@@ -24,9 +32,12 @@ flock -n 9 || fail 'Another deploy is running.'
 cd "$checkout"
 [[ -z $(as_agent git status --porcelain --untracked-files=no) ]] || fail "$checkout has local changes."
 as_agent git fetch --quiet origin main
+as_agent git merge-base --is-ancestor "$target" origin/main || fail "$target is not on origin/main."
 as_agent git checkout --quiet main
-as_agent git merge --quiet --ff-only origin/main
+as_agent git merge --quiet --ff-only "$target"
 sha=$(as_agent git rev-parse HEAD)
+# ff-only succeeds without moving when the checkout is already past the target.
+[[ $sha == $(as_agent git rev-parse "$target") ]] || fail "The checkout is at $sha, past $target; refusing to deploy a different commit."
 printf 'Deploying %s at %s\n' "$*" "$sha"
 
 health() {

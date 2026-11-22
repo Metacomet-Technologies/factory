@@ -42,9 +42,11 @@ else. Test against the sandbox (`scripts/sandbox up`), never production.
 ## Deploying
 
 Nobody deploys by hand. `factory-autodeploy.timer` on factory-gpu checks main
-every 2 minutes. When `ci-ok` is green it compares each component's running
-`inputs_fingerprint` with `scripts/build-fingerprint.sh` at the new commit and
-runs `sudo factory-deploy` for meter, factory-api and kiosk where they differ.
+every 2 minutes. It takes the newest commit whose `ci-ok` is green (main's tip
+may still be in CI), compares each component's running `inputs_fingerprint`
+with `scripts/build-fingerprint.sh` at that commit and runs
+`sudo factory-deploy --at <commit>` for meter, factory-api and kiosk where they
+differ.
 `factory-deploy` builds as `agent`, installs, probes health three times and
 rolls back on failure. Failures post `deploy:*` alerts to Slack; the latest
 state is in `/var/lib/factory-autodeploy/status.json`. Details:

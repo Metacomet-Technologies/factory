@@ -31,11 +31,17 @@ esac
 printf '{"inputs_fingerprint":"%s"}' "$(cat "$FAKE/running/$c")"
 """
 FAKE_SUDO = """#!/usr/bin/env bash
+# Stands in for sudo -n factory-deploy --at SHA COMPONENT...: moves the checkout
+# to SHA and makes each component report its fingerprint at SHA.
 [[ $1 == -n ]] && shift
 shift  # the factory-deploy path
+[[ $1 == --at ]] || { echo "ERROR: missing --at" >&2; exit 1; }
+sha=$2; shift 2
 echo "$*" >> "$FAKE/deploys"
+echo "$sha" >> "$FAKE/deployed-shas"
 if [[ -f $FAKE/fail ]]; then echo "ERROR: $(cat "$FAKE/fail")" >&2; exit 1; fi
-for c in "$@"; do cp "$FAKE/main/$c" "$FAKE/running/$c"; done
+git -C "$FACTORY_CHECKOUT" merge --quiet --ff-only "$sha"
+for c in "$@"; do git -C "$FACTORY_CHECKOUT" show "$sha:fp/$c" > "$FAKE/running/$c"; done
 """
 FINGERPRINT = """#!/usr/bin/env bash
 cat "$(dirname "$0")/fp/$1"
@@ -47,7 +53,7 @@ class AutodeployTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         t = pathlib.Path(self.temp.name)
         self.fake, self.state = t / "fake", t / "state"
-        for d in ("bin", "ci", "running", "main"):
+        for d in ("bin", "ci", "running"):
             (self.fake / d).mkdir(parents=True)
         self.state.mkdir()
         for name, text in (("gh", FAKE_GH), ("curl", FAKE_CURL), ("sudo", FAKE_SUDO)):
@@ -86,8 +92,6 @@ class AutodeployTest(unittest.TestCase):
         self.git("commit", "-q", "--allow-empty", "-m", "change", cwd=self.work)
         self.git("push", "-q", "origin", "main", cwd=self.work)
         sha = self.git("rev-parse", "HEAD", cwd=self.work)
-        for c in COMPONENTS:
-            (self.fake / "main" / c).write_text((self.work / "fp" / c).read_text())
         if ci:
             (self.fake / "ci" / sha).write_text(ci)
         return sha
@@ -97,6 +101,10 @@ class AutodeployTest(unittest.TestCase):
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return json.loads((self.state / "status.json").read_text())
+
+    def shas(self):
+        path = self.fake / "deployed-shas"
+        return path.read_text().splitlines() if path.exists() else []
 
     def deploys(self):
         path = self.fake / "deploys"
@@ -144,6 +152,22 @@ class AutodeployTest(unittest.TestCase):
         self.assertIsNone(status["deploy_failure"])
         self.run_deployer()
         self.assertEqual(self.deploys(), ["kiosk"])
+
+    def test_deploys_the_newest_green_commit_while_the_tip_is_in_ci(self):
+        green = self.push(ci="success", kiosk="k2")
+        self.push(kiosk="k3")  # tip still in CI
+        status = self.run_deployer()
+        self.assertEqual(self.deploys(), ["kiosk"])
+        self.assertEqual(self.shas(), [green], "deploys the tested commit, never the untested tip")
+        self.assertEqual((status["ci"], status["deploy_failure"]), ("pending", None))
+
+    def test_never_goes_back_before_the_deployed_commit(self):
+        old_green = self.push(ci="success", kiosk="k2")
+        self.run_deployer()
+        self.push(ci="failure", kiosk="k3")
+        self.push(kiosk="k4")
+        self.run_deployer()
+        self.assertEqual(self.shas(), [old_green], "nothing newer is green, so nothing deploys")
 
     def test_unknown_running_build_is_deployed(self):
         (self.fake / "running" / "meter").unlink()
