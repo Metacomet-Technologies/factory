@@ -218,9 +218,9 @@ export default function TopologyPage({ dark }: { dark: boolean }) {
             edges={edges}
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
-            colorMode={dark ? "dark" : "light"}
+            forceColorMode={dark ? "dark" : "light"}
             fitView
-            fitViewOptions={{ padding: 0.03 }}
+            fitViewOptions={{ padding: "1.5%" }}
             minZoom={0.3}
             maxZoom={2}
             nodesDraggable={false}
