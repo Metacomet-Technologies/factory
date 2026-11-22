@@ -876,7 +876,7 @@ export interface components {
       source: string;
     };
     /**
-     * @description Declaration order is registry order; diagnosis blames the first failing layer.
+     * @description Declaration order is registry order; diagnosis blames the first down layer, else the first failing one.
      * @enum {string}
      */
     Layer: "lan" | "wan" | "dns" | "tailnet";

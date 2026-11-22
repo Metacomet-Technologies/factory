@@ -95,7 +95,7 @@ test in `#factory-alerts`. Payload tests do not prove Slack's rendered layout.
 | `network:lan_down` | the open network event is `Down { lan }` and started 2 min or more ago; clears when that event closes or changes | critical | `net_events` (network collector, 30 s) |
 | `network:wan_down` | the same for `Down { wan }`, an ISP outage | critical | `net_events` |
 | `network:dns_down` | the same for `Down { dns }` | critical | `net_events` |
-| `network:throughput_low` | the 3 most recent `ok` speed tests are all below `--network-throughput-low-mbps` (500 Mb/s) in either direction, skipping failed and timed-out tests between them; clears when the newest `ok` test is at or above it both ways | warning | `net_speed_tests` |
+| `network:throughput_low` | the 3 most recent `ok` speed tests are all below `--network-throughput-low-mbps` (250 Mb/s) in either direction, skipping failed and timed-out tests between them; clears when the newest `ok` test is at or above it both ways | warning | `net_speed_tests` |
 | `network:speedtest_failing` | the 3 most recent speed tests all failed or timed out; clears on the next `ok` test | warning | `net_speed_tests` |
 | `retention:api`, `retention:meter` | 365-day request retention has skipped or failed for 24 h (`skipped_since_ms`); clears on a run that is allowed to prune | warning | API `/v1/health` `retention`; meter `/meter/health` `maintenance.retention` |
 | watchdog | factory-gpu health fails 5 consecutive minutes | critical | factory-console |
@@ -138,7 +138,7 @@ it is only degraded by loss, so the down alert clears and opens again 2 min afte
 the next down tick. A newest `ok` test that is still slow, or a newest test that
 still failed, holds its open alert. A tailnet outage has no alert in v1.
 
-Production note: the one manual production test measured 404 Mb/s upload against the 500 Mb/s default, so throughput_low will open unless the threshold is set at deploy.
+Production note: measured upload runs 325 to 515 Mb/s (daily median) against ~920 Mb/s download, so the default is 250 Mb/s; at 500 the alert would have opened 36 times on a healthy link.
 
 **Unavailable sources.** A source that cannot be read (missing file, permission
 denied, `tailscale status` failing, a stale GPU sample, a timer that is not
@@ -190,7 +190,7 @@ consecutive-failure counts restart with the process.
 | `FACTORY_ALERTS_SLACK_URL` / `--alerts-slack-url` | `https://slack.com/api` |
 | `FACTORY_API_ALERTS_STATE` / `--alerts-state` | `/var/lib/factory-api/alerts.json` |
 | `FACTORY_API_BACKUP_STATUS` / `--backup-status` | `/var/lib/factory-backup-status/status.json` |
-| `FACTORY_API_NETWORK_THROUGHPUT_LOW_MBPS` / `--network-throughput-low-mbps` | `500` (1 to 100000) |
+| `FACTORY_API_NETWORK_THROUGHPUT_LOW_MBPS` / `--network-throughput-low-mbps` | `250` (1 to 100000) |
 
 The token is never logged. Startup logs only `alerts: Slack token loaded; posting
 enabled` or `alerts: Slack token absent; ...`.

@@ -1,5 +1,6 @@
 //! Network diagnosis (MET-197). Each tick's samples give every layer a health;
-//! a reducer over ticks names the first failing layer in registry order. Pure:
+//! a reducer over ticks names the first down layer, else the first failing one,
+//! in registry order. Pure:
 //! no IO and no clock. Storage of the resulting episodes lives in network_history.
 use crate::network::{Burst, Layer, Sample};
 use anyhow::{Context, Result, ensure};
@@ -249,9 +250,10 @@ pub struct Diagnosis {
 /// consecutive Degraded or Lost tick; the current tick's health picks the
 /// state. A Lost layer is down from its second consecutive Lost tick and
 /// Degraded by loss before that. Any other health, Unknown included, resets
-/// both streaks, so recovery is immediate. The first layer in registry order
-/// with a confirmed fault names the state, even when a later layer is down: a
-/// degraded lan masks a down wan, but a one-tick lan blip does not.
+/// both streaks, so recovery is immediate. The first Down layer in registry
+/// order names the state; with none down, the first layer with a confirmed
+/// fault does. So a down lan masks a down wan, but a degraded lan does not
+/// hide a down wan, and a dns blip never splits a tailnet outage.
 pub fn step(previous: &Diagnosis, health: &[LayerHealth; 4]) -> Diagnosis {
     let streak = std::array::from_fn(|i| match health[i] {
         LayerHealth::Lost => previous.streak[i].saturating_add(1),
@@ -261,10 +263,10 @@ pub fn step(previous: &Diagnosis, health: &[LayerHealth; 4]) -> Diagnosis {
         LayerHealth::Lost | LayerHealth::Degraded(_) => previous.faulty[i].saturating_add(1),
         LayerHealth::Unknown | LayerHealth::Ok => 0,
     });
-    let state = Layer::ALL
+    let faults: Vec<LinkState> = Layer::ALL
         .into_iter()
         .filter(|&layer| faulty[layer as usize] >= CONFIRM_TICKS)
-        .find_map(|layer| {
+        .filter_map(|layer| {
             let i = layer as usize;
             match health[i] {
                 LayerHealth::Lost if streak[i] >= DOWN_TICKS => Some(LinkState::Down { layer }),
@@ -276,6 +278,12 @@ pub fn step(previous: &Diagnosis, health: &[LayerHealth; 4]) -> Diagnosis {
                 LayerHealth::Unknown | LayerHealth::Ok => None,
             }
         })
+        .collect();
+    let state = faults
+        .iter()
+        .find(|state| matches!(state, LinkState::Down { .. }))
+        .or(faults.first())
+        .copied()
         .unwrap_or_default();
     Diagnosis {
         streak,
@@ -359,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn every_layer_combination_blames_the_first_faulting_layer() {
+    fn every_layer_combination_blames_the_first_down_else_first_faulting_layer() {
         let combinations: Vec<[Effective; 4]> = (0..6usize.pow(4))
             .map(|n| std::array::from_fn(|i| EFFECTIVE[n / 6usize.pow(i as u32) % 6]))
             .collect();
@@ -367,52 +375,28 @@ mod tests {
         let faulting = |e: Effective| !matches!(e, Effective::Unknown | Effective::Ok);
         for effective in combinations {
             let state = diagnose(effective);
-            let first = (0..4).find(|&i| faulting(effective[i]));
-            assert_eq!(
-                state == LinkState::Healthy,
-                first.is_none(),
-                "healthy iff every layer is unknown or ok: {effective:?} -> {state:?}"
-            );
-            let Some(first) = first else {
+            let named = (0..4)
+                .find(|&i| effective[i] == Effective::Down)
+                .or_else(|| (0..4).find(|&i| faulting(effective[i])));
+            let Some(named) = named else {
+                assert_eq!(state, LinkState::Healthy, "{effective:?}");
                 continue;
             };
-            let layer = Layer::ALL[first];
-            assert_eq!(
-                state.layer(),
-                Some(layer),
-                "first faulting layer is named: {effective:?} -> {state:?}"
-            );
-            let named = effective[state.layer().unwrap() as usize];
-            assert_ne!(
-                named,
-                Effective::Unknown,
-                "unknown is never named: {effective:?}"
-            );
-            assert_eq!(
-                matches!(state, LinkState::Down { .. }),
-                named == Effective::Down,
-                "down iff the named layer is down: {effective:?} -> {state:?}"
-            );
-            match named {
-                Effective::Down => assert_eq!(state, LinkState::Down { layer }),
-                Effective::Degraded(reason) => {
-                    assert_eq!(
-                        state,
-                        LinkState::Degraded { layer, reason },
-                        "{effective:?}"
-                    )
-                }
+            let layer = Layer::ALL[named];
+            let expected = match effective[named] {
+                Effective::Down => LinkState::Down { layer },
+                Effective::Degraded(reason) => LinkState::Degraded { layer, reason },
                 Effective::Unknown | Effective::Ok => unreachable!(),
-            }
-            for later in first + 1..4 {
-                for other in EFFECTIVE {
-                    let mut changed = effective;
-                    changed[later] = other;
-                    assert_eq!(
-                        diagnose(changed),
-                        state,
-                        "layers after the first fault never matter: {effective:?} vs {changed:?}"
-                    );
+            };
+            assert_eq!(state, expected, "{effective:?}");
+            // A down layer is final: nothing after it changes the state.
+            if effective[named] == Effective::Down {
+                for later in named + 1..4 {
+                    for other in EFFECTIVE {
+                        let mut changed = effective;
+                        changed[later] = other;
+                        assert_eq!(diagnose(changed), state, "{effective:?} vs {changed:?}");
+                    }
                 }
             }
         }
@@ -479,20 +463,38 @@ mod tests {
         }
     }
 
-    /// The spec names the first layer that is down OR degraded, so a slow
-    /// gateway hides an ISP outage. This pins that literal reading.
+    /// A slow gateway must not hide an ISP outage, and a confirmed dns
+    /// degradation must not split a tailnet outage into alternating events
+    /// (production stored one 13.4 h tailnet outage as 184 of them).
     #[test]
-    fn degraded_lan_masks_down_wan() {
+    fn down_outranks_an_earlier_degraded_layer() {
         let tick = [degraded(Latency), Lost, OK, OK];
         assert_eq!(
             run(&[tick, tick]),
-            [
-                LinkState::Healthy,
-                LinkState::Degraded {
-                    layer: Lan,
-                    reason: Latency
-                }
-            ]
+            [LinkState::Healthy, LinkState::Down { layer: Wan }]
+        );
+        let tailnet_down = [OK, OK, OK, Lost];
+        let dns_slow = [OK, OK, degraded(Jitter), Lost];
+        let down = LinkState::Down { layer: Tailnet };
+        assert_eq!(
+            run(&[
+                tailnet_down,
+                tailnet_down,
+                dns_slow,
+                dns_slow,
+                dns_slow,
+                tailnet_down
+            ]),
+            [LinkState::Healthy, down, down, down, down, down]
+        );
+        // With nothing down, the earlier degraded layer still names the state.
+        let both_slow = [degraded(Latency), degraded(Loss), OK, OK];
+        assert_eq!(
+            run(&[both_slow, both_slow])[1],
+            LinkState::Degraded {
+                layer: Lan,
+                reason: Latency
+            }
         );
     }
 

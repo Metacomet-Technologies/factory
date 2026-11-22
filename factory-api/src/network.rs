@@ -22,7 +22,7 @@ pub const DEFAULT_DNS_NAME: &str = "cloudflare.com";
 pub const DEFAULT_TAILNET_TARGET: &str = "factory-console:22";
 pub const DEFAULT_ROUTE_TABLE: &str = "/proc/net/route";
 
-/// Declaration order is registry order; diagnosis blames the first failing layer.
+/// Declaration order is registry order; diagnosis blames the first down layer, else the first failing one.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ToSchema,
 )]

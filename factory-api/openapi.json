@@ -1494,7 +1494,7 @@
         "type": "object"
       },
       "Layer": {
-        "description": "Declaration order is registry order; diagnosis blames the first failing layer.",
+        "description": "Declaration order is registry order; diagnosis blames the first down layer, else the first failing one.",
         "enum": [
           "lan",
           "wan",

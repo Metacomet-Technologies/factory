@@ -31,7 +31,7 @@ pub const DASHBOARD_URL: &str = "https://factory-gpu.bearded-pompano.ts.net";
 /// systemd credential name; the unit loads it with `LoadCredential=`.
 pub const TOKEN_CREDENTIAL: &str = "slack-bot-token";
 pub const INTERVAL: Duration = Duration::from_secs(30);
-pub const DEFAULT_THROUGHPUT_LOW_MBPS: u32 = 500;
+pub const DEFAULT_THROUGHPUT_LOW_MBPS: u32 = 250;
 
 const RECENT: usize = 20;
 const NODE_OFFLINE_MS: i64 = 5 * 60_000;
@@ -3190,11 +3190,11 @@ mod tests {
             (
                 "network:throughput_low",
                 "warning",
-                "network throughput below 500 Mb/s in the last 3 ok speed tests: download 80, 90, 100 Mb/s; upload 10, 20, 30 Mb/s",
+                "network throughput below 250 Mb/s in the last 3 ok speed tests: download 80, 90, 100 Mb/s; upload 10, 20, 30 Mb/s",
                 "Network throughput low",
                 "/network|Open network page",
                 &[
-                    ("Threshold", "below 500 Mb/s in the last 3 ok speed tests"),
+                    ("Threshold", "below 250 Mb/s in the last 3 ok speed tests"),
                     ("Download", "80, 90, 100 Mb/s"),
                     ("Upload", "10, 20, 30 Mb/s"),
                 ],
@@ -4916,9 +4916,9 @@ mod tests {
         let key = "network:throughput_low";
         let open = |engine: &Engine| active(engine).iter().any(|a| a.0 == key);
         for rates in [
-            vec![(404 * M, 940 * M), (938 * M, 404 * M)],
-            vec![(404 * M, 940 * M), (938 * M, 404 * M), (500 * M, 500 * M)],
-            vec![(500 * M, 940 * M), (938 * M, 404 * M), (400 * M, 400 * M)],
+            vec![(204 * M, 940 * M), (938 * M, 204 * M)],
+            vec![(204 * M, 940 * M), (938 * M, 204 * M), (250 * M, 250 * M)],
+            vec![(250 * M, 940 * M), (938 * M, 204 * M), (200 * M, 200 * M)],
         ] {
             engine.evaluate(T0, &ok(&rates));
             assert!(!open(&engine), "{rates:?}");
@@ -4926,9 +4926,9 @@ mod tests {
         engine.evaluate(
             T0,
             &ok(&[
-                (404 * M, 940 * M),
-                (938 * M, 404 * M),
-                (500 * M - 1, 600 * M),
+                (204 * M, 940 * M),
+                (938 * M, 204 * M),
+                (250 * M - 1, 600 * M),
             ]),
         );
         assert_eq!(
@@ -4936,15 +4936,15 @@ mod tests {
             [(
                 key.into(),
                 AlertSeverity::Warning,
-                "network throughput below 500 Mb/s in the last 3 ok speed tests: download 404, 938, 500 Mb/s; upload 940, 404, 600 Mb/s".into(),
+                "network throughput below 250 Mb/s in the last 3 ok speed tests: download 204, 938, 250 Mb/s; upload 940, 204, 600 Mb/s".into(),
                 T0
             )]
         );
         // A newer slow test, even after a fast one, cannot prove recovery.
-        engine.evaluate(T0 + MIN, &ok(&[(450 * M, 940 * M), (940 * M, 940 * M)]));
+        engine.evaluate(T0 + MIN, &ok(&[(225 * M, 940 * M), (940 * M, 940 * M)]));
         assert!(open(&engine));
         // Exactly at the floor both ways is not low.
-        engine.evaluate(T0 + 2 * MIN, &ok(&[(500 * M, 500 * M), (450 * M, 450 * M)]));
+        engine.evaluate(T0 + 2 * MIN, &ok(&[(250 * M, 250 * M), (225 * M, 225 * M)]));
         assert!(!open(&engine));
         // The floor is configuration.
         let mut strict = Engine::load(Config {

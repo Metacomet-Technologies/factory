@@ -78,7 +78,8 @@ The test does not store the public IP. It stores the Cloudflare colo code only.
 ### Diagnosis
 
 Each tick reduces the latest per-target samples to one link state. The first
-layer, in registry order, that is down or degraded names the fault.
+layer, in registry order, that is down names the fault; with none down, the
+first degraded layer does.
 
 ```
 Healthy
@@ -121,9 +122,12 @@ times out after 1 s.
 - A layer is down after 2 consecutive `Lost` ticks. A confirmed fault whose
   current tick is the first `Lost` one is `Degraded { loss }`. Any other
   tick, unknown included, resets both counts, so recovery takes one good tick.
-- The first layer in registry order with a confirmed fault names the state,
-  so a degraded `lan` masks a down `wan`. A one-tick blip in an earlier layer
-  does not interrupt a later layer's event.
+- A down layer outranks every degraded one: the first down layer in registry
+  order names the state, and only with no layer down does the first layer
+  with a confirmed fault name it. So a down `lan` masks a down `wan`, but a
+  slow `lan` does not hide a down `wan`, and a slow `dns` does not split a
+  `tailnet` outage. Before this rule, one 13.4 h tailnet outage was stored as
+  184 alternating down and dns-jitter events.
 - The `net_events` row for a state stays open while the state holds and
   tracks the peak loss, average RTT and jitter of the faulting layer's chosen
   targets. Recovery closes it as `recovered`. A different state closes it as
@@ -173,7 +177,7 @@ not of device hardware, so it does not go under `/v1/devices`.
 These use the existing engine, Slack on open and threaded reply on recovery.
 
 - `network:lan_down`, `network:wan_down`, `network:dns_down` fire when an event has stayed open for 2 min or more.
-- `network:throughput_low` fires when 3 consecutive `ok` tests come in under 500 Mb/s in either direction. That is about half the observable ceiling for the 1 Gb/s symmetric fiber plan. The threshold is config.
+- `network:throughput_low` fires when 3 consecutive `ok` tests come in under 250 Mb/s in either direction. Download measures a steady ~920 Mb/s, but upload's daily median is 325 to 515 Mb/s, so a 500 Mb/s floor would have opened 36 times on a healthy link. The threshold is config.
 - `network:speedtest_failing` fires when 3 consecutive tests fail. That separates a blocked or changed endpoint from a slow link.
 
 ## Verification
@@ -188,4 +192,4 @@ These use the existing engine, Slack on open and threaded reply on recovery.
 1. Probes run from factory-gpu only in v1. Rows carry `device_id`.
 2. The provider is Cloudflare's speed endpoints, called in-process.
 3. Speed tests run every 3 hours, about 5.8 GB/day. The latency probes catch outages, so speed tests only need to show the trend.
-4. The plan is 1 Gb/s symmetric fiber. `throughput_low` is set at 500 Mb/s.
+4. The plan is 1 Gb/s symmetric fiber, but measured upload runs about half of download. `throughput_low` is set at 250 Mb/s so it flags a real drop, not the usual upload rate.

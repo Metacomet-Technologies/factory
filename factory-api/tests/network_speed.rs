@@ -236,7 +236,7 @@ fn alert_input_skips_unfinished_tests_between_ok_ones() -> Result<()> {
         test(
             started_ms,
             Verdict::Ok {
-                download_bps: 404_000_000,
+                download_bps: 204_000_000,
                 upload_bps: 900_000_000,
             },
         )
