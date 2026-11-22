@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
         db_path: args.db_path,
         listen: args.listen,
         nut_addr: args.nut_addr,
+        tracking_timeout: Duration::from_secs(10),
         trusted_peer_uid: args.trusted_peer_uid,
         allowed_logins: args.allowed_logins,
         hostname: std::fs::read_to_string("/proc/sys/kernel/hostname")?

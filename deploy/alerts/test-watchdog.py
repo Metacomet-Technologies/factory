@@ -66,7 +66,8 @@ class WatchdogTest(unittest.TestCase):
         Fake.healthy, Fake.posts, Fake.slack_fail = True, [], 0
         Fake.requests, Fake.method_failures = [], {}
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        # shutdown() waits for the next poll; the 0.5 s default dominated the suite.
+        threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True).start()
         base = f"http://127.0.0.1:{self.server.server_port}"
         self.temp = tempfile.TemporaryDirectory()
         root = pathlib.Path(self.temp.name)

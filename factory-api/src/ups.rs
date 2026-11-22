@@ -54,7 +54,7 @@ pub struct UpsCurrent {
     pub model: Option<String>,
 }
 
-pub async fn read(addr: &str, name: &str) -> Result<UpsCurrent> {
+pub async fn read(addr: &str, name: &str, timeout: Duration) -> Result<UpsCurrent> {
     ensure!(
         !name.is_empty()
             && name
@@ -62,7 +62,7 @@ pub async fn read(addr: &str, name: &str) -> Result<UpsCurrent> {
                 .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)),
         "invalid UPS name"
     );
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(timeout, async {
         let mut socket = tokio::net::TcpStream::connect(addr)
             .await
             .map_err(|e| anyhow::anyhow!("connect failed: {e}"))?;
@@ -77,7 +77,7 @@ pub async fn read(addr: &str, name: &str) -> Result<UpsCurrent> {
         parse(&response, name)
     })
     .await
-    .map_err(|_| anyhow::anyhow!("read timed out after 3 s"))?
+    .map_err(|_| anyhow::anyhow!("read timed out after {} s", timeout.as_secs_f64()))?
 }
 
 fn quoted(text: &str) -> Result<String> {

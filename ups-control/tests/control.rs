@@ -16,6 +16,8 @@ use tokio::sync::RwLock;
 // A spawned child retains copies of locked fds until exec. Exclude shim spawns
 // while calls can hold file locks; calls in separate harnesses still run together.
 static SHIM_FORK_GATE: RwLock<()> = RwLock::const_new(());
+/// Production waits 10 s; the fake NUT answers PENDING forever, so any bound works.
+const TRACKING_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn uid() -> u32 {
     fs::read_to_string("/proc/self/status")
@@ -193,6 +195,7 @@ impl Harness {
             db_path,
             listen,
             nut_addr: format!("127.0.0.1:{nut}").parse().unwrap(),
+            tracking_timeout: TRACKING_TIMEOUT,
             trusted_peer_uid: trusted,
             allowed_logins: vec!["DGarbs51@github".into(), "metacometdave@github".into()],
             hostname: hostname.into(),
@@ -953,7 +956,7 @@ async fn tracking_success_failure_pending_timeout_and_plain_ok() {
         assert_eq!(response["executed"], executed);
         assert_eq!(response["tracking_status"], expected);
         if mode == "PENDING" {
-            assert!(started.elapsed() >= Duration::from_secs(10));
+            assert!(started.elapsed() >= TRACKING_TIMEOUT);
         }
         let rows = h.control.store.rows(100, i64::MAX).await.unwrap();
         let row = rows.iter().find(|r| r.attempted).unwrap();

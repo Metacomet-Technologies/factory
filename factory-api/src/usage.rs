@@ -323,10 +323,10 @@ impl AppState {
         .await?
     }
 
-    pub(crate) fn start_usage_collector(&self) -> tokio::task::JoinHandle<()> {
+    pub(crate) fn start_usage_collector(&self, every: Duration) -> tokio::task::JoinHandle<()> {
         let state = self.clone();
         tokio::spawn(async move {
-            let mut timer = tokio::time::interval(Duration::from_secs(30));
+            let mut timer = tokio::time::interval(every);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut previous = None;
             loop {
@@ -814,7 +814,7 @@ mod tests {
                 .get(format!("http://{address}/v1/stream"))
                 .send()
                 .await?;
-            let watcher = state.start_usage_collector();
+            let watcher = state.start_usage_collector(Duration::from_millis(100));
             async fn event(stream: &mut reqwest::Response) -> anyhow::Result<Value> {
                 let mut data = String::new();
                 loop {

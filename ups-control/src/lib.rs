@@ -54,6 +54,9 @@ pub struct Config {
     pub db_path: PathBuf,
     pub listen: SocketAddr,
     pub nut_addr: SocketAddr,
+    /// How long a submitted command's tracking may stay PENDING. Production
+    /// uses 10 s, which the PENDING audit and response texts state.
+    pub tracking_timeout: Duration,
     pub trusted_peer_uid: u32,
     pub allowed_logins: Vec<String>,
     pub hostname: String,
@@ -216,7 +219,11 @@ impl Control {
                 .context("credential unavailable")?;
             Ok(raw.trim_end_matches(['\r', '\n']).to_owned())
         };
-        let nut = nut::Nut::new(config.nut_addr, credential("nut-password")?)?;
+        let nut = nut::Nut::new(
+            config.nut_addr,
+            credential("nut-password")?,
+            config.tracking_timeout,
+        )?;
         let slack_token = credential("slack-bot-token")?;
         ensure!(
             !slack_token.is_empty()

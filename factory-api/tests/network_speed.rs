@@ -453,6 +453,8 @@ fn config(base: String) -> SpeedConfig {
             steps: &STEPS,
             slow_request: Duration::from_secs(1),
             cap: Duration::from_secs(20),
+            // One ping per burst: the loopback latency is still measured, without 1.8 s bursts.
+            latency_probes: 1,
         },
     }
 }

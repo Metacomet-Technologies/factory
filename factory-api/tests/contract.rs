@@ -135,6 +135,7 @@ async fn ups_unavailable_and_silent_peer_do_not_block_collectors() -> Result<()>
 
     let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     state.ups_addr = silent.local_addr()?.to_string();
+    state.ups_timeout = Duration::from_millis(300);
     state.disable_pricing_collector = true;
     let peer = tokio::spawn(async move {
         let (_socket, _) = silent.accept().await.unwrap();
@@ -168,7 +169,7 @@ async fn ups_unavailable_and_silent_peer_do_not_block_collectors() -> Result<()>
     assert!(frames.contains("\"type\":\"ups.sample\"") && frames.contains("\"data\":null"));
     let warnings = state.ups().await;
     assert!(warnings.current.is_none());
-    assert!(warnings.warnings[0].contains("timed out after 3 s"));
+    assert!(warnings.warnings[0].contains("timed out after 0.3 s"));
     state.shutdown.cancel();
     for task in tasks {
         task.abort();
@@ -1671,7 +1672,9 @@ async fn overload_sheds_requests_times_out_work_and_keeps_sse_open() -> Result<(
             StatusCode::SERVICE_UNAVAILABLE
         }))
         .await;
-        let state = test_state(&temp, upstream).await?;
+        let mut state = test_state(&temp, upstream).await?;
+        // Production times out at 4 s; any bound under the upstream's 60 s sleep shows the 504.
+        state.request_timeout = Duration::from_millis(500);
         let (url, task) = serve(router(state.clone())).await;
         let client = reqwest::Client::new();
         let mut stream = client.get(format!("{url}/v1/stream")).send().await?;

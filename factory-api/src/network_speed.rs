@@ -65,11 +65,14 @@ pub struct Plan {
     pub slow_request: Duration,
     /// Hard cap over the whole test, latency bursts included.
     pub cap: Duration,
+    /// Pings per idle or loaded latency burst.
+    pub latency_probes: u32,
 }
 pub const PLAN: Plan = Plan {
     steps: &SEQUENCE,
     slow_request: Duration::from_secs(1),
     cap: Duration::from_secs(60),
+    latency_probes: network::PROBES,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,7 +192,7 @@ async fn measure(config: &SpeedConfig, partial: &Mutex<Partial>) -> Result<[i64;
         .user_agent("factory-speedtest/0.1")
         .build()?;
     // A failed latency burst leaves its latency null; it never fails the throughput test.
-    if let Ok(burst) = network::ping(config.latency_target).await {
+    if let Ok(burst) = network::ping(config.latency_target, config.plan.latency_probes).await {
         update(partial, |p| p.idle.push(burst));
     }
     let mut rates = [0; 2];
@@ -202,7 +205,13 @@ async fn measure(config: &SpeedConfig, partial: &Mutex<Partial>) -> Result<[i64;
         };
         let (rate, ()) = tokio::join!(
             transfer,
-            loaded_latency(config.latency_target, &done, direction, partial)
+            loaded_latency(
+                config.latency_target,
+                config.plan.latency_probes,
+                &done,
+                direction,
+                partial
+            )
         );
         rates[direction as usize] = rate?;
     }
@@ -213,6 +222,7 @@ async fn measure(config: &SpeedConfig, partial: &Mutex<Partial>) -> Result<[i64;
 /// gets one loaded sample.
 async fn loaded_latency(
     target: IpAddr,
+    probes: u32,
     done: &CancellationToken,
     direction: Direction,
     partial: &Mutex<Partial>,
@@ -221,7 +231,7 @@ async fn loaded_latency(
         tokio::time::interval_at(tokio::time::Instant::now() + LOADED_SPACING, LOADED_SPACING);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        if let Ok(burst) = network::ping(target).await {
+        if let Ok(burst) = network::ping(target, probes).await {
             update(partial, |p| p.loaded[direction as usize].push(burst));
         }
         tokio::select! { biased;
@@ -499,6 +509,7 @@ mod tests {
                 steps: &STEPS,
                 slow_request: Duration::from_millis(500),
                 cap,
+                latency_probes: network::PROBES,
             },
         };
         run(&config).await
@@ -511,6 +522,7 @@ mod tests {
         let partial = Mutex::new(Partial::default());
         loaded_latency(
             "127.0.0.1".parse().unwrap(),
+            network::PROBES,
             &done,
             Direction::Download,
             &partial,

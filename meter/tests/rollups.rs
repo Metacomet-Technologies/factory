@@ -696,10 +696,12 @@ fn v1(path: &Path, now: i64) -> (Vec<RequestRecord>, i64) {
     drop(db);
     let rows: Vec<_> = (1..=5_503).map(|id| record(id, now)).collect();
     let samples: Vec<_> = (1..=2_011).map(|i| sample(i, now)).collect();
-    // Rows as a v1 runtime wrote them.
-    let db = Connection::open(path).unwrap();
+    // Rows as a v1 runtime wrote them, in one transaction: a commit per row
+    // costs an fsync each, which dominated this test on disk-backed temp dirs.
+    let mut db = Connection::open(path).unwrap();
+    let tx = db.transaction().unwrap();
     for r in &rows {
-        db.execute(
+        tx.execute(
             "INSERT INTO requests(id,ts_ms,endpoint,model,prompt_eval_count,eval_count,load_duration_ns,prompt_eval_duration_ns,eval_duration_ns,total_duration_ns,latency_ms,status,stream,client_ip,client_hostname,user_key,actor_kind)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,200,0,'192.0.2.1','fixture',?12,COALESCE(?13,'unattributed'))",
             params![
@@ -713,14 +715,15 @@ fn v1(path: &Path, now: i64) -> (Vec<RequestRecord>, i64) {
         .unwrap();
     }
     for s in &samples {
-        db.execute(
+        tx.execute(
             "INSERT INTO gpu_samples(ts_ms,gpu_index,memory_used_mib,memory_total_mib,utilization_percent,temperature_c,power_w) VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![s.ts, s.index, s.memory_used_mib, s.memory_total_mib, s.utilization_percent, s.temperature_c, s.power_w],
         )
         .unwrap();
     }
-    db.execute_batch("INSERT INTO drop_episodes(started_at_ms,ended_at_ms,dropped_requests,dropped_gpu_samples) VALUES(1,2,3,4); ANALYZE;")
+    tx.execute_batch("INSERT INTO drop_episodes(started_at_ms,ended_at_ms,dropped_requests,dropped_gpu_samples) VALUES(1,2,3,4); ANALYZE;")
         .unwrap();
+    tx.commit().unwrap();
     (rows, samples.len() as i64)
 }
 

@@ -399,9 +399,11 @@ where
         .collect();
     Burst::from_replies(PROBES, &replies)
 }
-pub async fn ping(address: IpAddr) -> Result<Burst> {
+/// `probes` pings 200 ms apart; PROBES for every network target.
+pub async fn ping(address: IpAddr, probes: u32) -> Result<Burst> {
     let child = tokio::process::Command::new("ping")
-        .args(["-n", "-q", "-c", "10", "-i", "0.2", "-W", "1"])
+        .args(["-n", "-q", "-i", "0.2", "-W", "1", "-c"])
+        .arg(probes.to_string())
         .arg(address.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -425,11 +427,14 @@ pub async fn probe(target: &Target, ts_ms: i64) -> Result<Sample> {
                 .await
                 .with_context(|| format!("cannot read route table {}", path.display()))?;
             match default_gateway(&table)? {
-                Some(gateway) => (Some(gateway.to_string()), ping(gateway.into()).await?),
+                Some(gateway) => (
+                    Some(gateway.to_string()),
+                    ping(gateway.into(), PROBES).await?,
+                ),
                 None => (None, Burst::lost(PROBES)),
             }
         }
-        Probe::Icmp(address) => (Some(address.to_string()), ping(*address).await?),
+        Probe::Icmp(address) => (Some(address.to_string()), ping(*address, PROBES).await?),
         Probe::Resolve(name) => (
             Some(name.clone()),
             burst(|| tokio::net::lookup_host((name.as_str(), 0))).await,

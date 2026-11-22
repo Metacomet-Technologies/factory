@@ -31,6 +31,7 @@ pub(crate) fn error(status: StatusCode, code: &str, message: impl Into<String>) 
         .into_response()
 }
 pub fn router(state: AppState) -> Router {
+    let request_timeout = state.request_timeout;
     let api = Router::new()
         .route("/v1/pricing/confirm/{family}", axum::routing::any(dispatch))
         .route("/v1", axum::routing::any(dispatch))
@@ -38,7 +39,7 @@ pub fn router(state: AppState) -> Router {
         .layer(
             tower::ServiceBuilder::new()
                 .layer(axum::error_handling::HandleErrorLayer::new(layer_error))
-                .timeout(Duration::from_secs(4)),
+                .timeout(request_timeout),
         )
         // SSE has no request timeout. Its body observes the shutdown token.
         .route("/v1/stream", axum::routing::any(dispatch))

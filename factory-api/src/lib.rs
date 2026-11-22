@@ -68,6 +68,10 @@ pub struct AppState {
     pub disable_pricing_collector: bool,
     pub ups_addr: String,
     pub ups_name: String,
+    /// Bound on every non-SSE /v1 request; 504 after it. 4 s outside tests.
+    pub request_timeout: Duration,
+    /// Bound on one UPS read, connect included. 3 s outside tests.
+    pub ups_timeout: Duration,
     /// Network probe registry, built once from NetworkConfig in layer order.
     pub network: Arc<[network::Target]>,
     pub network_thresholds: network_diagnosis::Thresholds,
@@ -140,6 +144,8 @@ impl AppState {
             disable_pricing_collector: false,
             ups_addr: "127.0.0.1:3493".into(),
             ups_name: "cyberpower".into(),
+            ups_timeout: Duration::from_secs(3),
+            request_timeout: Duration::from_secs(4),
             // main installs the configured registry; embedders and tests probe nothing.
             network: Arc::new([]),
             network_thresholds: network_diagnosis::DEFAULT_THRESHOLDS,
@@ -715,7 +721,7 @@ impl AppState {
             .await
     }
     pub async fn ups(&self) -> ups::Ups {
-        let result = ups::read(&self.ups_addr, &self.ups_name).await;
+        let result = ups::read(&self.ups_addr, &self.ups_name, self.ups_timeout).await;
         let warnings = result
             .as_ref()
             .err()
@@ -913,7 +919,7 @@ impl AppState {
         }
     }
     pub fn start_collectors(&self) -> Vec<tokio::task::JoinHandle<()>> {
-        let mut tasks = vec![self.start_usage_collector()];
+        let mut tasks = vec![self.start_usage_collector(Duration::from_secs(30))];
         tasks.extend(self.start_alerts());
         if self.disable_pricing_collector {
             tracing::info!(

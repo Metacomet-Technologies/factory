@@ -8,6 +8,7 @@ use tokio::{
 pub struct Nut {
     pub addr: SocketAddr,
     password: String,
+    tracking_timeout: Duration,
 }
 
 pub struct Session(BufReader<TcpStream>);
@@ -19,7 +20,7 @@ pub struct Outcome {
 }
 
 impl Nut {
-    pub fn new(addr: SocketAddr, password: String) -> Result<Self> {
+    pub fn new(addr: SocketAddr, password: String, tracking_timeout: Duration) -> Result<Self> {
         ensure!(addr.ip().is_loopback(), "NUT must be loopback");
         ensure!(
             !password.is_empty()
@@ -27,7 +28,11 @@ impl Nut {
                 && password.bytes().all(|c| c.is_ascii_graphic()),
             "invalid NUT credential"
         );
-        Ok(Self { addr, password })
+        Ok(Self {
+            addr,
+            password,
+            tracking_timeout,
+        })
     }
 
     pub async fn connect(&self) -> Result<Session> {
@@ -81,7 +86,7 @@ impl Nut {
                     }),
             "invalid tracking receipt; not executed (unconfirmed)"
         );
-        let poll = tokio::time::timeout(Duration::from_secs(10), async {
+        let poll = tokio::time::timeout(self.tracking_timeout, async {
             loop {
                 session.send(&format!("GET TRACKING {id}")).await?;
                 let result = session.line().await?;
