@@ -26,7 +26,11 @@ function iso(value: unknown): number | null {
   return result;
 }
 const number = '(?:0|[1-9]\\d{0,2}(?:,\\d{3})*|[1-9]\\d*)(?:\\.\\d+)?';
-const summary = new RegExp(`^Amp (Gigawatt) Tier: agent usage \\$(${number}) of \\$(${number}) remaining \\((\\d{1,3})%\\), orb usage (${number})h of (${number})h (?:a1\\.xxlarge )?orb hours remaining \\((\\d{1,3})%\\) - period (\\d{4}-\\d{2}-\\d{2}) to (\\d{4}-\\d{2}-\\d{2}), resets (?:upon renewal )?in (\\d+) days$`);
+// Tier names (Gigawatt, Megawatt, …) and the orb size the hours are normalized to
+// (a1.xxlarge, then a1.small from 2026-11) change with the plan; both are one word.
+const TIER = '[A-Z][a-z]{2,19}';
+const ORB_SIZE = 'a1\\.[a-z0-9]{1,12}';
+const summary = new RegExp(`^Amp (${TIER}) Tier: agent usage \\$(${number}) of \\$(${number}) remaining \\((\\d{1,3})%\\), orb usage (${number})h of (${number})h (?:${ORB_SIZE} )?orb hours remaining \\((\\d{1,3})%\\) - period (\\d{4}-\\d{2}-\\d{2}) to (\\d{4}-\\d{2}-\\d{2}), resets (?:upon renewal )?in (\\d+) days$`);
 function balance(amount: string, unit: Balance['unit'], total: string | null): Balance {
   amount = decimal(amount.replaceAll(',', ''));
   total = total === null ? null : decimal(total.replaceAll(',', ''));
@@ -44,7 +48,7 @@ export function parseAmp(text: string): Reading {
   // `## ` sections (2026-11: "How Usage Is Charged"); they are never read.
   const blank = lines.indexOf('');
   if (blank >= 0) { check(lines[blank + 1]?.startsWith('## ')); lines.length = blank; }
-  const match = lines.shift()?.replace(/^\*\*Amp Gigawatt Tier:\*\*/, 'Amp Gigawatt Tier:').match(summary); check(match);
+  const match = lines.shift()?.replace(/^\*\*(Amp [A-Za-z]+ Tier:)\*\*/, '$1').match(summary); check(match);
   const [, plan, remaining, total, remainingPercent, hours, hoursTotal, hoursPercent, start, end] = match;
   const resets = iso(`${end}T00:00:00Z`);
   check(iso(`${start}T00:00:00Z`)! < resets!);
@@ -76,15 +80,16 @@ export function parseAmpDetails(text: string): void {
   check(summaryEnd > 2);
   parseAmp(lines.slice(2, summaryEnd).join('\n'));
   for (const [heading, header, unit] of [
-    ['## Amp Tier: Agent Usage Pool', '| Source | Recorded cost |', '\\$'],
-    ['## Amp Tier: Orb Usage Pool', '| Source | a1.xxlarge orb hours |', ''],
+    ['## Amp Tier: Agent Usage Pool', /^\| Source \| Recorded cost \|$/, '\\$'],
+    ['## Amp Tier: Orb Usage Pool', new RegExp(`^\\| Source \\| ${ORB_SIZE} orb hours \\|$`), ''],
   ]) {
     check(lines.filter(line => line === heading).length === 1);
     const from = lines.indexOf(heading) + 1;
     const next = lines.findIndex((line, i) => i >= from && line.startsWith('## '));
     const rows = lines.slice(from, next < 0 ? undefined : next).filter(line => line.startsWith('|'));
     const suffix = unit ? '' : 'h';
-    check(rows.length >= 4 && rows[0] === header && rows[1] === '| --- | ---: |');
+    // A pool with no draw this period has only the All sources row.
+    check(rows.length >= 3 && header.test(rows[0]) && rows[1] === '| --- | ---: |');
     check(new RegExp(`^\\| \\*\\*All sources\\*\\* \\| \\*\\*${unit}${number}${suffix}\\*\\* \\|$`).test(rows[2]));
     check(rows.slice(3).every(row => new RegExp(`^\\| [^|\\r\\n]+ \\| ${unit}${number}${suffix} \\|$`).test(row)));
   }
@@ -134,7 +139,7 @@ export function parseCodex(message: any): Reading {
   return { plan: rate.planType, windows, balance: credits, balances: credits ? [credits] : [], reset_credits_available: resets == null ? null : integer(resets.availableCount) };
 }
 const cursorPlans: Record<string, string> = {
-  free: 'free', pro: 'pro', 'pro plus': 'pro_plus', 'pro+': 'pro_plus', ultra: 'ultra',
+  free: 'free', pro: 'pro', 'pro plus': 'pro_plus', 'pro+': 'pro_plus', premium: 'premium', ultra: 'ultra',
   team: 'team', teams: 'team', business: 'business', enterprise: 'enterprise', edu: 'edu',
 };
 // Plan name only. `agent about` has no headless usage meters; email and request ids are dropped.

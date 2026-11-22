@@ -206,3 +206,48 @@ export const ampCharged = `Signed in as redacted@example.invalid (redacted)
 
 # Run \`amp usage --details\` for more detailed information.
 `;
+// 2026-11-22 capture (CLI 0.0.1795305655-gf675ab): Megawatt tier, hours normalized to
+// a1.small; identity redacted, explanatory section shortened.
+export const ampMegawatt = `Signed in as redacted@example.invalid (redacted)
+**Amp Megawatt Tier:** agent usage $19.99 of $20.00 remaining (100%), orb usage 741.2h of 750h a1.small orb hours remaining (99%) - period 2026-11-10 to 2026-12-10, resets upon renewal in 17 days
+**Workspace metacomet:** $2.37 remaining (set up auto-reload to avoid running out) - https://ampcode.com/workspaces/metacomet
+
+## How Usage Is Charged
+
+- Self-hosted orbs: free.
+
+# Run \`amp usage --details\` for more detailed information.
+`;
+export const detailsMegawatt = `# Usage
+
+${ampMegawatt.split('\n').slice(0, 3).join('\n')}
+
+## How Usage Is Charged
+
+- Self-hosted orbs: free.
+
+## Amp Tier: Agent Usage Pool
+
+Tier agent usage drawn in the selected range, by the model or feature that consumed it.
+
+| Source | Recorded cost |
+| --- | ---: |
+| **All sources** | **$0.01** |
+| Web Search | $0.008 |
+| Web Extract | $0.003 |
+
+## Amp Tier: Orb Usage Pool
+
+Gross included orb hours recorded in the selected range, in hours of a1.small orbs.
+
+| Source | a1.small orb hours |
+| --- | ---: |
+| **All sources** | **8.8h** |
+| Orb | 8.8h |
+
+## From
+
+| Source | Tokens | Recorded cost |
+| --- | ---: | ---: |
+| Amp | 1,000 | $0.01 |
+`;

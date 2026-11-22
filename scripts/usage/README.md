@@ -52,7 +52,11 @@ output or exception text. The collector kills only its own probe process group.
   emits a plain summary with workspace balances; details retain Markdown. Version
   `0.0.1792108872-gab0eb7` (2026-10-16) may append the exact optional Individual
   credits note ` (set up auto-reload to avoid running out)`.
-  Both summary styles accept an optional `a1.xxlarge` size label and either
+  Version `0.0.1795305655-gf675ab` (2026-11-22) reports the Megawatt tier with
+  hours normalized to `a1.small`. The tier is accepted as any one capitalized
+  word and the size as any `a1.<size>`, in the summary and the orb pool header.
+  A pool with no draw yet has only its All sources row.
+  Both summary styles accept an optional `a1.<size>` label and either
   `resets in N days` or `resets upon renewal in N days`. Sign-in identities are
   discarded. Workspace USD balances carry `label: "workspace <name>"` and
   `total: null`; unknown lines, duplicate pools and mismatched workspace URLs
@@ -69,7 +73,7 @@ output or exception text. The collector kills only its own probe process group.
   tokens are not extracted. Both a null email and a null tier mean
   `not logged in`. An email with a null tier is `CLI failed`. Plans map
   case-insensitively, with an optional `Cursor ` prefix: free, pro,
-  `Pro Plus`/`pro+` → `pro_plus`, ultra, team/teams, business, enterprise, edu.
+  `Pro Plus`/`pro+` → `pro_plus`, premium (seen on CLI `2026.11.19-f005e9d`), ultra, team/teams, business, enterprise, edu.
   Email, request id, OS and terminal fields are dropped. An ok row has a plan
   and empty windows. Version shape is `YYYY.M.D-<hex>`, checked on CLI
   `2026.10.16-e3cb207`. A live signed-in `subscriptionTier` of `Ultra` maps

@@ -106,19 +106,25 @@ fn valid(t: &AgentTool, now: i64) -> bool {
                     .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'g' | b'a'..=b'f'))
         })
         && t.plan.as_deref().is_none_or(|p| {
-            matches!(
-                p,
-                "Gigawatt"
-                    | "free"
-                    | "plus"
-                    | "pro"
-                    | "pro_plus"
-                    | "ultra"
-                    | "team"
-                    | "business"
-                    | "enterprise"
-                    | "edu"
-            )
+            // Amp reports its tier as one capitalized word (Gigawatt, Megawatt, ...).
+            let amp_tier = t.tool == "amp"
+                && (3..=20).contains(&p.len())
+                && p.as_bytes()[0].is_ascii_uppercase()
+                && p.bytes().skip(1).all(|b| b.is_ascii_lowercase());
+            amp_tier
+                || matches!(
+                    p,
+                    "free"
+                        | "plus"
+                        | "pro"
+                        | "pro_plus"
+                        | "premium"
+                        | "ultra"
+                        | "team"
+                        | "business"
+                        | "enterprise"
+                        | "edu"
+                )
         })
         && t.windows.len() <= 20
         && t.windows.iter().enumerate().all(|(i, w)| {
@@ -392,6 +398,25 @@ mod tests {
         assert!(parse(&serde_json::to_vec(&cursor).unwrap(), at).is_some());
         cursor["tools"][1]["plan"] = json!("redacted@example.invalid");
         assert!(parse(&serde_json::to_vec(&cursor).unwrap(), at).is_none());
+        cursor["tools"][1]["plan"] = json!("premium");
+        assert!(parse(&serde_json::to_vec(&cursor).unwrap(), at).is_some());
+        // Amp tiers are any one capitalized word; other tools cannot use that form.
+        cursor["tools"][1]["plan"] = json!("Megawatt");
+        assert!(parse(&serde_json::to_vec(&cursor).unwrap(), at).is_none());
+        let mut tier = value.clone();
+        for (plan, ok) in [
+            ("Megawatt", true),
+            ("mega watt", false),
+            ("MEGAWATT", false),
+            ("Mw", false),
+        ] {
+            tier["tools"][0]["plan"] = json!(plan);
+            assert_eq!(
+                parse(&serde_json::to_vec(&tier).unwrap(), at).is_some(),
+                ok,
+                "{plan}"
+            );
+        }
         cursor["tools"][1]["plan"] = json!("pro_plus");
         cursor["tools"][1]["status"] = json!("unknown");
         cursor["tools"][1]["reason"] = json!("not logged in");

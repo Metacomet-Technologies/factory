@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { createServer as createNetServer } from 'node:net';
 import { collect, command, readPrevious, writeSnapshot, CLAUDE_ARGS, supportedNode } from './collect.ts';
 import { age, FORMAT_CHANGED, parseAmp, parseAmpDetails, parseClaude, parseCodex, parseCursor, parseKimi, parseOpencode, parseOpencodeV2, STALE_MS } from './parsers.ts';
-import { amp, ampAutoReload, ampCharged, ampNew, details, detailsAutoReload, detailsNew, claude, codex, cursorAbout, cursorLoggedOut, kimiLive, kimiLoggedOut, kimiUsage, opencodeStats, opencodeV2ShareCard, opencodeV2Stats, opencodeV2Zero, fixtureRun, versions } from './fixtures.ts';
+import { amp, ampAutoReload, ampCharged, ampMegawatt, ampNew, details, detailsAutoReload, detailsMegawatt, detailsNew, claude, codex, cursorAbout, cursorLoggedOut, kimiLive, kimiLoggedOut, kimiUsage, opencodeStats, opencodeV2ShareCard, opencodeV2Stats, opencodeV2Zero, fixtureRun, versions } from './fixtures.ts';
 
 // A loopback port the OS reports free; fixed ports collide with other runs on the host.
 const freePort = () => new Promise<number>((resolve, reject) => {
@@ -71,6 +71,17 @@ test('Amp plain summaries preserve workspace balance without identity or invente
     assert.deepEqual(parseAmp(text), parseAmp(ampNew));
   }
   assert.equal(parseAmp(ampNew.replace('$0 remaining', '$12.34 remaining')).balances[2].amount, '12.34');
+  // 2026-11: the tier became Megawatt and hours are normalized to a1.small.
+  const megawatt = parseAmp(ampMegawatt);
+  assert.equal(megawatt.plan, 'Megawatt');
+  assert.deepEqual(megawatt.balances.map(b => [b.label ?? b.unit, b.amount, b.total]), [['usd', '19.99', '20.00'], ['orb_hours', '741.2', '750'], ['workspace metacomet', '2.37', null]]);
+  assert.deepEqual(megawatt.windows.map(w => [w.name, w.used_percent, w.resets_at_ms]), [['agent', 0, Date.UTC(2026, 11, 10)], ['orb', 1, Date.UTC(2026, 11, 10)]]);
+  parseAmpDetails(detailsMegawatt);
+  // A pool with no draw yet this period has only the All sources row.
+  parseAmpDetails(detailsMegawatt.replace('| Web Search | $0.008 |\n| Web Extract | $0.003 |\n', ''));
+  for (const text of [ampMegawatt.replace('Megawatt', 'mega watt'), ampMegawatt.replace('a1.small', 'small')])
+    assert.throws(() => parseAmp(text), { message: FORMAT_CHANGED });
+  assert.throws(() => parseAmpDetails(detailsMegawatt.replace('| Source | a1.small orb hours |', '| Source | small orb hours |')), { message: FORMAT_CHANGED });
   const charged = parseAmp(ampCharged);
   assert.deepEqual(charged.balances.map(b => [b.label ?? b.unit, b.amount]), [['usd', '0'], ['orb_hours', '879.1'], ['workspace metacomet', '2.50']]);
   assert.equal(charged.windows[0].used_percent, 100);
@@ -357,6 +368,7 @@ test('cursor, kimi and opencode fail closed and drop identity, tokens and wallet
   assert.equal(parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: 'Cursor Ultra' })).plan, 'ultra');
   assert.equal(parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: 'Ultra' })).plan, 'ultra');
   assert.equal(parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: 'Teams' })).plan, 'team');
+  assert.equal(parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: 'Premium' })).plan, 'premium');
   assert.throws(() => parseCursor(JSON.stringify(cursorLoggedOut)), { message: 'not logged in' });
   assert.throws(() => parseCursor(JSON.stringify({ ...cursorAbout, subscriptionTier: null })), { message: 'CLI failed' });
   assert.throws(() => parseCursor(JSON.stringify({ ...cursorAbout, userEmail: null })), { message: FORMAT_CHANGED });
