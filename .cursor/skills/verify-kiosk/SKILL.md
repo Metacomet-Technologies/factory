@@ -43,12 +43,13 @@ Doctor fails unless the recorded pid is alive, both ports are owned by that proc
 Use Playwright from `kiosk/node_modules` and its default browser cache (`~/.cache/ms-playwright`, or `PLAYWRIGHT_BROWSERS_PATH` when set). Open a new browser context so `localStorage` key `factory-theme` starts empty. Prefer accessible names over coordinates.
 
 ```sh
-node .cursor/skills/verify-kiosk/verify.mjs drive theme
+node .cursor/skills/verify-kiosk/verify.mjs drive theme   # or usage, gpu, frontier
+node .cursor/skills/verify-kiosk/verify.mjs drive all     # every journey, about 90 s
 ```
 
 That command is the theme journey in [features/theme.md](features/theme.md). It clicks the button named `Use dark theme` or `Use light theme`, then requires the accessible name to flip, `document.documentElement.dataset.theme` to change, and `localStorage['factory-theme']` to equal the new theme.
 
-Other journeys are specified in `features/` and are not wrapped by the helper. Follow those files literally. Do not substitute a unit test or a direct `dataset.theme` write for a click.
+Each `drive` journey follows its file in `features/` and exits non-zero at the first step that does not match. `frontier` waits out the refresh cooldown (about 61 s on a fresh mock, up to 3 minutes after a previous refresh). Do not substitute a unit test or a direct `dataset.theme` write for a click.
 
 Any layout or CSS change must also pass the device matrix in [features/device-matrix.md](features/device-matrix.md): every page at Devon's iPhone, iPad, MacBook, 27-inch and kiosk viewports, both themes, plus the topology explanation on both iPhone orientations and the Network link → Back → Forward journey on the iPhone and iPad, through `node .cursor/skills/verify-kiosk/devices.mjs` (from the repo root). `devices.mjs` and `contrast.mjs` are the helpers; the contrast audit is a copy of the one in `kiosk/scripts/screenshots.ts`.
 
@@ -56,7 +57,7 @@ Any layout or CSS change must also pass the device matrix in [features/device-ma
 
 Write proof under `$VERIFY_ROOT/evidence/<feature>/`. A theme proof is `theme/after.png` and `theme/after.aria.txt`. The text file records the button label and theme before and after the click, plus the stored preference. A screenshot alone is not proof.
 
-Exercise the on-screen control. Capture the action's result (label, theme attribute, stored preference), not only the final pixels. Theme has no server side effect. Usage and GPU range changes must show the matching `range` query on `/v1/llm/usage` or `/v1/gpu`. Frontier refresh must show the POST to `/v1/agents/refresh` and the following status text. The mock API answers non-GET with 405, so that journey fails on this stand-in until the mock accepts the refresh POST. Do not mark it passed because the button rendered.
+Exercise the on-screen control. Capture the action's result (label, theme attribute, stored preference), not only the final pixels. Theme has no server side effect. Usage and GPU range changes must show the matching `range` query on `/v1/llm/usage` or `/v1/gpu`. Frontier refresh must show the 202 from `POST /v1/agents/refresh`, `Refreshing…`, and then `Updated just now` after the mock pushes a newer `agents.usage`. Do not mark it passed because the button rendered.
 
 ## Cleanup
 
@@ -68,4 +69,4 @@ Cleanup sends `SIGTERM` to the recorded process group and deletes `$VERIFY_ROOT/
 
 ## Helpers
 
-`verify.mjs` is the harness. Invoke it with `node` as shown above. `launch` and `cleanup` are the only commands that start or stop the app. `doctor` is read-only. `drive theme` is the one scripted journey.
+`verify.mjs` is the harness. Invoke it with `node` as shown above. `launch` and `cleanup` are the only commands that start or stop the app. `doctor` is read-only. `drive <journey>` runs one journey; `drive all` runs all four.

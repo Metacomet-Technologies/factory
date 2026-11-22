@@ -23,6 +23,7 @@ Preconditions:
 - **Default.** Load `http://127.0.0.1:4181/`. The browser requests `GET /v1/llm/usage?range=24h` on the mock. Choose the link `Local LLM usage, pricing and model details`. The URL becomes `/llm`, and the `24h` toggle in `Usage range` is pressed.
 - **Seven days.** Choose `7d` inside the group named `Usage range`. The browser requests `GET /v1/llm/usage?range=7d`, and `7d` is pressed.
 - **Thirty days.** Choose `30d` inside that same group. The browser requests `GET /v1/llm/usage?range=30d`, and `30d` is pressed.
+- **Run it.** `node .cursor/skills/verify-kiosk/verify.mjs drive usage` does every step above.
 - **Proof.** Save a screenshot of the `/llm` page and a text file listing the three request URLs to `$VERIFY_ROOT/evidence/usage-range/`. The heading `factory` stays visible.
 
 ## Gotchas

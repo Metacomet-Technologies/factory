@@ -22,6 +22,7 @@ Preconditions:
 - **Default.** Load `http://127.0.0.1:4181/`. The browser requests `GET /v1/gpu?range=1h`. The `1h` toggle in `GPU history range` is pressed.
 - **Day.** Choose `24h` inside the group named `GPU history range`. The browser requests `GET /v1/gpu?range=24h`, and `24h` is pressed.
 - **Week.** Choose `7d` inside that same group. The browser requests `GET /v1/gpu?range=7d`, and `7d` is pressed.
+- **Run it.** `node .cursor/skills/verify-kiosk/verify.mjs drive gpu` does every step above.
 - **Proof.** Save a screenshot that includes the GPU card and a text file of the three request URLs to `$VERIFY_ROOT/evidence/gpu-range/`.
 
 ## Gotchas

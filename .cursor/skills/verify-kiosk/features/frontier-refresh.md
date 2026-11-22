@@ -22,11 +22,12 @@ Preconditions:
 
 - **Refresh.** Choose `Refresh usage`. The browser sends `POST /v1/agents/refresh` with an empty body. The status next to the button reads `Refreshing…`, and the button is disabled.
 - **Complete.** Wait for an `agents.usage` event whose `observed_at_ms` is newer than the click. `Refreshing…` clears and all six rows stay visible.
+- **Run it.** `node .cursor/skills/verify-kiosk/verify.mjs drive frontier` does every step above, including the cooldown wait.
 - **Proof.** Record the POST status, the status text after the click, and a screenshot under `$VERIFY_ROOT/evidence/frontier-refresh/`.
 
 ## Gotchas
 
-- The mock API used by `vp run mock-dev` answers every non-GET with HTTP 405, including `POST /v1/agents/refresh`. On that stand-in the journey fails at `refresh-post`: the POST returns 405 and the status reads `Refresh didn't complete` at once, without `Refreshing…` staying up. That exercises `refresh-failure` only. Report `refresh-post` as failed. Do not treat a rendered button as a completed refresh.
-- A 202 response starts a 90 second completion timer. HTTP success alone does not finish the journey.
+- The mock answers `POST /v1/agents/refresh` like the API: 202 with a 3 minute `next_allowed_at_ms`, then 429 until that time. It pushes a newer `agents.usage` on `/v1/stream` 1.5 s after a 202, which completes the journey. Other mock POSTs still answer 405.
+- A 202 response starts a 90 second completion timer. HTTP success alone does not finish the journey; it finishes when the status reads `Updated just now`.
 - The button stays disabled during cooldown. Forcing the click skips the user path.
 - A row whose fixture status is `not_tracked` or `unknown` shows `not tracked` or `unknown` instead of `observed … min ago`. The mock tracks all six by default.

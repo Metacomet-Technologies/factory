@@ -166,7 +166,7 @@ export function siteFixtures(
           net_tx_bps: metric(8e5 + (index % 9) * 1e5, 1e5),
         })),
   };
-  // Read-only in the mock: the server answers POST with 405, so no action can be confirmed.
+  // Read-only in the mock: the server answers control POSTs with 405, so no action can be confirmed.
   const control: ControlState = {
     login: "synthetic@github",
     actions: [

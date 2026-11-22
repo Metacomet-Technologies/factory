@@ -15,8 +15,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 - Start every recipe from the baseline state unless its preconditions say otherwise.
 - Prefer ARIA roles and accessible names over CSS selectors or DOM position.
 - Treat every command as literal. Keep quoted names and flags unchanged.
-- Run the theme journey through `verify.mjs drive theme`.
-- Run the other journeys with Playwright from `kiosk/node_modules`, using a fresh context.
+- Run a journey with `verify.mjs drive theme|usage|gpu|frontier`, or all of them with `verify.mjs drive all`. Each opens a fresh browser context.
 - Leave `$VERIFY_ROOT/evidence` in place during cleanup.
 
 ## Proof and skip reporting

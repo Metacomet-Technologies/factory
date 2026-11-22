@@ -15,12 +15,47 @@ const outage = process.env.MOCK_OUTAGE === "1";
 const agentStatus = process.env.MOCK_AGENTS_STATUS ?? (outage ? "unknown" : "ok");
 if (!["ok", "stale", "unknown", "not_tracked"].includes(agentStatus))
   throw new Error("Invalid MOCK_AGENTS_STATUS");
-const agents = () => agentFixtures(agentStatus as Parameters<typeof agentFixtures>[0]);
+// A refresh, like the API's, stamps every tracked tool with a new observation and pushes it on
+// /v1/stream; the next one is allowed 3 minutes later.
+let refreshedAt: number | null = null;
+let nextRefreshAt = 0;
+const streams = new Set<(event: StreamEvent) => void>();
+const agents = () => {
+  const data = agentFixtures(agentStatus as Parameters<typeof agentFixtures>[0]);
+  if (refreshedAt !== null && agentStatus === "ok")
+    for (const tool of data.tools) tool.observed_at_ms = refreshedAt;
+  return data;
+};
 const networkMode = (process.env.MOCK_NETWORK ?? "healthy") as NetworkMode;
 if (!["healthy", "degraded", "down"].includes(networkMode)) throw new Error("Invalid MOCK_NETWORK");
 createServer((request, response) => {
   const url = new URL(request.url ?? "/", "http://localhost");
   response.setHeader("Access-Control-Allow-Origin", "*");
+  if (request.method === "POST" && url.pathname === "/v1/agents/refresh") {
+    const now = Date.now();
+    const json = { "Content-Type": "application/json" };
+    if (now < nextRefreshAt) {
+      response
+        .writeHead(429, { ...json, "Retry-After": String(Math.ceil((nextRefreshAt - now) / 1000)) })
+        .end(
+          JSON.stringify({
+            error: { code: "cooldown", message: "usage refresh is cooling down" },
+            next_allowed_at_ms: nextRefreshAt,
+          }),
+        );
+      return;
+    }
+    nextRefreshAt = now + 180_000;
+    setTimeout(() => {
+      refreshedAt = Date.now();
+      const event: StreamEvent = { type: "agents.usage", ts_ms: refreshedAt, data: agents() };
+      for (const send of streams) send(event);
+    }, 1500);
+    response
+      .writeHead(202, json)
+      .end(JSON.stringify({ status: "accepted", next_allowed_at_ms: nextRefreshAt }));
+    return;
+  }
   if (request.method !== "GET") {
     response.writeHead(405).end();
     return;
@@ -34,6 +69,7 @@ createServer((request, response) => {
     response.write(": connected\n\n");
     const send = (event: StreamEvent) =>
       response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    streams.add(send);
     let index = 0;
     const gpu = setInterval(() => {
       const data = fixtures(outage).gpu.current;
@@ -74,6 +110,7 @@ createServer((request, response) => {
     }, 15000);
     const keepalive = setInterval(() => response.write(": keepalive\n\n"), 15000);
     response.on("close", () => {
+      streams.delete(send);
       clearInterval(gpu);
       clearInterval(llm);
       clearInterval(usage);
