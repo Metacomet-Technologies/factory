@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     process::Command,
     time::SystemTime,
@@ -43,10 +43,8 @@ fn main() {
     // Crate sources already invalidate themselves. Also rebuild when VERSION
     // or the git checkout moves, including a worktree gitdir and a branch ref.
     // meter and factory-api include this script.
-    println!("cargo:rerun-if-env-changed=FACTORY_RELEASE_VERSION");
     println!("cargo:rerun-if-changed={}", root.join("VERSION").display());
     watch_git(root);
-    let release = env::var("FACTORY_RELEASE_VERSION").ok();
     let version = fs::read_to_string(root.join("VERSION")).expect("read root VERSION");
     let version = version.trim();
     assert_eq!(
@@ -54,29 +52,6 @@ fn main() {
         env!("CARGO_PKG_VERSION"),
         "workspace version must match VERSION"
     );
-    if let Some(release) = &release {
-        let parse = |text: &str| -> Vec<u32> {
-            let parts: Vec<_> = text.split('.').collect();
-            assert_eq!(parts.len(), 3, "release version must be stable SemVer");
-            parts
-                .iter()
-                .map(|part| {
-                    assert!(
-                        !part.is_empty()
-                            && part.bytes().all(|b| b.is_ascii_digit())
-                            && (part.len() == 1 || !part.starts_with('0')),
-                        "release version must be stable SemVer"
-                    );
-                    part.parse().expect("release version component exceeds u32")
-                })
-                .collect()
-        };
-        assert!(
-            parse(release) >= parse(version),
-            "release version below VERSION"
-        );
-    }
-    let version = release.as_deref().unwrap_or(version);
     let git = |args: &[&str]| {
         if !root.join(".git").exists() {
             return None;
@@ -90,25 +65,12 @@ fn main() {
             .and_then(|output| String::from_utf8(output.stdout).ok())
             .map(|text| text.trim().to_owned())
     };
-    let sha = if release.is_some() {
-        git(&["rev-parse", "HEAD"]).expect("release build requires git identity")
-    } else {
-        git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or("unknown".into())
-    };
+    let sha = git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or("unknown".into());
     let dirty = git(&["status", "--porcelain"]).is_some_and(|status| !status.is_empty());
-    // Release retries must reproduce identical assets, including embedded time.
-    let built_at_ms = if release.is_some() {
-        git(&["show", "-s", "--format=%ct", "HEAD"])
-            .expect("release build requires commit time")
-            .parse::<u128>()
-            .expect("invalid commit time")
-            * 1000
-    } else {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-    };
+    let built_at_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
     println!("cargo:rustc-env=FACTORY_VERSION={version}");
     println!("cargo:rustc-env=FACTORY_GIT_SHA={sha}");
     println!("cargo:rustc-env=FACTORY_GIT_DIRTY={dirty}");
