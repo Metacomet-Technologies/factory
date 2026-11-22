@@ -22,6 +22,10 @@ updates:
     directory: /kiosk
     schedule:
       interval: weekly
+    ignore:
+      # Node types follow the pinned Node major (.node-version), not npm latest.
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
     groups:
       weekly-kiosk:
         patterns: ['*']
