@@ -78,8 +78,8 @@ async function explanation(device, theme) {
   const cdp = await context.newCDPSession(page);
   await cdp.send("Emulation.setSafeAreaInsetsOverride", { insets: device.insets });
   await page.locator(".react-flow__node").first().waitFor();
-  await page.getByRole("button", { name: "Linear dispatch", exact: true }).click();
-  await page.getByRole("button", { name: "How linear dispatch works" }).click();
+  await page.getByRole("button", { name: "Work and deploy", exact: true }).click();
+  await page.getByRole("button", { name: "How work and deploy works" }).click();
   await page.locator("#topology-steps").waitFor({ state: "visible" });
   await page.waitForTimeout(400);
   const result = await page.evaluate(() => {
@@ -441,7 +441,7 @@ try {
       }
       await context.close();
     }
-  // The topology explanation on a phone: select Linear dispatch, open "How … works" and
+  // The topology explanation on a phone: select Work and deploy, open "How … works" and
   // require every step to be reachable by scrolling the document, never an inner scroller.
   for (const device of DEVICES.filter(
     (d) => !journeyOnly && d.name.startsWith("iphone") && (!only || only.includes(d.name)),

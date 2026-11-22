@@ -191,7 +191,7 @@ const nodeList: Omit<TopologyNode, "x" | "y">[] = [
   { id: "amp", title: "ampcode.com", sub: "threads, routing, MCP", kind: "cloud" },
   { id: "openai", title: "OpenAI", sub: "GPT, ChatGPT Only preset", kind: "cloud" },
   { id: "anth", title: "Anthropic", sub: "Claude Max, Opus 5.5", kind: "cloud" },
-  { id: "runG", title: "Amp runner", sub: "push to main, factory-deploy", kind: "service" },
+  { id: "runG", title: "Amp runner", sub: "push to main, auto-deploy", kind: "service" },
   { id: "claude", title: "claude CLI", sub: "Claude engine, /usage", kind: "service" },
   { id: "codex", title: "codex CLI", sub: "quota read only", kind: "service" },
   { id: "coll", title: "Usage collector", sub: "every 15 min", kind: "service" },
@@ -277,15 +277,15 @@ export const FLOWS: Flow[] = [
   {
     id: "work",
     name: "Work and deploy",
-    intro: "Main-based: an agent thread pushes to main and deploys what it changed.",
+    intro: "Main-based: an agent thread pushes to main; green commits deploy themselves.",
     nodes: ["amp", "runG", "runC", "github", "linear", "api"],
     edges: ["toRunG", "toRunC", "push", "comment", "selfDeploy"],
     steps: [
       "Amp starts the thread on a runner: factory-gpu, or the console when it is on.",
-      "The agent works in its own worktree, runs the checks in AGENTS.md and pushes to main.",
-      "CI runs on every push to main; a red main is fixed or reverted first.",
+      "The agent works in its own worktree and pushes to main; the pre-push hook runs the fast checks.",
+      "CI runs every test on each push to main; a red main is fixed or reverted first.",
       "It comments the commit SHA on its Linear issue.",
-      "On factory-gpu, sudo factory-deploy builds main and installs meter, factory-api or kiosk, rolling back if health checks fail.",
+      "Every 2 minutes factory-gpu deploys the newest green commit: only the meter, factory-api or kiosk builds that changed, rolling back if health checks fail.",
     ],
   },
   {

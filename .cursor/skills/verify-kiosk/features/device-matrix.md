@@ -15,7 +15,7 @@ Every kiosk page fits each of Devon's devices in every listed orientation: no ho
 ## How to get to it (user POV)
 
 - Open `/`, `/ups`, `/llm`, `/network`, `/devices/factory-gpu` or `/topology` on one of these devices.
-- On `/topology` on an iPhone, choose the flow `Linear dispatch`, then `How linear dispatch works`.
+- On `/topology` on an iPhone, choose the flow `Work and deploy`, then `How work and deploy works`.
 - On `/` on an iPhone or iPad, scroll down to the `Network` card and tap it, then go Back and Forward.
 
 | Device | Name in the run | CSS viewport | DPR | Insets |
@@ -37,7 +37,7 @@ Preconditions:
 
 - **Run the matrix.** From the repo root, run `BASE_URL=http://127.0.0.1:4181 node .cursor/skills/verify-kiosk/devices.mjs` (output goes to `$VERIFY_ROOT/evidence/devices`). Each context uses the row's viewport, DPR, touch and `isMobile`, and sets the insets with `Emulation.setSafeAreaInsetsOverride`. Without `viewport-fit=cover` the landscape iPhone width drops to 814 px, as Safari letterboxes it. The run ends with `Device matrix: 92 captures (pages × viewports × themes, plus the topology explanation), 0 problem(s).` and exits 0.
 - **Narrow a run.** `DEVICES=iphone-portrait,iphone-landscape THEMES=dark` limits devices and themes.
-- **Open the explanation.** For `iphone-landscape` (932×380) and `iphone-portrait` (430×739) in both themes, the helper presses the toggle button `Linear dispatch`, then `How linear dispatch works`, and waits for `#topology-steps`. It fails when that box or an ancestor scrolls or clips it vertically, when the page scrolls horizontally, or when any heading, step or legend line, scrolled into view, is not the topmost element at its centre.
+- **Open the explanation.** For `iphone-landscape` (932×380) and `iphone-portrait` (430×739) in both themes, the helper presses the toggle button `Work and deploy`, then `How work and deploy works`, and waits for `#topology-steps`. It fails when that box or an ancestor scrolls or clips it vertically, when the page scrolls horizontally, or when any heading, step or legend line, scrolled into view, is not the topmost element at its centre.
 - **Follow a link and go Back/Forward.** For the four iPhone and iPad rows (first theme), the helper loads `/`, scrolls the `Network` card to the middle of the screen and taps it. `/network` must open at `scrollY` 0 with its `.page-title` below the top bar. It scrolls `/network` to 240 px, goes Back (the `Network` card must be on screen again), then Forward (`/network` must be back at 240 px). `JOURNEY_ONLY=1` runs only this journey; `<device>-<theme>-network-journey.png` is the final viewport.
 - **Proof.** `$VERIFY_ROOT/evidence/devices/<device>-<theme>-<page>.png` is a full-page screenshot; `<device>-<theme>-topology-explanation.png` shows the open explanation. `devices-check.json` records, per capture, the layout viewport, document size, panel width used, smallest font, contrast minimums and every problem.
 
