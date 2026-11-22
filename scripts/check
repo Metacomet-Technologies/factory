@@ -56,13 +56,13 @@ in_kiosk() { (cd kiosk && step "$@"); }
 deploy_tests() {
     local test dir
     for test in $(git ls-files 'deploy/test*.py' 'deploy/*/test*.py'); do
+        dir=$(dirname "$test")
+        ((all)) || touched "^${dir}/[^/]+$" || continue
         case $test in
             deploy/backup/test-offsite.py|deploy/test-agent-host-config.py|deploy/test-cleanup-console-rollback.py) continue ;;
             deploy/backup/test-offsite-runtime.py)
                 python3 -c 'import ensurepip' 2>/dev/null || { echo "skip $test: python3-venv missing (CI runs it)"; continue; } ;;
         esac
-        dir=$(dirname "$test")
-        ((all)) || touched "^${dir}/[^/]+$" || continue
         step python3 -B "$test"
     done
 }
