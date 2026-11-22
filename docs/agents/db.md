@@ -1,12 +1,11 @@
-Paths in the verbatim rules below are repository-root-relative.
-Local link: [data-model plan](../data-model.md).
-
 ## Database rules
 
-Follow [the data-model plan](docs/data-model.md). These rules govern new DB work;
-MET-92 steps 3–5 add the enforcement below and migrate the audited legacy tables.
-Do not claim the planned tests already exist. SQLite stays; no Valkey/Redis or
+Follow [the data model](../data-model.md). SQLite stays; no Valkey/Redis or
 partitioning. Postgres is the escalation path after measured SQLite limits.
+`factory-db` provides the enforcement: `counter` counts statements per job scope
+for the query-budget tests, `explain` backs the `EXPLAIN QUERY PLAN` tests,
+`migrations` is the versioned runner, `pool` applies the shared PRAGMAs and
+`money` holds the integer units. Owners' tests use these to enforce the rules below.
 
 | Rule | Enforcement |
 | --- | --- |

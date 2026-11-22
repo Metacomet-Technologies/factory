@@ -185,7 +185,7 @@ baseline below, as `agent`:
   with `rustup toolchain uninstall <version>` or `vp env uninstall <version>` (Node) or `vp env uninstall bun@<version>`.
 
 The repository side (this script, the orb wrapper, CI, the sandbox preflight)
-rolls back by reverting its merge commit.
+rolls back by reverting the commit.
 
 ## Prod baseline (MET-222, 2026-10-17)
 

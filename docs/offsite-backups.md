@@ -46,7 +46,7 @@ API copies disappear in a house loss. If requests becomes authoritative for
 customer invoicing or its loss budget becomes 15 minutes, choose Litestream
 for requests and separately reassess meter/pricing consistency. None of the
 current evidence justifies operating continuous replication for every DB.
-No database is recommended as `none`; no Litestream daemon is part of this PR.
+No database is recommended as `none`; no Litestream daemon runs.
 
 
 In the later `meter-v0` ticket, inventory and validate the existing pairs under
@@ -312,9 +312,9 @@ explicit recovery approval, stop the owning service, preserve its current
 DB/WAL state, restore ownership and modes from that service's runbook, and
 validate schema versions, row invariants and application behavior before
 starting it. Snapshots of different DBs are sequential, not one cross-database
-transaction. Reconcile requests against meter/pricing, dispatch against external
-work, and UPS audit against physical state. Never replay pending power actions
-or dispatcher jobs merely because a restored DB says they are pending.
+transaction. Reconcile requests against meter/pricing and UPS audit against
+physical state. Never replay pending power actions merely because a restored DB
+says they are pending.
 
 ## Monitoring
 
@@ -331,7 +331,7 @@ detect accidental disablement.
 
 `backup-state.py` publishes the whole status to
 `/var/lib/factory-backup-status/status.json` as `root:factory-api 0640`.
-All three conditions are implemented in the merged prototype, using the existing
+All three conditions are implemented, using the existing
 factory-api `backup:status` warning and Slack engine:
 
 1. **Status unavailable or unreadable:** `AppState::alert_signals` detects a
@@ -385,8 +385,8 @@ Page on failed or overdue drills. A PUT receipt is not a restore-check receipt.
 ## Activation runbook
 
 [MET-334](https://linear.app/metacomet/issue/MET-334) covers activation of the
-current daily inventory. Dispatch and meter-v0 remain separate later tickets,
-not prerequisites for this rollout. The 26-hour budget, static token, shared
+current daily inventory. meter-v0 remains a separate later ticket, not a
+prerequisite for this rollout. The 26-hour budget, static token, shared
 Factory vault recovery with Dave, and lack of off-house monitoring are approved.
 
 Run these commands in Devon's existing Mac zsh session with the client helpers
@@ -412,8 +412,9 @@ configuration values appear in arguments or environment variables.
 
 ### 1. Install the GPU runtime
 
-The deployed checkout is at a release tag. Fetch `origin/main` as `agent` and
-create a detached temporary worktree without changing the deployed checkout.
+The deployed checkout is the main checkout, which autodeploy fast-forwards.
+Fetch `origin/main` as `agent` and create a detached temporary worktree so the
+install runs from a fixed commit without changing the deployed checkout.
 Stop if `/tmp/factory-main` already exists. Review the printed commit and
 confirm it contains the approved MET-334 changes before running the installer.
 

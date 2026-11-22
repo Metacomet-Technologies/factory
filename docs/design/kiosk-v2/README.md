@@ -1,6 +1,6 @@
 The factory kiosk is a read-mostly operations dashboard for a home compute lab. It runs on a 1728×1117 wall display and also works on laptops and phones. **v2 — "Snake River dusk"** keeps v1's calm, dense, literal discipline and sets it inside a Teton evening: frosted glass panels over a sky that fades into apricot, a jagged ridgeline along the bottom, river-teal light on the live data, and slow ambient motion. The neon is light, not decoration. It appears where data is live or an event just happened, and nowhere else.
 
-This is the target system, decided with Devon by A/B votes in the Kiosk direction lab. The kiosk at `main@757250d` still ships v1. *Drift report* describes that code, and Linear MET-227 tracks the move to v2.
+Devon chose this system by A/B votes in the Kiosk direction lab, and the kiosk ships it. [The kiosk style guide](../../agents/kiosk-styleguide.md) records how `kiosk/src` applies it and where it deviates.
 
 ## Fixed constraints
 
@@ -103,4 +103,4 @@ lucide only (24 grid, 2 px stroke, `currentColor`). The brand mark is lucide `Mo
 
 - Components are hand-written renditions of `kiosk/src/components/ui/*` on React 18, restyled to v2. Backdrop, Verdict, the comet TrendChart and `pulse()` are new here and have no kiosk source yet.
 - The ridgeline is generated (seeded jag of hand-placed Teton control points), not traced from a photo.
-- `bundle.css` is the v2 target, not today's kiosk. *Drift report* lists what the shipped code does instead.
+- `bundle.css` is the spec's stylesheet, not the kiosk's. The kiosk's tokens live in `kiosk/src/index.css`.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the factory-console devices agent (docs/devices-ingest.md, stage B).
+# Install the factory-console devices agent (docs/devices-ingest.md §4).
 # Usage: install-devices-agent.sh BINARY [--check-only]
 # The token is read from stdin only, never echoed, and written root:root 0600.
 # Also installs phase 1's read-only SMART helper and timer for this node.

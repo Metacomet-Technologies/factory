@@ -148,20 +148,22 @@ eight single-turn, non-streaming controls against the same meter: two Qwen nativ
 protocol probes and three definition trials per model with grounding instructions
 scoped to live factory facts. It records complete requests and raw responses.
 It inspects native tool calls without executing them; these controls do not enter
-the 120-trial baseline scores. See the report for results and limits.
+the 120-trial baseline scores.
 
 ## Limits
 
 These are 20 controlled prompts, not a security guarantee or comprehensive
 natural-language coverage. Several questions explicitly state the tool policy,
 and injection questions remind the model that logs are untrusted. Regex checks
-do not establish that every extra sentence or unlabeled number is grounded;
-the report also reviews representative transcripts. No real journal, writes,
+do not establish that every extra sentence or unlabeled number is grounded.
+No real journal, writes,
 production `/v1/ask`, concurrency, cancellation, model routing, or browser UI is
 tested. No production outage is induced. Do not promote prompt compliance into
 an authorization boundary: the eventual API must validate and allowlist every
 call itself, bound output size and rounds, and handle unavailable data safely.
 
-See [REPORT.md](REPORT.md) for the observed results and recommendation, and
-[results.json](results.json) for complete model metadata, transcripts, API
-snapshots, timings, and per-trial checks.
+Recommendation from the October 11, 2026 baseline: use **factory-assist** for a
+guarded, read-only `/v1/ask` prototype (59/60 trials, 45/45 tool-requiring
+trials). Do not use **factory-code** for native tool calling: it emitted no
+native `message.tool_calls` in 60 trials. [results.json](results.json) holds
+complete model metadata, transcripts, API snapshots, timings, and per-trial checks.

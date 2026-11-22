@@ -196,36 +196,28 @@ Backup status that factory-api can read is
 
 ## Install and rollback
 
-After merge and the wrap-up thread's main-checkout builds, Devon runs these
-from his Mac. No deploy runs in an agent session. Save each printed backup
-path. These commands install the helpers, prebuilt API, and kiosk:
+factory-api and the kiosk deploy automatically from green main
+([deploy flow](PLAYBOOK.md#6-deploy-flow)). Devon installs the device helpers
+from his Mac and saves the printed backup path:
 
 ```sh
 gpu-ssh "sudo bash /home/agent/work/factory/deploy/devices/install-devices.sh"
 gpu-ssh "sudo bash /home/agent/work/factory/deploy/devices/install-devices.sh --preflight"
-gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api"
-gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-kiosk.sh /home/agent/work/factory/kiosk/dist"
 gpu-ssh 'sudo systemctl start factory-devices-maintenance.service factory-devices-smart.service; sudo python3 -m json.tool /var/lib/factory-devices/maintenance.json; sudo systemctl status factory-devices-maintenance.timer --no-pager'
 ```
 
-There is no DB migration for MET-217. The existing API installer's backup and
-schema preflight gates still apply. Do not restart Ollama or change factory-console.
-
-Verify the new response-level `maintenance` object and the Maintenance card:
+Verify the response-level `maintenance` object and the Maintenance card, and
+roll back with the printed snapshot:
 
 ```sh
 gpu-ssh 'curl -fsS http://127.0.0.1:8080/v1/devices/factory-gpu | python3 -c '\''import json,sys; print(json.dumps(json.load(sys.stdin).get("maintenance"), indent=2))'\'''
 # Open https://factory-gpu.bearded-pompano.ts.net/devices/factory-gpu
-# Replace placeholders with the printed component backup paths:
-gpu-ssh "sudo bash /home/agent/work/factory/deploy/rollback-kiosk.sh /var/backups/factory-kiosk/KIOSK_SNAPSHOT"
-gpu-ssh "sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/API_SNAPSHOT"
 gpu-ssh "sudo bash /home/agent/work/factory/deploy/devices/rollback-devices.sh /var/backups/factory-devices/DEVICES_SNAPSHOT"
 ```
 
 Rollback restores previous helpers and units, disabling the maintenance timer
 and stopping its service when those files were absent before install. The last
-maintenance snapshot can remain as historical data. Revert the API and kiosk
-through their own printed rollback snapshots.
+maintenance snapshot can remain as historical data.
 
 Before rolling factory-api back, let pending unclean-shutdown notices drain.
 The old binary cannot read outbox entries with `thread_ts: null` and moves
@@ -249,7 +241,7 @@ Unprivileged tests use `DEVICES_TEST_ROOT` and do not call host `smartctl`.
 ## Phase 2A: remote devices
 
 The server side of [devices-ingest.md](devices-ingest.md), option A. Until
-the stage B agent is installed, factory-console shows "Waiting for first
+the agent sends its first sample, factory-console shows "Waiting for first
 sample".
 
 - Credentials: `/etc/factory-api/device-tokens`, `root:factory-api` 0640, one
@@ -281,34 +273,8 @@ sample".
 There is no DB migration. Remote samples use the existing `device_samples`
 table.
 
-### Agent build and handoff
-
-After merge, the wrap-up thread runs these on factory-gpu as `agent`, directly
-(no sudo), in the main checkout. `gpu-ssh` runs as `dgarbs51`, which cannot
-build in `/home/agent`:
-
-```sh
-cd /home/agent/work/factory
-git status --porcelain            # must print nothing
-git fetch origin
-git merge --ff-only origin/main
-cargo build --release -p factory-api
-cd kiosk && vp install && VITE_API_BASE= vp build
-```
-
-It hands Devon `target/release/factory-api` and `kiosk/dist` with the commands
-below. Nothing is installed by the agent.
-
-### Deploy (Devon, from the Mac)
-
-```sh
-gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api --check-only"
-gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api"
-gpu-ssh "sudo bash /home/agent/work/factory/deploy/install-kiosk.sh /home/agent/work/factory/kiosk/dist"
-gpu-ssh 'curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "Content-Type: application/json" -d "{}" http://127.0.0.1:8080/v1/devices/factory-console/samples'
-```
-
-The last command prints `401`. Save the printed API and kiosk backup paths.
+factory-api and the kiosk deploy automatically from green main. After a deploy,
+an unauthenticated `POST /v1/devices/factory-console/samples` returns 401.
 
 ### Enrollment
 
@@ -411,7 +377,7 @@ endpoint. Remote rows in `device_samples` stay and age out with retention.
 takes slow inventory every 5 min, and uploads to
 `https://factory-gpu.bearded-pompano.ts.net/v1/devices/factory-console/samples`.
 What it reads, how failures are encoded, and the capability table are in
-[devices-ingest.md](devices-ingest.md#5-stage-b-factory-console-agent). It is
+[devices-ingest.md](devices-ingest.md#4-factory-console-agent). It is
 read-only: no commands, writes, self-tests, reboots or remediation. The buffer
 is 240 samples in memory; a restart starts a new session and drops it.
 
@@ -444,8 +410,7 @@ PATH shims, no privileges).
 
 ### Deploy (Devon, from the Mac)
 
-Stage A must be deployed on factory-gpu and factory-console enrolled first
-([Enrollment](#enrollment)). Build as `agent` in the console's main checkout,
+factory-console must be enrolled first ([Enrollment](#enrollment)). Build as `agent` in the console's main checkout,
 then preflight, install, and verify:
 
 ```sh
@@ -483,8 +448,7 @@ The first two print `active` twice, `User=factory-devices`, and an `agent
 started` line with no warnings. The grep prints `0`. The curl prints a status
 other than `stale` or `unknown` and an age under 45000 ms; then open
 `https://factory-gpu.bearded-pompano.ts.net/devices` and check both nodes. The
-last line is the real capability table; record it on MET-220 and in
-devices-ingest.md.
+last line lists the sources the agent discovered.
 
 ### Rollback
 

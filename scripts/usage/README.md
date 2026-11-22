@@ -23,11 +23,8 @@ starts while that service is running. SSE still observes snapshots every 30 seco
 202 means requested, not completed. The API installer creates the private
 `factory-api:factory-api 0700` trigger directory before restarting its hardened unit;
 the usage installer preserves its inode and enables/verifies the path unit.
-After the clean merged build, install API, run
-`gpu-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/install-usage.sh'`,
-then build/install kiosk. Usage rollback disables/removes the path and timer/service
-but retains snapshots and the trigger directory. Restore kiosk and API using their
-printed installer snapshots; no database migration or Ollama restart is required.
+Usage rollback disables/removes the path and timer/service but retains snapshots
+and the trigger directory.
 
 ```sh
 node scripts/usage/collect.ts --dry-run
@@ -201,91 +198,22 @@ clients should fetch `/v1/agents`; notifications are not replayed. The existing
 API unit's `ProtectSystem=strict` permits reads; `ProtectHome=true` does not
 hide `/var/lib/factory-usage`. Its `factory-api` group already has read access.
 
-## Deploy from Mac, after merge and clean main-checkout update
+## Install and rollback (Devon)
 
-Artifacts only; never run these during development. First complete the PLAYBOOK
-main-checkout handoff at `/home/agent/work/factory` on factory-gpu. Then, in order:
-
-```sh
-gpu-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && cargo build --release --locked -p factory-api"'
-gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api'
-gpu-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/install-usage.sh'
-curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/agents | jq
-gpu-ssh 'systemctl is-active factory-usage.timer; systemctl is-enabled factory-usage.timer; systemctl list-timers factory-usage.timer'
-```
-
-The usage installer verifies all CLIs as agent from a readable directory (Node
-can be a Vite+ shim), prints one sanitized dry-run and requires amp, cursor,
-claude-code, codex, kimi and opencode `ok` before changing anything. Cursor
-must already be logged in with a recognized plan, and Kimi must already be
-logged in; the installer does not log in. It snapshots units/state, sets directory
-permissions, installs units, starts one collection, checks file readability as
-both agent and factory-api, and requires those six tools ok through the running
-API before enabling the timer. Install the API before this collector: a
-five-tool snapshot does not validate on the six-tool API, and the previous API
-rejects the six-tool snapshot. It does not redeploy API,
-touch databases or restart runners. CLI authentication/refresh and service-user
-permissions still require the administrator's actual installation verification.
-
-Rollback, from Mac (substitute the exact API snapshot printed by its installer):
+factory-api deploys automatically from green main. Devon installs the collector
+units on factory-gpu from his Mac, and rolls them back the same way:
 
 ```sh
-gpu-ssh 'cd /tmp && sudo bash /home/agent/work/factory/deploy/rollback-usage.sh'
-gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/<printed-snapshot-directory>'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-usage.sh'
+gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-usage.sh'
 ```
 
-Usage rollback removes only collector units and retains usage.json/backups.
-Without API rollback, retained usage ages stale after 45 minutes. API rollback
-restores the previous API binary/unit; no usage DB migration exists.
-
-## MET-137 upgrade and rollback (from Mac)
-
-Devon merges this self-deploying change; the wrap-up pull updates the collector
-in `/home/agent/work/factory`. Do not reinstall its unchanged timer/service.
-Until the API upgrade, the old API rejects the extra workspace balance or new
-diagnostic strings. After the clean main-checkout handoff, install in this order:
-
-```sh
-gpu-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && cargo build --release --locked -p factory-api"'
-gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api'
-gpu-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory/kiosk && vp install --frozen-lockfile && VITE_API_BASE= vp build"'
-gpu-ssh 'sudo bash /home/agent/work/factory/deploy/install-kiosk.sh /home/agent/work/factory/kiosk/dist'
-gpu-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && node scripts/usage/collect.ts --dry-run"'
-curl -fsS https://factory-gpu.bearded-pompano.ts.net/v1/agents | jq '.tools[] | select(.tool == "amp")'
-```
-
-Wait for the next scheduled collection (up to 15 minutes, or the next hourly
-details attempt after a failed check) before verifying the API row is live.
-UI only: inspect Frontier CLIs on the console kiosk after its self-reload.
-No console install, inference, migration or Ollama restart is needed.
-
-For rollback, first merge a reviewed revert PR and complete its wrap-up pull
-to restore the collector; do not reset main or restore the old API while the
-new collector keeps writing unsupported balances. Then restore the exact
-snapshots printed by the installers, in reverse order:
-
-```sh
-gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-kiosk.sh /var/backups/factory-kiosk/<printed-kiosk-snapshot>'
-gpu-ssh 'sudo bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/<printed-api-snapshot>'
-```
-
-The prior collector cannot parse this CLI format, so rollback restores the
-previous stale/unknown behavior rather than making Amp live.
-
-## MET-142 upgrade and rollback (from Mac)
-
-Devon merges this self-deploying change. The wrap-up pull updates the collector
-in `/home/agent/work/factory`; CI uses the new Node test step on merge. No unit
-reinstall, service restart, console change, migration or deploy artifact is needed.
-After the wrap-up handoff, verify once:
-
-```sh
-gpu-ssh 'sudo -iu agent bash -lc "cd /home/agent/work/factory && node scripts/usage/collect.ts --dry-run"'
-```
-
-Rollback requires a reviewed revert PR and its wrap-up pull, not a reset of main.
-After that handoff, run the same command above. This restores the old hourly
-CLI-version mismatch behavior; snapshots and units remain unchanged.
+The installer runs one sanitized dry run as agent and requires amp, cursor,
+claude-code, codex, kimi and opencode `ok` before changing anything; it does not
+log in. It snapshots units and state, installs the units, starts one collection
+and requires all six tools `ok` through the running API before enabling the
+timer. Rollback removes only the collector units and keeps `usage.json` and its
+backups; retained usage goes stale after 45 minutes.
 
 ## Checks
 
@@ -298,12 +226,7 @@ redacted; its details fixture reconstructs the observed Markdown/report layout.
 Rust exercises serialized contract, public HTTP snapshot reads and real SSE
 after an atomic replacement. No tests call live vendor services.
 
-```sh
-node --test scripts/usage
-UPDATE_OPENAPI=1 cargo test -p factory-api --test openapi_snapshot
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace
-bash -n deploy/install-usage.sh deploy/rollback-usage.sh
-shellcheck -x deploy/install-usage.sh deploy/rollback-usage.sh
-```
+Run `scripts/check` before pushing. It runs the usage group
+(`node --test scripts/usage`) for changes here, and the rust and shell groups
+when those files change. Regenerate the OpenAPI snapshot after a contract change
+with `UPDATE_OPENAPI=1 cargo test -p factory-api --test openapi_snapshot`.

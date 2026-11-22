@@ -93,13 +93,12 @@ fails without rebooting; inspect the failed service's journal.
 This is the specified process-based busy rule, not a runner activity API.
 Inference or remote agent work entirely inside an allowlisted daemon can be
 invisible between tool processes. The worktree signal below covers
-dispatched work; observe mode must still precede enforcement.
+agent work between tool processes; observe mode must still precede enforcement.
 
 ### Agent worktrees
 
-A dispatched thread thinking inside the allowlisted runner has no tool process.
-Dispatched builder and QA worktrees are the directories
-`/home/agent/work/factory-*`; the main checkout `/home/agent/work/factory` and
+An agent thread thinking inside the allowlisted runner has no tool process.
+Agent worktrees are the directories `/home/agent/work/factory-*`; the main checkout `/home/agent/work/factory` and
 other directories are ignored. Any file in one of them, excluding `.git/`
 contents and a linked worktree's `.git` pointer file, modified within the last
 30 minutes (1,800,000 ms, inclusive) records
@@ -177,8 +176,8 @@ It uses `DefaultDependencies=no` to avoid a cycle with the target enabling it,
 and retains explicit shutdown ordering. It observes rather than repairs
 services. GPU configuration includes meter, Ollama, Amp and operational NUT
 units (not optional/inactive enumerators), plus `factory-api.service` and the
-`factory-usage` and `factory-backup` timers. After MET-114,
-console includes `amp-runner.service`, `gdm.service` and `factory-backup.timer`.
+`factory-usage` and `factory-backup` timers. Console configuration includes
+`amp-runner.service`, `gdm.service` and `factory-backup.timer`.
 If the marker disappears after boot, it clears pending and skip state without
 overwriting the preceding reboot decision. If it remains, pending age survives.
 Time-sync ordering is not itself proof of synchronization; the boolean records
@@ -186,8 +185,8 @@ what timedatectl reports.
 
 ## Installation, observation and mode switch
 
-After this PR is merged and both node checkouts have been updated, run **from
-the Mac**, GPU first. No build artifact is required for this host-only tooling.
+Once both node checkouts are at the commit to install, run **from the Mac**,
+GPU first. No build artifact is required for this host-only tooling.
 
 ```sh
 gpu-ssh "sudo bash /home/agent/work/factory/deploy/reboot/install-reboot-policy.sh --node factory-gpu --mode observe"

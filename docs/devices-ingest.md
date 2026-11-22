@@ -1,13 +1,14 @@
-# Devices ingestion (phase 2 design)
+# Devices ingestion
 
-Status: decided 2026-10-17 (option A). Stage A, the server side (MET-196 Build
-items 5–8), is implemented in MET-219: the endpoint, auth, ingest semantics,
-per-device health and alerts, reads, SSE, the kiosk Devices pages, and the
-hash enrollment step. Stage B, the factory-console agent and its installer, is
-implemented in MET-220 (`devices-agent/`, `deploy/devices-agent/`) and not yet
-installed; see [Stage B](#5-stage-b-factory-console-agent). No tailnet policy,
-firewall, or Serve configuration has been created or changed. Operations are in
-[devices.md](devices.md#phase-2a-remote-devices) and
+Remote factory nodes push host telemetry to factory-api over one authenticated
+endpoint. factory-api (`factory-api/src/devices_ingest.rs`, `device_auth.rs`)
+implements the contract below: the endpoint, per-device bearer credentials,
+ingest semantics, per-device health and alerts, reads and SSE; the kiosk
+Devices pages show each device. The factory-console agent is `devices-agent/`,
+installed by Devon with `deploy/devices-agent/install-devices-agent.sh`
+([section 4](#4-factory-console-agent)). Ingest uses the existing Serve mount;
+there is no separate tailnet policy, firewall or Serve configuration.
+Operations are in [devices.md](devices.md#phase-2a-remote-devices) and
 [devices.md](devices.md#phase-2b-factory-console-agent).
 
 Phase 1 ([devices.md](devices.md)) collects factory-gpu inside factory-api.
@@ -16,7 +17,7 @@ telemetry to that same factory-api. factory-console is an Ubuntu T2 MacBook
 (kiosk, backups, overflow Amp runner, watchdog). It has no NVIDIA GPU, and its
 sensors must be discovered, not assumed.
 
-The base types are the merged phase-1 types in `factory-api/src/devices.rs`
+The base types are the phase-1 types in `factory-api/src/devices.rs`
 (`Metric`, `Availability`, `HostIdentity`, `Cpu`, `Ram`, `Filesystem`, `Drive`,
 `SmartStatus`, `DiskIo`, `Network`, `Cooling`, `BackupView`, `ClockView`,
 `RebootView`, `CollectorHealth`) and the storage in `devices_history.rs` and
@@ -1337,87 +1338,7 @@ Design of A:
 - Agents never put the token in a URL. Failed authentication is logged on the
   server with the claimed device and remote address, never the token.
 
-## 4. Review list
-
-### Decided
-
-- One endpoint, `POST /v1/devices/{device_id}/samples`, one sample per
-  request, on the existing factory-api behind the existing Serve mount.
-- `schema_version: 1`, additive rules, unknown fields ignored, server-owned
-  fields rejected, 30-day overlap for any future version 2.
-- Payload reuses phase-1 types and units. No GPU or UPS for remote devices.
-  Health is computed by the server.
-- Sample identity `(device_id, session_id, seq)`. Ordering and dedupe by
-  `observed_at_ms` against the last accepted sample, which is also the
-  history key.
-- `received_at_ms` is server-stamped. Stale after 45 s. `unknown` until the
-  first sample after a server restart.
-- Current state never moves backward. History never gets a duplicate row and
-  is written only when both clocks are synchronized.
-- Limits: 64 KiB body, item caps, 4 req/s per device, ±60 s future skew,
-  2 h expiry, 240-sample in-memory agent buffer.
-- `factory-gpu` cannot be written remotely. The phase-1 local flow is
-  unchanged.
-- Recommended authentication: per-device bearer token, hash-only on the
-  server.
-- MET-258 adds optional adapter and battery telemetry as `power` in schema
-  version 1, and reads `applesmc` fans through `APP0001:00` when exposed.
-  Other T2-specific sensors remain outside the contract.
-
-### Decided by Devon (2026-10-17)
-
-1. Option A: per-device bearer token over the existing Serve `/` mount.
-2. The enrolled device id is `factory-console`. The agent's system user on
-   the console is decided with stage B.
-3. Devon generates the token on the Mac and stores it at
-   `op://Factory/factory-console devices token/credential`. Generation stays
-   manual. factory-gpu holds only the hash, in `/etc/factory-api/device-tokens`
-   (`root:factory-api` 0640), lines `<device_id> <sha256 hex> <label>`.
-   `install-factory-api.sh --enroll-device <id>` reads the token on stdin and
-   is idempotent; `rollback-factory-api.sh --unenroll-device <snapshot>`
-   removes only its line.
-4. At most two hashes per device, reread on change without a restart,
-   constant-time compare. Rotate only on suspicion; no schedule.
-5. No tailnet policy, ufw or Serve change.
-6. SMART on factory-console is decided with stage B (agent). The server
-   accepts `unsupported` and `permission_denied` either way.
-7. The phase-1 alert keys fire for remote devices, prefixed with the device
-   id (`devices:factory-console:telemetry` and so on). Remote telemetry alerts
-   stay quiet while fleet reports the node itself offline, so the node alert is
-   not duplicated.
-8. Remote devices are stale after 45 s.
-
-### Implementation notes (MET-219)
-
-- Success is HTTP 200 for every accepted request, stored or ignored, as
-  section 1 says. (The MET-219 ticket text said 202; the contract wins.)
-- MET-217 added `unsafe_shutdowns` to phase-1 drives after this contract was
-  written. Schema version 1 does not include it, so a remote drive's
-  `unsafe_shutdowns` is ignored like any unknown field and remote devices get
-  no unclean-shutdown notice. Adding it is an additive v1 change.
-- The device list is the enrolled devices. Removing a device's last hash
-  removes it from `/v1/devices` and clears its alerts. An unreadable hash file
-  fails closed: every request is 401 and no remote device is listed.
-- Failed authentication is logged with the claimed device, the peer address
-  (127.0.0.1 behind Serve) and the sanitized `X-Forwarded-For`, never the token
-  or the hash.
-- No storage change: remote samples use the existing `device_samples` table,
-  and the last accepted time is reloaded from it after a restart.
-
-### Not verified
-
-- The Tailscale version on factory-gpu, and whether app capabilities work for
-  tagged nodes in this tailnet (only matters for option B).
-- That the real Serve forwards the `Authorization` header unchanged. The docs
-  list only identity and capability headers as stripped. The sandbox Serve
-  emulation forwards it and strips `Tailscale-*` headers
-  (`scripts/sandbox-shims/devices-smoke.py`, MET-219), which proves only the
-  emulation. The first real check is Devon's POST through Serve after deploy:
-  401 without a token, 200 with the enrolled one.
-- Which sensors factory-console exposes (CPU temperature, fans, T2 NVMe SMART,
-  battery). The examples show plausible values, not readings from the host.
-
-## 5. Stage B: factory-console agent
+## 4. factory-console agent
 
 `factory-devices-agent` (crate `devices-agent/`) runs as the system user
 `factory-devices` on factory-console. It calls the phase-1 collector
@@ -1447,57 +1368,10 @@ floor capped at 60 s. Logs never contain the token, the `Authorization`
 header, a URL with credentials, or a body. Request errors are logged only by
 kind (timeout, connect failed).
 
-### Console capability table
-
-Synthetic: the agent from this branch against the sandbox stack (stage A
-factory-api, fake Serve) and a console-shaped fixture root
-(`--discover --root`). It is not factory-console. The real table replaces the
-right-hand column after the install (`journalctl -u factory-devices-agent`
-logs a `discovered sources` line on each start).
-
-| Source | Agent reads | Sandbox (synthetic) | factory-console (real) | T2 note (not verified) |
-| --- | --- | --- | --- | --- |
-| CPU utilization, iowait, load | `/proc/stat`, `/proc/loadavg` | available | pending install | — |
-| CPU temperature | hwmon/thermal names containing package, tdie, tctl, cpu or x86_pkg | unsupported (fixture sensor is unlabeled) | pending install | Intel `coretemp` "Package id 0" is expected |
-| Memory | `/proc/meminfo` | available | pending install | — |
-| Filesystems | `/proc/self/mountinfo` + statvfs | available (`/`) | pending install | — |
-| Drives | `/sys/block` | available (`nvme0n1`) | pending install | Apple NVMe (ANS2) through the T2 |
-| SMART | `/var/lib/factory-devices/smart.json` from the root helper | unsupported (`tool: absent`) | pending install | `smartctl` may be absent or may not read the Apple controller's health log; either is `unsupported`, not healthy |
-| Disk I/O | `/proc/diskstats` | available | pending install | — |
-| Network | `/proc/net/dev`, all but `lo` | available | pending install | — |
-| Temperatures | `/sys/class/hwmon`, `/sys/class/thermal` | available (1 sensor) | pending install | whatever hwmon exposes |
-| Fans | hwmon `fan*_input`, plus the `APP0001:00` ACPI device, its `physical_node`, and their hwmon directories | unsupported in the baseline sandbox | sysfs reads 1824 and 1699 rpm; agent fix awaits deployment | MET-312 discovers the ACPI driver's attributes and deduplicates Apple fans by index before adding labels |
-| Battery | `/sys/class/power_supply`, including adapter online state | unsupported without a battery fixture | pending verification | MET-258 adds optional `power` readings in schema v1 |
-| Clock | `adjtimex` | available | pending install | — |
-| Backup | published status file | unsupported (no file) | pending install | factory-console publishes none (`deploy/backup/nodes.conf`) |
-| Reboot | published status file | unsupported (no file) | pending install | published only where a `factory-api` group exists, so none today |
-
 ### T2 fan discovery (MET-312)
 
-Read-only probes as `agent` on factory-console on 2026-10-24 found that
-`7.2.9-2-t2-resolute` already binds `applesmc` on the ACPI bus:
-
-```text
-readlink /sys/bus/acpi/devices/APP0001:00/driver
-../../../../../../bus/acpi/drivers/applesmc
-cat /sys/bus/acpi/devices/APP0001:00/name
-applesmc
-cat /sys/bus/acpi/devices/APP0001:00/fan1_input
-1824
-cat /sys/bus/acpi/devices/APP0001:00/fan2_input
-1699
-cat /sys/bus/acpi/devices/APP0001:00/physical_node/waiting_for_supplier
-0
-```
-
-The empty platform `physical_node` is not the bound ACPI device. The nameless
-`hwmon3` points back to that ACPI device through `device`; its own directory
-has no fan attributes. MET-258 checked only the physical node and hwmon
-directories, missing the attributes on the ACPI device itself. The deployed
-API consequently reported only `amdgpu fan1 = 0`, with availability `available`.
-No kernel, package, module option, or supplier-ordering fix is indicated.
-`modinfo -F parm applesmc` returned no parameters. Both fan labels returned
-`Invalid argument`, so the collector must tolerate unreadable optional labels.
+On factory-console the `applesmc` driver binds the `APP0001:00` ACPI device and
+exposes fan inputs there, not on its platform `physical_node`.
 
 Discovery accepts a hwmon named `applesmc` anywhere in the hwmon class, or
 one beneath `APP0001:00` or its physical node even without a name. It also
@@ -1511,9 +1385,4 @@ are readable, an `applesmc fans` entry has a null value and a diagnostic in
 the existing metric `detail`. Availability is `unsupported` without a driver
 binding and `error` with a binding but no readable inputs. Malformed or
 out-of-range Apple readings remain individual errors. Non-Apple readings
-are retained. No ingest schema change is needed.
-
-The fix ships in the devices-agent binary through the existing installer.
-There is no new host configuration to install or undo, and no module reload
-or reboot is required. Live API acceptance remains pending Devon's install;
-see [console deployment](devices.md#deploy-devon-from-the-mac).
+are retained.

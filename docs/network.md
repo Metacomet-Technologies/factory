@@ -1,6 +1,7 @@
-# Network quality monitoring (draft spec)
+# Network quality monitoring
 
-Status: spec agreed 2026-10-16. Tracked in Linear.
+The implemented design: probes and speed tests from factory-gpu, diagnosis,
+alerts, and the kiosk Network card and `/network` page.
 
 ## Goal
 
@@ -175,15 +176,6 @@ These use the existing engine, Slack on open and threaded reply on recovery.
 - Diagnosis is a pure function. Table-driven tests cover each layer combination.
 - DB tests are the db.md set: query budgets, EXPLAIN plans, retention boundaries and idempotence.
 - Kiosk mock fixtures cover each state. Run `vp check`, `vp test --run` and `vp build`.
-
-## Delivery
-
-Each item is one PR, and each ends with a check.
-
-1. Schema, probe parser, latency sampler, `GET /v1/network` and history.
-2. Throughput runner, `net_speed_tests`, speed-test endpoint.
-3. Diagnosis reducer, `net_events`, alerts.
-4. Kiosk card and `/network` page.
 
 ## Decisions
 

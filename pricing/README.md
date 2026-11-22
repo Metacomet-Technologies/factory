@@ -45,8 +45,7 @@ in this binary, so no collector-disable setting applies.
 `config/references.toml` supplies the bundled defaults. To load edits without
 rebuilding, pass `--config config/references.toml` (or another TOML file).
 ChatGPT mid-tier uses `^openai/gpt-[0-9]+(?:\.[0-9]+)?-sol$`, selecting ordinary
-Sol models and excluding Pro, Luna, Astra, and batch variants. See
-[the live report](LIVE_REPORT.md) for the original recommendation and capture.
+Sol models and excluding Pro, Luna, Astra, and batch variants.
 
 ## Library
 
@@ -140,11 +139,8 @@ its age is visible in `show.rates.fetched_at_ms`.
 
 ## Verification
 
-```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-```
+Run `scripts/check` from the repository root before pushing; pricing changes
+run its rust group (fmt, clippy, workspace tests).
 
 Offline tests cover real-feed parsing, newest-wins and tie resolution, pending
 and confirmed changes, the strict cross-check threshold, rate/model history,
@@ -153,9 +149,8 @@ Fixtures retain relevant entries from both live responses, with irrelevant
 OpenRouter fields removed; the unpriced routing entry and LiteLLM non-native
 entries remain as parser controls. They require no network or API keys.
 
-Exact live commands, outputs, all matching IDs, dates, and rates are in
-[LIVE_REPORT.md](LIVE_REPORT.md). Live validation uses a disposable database,
-not a committed database or a production selection.
+Live validation uses a disposable database, not a committed database or a
+production selection.
 
 ## Future
 

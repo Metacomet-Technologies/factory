@@ -239,77 +239,11 @@ the token, and restarts factory-api if it is running. On the console, removal
 disables and removes the timer, service, script and state. The API's
 `alerts.json` stays; without a token the engine only logs.
 
-### Deploy MET-253 from Devon's Mac
-
-Run these commands only after the change is on main and approved.
-Both clean `/home/agent/work/factory` checkouts must be at the approved commit.
-The GPU must already have approved release binaries for `factory-api` and
-`factory-ups-control` in `target/release`. This procedure assumes NUT, UPS
-control, the `/control` Serve mount, and backups are already installed. It does
-not change NUT, Serve, backup configuration, database schemas, or Slack scopes.
-These commands have not been run for MET-253.
-
-Stop on every failure. Keep the first printed snapshot path from each changed
-component; reruns snapshot the newer state. Keep `GPU_STAGE` in the Mac shell
-until verification and any rollback finish.
-
-The administrator cannot traverse `/home/agent`. Copy the UPS artifacts as
-agent into `/var/tmp`, as in the [UPS deployment procedure](ups.md#ordered-mac-deployment-and-rollback).
-Run the API installer as root at its original path: it verifies the binary's
-build SHA against the clean checkout as agent, so a staged copy without Git
-metadata is not sufficient. Root can read the alerts scripts at their original
-paths too. No command relies on the administrator reading those files directly.
-
-```sh
-set -o pipefail
-GPU_STAGE=$(gpu-ssh 'mktemp -d /var/tmp/factory-met-253.XXXXXX')
-gpu-ssh "set -o pipefail; sudo -u agent tar -C /home/agent/work/factory -cf - deploy/ups target/release/factory-ups-control | tar --no-same-owner -xf - -C '$GPU_STAGE'"
-
-# 1. Check and install the approved API binary, preserving the alert credential drop-in.
-gpu-ssh 'sudo -n bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api --check-only'
-gpu-ssh 'sudo -n bash /home/agent/work/factory/deploy/install-factory-api.sh /home/agent/work/factory/target/release/factory-api'
-
-# 2. Reconcile the GPU credential, then install the console watchdog.
-op read 'op://Factory/Factory Alerts Slack bot token/credential' | ssh -T "$FACTORY_USER@$FACTORY_GPU" 'sudo -n bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-gpu'
-op read 'op://Factory/Factory Alerts Slack bot token/credential' | ssh -T "$FACTORY_USER@$FACTORY_CONSOLE" 'sudo -n bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-console'
-
-# 3. Check and install the approved UPS control binary. No UPS action is run.
-gpu-ssh "sudo -n bash '$GPU_STAGE/deploy/ups/install-ups-control.sh' '$GPU_STAGE/target/release/factory-ups-control' 0 'DGarbs51@github,metacometdave@github' --dry-run"
-gpu-ssh "sudo -n bash '$GPU_STAGE/deploy/ups/install-ups-control.sh' '$GPU_STAGE/target/release/factory-ups-control' 0 'DGarbs51@github,metacometdave@github'"
-
-# 4. Post the approved live layout test and inspect #factory-alerts.
-gpu-ssh 'sudo -n bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-gpu --test-alert'
-```
-
-The token pipes over plain `ssh -T`, a byte stream with no PTY. Do not pipe it
-through `gpu-ssh` or `console-ssh`: those helpers run `_factory_ready` first,
-which can print or fail. `sudo -n` refuses to prompt while stdin carries the
-token. Do not put the token in argv, an environment variable, or a staging file.
-
-Devon must inspect the resolved parent, the single threaded reply, colors,
-field layout, localized date, fallback text, and dashboard link. The test exercises
-factory-api's formatter, not every real alert or UPS audit outcome. The console
-installer runs one health check; it does not force an outage.
-
-### Roll back MET-253 from Devon's Mac
-
-Replace the uppercase snapshot placeholders with the exact paths printed by
-the matching install run. Roll back only components that changed. The GPU
-alerts installer can report no change and produce no snapshot; skip that
-rollback in that case. Never omit the alerts snapshot argument during an
-upgrade rollback, because omission removes the credential used by UPS control.
-
-```sh
-gpu-ssh "sudo -n bash '$GPU_STAGE/deploy/ups/rollback-ups-control.sh' /var/backups/ups-control.CONTROL_SNAPSHOT"
-console-ssh 'sudo -n bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh --node factory-console /var/backups/factory-alerts/CONSOLE_ALERTS_SNAPSHOT'
-gpu-ssh 'sudo -n bash /home/agent/work/factory/deploy/alerts/rollback-alerts.sh --node factory-gpu /var/backups/factory-alerts/GPU_ALERTS_SNAPSHOT'
-gpu-ssh 'sudo -n bash /home/agent/work/factory/deploy/rollback-factory-api.sh /var/backups/factory-api/API_SNAPSHOT'
-```
-
-These rollback commands restore binaries, scripts, credentials, and service
-state from their snapshots. They do not remove the existing `/control` mount,
-UPS audit database, or API alert state. They do not undo Slack messages already
-accepted. With current database schemas, MET-253 needs no database downgrade.
+Pipe the token over plain `ssh -T`, a byte stream with no PTY, for example
+`op read 'op://Factory/Factory Alerts Slack bot token/credential' | ssh -T "$FACTORY_USER@$FACTORY_GPU" 'sudo -n bash /home/agent/work/factory/deploy/alerts/install-alerts.sh --node factory-gpu'`.
+Do not pipe it through `gpu-ssh` or `console-ssh`, whose `_factory_ready` step
+can print or fail, and never put it in argv, an environment variable or a
+staging file.
 
 ## Tests and sandbox check
 

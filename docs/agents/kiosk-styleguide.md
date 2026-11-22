@@ -351,7 +351,9 @@ stacks; numbers get `tabular-nums` from `body`.
 
 ## Checks
 
-From `kiosk/` after `source /home/agent/.config/vite-plus/env`:
+`scripts/check` from the repository root runs the kiosk group (`vp check`
+against the committed OpenAPI, `vp test --run`, `vp build`) when kiosk files
+change. From `kiosk/` after `source /home/agent/.config/vite-plus/env`:
 
 - `vp check` (`OPENAPI_URL=file:///…/factory-api/openapi.json vp check`
   offline), `vp test --run`, `vp build`.
@@ -381,9 +383,9 @@ From `kiosk/` after `source /home/agent/.config/vite-plus/env`:
   `DEVICES=` and `THEMES=` narrow a run. WebKit is not covered: its system
   libraries are not part of the environment contract.
 
-## Checklist before opening a PR
+## Checklist before pushing
 
-- The three `vp` commands plus the scripts above pass.
+- `scripts/check` plus the scripts above pass.
 - Screenshots of every changed page in light and dark at 1728×1117 and at a
   narrow width, inspected.
 - Tests assert through roles and visible text, not class names.

@@ -1,7 +1,7 @@
 # factory / kiosk
 
-A React 19 dashboard for factory-api's v1 contract. MET-114 targets
-the API/static origin on factory-gpu; Chrome remains on factory-console.
+A React 19 dashboard for factory-api's v1 contract, served by factory-api on
+factory-gpu and shown in Chrome on factory-console.
 The app contacts factory-api and the same-origin UPS control service; the
 optional live verification script sends four small Ollama requests. All authored app,
 server, configuration, test and script sources are TypeScript. Both TypeScript
@@ -72,26 +72,6 @@ sandbox health response. Required screenshots plus a pending-banner capture and
 the sandbox, then `scripts/sandbox reset --rows 1k --kiosk` deletes only this
 worktree's disposable data and starts again. Stop with `scripts/sandbox down`.
 
-### Mac install and rollback (Devon only)
-
-Install only after MET-166's service and same-origin `/control` Serve route are
-available. These commands replace static kiosk assets only; no deployment was
-performed by the agent. Build/read `/home/agent` files as agent and stage outside
-that directory for the root-only installer. Preserve its printed snapshot path.
-
-```sh
-gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-168-ups-page-controls-typed/kiosk && VITE_API_BASE= vp build'"
-gpu-ssh 'set -euo pipefail; stage=$(mktemp -d /tmp/met-168-kiosk.XXXXXX); trap '\''rm -rf -- "$stage"'\'' EXIT; sudo -u agent tar -C /home/agent/work/factory-met-168-ups-page-controls-typed/kiosk/dist -cf - . | tar -xf - -C "$stage"; sudo -u agent cat /home/agent/work/factory-met-168-ups-page-controls-typed/deploy/install-kiosk.sh | sudo bash -s -- "$stage"'
-# Immediate rollback to the latest complete kiosk snapshot:
-gpu-ssh 'set -euo pipefail; sudo -u agent cat /home/agent/work/factory-met-168-ups-page-controls-typed/deploy/rollback-kiosk.sh | sudo bash -s'
-```
-
-If another installation intervened, append the preserved snapshot path to
-`sudo bash -s -- /var/backups/factory-kiosk/<printed-snapshot>` instead of using
-the latest snapshot. Devon's gate remains: from his phone, check controls, one
-quick test and its audit row; from the console, check that Controls contains only
-the denied text. Neither physical device nor a real power interruption was tested.
-
 ## UPS history and settings (MET-167)
 
 `/ups` shows live UPS telemetry, a session-only 15-minute SSE load sparkline,
@@ -145,25 +125,6 @@ fake-upsd to OL. The fake's constant 144 W load cannot supply a 70–110 W healt
 trend, and its short history cannot supply year-long GPU energy coverage; those
 nullable/boundary cases are covered with UI fixtures, not claimed as live data.
 Physical phone Safari and console Chrome checks remain Devon's deployment gate.
-
-### Mac installation and rollback
-
-Devon runs these only when ready to install. No API deployment or service restart
-is needed once MET-165's API is installed. Build and read worktree files as agent;
-the administrator stages a disposable copy outside `/home/agent` for the existing
-root-only installer. Preserve the printed rollback snapshot path.
-
-```sh
-gpu-ssh "sudo -u agent bash -lc 'cd /home/agent/work/factory-met-167-ups-page-charts-power/kiosk && VITE_API_BASE= vp build'"
-gpu-ssh 'set -euo pipefail; stage=$(mktemp -d /tmp/met-167-kiosk.XXXXXX); trap '\''rm -rf -- "$stage"'\'' EXIT; sudo -u agent tar -C /home/agent/work/factory-met-167-ups-page-charts-power/kiosk/dist -cf - . | tar -xf - -C "$stage"; sudo -u agent cat /home/agent/work/factory-met-167-ups-page-charts-power/deploy/install-kiosk.sh | sudo bash -s -- "$stage"'
-# Immediate rollback to the latest complete kiosk snapshot:
-gpu-ssh 'set -euo pipefail; sudo -u agent cat /home/agent/work/factory-met-167-ups-page-charts-power/deploy/rollback-kiosk.sh | sudo bash -s'
-```
-
-If another installation has occurred since, pass the preserved snapshot path to
-`sudo bash -s -- /var/backups/factory-kiosk/<printed-snapshot>` instead of using
-the latest-snapshot default. Then check `/ups` on the phone and confirm the console
-dashboard, including its model rows, fits above the footer without page scrolling.
 
 ## Network (MET-197)
 
@@ -273,8 +234,7 @@ state. Desktop quota rows are inline; the existing ticker viewport is shortened
 from 210px to 140px and bottom padding from 60px to 56px to fit 1728×1117.
 No cards move; phone cards still stack and scroll. No dependencies or deploy
 artifacts are added. Regenerate/check API types with `OPENAPI_URL=file:///.../factory-api/openapi.json`;
-the MET-125 committed types already match. Install with `deploy/install-kiosk.sh`
-only after the MET-125 API deployment; merge and deployment remain human gates.
+the committed types match it.
 
 ## Running versions (MET-107 phase 1)
 
@@ -318,8 +278,6 @@ hash mismatch, dirty builds, unknown SHA/fingerprint, and missing health/Fleet d
 Desktop Fleet columns fill available space and pricing notices use two columns
 to reserve footer space at 1728×1117. Phone/tablet retain scrolling cards with
 bottom padding, so the last card can scroll clear of the fixed footer.
-See the root README's phase 1 handoff for per-node builds and explicit installer
-paths. Release workflows and version-downloading installers remain phases 2–3.
 
 ## Toolchain and commands
 
@@ -336,32 +294,6 @@ Development and preview bind to loopback. Access remotely through an SSH tunnel
 to factory-gpu; no host firewall, production service or Tailscale changes are
 needed. Deployment is tailnet-only, served by factory-api on factory-gpu.
 
-## MET-114 origin switch
-
-Follow the root README's **MET-114 move** runbook; no watchdog or new console
-web server is needed. Build with `VITE_API_BASE=`. Relative `/v1/*`, SSE and
-`/version.json` then use `https://factory-gpu.bearded-pompano.ts.net`, served
-through GPU Tailscale Serve to `127.0.0.1:8080`. The existing no-cache manifest
-and reload guard work at that origin without a code change or CORS setting.
-Browser theme storage is origin-specific; an old console-origin preference
-does not transfer automatically.
-
-Only the existing `Exec=` URL changes; preserve every other Chrome flag and
-desktop key. From Mac after GPU health and Serve pass:
-
-```sh
-console-ssh "sudo -u console cp -p /home/console/.config/autostart/console-kiosk.desktop /home/console/.config/autostart/console-kiosk.desktop.met-114"
-console-ssh "sudo -u console sed -i '/^Exec=/s|--app=http://localhost:8080|--app=https://factory-gpu.bearded-pompano.ts.net|' /home/console/.config/autostart/console-kiosk.desktop"
-console-ssh "sudo -u console grep '^Exec=' /home/console/.config/autostart/console-kiosk.desktop"
-```
-
-Make the backup once, before the first edit. Check exactly one `Exec=` line
-has the new URL. UI only: close and relaunch Chrome in the console desktop
-session (or log out/in). Changing autostart does not change an already-running
-Chrome process. Permissions and the physical session remain an administrator
-verification; do not restart the Amp runner. Rollback replaces only the new
-URL with `http://localhost:8080`, as printed by the rollback script.
-
 ```sh
 vp fmt
 vp run api:types    # Regenerate committed types from the deployed OpenAPI
@@ -370,6 +302,10 @@ vp test --run       # Testing Library + jsdom, supplied by Vite+
 vp build            # kiosk/dist; no mock proxy baked into the bundle
 vp run mock-preview # Native mock :4179 + production preview :4180
 ```
+
+Before pushing, run `scripts/check` from the repository root. When kiosk files
+change it runs the kiosk group: `vp install --frozen-lockfile`, `vp check`
+against the committed `factory-api/openapi.json`, `vp test --run` and `vp build`.
 
 Tasks and test configuration live in `vite.config.ts`; there is no separate
 Vitest, ESLint, Prettier or Tailwind config. Tailwind v4 uses `@theme` in
@@ -473,10 +409,8 @@ selected token. The same eight kiosk cases pass through self-update reload;
 both placeholder schemes pass too. Existing five viewport checks, contrast,
 height, overflow, SSE reconnects, range controls and tooltips pass. The tooltip
 check now reads the fixture version rather than the obsolete `1.0.0-mock`.
-No screenshot baselines or production settings were changed. Mac, physical
-iPhone and console session checks remain deployment gates; this PR contributes
-to MET-87 and does not close it. Install factory-api and kiosk from the same
-combined MET-92 release commit; a static-only install cannot update the placeholder.
+Physical iPhone and console session checks are manual. factory-api and the
+kiosk deploy from the same commit, so the placeholder updates with the dashboard.
 
 ## Mock and screenshots
 
@@ -629,158 +563,11 @@ without a build meta tag skips these checks. Tests cover unchanged builds,
 each lifecycle trigger, ignored hidden/non-persisted events and burst debounce.
 
 The placeholder retains its 30-second meta refresh and now has a 30-second
-JavaScript fallback plus an immediate reload when visibility returns. This
-placeholder change requires a factory-api binary redeploy; static kiosk
-installation alone cannot update it. Already-open old placeholders need one
-manual refresh to receive the new fallback. Later dashboard installs use the
-build check. Reload preserves the saved theme; range/ticker state resets.
-
-## Live build and administrator handoff
-
-From `kiosk/`, with the deployed API left running:
-
-```sh
-VITE_API_BASE= vp build
-KIOSK_API_PROXY=http://127.0.0.1:8080 vp preview --host 127.0.0.1 --port 14180 --strictPort
-# In another terminal; generates four real factory-assist requests:
-vp run screenshots:live
-```
-
-`KIOSK_API_PROXY` proxies `/v1` and `/openapi.json` only in dev/preview. It is not
-baked into the production bundle. The live check uses native browser SSE,
-asserts ticker/GPU values against received frames, waits for usage to refresh,
-checks layout/phone cards, and saves exact viewport screenshots plus full-page
-tablet/phone views. Stop the preview after verification. No service restarts,
-deploy scripts, meter configuration or model changes are part of this check.
-
-Captures: [1728×1117 dark](screenshots/live-1728-dark.png),
-[1024×768 dark](screenshots/live-1024-dark.png),
-[390×844 dark](screenshots/live-390-dark.png),
-[tablet full page](screenshots/live-1024-dark-full.png),
-[phone full page](screenshots/live-390-dark-full.png).
-[Live checks](screenshots/live-checks.json) now record the MET-86 read-only
-capture run: native SSE, Fleet labels and dimensions, with no inference or API
-mutation requests. Usage and pricing requests exceeded 60 seconds on the
-deployed API, while health, Fleet, GPU and SSE responded. The refreshed live
-captures preserve those sections' actual loading state. The unchanged range
-loading guard therefore prevents a changed build from reloading on the fully
-live page until those requests complete or fail. The lifecycle/reload browser
-check used browser-only timeout failures for those two requests, real Fleet/GPU/
-SSE, and simulated manifest/index replacement. Hidden events performed no
-check; a visible/pageshow/online burst performed one check after 250ms. A changed
-identity stayed loaded during an open tooltip and navigated once after dismissal.
-This is Chromium simulation, not physical iPhone Safari or console Chrome proof.
-
-The earlier Phase 3b successful run sent four requests (90 prompt tokens, 96 output tokens),
-matches all four completions in each browser's real SSE, and sees cached totals
-increase from 68 to 94 requests, 58,908 to 81,519 input tokens and 6,325 to
-11,191 output tokens. Other tailnet clients generate concurrently; these deltas
-are not attributed solely to verification traffic. Each viewport has no
-horizontal overflow; desktop scroll height is exactly 1,117px. Its ticker's
-partial last visible row is intentional inside a bounded scroll viewport.
-
-The first browser attempt's 5s SSE-open timeout was too short for the API's
-15s first-frame cadence. The next attempt assumed an isolated four-row ticker
-and failed on concurrent traffic. The corrected check matches our completion
-counts/latencies instead of excluding other clients. Self-update verification
-also checks a simulated manifest/index replacement in the built app: an unchanged
-identity stays loaded, an open API tooltip defers reload, and dismissing it
-causes a full navigation to the new identity. No real deployment is performed.
-
-Built directory: `/home/agent/work/factory/kiosk/dist`. Devon installs it:
-
-```sh
-sudo bash deploy/install-kiosk.sh /home/agent/work/factory/kiosk/dist
-```
-
-Kiosk installation changes only static files and does not restart factory-api.
-MET-86 also changes the API's built-in placeholder: **factory-api needs a binary
-redeploy for that fallback**, separately from installing this dist. No deployment
-or production restart was performed during development.
-
-`vp check`, `vp test --run` (15 tests), `vp build`, Rust fmt, clippy with denied
-warnings and workspace tests pass. The live preview is stopped after checking.
-
-## MET-86 console investigation and administrator handoff
-
-Read-only observations on factory-console (Ubuntu 26.04.1, GNOME Wayland):
-
-- Console is UID 1001, session 1: `Active=yes`, `State=active`, `IdleHint=no`,
-  `IdleSinceHint=0`, `LockedHint=no`. This does not establish its earlier state.
-- Chrome 155.0.8059.39 runs with `--kiosk --app=http://localhost:8080` and the
-  error/first-run/password-store flags below, but no background flags.
-- Agent cannot read console's autostart files or connect to `/run/user/1001/bus`.
-  `gsettings` as agent reads agent settings, even with that bus address; its
-  `idle-delay=300` is **not** console's value. Console's blanking/lock/suspend
-  policy remains unverified.
-- The server currently returns matching dashboard index/manifest identities.
-  No first-deploy page/timer history is available. An old hidden/suspended
-  placeholder is a hypothesis; the original foreground failure's cause is
-  **not established**. Today's hung usage/pricing requests independently block
-  reload through the existing loading guard; that is not proof of the old cause.
-
-[Chrome's timer documentation](https://developer.chrome.com/blog/timer-throttling-in-chrome-88)
-describes minimal throttling for visible pages and minute-level checks for
-intensively throttled hidden pages. [Frozen pages](https://developer.chrome.com/docs/web-platform/page-lifecycle-api)
-do not execute timers or fetch callbacks. Chromium's kiosk switch enters
-fullscreen, without a timer/freezing exemption. A truly visible top-level page
-should not undergo ordinary background throttling or freezing.
-
-Devon: run this read-only inspection on factory-console. Confirm the current
-console session ID first; session IDs can change:
-
-```sh
-loginctl list-sessions
-loginctl show-session 1 -p Name -p Active -p State -p IdleHint -p IdleSinceHint -p LockedHint -p Type
-sudo -u console env XDG_RUNTIME_DIR=/run/user/1001 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus bash -c '
-  gsettings get org.gnome.desktop.session idle-delay
-  gsettings get org.gnome.desktop.screensaver lock-enabled
-  gsettings get org.gnome.settings-daemon.plugins.power idle-dim
-  gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type
-  gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout
-  gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type
-  gsettings get org.gnome.settings-daemon.plugins.power sleep-inactive-battery-timeout
-  gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive
-  cat /home/console/.config/autostart/console-kiosk.desktop
-'
-```
-
-Recommended change, not applied: edit only the existing `Exec=` line in
-`/home/console/.config/autostart/console-kiosk.desktop`, preserving other keys:
-
-```ini
-Exec=/usr/bin/google-chrome --kiosk --app=http://localhost:8080 --noerrdialogs --disable-session-crashed-bubble --disable-infobars --no-first-run --no-default-browser-check --password-store=basic --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows
-```
-
-- `--disable-background-timer-throttling`: disables Blink background timer
-  throttling, including on Linux.
-- `--disable-renderer-backgrounding`: retains foreground renderer process
-  priority; it does not override page freezing.
-- `--disable-backgrounding-occluded-windows`: treats reported occluded WebContents
-  as visible; it is not Windows-only, but does not override Wayland compositor
-  suspension or actual hidden/minimized state.
-
-See [Chromium's switch definitions](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/content/public/common/content_switches.cc).
-None guarantees execution during OS sleep or page freezing. Apply at the next
-planned Chrome/session launch; no kiosk was restarted here.
-
-Only for a physically secured, dedicated read-only console session: these commands
-disable automatic blanking, locking, dimming and idle suspend. Disabling locking
-reduces physical-access protection; do not apply to Devon's personal session:
-
-```sh
-sudo -u console env XDG_RUNTIME_DIR=/run/user/1001 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus bash -c '
-  gsettings set org.gnome.desktop.session idle-delay 0
-  gsettings set org.gnome.desktop.screensaver lock-enabled false
-  gsettings set org.gnome.settings-daemon.plugins.power idle-dim false
-  gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type nothing
-  gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type nothing
-'
-```
-
-Lid-close behavior is unchanged; browser flags cannot prevent independent system
-suspend. If refresh still fails while visibly awake, record page visibility,
-console/network errors and `chrome://discards` state rather than assuming throttling.
+JavaScript fallback plus an immediate reload when visibility returns. factory-api
+serves the placeholder, so it changes with a factory-api deploy, not a kiosk
+install. Reload preserves the saved theme; range/ticker state resets. Pushes to
+green main deploy the kiosk automatically; see the
+[deploy flow](../docs/PLAYBOOK.md#6-deploy-flow).
 
 ## Tooling deviations and limits
 
