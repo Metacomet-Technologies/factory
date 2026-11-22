@@ -80,11 +80,11 @@
           "balance": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/AgentBalance",
                 "description": "Primary balance; the first item in balances, not an additional pool."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -343,11 +343,11 @@
           "rtt": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/Rtt",
                 "description": "Null exactly when nothing was received."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -705,10 +705,10 @@
           "power": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/Power"
               },
               {
-                "$ref": "#/components/schemas/Power"
+                "type": "null"
               }
             ]
           },
@@ -790,21 +790,21 @@
           "ingest": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/IngestView",
                 "description": "Remote ingest state (docs/devices-ingest.md). Null for factory-gpu."
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "maintenance": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/NodeMaintenance"
               },
               {
-                "$ref": "#/components/schemas/NodeMaintenance"
+                "type": "null"
               }
             ]
           },
@@ -920,30 +920,30 @@
           "pending": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/Selection"
               },
               {
-                "$ref": "#/components/schemas/Selection"
+                "type": "null"
               }
             ]
           },
           "rates": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/Rates"
               },
               {
-                "$ref": "#/components/schemas/Rates"
+                "type": "null"
               }
             ]
           },
           "selected": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/Selection"
               },
               {
-                "$ref": "#/components/schemas/Selection"
+                "type": "null"
               }
             ]
           }
@@ -1035,10 +1035,10 @@
           "current": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/GpuCurrent"
               },
               {
-                "$ref": "#/components/schemas/GpuCurrent"
+                "type": "null"
               }
             ]
           },
@@ -1360,10 +1360,10 @@
           "power": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/Power"
               },
               {
-                "$ref": "#/components/schemas/Power"
+                "type": "null"
               }
             ]
           }
@@ -2177,10 +2177,10 @@
               "end_reason": {
                 "oneOf": [
                   {
-                    "type": "null"
+                    "$ref": "#/components/schemas/NetworkEndReason"
                   },
                   {
-                    "$ref": "#/components/schemas/NetworkEndReason"
+                    "type": "null"
                   }
                 ]
               },
@@ -2557,22 +2557,22 @@
           "latest_speed_test": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/NetworkSpeedTest",
                 "description": "Null before the first stored test."
+              },
+              {
+                "type": "null"
               }
             ]
           },
           "open_event": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/NetworkEvent",
                 "description": "The open degraded or down episode; null when healthy."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -2608,10 +2608,10 @@
           "latest": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/Sample"
               },
               {
-                "$ref": "#/components/schemas/Sample"
+                "type": "null"
               }
             ]
           },
@@ -3395,10 +3395,10 @@
           "current": {
             "oneOf": [
               {
-                "type": "null"
+                "$ref": "#/components/schemas/UpsCurrent"
               },
               {
-                "$ref": "#/components/schemas/UpsCurrent"
+                "type": "null"
               }
             ]
           },
@@ -3881,8 +3881,7 @@
                   "$ref": "#/components/schemas/Agents"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -3899,8 +3898,7 @@
                   "$ref": "#/components/schemas/AgentsRefresh"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -3909,8 +3907,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "content": {
@@ -3919,8 +3916,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "413": {
             "content": {
@@ -3929,8 +3925,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "429": {
             "content": {
@@ -3940,7 +3935,6 @@
                 }
               }
             },
-            "description": "",
             "headers": {
               "Retry-After": {
                 "description": "Seconds until next refresh, rounded up",
@@ -3959,8 +3953,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -3977,8 +3970,7 @@
                   "$ref": "#/components/schemas/Alerts"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "summary": "Active alerts and the last 20 cleared ones, as posted to Slack `#factory-alerts`.",
@@ -3996,8 +3988,7 @@
                   "$ref": "#/components/schemas/DeviceList"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4014,8 +4005,7 @@
                   "$ref": "#/components/schemas/DeviceView"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "404": {
             "content": {
@@ -4024,8 +4014,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4053,8 +4042,7 @@
                   "$ref": "#/components/schemas/DeviceHistory"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -4063,8 +4051,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "404": {
             "content": {
@@ -4073,8 +4060,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4101,8 +4087,7 @@
                   "$ref": "#/components/schemas/DeviceView"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "404": {
             "content": {
@@ -4111,8 +4096,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "summary": "An enrolled remote device: stale after 45 s of transport or collection age, and\n`unknown` until its first fresh sample since factory-api started. `factory-gpu`\nis served the same way at its literal path.",
@@ -4149,8 +4133,7 @@
                   "$ref": "#/components/schemas/DeviceHistory"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -4159,8 +4142,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "404": {
             "content": {
@@ -4169,8 +4151,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4208,8 +4189,7 @@
                   "$ref": "#/components/schemas/IngestResult"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -4218,8 +4198,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "401": {
             "content": {
@@ -4228,8 +4207,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "content": {
@@ -4238,8 +4216,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "405": {
             "content": {
@@ -4248,8 +4225,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "413": {
             "content": {
@@ -4258,8 +4234,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "415": {
             "content": {
@@ -4268,8 +4243,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "429": {
             "content": {
@@ -4279,7 +4253,6 @@
                 }
               }
             },
-            "description": "",
             "headers": {
               "Retry-After": {
                 "description": "Seconds before retrying",
@@ -4298,8 +4271,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "security": [
@@ -4322,8 +4294,7 @@
                   "$ref": "#/components/schemas/Fleet"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4351,8 +4322,7 @@
                   "$ref": "#/components/schemas/Gpu"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -4361,8 +4331,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4379,8 +4348,7 @@
                   "$ref": "#/components/schemas/Health"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4408,8 +4376,7 @@
                   "$ref": "#/components/schemas/Usage"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -4418,8 +4385,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4436,8 +4402,7 @@
                   "$ref": "#/components/schemas/NetworkStatus"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "500": {
             "content": {
@@ -4446,8 +4411,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "summary": "Every registry target in layer order with its latest stored sample (null\nbefore the first tick), plus network and clock warnings.",
@@ -4488,8 +4452,7 @@
                   "$ref": "#/components/schemas/NetworkEvents"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -4498,8 +4461,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "500": {
             "content": {
@@ -4508,8 +4470,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "summary": "Degraded and down episodes, newest first by started_ms then id, the open one included.",
@@ -4538,8 +4499,7 @@
                   "$ref": "#/components/schemas/NetworkHistory"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -4548,8 +4508,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "500": {
             "content": {
@@ -4558,8 +4517,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "summary": "1h and 24h read raw bursts in at most 720 buckets per target; jitter is the\nmean of the bursts' mdev. 7d and 30d read hourly rollups; jitter is the\nnearest-rank p95 of each hour's mdev values. Loss is lost replies over sent.",
@@ -4588,8 +4546,7 @@
                   "$ref": "#/components/schemas/NetworkSpeedTests"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -4598,8 +4555,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "500": {
             "content": {
@@ -4608,8 +4564,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "summary": "Throughput tests that started within the range, for charts.",
@@ -4627,8 +4582,7 @@
                   "$ref": "#/components/schemas/Pricing"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4655,8 +4609,7 @@
                   "$ref": "#/components/schemas/Pricing"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "404": {
             "content": {
@@ -4665,8 +4618,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "409": {
             "content": {
@@ -4675,8 +4627,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4693,8 +4644,7 @@
                   "$ref": "#/components/schemas/Pricing"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4711,8 +4661,7 @@
                   "$ref": "#/components/schemas/UpsSettings"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "500": {
             "content": {
@@ -4721,8 +4670,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4747,8 +4695,7 @@
                   "$ref": "#/components/schemas/UpsSettings"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -4757,8 +4704,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "403": {
             "content": {
@@ -4767,8 +4713,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "413": {
             "content": {
@@ -4777,8 +4722,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "500": {
             "content": {
@@ -4787,8 +4731,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "503": {
             "content": {
@@ -4797,8 +4740,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4815,8 +4757,7 @@
                   "$ref": "#/components/schemas/StreamEvent"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4833,8 +4774,7 @@
                   "$ref": "#/components/schemas/Ups"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4862,8 +4802,7 @@
                   "$ref": "#/components/schemas/UpsEnergy"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -4872,8 +4811,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "500": {
             "content": {
@@ -4882,8 +4820,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "summary": "Costs round half-up once per range. Coverage counts intervals between reads\nno more than 30s apart. An expired leading partial hour is omitted, not estimated.\nGPU energy uses the same covered UPS intervals and right-endpoint rounding.\nIt is null if GPU coverage is missing or its energy exceeds the UPS load.",
@@ -4934,8 +4871,7 @@
                   "$ref": "#/components/schemas/UpsEvents"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -4944,8 +4880,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "500": {
             "content": {
@@ -4954,8 +4889,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "tags": []
@@ -4986,8 +4920,7 @@
                   "type": "array"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "400": {
             "content": {
@@ -4996,8 +4929,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           },
           "500": {
             "content": {
@@ -5006,8 +4938,7 @@
                   "$ref": "#/components/schemas/ApiError"
                 }
               }
-            },
-            "description": ""
+            }
           }
         },
         "summary": "Raw ranges use at most 720 time buckets. All metrics expose min/avg/max;\nruntime is the minimum. Longer ranges include the overlapping hourly bucket.",

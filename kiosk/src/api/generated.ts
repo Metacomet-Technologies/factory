@@ -475,7 +475,7 @@ export interface components {
       label: string;
     };
     AgentTool: {
-      balance?: null | components["schemas"]["AgentBalance"];
+      balance?: components["schemas"]["AgentBalance"] | null;
       /** @description Amp has independent USD and normalized orb-hour pools. Never sum units. */
       balances: components["schemas"]["AgentBalance"][];
       /** @description Cursor cycle spend details in USD; empty for every other tool. */
@@ -541,7 +541,7 @@ export interface components {
     Burst: {
       /** Format: int32 */
       received: number;
-      rtt?: null | components["schemas"]["Rtt"];
+      rtt?: components["schemas"]["Rtt"] | null;
       /** Format: int32 */
       sent: number;
     };
@@ -652,7 +652,7 @@ export interface components {
        * @description Device wall clock (Unix ms) when the fast sample was taken.
        */
       observed_at_ms: number;
-      power?: null | components["schemas"]["Power"];
+      power?: components["schemas"]["Power"] | null;
       /**
        * Format: int64
        * @description Only `1` is accepted.
@@ -684,8 +684,8 @@ export interface components {
       device: components["schemas"]["HostSnapshot"];
       /** Format: int64 */
       generated_at_ms: number;
-      ingest?: null | components["schemas"]["IngestView"];
-      maintenance?: null | components["schemas"]["NodeMaintenance"];
+      ingest?: components["schemas"]["IngestView"] | null;
+      maintenance?: components["schemas"]["NodeMaintenance"] | null;
       warnings: string[];
     };
     DiskIo: {
@@ -713,9 +713,9 @@ export interface components {
     };
     Family: {
       family: string;
-      pending?: null | components["schemas"]["Selection"];
-      rates?: null | components["schemas"]["Rates"];
-      selected?: null | components["schemas"]["Selection"];
+      pending?: components["schemas"]["Selection"] | null;
+      rates?: components["schemas"]["Rates"] | null;
+      selected?: components["schemas"]["Selection"] | null;
     };
     Filesystem: {
       fstype: string;
@@ -738,7 +738,7 @@ export interface components {
       service: string;
     };
     Gpu: {
-      current?: null | components["schemas"]["GpuCurrent"];
+      current?: components["schemas"]["GpuCurrent"] | null;
       history: components["schemas"]["GpuHistory"][];
       loaded_models: string[];
     };
@@ -833,7 +833,7 @@ export interface components {
       network: components["schemas"]["Network"];
       /** Format: int64 */
       observed_at_ms: number;
-      power?: null | components["schemas"]["Power"];
+      power?: components["schemas"]["Power"] | null;
     };
     IngestResult: {
       current_updated: boolean;
@@ -1050,7 +1050,7 @@ export interface components {
      *     state it records; it is never healthy.
      */
     NetworkEvent: components["schemas"]["NetworkLinkState"] & {
-      end_reason?: null | components["schemas"]["NetworkEndReason"];
+      end_reason?: components["schemas"]["NetworkEndReason"] | null;
       /**
        * Format: int64
        * @description Null while the episode is open.
@@ -1184,8 +1184,8 @@ export interface components {
       device_id: string;
       /** Format: int64 */
       generated_at_ms: number;
-      latest_speed_test?: null | components["schemas"]["NetworkSpeedTest"];
-      open_event?: null | components["schemas"]["NetworkEvent"];
+      latest_speed_test?: components["schemas"]["NetworkSpeedTest"] | null;
+      open_event?: components["schemas"]["NetworkEvent"] | null;
       /** @description The stored open event's state; healthy when none is open. */
       state: components["schemas"]["NetworkLinkState"];
       /** @description Registry order: lan, wan, dns, tailnet. */
@@ -1193,7 +1193,7 @@ export interface components {
       warnings: string[];
     };
     NetworkTarget: {
-      latest?: null | components["schemas"]["Sample"];
+      latest?: components["schemas"]["Sample"] | null;
       layer: components["schemas"]["Layer"];
       probe: components["schemas"]["ProbeKind"];
       target: string;
@@ -1440,7 +1440,7 @@ export interface components {
       requests: number;
     };
     Ups: {
-      current?: null | components["schemas"]["UpsCurrent"];
+      current?: components["schemas"]["UpsCurrent"] | null;
       /** Format: int64 */
       generated_at_ms: number;
       warnings: string[];
